@@ -13907,83 +13907,37 @@ struct UnifiedArchitectureRequiredReport {
     command: &'static str,
 }
 
+macro_rules! unified_architecture_required_report_rows {
+    ($(($label:literal, $path:literal, $command:literal)),+ $(,)?) => {
+        &[
+            $(
+                UnifiedArchitectureRequiredReport {
+                    label: $label,
+                    path: $path,
+                    command: $command,
+                },
+            )+
+        ]
+    };
+}
+
 fn unified_architecture_required_reports() -> &'static [UnifiedArchitectureRequiredReport] {
-    &[
-        UnifiedArchitectureRequiredReport {
-            label: "runtime-change-sets",
-            path: "target/reports/unified/runtime-change-sets.json",
-            command: "verify-runtime-change-sets",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "document-batch-patches",
-            path: "target/reports/unified/document-batch-patches.json",
-            command: "verify-document-batch-patches",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "retained-layout-deltas",
-            path: "target/reports/unified/retained-layout-deltas.json",
-            command: "verify-retained-layout-deltas",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "text-cache-layers",
-            path: "target/reports/unified/text-cache-layers.json",
-            command: "verify-text-cache-layers",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "render-patch-contract",
-            path: "target/reports/unified/render-patch-contract.json",
-            command: "verify-render-patch-contract",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "wgpu-retained-arenas",
-            path: "target/reports/native-gpu/wgpu-retained-arenas.json",
-            command: "verify-wgpu-retained-arenas",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "wgpu-readback",
-            path: "target/reports/native-gpu/wgpu-readback.json",
-            command: "verify-wgpu-readback",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "semantic-scene",
-            path: "target/reports/unified/semantic-scene.json",
-            command: "verify-semantic-scene",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "accessibility-adapters",
-            path: "target/reports/unified/accessibility-adapters.json",
-            command: "verify-accessibility-adapters",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "3d-hello-cube",
-            path: "target/reports/unified/3d-hello-cube.json",
-            command: "verify-3d-hello-cube",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "solid-graph",
-            path: "target/reports/unified/solid-graph.json",
-            command: "verify-solid-graph",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "3d-printable-bracket",
-            path: "target/reports/unified/3d-printable-bracket.json",
-            command: "verify-3d-printable-bracket",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "manufacturing-slices",
-            path: "target/reports/unified/manufacturing-slices.json",
-            command: "verify-manufacturing-slices",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "3mf-export",
-            path: "target/reports/unified/3mf-export.json",
-            command: "verify-3mf-export",
-        },
-        UnifiedArchitectureRequiredReport {
-            label: "3d-parametric-car",
-            path: "target/reports/unified/3d-parametric-car.json",
-            command: "verify-3d-parametric-car",
-        },
+    unified_architecture_required_report_rows![
+        ("runtime-change-sets", "target/reports/unified/runtime-change-sets.json", "verify-runtime-change-sets"),
+        ("document-batch-patches", "target/reports/unified/document-batch-patches.json", "verify-document-batch-patches"),
+        ("retained-layout-deltas", "target/reports/unified/retained-layout-deltas.json", "verify-retained-layout-deltas"),
+        ("text-cache-layers", "target/reports/unified/text-cache-layers.json", "verify-text-cache-layers"),
+        ("render-patch-contract", "target/reports/unified/render-patch-contract.json", "verify-render-patch-contract"),
+        ("wgpu-retained-arenas", "target/reports/native-gpu/wgpu-retained-arenas.json", "verify-wgpu-retained-arenas"),
+        ("wgpu-readback", "target/reports/native-gpu/wgpu-readback.json", "verify-wgpu-readback"),
+        ("semantic-scene", "target/reports/unified/semantic-scene.json", "verify-semantic-scene"),
+        ("accessibility-adapters", "target/reports/unified/accessibility-adapters.json", "verify-accessibility-adapters"),
+        ("3d-hello-cube", "target/reports/unified/3d-hello-cube.json", "verify-3d-hello-cube"),
+        ("solid-graph", "target/reports/unified/solid-graph.json", "verify-solid-graph"),
+        ("3d-printable-bracket", "target/reports/unified/3d-printable-bracket.json", "verify-3d-printable-bracket"),
+        ("manufacturing-slices", "target/reports/unified/manufacturing-slices.json", "verify-manufacturing-slices"),
+        ("3mf-export", "target/reports/unified/3mf-export.json", "verify-3mf-export"),
+        ("3d-parametric-car", "target/reports/unified/3d-parametric-car.json", "verify-3d-parametric-car"),
     ]
 }
 
@@ -56414,356 +56368,81 @@ struct BytesMachinePlanRequiredReport {
     measurement_mode: &'static str,
 }
 
+macro_rules! bytes_machine_plan_required_report_rows {
+    ($(($label:literal, $path:literal, $command:literal, $measurement_mode:literal)),+ $(,)?) => {
+        &[
+            $(
+                BytesMachinePlanRequiredReport {
+                    label: $label,
+                    path: $path,
+                    command: $command,
+                    measurement_mode: $measurement_mode,
+                },
+            )+
+        ]
+    };
+}
+
 fn bytes_machine_plan_required_reports() -> &'static [BytesMachinePlanRequiredReport] {
-    &[
-        BytesMachinePlanRequiredReport {
-            label: "phase0-baseline",
-            path: "target/reports/bytes-plan/phase0-baseline.json",
-            command: "bytes-plan-phase0-baseline",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-initial-dump-plan",
-            path: "target/reports/bytes-plan/bytes-initial-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-initial-run-plan",
-            path: "target/reports/bytes-plan/bytes-initial-run-plan.json",
-            command: "run-plan",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "root-scalar-plan-ops-dump-plan",
-            path: "target/reports/bytes-plan/root-scalar-plan-ops-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "root-scalar-plan-ops-scenario",
-            path: "target/reports/bytes-plan/root-scalar-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-length-scenario",
-            path: "target/reports/bytes-plan/bytes-length-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-is-empty-scenario",
-            path: "target/reports/bytes-plan/bytes-is-empty-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-get-scenario",
-            path: "target/reports/bytes-plan/bytes-get-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-equal-scenario",
-            path: "target/reports/bytes-plan/bytes-equal-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-concat-scenario",
-            path: "target/reports/bytes-plan/bytes-concat-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-concat-chain-scenario",
-            path: "target/reports/bytes-plan/bytes-concat-chain-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-set-scenario",
-            path: "target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-same-event-dependency-scenario",
-            path: "target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-indexed-same-event-dependency-scenario",
-            path: "target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-text-conversion-scenario",
-            path: "target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-slice-take-drop-scenario",
-            path: "target/reports/bytes-plan/bytes-slice-take-drop-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-dynamic-slice-dump-plan",
-            path: "target/reports/bytes-plan/bytes-dynamic-slice-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-dynamic-slice-scenario",
-            path: "target/reports/bytes-plan/bytes-dynamic-slice-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-search-scenario",
-            path: "target/reports/bytes-plan/bytes-search-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-encoding-scenario",
-            path: "target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-numeric-scenario",
-            path: "target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-set-conversion-bank-dump-plan",
-            path: "target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-set-conversion-bank-scenario",
-            path: "target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-constant-expr-dump-plan",
-            path: "target/reports/bytes-plan/bytes-constant-expr-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-constant-expr-scenario",
-            path: "target/reports/bytes-plan/bytes-constant-expr-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-source-payload-dump-plan",
-            path: "target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-source-payload-route",
-            path: "target/reports/bytes-plan/bytes-source-payload-route-run-plan.json",
-            command: "run-plan-route",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-source-payload-large-route",
-            path: "target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json",
-            command: "run-plan-route",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-source-payload-scenario",
-            path: "target/reports/bytes-plan/bytes-source-payload-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-indexed-source-payload-dump-plan",
-            path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-indexed-source-payload-route",
-            path: "target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json",
-            command: "run-plan-route",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-indexed-source-payload-scenario",
-            path: "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-indexed-equal-scenario",
-            path: "target/reports/bytes-plan/bytes-indexed-equal-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-indexed-search-scenario",
-            path: "target/reports/bytes-plan/bytes-indexed-search-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-append-row-refresh-dump-plan",
-            path: "target/reports/bytes-plan/bytes-append-row-refresh-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-append-row-refresh-scenario",
-            path: "target/reports/bytes-plan/bytes-append-row-refresh-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-type-system",
-            path: "target/reports/bytes-plan/bytes-type-system.json",
-            command: "verify-bytes-type-system",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-default-engine-readiness",
-            path: "target/reports/bytes-plan/bytes-default-engine-readiness.json",
-            command: "verify-bytes-default-engine-readiness",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-negative",
-            path: "target/reports/bytes-plan/bytes-negative.json",
-            command: "verify-bytes-negative",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-machine-plan-adversarial",
-            path: "target/reports/bytes-plan/bytes-machine-plan-adversarial.json",
-            command: "verify-bytes-machine-plan-adversarial",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-file-read-plan",
-            path: "target/reports/bytes-plan/bytes-file-read-plan.json",
-            command: "verify-bytes-file-read-plan",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-file-write-plan",
-            path: "target/reports/bytes-plan/bytes-file-write-plan.json",
-            command: "verify-bytes-file-write-plan",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-storage-profile",
-            path: "target/reports/bytes-plan/bytes-storage-profile.json",
-            command: "verify-bytes-storage-profile",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-fixed-warm-tick",
-            path: "target/reports/bytes-plan/bytes-fixed-warm-tick.json",
-            command: "verify-bytes-fixed-warm-tick",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "bytes-byte-bank-layout",
-            path: "target/reports/bytes-plan/bytes-byte-bank-layout.json",
-            command: "verify-bytes-byte-bank-layout",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "build-bytes-boundary",
-            path: "target/reports/bytes-plan/build-bytes-boundary.json",
-            command: "verify-build-bytes-boundary",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-dump-plan",
-            path: "target/reports/bytes-plan/todomvc-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-submit",
-            path: "target/reports/bytes-plan/todomvc-submit-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-toggle",
-            path: "target/reports/bytes-plan/todomvc-toggle-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-toggle-all",
-            path: "target/reports/bytes-plan/todomvc-toggle-all-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-dynamic-delete",
-            path: "target/reports/bytes-plan/todomvc-dynamic-delete-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-clear-completed",
-            path: "target/reports/bytes-plan/todomvc-clear-completed-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-edit-commit",
-            path: "target/reports/bytes-plan/todomvc-edit-commit-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-edit-cancel",
-            path: "target/reports/bytes-plan/todomvc-edit-cancel-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-edit-blur",
-            path: "target/reports/bytes-plan/todomvc-edit-blur-root-list-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "todomvc-root-scalar",
-            path: "target/reports/bytes-plan/todomvc-root-scalar-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "cells-dump-plan",
-            path: "target/reports/bytes-plan/cells-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        },
-        BytesMachinePlanRequiredReport {
-            label: "cells-ascii-formula",
-            path: "target/reports/bytes-plan/cells-ascii-formula-run.json",
-            command: "run-plan-scenario-events",
-            measurement_mode: "proof",
-        },
+    bytes_machine_plan_required_report_rows![
+        ("phase0-baseline", "target/reports/bytes-plan/phase0-baseline.json", "bytes-plan-phase0-baseline", "diagnostic"),
+        ("bytes-initial-dump-plan", "target/reports/bytes-plan/bytes-initial-dump-plan.json", "dump-plan", "diagnostic"),
+        ("bytes-initial-run-plan", "target/reports/bytes-plan/bytes-initial-run-plan.json", "run-plan", "proof"),
+        ("root-scalar-plan-ops-dump-plan", "target/reports/bytes-plan/root-scalar-plan-ops-dump-plan.json", "dump-plan", "diagnostic"),
+        ("root-scalar-plan-ops-scenario", "target/reports/bytes-plan/root-scalar-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-length-scenario", "target/reports/bytes-plan/bytes-length-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-is-empty-scenario", "target/reports/bytes-plan/bytes-is-empty-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-get-scenario", "target/reports/bytes-plan/bytes-get-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-equal-scenario", "target/reports/bytes-plan/bytes-equal-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-concat-scenario", "target/reports/bytes-plan/bytes-concat-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-concat-chain-scenario", "target/reports/bytes-plan/bytes-concat-chain-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-set-scenario", "target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-same-event-dependency-scenario", "target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-indexed-same-event-dependency-scenario", "target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-text-conversion-scenario", "target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-slice-take-drop-scenario", "target/reports/bytes-plan/bytes-slice-take-drop-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-dynamic-slice-dump-plan", "target/reports/bytes-plan/bytes-dynamic-slice-dump-plan.json", "dump-plan", "diagnostic"),
+        ("bytes-dynamic-slice-scenario", "target/reports/bytes-plan/bytes-dynamic-slice-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-search-scenario", "target/reports/bytes-plan/bytes-search-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-encoding-scenario", "target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-numeric-scenario", "target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-set-conversion-bank-dump-plan", "target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json", "dump-plan", "diagnostic"),
+        ("bytes-set-conversion-bank-scenario", "target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-constant-expr-dump-plan", "target/reports/bytes-plan/bytes-constant-expr-dump-plan.json", "dump-plan", "diagnostic"),
+        ("bytes-constant-expr-scenario", "target/reports/bytes-plan/bytes-constant-expr-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-source-payload-dump-plan", "target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json", "dump-plan", "diagnostic"),
+        ("bytes-source-payload-route", "target/reports/bytes-plan/bytes-source-payload-route-run-plan.json", "run-plan-route", "proof"),
+        ("bytes-source-payload-large-route", "target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json", "run-plan-route", "proof"),
+        ("bytes-source-payload-scenario", "target/reports/bytes-plan/bytes-source-payload-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-indexed-source-payload-dump-plan", "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json", "dump-plan", "diagnostic"),
+        ("bytes-indexed-source-payload-route", "target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json", "run-plan-route", "proof"),
+        ("bytes-indexed-source-payload-scenario", "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-indexed-equal-scenario", "target/reports/bytes-plan/bytes-indexed-equal-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-indexed-search-scenario", "target/reports/bytes-plan/bytes-indexed-search-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-append-row-refresh-dump-plan", "target/reports/bytes-plan/bytes-append-row-refresh-dump-plan.json", "dump-plan", "diagnostic"),
+        ("bytes-append-row-refresh-scenario", "target/reports/bytes-plan/bytes-append-row-refresh-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("bytes-type-system", "target/reports/bytes-plan/bytes-type-system.json", "verify-bytes-type-system", "proof"),
+        ("bytes-default-engine-readiness", "target/reports/bytes-plan/bytes-default-engine-readiness.json", "verify-bytes-default-engine-readiness", "proof"),
+        ("bytes-negative", "target/reports/bytes-plan/bytes-negative.json", "verify-bytes-negative", "proof"),
+        ("bytes-machine-plan-adversarial", "target/reports/bytes-plan/bytes-machine-plan-adversarial.json", "verify-bytes-machine-plan-adversarial", "proof"),
+        ("bytes-file-read-plan", "target/reports/bytes-plan/bytes-file-read-plan.json", "verify-bytes-file-read-plan", "proof"),
+        ("bytes-file-write-plan", "target/reports/bytes-plan/bytes-file-write-plan.json", "verify-bytes-file-write-plan", "proof"),
+        ("bytes-storage-profile", "target/reports/bytes-plan/bytes-storage-profile.json", "verify-bytes-storage-profile", "proof"),
+        ("bytes-fixed-warm-tick", "target/reports/bytes-plan/bytes-fixed-warm-tick.json", "verify-bytes-fixed-warm-tick", "proof"),
+        ("bytes-byte-bank-layout", "target/reports/bytes-plan/bytes-byte-bank-layout.json", "verify-bytes-byte-bank-layout", "proof"),
+        ("build-bytes-boundary", "target/reports/bytes-plan/build-bytes-boundary.json", "verify-build-bytes-boundary", "proof"),
+        ("todomvc-dump-plan", "target/reports/bytes-plan/todomvc-dump-plan.json", "dump-plan", "diagnostic"),
+        ("todomvc-submit", "target/reports/bytes-plan/todomvc-submit-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-toggle", "target/reports/bytes-plan/todomvc-toggle-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-toggle-all", "target/reports/bytes-plan/todomvc-toggle-all-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-dynamic-delete", "target/reports/bytes-plan/todomvc-dynamic-delete-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-clear-completed", "target/reports/bytes-plan/todomvc-clear-completed-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-edit-commit", "target/reports/bytes-plan/todomvc-edit-commit-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-edit-cancel", "target/reports/bytes-plan/todomvc-edit-cancel-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-edit-blur", "target/reports/bytes-plan/todomvc-edit-blur-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("todomvc-root-scalar", "target/reports/bytes-plan/todomvc-root-scalar-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
+        ("cells-dump-plan", "target/reports/bytes-plan/cells-dump-plan.json", "dump-plan", "diagnostic"),
+        ("cells-ascii-formula", "target/reports/bytes-plan/cells-ascii-formula-run.json", "run-plan-scenario-events", "proof"),
     ]
 }
 
@@ -63346,6 +63025,16 @@ struct BytesFileWriteReportNegativeCase {
     report: serde_json::Value,
 }
 
+macro_rules! push_bytes_file_write_report_negative_case {
+    ($cases:ident, $id:literal, $category:literal, $report:ident) => {
+        $cases.push(BytesFileWriteReportNegativeCase {
+            id: $id,
+            category: $category,
+            report: $report,
+        });
+    };
+}
+
 #[derive(Clone, Copy)]
 enum BytesFileWriteFabricatedPlanMutation {
     MissingBytesOperand,
@@ -63369,6 +63058,20 @@ struct BytesFileWriteFabricatedPlanCase {
     id: &'static str,
     category: &'static str,
     mutation: BytesFileWriteFabricatedPlanMutation,
+}
+
+macro_rules! bytes_file_write_fabricated_plan_cases {
+    ($(($id:literal, $category:literal, $mutation:ident)),+ $(,)?) => {
+        vec![
+            $(
+                BytesFileWriteFabricatedPlanCase {
+                    id: $id,
+                    category: $category,
+                    mutation: $mutation,
+                },
+            )+
+        ]
+    };
 }
 
 struct BytesFileWriteFabricatedPlanResult {
@@ -63412,82 +63115,22 @@ impl BytesFileWriteFabricatedPlanResult {
 
 fn bytes_file_write_fabricated_plan_negative_cases() -> Vec<BytesFileWriteFabricatedPlanCase> {
     use BytesFileWriteFabricatedPlanMutation::*;
-    vec![
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-missing-bytes-operand",
-            category: "operand-shape",
-            mutation: MissingBytesOperand,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-extra-path-operand",
-            category: "operand-shape",
-            mutation: ExtraPathOperand,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-row-field-path-op-not-indexed",
-            category: "indexed-row-field-path",
-            mutation: RowFieldPathOpNotIndexed,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-row-field-path-input-missing",
-            category: "indexed-row-field-path",
-            mutation: RowFieldPathInputMissing,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-row-field-path-foreign-list",
-            category: "indexed-row-field-path",
-            mutation: RowFieldPathForeignList,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-missing-path-constant",
-            category: "constant-binding",
-            mutation: MissingPathConstant,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-non-text-path-constant",
-            category: "constant-binding",
-            mutation: NonTextPathConstant,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-non-static-parent-path",
-            category: "path-policy",
-            mutation: NonStaticParentPath,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-missing-source-input",
-            category: "operand-shape",
-            mutation: MissingSourceInput,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-extra-source-input",
-            category: "operand-shape",
-            mutation: ExtraSourceInput,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-source-payload-input-declared",
-            category: "operand-shape",
-            mutation: SourcePayloadInputDeclared,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-update-constant-present",
-            category: "operand-shape",
-            mutation: UpdateConstantPresent,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-source-payload-field-present",
-            category: "operand-shape",
-            mutation: SourcePayloadFieldPresent,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-input-not-bytes",
-            category: "type-policy",
-            mutation: InputNotBytes,
-        },
-        BytesFileWriteFabricatedPlanCase {
-            id: "fabricated-output-not-text",
-            category: "type-policy",
-            mutation: OutputNotText,
-        },
+    bytes_file_write_fabricated_plan_cases![
+        ("fabricated-missing-bytes-operand", "operand-shape", MissingBytesOperand),
+        ("fabricated-extra-path-operand", "operand-shape", ExtraPathOperand),
+        ("fabricated-row-field-path-op-not-indexed", "indexed-row-field-path", RowFieldPathOpNotIndexed),
+        ("fabricated-row-field-path-input-missing", "indexed-row-field-path", RowFieldPathInputMissing),
+        ("fabricated-row-field-path-foreign-list", "indexed-row-field-path", RowFieldPathForeignList),
+        ("fabricated-missing-path-constant", "constant-binding", MissingPathConstant),
+        ("fabricated-non-text-path-constant", "constant-binding", NonTextPathConstant),
+        ("fabricated-non-static-parent-path", "path-policy", NonStaticParentPath),
+        ("fabricated-missing-source-input", "operand-shape", MissingSourceInput),
+        ("fabricated-extra-source-input", "operand-shape", ExtraSourceInput),
+        ("fabricated-source-payload-input-declared", "operand-shape", SourcePayloadInputDeclared),
+        ("fabricated-update-constant-present", "operand-shape", UpdateConstantPresent),
+        ("fabricated-source-payload-field-present", "operand-shape", SourcePayloadFieldPresent),
+        ("fabricated-input-not-bytes", "type-policy", InputNotBytes),
+        ("fabricated-output-not-text", "type-policy", OutputNotText),
     ]
 }
 
@@ -63910,88 +63553,48 @@ fn bytes_file_write_report_negative_cases(
     let mut forged_summary_digest = base.clone();
     forged_summary_digest["file_write_summary"]["sha256"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-summary-digest",
-        category: "file-artifact-binding",
-        report: forged_summary_digest,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-summary-digest", "file-artifact-binding", forged_summary_digest);
 
     let mut forged_host_effect_digest = base.clone();
     forged_host_effect_digest["plan_executor"]["per_step"][0]["updates"][0]["host_effect"]["sha256"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-host-effect-digest",
-        category: "executor-host-effect-binding",
-        report: forged_host_effect_digest,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-host-effect-digest", "executor-host-effect-binding", forged_host_effect_digest);
 
     let mut forged_len = base.clone();
     forged_len["file_write_summary"]["byte_len"] = json!(99);
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-byte-length",
-        category: "file-artifact-binding",
-        report: forged_len,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-byte-length", "file-artifact-binding", forged_len);
 
     let mut forged_last_byte = base.clone();
     forged_last_byte["file_write_summary"]["last_byte"] = json!(0);
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-last-byte",
-        category: "file-artifact-binding",
-        report: forged_last_byte,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-last-byte", "file-artifact-binding", forged_last_byte);
 
     let mut inline_payload_leak = base.clone();
     inline_payload_leak["plan_executor"]["per_step"][0]["updates"][0]["host_effect"]["inline_bytes"] =
         json!([222, 173, 190, 239]);
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "public-inline-bytes-leak",
-        category: "payload-leak",
-        report: inline_payload_leak,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "public-inline-bytes-leak", "payload-leak", inline_payload_leak);
 
     let mut expression_kind_downgrade = base.clone();
     expression_kind_downgrade["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
         json!("read_path");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "expression-kind-downgrade",
-        category: "typed-op-binding",
-        report: expression_kind_downgrade,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "expression-kind-downgrade", "typed-op-binding", expression_kind_downgrade);
 
     let mut missing_update = base.clone();
     missing_update["plan_executor"]["per_step"][0]["updates"] = json!([]);
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "missing-file-write-update",
-        category: "executor-shape",
-        report: missing_update,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "missing-file-write-update", "executor-shape", missing_update);
 
     let mut nonzero_ast = base.clone();
     nonzero_ast["plan_executor"]["runtime_ast_eval_count"] = json!(1);
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "nonzero-runtime-ast-eval",
-        category: "fallback-counter",
-        report: nonzero_ast,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "nonzero-runtime-ast-eval", "fallback-counter", nonzero_ast);
 
     let mut forged_plan_hash = base.clone();
     forged_plan_hash["plan_hash"] =
         json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-plan-hash",
-        category: "plan-binding",
-        report: forged_plan_hash,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-plan-hash", "plan-binding", forged_plan_hash);
 
     let mut forged_binary_hash = base.clone();
     forged_binary_hash["binary_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-binary-hash",
-        category: "binary-binding",
-        report: forged_binary_hash,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-binary-hash", "binary-binding", forged_binary_hash);
 
     let mut missing_live_negative = base.clone();
     missing_live_negative
@@ -64002,20 +63605,12 @@ fn bytes_file_write_report_negative_cases(
         .as_object_mut()
         .expect("report must be object")
         .remove("live_negative_case_count");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "missing-live-negative-evidence",
-        category: "live-negative-evidence",
-        report: missing_live_negative,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "missing-live-negative-evidence", "live-negative-evidence", missing_live_negative);
 
     let mut forged_live_negative_detail = base.clone();
     forged_live_negative_detail["live_negative_cases"][0]["detail"] =
         json!("PlanExecutor accepted forged live-negative evidence");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-live-negative-detail",
-        category: "live-negative-evidence",
-        report: forged_live_negative_detail,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-live-negative-detail", "live-negative-evidence", forged_live_negative_detail);
 
     let mut missing_fabricated_plan_negative_evidence = base.clone();
     if let Some(object) = missing_fabricated_plan_negative_evidence.as_object_mut() {
@@ -64033,49 +63628,29 @@ fn bytes_file_write_report_negative_cases(
                 .is_some_and(|id| id.starts_with("fabricated-plan-negative-"))
         });
     }
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "missing-fabricated-plan-negative-evidence",
-        category: "fabricated-plan-negative-evidence",
-        report: missing_fabricated_plan_negative_evidence,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "missing-fabricated-plan-negative-evidence", "fabricated-plan-negative-evidence", missing_fabricated_plan_negative_evidence);
 
     let mut forged_fabricated_plan_negative_hash = base.clone();
     forged_fabricated_plan_negative_hash["fabricated_plan_negative_cases"][0]["mutated_plan_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-fabricated-plan-negative-hash",
-        category: "fabricated-plan-negative-binding",
-        report: forged_fabricated_plan_negative_hash,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-fabricated-plan-negative-hash", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_hash);
 
     let mut forged_fabricated_plan_negative_check = base.clone();
     forged_fabricated_plan_negative_check["fabricated_plan_negative_cases"][0]["expected_failed_check_ids"] =
         json!(["capability-summary-derived-counts"]);
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-fabricated-plan-negative-check",
-        category: "fabricated-plan-negative-binding",
-        report: forged_fabricated_plan_negative_check,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-fabricated-plan-negative-check", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_check);
 
     let mut forged_fabricated_plan_runtime_executed = base.clone();
     forged_fabricated_plan_runtime_executed["fabricated_plan_negative_cases"][0]["runtime_executed"] =
         json!(true);
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "forged-fabricated-plan-runtime-executed",
-        category: "fabricated-plan-negative-boundary",
-        report: forged_fabricated_plan_runtime_executed,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "forged-fabricated-plan-runtime-executed", "fabricated-plan-negative-boundary", forged_fabricated_plan_runtime_executed);
 
     let mut fabricated_plan_extra_runtime_claim = base.clone();
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["selected_step_ids"] =
         json!(["write-file-bytes"]);
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["plan_executor"] =
         json!({"executor": "fake-runtime-claim"});
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "fabricated-plan-extra-runtime-claim",
-        category: "fabricated-plan-negative-boundary",
-        report: fabricated_plan_extra_runtime_claim,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "fabricated-plan-extra-runtime-claim", "fabricated-plan-negative-boundary", fabricated_plan_extra_runtime_claim);
 
     let mut fabricated_plan_duplicate_case = base.clone();
     if let Some(cases_array) = fabricated_plan_duplicate_case
@@ -64089,11 +63664,7 @@ fn bytes_file_write_report_negative_cases(
         }
         fabricated_plan_duplicate_case["fabricated_plan_negative_cases"] = json!(duplicated);
     }
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "fabricated-plan-duplicate-case",
-        category: "fabricated-plan-negative-binding",
-        report: fabricated_plan_duplicate_case,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "fabricated-plan-duplicate-case", "fabricated-plan-negative-binding", fabricated_plan_duplicate_case);
 
     let mut missing_negative = base.clone();
     missing_negative
@@ -64104,11 +63675,7 @@ fn bytes_file_write_report_negative_cases(
         .as_object_mut()
         .expect("report must be object")
         .remove("negative_case_count");
-    cases.push(BytesFileWriteReportNegativeCase {
-        id: "missing-negative-evidence",
-        category: "negative-evidence",
-        report: missing_negative,
-    });
+    push_bytes_file_write_report_negative_case!(cases, "missing-negative-evidence", "negative-evidence", missing_negative);
 
     cases
 }
@@ -64298,24 +63865,7 @@ fn bytes_file_write_live_negative_cases() -> Vec<BytesFileWriteLiveNegativeCase>
             id: "runtime-dynamic-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
-            source: r#"
-payload:
-    BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF } |> HOLD payload { LATEST {} }
-
-store: [
-    write: SOURCE
-    path_state:
-        TEXT { ../dynamic.bin } |> HOLD path_state { LATEST {} }
-    write_status:
-        TEXT { pending } |> HOLD write_status {
-            LATEST {
-                store.write |> THEN { payload |> File/write_bytes(path: store.path_state) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { File write bytes }))
-"#,
+            source: bytes_file_write_dynamic_path_negative_source("TEXT { ../dynamic.bin }"),
             expected_error_contains: "may not contain parent-directory segments",
             target_path: None,
             target_kind: None,
@@ -64324,36 +63874,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { File write
             id: "runtime-indexed-row-field-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { ../indexed.bin }, write_status: TEXT { pending }]
-            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { ../indexed.bin }, write_status: TEXT { pending }]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        write: SOURCE
-        name: row.name
-        path_state: row.path_state
-        payload:
-            row.payload |> HOLD payload {
-                LATEST {}
-            }
-        write_status:
-            row.write_status |> HOLD write_status {
-                LATEST {
-                    write |> THEN { payload |> File/write_bytes(path: path_state) }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes negative }))
-"#,
+            source: bytes_file_write_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { ../indexed.bin }, write_status: TEXT { pending }]\n            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { ../indexed.bin }, write_status: TEXT { pending }]",
+                "path_state: row.path_state",
+                "payload |> File/write_bytes(path: path_state)",
+                "Indexed file write bytes negative",
+            ),
             expected_error_contains: "may not contain parent-directory segments",
             target_path: None,
             target_kind: None,
@@ -64362,36 +63888,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "runtime-indexed-row-field-missing-parent",
             category: "runtime-path-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { missing-parent/out.bin }, write_status: TEXT { pending }]
-            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { missing-parent/out.bin }, write_status: TEXT { pending }]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        write: SOURCE
-        name: row.name
-        path_state: row.path_state
-        payload:
-            row.payload |> HOLD payload {
-                LATEST {}
-            }
-        write_status:
-            row.write_status |> HOLD write_status {
-                LATEST {
-                    write |> THEN { payload |> File/write_bytes(path: path_state) }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes missing parent negative }))
-"#,
+            source: bytes_file_write_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { missing-parent/out.bin }, write_status: TEXT { pending }]\n            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { missing-parent/out.bin }, write_status: TEXT { pending }]",
+                "path_state: row.path_state",
+                "payload |> File/write_bytes(path: path_state)",
+                "Indexed file write bytes missing parent negative",
+            ),
             expected_error_contains: "cannot write `missing-parent/out.bin`",
             target_path: Some("missing-parent/out.bin"),
             target_kind: Some("missing_parent"),
@@ -64400,36 +63902,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "typecheck-indexed-row-field-non-text-path",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: 7, write_status: TEXT { pending }]
-            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: 7, write_status: TEXT { pending }]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        write: SOURCE
-        name: row.name
-        path_state: row.path_state
-        payload:
-            row.payload |> HOLD payload {
-                LATEST {}
-            }
-        write_status:
-            row.write_status |> HOLD write_status {
-                LATEST {
-                    write |> THEN { payload |> File/write_bytes(path: path_state) }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes non-text path negative }))
-"#,
+            source: bytes_file_write_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: 7, write_status: TEXT { pending }]\n            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: 7, write_status: TEXT { pending }]",
+                "path_state: row.path_state",
+                "payload |> File/write_bytes(path: path_state)",
+                "Indexed file write bytes non-text path negative",
+            ),
             expected_error_contains: "File/write_bytes",
             target_path: None,
             target_kind: None,
@@ -64438,36 +63916,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "runtime-indexed-row-field-missing-target-row",
             category: "indexed-row-dispatch-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/missing-target.bin }, write_status: TEXT { pending }]
-            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/missing-target.bin }, write_status: TEXT { pending }]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        write: SOURCE
-        name: row.name
-        path_state: row.path_state
-        payload:
-            row.payload |> HOLD payload {
-                LATEST {}
-            }
-        write_status:
-            row.write_status |> HOLD write_status {
-                LATEST {
-                    write |> THEN { payload |> File/write_bytes(path: path_state) }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes missing target row negative }))
-"#,
+            source: bytes_file_write_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/missing-target.bin }, write_status: TEXT { pending }]\n            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/missing-target.bin }, write_status: TEXT { pending }]",
+                "path_state: row.path_state",
+                "payload |> File/write_bytes(path: path_state)",
+                "Indexed file write bytes missing target row negative",
+            ),
             expected_error_contains: "target key/generation 999/1 not found",
             target_path: None,
             target_kind: None,
@@ -64476,35 +63930,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "typecheck-indexed-row-field-unknown-path-field",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/unknown-field.bin }, write_status: TEXT { pending }]
-            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/unknown-field.bin }, write_status: TEXT { pending }]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        write: SOURCE
-        name: row.name
-        payload:
-            row.payload |> HOLD payload {
-                LATEST {}
-            }
-        write_status:
-            row.write_status |> HOLD write_status {
-                LATEST {
-                    write |> THEN { payload |> File/write_bytes(path: row.missing_path) }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes unknown path field negative }))
-"#,
+            source: bytes_file_write_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/unknown-field.bin }, write_status: TEXT { pending }]\n            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/unknown-field.bin }, write_status: TEXT { pending }]",
+                "",
+                "payload |> File/write_bytes(path: row.missing_path)",
+                "Indexed file write bytes unknown path field negative",
+            ),
             expected_error_contains: "missing_path",
             target_path: None,
             target_kind: None,
@@ -64513,35 +63944,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
             category: "indexed-row-shape-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/mixed-row-shape.bin }, write_status: TEXT { pending }]
-            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, write_status: TEXT { pending }]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        write: SOURCE
-        name: row.name
-        payload:
-            row.payload |> HOLD payload {
-                LATEST {}
-            }
-        write_status:
-            row.write_status |> HOLD write_status {
-                LATEST {
-                    write |> THEN { payload |> File/write_bytes(path: row.path_state) }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file write bytes mixed row-shape negative }))
-"#,
+            source: bytes_file_write_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, path_state: TEXT { outputs/mixed-row-shape.bin }, write_status: TEXT { pending }]\n            [name: TEXT { beta }, payload: BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF }, write_status: TEXT { pending }]",
+                "",
+                "payload |> File/write_bytes(path: row.path_state)",
+                "Indexed file write bytes mixed row-shape negative",
+            ),
             expected_error_contains: "is not in the static schedule symbol table",
             target_path: None,
             target_kind: None,
@@ -64621,6 +64029,78 @@ store: [
 ]
 
 document: Document/new(root: Element/label(element: [], label: TEXT {{ File write bytes }}))
+"#
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn bytes_file_write_dynamic_path_negative_source(path_initial: &'static str) -> &'static str {
+    Box::leak(
+        format!(
+            r#"
+payload:
+    BYTES[4] {{ 16uDE, 16uAD, 16uBE, 16uEF }} |> HOLD payload {{ LATEST {{}} }}
+
+store: [
+    write: SOURCE
+    path_state:
+        {path_initial} |> HOLD path_state {{ LATEST {{}} }}
+    write_status:
+        TEXT {{ pending }} |> HOLD write_status {{
+            LATEST {{
+                store.write |> THEN {{ payload |> File/write_bytes(path: store.path_state) }}
+            }}
+        }}
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ File write bytes }}))
+"#
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn bytes_file_write_indexed_row_field_negative_source(
+    rows: &'static str,
+    path_binding: &'static str,
+    write_expr: &'static str,
+    label: &'static str,
+) -> &'static str {
+    let path_binding = if path_binding.is_empty() {
+        String::new()
+    } else {
+        format!("        {path_binding}\n")
+    };
+    Box::leak(
+        format!(
+            r#"
+store: [
+    rows:
+        LIST {{
+{rows}
+        }}
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {{
+    [
+        write: SOURCE
+        name: row.name
+{path_binding}        payload:
+            row.payload |> HOLD payload {{
+                LATEST {{}}
+            }}
+        write_status:
+            row.write_status |> HOLD write_status {{
+                LATEST {{
+                    write |> THEN {{ {write_expr} }}
+                }}
+            }}
+    ]
+}}
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ {label} }}))
 "#
         )
         .into_boxed_str(),
@@ -64707,6 +64187,16 @@ struct BytesFileReadReportNegativeCase {
     report: serde_json::Value,
 }
 
+macro_rules! push_bytes_file_read_report_negative_case {
+    ($cases:ident, $id:literal, $category:literal, $report:ident) => {
+        $cases.push(BytesFileReadReportNegativeCase {
+            id: $id,
+            category: $category,
+            report: $report,
+        });
+    };
+}
+
 fn bytes_file_read_report_negative_descriptors() -> Vec<(&'static str, &'static str)> {
     vec![
         ("forged-summary-digest", "file-artifact-binding"),
@@ -64772,79 +64262,43 @@ fn bytes_file_read_report_negative_cases(
     let mut forged_summary_digest = base.clone();
     forged_summary_digest["file_read_summary"]["sha256"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-summary-digest",
-        category: "file-artifact-binding",
-        report: forged_summary_digest,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-summary-digest", "file-artifact-binding", forged_summary_digest);
 
     let mut forged_update_digest = base.clone();
     forged_update_digest["plan_executor"]["per_step"][0]["updates"][0]["value"]["digest"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-update-digest",
-        category: "executor-value-binding",
-        report: forged_update_digest,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-update-digest", "executor-value-binding", forged_update_digest);
 
     let mut forged_state_digest = base.clone();
     forged_state_digest["state_summary"]["store.file_bytes"]["digest"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-state-digest",
-        category: "state-binding",
-        report: forged_state_digest,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-state-digest", "state-binding", forged_state_digest);
 
     let mut forged_len = base.clone();
     forged_len["file_read_summary"]["byte_len"] = json!(175);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-byte-length",
-        category: "file-artifact-binding",
-        report: forged_len,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-byte-length", "file-artifact-binding", forged_len);
 
     let mut forged_first_byte = base.clone();
     forged_first_byte["file_read_summary"]["first_byte"] = json!(61);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-first-byte",
-        category: "file-artifact-binding",
-        report: forged_first_byte,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-first-byte", "file-artifact-binding", forged_first_byte);
 
     let mut forged_followup_len = base.clone();
     forged_followup_len["state_summary"]["store.file_len"] = json!(175);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-followup-bytes-length",
-        category: "bytes-consumer-binding",
-        report: forged_followup_len,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-followup-bytes-length", "bytes-consumer-binding", forged_followup_len);
 
     let mut forged_followup_first = base.clone();
     forged_followup_first["state_summary"]["store.first_byte"] = json!(61);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-followup-bytes-get",
-        category: "bytes-consumer-binding",
-        report: forged_followup_first,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-followup-bytes-get", "bytes-consumer-binding", forged_followup_first);
 
     let mut inline_payload_leak = base.clone();
     inline_payload_leak["plan_executor"]["per_step"][0]["updates"][0]["value"]["inline_bytes"] =
         json!([60, 115, 118, 103]);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "public-inline-bytes-leak",
-        category: "payload-leak",
-        report: inline_payload_leak,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "public-inline-bytes-leak", "payload-leak", inline_payload_leak);
 
     let mut expression_kind_downgrade = base.clone();
     expression_kind_downgrade["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
         json!("read_path");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "expression-kind-downgrade",
-        category: "typed-op-binding",
-        report: expression_kind_downgrade,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "expression-kind-downgrade", "typed-op-binding", expression_kind_downgrade);
 
     let mut path_escape = base.clone();
     path_escape["file_read_summary"]["path"] =
@@ -64853,45 +64307,25 @@ fn bytes_file_read_report_negative_cases(
         json!("todo_mvc_physical/assets/icons/checkbox_active.svg");
     path_escape["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"]["path"] =
         json!("../todo_mvc_physical/assets/icons/checkbox_active.svg");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "path-parent-escape",
-        category: "path-policy",
-        report: path_escape,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "path-parent-escape", "path-policy", path_escape);
 
     let mut missing_artifact = base.clone();
     missing_artifact["file_read_summary"]["artifact_path"] =
         json!("examples/todo_mvc_physical/assets/icons/missing.svg");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "missing-artifact",
-        category: "artifact-binding",
-        report: missing_artifact,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "missing-artifact", "artifact-binding", missing_artifact);
 
     let mut missing_file_read_op = base.clone();
     missing_file_read_op["plan_executor"]["per_step"][0]["updates"] = json!([]);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "missing-file-read-update",
-        category: "executor-shape",
-        report: missing_file_read_op,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "missing-file-read-update", "executor-shape", missing_file_read_op);
 
     let mut nonzero_fallback = base.clone();
     nonzero_fallback["plan_executor"]["runtime_ast_eval_count"] = json!(1);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "nonzero-runtime-ast-eval",
-        category: "fallback-counter",
-        report: nonzero_fallback,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "nonzero-runtime-ast-eval", "fallback-counter", nonzero_fallback);
 
     let mut forged_plan_hash = base.clone();
     forged_plan_hash["plan_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-plan-hash",
-        category: "plan-binding",
-        report: forged_plan_hash,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-plan-hash", "plan-binding", forged_plan_hash);
 
     let mut missing_negative_evidence = base.clone();
     if let Some(object) = missing_negative_evidence.as_object_mut() {
@@ -64909,72 +64343,40 @@ fn bytes_file_read_report_negative_cases(
                 .is_some_and(|id| id.starts_with("negative-"))
         });
     }
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "missing-negative-evidence",
-        category: "negative-evidence",
-        report: missing_negative_evidence,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "missing-negative-evidence", "negative-evidence", missing_negative_evidence);
 
     let mut forged_semantic_delta = base.clone();
     forged_semantic_delta["semantic_deltas"][0]["value"]["digest"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-semantic-delta-digest",
-        category: "semantic-delta-binding",
-        report: forged_semantic_delta,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-semantic-delta-digest", "semantic-delta-binding", forged_semantic_delta);
 
     let mut forged_executor_step_id = base.clone();
     forged_executor_step_id["plan_executor"]["per_step"][0]["step_id"] = json!("wrong-step");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-executor-step-id",
-        category: "executor-trace-binding",
-        report: forged_executor_step_id,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-executor-step-id", "executor-trace-binding", forged_executor_step_id);
 
     let mut forged_file_read_update_op_id = base.clone();
     forged_file_read_update_op_id["plan_executor"]["per_step"][0]["updates"][0]["update_op_id"] =
         json!(999);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-file-read-update-op-id",
-        category: "executor-trace-binding",
-        report: forged_file_read_update_op_id,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-file-read-update-op-id", "executor-trace-binding", forged_file_read_update_op_id);
 
     let mut host_root_path_rebind = base.clone();
     host_root_path_rebind["file_read_summary"]["host_root"] = json!("");
     host_root_path_rebind["file_read_summary"]["path"] =
         json!("examples/todo_mvc_physical/assets/icons/checkbox_active.svg");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "host-root-path-rebind",
-        category: "file-artifact-binding",
-        report: host_root_path_rebind,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "host-root-path-rebind", "file-artifact-binding", host_root_path_rebind);
 
     let mut forged_program_hash = base.clone();
     forged_program_hash["program_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-program-hash",
-        category: "source-binding",
-        report: forged_program_hash,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-program-hash", "source-binding", forged_program_hash);
 
     let mut forged_graph_node_count = base.clone();
     forged_graph_node_count["graph_node_count"] = json!(999);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-graph-node-count",
-        category: "source-binding",
-        report: forged_graph_node_count,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-graph-node-count", "source-binding", forged_graph_node_count);
 
     let mut forged_summary_mode = base.clone();
     forged_summary_mode["file_read_summary"]["mode"] = json!("generic-proof");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-summary-mode",
-        category: "file-artifact-binding",
-        report: forged_summary_mode,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-summary-mode", "file-artifact-binding", forged_summary_mode);
 
     let mut missing_live_negative_evidence = base.clone();
     if let Some(object) = missing_live_negative_evidence.as_object_mut() {
@@ -64992,20 +64394,12 @@ fn bytes_file_read_report_negative_cases(
                 .is_some_and(|id| id.starts_with("live-negative-"))
         });
     }
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "missing-live-negative-evidence",
-        category: "live-negative-evidence",
-        report: missing_live_negative_evidence,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "missing-live-negative-evidence", "live-negative-evidence", missing_live_negative_evidence);
 
     let mut forged_live_negative_expected_error = base.clone();
     forged_live_negative_expected_error["live_negative_cases"][0]["expected_error_contains"] =
         json!("forged expected error");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-live-negative-expected-error",
-        category: "live-negative-binding",
-        report: forged_live_negative_expected_error,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-live-negative-expected-error", "live-negative-binding", forged_live_negative_expected_error);
 
     let mut forged_live_negative_target_kind = base.clone();
     if let Some(case) = forged_live_negative_target_kind
@@ -65021,11 +64415,7 @@ fn bytes_file_read_report_negative_cases(
     {
         case["target_kind"] = json!("file");
     }
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-live-negative-target-kind",
-        category: "live-negative-binding",
-        report: forged_live_negative_target_kind,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-live-negative-target-kind", "live-negative-binding", forged_live_negative_target_kind);
 
     let mut missing_fabricated_plan_negative_evidence = base.clone();
     if let Some(object) = missing_fabricated_plan_negative_evidence.as_object_mut() {
@@ -65043,49 +64433,29 @@ fn bytes_file_read_report_negative_cases(
                 .is_some_and(|id| id.starts_with("fabricated-plan-negative-"))
         });
     }
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "missing-fabricated-plan-negative-evidence",
-        category: "fabricated-plan-negative-evidence",
-        report: missing_fabricated_plan_negative_evidence,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "missing-fabricated-plan-negative-evidence", "fabricated-plan-negative-evidence", missing_fabricated_plan_negative_evidence);
 
     let mut forged_fabricated_plan_negative_hash = base.clone();
     forged_fabricated_plan_negative_hash["fabricated_plan_negative_cases"][0]["mutated_plan_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-fabricated-plan-negative-hash",
-        category: "fabricated-plan-negative-binding",
-        report: forged_fabricated_plan_negative_hash,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-fabricated-plan-negative-hash", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_hash);
 
     let mut forged_fabricated_plan_negative_check = base.clone();
     forged_fabricated_plan_negative_check["fabricated_plan_negative_cases"][0]["expected_failed_check_ids"] =
         json!(["capability-summary-derived-counts"]);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-fabricated-plan-negative-check",
-        category: "fabricated-plan-negative-binding",
-        report: forged_fabricated_plan_negative_check,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-fabricated-plan-negative-check", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_check);
 
     let mut forged_fabricated_plan_runtime_executed = base.clone();
     forged_fabricated_plan_runtime_executed["fabricated_plan_negative_cases"][0]["runtime_executed"] =
         json!(true);
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "forged-fabricated-plan-runtime-executed",
-        category: "fabricated-plan-negative-boundary",
-        report: forged_fabricated_plan_runtime_executed,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "forged-fabricated-plan-runtime-executed", "fabricated-plan-negative-boundary", forged_fabricated_plan_runtime_executed);
 
     let mut fabricated_plan_extra_runtime_claim = base.clone();
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["selected_step_ids"] =
         json!(["load"]);
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["plan_executor"] =
         json!({"executor": "fake-runtime-claim"});
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "fabricated-plan-extra-runtime-claim",
-        category: "fabricated-plan-negative-boundary",
-        report: fabricated_plan_extra_runtime_claim,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "fabricated-plan-extra-runtime-claim", "fabricated-plan-negative-boundary", fabricated_plan_extra_runtime_claim);
 
     let mut fabricated_plan_duplicate_case = base.clone();
     if let Some(cases_array) = fabricated_plan_duplicate_case
@@ -65099,11 +64469,7 @@ fn bytes_file_read_report_negative_cases(
         }
         fabricated_plan_duplicate_case["fabricated_plan_negative_cases"] = json!(duplicated);
     }
-    cases.push(BytesFileReadReportNegativeCase {
-        id: "fabricated-plan-duplicate-case",
-        category: "fabricated-plan-negative-binding",
-        report: fabricated_plan_duplicate_case,
-    });
+    push_bytes_file_read_report_negative_case!(cases, "fabricated-plan-duplicate-case", "fabricated-plan-negative-binding", fabricated_plan_duplicate_case);
 
     cases
 }
@@ -65131,6 +64497,20 @@ struct BytesFileReadFabricatedPlanCase {
     id: &'static str,
     category: &'static str,
     mutation: BytesFileReadFabricatedPlanMutation,
+}
+
+macro_rules! bytes_file_read_fabricated_plan_cases {
+    ($(($id:literal, $category:literal, $mutation:ident)),+ $(,)?) => {
+        vec![
+            $(
+                BytesFileReadFabricatedPlanCase {
+                    id: $id,
+                    category: $category,
+                    mutation: $mutation,
+                },
+            )+
+        ]
+    };
 }
 
 struct BytesFileReadFabricatedPlanResult {
@@ -65174,82 +64554,22 @@ impl BytesFileReadFabricatedPlanResult {
 
 fn bytes_file_read_fabricated_plan_negative_cases() -> Vec<BytesFileReadFabricatedPlanCase> {
     use BytesFileReadFabricatedPlanMutation::*;
-    vec![
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-missing-path-operand",
-            category: "operand-shape",
-            mutation: MissingPathOperand,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-extra-path-operand",
-            category: "operand-shape",
-            mutation: ExtraPathOperand,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-row-field-path-op-not-indexed",
-            category: "indexed-row-field-path",
-            mutation: RowFieldPathOpNotIndexed,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-row-field-path-input-missing",
-            category: "indexed-row-field-path",
-            mutation: RowFieldPathInputMissing,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-row-field-path-foreign-list",
-            category: "indexed-row-field-path",
-            mutation: RowFieldPathForeignList,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-missing-path-constant",
-            category: "constant-binding",
-            mutation: MissingPathConstant,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-non-text-path-constant",
-            category: "constant-binding",
-            mutation: NonTextPathConstant,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-non-static-parent-path",
-            category: "path-policy",
-            mutation: NonStaticParentPath,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-missing-source-input",
-            category: "operand-shape",
-            mutation: MissingSourceInput,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-extra-source-input",
-            category: "operand-shape",
-            mutation: ExtraSourceInput,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-state-input-declared",
-            category: "operand-shape",
-            mutation: StateInputDeclared,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-source-payload-input-declared",
-            category: "operand-shape",
-            mutation: SourcePayloadInputDeclared,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-update-constant-present",
-            category: "operand-shape",
-            mutation: UpdateConstantPresent,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-source-payload-field-present",
-            category: "operand-shape",
-            mutation: SourcePayloadFieldPresent,
-        },
-        BytesFileReadFabricatedPlanCase {
-            id: "fabricated-output-not-bytes",
-            category: "type-policy",
-            mutation: OutputNotBytes,
-        },
+    bytes_file_read_fabricated_plan_cases![
+        ("fabricated-missing-path-operand", "operand-shape", MissingPathOperand),
+        ("fabricated-extra-path-operand", "operand-shape", ExtraPathOperand),
+        ("fabricated-row-field-path-op-not-indexed", "indexed-row-field-path", RowFieldPathOpNotIndexed),
+        ("fabricated-row-field-path-input-missing", "indexed-row-field-path", RowFieldPathInputMissing),
+        ("fabricated-row-field-path-foreign-list", "indexed-row-field-path", RowFieldPathForeignList),
+        ("fabricated-missing-path-constant", "constant-binding", MissingPathConstant),
+        ("fabricated-non-text-path-constant", "constant-binding", NonTextPathConstant),
+        ("fabricated-non-static-parent-path", "path-policy", NonStaticParentPath),
+        ("fabricated-missing-source-input", "operand-shape", MissingSourceInput),
+        ("fabricated-extra-source-input", "operand-shape", ExtraSourceInput),
+        ("fabricated-state-input-declared", "operand-shape", StateInputDeclared),
+        ("fabricated-source-payload-input-declared", "operand-shape", SourcePayloadInputDeclared),
+        ("fabricated-update-constant-present", "operand-shape", UpdateConstantPresent),
+        ("fabricated-source-payload-field-present", "operand-shape", SourcePayloadFieldPresent),
+        ("fabricated-output-not-bytes", "type-policy", OutputNotBytes),
     ]
 }
 
@@ -65636,21 +64956,7 @@ fn bytes_file_read_live_negative_cases() -> Vec<BytesFileReadLiveNegativeCase> {
             id: "runtime-dynamic-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    load: SOURCE
-    path:
-        TEXT { ../small.bin } |> HOLD path { LATEST {} }
-    file_bytes:
-        BYTES {} |> HOLD file_bytes {
-            LATEST {
-                store.load |> THEN { store.path |> File/read_bytes() }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { File bytes }))
-"#,
+            source: bytes_file_read_dynamic_path_negative_source("TEXT { ../small.bin }"),
             expected_error_contains: "may not contain parent-directory segments",
             target_path: None,
             target_kind: None,
@@ -65659,32 +64965,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { File bytes
             id: "runtime-indexed-row-field-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, path_state: TEXT { ../small.bin }, file_bytes: BYTES[4] {}]
-            [name: TEXT { beta }, path_state: TEXT { ../small.bin }, file_bytes: BYTES[4] {}]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        load: SOURCE
-        name: row.name
-        path_state: row.path_state
-        file_bytes:
-            row.file_bytes |> HOLD file_bytes {
-                LATEST {
-                    load |> THEN { path_state |> File/read_bytes() }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes negative }))
-"#,
+            source: bytes_file_read_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, path_state: TEXT { ../small.bin }, file_bytes: BYTES[4] {}]\n            [name: TEXT { beta }, path_state: TEXT { ../small.bin }, file_bytes: BYTES[4] {}]",
+                "path_state: row.path_state",
+                "path_state |> File/read_bytes()",
+                "Indexed file read bytes negative",
+            ),
             expected_error_contains: "may not contain parent-directory segments",
             target_path: None,
             target_kind: None,
@@ -65693,32 +64979,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "runtime-indexed-row-field-missing-file",
             category: "runtime-path-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, path_state: TEXT { missing.bin }, file_bytes: BYTES[4] {}]
-            [name: TEXT { beta }, path_state: TEXT { missing.bin }, file_bytes: BYTES[4] {}]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        load: SOURCE
-        name: row.name
-        path_state: row.path_state
-        file_bytes:
-            row.file_bytes |> HOLD file_bytes {
-                LATEST {
-                    load |> THEN { path_state |> File/read_bytes() }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes missing file negative }))
-"#,
+            source: bytes_file_read_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, path_state: TEXT { missing.bin }, file_bytes: BYTES[4] {}]\n            [name: TEXT { beta }, path_state: TEXT { missing.bin }, file_bytes: BYTES[4] {}]",
+                "path_state: row.path_state",
+                "path_state |> File/read_bytes()",
+                "Indexed file read bytes missing file negative",
+            ),
             expected_error_contains: "cannot read `missing.bin`",
             target_path: Some("missing.bin"),
             target_kind: Some("missing"),
@@ -65727,32 +64993,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "runtime-indexed-row-field-fixed-output-length-mismatch",
             category: "runtime-type-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, path_state: TEXT { too-long.bin }, file_bytes: BYTES[1] {}]
-            [name: TEXT { beta }, path_state: TEXT { too-long.bin }, file_bytes: BYTES[1] {}]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        load: SOURCE
-        name: row.name
-        path_state: row.path_state
-        file_bytes:
-            row.file_bytes |> HOLD file_bytes {
-                LATEST {
-                    load |> THEN { path_state |> File/read_bytes() }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes fixed mismatch negative }))
-"#,
+            source: bytes_file_read_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, path_state: TEXT { too-long.bin }, file_bytes: BYTES[1] {}]\n            [name: TEXT { beta }, path_state: TEXT { too-long.bin }, file_bytes: BYTES[1] {}]",
+                "path_state: row.path_state",
+                "path_state |> File/read_bytes()",
+                "Indexed file read bytes fixed mismatch negative",
+            ),
             expected_error_contains: "fixed length 1 does not match produced length 4",
             target_path: Some("too-long.bin"),
             target_kind: Some("file"),
@@ -65761,32 +65007,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "typecheck-indexed-row-field-non-text-path",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, path_state: 7, file_bytes: BYTES[4] {}]
-            [name: TEXT { beta }, path_state: 7, file_bytes: BYTES[4] {}]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        load: SOURCE
-        name: row.name
-        path_state: row.path_state
-        file_bytes:
-            row.file_bytes |> HOLD file_bytes {
-                LATEST {
-                    load |> THEN { path_state |> File/read_bytes() }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes non-text path negative }))
-"#,
+            source: bytes_file_read_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, path_state: 7, file_bytes: BYTES[4] {}]\n            [name: TEXT { beta }, path_state: 7, file_bytes: BYTES[4] {}]",
+                "path_state: row.path_state",
+                "path_state |> File/read_bytes()",
+                "Indexed file read bytes non-text path negative",
+            ),
             expected_error_contains: "File/read_bytes",
             target_path: None,
             target_kind: None,
@@ -65795,32 +65021,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "runtime-indexed-row-field-missing-target-row",
             category: "indexed-row-dispatch-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
-            [name: TEXT { beta }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        load: SOURCE
-        name: row.name
-        path_state: row.path_state
-        file_bytes:
-            row.file_bytes |> HOLD file_bytes {
-                LATEST {
-                    load |> THEN { path_state |> File/read_bytes() }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes missing target row negative }))
-"#,
+            source: bytes_file_read_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]\n            [name: TEXT { beta }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]",
+                "path_state: row.path_state",
+                "path_state |> File/read_bytes()",
+                "Indexed file read bytes missing target row negative",
+            ),
             expected_error_contains: "target key/generation 999/1 not found",
             target_path: None,
             target_kind: None,
@@ -65829,31 +65035,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "typecheck-indexed-row-field-unknown-path-field",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
-            [name: TEXT { beta }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        load: SOURCE
-        name: row.name
-        file_bytes:
-            row.file_bytes |> HOLD file_bytes {
-                LATEST {
-                    load |> THEN { row.missing_path |> File/read_bytes() }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes unknown path field negative }))
-"#,
+            source: bytes_file_read_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]\n            [name: TEXT { beta }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]",
+                "",
+                "row.missing_path |> File/read_bytes()",
+                "Indexed file read bytes unknown path field negative",
+            ),
             expected_error_contains: "missing_path",
             target_path: None,
             target_kind: None,
@@ -65862,31 +65049,12 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Indexed fi
             id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
             category: "indexed-row-shape-policy",
             stage: "plan-executor",
-            source: r#"
-store: [
-    rows:
-        LIST {
-            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]
-            [name: TEXT { beta }, file_bytes: BYTES[4] {}]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        load: SOURCE
-        name: row.name
-        file_bytes:
-            row.file_bytes |> HOLD file_bytes {
-                LATEST {
-                    load |> THEN { row.path_state |> File/read_bytes() }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Indexed file read bytes mixed row-shape negative }))
-"#,
+            source: bytes_file_read_indexed_row_field_negative_source(
+                "            [name: TEXT { alpha }, path_state: TEXT { small.bin }, file_bytes: BYTES[4] {}]\n            [name: TEXT { beta }, file_bytes: BYTES[4] {}]",
+                "",
+                "row.path_state |> File/read_bytes()",
+                "Indexed file read bytes mixed row-shape negative",
+            ),
             expected_error_contains: "is not in the static schedule symbol table",
             target_path: None,
             target_kind: None,
@@ -65973,6 +65141,71 @@ store: [
 ]
 
 document: Document/new(root: Element/label(element: [], label: TEXT {{ File bytes }}))
+"#
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn bytes_file_read_dynamic_path_negative_source(path_initial: &'static str) -> &'static str {
+    Box::leak(
+        format!(
+            r#"
+store: [
+    load: SOURCE
+    path:
+        {path_initial} |> HOLD path {{ LATEST {{}} }}
+    file_bytes:
+        BYTES {{}} |> HOLD file_bytes {{
+            LATEST {{
+                store.load |> THEN {{ store.path |> File/read_bytes() }}
+            }}
+        }}
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ File bytes }}))
+"#
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn bytes_file_read_indexed_row_field_negative_source(
+    rows: &'static str,
+    path_binding: &'static str,
+    read_expr: &'static str,
+    label: &'static str,
+) -> &'static str {
+    let path_binding = if path_binding.is_empty() {
+        String::new()
+    } else {
+        format!("        {path_binding}\n")
+    };
+    Box::leak(
+        format!(
+            r#"
+store: [
+    rows:
+        LIST {{
+{rows}
+        }}
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {{
+    [
+        load: SOURCE
+        name: row.name
+{path_binding}        file_bytes:
+            row.file_bytes |> HOLD file_bytes {{
+                LATEST {{
+                    load |> THEN {{ {read_expr} }}
+                }}
+            }}
+    ]
+}}
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ {label} }}))
 "#
         )
         .into_boxed_str(),
@@ -66132,52 +65365,7 @@ fn verify_bytes_type_system(args: &[String]) -> Result<(), Box<dyn std::error::E
     let fixture_dir = PathBuf::from("target/generated/bytes-type-system-fixtures");
     fs::create_dir_all(&fixture_dir)?;
     let source_path = fixture_dir.join("bytes-type-system.bn");
-    let source = r#"
-SOURCE
-HOLD
-LATEST
-LIST {}
-hex_input: TEXT { 01020304 } |> HOLD hex_input { LATEST {} }
-base64_input: TEXT { AQIDBA== } |> HOLD base64_input { LATEST {} }
-bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
-len: bytes |> Bytes/length
-empty: bytes |> Bytes/is_empty
-first: bytes |> Bytes/get(index: 0)
-sliced: bytes |> Bytes/slice(offset: 1, byte_count: 2)
-taken: bytes |> Bytes/take(byte_count: 2)
-dropped: bytes |> Bytes/drop(byte_count: 2)
-grown: bytes |> Bytes/concat(with: BYTES[1] { 16u00 })
-same: bytes |> Bytes/equal(with: BYTES[4] { 16u01, 16u02, 16u03, 16u04 })
-found: bytes |> Bytes/find(needle: BYTES[2] { 16u02, 16u03 })
-starts: bytes |> Bytes/starts_with(prefix: BYTES[2] { 16u01, 16u02 })
-ends: bytes |> Bytes/ends_with(suffix: BYTES[2] { 16u03, 16u04 })
-hex: bytes |> Bytes/to_hex
-base64: bytes |> Bytes/to_base64
-decoded: TEXT { 01020304 } |> Bytes/from_hex
-decoded64: TEXT { AQIDBA== } |> Bytes/from_base64
-encoded: TEXT { hi } |> Text/to_bytes(encoding: Utf8)
-encoded_ascii_fixed: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
-text: bytes |> Bytes/to_text(encoding: Utf8)
-read: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Little)
-read_signed: bytes |> Bytes/read_signed(offset: 0, byte_count: 4, endian: Big)
-written: bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Little, value: 1)
-written_signed: bytes |> Bytes/write_signed(offset: 0, byte_count: 4, endian: Big, value: -1)
-zeros: Bytes/zeros(byte_count: 4)
-file_bytes: TEXT { ./asset.svg } |> File/read_bytes()
-file_text: TEXT { ./asset.svg } |> File/read_text()
-file_write: bytes |> File/write_bytes(path: TEXT { output.bin })
-static_hex: TEXT { 01 02 03 04 } |> Bytes/from_hex
-static_base64: TEXT { AQIDBA== } |> Bytes/from_base64
-static_utf8: TEXT { č } |> Text/to_bytes(encoding: Utf8)
-static_ascii: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
-dynamic_hex: hex_input |> Bytes/from_hex
-dynamic_base64: base64_input |> Bytes/from_base64
-dynamic_utf8: hex_input |> Text/to_bytes(encoding: Utf8)
-folded_index: bytes |> Bytes/get(index: 1 + 1)
-folded_slice: bytes |> Bytes/slice(offset: 1 + 1, byte_count: 1 + 1)
-folded_numeric: bytes |> Bytes/read_unsigned(offset: 2 - 2, byte_count: 2 * 2, endian: Little)
-document: []
-"#;
+    let source = include_str!("../../../examples/bytes_type_system_fixture.bn");
     fs::write(&source_path, source)?;
     let parsed = boon_parser::parse_source(source_path.display().to_string(), source)?;
     let typecheck = boon_typecheck::check(&parsed);
@@ -67809,10 +66997,33 @@ struct BytesReportNegativeCase {
     report: serde_json::Value,
 }
 
+macro_rules! bytes_report_negative_case {
+    ($id:literal, $report:ident) => {
+        BytesReportNegativeCase {
+            id: $id,
+            report: $report,
+        }
+    };
+}
+
 struct BytesMachinePlanAggregateTamperCase {
     id: &'static str,
     child_path: &'static str,
     mutation: BytesMachinePlanAggregateMutation,
+}
+
+macro_rules! bytes_machine_plan_aggregate_tamper_cases {
+    ($(($id:literal, $child_path:literal, $mutation:ident)),+ $(,)?) => {
+        vec![
+            $(
+                BytesMachinePlanAggregateTamperCase {
+                    id: $id,
+                    child_path: $child_path,
+                    mutation: BytesMachinePlanAggregateMutation::$mutation,
+                },
+            )+
+        ]
+    };
 }
 
 #[derive(Clone, Copy)]
@@ -67832,70 +67043,19 @@ enum BytesMachinePlanAggregateMutation {
 }
 
 fn bytes_machine_plan_aggregate_tamper_cases() -> Vec<BytesMachinePlanAggregateTamperCase> {
-    vec![
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-missing-child-report-rejected",
-            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
-            mutation: BytesMachinePlanAggregateMutation::RemoveChild,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-stale-child-artifact-hash-rejected",
-            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
-            mutation: BytesMachinePlanAggregateMutation::StaleArtifactHash,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-edited-child-success-flag-rejected",
-            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
-            mutation: BytesMachinePlanAggregateMutation::EditedSuccessFlag,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-runtime-ast-fallback-rejected",
-            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
-            mutation: BytesMachinePlanAggregateMutation::RuntimeAstEval,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-executable-string-path-rejected",
-            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
-            mutation: BytesMachinePlanAggregateMutation::ExecutableStringPath,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-unknown-plan-op-rejected",
-            child_path: "target/reports/bytes-plan/bytes-file-read-plan.json",
-            mutation: BytesMachinePlanAggregateMutation::UnknownPlanOp,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-storage-profile-indexed-private-bytes-tamper-rejected",
-            child_path: "target/reports/bytes-plan/bytes-storage-profile.json",
-            mutation: BytesMachinePlanAggregateMutation::StorageProfileIndexedPrivateBytesTamper,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-storage-profile-large-dynamic-state-summary-tamper-rejected",
-            child_path: "target/reports/bytes-plan/bytes-storage-profile.json",
-            mutation:
-                BytesMachinePlanAggregateMutation::StorageProfileLargeDynamicStateSummaryTamper,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-storage-profile-large-dynamic-shared-storage-tamper-rejected",
-            child_path: "target/reports/bytes-plan/bytes-storage-profile.json",
-            mutation:
-                BytesMachinePlanAggregateMutation::StorageProfileLargeDynamicSharedStorageTamper,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-storage-profile-large-dynamic-byte-len-tamper-rejected",
-            child_path: "target/reports/bytes-plan/bytes-storage-profile.json",
-            mutation: BytesMachinePlanAggregateMutation::StorageProfileLargeDynamicByteLenTamper,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-storage-profile-large-dynamic-host-digest-tamper-rejected",
-            child_path: "target/reports/bytes-plan/bytes-storage-profile.json",
-            mutation: BytesMachinePlanAggregateMutation::StorageProfileLargeDynamicHostDigestTamper,
-        },
-        BytesMachinePlanAggregateTamperCase {
-            id: "aggregate-storage-profile-large-dynamic-bytes-access-len-tamper-rejected",
-            child_path: "target/reports/bytes-plan/bytes-storage-profile.json",
-            mutation:
-                BytesMachinePlanAggregateMutation::StorageProfileLargeDynamicBytesAccessLenTamper,
-        },
+    bytes_machine_plan_aggregate_tamper_cases![
+        ("aggregate-missing-child-report-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", RemoveChild),
+        ("aggregate-stale-child-artifact-hash-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", StaleArtifactHash),
+        ("aggregate-edited-child-success-flag-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", EditedSuccessFlag),
+        ("aggregate-runtime-ast-fallback-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", RuntimeAstEval),
+        ("aggregate-executable-string-path-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", ExecutableStringPath),
+        ("aggregate-unknown-plan-op-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", UnknownPlanOp),
+        ("aggregate-storage-profile-indexed-private-bytes-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileIndexedPrivateBytesTamper),
+        ("aggregate-storage-profile-large-dynamic-state-summary-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicStateSummaryTamper),
+        ("aggregate-storage-profile-large-dynamic-shared-storage-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicSharedStorageTamper),
+        ("aggregate-storage-profile-large-dynamic-byte-len-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicByteLenTamper),
+        ("aggregate-storage-profile-large-dynamic-host-digest-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicHostDigestTamper),
+        ("aggregate-storage-profile-large-dynamic-bytes-access-len-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicBytesAccessLenTamper),
     ]
 }
 
@@ -68137,22 +67297,10 @@ fn bytes_report_negative_cases(base: &serde_json::Value) -> Vec<BytesReportNegat
     forged_state_byte_len["state_summary"]["store.patched"]["byte_len"] = json!(5);
 
     vec![
-        BytesReportNegativeCase {
-            id: "forged-update-digest",
-            report: forged_update_digest,
-        },
-        BytesReportNegativeCase {
-            id: "public-inline-payload-leak",
-            report: inline_payload_leak,
-        },
-        BytesReportNegativeCase {
-            id: "forged-update-constant",
-            report: forged_update_constant,
-        },
-        BytesReportNegativeCase {
-            id: "forged-state-byte-len",
-            report: forged_state_byte_len,
-        },
+        bytes_report_negative_case!("forged-update-digest", forged_update_digest),
+        bytes_report_negative_case!("public-inline-payload-leak", inline_payload_leak),
+        bytes_report_negative_case!("forged-update-constant", forged_update_constant),
+        bytes_report_negative_case!("forged-state-byte-len", forged_state_byte_len),
     ]
 }
 
@@ -68200,38 +67348,14 @@ fn bytes_source_payload_report_negative_cases(
         json!("Text");
 
     vec![
-        BytesReportNegativeCase {
-            id: "source-payload-missing-bytes-artifact",
-            report: missing_payload_bytes,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-forged-digest",
-            report: forged_payload_digest,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-forged-byte-len",
-            report: forged_payload_len,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-missing-inline-bytes",
-            report: missing_inline_bytes,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-inline-byte-out-of-range",
-            report: out_of_range_inline_byte,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-forged-route-field",
-            report: forged_route_surface_payload_field,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-forged-executor-field",
-            report: forged_executor_payload_field,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-forged-update-field",
-            report: forged_update_payload_field,
-        },
+        bytes_report_negative_case!("source-payload-missing-bytes-artifact", missing_payload_bytes),
+        bytes_report_negative_case!("source-payload-forged-digest", forged_payload_digest),
+        bytes_report_negative_case!("source-payload-forged-byte-len", forged_payload_len),
+        bytes_report_negative_case!("source-payload-missing-inline-bytes", missing_inline_bytes),
+        bytes_report_negative_case!("source-payload-inline-byte-out-of-range", out_of_range_inline_byte),
+        bytes_report_negative_case!("source-payload-forged-route-field", forged_route_surface_payload_field),
+        bytes_report_negative_case!("source-payload-forged-executor-field", forged_executor_payload_field),
+        bytes_report_negative_case!("source-payload-forged-update-field", forged_update_payload_field),
     ]
 }
 
@@ -68260,23 +67384,62 @@ fn bytes_large_source_payload_report_negative_cases(
     artifact_inline_leak["source_event"]["payload_bytes"]["bytes"]["inline_bytes"] = json!([1]);
 
     vec![
-        BytesReportNegativeCase {
-            id: "source-payload-large-missing-artifact-listing",
-            report: missing_artifact_listing,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-large-forged-artifact-sha256",
-            report: forged_artifact_sha256,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-large-inline-over-limit",
-            report: inline_over_limit,
-        },
-        BytesReportNegativeCase {
-            id: "source-payload-large-artifact-inline-leak",
-            report: artifact_inline_leak,
-        },
+        bytes_report_negative_case!("source-payload-large-missing-artifact-listing", missing_artifact_listing),
+        bytes_report_negative_case!("source-payload-large-forged-artifact-sha256", forged_artifact_sha256),
+        bytes_report_negative_case!("source-payload-large-inline-over-limit", inline_over_limit),
+        bytes_report_negative_case!("source-payload-large-artifact-inline-leak", artifact_inline_leak),
     ]
+}
+
+fn bytes_negative_hold_source(
+    payload_name: &'static str,
+    payload_initial: &'static str,
+    target_name: &'static str,
+    target_initial: &'static str,
+    update_expr: &'static str,
+) -> &'static str {
+    Box::leak(
+        format!(
+            r#"
+{payload_name}:
+    {payload_initial} |> HOLD {payload_name} {{ LATEST {{}} }}
+
+store: [
+    trigger: SOURCE
+    {target_name}:
+        {target_initial} |> HOLD {target_name} {{
+            LATEST {{
+                store.trigger |> THEN {{ {update_expr} }}
+            }}
+        }}
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ Bytes }}))
+"#
+        )
+        .into_boxed_str(),
+    )
+}
+
+fn bytes_source_payload_route_negative_source(target_initial: &'static str) -> &'static str {
+    Box::leak(
+        format!(
+            r#"
+store: [
+    receive: SOURCE
+    received:
+        {target_initial} |> HOLD received {{
+            LATEST {{
+                store.receive.bytes |> THEN {{ store.receive.bytes }}
+            }}
+        }}
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT {{ Bytes source payload }}))
+"#
+        )
+        .into_boxed_str(),
+    )
 }
 
 fn bytes_negative_plan_cases() -> Vec<BytesNegativePlanCase> {
@@ -68284,122 +67447,68 @@ fn bytes_negative_plan_cases() -> Vec<BytesNegativePlanCase> {
         BytesNegativePlanCase {
             id: "plan-static-out-of-bounds-slice",
             expected_error: "`Bytes/slice` byte range 2..4 is out of bounds for fixed BYTES[3]",
-            source: r#"
-payload:
-    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD payload { LATEST {} }
-
-store: [
-    trigger: SOURCE
-    sliced:
-        BYTES[2] {} |> HOLD sliced {
-            LATEST {
-                store.trigger |> THEN { payload |> Bytes/slice(offset: 2, byte_count: 2) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
+            source: bytes_negative_hold_source(
+                "payload",
+                "BYTES[3] { 16u01, 16u02, 16u03 }",
+                "sliced",
+                "BYTES[2] {}",
+                "payload |> Bytes/slice(offset: 2, byte_count: 2)",
+            ),
         },
         BytesNegativePlanCase {
             id: "plan-bytes-get-out-of-bounds",
             expected_error: "index 4 is out of bounds",
-            source: r#"
-payload:
-    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD payload { LATEST {} }
-
-store: [
-    trigger: SOURCE
-    byte:
-        16u00 |> HOLD byte {
-            LATEST {
-                store.trigger |> THEN { payload |> Bytes/get(index: 4) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
+            source: bytes_negative_hold_source(
+                "payload",
+                "BYTES[3] { 16u01, 16u02, 16u03 }",
+                "byte",
+                "16u00",
+                "payload |> Bytes/get(index: 4)",
+            ),
         },
         BytesNegativePlanCase {
             id: "plan-bytes-set-out-of-bounds",
             expected_error: "`Bytes/set` index 4 is out of bounds for fixed BYTES[3]",
-            source: r#"
-payload:
-    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD payload { LATEST {} }
-
-store: [
-    trigger: SOURCE
-    patched:
-        BYTES[3] {} |> HOLD patched {
-            LATEST {
-                store.trigger |> THEN { payload |> Bytes/set(index: 4, value: 16uAA) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
+            source: bytes_negative_hold_source(
+                "payload",
+                "BYTES[3] { 16u01, 16u02, 16u03 }",
+                "patched",
+                "BYTES[3] {}",
+                "payload |> Bytes/set(index: 4, value: 16uAA)",
+            ),
         },
         BytesNegativePlanCase {
             id: "plan-invalid-utf8-bytes-to-text",
             expected_error: "not valid UTF-8",
-            source: r#"
-bad_payload:
-    BYTES[2] { 16uC3, 16u28 } |> HOLD bad_payload { LATEST {} }
-
-store: [
-    trigger: SOURCE
-    decoded:
-        TEXT { old } |> HOLD decoded {
-            LATEST {
-                store.trigger |> THEN { bad_payload |> Bytes/to_text(encoding: Utf8) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
+            source: bytes_negative_hold_source(
+                "bad_payload",
+                "BYTES[2] { 16uC3, 16u28 }",
+                "decoded",
+                "TEXT { old }",
+                "bad_payload |> Bytes/to_text(encoding: Utf8)",
+            ),
         },
         BytesNegativePlanCase {
             id: "plan-write-unsigned-overflow",
             expected_error: "MachinePlan verification failed",
-            source: r#"
-payload:
-    BYTES[1] { 16u00 } |> HOLD payload { LATEST {} }
-
-store: [
-    trigger: SOURCE
-    patched:
-        BYTES[1] {} |> HOLD patched {
-            LATEST {
-                store.trigger |> THEN { payload |> Bytes/write_unsigned(offset: 0, byte_count: 1, endian: Little, value: 256) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
+            source: bytes_negative_hold_source(
+                "payload",
+                "BYTES[1] { 16u00 }",
+                "patched",
+                "BYTES[1] {}",
+                "payload |> Bytes/write_unsigned(offset: 0, byte_count: 1, endian: Little, value: 256)",
+            ),
         },
         BytesNegativePlanCase {
             id: "plan-read-unsigned-number-overflow",
             expected_error: "overflows Boon NUMBER",
-            source: r#"
-payload:
-    BYTES[8] { 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF } |> HOLD payload { LATEST {} }
-
-store: [
-    trigger: SOURCE
-    read:
-        0 |> HOLD read {
-            LATEST {
-                store.trigger |> THEN { payload |> Bytes/read_unsigned(offset: 0, byte_count: 8, endian: Big) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
+            source: bytes_negative_hold_source(
+                "payload",
+                "BYTES[8] { 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF, 16uFF }",
+                "read",
+                "0",
+                "payload |> Bytes/read_unsigned(offset: 0, byte_count: 8, endian: Big)",
+            ),
         },
         BytesNegativePlanCase {
             id: "plan-bytes-source-payload-guard-rejected",
@@ -68461,19 +67570,7 @@ fn bytes_negative_source_payload_route_cases() -> Vec<BytesNegativeSourcePayload
             target_state: "store.received",
             payload_bytes: Some(&[1, 254, 4]),
             expected_error: "`HOLD` update must match the held value type",
-            source: r#"
-store: [
-    receive: SOURCE
-    received:
-        TEXT { old } |> HOLD received {
-            LATEST {
-                store.receive.bytes |> THEN { store.receive.bytes }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes source payload }))
-"#,
+            source: bytes_source_payload_route_negative_source("TEXT { old }"),
         },
         BytesNegativeSourcePayloadRouteCase {
             id: "source-payload-fixed-length-mismatch",
@@ -68481,19 +67578,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Bytes sour
             target_state: "store.received",
             payload_bytes: Some(&[1, 254, 4]),
             expected_error: "BYTES payload has byte_len 3 but output fixed_len 2",
-            source: r#"
-store: [
-    receive: SOURCE
-    received:
-        BYTES[2] {} |> HOLD received {
-            LATEST {
-                store.receive.bytes |> THEN { store.receive.bytes }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes source payload }))
-"#,
+            source: bytes_source_payload_route_negative_source("BYTES[2] {}"),
         },
         BytesNegativeSourcePayloadRouteCase {
             id: "source-payload-missing-bytes-payload",
@@ -68501,19 +67586,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Bytes sour
             target_state: "store.received",
             payload_bytes: None,
             expected_error: "source event is missing `bytes` BYTES payload",
-            source: r#"
-store: [
-    receive: SOURCE
-    received:
-        BYTES {} |> HOLD received {
-            LATEST {
-                store.receive.bytes |> THEN { store.receive.bytes }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes source payload }))
-"#,
+            source: bytes_source_payload_route_negative_source("BYTES {}"),
         },
     ]
 }

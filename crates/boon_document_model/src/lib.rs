@@ -3,14 +3,16 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct DocumentNodeId(pub String);
+macro_rules! string_ids {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+            pub struct $name(pub String);
+        )+
+    };
+}
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct SourceBindingId(pub String);
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct ScrollRootId(pub String);
+string_ids!(DocumentNodeId, SourceBindingId, ScrollRootId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rect {

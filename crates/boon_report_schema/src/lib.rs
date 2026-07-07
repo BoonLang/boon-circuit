@@ -11,6 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub type ReportSchemaResult<T> = Result<T, Box<dyn std::error::Error>>;
 type RuntimeResult<T> = ReportSchemaResult<T>;
 const SOURCE_EVENT_INLINE_BYTES_LIMIT: usize = 1024;
+const PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS: &[&str] = &[
+    "runtime_ast_eval_count",
+    "executable_string_path_count",
+    "unknown_plan_op_count",
+    "graph_rebuild_count",
+    "graph_clones_per_item",
+];
 
 static REPORT_BINARY_HASH_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
 
@@ -101,6 +108,30 @@ fn toml_u64_ref(table: &BTreeMap<String, toml::Value>, key: &str) -> Option<u64>
         .get(key)
         .and_then(toml::Value::as_integer)
         .and_then(|value| u64::try_from(value).ok())
+}
+
+fn verify_zero_u64_fields(
+    object: &serde_json::Map<String, JsonValue>,
+    keys: &[&str],
+    report_path: &Path,
+    context: &str,
+) -> RuntimeResult<()> {
+    for key in keys {
+        if object.get(*key).and_then(JsonValue::as_u64) != Some(0) {
+            return Err(format!("{} {context}.{key} must be zero", report_path.display()).into());
+        }
+    }
+    Ok(())
+}
+
+fn with_plan_executor_no_fallback_counters(mut report: JsonValue) -> JsonValue {
+    let object = report
+        .as_object_mut()
+        .expect("PlanExecutor no-fallback counters attach only to JSON objects");
+    for key in PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS {
+        object.insert((*key).to_owned(), json!(0));
+    }
+    report
 }
 
 pub fn enrich_runtime_execution_surface(report: &mut JsonValue, layer: &str) {
@@ -3932,21 +3963,12 @@ fn verify_run_plan_report(report: &JsonValue, report_path: &Path) -> RuntimeResu
         )
         .into());
     }
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} run-plan plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "run-plan plan_executor",
+    )?;
     if executor
         .get("initialized_state_count")
         .and_then(JsonValue::as_u64)
@@ -4138,22 +4160,19 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
         report_path,
     )?;
 
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-        "selected_op_unresolved_executable_ref_count",
-    ] {
-        if route_surface.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} run-plan-route route_surface.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        route_surface,
+        &[
+            "runtime_ast_eval_count",
+            "executable_string_path_count",
+            "unknown_plan_op_count",
+            "graph_rebuild_count",
+            "graph_clones_per_item",
+            "selected_op_unresolved_executable_ref_count",
+        ],
+        report_path,
+        "run-plan-route route_surface",
+    )?;
     if route_surface
         .get("selected_op_indexed")
         .and_then(JsonValue::as_bool)
@@ -4287,21 +4306,12 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
         )
         .into());
     }
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} run-plan-route plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "run-plan-route plan_executor",
+    )?;
     let actual_per_step = normalized_plan_executor_per_step_for_semantic_compare(
         executor.get("per_step").unwrap_or(&JsonValue::Null),
     );
@@ -4579,21 +4589,12 @@ fn verify_run_plan_root_scalar_scenario_report(
         )
         .into());
     }
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} run-plan-root-scalar-scenario plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "run-plan-root-scalar-scenario plan_executor",
+    )?;
     if executor
         .get("selected_step_count")
         .and_then(JsonValue::as_u64)
@@ -4985,21 +4986,12 @@ fn verify_run_plan_scenario_events_report(
         )
         .into());
     }
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} run-plan-scenario-events plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "run-plan-scenario-events plan_executor",
+    )?;
     if executor
         .get("selected_step_count")
         .and_then(JsonValue::as_u64)
@@ -10715,21 +10707,12 @@ fn verify_bytes_file_write_plan_report_inner(
         )
         .into());
     }
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} verify-bytes-file-write-plan plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "verify-bytes-file-write-plan plan_executor",
+    )?;
     if executor
         .get("selected_step_count")
         .and_then(JsonValue::as_u64)
@@ -11373,21 +11356,12 @@ fn verify_dynamic_path_file_write_summary(
                 report_path.display()
             )
         })?;
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} dynamic-path File/write_bytes plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "dynamic-path File/write_bytes plan_executor",
+    )?;
     let update = summary
         .get("plan_executor")
         .unwrap_or(&JsonValue::Null)
@@ -13307,21 +13281,12 @@ fn verify_bytes_file_read_plan_report(report: &JsonValue, report_path: &Path) ->
         )
         .into());
     }
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} verify-bytes-file-read-plan plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "verify-bytes-file-read-plan plan_executor",
+    )?;
     if executor
         .get("selected_step_count")
         .and_then(JsonValue::as_u64)
@@ -13628,21 +13593,12 @@ fn verify_dynamic_path_file_read_summary(
                 report_path.display()
             )
         })?;
-    for key in [
-        "runtime_ast_eval_count",
-        "executable_string_path_count",
-        "unknown_plan_op_count",
-        "graph_rebuild_count",
-        "graph_clones_per_item",
-    ] {
-        if executor.get(key).and_then(JsonValue::as_u64) != Some(0) {
-            return Err(format!(
-                "{} dynamic-path File/read_bytes plan_executor.{key} must be zero",
-                report_path.display()
-            )
-            .into());
-        }
-    }
+    verify_zero_u64_fields(
+        executor,
+        PLAN_EXECUTOR_NO_FALLBACK_COUNTER_KEYS,
+        report_path,
+        "dynamic-path File/read_bytes plan_executor",
+    )?;
     let update = summary
         .get("plan_executor")
         .unwrap_or(&JsonValue::Null)
@@ -17553,19 +17509,14 @@ fn expected_indexed_bytes_read_executor_report(
     output_state_id: boon_plan::StateId,
     expression_kind: &str,
 ) -> JsonValue {
-    json!({
+    with_plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-bytes-read-evaluator-v1",
         "update_op_id": op.id.0,
         "target_state_id": output_state_id.0,
         "supported": true,
         "unsupported_reason": null,
         "expression_kind": expression_kind,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    })
+    }))
 }
 
 fn expected_indexed_bytes_write_executor_report(
@@ -17573,7 +17524,7 @@ fn expected_indexed_bytes_write_executor_report(
     output_state_id: boon_plan::StateId,
     expression_kind: &str,
 ) -> JsonValue {
-    json!({
+    with_plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-bytes-write-evaluator-v1",
         "update_op_id": op.id.0,
         "target_state_id": output_state_id.0,
@@ -17581,12 +17532,7 @@ fn expected_indexed_bytes_write_executor_report(
         "unsupported_reason": null,
         "expression_kind": expression_kind,
         "bytes_commit": true,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    })
+    }))
 }
 
 fn expected_indexed_file_read_path(
@@ -33301,7 +33247,7 @@ mod tests {
         let expected_value = expected.expected_value.clone();
         let state_summary = json!({ target_state: expected_value.clone() });
         let signatures = expected.semantic_delta_signatures.clone();
-        let route_surface = json!({
+        let route_surface = with_plan_executor_no_fallback_counters(json!({
             "source": source_route,
             "source_id": expected.source_id,
             "target_state": target_state,
@@ -33316,28 +33262,18 @@ mod tests {
             "global_typed_lowering_executable": plan.capability_summary.typed_lowering_executable,
             "global_cpu_plan_executor_complete": plan.capability_summary.cpu_plan_executor_complete,
             "global_unresolved_executable_ref_count": plan.capability_summary.unresolved_executable_ref_count,
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0,
             "selected_op_unresolved_executable_ref_count": 0,
             "selected_op_indexed": false
-        });
+        }));
         let semantic_deltas = expected.semantic_deltas.clone();
-        let command_report_assembly_core = json!({
+        let command_report_assembly_core = with_plan_executor_no_fallback_counters(json!({
             "executor": "cpu-plan-source-route-command-report-assembly-v1",
             "plan_executor_status": "pass",
             "status": "pass",
             "report_status_basis": "plan-executor-product",
             "exit_status": 0,
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0
-        });
-        let plan_executor = json!({
+        }));
+        let plan_executor = with_plan_executor_no_fallback_counters(json!({
             "executor": "cpu-plan-source-route-v1",
             "source": source_route,
             "source_id": expected.source_id,
@@ -33355,17 +33291,12 @@ mod tests {
             "executed_indexed_update_count": expected.executed_indexed_update_count,
             "emitted_source_bind_count": expected.emitted_source_bind_count,
             "emitted_source_unbind_count": expected.emitted_source_unbind_count,
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0,
             "state_summary": state_summary,
             "full_state_summary": expected.full_state_summary,
             "semantic_delta_signatures": signatures,
             "semantic_deltas": semantic_deltas,
             "per_step": expected.per_step
-        });
+        }));
         json!({
             "status": "pass",
             "report_version": 1,
@@ -33432,19 +33363,14 @@ mod tests {
         )
         .unwrap();
         let expected_steps = expected.per_step.as_array().unwrap();
-        let command_report_assembly_core = json!({
+        let command_report_assembly_core = with_plan_executor_no_fallback_counters(json!({
             "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
             "plan_executor_status": "pass",
             "status": "pass",
             "report_status_basis": "plan-executor-product",
             "exit_status": 0,
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0
-        });
-        let plan_executor = json!({
+        }));
+        let plan_executor = with_plan_executor_no_fallback_counters(json!({
             "executor": "cpu-plan-root-list-scenario-v1",
             "selected_step_count": expected_steps.len(),
             "initialized_root_state_count": expected.initialized_root_state_count,
@@ -33459,18 +33385,13 @@ mod tests {
             "emitted_source_bind_count": expected.emitted_source_bind_count,
             "emitted_source_unbind_count": expected.emitted_source_unbind_count,
             "list_slot_count": plan.storage_layout.list_slots.len(),
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0,
             "state_summary": expected.state_summary,
             "list_summary": expected.list_summary,
             "list_view_summary": expected.list_view_summary,
             "list_retains": expected.list_retains,
             "semantic_delta_signatures": expected.semantic_delta_signatures,
             "per_step": expected.per_step
-        });
+        }));
         let mut report = base_report();
         report["measurement_mode"] = json!("proof");
         report["command"] = json!("run-plan-root-scalar-scenario");

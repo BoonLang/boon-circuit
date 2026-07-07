@@ -34,197 +34,42 @@ pub struct TypedProgram {
     pub static_schedule_verified: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ExprId(pub usize);
+macro_rules! typed_usize_ids {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+            #[serde(transparent)]
+            pub struct $name(pub usize);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct NodeId(pub usize);
+            impl $name {
+                pub fn as_usize(self) -> usize {
+                    self.0
+                }
+            }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ScopeId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SourceId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct StateId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ListId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct FieldId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ViewBindingId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SourceUnitId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct FunctionId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DiagnosticSpanId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SemanticSymbolId(pub usize);
-
-impl ExprId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
+            impl fmt::Display for $name {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    self.0.fmt(formatter)
+                }
+            }
+        )+
+    };
 }
 
-impl NodeId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl ScopeId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl SourceId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl StateId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl ListId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl FieldId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl ViewBindingId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl SourceUnitId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl FunctionId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl DiagnosticSpanId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl SemanticSymbolId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl fmt::Display for ExprId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for NodeId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for ScopeId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for SourceId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for StateId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for ListId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for FieldId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for ViewBindingId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for SourceUnitId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for FunctionId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for DiagnosticSpanId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl fmt::Display for SemanticSymbolId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
+typed_usize_ids!(
+    ExprId,
+    NodeId,
+    ScopeId,
+    SourceId,
+    StateId,
+    ListId,
+    FieldId,
+    ViewBindingId,
+    SourceUnitId,
+    FunctionId,
+    DiagnosticSpanId,
+    SemanticSymbolId,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticIndex {

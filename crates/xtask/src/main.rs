@@ -53284,16 +53284,53 @@ fn write_native_gate_report(
     let default_report = native_default_report_path(command, args);
     let report = report_arg(args).unwrap_or(default_report);
     let _ = std::fs::remove_file(&report);
-    let status = if blockers.is_empty() { "pass" } else { "fail" };
+    let mut object = gate_report_object(
+        args,
+        command,
+        json!(args),
+        json!(file_hash("budgets/native-gpu.toml")),
+        true,
+        checks,
+        &blockers,
+        extra,
+    );
+    sidecarize_native_gate_report(&report, command, &mut object)?;
+    write_json(&report, &serde_json::Value::Object(object))?;
+    verify_report_schema(&report)?;
+    if blockers.is_empty() {
+        println!("wrote {}", report.display());
+        Ok(())
+    } else {
+        Err(format!(
+            "native GPU gate `{command}` blocked; wrote {}",
+            report.display()
+        )
+        .into())
+    }
+}
+
+fn gate_report_object(
+    args: &[String],
+    command: &str,
+    command_argv: serde_json::Value,
+    budget_hash: serde_json::Value,
+    native_gpu_contract: bool,
+    checks: Vec<serde_json::Value>,
+    blockers: &[String],
+    extra: serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut object = serde_json::Map::new();
-    object.insert("status".to_owned(), json!(status));
+    object.insert(
+        "status".to_owned(),
+        json!(if blockers.is_empty() { "pass" } else { "fail" }),
+    );
     object.insert("report_version".to_owned(), json!(1));
     object.insert(
         "generated_at_utc".to_owned(),
         json!(current_unix_seconds().to_string()),
     );
     object.insert("command".to_owned(), json!(command));
-    object.insert("command_argv".to_owned(), json!(args));
+    object.insert("command_argv".to_owned(), command_argv);
     object.insert(
         "measurement_mode".to_owned(),
         json!(measurement_mode_for_command(command)),
@@ -53313,14 +53350,13 @@ fn write_native_gate_report(
     object.insert("source_hash".to_owned(), json!("n/a"));
     object.insert("scenario_hash".to_owned(), json!("n/a"));
     object.insert("program_hash".to_owned(), json!("n/a"));
-    object.insert(
-        "budget_hash".to_owned(),
-        json!(file_hash("budgets/native-gpu.toml")),
-    );
+    object.insert("budget_hash".to_owned(), budget_hash);
     object.insert("graph_node_count".to_owned(), json!(0));
     object.insert("per_step_pass_fail".to_owned(), json!(checks));
     object.insert("artifact_sha256s".to_owned(), json!([]));
-    object.insert("native_gpu_contract".to_owned(), json!(true));
+    if native_gpu_contract {
+        object.insert("native_gpu_contract".to_owned(), json!(true));
+    }
     if !blockers.is_empty() {
         object.insert("blockers".to_owned(), json!(blockers));
     }
@@ -53330,19 +53366,7 @@ fn write_native_gate_report(
         }
     }
     ensure_interaction_report_contract(&mut object, command, args);
-    sidecarize_native_gate_report(&report, command, &mut object)?;
-    write_json(&report, &serde_json::Value::Object(object))?;
-    verify_report_schema(&report)?;
-    if blockers.is_empty() {
-        println!("wrote {}", report.display());
-        Ok(())
-    } else {
-        Err(format!(
-            "native GPU gate `{command}` blocked; wrote {}",
-            report.display()
-        )
-        .into())
-    }
+    object
 }
 
 fn report_json_sidecar_pointers(command: &str) -> &'static [&'static str] {
@@ -53560,51 +53584,16 @@ fn write_static_gate_report(
     extra: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(&report);
-    let status = if blockers.is_empty() { "pass" } else { "fail" };
-    let mut object = serde_json::Map::new();
-    object.insert("status".to_owned(), json!(status));
-    object.insert("report_version".to_owned(), json!(1));
-    object.insert(
-        "generated_at_utc".to_owned(),
-        json!(current_unix_seconds().to_string()),
-    );
-    object.insert("command".to_owned(), json!(command));
-    object.insert(
-        "command_argv".to_owned(),
+    let mut object = gate_report_object(
+        args,
+        command,
         json!(replayable_xtask_argv(args)),
+        json!("n/a"),
+        false,
+        checks,
+        &blockers,
+        extra,
     );
-    object.insert(
-        "measurement_mode".to_owned(),
-        json!(measurement_mode_for_command(command)),
-    );
-    object.insert(
-        "exit_status".to_owned(),
-        json!(if blockers.is_empty() { 0 } else { 1 }),
-    );
-    object.insert("git_commit".to_owned(), json!(git_commit()));
-    insert_worktree_fingerprint_fields(
-        &mut object,
-        worktree_fingerprint_scope_for_command(command),
-    );
-    object.insert("binary_hash".to_owned(), json!(current_binary_hash()));
-    object.insert("binary_path".to_owned(), json!(current_binary_path()));
-    insert_verifier_identity(&mut object, command, args);
-    object.insert("source_hash".to_owned(), json!("n/a"));
-    object.insert("scenario_hash".to_owned(), json!("n/a"));
-    object.insert("program_hash".to_owned(), json!("n/a"));
-    object.insert("budget_hash".to_owned(), json!("n/a"));
-    object.insert("graph_node_count".to_owned(), json!(0));
-    object.insert("per_step_pass_fail".to_owned(), json!(checks));
-    object.insert("artifact_sha256s".to_owned(), json!([]));
-    if !blockers.is_empty() {
-        object.insert("blockers".to_owned(), json!(blockers));
-    }
-    if let Some(extra) = extra.as_object() {
-        for (key, value) in extra {
-            object.insert(key.clone(), value.clone());
-        }
-    }
-    ensure_interaction_report_contract(&mut object, command, args);
     if !report_json_sidecar_pointers(command).is_empty() {
         sidecarize_native_gate_report(&report, command, &mut object)?;
     }

@@ -3,14 +3,16 @@ use std::collections::BTreeMap;
 
 pub use boon_document_model::{DocumentNodeId, Rect, SourceBindingId};
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct SurfaceId(pub String);
+macro_rules! string_ids {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+            pub struct $name(pub String);
+        )+
+    };
+}
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct WindowId(pub String);
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct RoleId(pub String);
+string_ids!(SurfaceId, WindowId, RoleId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogicalSize {
@@ -103,8 +105,7 @@ pub struct HitResolution {
     pub source_intents: Vec<SourceIntent>,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct SemanticId(pub String);
+string_ids!(SemanticId);
 
 impl SemanticId {
     pub fn from_document_node_id(node: &DocumentNodeId) -> Self {

@@ -11144,55 +11144,14 @@ impl LiveRuntime {
     }
 
     pub fn apply_source_event(&mut self, event: LiveSourceEvent) -> RuntimeResult<LiveStepOutput> {
-        let event = self.accept_single_source_event_batch(event)?;
-        let apply_started = Instant::now();
-        let (output, state_summary) = {
-            let plan_session = self.plan_session_mut();
-            let step_report = plan_session.apply_source_event(event)?;
-            let output = plan_executor_step_report_to_live_turn_output(
-                &step_report,
-                runtime_elapsed_ms(apply_started),
-            )?;
-            let summary_started = Instant::now();
-            let state_summary = plan_session.state_summary();
-            (output, (state_summary, runtime_elapsed_ms(summary_started)))
-        };
-        self.next_step = self.next_step.saturating_add(1);
-        Ok(LiveStepOutput {
-            semantic_deltas: output.semantic_deltas,
-            render_patches: output.render_patches,
-            state_summary: state_summary.0,
-            apply_step_ms: output.apply_step_ms,
-            state_summary_ms: state_summary.1,
-        })
+        self.apply_source_event_with_summary_limits(event, None)
     }
 
     pub fn apply_source_event_for_document(
         &mut self,
         event: LiveSourceEvent,
     ) -> RuntimeResult<LiveStepOutput> {
-        let event = self.accept_single_source_event_batch(event)?;
-        let apply_started = Instant::now();
-        let (output, state_summary) = {
-            let plan_session = self.plan_session_mut();
-            let step_report = plan_session.apply_source_event(event)?;
-            let output = plan_executor_step_report_to_live_turn_output(
-                &step_report,
-                runtime_elapsed_ms(apply_started),
-            )?;
-            let summary_started = Instant::now();
-            let state_summary =
-                plan_session.document_state_summary(SummaryLimits::document_preview());
-            (output, (state_summary, runtime_elapsed_ms(summary_started)))
-        };
-        self.next_step = self.next_step.saturating_add(1);
-        Ok(LiveStepOutput {
-            semantic_deltas: output.semantic_deltas,
-            render_patches: output.render_patches,
-            state_summary: state_summary.0,
-            apply_step_ms: output.apply_step_ms,
-            state_summary_ms: state_summary.1,
-        })
+        self.apply_source_event_with_summary_limits(event, Some(SummaryLimits::document_preview()))
     }
 
     pub fn apply_source_event_for_document_window(
@@ -11203,6 +11162,22 @@ impl LiveRuntime {
         column_start: usize,
         column_count: usize,
     ) -> RuntimeResult<LiveStepOutput> {
+        self.apply_source_event_with_summary_limits(
+            event,
+            Some(SummaryLimits::document_preview_window(
+                row_start,
+                row_count,
+                column_start,
+                column_count,
+            )),
+        )
+    }
+
+    fn apply_source_event_with_summary_limits(
+        &mut self,
+        event: LiveSourceEvent,
+        summary_limits: Option<SummaryLimits>,
+    ) -> RuntimeResult<LiveStepOutput> {
         let event = self.accept_single_source_event_batch(event)?;
         let apply_started = Instant::now();
         let (output, state_summary) = {
@@ -11213,13 +11188,10 @@ impl LiveRuntime {
                 runtime_elapsed_ms(apply_started),
             )?;
             let summary_started = Instant::now();
-            let state_summary =
-                plan_session.document_state_summary(SummaryLimits::document_preview_window(
-                    row_start,
-                    row_count,
-                    column_start,
-                    column_count,
-                ));
+            let state_summary = match summary_limits {
+                Some(limits) => plan_session.document_state_summary(limits),
+                None => plan_session.state_summary(),
+            };
             (output, (state_summary, runtime_elapsed_ms(summary_started)))
         };
         self.next_step = self.next_step.saturating_add(1);
@@ -11412,14 +11384,7 @@ impl LiveRuntime {
         event: LiveSourceEvent,
         paths: &[String],
     ) -> RuntimeResult<LiveSparseStepOutput> {
-        event.assert_matches_step(step)?;
-        let output = self.apply_source_event_turn(event)?;
-        let value_summaries = self.runtime_value_summaries(paths, 3, 8, 4);
-        Ok(LiveSparseStepOutput {
-            semantic_delta_count: output.semantic_deltas.len(),
-            render_patch_count: output.render_patches.len(),
-            value_summaries,
-        })
+        self.apply_source_event_for_step_value_summaries(step, event, paths)
     }
 
     pub fn apply_source_event_for_step_with_document_window(
@@ -24058,6 +24023,18 @@ impl GenericCircuitRuntime {
         .instantiate_storage()
     }
 
+    fn list_memory(&self, list: &str) -> RuntimeResult<&ListMemory> {
+        self.lists
+            .memory(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
+    }
+
+    fn list_memory_mut(&mut self, list: &str) -> RuntimeResult<&mut ListMemory> {
+        self.lists
+            .memory_mut(list)
+            .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
+    }
+
     fn root_textlike(&self, path: &str) -> RuntimeResult<String> {
         self.root
             .textlike(path)
@@ -24331,10 +24308,7 @@ impl GenericCircuitRuntime {
     }
 
     fn reserve_list(&mut self, list: &str, additional: usize) -> RuntimeResult<()> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .reserve(additional);
+        self.list_memory_mut(list)?.reserve(additional);
         Ok(())
     }
 
@@ -24415,10 +24389,7 @@ impl GenericCircuitRuntime {
         list: &str,
         fields: &[&str],
     ) -> RuntimeResult<Vec<serde_json::Map<String, JsonValue>>> {
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         let mut values = Vec::with_capacity(rows.len());
         for index in 0..rows.len() {
             let mut row = serde_json::Map::new();
@@ -24469,10 +24440,7 @@ impl GenericCircuitRuntime {
         field: &str,
         additional_by_row: impl Fn(usize, &str) -> usize,
     ) -> RuntimeResult<()> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         for index in 0..rows.len() {
             let current = rows
                 .textlike(index, field)
@@ -24493,9 +24461,7 @@ impl GenericCircuitRuntime {
         if source_field == target_field {
             return Ok(());
         }
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory_mut(list)?
             .copy_textlike(index, source_field, target_field)
             .map_err(|_| {
                 format!("generic list `{list}` field `{target_field}` is not text-like").into()
@@ -24503,9 +24469,7 @@ impl GenericCircuitRuntime {
     }
 
     fn list_row_textlike(&self, list: &str, index: usize, field: &str) -> RuntimeResult<&str> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory(list)?
             .textlike(index, field)
             .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like").into())
     }
@@ -24570,10 +24534,7 @@ impl GenericCircuitRuntime {
         field: &str,
         expected: &str,
     ) -> RuntimeResult<Option<usize>> {
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         for index in 0..rows.len() {
             if self.list_row_textlike(list, index, field)? == expected {
                 return Ok(Some(index));
@@ -24588,10 +24549,7 @@ impl GenericCircuitRuntime {
         field: &str,
         expected: &str,
     ) -> RuntimeResult<Option<usize>> {
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         Ok(rows.find_textlike_existing_index(field, expected))
     }
 
@@ -24601,10 +24559,7 @@ impl GenericCircuitRuntime {
         field: &str,
         expected: &str,
     ) -> RuntimeResult<(Option<usize>, TextLookupProbe)> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         Ok(rows.find_textlike_indexed(field, expected))
     }
 
@@ -24614,10 +24569,7 @@ impl GenericCircuitRuntime {
         field: &str,
         expected: &str,
     ) -> RuntimeResult<(Option<Vec<usize>>, TextLookupProbe)> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         Ok(rows.find_textlike_indices_indexed(field, expected))
     }
 
@@ -24629,10 +24581,7 @@ impl GenericCircuitRuntime {
         selection: &[usize],
         equal: bool,
     ) -> RuntimeResult<(Option<Vec<usize>>, TextLookupProbe)> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         Ok(rows.find_textlike_indices_in_selection_indexed(field, expected, selection, equal))
     }
 
@@ -24642,10 +24591,7 @@ impl GenericCircuitRuntime {
         field: &str,
         expected: &str,
     ) -> RuntimeResult<Option<usize>> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         Ok(rows.textlike_index_candidate_count(field, expected))
     }
 
@@ -24657,10 +24603,7 @@ impl GenericCircuitRuntime {
         op: &str,
         row_on_left: bool,
     ) -> RuntimeResult<(Option<Vec<usize>>, NumericLookupProbe)> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         Ok(rows.find_numeric_indices_indexed(field, scalar, op, row_on_left))
     }
 
@@ -24673,10 +24616,7 @@ impl GenericCircuitRuntime {
         row_on_left: bool,
         selection: &[usize],
     ) -> RuntimeResult<(Option<Vec<usize>>, NumericLookupProbe)> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         Ok(rows.find_numeric_indices_in_selection_indexed(
             field,
             scalar,
@@ -24781,33 +24721,25 @@ impl GenericCircuitRuntime {
     }
 
     fn text_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory(list)?
             .textlike_field_names(index)
             .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
     }
 
     fn bool_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory(list)?
             .bool_field_names(index)
             .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
     }
 
     fn json_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory(list)?
             .json_field_names(index)
             .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
     }
 
     fn list_row_field_names(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory(list)?
             .field_names(index)
             .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
     }
@@ -24819,9 +24751,7 @@ impl GenericCircuitRuntime {
         field: &str,
         value: &str,
     ) -> RuntimeResult<()> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory_mut(list)?
             .set_textlike(index, field, value)
             .map_err(|error| {
                 format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
@@ -24836,9 +24766,7 @@ impl GenericCircuitRuntime {
         field: &str,
         value: &str,
     ) -> RuntimeResult<()> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory_mut(list)?
             .set_or_insert_text(index, field, value)
             .map_err(|error| {
                 format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
@@ -24853,9 +24781,7 @@ impl GenericCircuitRuntime {
         field: &str,
         value: bool,
     ) -> RuntimeResult<()> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory_mut(list)?
             .set_bool(index, field, value)
             .map_err(|error| {
                 format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
@@ -24870,9 +24796,7 @@ impl GenericCircuitRuntime {
         field: &str,
         value: FieldValue,
     ) -> RuntimeResult<()> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory_mut(list)?
             .set_value(index, field, value)
             .map_err(|error| {
                 format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
@@ -24926,17 +24850,11 @@ impl GenericCircuitRuntime {
     }
 
     fn list_visible_snapshots(&self, list: &str) -> RuntimeResult<Vec<RuntimeRowSnapshot>> {
-        self.lists
-            .memory(list)
-            .map(ListMemory::visible_snapshots)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
+        Ok(self.list_memory(list)?.visible_snapshots())
     }
 
     fn list_row_snapshot(&self, list: &str, index: usize) -> RuntimeResult<RuntimeRowSnapshot> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .snapshot_index(index)
+        self.list_memory(list)?.snapshot_index(index)
     }
 
     fn set_or_replace_list_row_value(
@@ -24946,9 +24864,7 @@ impl GenericCircuitRuntime {
         field: &str,
         value: FieldValue,
     ) -> RuntimeResult<()> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory_mut(list)?
             .set_or_replace_value(index, field, value)
             .map_err(|error| {
                 format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
@@ -24962,9 +24878,7 @@ impl GenericCircuitRuntime {
         field: &str,
         values: Vec<String>,
     ) -> RuntimeResult<Vec<usize>> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory_mut(list)?
             .set_or_replace_text_values(field, values)
             .map_err(|error| {
                 format!("generic list `{list}` set `{field}` batch failed: {error}").into()
@@ -25820,10 +25734,9 @@ impl GenericCircuitRuntime {
             .cloned()
             .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
         let additional = count - spare_len;
-        let spare_rows = self
-            .lists
-            .spare_rows_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let spare_rows = self.lists.spare_rows_mut(list).ok_or_else(|| {
+            format!("generic runtime has no list `{list}`")
+        })?;
         spare_rows.reserve(additional + count);
         let mut append_source_values = BTreeMap::new();
         append_source_values.insert(trigger.to_owned(), String::new());
@@ -26017,11 +25930,7 @@ impl GenericCircuitRuntime {
                 .into());
             }
         }
-        Ok(self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .append(row))
+        Ok(self.list_memory_mut(list)?.append(row))
     }
 
     fn remove_row(
@@ -26029,10 +25938,7 @@ impl GenericCircuitRuntime {
         list: &str,
         index: usize,
     ) -> RuntimeResult<KeyedRow<RuntimeRowSnapshot>> {
-        let rows = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory_mut(list)?;
         if index >= rows.len() {
             return Err(format!("generic list `{list}` has no index {index}").into());
         }
@@ -26046,9 +25952,7 @@ impl GenericCircuitRuntime {
         to: usize,
     ) -> RuntimeResult<GenericListRowCommit> {
         let (key, generation) = self
-            .lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+            .list_memory_mut(list)?
             .move_index(from, to)?;
         Ok(GenericListRowCommit {
             list: list.to_owned(),
@@ -26058,9 +25962,7 @@ impl GenericCircuitRuntime {
     }
 
     fn row_identity(&self, list: &str, index: usize) -> RuntimeResult<(u64, u64)> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
+        self.list_memory(list)?
             .row_identity(index)
             .ok_or_else(|| format!("generic list `{list}` has no index {index}").into())
     }
@@ -26070,18 +25972,11 @@ impl GenericCircuitRuntime {
     }
 
     fn bound_index(&self, list: &str, key: u64, generation: u64) -> RuntimeResult<Option<usize>> {
-        Ok(self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?
-            .bound_index(key, generation))
+        Ok(self.list_memory(list)?.bound_index(key, generation))
     }
 
     fn list_len(&self, list: &str) -> RuntimeResult<usize> {
-        self.lists
-            .memory(list)
-            .map(ListMemory::len)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
+        Ok(self.list_memory(list)?.len())
     }
 
     fn list_row_matches_predicate(
@@ -26131,10 +26026,7 @@ impl GenericCircuitRuntime {
         if predicate == RuntimeListPredicate::Unsupported {
             return Err(format!("count over list `{list}` has unsupported predicate in IR").into());
         }
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         let mut count = 0usize;
         for index in 0..rows.len() {
             if self.list_row_matches_predicate(list, index, &predicate)? {
@@ -26167,10 +26059,7 @@ impl GenericCircuitRuntime {
             )
             .into());
         }
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         let mut values = Vec::new();
         for index in 0..rows.len() {
             let visible = self.list_row_matches_predicate(list, index, &predicate)?;
@@ -26188,10 +26077,7 @@ impl GenericCircuitRuntime {
         bool_field: &str,
         expected: bool,
     ) -> RuntimeResult<Vec<String>> {
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         let mut values = Vec::new();
         for index in 0..rows.len() {
             if self.list_row_bool(list, index, bool_field)? == expected {
@@ -26208,10 +26094,7 @@ impl GenericCircuitRuntime {
         bool_field: &str,
         expected: bool,
     ) -> RuntimeResult<Option<String>> {
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         for index in 0..rows.len() {
             if self.list_row_bool(list, index, bool_field)? == expected {
                 return Ok(Some(
@@ -26345,10 +26228,7 @@ impl GenericCircuitRuntime {
     }
 
     fn any_list_bool(&self, list: &str, field: &str, expected: bool) -> RuntimeResult<bool> {
-        let rows = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let rows = self.list_memory(list)?;
         for index in 0..rows.len() {
             if self.list_row_bool(list, index, field)? == expected {
                 return Ok(true);
@@ -26363,10 +26243,7 @@ impl GenericCircuitRuntime {
         index: usize,
         field: &str,
     ) -> RuntimeResult<FieldValueRef<'_>> {
-        let memory = self
-            .lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
+        let memory = self.list_memory(list)?;
         memory.value(index, field).ok_or_else(|| {
             let available = memory
                 .field_names(index)

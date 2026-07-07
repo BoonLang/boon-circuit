@@ -57,79 +57,35 @@ impl TargetProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PlanSourceRouteId(pub usize);
+macro_rules! plan_usize_ids {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+            #[serde(transparent)]
+            pub struct $name(pub usize);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PlanConstantId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PlanStorageId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PlanRegionId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PlanOpId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PlanDeltaId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SourceId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct StateId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ListId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct FieldId(pub usize);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ScopeId(pub usize);
-
-impl SourceId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
+            impl $name {
+                pub fn as_usize(self) -> usize {
+                    self.0
+                }
+            }
+        )+
+    };
 }
 
-impl StateId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl ListId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl FieldId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-impl ScopeId {
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
+plan_usize_ids!(
+    PlanSourceRouteId,
+    PlanConstantId,
+    PlanStorageId,
+    PlanRegionId,
+    PlanOpId,
+    PlanDeltaId,
+    SourceId,
+    StateId,
+    ListId,
+    FieldId,
+    ScopeId,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourcePayloadSchema {

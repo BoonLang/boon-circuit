@@ -485,6 +485,125 @@ fn report_source_replay_identity_matches_report(report: &JsonValue) -> bool {
     report.get("source_replay_identity") == Some(&expected)
 }
 
+fn require_report_status_pass(report: &JsonValue, path: &Path, command: &str) -> RuntimeResult<()> {
+    if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
+        return Err(format!("{} {command} report did not pass", path.display()).into());
+    }
+    Ok(())
+}
+
+fn verify_pass_report_prelude(report: &JsonValue, path: &Path, command: &str) -> RuntimeResult<()> {
+    require_report_status_pass(report, path, command)?;
+    verify_common_report_shape(report, path)?;
+    verify_measurement_mode(report, path)?;
+    Ok(())
+}
+
+type ReportSchemaVerifier = fn(&JsonValue, &Path) -> RuntimeResult<()>;
+type PassReportSchemaSpec = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    ReportSchemaVerifier,
+);
+
+const NO_REPORT_HASHES: &[(&str, &str)] = &[];
+const SOURCE_REPORT_HASH: &[(&str, &str)] = &[("source_path", "source_hash")];
+const SOURCE_SCENARIO_REPORT_HASHES: &[(&str, &str)] = &[
+    ("source_path", "source_hash"),
+    ("scenario_path", "scenario_hash"),
+];
+
+const PASS_REPORT_SCHEMA_SPECS: &[PassReportSchemaSpec] = &[
+    ("run-plan", SOURCE_REPORT_HASH, verify_run_plan_report),
+    (
+        "run-plan-route",
+        SOURCE_REPORT_HASH,
+        verify_run_plan_route_report,
+    ),
+    (
+        "run-plan-root-scalar-scenario",
+        SOURCE_SCENARIO_REPORT_HASHES,
+        verify_run_plan_root_scalar_scenario_report,
+    ),
+    (
+        "run-plan-scenario-events",
+        SOURCE_SCENARIO_REPORT_HASHES,
+        verify_run_plan_scenario_events_report,
+    ),
+    (
+        "verify-bytes-file-read-plan",
+        SOURCE_SCENARIO_REPORT_HASHES,
+        verify_bytes_file_read_plan_report,
+    ),
+    (
+        "verify-bytes-file-write-plan",
+        SOURCE_SCENARIO_REPORT_HASHES,
+        verify_bytes_file_write_plan_report,
+    ),
+    (
+        "verify-bytes-negative",
+        NO_REPORT_HASHES,
+        verify_bytes_negative_report,
+    ),
+    (
+        "verify-bytes-type-system",
+        SOURCE_REPORT_HASH,
+        verify_bytes_type_system_report,
+    ),
+    (
+        "verify-bytes-machine-plan-adversarial",
+        NO_REPORT_HASHES,
+        verify_bytes_machine_plan_adversarial_report,
+    ),
+    (
+        "verify-bytes-storage-profile",
+        NO_REPORT_HASHES,
+        verify_bytes_storage_profile_report,
+    ),
+    (
+        "verify-bytes-fixed-warm-tick",
+        NO_REPORT_HASHES,
+        verify_bytes_fixed_warm_tick_report,
+    ),
+    (
+        "verify-bytes-byte-bank-layout",
+        NO_REPORT_HASHES,
+        verify_bytes_byte_bank_layout_report,
+    ),
+];
+
+const PASS_ONLY_REPORT_SCHEMA_SPECS: &[PassReportSchemaSpec] = &[
+    (
+        "verify-bytes-default-engine-readiness",
+        NO_REPORT_HASHES,
+        verify_bytes_default_engine_readiness_report,
+    ),
+    (
+        "verify-bytes-release-benchmark-reproduction",
+        NO_REPORT_HASHES,
+        verify_bytes_release_benchmark_reproduction_report,
+    ),
+    (
+        "verify-bytes-machine-plan-all",
+        NO_REPORT_HASHES,
+        verify_bytes_machine_plan_all_report,
+    ),
+];
+
+fn verify_pass_report_schema_spec(
+    report: &JsonValue,
+    path: &Path,
+    spec: &PassReportSchemaSpec,
+) -> RuntimeResult<()> {
+    let (command, hashes, verifier) = *spec;
+    verify_pass_report_prelude(report, path, command)?;
+    for (path_field, hash_field) in hashes {
+        verify_report_file_hash(report, path, path_field, hash_field)?;
+    }
+    verifier(report, path)?;
+    verify_artifact_hashes(report, path)
+}
+
 pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
     let report: JsonValue = serde_json::from_slice(&fs::read(path)?)?;
     if report.get("command").and_then(JsonValue::as_str) == Some("compile-artifact") {
@@ -535,202 +654,19 @@ pub fn verify_report_schema(path: &Path) -> RuntimeResult<()> {
         verify_artifact_hashes(&report, path)?;
         return Ok(());
     }
-    if report_command_is(&report, "run-plan") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!("{} run-plan report did not pass", path.display()).into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
-        verify_run_plan_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "run-plan-route") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!("{} run-plan-route report did not pass", path.display()).into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
-        verify_run_plan_route_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "run-plan-root-scalar-scenario") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} run-plan-root-scalar-scenario report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
-        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
-        verify_run_plan_root_scalar_scenario_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "run-plan-scenario-events") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} run-plan-scenario-events report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
-        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
-        verify_run_plan_scenario_events_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-file-read-plan") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-file-read-plan report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
-        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
-        verify_bytes_file_read_plan_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-file-write-plan") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-file-write-plan report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
-        verify_report_file_hash(&report, path, "scenario_path", "scenario_hash")?;
-        verify_bytes_file_write_plan_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-negative") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-negative report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_negative_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-type-system") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-type-system report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_report_file_hash(&report, path, "source_path", "source_hash")?;
-        verify_bytes_type_system_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-default-engine-readiness")
-        && report.get("status").and_then(JsonValue::as_str) == Some("pass")
+    if let Some(spec) = PASS_REPORT_SCHEMA_SPECS
+        .iter()
+        .find(|spec| report_command_is(&report, spec.0))
     {
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_default_engine_readiness_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
+        verify_pass_report_schema_spec(&report, path, spec)?;
         return Ok(());
     }
-    if report_command_is(&report, "verify-bytes-machine-plan-adversarial") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-machine-plan-adversarial report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_machine_plan_adversarial_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-release-benchmark-reproduction")
-        && report.get("status").and_then(JsonValue::as_str) == Some("pass")
+    if report.get("status").and_then(JsonValue::as_str) == Some("pass")
+        && let Some(spec) = PASS_ONLY_REPORT_SCHEMA_SPECS
+            .iter()
+            .find(|spec| report_command_is(&report, spec.0))
     {
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_release_benchmark_reproduction_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-storage-profile") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-storage-profile report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_storage_profile_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-fixed-warm-tick") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-fixed-warm-tick report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_fixed_warm_tick_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-byte-bank-layout") {
-        if report.get("status").and_then(JsonValue::as_str) != Some("pass") {
-            return Err(format!(
-                "{} verify-bytes-byte-bank-layout report did not pass",
-                path.display()
-            )
-            .into());
-        }
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_byte_bank_layout_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
-        return Ok(());
-    }
-    if report_command_is(&report, "verify-bytes-machine-plan-all")
-        && report.get("status").and_then(JsonValue::as_str) == Some("pass")
-    {
-        verify_common_report_shape(&report, path)?;
-        verify_measurement_mode(&report, path)?;
-        verify_bytes_machine_plan_all_report(&report, path)?;
-        verify_artifact_hashes(&report, path)?;
+        verify_pass_report_schema_spec(&report, path, spec)?;
         return Ok(());
     }
     if report_command_is(&report, "verify-native-gpu-all") {
@@ -10994,12 +10930,244 @@ fn verify_bytes_file_write_plan_report_inner(
     Ok(())
 }
 
-struct ExpectedBytesFileWriteLiveNegativeCase {
+struct ExpectedBytesFileLiveNegativeCase {
     id: &'static str,
     category: &'static str,
     stage: &'static str,
     expected_error_contains: &'static str,
     target_kind: Option<&'static str>,
+}
+
+type BytesFileLiveNegativeTargetVerifier = fn(
+    &JsonValue,
+    &ExpectedBytesFileLiveNegativeCase,
+    &Path,
+    &BTreeSet<String>,
+    &str,
+) -> RuntimeResult<()>;
+
+struct BytesFileLiveNegativeSpec<'a> {
+    command: &'static str,
+    op_label: &'static str,
+    selected_step_id: &'static str,
+    cases: &'a [ExpectedBytesFileLiveNegativeCase],
+    target_verifier: BytesFileLiveNegativeTargetVerifier,
+}
+
+fn verify_bytes_file_live_negative_evidence(
+    report: &JsonValue,
+    report_path: &Path,
+    checks: &[JsonValue],
+    spec: BytesFileLiveNegativeSpec<'_>,
+) -> RuntimeResult<()> {
+    if report
+        .get("live_negative_case_count")
+        .and_then(JsonValue::as_u64)
+        != Some(spec.cases.len() as u64)
+    {
+        return Err(format!(
+            "{} {} live_negative_case_count is missing or wrong",
+            report_path.display(),
+            spec.command
+        )
+        .into());
+    }
+    let cases = report
+        .get("live_negative_cases")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            format!(
+                "{} {} live_negative_cases is not an array",
+                report_path.display(),
+                spec.command
+            )
+        })?;
+    let artifact_paths = report
+        .get("artifact_sha256s")
+        .and_then(JsonValue::as_array)
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    let mut seen_ids = BTreeSet::new();
+    for expected_case in spec.cases {
+        let case = cases
+            .iter()
+            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
+            .ok_or_else(|| {
+                format!(
+                    "{} missing live {} negative case `{}`",
+                    report_path.display(),
+                    spec.op_label,
+                    expected_case.id
+                )
+            })?;
+        seen_ids.insert(expected_case.id.to_owned());
+        verify_bytes_file_live_negative_case(
+            case,
+            expected_case,
+            report_path,
+            checks,
+            &artifact_paths,
+            &spec,
+        )?;
+    }
+    let expected_ids = spec
+        .cases
+        .iter()
+        .map(|case| case.id.to_owned())
+        .collect::<BTreeSet<_>>();
+    let actual_ids = cases
+        .iter()
+        .map(|case| {
+            case.get("id")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "{} live {} negative case missing id",
+                        report_path.display(),
+                        spec.op_label
+                    )
+                })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if seen_ids != expected_ids || actual_ids != expected_ids {
+        return Err(format!(
+            "{} live {} negative case ids do not match expected matrix",
+            report_path.display(),
+            spec.op_label
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_bytes_file_live_negative_case(
+    case: &JsonValue,
+    expected: &ExpectedBytesFileLiveNegativeCase,
+    report_path: &Path,
+    checks: &[JsonValue],
+    artifact_paths: &BTreeSet<String>,
+    spec: &BytesFileLiveNegativeSpec<'_>,
+) -> RuntimeResult<()> {
+    for (key, value) in [
+        ("category", expected.category),
+        ("stage", expected.stage),
+        ("target_profile", "software_default"),
+        ("expected_error_contains", expected.expected_error_contains),
+    ] {
+        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
+            return Err(format!(
+                "{} live {} negative case `{}` has wrong `{key}`",
+                report_path.display(),
+                spec.op_label,
+                expected.id
+            )
+            .into());
+        }
+    }
+    if case.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(format!(
+            "{} live {} negative case `{}` was not rejected",
+            report_path.display(),
+            spec.op_label,
+            expected.id
+        )
+        .into());
+    }
+    if case.get("selected_step_ids") != Some(&json!([spec.selected_step_id])) {
+        return Err(format!(
+            "{} live {} negative case `{}` has wrong selected steps",
+            report_path.display(),
+            spec.op_label,
+            expected.id
+        )
+        .into());
+    }
+    let source_path = case
+        .get("source_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live {} negative case `{}` missing source_path",
+                report_path.display(),
+                spec.op_label,
+                expected.id
+            )
+        })?;
+    let scenario_path = case
+        .get("scenario_path")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live {} negative case `{}` missing scenario_path",
+                report_path.display(),
+                spec.op_label,
+                expected.id
+            )
+        })?;
+    if case.get("source_sha256").and_then(JsonValue::as_str)
+        != Some(sha256_file(Path::new(source_path))?.as_str())
+        || case.get("scenario_sha256").and_then(JsonValue::as_str)
+            != Some(sha256_file(Path::new(scenario_path))?.as_str())
+    {
+        return Err(format!(
+            "{} live {} negative case `{}` has stale source/scenario hash",
+            report_path.display(),
+            spec.op_label,
+            expected.id
+        )
+        .into());
+    }
+    for path in [source_path, scenario_path] {
+        if !artifact_paths.contains(path) {
+            return Err(format!(
+                "{} live {} negative case `{}` missing artifact hash for `{path}`",
+                report_path.display(),
+                spec.op_label,
+                expected.id
+            )
+            .into());
+        }
+    }
+    let detail = case
+        .get("detail")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| {
+            format!(
+                "{} live {} negative case `{}` missing detail",
+                report_path.display(),
+                spec.op_label,
+                expected.id
+            )
+        })?;
+    if !detail.contains(expected.expected_error_contains)
+        || case.get("detail_sha256").and_then(JsonValue::as_str)
+            != Some(sha256_bytes(detail.as_bytes()).as_str())
+    {
+        return Err(format!(
+            "{} live {} negative case `{}` has forged error evidence",
+            report_path.display(),
+            spec.op_label,
+            expected.id
+        )
+        .into());
+    }
+    let check_id = format!("live-negative-{}-rejected", expected.id);
+    if !checks.iter().any(|check| {
+        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
+            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
+    }) {
+        return Err(format!(
+            "{} missing passing live negative check `{check_id}`",
+            report_path.display()
+        )
+        .into());
+    }
+    (spec.target_verifier)(case, expected, report_path, artifact_paths, source_path)
 }
 
 fn verify_dynamic_path_file_write_summary(
@@ -11275,107 +11443,107 @@ fn verify_dynamic_path_file_write_summary(
     Ok(())
 }
 
-fn expected_bytes_file_write_live_negative_cases() -> Vec<ExpectedBytesFileWriteLiveNegativeCase> {
+fn expected_bytes_file_write_live_negative_cases() -> Vec<ExpectedBytesFileLiveNegativeCase> {
     let mut cases = vec![
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "source-empty-path",
             category: "source-path-policy",
             stage: "semantic-ir",
             expected_error_contains: "must be a non-empty relative path without parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "source-absolute-path",
             category: "source-path-policy",
             stage: "semantic-ir",
             expected_error_contains: "must be a non-empty relative path without parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "source-parent-directory-path",
             category: "source-path-policy",
             stage: "semantic-ir",
             expected_error_contains: "must be a non-empty relative path without parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "source-missing-path",
             category: "source-path-policy",
             stage: "semantic-ir",
             expected_error_contains: "unsupported update expression",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "typecheck-non-bytes-input",
             category: "typecheck-policy",
             stage: "typecheck",
             expected_error_contains: "File/write_bytes",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "typecheck-wrong-path-type",
             category: "typecheck-policy",
             stage: "typecheck",
             expected_error_contains: "File/write_bytes",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-dynamic-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "may not contain parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "may not contain parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-missing-parent",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "cannot write `missing-parent/out.bin`",
             target_kind: Some("missing_parent"),
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "typecheck-indexed-row-field-non-text-path",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
             expected_error_contains: "File/write_bytes",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-missing-target-row",
             category: "indexed-row-dispatch-policy",
             stage: "plan-executor",
             expected_error_contains: "target key/generation 999/1 not found",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "typecheck-indexed-row-field-unknown-path-field",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
             expected_error_contains: "missing_path",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
             category: "indexed-row-shape-policy",
             stage: "plan-executor",
             expected_error_contains: "is not in the static schedule symbol table",
             target_kind: None,
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-missing-parent",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "cannot write `missing-parent/out.bin`",
             target_kind: Some("missing_parent"),
         },
-        ExpectedBytesFileWriteLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-directory-target",
             category: "runtime-path-policy",
             stage: "plan-executor",
@@ -11386,14 +11554,14 @@ fn expected_bytes_file_write_live_negative_cases() -> Vec<ExpectedBytesFileWrite
 
     #[cfg(unix)]
     {
-        cases.push(ExpectedBytesFileWriteLiveNegativeCase {
+        cases.push(ExpectedBytesFileLiveNegativeCase {
             id: "runtime-symlink-target",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "may not target a symlink",
             target_kind: Some("symlink"),
         });
-        cases.push(ExpectedBytesFileWriteLiveNegativeCase {
+        cases.push(ExpectedBytesFileLiveNegativeCase {
             id: "runtime-symlink-parent-escape",
             category: "runtime-path-policy",
             stage: "plan-executor",
@@ -11411,203 +11579,25 @@ fn verify_bytes_file_write_live_negative_evidence(
     checks: &[JsonValue],
 ) -> RuntimeResult<()> {
     let expected = expected_bytes_file_write_live_negative_cases();
-    if report
-        .get("live_negative_case_count")
-        .and_then(JsonValue::as_u64)
-        != Some(expected.len() as u64)
-    {
-        return Err(format!(
-            "{} verify-bytes-file-write-plan live_negative_case_count is missing or wrong",
-            report_path.display()
-        )
-        .into());
-    }
-    let cases = report
-        .get("live_negative_cases")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} verify-bytes-file-write-plan live_negative_cases is not an array",
-                report_path.display()
-            )
-        })?;
-    let artifact_paths = report
-        .get("artifact_sha256s")
-        .and_then(JsonValue::as_array)
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-
-    let mut seen_ids = BTreeSet::new();
-    for expected_case in &expected {
-        let case = cases
-            .iter()
-            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
-            .ok_or_else(|| {
-                format!(
-                    "{} missing live File/write_bytes negative case `{}`",
-                    report_path.display(),
-                    expected_case.id
-                )
-            })?;
-        seen_ids.insert(expected_case.id.to_owned());
-        verify_bytes_file_write_live_negative_case(
-            case,
-            expected_case,
-            report_path,
-            checks,
-            &artifact_paths,
-        )?;
-    }
-    let expected_ids = expected
-        .iter()
-        .map(|case| case.id.to_owned())
-        .collect::<BTreeSet<_>>();
-    let actual_ids = cases
-        .iter()
-        .map(|case| {
-            case.get("id")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| {
-                    format!(
-                        "{} live File/write_bytes negative case missing id",
-                        report_path.display()
-                    )
-                })
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    if seen_ids != expected_ids || actual_ids != expected_ids {
-        return Err(format!(
-            "{} live File/write_bytes negative case ids do not match expected matrix",
-            report_path.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn verify_bytes_file_write_live_negative_case(
-    case: &JsonValue,
-    expected: &ExpectedBytesFileWriteLiveNegativeCase,
-    report_path: &Path,
-    checks: &[JsonValue],
-    artifact_paths: &BTreeSet<String>,
-) -> RuntimeResult<()> {
-    for (key, value) in [
-        ("category", expected.category),
-        ("stage", expected.stage),
-        ("target_profile", "software_default"),
-        ("expected_error_contains", expected.expected_error_contains),
-    ] {
-        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
-            return Err(format!(
-                "{} live File/write_bytes negative case `{}` has wrong `{key}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-    if case.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
-        return Err(format!(
-            "{} live File/write_bytes negative case `{}` was not rejected",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    if case.get("selected_step_ids") != Some(&json!(["write"])) {
-        return Err(format!(
-            "{} live File/write_bytes negative case `{}` has wrong selected steps",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    let source_path = case
-        .get("source_path")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            format!(
-                "{} live File/write_bytes negative case `{}` missing source_path",
-                report_path.display(),
-                expected.id
-            )
-        })?;
-    let scenario_path = case
-        .get("scenario_path")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            format!(
-                "{} live File/write_bytes negative case `{}` missing scenario_path",
-                report_path.display(),
-                expected.id
-            )
-        })?;
-    if case.get("source_sha256").and_then(JsonValue::as_str)
-        != Some(sha256_file(Path::new(source_path))?.as_str())
-        || case.get("scenario_sha256").and_then(JsonValue::as_str)
-            != Some(sha256_file(Path::new(scenario_path))?.as_str())
-    {
-        return Err(format!(
-            "{} live File/write_bytes negative case `{}` has stale source/scenario hash",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    for path in [source_path, scenario_path] {
-        if !artifact_paths.contains(path) {
-            return Err(format!(
-                "{} live File/write_bytes negative case `{}` missing artifact hash for `{path}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-    let detail = case
-        .get("detail")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            format!(
-                "{} live File/write_bytes negative case `{}` missing detail",
-                report_path.display(),
-                expected.id
-            )
-        })?;
-    if !detail.contains(expected.expected_error_contains)
-        || case.get("detail_sha256").and_then(JsonValue::as_str)
-            != Some(sha256_bytes(detail.as_bytes()).as_str())
-    {
-        return Err(format!(
-            "{} live File/write_bytes negative case `{}` has forged error evidence",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    let check_id = format!("live-negative-{}-rejected", expected.id);
-    if !checks.iter().any(|check| {
-        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
-            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
-    }) {
-        return Err(format!(
-            "{} missing passing live negative check `{check_id}`",
-            report_path.display()
-        )
-        .into());
-    }
-    verify_bytes_file_write_live_negative_target(case, expected, report_path, source_path)
+    verify_bytes_file_live_negative_evidence(
+        report,
+        report_path,
+        checks,
+        BytesFileLiveNegativeSpec {
+            command: "verify-bytes-file-write-plan",
+            op_label: "File/write_bytes",
+            selected_step_id: "write",
+            cases: &expected,
+            target_verifier: verify_bytes_file_write_live_negative_target,
+        },
+    )
 }
 
 fn verify_bytes_file_write_live_negative_target(
     case: &JsonValue,
-    expected: &ExpectedBytesFileWriteLiveNegativeCase,
+    expected: &ExpectedBytesFileLiveNegativeCase,
     report_path: &Path,
+    _artifact_paths: &BTreeSet<String>,
     source_path: &str,
 ) -> RuntimeResult<()> {
     let Some(expected_kind) = expected.target_kind else {
@@ -13745,115 +13735,107 @@ fn verify_bytes_file_read_negative_evidence(
     Ok(())
 }
 
-struct ExpectedBytesFileReadLiveNegativeCase {
-    id: &'static str,
-    category: &'static str,
-    stage: &'static str,
-    expected_error_contains: &'static str,
-    target_kind: Option<&'static str>,
-}
-
-fn expected_bytes_file_read_live_negative_cases() -> Vec<ExpectedBytesFileReadLiveNegativeCase> {
+fn expected_bytes_file_read_live_negative_cases() -> Vec<ExpectedBytesFileLiveNegativeCase> {
     let mut cases = vec![
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "source-empty-path",
             category: "source-path-policy",
             stage: "semantic-ir",
             expected_error_contains: "must be a non-empty relative path without parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "source-absolute-path",
             category: "source-path-policy",
             stage: "semantic-ir",
             expected_error_contains: "must be a non-empty relative path without parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "source-parent-directory-path",
             category: "source-path-policy",
             stage: "semantic-ir",
             expected_error_contains: "must be a non-empty relative path without parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-dynamic-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "may not contain parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-parent-path",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "may not contain parent-directory segments",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-missing-file",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "cannot read `missing.bin`",
             target_kind: Some("missing"),
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-fixed-output-length-mismatch",
             category: "runtime-type-policy",
             stage: "plan-executor",
             expected_error_contains: "fixed length 1 does not match produced length 4",
             target_kind: Some("file"),
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "typecheck-indexed-row-field-non-text-path",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
             expected_error_contains: "File/read_bytes",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-missing-target-row",
             category: "indexed-row-dispatch-policy",
             stage: "plan-executor",
             expected_error_contains: "target key/generation 999/1 not found",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "typecheck-indexed-row-field-unknown-path-field",
             category: "indexed-row-field-type-policy",
             stage: "typecheck",
             expected_error_contains: "missing_path",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-indexed-row-field-mixed-row-shape-missing-path",
             category: "indexed-row-shape-policy",
             stage: "plan-executor",
             expected_error_contains: "is not in the static schedule symbol table",
             target_kind: None,
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-missing-file",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "cannot read `missing.bin`",
             target_kind: Some("missing"),
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-directory-target",
             category: "runtime-path-policy",
             stage: "plan-executor",
             expected_error_contains: "cannot read `directory-target`",
             target_kind: Some("directory"),
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "runtime-fixed-output-length-mismatch",
             category: "runtime-type-policy",
             stage: "plan-executor",
             expected_error_contains: "fixed length 1 does not match produced length 4",
             target_kind: Some("file"),
         },
-        ExpectedBytesFileReadLiveNegativeCase {
+        ExpectedBytesFileLiveNegativeCase {
             id: "plan-wrong-output-type",
             category: "typecheck-policy",
             stage: "typecheck",
@@ -13863,7 +13845,7 @@ fn expected_bytes_file_read_live_negative_cases() -> Vec<ExpectedBytesFileReadLi
     ];
 
     #[cfg(unix)]
-    cases.push(ExpectedBytesFileReadLiveNegativeCase {
+    cases.push(ExpectedBytesFileLiveNegativeCase {
         id: "runtime-symlink-escape",
         category: "runtime-path-policy",
         stage: "plan-executor",
@@ -13880,203 +13862,23 @@ fn verify_bytes_file_read_live_negative_evidence(
     checks: &[JsonValue],
 ) -> RuntimeResult<()> {
     let expected = expected_bytes_file_read_live_negative_cases();
-    if report
-        .get("live_negative_case_count")
-        .and_then(JsonValue::as_u64)
-        != Some(expected.len() as u64)
-    {
-        return Err(format!(
-            "{} verify-bytes-file-read-plan live_negative_case_count is missing or wrong",
-            report_path.display()
-        )
-        .into());
-    }
-    let cases = report
-        .get("live_negative_cases")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| {
-            format!(
-                "{} live_negative_cases is not an array",
-                report_path.display()
-            )
-        })?;
-    let artifact_paths = report
-        .get("artifact_sha256s")
-        .and_then(JsonValue::as_array)
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(|artifact| artifact.get("path").and_then(JsonValue::as_str))
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-
-    let mut seen_ids = BTreeSet::new();
-    for expected_case in &expected {
-        let case = cases
-            .iter()
-            .find(|case| case.get("id").and_then(JsonValue::as_str) == Some(expected_case.id))
-            .ok_or_else(|| {
-                format!(
-                    "{} missing live File/read_bytes negative case `{}`",
-                    report_path.display(),
-                    expected_case.id
-                )
-            })?;
-        seen_ids.insert(expected_case.id.to_owned());
-        verify_bytes_file_read_live_negative_case(
-            case,
-            expected_case,
-            report_path,
-            checks,
-            &artifact_paths,
-        )?;
-    }
-    let expected_ids = expected
-        .iter()
-        .map(|case| case.id.to_owned())
-        .collect::<BTreeSet<_>>();
-    let actual_ids = cases
-        .iter()
-        .map(|case| {
-            case.get("id")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| format!("{} live negative case missing id", report_path.display()))
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    if seen_ids != expected_ids || actual_ids != expected_ids {
-        return Err(format!(
-            "{} live File/read_bytes negative case ids do not match expected matrix",
-            report_path.display()
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn verify_bytes_file_read_live_negative_case(
-    case: &JsonValue,
-    expected: &ExpectedBytesFileReadLiveNegativeCase,
-    report_path: &Path,
-    checks: &[JsonValue],
-    artifact_paths: &BTreeSet<String>,
-) -> RuntimeResult<()> {
-    for (key, value) in [
-        ("category", expected.category),
-        ("stage", expected.stage),
-        ("target_profile", "software_default"),
-        ("expected_error_contains", expected.expected_error_contains),
-    ] {
-        if case.get(key).and_then(JsonValue::as_str) != Some(value) {
-            return Err(format!(
-                "{} live File/read_bytes negative case `{}` has wrong `{key}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-    if case.get("rejected").and_then(JsonValue::as_bool) != Some(true) {
-        return Err(format!(
-            "{} live File/read_bytes negative case `{}` was not rejected",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    if case.get("selected_step_ids") != Some(&json!(["load"])) {
-        return Err(format!(
-            "{} live File/read_bytes negative case `{}` has wrong selected steps",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    let source_path = case
-        .get("source_path")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            format!(
-                "{} live File/read_bytes negative case `{}` missing source_path",
-                report_path.display(),
-                expected.id
-            )
-        })?;
-    let scenario_path = case
-        .get("scenario_path")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            format!(
-                "{} live File/read_bytes negative case `{}` missing scenario_path",
-                report_path.display(),
-                expected.id
-            )
-        })?;
-    if case.get("source_sha256").and_then(JsonValue::as_str)
-        != Some(sha256_file(Path::new(source_path))?.as_str())
-        || case.get("scenario_sha256").and_then(JsonValue::as_str)
-            != Some(sha256_file(Path::new(scenario_path))?.as_str())
-    {
-        return Err(format!(
-            "{} live File/read_bytes negative case `{}` has stale source/scenario hash",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    for path in [source_path, scenario_path] {
-        if !artifact_paths.contains(path) {
-            return Err(format!(
-                "{} live File/read_bytes negative case `{}` missing artifact hash for `{path}`",
-                report_path.display(),
-                expected.id
-            )
-            .into());
-        }
-    }
-    let detail = case
-        .get("detail")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| {
-            format!(
-                "{} live File/read_bytes negative case `{}` missing detail",
-                report_path.display(),
-                expected.id
-            )
-        })?;
-    if !detail.contains(expected.expected_error_contains)
-        || case.get("detail_sha256").and_then(JsonValue::as_str)
-            != Some(sha256_bytes(detail.as_bytes()).as_str())
-    {
-        return Err(format!(
-            "{} live File/read_bytes negative case `{}` has forged error evidence",
-            report_path.display(),
-            expected.id
-        )
-        .into());
-    }
-    let check_id = format!("live-negative-{}-rejected", expected.id);
-    if !checks.iter().any(|check| {
-        check.get("id").and_then(JsonValue::as_str) == Some(check_id.as_str())
-            && check.get("pass").and_then(JsonValue::as_bool) == Some(true)
-    }) {
-        return Err(format!(
-            "{} missing passing live negative check `{check_id}`",
-            report_path.display()
-        )
-        .into());
-    }
-    verify_bytes_file_read_live_negative_target(
-        case,
-        expected,
+    verify_bytes_file_live_negative_evidence(
+        report,
         report_path,
-        artifact_paths,
-        source_path,
+        checks,
+        BytesFileLiveNegativeSpec {
+            command: "verify-bytes-file-read-plan",
+            op_label: "File/read_bytes",
+            selected_step_id: "load",
+            cases: &expected,
+            target_verifier: verify_bytes_file_read_live_negative_target,
+        },
     )
 }
 
 fn verify_bytes_file_read_live_negative_target(
     case: &JsonValue,
-    expected: &ExpectedBytesFileReadLiveNegativeCase,
+    expected: &ExpectedBytesFileLiveNegativeCase,
     report_path: &Path,
     artifact_paths: &BTreeSet<String>,
     source_path: &str,

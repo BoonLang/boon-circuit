@@ -26137,10 +26137,10 @@ fn verify_native_gpu_preview_e2e_hello_3d(
     let example = entry.id.clone();
     let mut checks = Vec::new();
     let mut blockers = Vec::new();
-    let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
-    fs::create_dir_all(&artifacts_dir)?;
-    fs::create_dir_all("target/reports/native-gpu")?;
-    let role_report = PathBuf::from("target/reports/native-gpu/preview-e2e-hello_3d-role.json");
+    let role_report = fresh_native_role_report_path(
+        Path::new("target/reports/native-gpu"),
+        "preview-e2e-hello_3d-role.json",
+    )?;
     let source_path = PathBuf::from(&entry.source);
     let source_text = boon_runtime::source_text_for_entry(entry)?;
     let source_files = manifest_runtime_source_files(entry);
@@ -26170,40 +26170,43 @@ fn verify_native_gpu_preview_e2e_hello_3d(
         (!build.success()).then(|| "failed to build boon_native_playground".to_owned()),
     );
 
-    let _ = fs::remove_file(&role_report);
-    let run_output = if build.success() {
-        Some(
-            Command::new(&launched_binary_path)
-                .args([
-                    "--role",
-                    "preview",
-                    "--code-file",
-                    source_path
-                        .to_str()
-                        .ok_or("hello_3d source path is not UTF-8")?,
-                    "--probe",
-                    "--proof-mode",
-                    "readback",
-                    "--demand-driven-loop",
-                    "--world-scene-orbit-probe",
-                    "--hold-ms",
-                    "1",
-                    "--warmup-frame-count",
-                    "0",
-                    "--sample-frame-count",
-                    "1",
-                    "--title-token",
-                    "preview-e2e-hello-3d-world-scene",
-                    "--report",
-                    role_report
-                        .to_str()
-                        .ok_or("hello_3d role report path is not UTF-8")?,
-                ])
-                .output()?,
-        )
-    } else {
-        None
-    };
+    let role_report_arg = role_report
+        .to_str()
+        .ok_or("hello_3d role report path is not UTF-8")?
+        .to_owned();
+    let source_path_arg = source_path
+        .to_str()
+        .ok_or("hello_3d source path is not UTF-8")?
+        .to_owned();
+    let role_run = run_native_role_command(
+        build.success(),
+        &launched_binary_path,
+        &role_report,
+        |command| {
+            command.args([
+                "--role",
+                "preview",
+                "--code-file",
+                &source_path_arg,
+                "--probe",
+                "--proof-mode",
+                "readback",
+                "--demand-driven-loop",
+                "--world-scene-orbit-probe",
+                "--hold-ms",
+                "1",
+                "--warmup-frame-count",
+                "0",
+                "--sample-frame-count",
+                "1",
+                "--title-token",
+                "preview-e2e-hello-3d-world-scene",
+                "--report",
+                &role_report_arg,
+            ]);
+        },
+    )?;
+    let run_output = role_run.output;
     let run_success = run_output
         .as_ref()
         .is_some_and(|output| output.status.success());
@@ -26231,11 +26234,9 @@ fn verify_native_gpu_preview_e2e_hello_3d(
                 .unwrap_or_else(|| "hello_3d preview role not run".to_owned())
         }),
     );
-    let role_report_json = if role_report.exists() {
-        read_json(&role_report)?
-    } else {
-        json!({"status": "missing"})
-    };
+    let role_report_json = role_run
+        .report_json
+        .unwrap_or_else(|| json!({"status": "missing"}));
     let role_schema_pass = role_report.exists() && verify_report_schema(&role_report).is_ok();
     let external_proof = role_report_json
         .pointer("/details/app_window_surface_proof/external_render_proof")
@@ -36247,6 +36248,50 @@ fn role_report_steps_all_pass(report: Option<&serde_json::Value>) -> bool {
         })
 }
 
+struct NativeRoleRun {
+    output: Option<std::process::Output>,
+    report_json: Option<serde_json::Value>,
+}
+
+fn fresh_native_role_report_path(
+    artifacts_dir: &Path,
+    file_name: impl AsRef<Path>,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    fs::create_dir_all(artifacts_dir)?;
+    let role_report = artifacts_dir.join(file_name);
+    let _ = fs::remove_file(&role_report);
+    Ok(role_report)
+}
+
+fn run_native_role_command(
+    should_run: bool,
+    binary_path: &Path,
+    role_report: &Path,
+    configure: impl FnOnce(&mut Command),
+) -> Result<NativeRoleRun, Box<dyn std::error::Error>> {
+    let output = should_run
+        .then(|| {
+            let mut command = Command::new(binary_path);
+            configure(&mut command);
+            command.output()
+        })
+        .transpose()?;
+    Ok(NativeRoleRun {
+        output,
+        report_json: read_optional_json(role_report)?,
+    })
+}
+
+fn native_role_report_artifacts(
+    role_report: &Path,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    if role_report.exists() {
+        Ok(vec![artifact_hash(role_report)?])
+    } else {
+        Ok(Vec::new())
+    }
+}
+
 fn push_native_role_report_shell_checks(
     checks: &mut Vec<serde_json::Value>,
     blockers: &mut Vec<String>,
@@ -36361,9 +36406,8 @@ fn verify_native_counter_interaction_speed(
     let source_path = PathBuf::from(&entry.source);
     let scenario_path = PathBuf::from(&entry.scenario);
     let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
-    std::fs::create_dir_all(&artifacts_dir)?;
-    let role_report = artifacts_dir.join("counter-interaction-speed-role.json");
-    let _ = std::fs::remove_file(&role_report);
+    let role_report =
+        fresh_native_role_report_path(&artifacts_dir, "counter-interaction-speed-role.json")?;
 
     let build = Command::new("cargo")
         .args(["build", "-p", "boon_native_playground"])
@@ -36381,35 +36425,33 @@ fn verify_native_counter_interaction_speed(
     let event_count_arg = event_count.to_string();
     let max_total_ms_arg = max_total_ms.to_string();
     let role_report_arg = role_report.display().to_string();
-    let role_output = if build.success() && example_ok {
-        Some(
-            Command::new(&binary_path)
-                .args([
-                    "--role",
-                    "interaction-speed",
-                    "--example",
-                    "counter",
-                    "--event-count",
-                    &event_count_arg,
-                    "--max-total-ms",
-                    &max_total_ms_arg,
-                    "--report",
-                    &role_report_arg,
-                ])
-                .output()?,
-        )
-    } else {
-        None
-    };
-    let role_report_json = read_optional_json(&role_report)?;
-    let role_data = NativeRoleReport::new(role_report_json.as_ref());
+    let role_run = run_native_role_command(
+        build.success() && example_ok,
+        &binary_path,
+        &role_report,
+        |command| {
+            command.args([
+                "--role",
+                "interaction-speed",
+                "--example",
+                "counter",
+                "--event-count",
+                &event_count_arg,
+                "--max-total-ms",
+                &max_total_ms_arg,
+                "--report",
+                &role_report_arg,
+            ]);
+        },
+    )?;
+    let role_data = NativeRoleReport::new(role_run.report_json.as_ref());
     push_native_role_report_shell_checks(
         &mut checks,
         &mut blockers,
         "counter-interaction-speed",
         "interaction-speed",
         &role_report,
-        role_output.as_ref(),
+        role_run.output.as_ref(),
         role_data.value(),
         false,
     );
@@ -36465,11 +36507,7 @@ fn verify_native_counter_interaction_speed(
         }),
     );
 
-    let role_artifact = if role_report.exists() {
-        vec![artifact_hash(&role_report)?]
-    } else {
-        Vec::new()
-    };
+    let role_artifact = native_role_report_artifacts(&role_report)?;
     write_native_gate_report(
         args,
         "verify-native-counter-interaction-speed",
@@ -36554,9 +36592,10 @@ fn verify_native_cells_interaction_speed(
     );
 
     let artifacts_dir = PathBuf::from("target/artifacts/native-gpu");
-    std::fs::create_dir_all(&artifacts_dir)?;
-    let role_report = artifacts_dir.join(format!("cells-interaction-speed-{profile}-role.json"));
-    let _ = std::fs::remove_file(&role_report);
+    let role_report = fresh_native_role_report_path(
+        &artifacts_dir,
+        format!("cells-interaction-speed-{profile}-role.json"),
+    )?;
 
     let mut build_args = vec!["build", "-p", "boon_native_playground"];
     if profile == "release" {
@@ -36581,9 +36620,12 @@ fn verify_native_cells_interaction_speed(
     let max_p95_ms_arg = max_p95_ms.to_string();
     let max_max_ms_arg = max_max_ms.to_string();
     let role_report_arg = role_report.display().to_string();
-    let role_output = if build.success() && profile_ok && generic_source_ok {
-        Some(
-            Command::new(&binary_path)
+    let role_run = run_native_role_command(
+        build.success() && profile_ok && generic_source_ok,
+        &binary_path,
+        &role_report,
+        |command| {
+            command
                 .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
                 .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
                 .args([
@@ -36599,21 +36641,17 @@ fn verify_native_cells_interaction_speed(
                     &max_max_ms_arg,
                     "--report",
                     &role_report_arg,
-                ])
-                .output()?,
-        )
-    } else {
-        None
-    };
-    let role_report_json = read_optional_json(&role_report)?;
-    let role_data = NativeRoleReport::new(role_report_json.as_ref());
+                ]);
+        },
+    )?;
+    let role_data = NativeRoleReport::new(role_run.report_json.as_ref());
     push_native_role_report_shell_checks(
         &mut checks,
         &mut blockers,
         "cells-interaction-speed",
         "interaction-speed",
         &role_report,
-        role_output.as_ref(),
+        role_run.output.as_ref(),
         role_data.value(),
         false,
     );
@@ -36731,11 +36769,7 @@ fn verify_native_cells_interaction_speed(
         }),
     );
 
-    let role_artifact = if role_report.exists() {
-        vec![artifact_hash(&role_report)?]
-    } else {
-        Vec::new()
-    };
+    let role_artifact = native_role_report_artifacts(&role_report)?;
     let click_interaction_timing = role_data.value_or("click_interaction_timing_ms", json!(null));
     let click_native_input_timing = role_data.value_or("click_native_input_timing_ms", json!(null));
     let interaction_timing_samples = role_data.value_or("interaction_timing_samples", json!([]));
@@ -45811,8 +45845,8 @@ fn verify_native_gpu_novywave_interaction_speed(
         })
         .filter(|stem| !stem.trim().is_empty())
         .unwrap_or_else(|| "novywave-interaction-speed".to_owned());
-    let role_report = artifacts_dir.join(format!("{role_report_stem}-role.json"));
-    let _ = std::fs::remove_file(&role_report);
+    let role_report =
+        fresh_native_role_report_path(&artifacts_dir, format!("{role_report_stem}-role.json"))?;
 
     let build = Command::new("cargo")
         .args(["build", "--release", "-p", "boon_native_playground"])
@@ -45832,44 +45866,41 @@ fn verify_native_gpu_novywave_interaction_speed(
     let max_max_ms_arg = max_max_ms.to_string();
     let max_resize_p95_ms_arg = max_resize_p95_ms.to_string();
     let role_report_arg = role_report.display().to_string();
-    let role_output = if build.success() {
-        let mut command = Command::new(&binary_path);
-        command
-            .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
-            .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
-            .env("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH", "1")
-            .args([
-                "--role",
-                "interaction-speed",
-                "--example",
-                "novywave",
-                "--event-count",
-                &event_count_arg,
-                "--max-p95-ms",
-                &max_p95_ms_arg,
-                "--max-max-ms",
-                &max_max_ms_arg,
-                "--max-resize-p95-ms",
-                &max_resize_p95_ms_arg,
-                "--report",
-                &role_report_arg,
-            ]);
-        if args.iter().any(|arg| arg == "--record-hot-path-profiles") {
-            command.arg("--record-hot-path-profiles");
-        }
-        Some(command.output()?)
-    } else {
-        None
-    };
-    let role_report_json = read_optional_json(&role_report)?;
-    let role_data = NativeRoleReport::new(role_report_json.as_ref());
+    let record_hot_path_profiles = args.iter().any(|arg| arg == "--record-hot-path-profiles");
+    let role_run =
+        run_native_role_command(build.success(), &binary_path, &role_report, |command| {
+            command
+                .env("BOON_NATIVE_DISABLE_UI_STATE_PERSIST", "1")
+                .env("BOON_NATIVE_PREVIEW_COMPACT_TIMING", "1")
+                .env("BOON_NATIVE_PREVIEW_PROFILE_HOT_PATH", "1")
+                .args([
+                    "--role",
+                    "interaction-speed",
+                    "--example",
+                    "novywave",
+                    "--event-count",
+                    &event_count_arg,
+                    "--max-p95-ms",
+                    &max_p95_ms_arg,
+                    "--max-max-ms",
+                    &max_max_ms_arg,
+                    "--max-resize-p95-ms",
+                    &max_resize_p95_ms_arg,
+                    "--report",
+                    &role_report_arg,
+                ]);
+            if record_hot_path_profiles {
+                command.arg("--record-hot-path-profiles");
+            }
+        })?;
+    let role_data = NativeRoleReport::new(role_run.report_json.as_ref());
     push_native_role_report_shell_checks(
         &mut checks,
         &mut blockers,
         "novywave-interaction-speed",
         "NovyWave interaction-speed",
         &role_report,
-        role_output.as_ref(),
+        role_run.output.as_ref(),
         role_data.value(),
         true,
     );
@@ -46048,11 +46079,7 @@ fn verify_native_gpu_novywave_interaction_speed(
         }),
     );
 
-    let role_artifact = if role_report.exists() {
-        vec![artifact_hash(&role_report)?]
-    } else {
-        Vec::new()
-    };
+    let role_artifact = native_role_report_artifacts(&role_report)?;
     let click_interaction_timing = role_field_or_null("click_interaction_timing_ms");
     let hover_interaction_timing = role_field_or_null("hover_interaction_timing_ms");
     let divider_interaction_timing = role_field_or_null("divider_interaction_timing_ms");
@@ -75881,7 +75908,8 @@ expected_source_event = { source = "store.sources.increment_button.press", targe
                 }]
             },
             "native_host_input_route_evidence": {
-                "changes_visible_frame": false
+                "status": "pass",
+                "changes_visible_frame": true
             }
         })
     }

@@ -19749,40 +19749,169 @@ fn expected_bytes_encode_hex(data: &[u8]) -> String {
     output
 }
 
+enum ExpectedBytesCheckContext<'a> {
+    Root {
+        report_path: &'a Path,
+        op: &'a boon_plan::PlanOp,
+        input_label: &'a str,
+    },
+    Row {
+        report_path: &'a Path,
+    },
+}
+
+impl ExpectedBytesCheckContext<'_> {
+    fn scoped_error(&self, operation: &str, detail: String) -> Box<dyn std::error::Error> {
+        match self {
+            Self::Root {
+                report_path, op, ..
+            } => format!(
+                "{} root {operation} update branch {} {detail}",
+                report_path.display(),
+                op.id.0
+            )
+            .into(),
+            Self::Row { report_path } => {
+                format!("{} row {operation} {detail}", report_path.display()).into()
+            }
+        }
+    }
+
+    fn input_detail(&self, detail: &str) -> String {
+        match self {
+            Self::Root { input_label, .. } => format!("input `{input_label}` {detail}"),
+            Self::Row { .. } => format!("input {detail}"),
+        }
+    }
+
+    fn hex_odd_digit_error(&self) -> Box<dyn std::error::Error> {
+        self.scoped_error(
+            "Bytes/from_hex",
+            self.input_detail("has odd hex digit count"),
+        )
+    }
+
+    fn hex_invalid_digit_error(&self) -> Box<dyn std::error::Error> {
+        self.scoped_error("Bytes/from_hex", self.input_detail("has invalid hex digit"))
+    }
+
+    fn base64_error(&self) -> Box<dyn std::error::Error> {
+        self.scoped_error("Bytes/from_base64", self.input_detail("is invalid base64"))
+    }
+
+    fn range_unsupported_error(
+        &self,
+        operation: &str,
+        byte_count: usize,
+    ) -> Box<dyn std::error::Error> {
+        self.scoped_error(
+            operation,
+            format!("byte_count {byte_count} is not supported"),
+        )
+    }
+
+    fn range_overflow_error(&self, operation: &str) -> Box<dyn std::error::Error> {
+        match self {
+            Self::Root { input_label, .. } => self.scoped_error(
+                operation,
+                format!("byte range overflows for `{input_label}`"),
+            ),
+            Self::Row { .. } => self.scoped_error(operation, "byte range overflows".to_owned()),
+        }
+    }
+
+    fn range_out_of_bounds_error(
+        &self,
+        operation: &str,
+        offset: usize,
+        end: usize,
+        len: usize,
+    ) -> Box<dyn std::error::Error> {
+        match self {
+            Self::Root { input_label, .. } => self.scoped_error(
+                operation,
+                format!("byte range {offset}..{end} is out of bounds for `{input_label}`"),
+            ),
+            Self::Row { .. } => self.scoped_error(
+                operation,
+                format!("byte range {offset}..{end} is out of bounds for length {len}"),
+            ),
+        }
+    }
+
+    fn read_unsigned_overflow_error(&self) -> Box<dyn std::error::Error> {
+        self.scoped_error("Bytes/read_unsigned", "overflows Boon NUMBER".to_owned())
+    }
+
+    fn write_unsigned_negative_error(&self, value: i64) -> Box<dyn std::error::Error> {
+        match self {
+            Self::Root { .. } => {
+                self.scoped_error("Bytes/write_unsigned", format!("value {value} is negative"))
+            }
+            Self::Row { .. } => {
+                self.scoped_error("Bytes/write_unsigned", "numeric overflow".to_owned())
+            }
+        }
+    }
+
+    fn write_unsigned_overflow_error(&self, byte_count: usize) -> Box<dyn std::error::Error> {
+        match self {
+            Self::Root { .. } => self.scoped_error(
+                "Bytes/write_unsigned",
+                format!("value overflows byte_count {byte_count}"),
+            ),
+            Self::Row { .. } => {
+                self.scoped_error("Bytes/write_unsigned", "numeric overflow".to_owned())
+            }
+        }
+    }
+
+    fn write_signed_overflow_error(&self, type_label: &str) -> Box<dyn std::error::Error> {
+        match self {
+            Self::Root { .. } => self.scoped_error(
+                "Bytes/write_signed",
+                format!("value overflows {type_label}"),
+            ),
+            Self::Row { .. } => {
+                self.scoped_error("Bytes/write_signed", "numeric overflow".to_owned())
+            }
+        }
+    }
+}
+
 fn expected_bytes_decode_hex(
     text: &str,
     report_path: &Path,
     op: &boon_plan::PlanOp,
     input_label: &str,
 ) -> RuntimeResult<Vec<u8>> {
+    expected_bytes_decode_hex_with_context(
+        text,
+        &ExpectedBytesCheckContext::Root {
+            report_path,
+            op,
+            input_label,
+        },
+    )
+}
+
+fn expected_bytes_decode_hex_with_context(
+    text: &str,
+    context: &ExpectedBytesCheckContext<'_>,
+) -> RuntimeResult<Vec<u8>> {
     let digits = text
         .bytes()
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect::<Vec<_>>();
     if digits.len() % 2 != 0 {
-        return Err(format!(
-            "{} root Bytes/from_hex update branch {} input `{input_label}` has odd hex digit count",
-            report_path.display(),
-            op.id.0
-        )
-        .into());
+        return Err(context.hex_odd_digit_error());
     }
     let mut output = Vec::with_capacity(digits.len() / 2);
     for chunk in digits.chunks_exact(2) {
-        let high = expected_bytes_hex_value(chunk[0]).ok_or_else(|| {
-            format!(
-                "{} root Bytes/from_hex update branch {} input `{input_label}` has invalid hex digit",
-                report_path.display(),
-                op.id.0
-            )
-        })?;
-        let low = expected_bytes_hex_value(chunk[1]).ok_or_else(|| {
-            format!(
-                "{} root Bytes/from_hex update branch {} input `{input_label}` has invalid hex digit",
-                report_path.display(),
-                op.id.0
-            )
-        })?;
+        let high =
+            expected_bytes_hex_value(chunk[0]).ok_or_else(|| context.hex_invalid_digit_error())?;
+        let low =
+            expected_bytes_hex_value(chunk[1]).ok_or_else(|| context.hex_invalid_digit_error())?;
         output.push((high << 4) | low);
     }
     Ok(output)
@@ -19826,6 +19955,20 @@ fn expected_bytes_decode_base64(
     op: &boon_plan::PlanOp,
     input_label: &str,
 ) -> RuntimeResult<Vec<u8>> {
+    expected_bytes_decode_base64_with_context(
+        text,
+        &ExpectedBytesCheckContext::Root {
+            report_path,
+            op,
+            input_label,
+        },
+    )
+}
+
+fn expected_bytes_decode_base64_with_context(
+    text: &str,
+    context: &ExpectedBytesCheckContext<'_>,
+) -> RuntimeResult<Vec<u8>> {
     let input = text
         .bytes()
         .filter(|byte| !byte.is_ascii_whitespace())
@@ -19834,32 +19977,32 @@ fn expected_bytes_decode_base64(
         return Ok(Vec::new());
     }
     if input.len() % 4 != 0 {
-        return Err(expected_base64_error(report_path, op, input_label));
+        return Err(context.base64_error());
     }
     let mut output = Vec::with_capacity((input.len() / 4).saturating_mul(3));
     for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
         let final_chunk = chunk_index == input.len() / 4 - 1;
         if chunk[0] == b'=' || chunk[1] == b'=' {
-            return Err(expected_base64_error(report_path, op, input_label));
+            return Err(context.base64_error());
         }
         let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
         if padding > 2 || (!final_chunk && padding > 0) {
-            return Err(expected_base64_error(report_path, op, input_label));
+            return Err(context.base64_error());
         }
         if padding == 1 && chunk[2] == b'=' {
-            return Err(expected_base64_error(report_path, op, input_label));
+            return Err(context.base64_error());
         }
-        let a = expected_bytes_base64_value(chunk[0], report_path, op, input_label)?;
-        let b = expected_bytes_base64_value(chunk[1], report_path, op, input_label)?;
+        let a = expected_bytes_base64_value(chunk[0], context)?;
+        let b = expected_bytes_base64_value(chunk[1], context)?;
         let c = if chunk[2] == b'=' {
             0
         } else {
-            expected_bytes_base64_value(chunk[2], report_path, op, input_label)?
+            expected_bytes_base64_value(chunk[2], context)?
         };
         let d = if chunk[3] == b'=' {
             0
         } else {
-            expected_bytes_base64_value(chunk[3], report_path, op, input_label)?
+            expected_bytes_base64_value(chunk[3], context)?
         };
         let packed = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
         output.push(((packed >> 16) & 0xff) as u8);
@@ -19875,9 +20018,7 @@ fn expected_bytes_decode_base64(
 
 fn expected_bytes_base64_value(
     byte: u8,
-    report_path: &Path,
-    op: &boon_plan::PlanOp,
-    input_label: &str,
+    context: &ExpectedBytesCheckContext<'_>,
 ) -> RuntimeResult<u8> {
     match byte {
         b'A'..=b'Z' => Ok(byte - b'A'),
@@ -19885,21 +20026,8 @@ fn expected_bytes_base64_value(
         b'0'..=b'9' => Ok(byte - b'0' + 52),
         b'+' => Ok(62),
         b'/' => Ok(63),
-        _ => Err(expected_base64_error(report_path, op, input_label)),
+        _ => Err(context.base64_error()),
     }
-}
-
-fn expected_base64_error(
-    report_path: &Path,
-    op: &boon_plan::PlanOp,
-    input_label: &str,
-) -> Box<dyn std::error::Error + Send + Sync> {
-    format!(
-        "{} root Bytes/from_base64 update branch {} input `{input_label}` is invalid base64",
-        report_path.display(),
-        op.id.0
-    )
-    .into()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19915,38 +20043,21 @@ fn expected_bytes_endian_label(value: ExpectedBytesEndian) -> &'static str {
     }
 }
 
-fn expected_checked_numeric_range<'a>(
+fn expected_checked_numeric_range_with_context<'a>(
     data: &'a [u8],
     offset: usize,
     byte_count: usize,
     operation: &str,
-    report_path: &Path,
-    op: &boon_plan::PlanOp,
-    input_label: &str,
+    context: &ExpectedBytesCheckContext<'_>,
 ) -> RuntimeResult<&'a [u8]> {
     if !matches!(byte_count, 1 | 2 | 4 | 8) {
-        return Err(format!(
-            "{} root {operation} update branch {} byte_count {byte_count} is not supported",
-            report_path.display(),
-            op.id.0
-        )
-        .into());
+        return Err(context.range_unsupported_error(operation, byte_count));
     }
-    let end = offset.checked_add(byte_count).ok_or_else(|| {
-        format!(
-            "{} root {operation} update branch {} byte range overflows for `{input_label}`",
-            report_path.display(),
-            op.id.0
-        )
-    })?;
-    data.get(offset..end).ok_or_else(|| {
-        format!(
-            "{} root {operation} update branch {} byte range {offset}..{end} is out of bounds for `{input_label}`",
-            report_path.display(),
-            op.id.0
-        )
-        .into()
-    })
+    let end = offset
+        .checked_add(byte_count)
+        .ok_or_else(|| context.range_overflow_error(operation))?;
+    data.get(offset..end)
+        .ok_or_else(|| context.range_out_of_bounds_error(operation, offset, end, data.len()))
 }
 
 fn expected_bytes_read_unsigned(
@@ -19958,14 +20069,32 @@ fn expected_bytes_read_unsigned(
     op: &boon_plan::PlanOp,
     input_label: &str,
 ) -> RuntimeResult<i64> {
-    let slice = expected_checked_numeric_range(
+    expected_bytes_read_unsigned_with_context(
+        data,
+        offset,
+        byte_count,
+        endian,
+        &ExpectedBytesCheckContext::Root {
+            report_path,
+            op,
+            input_label,
+        },
+    )
+}
+
+fn expected_bytes_read_unsigned_with_context(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    context: &ExpectedBytesCheckContext<'_>,
+) -> RuntimeResult<i64> {
+    let slice = expected_checked_numeric_range_with_context(
         data,
         offset,
         byte_count,
         "Bytes/read_unsigned",
-        report_path,
-        op,
-        input_label,
+        context,
     )?;
     let mut bytes = [0u8; 8];
     let value = match endian {
@@ -19979,12 +20108,7 @@ fn expected_bytes_read_unsigned(
         }
     };
     if value > i64::MAX as u64 {
-        return Err(format!(
-            "{} root Bytes/read_unsigned update branch {} overflows Boon NUMBER",
-            report_path.display(),
-            op.id.0
-        )
-        .into());
+        return Err(context.read_unsigned_overflow_error());
     }
     Ok(value as i64)
 }
@@ -19998,14 +20122,32 @@ fn expected_bytes_read_signed(
     op: &boon_plan::PlanOp,
     input_label: &str,
 ) -> RuntimeResult<i64> {
-    let slice = expected_checked_numeric_range(
+    expected_bytes_read_signed_with_context(
+        data,
+        offset,
+        byte_count,
+        endian,
+        &ExpectedBytesCheckContext::Root {
+            report_path,
+            op,
+            input_label,
+        },
+    )
+}
+
+fn expected_bytes_read_signed_with_context(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    context: &ExpectedBytesCheckContext<'_>,
+) -> RuntimeResult<i64> {
+    let slice = expected_checked_numeric_range_with_context(
         data,
         offset,
         byte_count,
         "Bytes/read_signed",
-        report_path,
-        op,
-        input_label,
+        context,
     )?;
     Ok(match (byte_count, endian) {
         (1, _) => i8::from_ne_bytes([slice[0]]) as i64,
@@ -20037,22 +20179,40 @@ fn expected_bytes_write_unsigned(
     op: &boon_plan::PlanOp,
     input_label: &str,
 ) -> RuntimeResult<Vec<u8>> {
-    expected_checked_numeric_range(
+    expected_bytes_write_unsigned_with_context(
+        data,
+        offset,
+        byte_count,
+        endian,
+        value,
+        &ExpectedBytesCheckContext::Root {
+            report_path,
+            op,
+            input_label,
+        },
+    )
+}
+
+fn expected_bytes_write_unsigned_with_context(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    value: i64,
+    context: &ExpectedBytesCheckContext<'_>,
+) -> RuntimeResult<Vec<u8>> {
+    if matches!(context, ExpectedBytesCheckContext::Row { .. }) && value < 0 {
+        return Err(context.write_unsigned_negative_error(value));
+    }
+    expected_checked_numeric_range_with_context(
         data,
         offset,
         byte_count,
         "Bytes/write_unsigned",
-        report_path,
-        op,
-        input_label,
+        context,
     )?;
     if value < 0 {
-        return Err(format!(
-            "{} root Bytes/write_unsigned update branch {} value {value} is negative",
-            report_path.display(),
-            op.id.0
-        )
-        .into());
+        return Err(context.write_unsigned_negative_error(value));
     }
     let max = if byte_count == 8 {
         u64::MAX
@@ -20061,12 +20221,7 @@ fn expected_bytes_write_unsigned(
     };
     let value = value as u64;
     if value > max {
-        return Err(format!(
-            "{} root Bytes/write_unsigned update branch {} value overflows byte_count {byte_count}",
-            report_path.display(),
-            op.id.0
-        )
-        .into());
+        return Err(context.write_unsigned_overflow_error(byte_count));
     }
     let mut output = data.to_vec();
     let bytes = match endian {
@@ -20087,42 +20242,40 @@ fn expected_bytes_write_signed(
     op: &boon_plan::PlanOp,
     input_label: &str,
 ) -> RuntimeResult<Vec<u8>> {
-    expected_checked_numeric_range(
+    expected_bytes_write_signed_with_context(
+        data,
+        offset,
+        byte_count,
+        endian,
+        value,
+        &ExpectedBytesCheckContext::Root {
+            report_path,
+            op,
+            input_label,
+        },
+    )
+}
+
+fn expected_bytes_write_signed_with_context(
+    data: &[u8],
+    offset: usize,
+    byte_count: usize,
+    endian: ExpectedBytesEndian,
+    value: i64,
+    context: &ExpectedBytesCheckContext<'_>,
+) -> RuntimeResult<Vec<u8>> {
+    if matches!(context, ExpectedBytesCheckContext::Row { .. }) {
+        expected_bytes_validate_signed_write_value(byte_count, value, context)?;
+    }
+    expected_checked_numeric_range_with_context(
         data,
         offset,
         byte_count,
         "Bytes/write_signed",
-        report_path,
-        op,
-        input_label,
+        context,
     )?;
-    match byte_count {
-        1 if !(i8::MIN as i64..=i8::MAX as i64).contains(&value) => {
-            return Err(format!(
-                "{} root Bytes/write_signed update branch {} value overflows i8",
-                report_path.display(),
-                op.id.0
-            )
-            .into());
-        }
-        2 if !(i16::MIN as i64..=i16::MAX as i64).contains(&value) => {
-            return Err(format!(
-                "{} root Bytes/write_signed update branch {} value overflows i16",
-                report_path.display(),
-                op.id.0
-            )
-            .into());
-        }
-        4 if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) => {
-            return Err(format!(
-                "{} root Bytes/write_signed update branch {} value overflows i32",
-                report_path.display(),
-                op.id.0
-            )
-            .into());
-        }
-        1 | 2 | 4 | 8 => {}
-        _ => unreachable!("validated numeric byte count"),
+    if matches!(context, ExpectedBytesCheckContext::Root { .. }) {
+        expected_bytes_validate_signed_write_value(byte_count, value, context)?;
     }
     let mut output = data.to_vec();
     let bytes = match (byte_count, endian) {
@@ -20137,6 +20290,26 @@ fn expected_bytes_write_signed(
     };
     output[offset..offset + byte_count].copy_from_slice(&bytes);
     Ok(output)
+}
+
+fn expected_bytes_validate_signed_write_value(
+    byte_count: usize,
+    value: i64,
+    context: &ExpectedBytesCheckContext<'_>,
+) -> RuntimeResult<()> {
+    match byte_count {
+        1 if !(i8::MIN as i64..=i8::MAX as i64).contains(&value) => {
+            Err(context.write_signed_overflow_error("i8"))
+        }
+        2 if !(i16::MIN as i64..=i16::MAX as i64).contains(&value) => {
+            Err(context.write_signed_overflow_error("i16"))
+        }
+        4 if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) => {
+            Err(context.write_signed_overflow_error("i32"))
+        }
+        1 | 2 | 4 | 8 => Ok(()),
+        _ => Err(context.range_unsupported_error("Bytes/write_signed", byte_count)),
+    }
 }
 
 fn expected_resolve_plan_row_index(
@@ -24471,101 +24644,11 @@ fn expected_row_bytes_to_text(
 }
 
 fn expected_row_bytes_decode_hex(text: &str, report_path: &Path) -> RuntimeResult<Vec<u8>> {
-    let digits = text
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect::<Vec<_>>();
-    if digits.len() % 2 != 0 {
-        return Err(format!(
-            "{} row Bytes/from_hex input has odd hex digit count",
-            report_path.display()
-        )
-        .into());
-    }
-    let mut output = Vec::with_capacity(digits.len() / 2);
-    for chunk in digits.chunks_exact(2) {
-        let high = expected_bytes_hex_value(chunk[0]).ok_or_else(|| {
-            format!(
-                "{} row Bytes/from_hex input has invalid hex digit",
-                report_path.display()
-            )
-        })?;
-        let low = expected_bytes_hex_value(chunk[1]).ok_or_else(|| {
-            format!(
-                "{} row Bytes/from_hex input has invalid hex digit",
-                report_path.display()
-            )
-        })?;
-        output.push((high << 4) | low);
-    }
-    Ok(output)
+    expected_bytes_decode_hex_with_context(text, &ExpectedBytesCheckContext::Row { report_path })
 }
 
 fn expected_row_bytes_decode_base64(text: &str, report_path: &Path) -> RuntimeResult<Vec<u8>> {
-    let input = text
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect::<Vec<_>>();
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-    if input.len() % 4 != 0 {
-        return Err(expected_row_base64_error(report_path));
-    }
-    let mut output = Vec::with_capacity((input.len() / 4).saturating_mul(3));
-    for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
-        let final_chunk = chunk_index == input.len() / 4 - 1;
-        if chunk[0] == b'=' || chunk[1] == b'=' {
-            return Err(expected_row_base64_error(report_path));
-        }
-        let padding = chunk.iter().rev().take_while(|byte| **byte == b'=').count();
-        if padding > 2 || (!final_chunk && padding > 0) {
-            return Err(expected_row_base64_error(report_path));
-        }
-        if padding == 1 && chunk[2] == b'=' {
-            return Err(expected_row_base64_error(report_path));
-        }
-        let a = expected_row_bytes_base64_value(chunk[0], report_path)?;
-        let b = expected_row_bytes_base64_value(chunk[1], report_path)?;
-        let c = if chunk[2] == b'=' {
-            0
-        } else {
-            expected_row_bytes_base64_value(chunk[2], report_path)?
-        };
-        let d = if chunk[3] == b'=' {
-            0
-        } else {
-            expected_row_bytes_base64_value(chunk[3], report_path)?
-        };
-        let packed = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
-        output.push(((packed >> 16) & 0xff) as u8);
-        if padding < 2 {
-            output.push(((packed >> 8) & 0xff) as u8);
-        }
-        if padding < 1 {
-            output.push((packed & 0xff) as u8);
-        }
-    }
-    Ok(output)
-}
-
-fn expected_row_bytes_base64_value(byte: u8, report_path: &Path) -> RuntimeResult<u8> {
-    match byte {
-        b'A'..=b'Z' => Ok(byte - b'A'),
-        b'a'..=b'z' => Ok(byte - b'a' + 26),
-        b'0'..=b'9' => Ok(byte - b'0' + 52),
-        b'+' => Ok(62),
-        b'/' => Ok(63),
-        _ => Err(expected_row_base64_error(report_path)),
-    }
-}
-
-fn expected_row_base64_error(report_path: &Path) -> Box<dyn std::error::Error + Send + Sync> {
-    format!(
-        "{} row Bytes/from_base64 input is invalid base64",
-        report_path.display()
-    )
-    .into()
+    expected_bytes_decode_base64_with_context(text, &ExpectedBytesCheckContext::Row { report_path })
 }
 
 fn expected_row_bytes_endian(text: &str, report_path: &Path) -> RuntimeResult<ExpectedBytesEndian> {
@@ -24580,36 +24663,6 @@ fn expected_row_bytes_endian(text: &str, report_path: &Path) -> RuntimeResult<Ex
     }
 }
 
-fn expected_row_checked_numeric_range<'a>(
-    data: &'a [u8],
-    offset: usize,
-    byte_count: usize,
-    operation: &str,
-    report_path: &Path,
-) -> RuntimeResult<&'a [u8]> {
-    if !matches!(byte_count, 1 | 2 | 4 | 8) {
-        return Err(format!(
-            "{} row {operation} byte_count {byte_count} is not supported",
-            report_path.display()
-        )
-        .into());
-    }
-    let end = offset.checked_add(byte_count).ok_or_else(|| {
-        format!(
-            "{} row {operation} byte range overflows",
-            report_path.display()
-        )
-    })?;
-    data.get(offset..end).ok_or_else(|| {
-        format!(
-            "{} row {operation} byte range {offset}..{end} is out of bounds for length {}",
-            report_path.display(),
-            data.len()
-        )
-        .into()
-    })
-}
-
 fn expected_row_bytes_read_unsigned(
     data: &[u8],
     offset: usize,
@@ -24617,32 +24670,13 @@ fn expected_row_bytes_read_unsigned(
     endian: ExpectedBytesEndian,
     report_path: &Path,
 ) -> RuntimeResult<i64> {
-    let slice = expected_row_checked_numeric_range(
+    expected_bytes_read_unsigned_with_context(
         data,
         offset,
         byte_count,
-        "Bytes/read_unsigned",
-        report_path,
-    )?;
-    let mut bytes = [0u8; 8];
-    let value = match endian {
-        ExpectedBytesEndian::Little => {
-            bytes[..byte_count].copy_from_slice(slice);
-            u64::from_le_bytes(bytes)
-        }
-        ExpectedBytesEndian::Big => {
-            bytes[8 - byte_count..].copy_from_slice(slice);
-            u64::from_be_bytes(bytes)
-        }
-    };
-    if value > i64::MAX as u64 {
-        return Err(format!(
-            "{} row Bytes/read_unsigned overflows Boon NUMBER",
-            report_path.display()
-        )
-        .into());
-    }
-    Ok(value as i64)
+        endian,
+        &ExpectedBytesCheckContext::Row { report_path },
+    )
 }
 
 fn expected_row_bytes_read_signed(
@@ -24652,31 +24686,13 @@ fn expected_row_bytes_read_signed(
     endian: ExpectedBytesEndian,
     report_path: &Path,
 ) -> RuntimeResult<i64> {
-    let slice = expected_row_checked_numeric_range(
+    expected_bytes_read_signed_with_context(
         data,
         offset,
         byte_count,
-        "Bytes/read_signed",
-        report_path,
-    )?;
-    Ok(match (byte_count, endian) {
-        (1, _) => i8::from_ne_bytes([slice[0]]) as i64,
-        (2, ExpectedBytesEndian::Little) => i16::from_le_bytes([slice[0], slice[1]]) as i64,
-        (2, ExpectedBytesEndian::Big) => i16::from_be_bytes([slice[0], slice[1]]) as i64,
-        (4, ExpectedBytesEndian::Little) => {
-            i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as i64
-        }
-        (4, ExpectedBytesEndian::Big) => {
-            i32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]) as i64
-        }
-        (8, ExpectedBytesEndian::Little) => i64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        (8, ExpectedBytesEndian::Big) => i64::from_be_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => unreachable!("validated numeric byte count"),
-    })
+        endian,
+        &ExpectedBytesCheckContext::Row { report_path },
+    )
 }
 
 fn expected_row_bytes_write_unsigned(
@@ -24687,40 +24703,14 @@ fn expected_row_bytes_write_unsigned(
     value: i64,
     report_path: &Path,
 ) -> RuntimeResult<Vec<u8>> {
-    if value < 0 {
-        return Err(format!(
-            "{} row Bytes/write_unsigned numeric overflow",
-            report_path.display()
-        )
-        .into());
-    }
-    let _ = expected_row_checked_numeric_range(
+    expected_bytes_write_unsigned_with_context(
         data,
         offset,
         byte_count,
-        "Bytes/write_unsigned",
-        report_path,
-    )?;
-    let max = if byte_count == 8 {
-        u64::MAX
-    } else {
-        (1u64 << (byte_count * 8)) - 1
-    };
-    let value = value as u64;
-    if value > max {
-        return Err(format!(
-            "{} row Bytes/write_unsigned numeric overflow",
-            report_path.display()
-        )
-        .into());
-    }
-    let mut output = data.to_vec();
-    let bytes = match endian {
-        ExpectedBytesEndian::Little => value.to_le_bytes()[..byte_count].to_vec(),
-        ExpectedBytesEndian::Big => value.to_be_bytes()[8 - byte_count..].to_vec(),
-    };
-    output[offset..offset + byte_count].copy_from_slice(&bytes);
-    Ok(output)
+        endian,
+        value,
+        &ExpectedBytesCheckContext::Row { report_path },
+    )
 }
 
 fn expected_row_bytes_write_signed(
@@ -24731,62 +24721,14 @@ fn expected_row_bytes_write_signed(
     value: i64,
     report_path: &Path,
 ) -> RuntimeResult<Vec<u8>> {
-    match byte_count {
-        1 if !(i8::MIN as i64..=i8::MAX as i64).contains(&value) => {
-            return Err(format!(
-                "{} row Bytes/write_signed numeric overflow",
-                report_path.display()
-            )
-            .into());
-        }
-        2 if !(i16::MIN as i64..=i16::MAX as i64).contains(&value) => {
-            return Err(format!(
-                "{} row Bytes/write_signed numeric overflow",
-                report_path.display()
-            )
-            .into());
-        }
-        4 if !(i32::MIN as i64..=i32::MAX as i64).contains(&value) => {
-            return Err(format!(
-                "{} row Bytes/write_signed numeric overflow",
-                report_path.display()
-            )
-            .into());
-        }
-        1 | 2 | 4 | 8 => {}
-        _ => {
-            return Err(format!(
-                "{} row Bytes/write_signed byte_count {byte_count} is not supported",
-                report_path.display()
-            )
-            .into());
-        }
-    }
-    let _ = expected_row_checked_numeric_range(
+    expected_bytes_write_signed_with_context(
         data,
         offset,
         byte_count,
-        "Bytes/write_signed",
-        report_path,
-    )?;
-    let mut bytes = [0u8; 8];
-    match (byte_count, endian) {
-        (1, _) => bytes[0] = value as i8 as u8,
-        (2, ExpectedBytesEndian::Little) => {
-            bytes[..2].copy_from_slice(&(value as i16).to_le_bytes())
-        }
-        (2, ExpectedBytesEndian::Big) => bytes[..2].copy_from_slice(&(value as i16).to_be_bytes()),
-        (4, ExpectedBytesEndian::Little) => {
-            bytes[..4].copy_from_slice(&(value as i32).to_le_bytes())
-        }
-        (4, ExpectedBytesEndian::Big) => bytes[..4].copy_from_slice(&(value as i32).to_be_bytes()),
-        (8, ExpectedBytesEndian::Little) => bytes.copy_from_slice(&value.to_le_bytes()),
-        (8, ExpectedBytesEndian::Big) => bytes.copy_from_slice(&value.to_be_bytes()),
-        _ => unreachable!("validated byte count"),
-    }
-    let mut output = data.to_vec();
-    output[offset..offset + byte_count].copy_from_slice(&bytes[..byte_count]);
-    Ok(output)
+        endian,
+        value,
+        &ExpectedBytesCheckContext::Row { report_path },
+    )
 }
 
 fn expected_row_private_bytes_json(bytes: &[u8]) -> JsonValue {

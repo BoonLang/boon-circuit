@@ -20,6 +20,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type PlanExecutorResult<T> = Result<T, Box<dyn Error>>;
 
+fn plan_executor_no_fallback_counters(mut report: JsonValue) -> JsonValue {
+    let object = report
+        .as_object_mut()
+        .expect("PlanExecutor report counters attach only to JSON objects");
+    object.insert("runtime_ast_eval_count".to_owned(), json!(0));
+    object.insert("executable_string_path_count".to_owned(), json!(0));
+    object.insert("unknown_plan_op_count".to_owned(), json!(0));
+    object.insert("graph_rebuild_count".to_owned(), json!(0));
+    object.insert("graph_clones_per_item".to_owned(), json!(0));
+    report
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitialStateExecution {
     pub plan_hash: String,
@@ -519,19 +531,14 @@ pub fn assemble_source_route_command_output(
             .as_ref()
             .map(|path| path.display().to_string()),
     });
-    let command_output_core = json!({
+    let command_output_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-command-output-v1",
         "source": input.source_route,
         "target_state": input.target_state,
         "payload_byte_artifact_count": payload_report.artifacts.len(),
         "inline_byte_limit": input.inline_byte_limit,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
         "source_event_payload_bytes_core": payload_report.executor_report,
-    });
+    }));
     let mut plan_executor = input.plan_executor;
     if let Some(object) = plan_executor.as_object_mut() {
         object.insert(
@@ -1059,19 +1066,14 @@ pub fn select_explicit_root_scenario_steps(
         selected_indices.push(index);
         selected_step_ids.push(step.id.clone());
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-explicit-root-scenario-step-selection-v1",
         "scenario": scenario_name,
         "requested_step_ids": requested_step_ids,
         "selected_step_ids": selected_step_ids,
         "selected_indices": selected_indices,
         "scenario_step_count": steps.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(ExplicitRootScenarioStepSelection {
         selected_indices,
         selected_step_ids,
@@ -1104,7 +1106,7 @@ pub fn select_scenario_event_steps(
         .filter(|step| !step.has_expected_source_event)
         .map(|step| step.id.clone())
         .collect::<Vec<_>>();
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-scenario-events-step-selection-v1",
         "scenario": scenario_name,
         "selected_step_ids": selected_step_ids,
@@ -1112,12 +1114,7 @@ pub fn select_scenario_event_steps(
         "selected_indices": selected_indices,
         "all_indices": all_indices,
         "scenario_step_count": steps.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(ScenarioEventsStepSelection {
         all_indices,
         selected_indices,
@@ -2379,7 +2376,7 @@ where
         row_bool_deltas.clear();
     }
     let fields_after_refresh = row.fields.clone();
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-list-append-row-construction-v1",
         "list_id": list_id,
         "append_op_id": append_op_id,
@@ -2389,12 +2386,7 @@ where
         "bytes_field_count": bytes_field_count,
         "source_path_count": source_paths.len(),
         "row_bool_delta_count": row_bool_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     Ok(ListAppendRowConstruction {
         row,
@@ -2510,18 +2502,13 @@ where
         report_rows.push(mutation_record.report_row);
         appended_row_count += 1;
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-list-append-execution-v1",
         "visited_append_op_count": visited_append_op_count,
         "appended_row_count": appended_row_count,
         "source_bind_count": source_bind_count,
         "semantic_delta_count": semantic_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(ListAppendExecution {
         semantic_deltas,
         report_rows,
@@ -2571,7 +2558,7 @@ pub fn record_list_append_mutation(
         "trigger": input.trigger_value,
         "fields": input.fields_after_refresh,
     });
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-list-append-mutation-record-v1",
         "list_id": input.list_id,
         "append_op_id": input.append_op_id,
@@ -2579,12 +2566,7 @@ pub fn record_list_append_mutation(
         "generation": input.generation,
         "source_bind_count": source_bind_count,
         "semantic_delta_count": semantic_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     ListAppendMutationRecord {
         semantic_deltas,
@@ -2660,7 +2642,7 @@ pub fn record_list_remove_mutation(input: ListRemoveMutationInput) -> ListRemove
         "source_unbinds": source_unbinds,
         "row_fields": input.row_fields,
     });
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-list-remove-mutation-record-v1",
         "list_id": input.list_id,
         "remove_op_id": input.remove_op_id,
@@ -2669,12 +2651,7 @@ pub fn record_list_remove_mutation(input: ListRemoveMutationInput) -> ListRemove
         "generation": input.generation,
         "source_unbind_count": source_unbind_count,
         "semantic_delta_count": semantic_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     ListRemoveMutationRecord {
         semantic_deltas,
@@ -2988,19 +2965,14 @@ pub fn remove_list_rows_for_source_event(
         }
     }
     let derived_count = report_derived.len();
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-list-remove-execution-v1",
         "visited_remove_op_count": visited_remove_op_count,
         "removed_row_count": removed_row_count,
         "source_unbind_count": source_unbind_count,
         "derived_count": derived_count,
         "semantic_delta_count": semantic_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(ListRemoveExecution {
         semantic_deltas,
         report_rows,
@@ -5665,17 +5637,12 @@ pub fn evaluate_list_remove_predicate(
             .into());
         }
     };
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-list-remove-predicate-evaluator-v1",
         "matches": matches,
         "key": row.key,
         "generation": row.generation,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(ListRemovePredicateEvaluation {
         matches,
         executor_report,
@@ -6438,18 +6405,13 @@ pub fn assemble_initial_state_report(
     list_view_summary: &JsonValue,
     list_retains: &[JsonValue],
 ) -> InitialStateReportAssembly {
-    let report_assembly_core = json!({
+    let report_assembly_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-initial-state-report-assembly-v1",
         "initialized_state_count": initialized_state_count,
         "source_route_metadata_count": source_route_metadata_count,
         "list_projection_count": executed_list_projection_count,
         "list_retain_count": executed_list_retain_count,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let executor_report = json!({
         "executor": "cpu-plan-initial-state-v1",
         "initialized_state_count": initialized_state_count,
@@ -6752,17 +6714,12 @@ pub fn initialize_root_bytes_storage(
     }
 
     let plan_hash = plan_sha256(plan)?;
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-bytes-storage-initializer-v1",
         "plan_hash": plan_hash,
         "initialized_bytes_state_count": private_bytes.len(),
         "fixed_byte_bank_count": fixed_byte_banks.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     Ok(RootBytesStorageInitialization {
         initialized_bytes_state_count: private_bytes.len(),
@@ -6944,7 +6901,7 @@ pub fn initialize_root_state(plan: &MachinePlan) -> PlanExecutorResult<PlanExecu
     initialized_state_count += root_initial_field_copy_count;
     let initialized_source_event_transform_count = source_event_transform_commits.len();
     let bytes_initialization = initialize_root_bytes_storage(plan, &root_state)?;
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-state-initializer-v1",
         "initialized_state_count": initialized_state_count,
         "root_initial_field_copy_count": root_initial_field_copy_count,
@@ -6953,12 +6910,7 @@ pub fn initialize_root_state(plan: &MachinePlan) -> PlanExecutorResult<PlanExecu
         "initialized_bytes_state_count": bytes_initialization.initialized_bytes_state_count,
         "fixed_byte_bank_count": bytes_initialization.fixed_byte_bank_count,
         "bytes_initialization_core": bytes_initialization.executor_report,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(PlanExecutorRootState {
         root_state,
         private_bytes: bytes_initialization.private_bytes,
@@ -8971,19 +8923,14 @@ pub fn evaluate_root_bytes_source_payload_commit(
         &format!("root BYTES source-payload commit branch {}", op_id.0),
     )?;
     let value = executor_bytes.report_json();
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-bytes-source-payload-commit-v1",
         "update_op_id": op_id.0,
         "target_state_id": output_state_id.0,
         "source_payload_field": field,
         "byte_len": executor_bytes.byte_len(),
         "digest": executor_bytes.digest(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootBytesSourcePayloadCommit {
         target_state_id: output_state_id,
         value,
@@ -9906,19 +9853,14 @@ pub fn apply_root_bytes_state_transition(
         bytes_owner.clear_bytes_for_state(target_state_id);
         "clear"
     };
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-bytes-state-transition-v1",
         "update_op_id": op_id.0,
         "target_state_id": target_state_id.0,
         "mode": mode,
         "private_bytes_state_count": bytes_owner.private_bytes_state_count(),
         "fixed_byte_bank_count": bytes_owner.fixed_byte_bank_count(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootBytesStateTransition {
         target_state_id,
         mode,
@@ -10057,7 +9999,7 @@ pub fn select_source_route_update(
     }
 
     let plan_hash = plan_sha256(plan)?;
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-selection-v1",
         "source": source_route,
         "source_id": source_id.0,
@@ -10068,12 +10010,7 @@ pub fn select_source_route_update(
         "update_constant_id": update_constant_id.map(|id| id.0),
         "selected_op_indexed": op.indexed,
         "selected_op_unresolved_executable_ref_count": op.unresolved_executable_ref_count,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     Ok(SourceRouteSelection {
         plan_hash,
@@ -10115,7 +10052,7 @@ pub fn resolve_source_route_execution_context(
                 selection.update_op_id.0
             )
         })?;
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-execution-context-v1",
         "source": source_route,
         "source_id": selection.source_id.0,
@@ -10126,12 +10063,7 @@ pub fn resolve_source_route_execution_context(
         "selected_op_indexed": update_op.indexed,
         "selected_op_unresolved_executable_ref_count": update_op.unresolved_executable_ref_count,
         "selection_core": selection.executor_report,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(SourceRouteExecutionContext {
         selection,
         source_route_slot,
@@ -10203,17 +10135,12 @@ pub fn order_indexed_update_semantic_deltas(
                 .flat_map(|execution| execution.semantic_deltas.iter().cloned()),
         );
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-update-delta-ordering-v1",
         "bulk_indexed_update": bulk_indexed_update,
         "execution_count": executions.len(),
         "semantic_delta_count": semantic_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     IndexedUpdateDeltaOrdering {
         semantic_deltas,
         executor_report,
@@ -10227,7 +10154,7 @@ pub fn select_unscoped_indexed_update_targets(
     event: &IndexedUpdateTargetEvent,
     list_rows: &BTreeMap<usize, Vec<PlanExecutorListRow>>,
 ) -> PlanExecutorResult<IndexedUpdateTargetSelection> {
-    let mut executor_report = json!({
+    let mut executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-update-target-selection-v1",
         "source": event.source,
         "bulk_indexed_update": false,
@@ -10235,12 +10162,7 @@ pub fn select_unscoped_indexed_update_targets(
         "list": null,
         "target_count": 0,
         "skip_reason": null,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let skip = |executor_report: &mut JsonValue, reason: &str| -> IndexedUpdateTargetSelection {
         if let Some(object) = executor_report.as_object_mut() {
             object.insert("skip_reason".to_owned(), json!(reason));
@@ -10415,19 +10337,14 @@ where
         .into_iter()
         .flat_map(|execution| execution.report_rows)
         .collect::<Vec<_>>();
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-update-batch-execution-v1",
         "op_id": op.id.0,
         "bulk_indexed_update": bulk_indexed_update,
         "updated_row_count": updated_row_count,
         "report_row_count": report_rows.len(),
         "semantic_delta_count": ordered_indexed_deltas.semantic_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(IndexedUpdateBatchExecution {
         semantic_deltas: ordered_indexed_deltas.semantic_deltas,
         report_rows,
@@ -10451,19 +10368,14 @@ fn indexed_json_update_outcome(
                 (Some(kind), payload, constant_id, constant_value)
             })
             .unwrap_or((None, JsonValue::Null, JsonValue::Null, JsonValue::Null));
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-json-update-evaluator-v1",
         "update_op_id": op_id.0,
         "supported": supported,
         "unsupported_reason": unsupported_reason,
         "target_state_id": target_state_id.0,
         "expression_kind": expression_kind,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     IndexedJsonUpdateEvaluation {
         supported,
         unsupported_reason,
@@ -11483,7 +11395,7 @@ pub fn root_update_candidate_from_executed(
 pub fn assemble_root_runtime_branch_update(
     input: RootRuntimeBranchUpdateInput,
 ) -> RootExecutedUpdate {
-    let runtime_branch_execution_core = json!({
+    let runtime_branch_execution_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-runtime-branch-update-execution-v1",
         "expression_kind": input.expression_kind.clone(),
         "source_payload_field": input.source_payload_field.clone(),
@@ -11494,12 +11406,7 @@ pub fn assemble_root_runtime_branch_update(
         "state_write_core": input.state_write_core.clone(),
         "bytes_state_core": input.bytes_state_core.clone(),
         "runtime_branch_core": input.runtime_branch_core.clone(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let mut executor_core = if input.runtime_branch_core.is_null() {
         runtime_branch_execution_core.clone()
     } else {
@@ -11624,7 +11531,7 @@ pub fn assemble_root_update_commit(
         "value": input.value,
         "changed": input.changed,
     });
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-update-commit-assembly-v1",
         "source_id": input.source_id.0,
         "target_state_id": input.target_state_id,
@@ -11632,12 +11539,7 @@ pub fn assemble_root_update_commit(
         "candidate_update_op_count": candidate_update_op_count,
         "changed": input.changed,
         "emitted_semantic_delta": semantic_delta.is_some(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootUpdateCommitAssembly {
         touched_state,
         semantic_delta_signature,
@@ -11723,7 +11625,7 @@ pub fn commit_ordered_root_update_candidates(
         executed_update_branch_count += 1;
     }
 
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-update-commit-batch-v1",
         "source_id": source_id.0,
         "candidate_count": candidate_count,
@@ -11731,12 +11633,7 @@ pub fn commit_ordered_root_update_candidates(
         "missing_executed_update_count": missing_executed_update_count,
         "touched_state_count": touched_states.len(),
         "semantic_delta_count": semantic_deltas.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     Ok(RootUpdateCommitBatch {
         touched_states,
@@ -11773,19 +11670,14 @@ pub fn apply_root_update_storage_transition(
         fixed_mutation,
         op_id,
     )?;
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-update-storage-transition-v1",
         "update_op_id": op_id.0,
         "target_state_id": target_state_id.0,
         "target_state": target_state_label,
         "bytes_transition_mode": bytes_transition.mode,
         "bytes_transition_core": bytes_transition.executor_report,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootUpdateStorageTransition {
         target_state_id,
         target_state_label: target_state_label.to_owned(),
@@ -11918,18 +11810,13 @@ where
             duplicate_update: false,
             skipped_update: true,
             runtime_branch_used: false,
-            executor_report: json!({
+            executor_report: plan_executor_no_fallback_counters(json!({
                 "executor": "cpu-plan-root-update-branch-collection-v1",
                 "update_op_id": op.id.0,
                 "target_state_id": state_id.0,
                 "mode": "skipped_by_guard",
                 "json_update_core": json_update_execution.executor_report,
-                "runtime_ast_eval_count": 0,
-                "executable_string_path_count": 0,
-                "unknown_plan_op_count": 0,
-                "graph_rebuild_count": 0,
-                "graph_clones_per_item": 0,
-            }),
+            })),
         });
     }
 
@@ -11945,18 +11832,13 @@ where
                 duplicate_update: false,
                 skipped_update: true,
                 runtime_branch_used,
-                executor_report: json!({
+                executor_report: plan_executor_no_fallback_counters(json!({
                     "executor": "cpu-plan-root-update-branch-collection-v1",
                     "update_op_id": op.id.0,
                     "target_state_id": state_id.0,
                     "mode": "runtime_branch_noop",
                     "json_update_core": json_update_execution.executor_report,
-                    "runtime_ast_eval_count": 0,
-                    "executable_string_path_count": 0,
-                    "unknown_plan_op_count": 0,
-                    "graph_rebuild_count": 0,
-                    "graph_clones_per_item": 0,
-                }),
+                })),
             });
         };
         executed
@@ -11976,19 +11858,14 @@ where
             duplicate_update: true,
             skipped_update: false,
             runtime_branch_used,
-            executor_report: json!({
+            executor_report: plan_executor_no_fallback_counters(json!({
                 "executor": "cpu-plan-root-update-branch-collection-v1",
                 "update_op_id": op.id.0,
                 "target_state_id": state_id.0,
                 "mode": "duplicate_candidate",
                 "candidate_record_core": candidate_record.executor_report,
                 "json_update_core": json_update_execution.executor_report,
-                "runtime_ast_eval_count": 0,
-                "executable_string_path_count": 0,
-                "unknown_plan_op_count": 0,
-                "graph_rebuild_count": 0,
-                "graph_clones_per_item": 0,
-            }),
+            })),
         });
     }
     if executed.bytes_value.is_none() && executed.fixed_bytes_mutation.is_none() {
@@ -12016,19 +11893,14 @@ where
         duplicate_update: false,
         skipped_update: false,
         runtime_branch_used,
-        executor_report: json!({
+        executor_report: plan_executor_no_fallback_counters(json!({
             "executor": "cpu-plan-root-update-branch-collection-v1",
             "update_op_id": op.id.0,
             "target_state_id": state_id.0,
             "mode": "inserted_candidate",
             "candidate_record_core": candidate_record.executor_report,
             "json_update_core": json_update_execution.executor_report,
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0,
-        }),
+        })),
     })
 }
 
@@ -12038,19 +11910,14 @@ fn root_update_candidate_record_report(
     state_id: usize,
     op_ids: &[usize],
 ) -> JsonValue {
-    json!({
+    plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-update-candidate-tracker-v1",
         "kind": kind,
         "source": source_route,
         "state_id": state_id,
         "candidate_update_op_ids": op_ids,
         "candidate_update_op_count": op_ids.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    })
+    }))
 }
 
 fn field_set_delta_target_key(delta: &JsonValue) -> PlanExecutorResult<Option<String>> {
@@ -12117,7 +11984,7 @@ pub fn execute_source_route_json_update(
         &root_state,
     )?;
     if !evaluation.supported || evaluation.skipped_by_guard {
-        let executor_report = json!({
+        let executor_report = plan_executor_no_fallback_counters(json!({
             "executor": "cpu-plan-source-route-json-execution-v1",
             "source": source_route,
             "source_id": selection.source_id.0,
@@ -12130,12 +11997,7 @@ pub fn execute_source_route_json_update(
             "selection_core": selection.executor_report,
             "evaluation_core": evaluation.executor_report,
             "state_write_core": JsonValue::Null,
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0,
-        });
+        }));
         return Ok(SourceRouteJsonExecution {
             plan_hash: selection.plan_hash,
             source_label: selection.source_label,
@@ -12177,7 +12039,7 @@ pub fn execute_source_route_json_update(
         semantic_delta_signatures.push(format!("FieldSet:{}", selection.target_state_label));
         semantic_deltas.push(delta);
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-json-execution-v1",
         "source": source_route,
         "source_id": selection.source_id.0,
@@ -12197,12 +12059,7 @@ pub fn execute_source_route_json_update(
         "state_summary": state_summary,
         "semantic_delta_signatures": semantic_delta_signatures,
         "semantic_deltas": semantic_deltas,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(SourceRouteJsonExecution {
         plan_hash: selection.plan_hash,
         source_label: selection.source_label,
@@ -12273,7 +12130,7 @@ pub fn validate_source_route_full_execution(
             .into());
         }
         let state_summary = json!({ target_state_label.clone(): value.clone() });
-        let executor_report = json!({
+        let executor_report = plan_executor_no_fallback_counters(json!({
             "executor": "cpu-plan-source-route-full-execution-validation-v1",
             "target_state": target_state_label,
             "target_state_id": target_state_id.0,
@@ -12281,12 +12138,7 @@ pub fn validate_source_route_full_execution(
             "selected_op_indexed": true,
             "matched": true,
             "indexed_update": indexed_update,
-            "runtime_ast_eval_count": 0,
-            "executable_string_path_count": 0,
-            "unknown_plan_op_count": 0,
-            "graph_rebuild_count": 0,
-            "graph_clones_per_item": 0,
-        });
+        }));
         return Ok(SourceRouteFullExecutionValidation {
             target_state_id,
             target_state_label,
@@ -12310,19 +12162,14 @@ pub fn validate_source_route_full_execution(
         .into());
     }
     let state_summary = json!({ target_state_label.clone(): value.clone() });
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-full-execution-validation-v1",
         "target_state": target_state_label,
         "target_state_id": target_state_id.0,
         "selected_update_op_id": selected_update_op.id.0,
         "selected_op_indexed": false,
         "matched": true,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(SourceRouteFullExecutionValidation {
         target_state_id,
         target_state_label,
@@ -12351,7 +12198,7 @@ pub fn select_source_route_execution_surface(
     } else {
         SourceRouteExecutionSurfaceKind::FullExecution
     };
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-execution-surface-v1",
         "source": execution.source_label,
         "source_id": execution.source_id.0,
@@ -12365,12 +12212,7 @@ pub fn select_source_route_execution_surface(
             SourceRouteExecutionSurfaceKind::PlanJson => "plan-json",
             SourceRouteExecutionSurfaceKind::FullExecution => "full-execution",
         },
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(SourceRouteExecutionSurface {
         kind,
         route_core_value_is_bytes,
@@ -12543,20 +12385,15 @@ pub fn assemble_source_route_report(
     let full_executor = full_executor_report
         .as_object()
         .ok_or("root-scenario executor report is not an object")?;
-    let report_assembly_core = json!({
+    let report_assembly_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-report-assembly-v1",
         "source": source_route,
         "source_id": source_id.0,
         "target_state": target_state,
         "target_state_id": target_state_id.0,
         "update_op_id": update_op.id.0,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
-    let route_surface = json!({
+    }));
+    let route_surface = plan_executor_no_fallback_counters(json!({
         "source": source_route,
         "source_id": source_id.0,
         "target_state": target_state,
@@ -12572,19 +12409,14 @@ pub fn assemble_source_route_report(
         "global_typed_lowering_executable": plan.capability_summary.typed_lowering_executable,
         "global_cpu_plan_executor_complete": plan.capability_summary.cpu_plan_executor_complete,
         "global_unresolved_executable_ref_count": plan.capability_summary.unresolved_executable_ref_count,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
         "selected_op_unresolved_executable_ref_count": update_op.unresolved_executable_ref_count,
         "selected_op_indexed": update_op.indexed,
         "executor_core": route_selection_core,
         "route_execution_core": route_execution_core,
         "full_execution_validation_core": full_execution_validation_core,
         "report_assembly_core": report_assembly_core,
-    });
-    let executor_report = json!({
+    }));
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-v1",
         "source": source_route,
         "source_id": source_id.0,
@@ -12624,11 +12456,6 @@ pub fn assemble_source_route_report(
             .get("emitted_source_unbind_count")
             .cloned()
             .unwrap_or_else(|| json!(0)),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
         "executor_core": route_selection_core,
         "route_execution_core": route_execution_core,
         "full_execution_validation_core": full_execution_validation_core,
@@ -12638,7 +12465,7 @@ pub fn assemble_source_route_report(
         "semantic_delta_signatures": semantic_delta_signatures,
         "semantic_deltas": semantic_deltas,
         "per_step": per_step,
-    });
+    }));
     Ok(SourceRouteReportAssembly {
         route_surface,
         executor_report,
@@ -12658,18 +12485,13 @@ pub fn assemble_source_route_command_report(
     let report_status = "pass";
     let exit_status = 0;
     let report_status_basis = "plan-executor-product";
-    let command_report_assembly_core = json!({
+    let command_report_assembly_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-route-command-report-assembly-v1",
         "plan_executor_status": plan_executor_status,
         "status": report_status,
         "report_status_basis": report_status_basis,
         "exit_status": exit_status,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let report = json!({
         "status": report_status,
         "plan_executor_status": plan_executor_status,
@@ -12732,15 +12554,10 @@ pub fn assemble_source_route_command_report(
 pub fn assemble_root_scenario_command_output(
     input: RootScenarioCommandOutputInput,
 ) -> RootScenarioCommandOutput {
-    let command_output_core = json!({
+    let command_output_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-scenario-command-output-v1",
         "selected_step_count": input.selected_step_ids.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let mut plan_executor = input.plan_executor;
     if let Some(object) = plan_executor.as_object_mut() {
         object.insert(
@@ -12791,18 +12608,13 @@ pub fn assemble_root_scenario_command_report(
     let report_status = "pass";
     let exit_status = 0;
     let report_status_basis = "plan-executor-product";
-    let command_report_assembly_core = json!({
+    let command_report_assembly_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-scenario-command-report-assembly-v1",
         "plan_executor_status": plan_executor_status,
         "status": report_status,
         "report_status_basis": report_status_basis,
         "exit_status": exit_status,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let report = json!({
         "status": report_status,
         "plan_executor_status": plan_executor_status,
@@ -12863,16 +12675,11 @@ pub fn assemble_scenario_events_command_output(
         .get("selected_step_ids")
         .and_then(JsonValue::as_array)
         .map_or(0, Vec::len);
-    let command_output_core = json!({
+    let command_output_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-scenario-events-command-output-v1",
         "selected_step_count": selected_step_count,
         "assertion_only_covered": input.assertion_only_covered,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let mut plan_executor = input.plan_executor;
     if let Some(object) = plan_executor.as_object_mut() {
         object.insert(
@@ -12926,19 +12733,14 @@ pub fn assemble_scenario_events_command_report(
     let exit_status = if accepted { 0 } else { 1 };
     let report_status_basis = "plan-executor-product-plus-assertion-coverage";
     let measurement_mode = "proof";
-    let command_report_assembly_core = json!({
+    let command_report_assembly_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-scenario-events-command-report-assembly-v1",
         "assertion_only_covered": input.assertion_only_covered,
         "plan_executor_status": plan_executor_status,
         "status": report_status,
         "report_status_basis": report_status_basis,
         "exit_status": exit_status,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let selected_step_ids = input
         .plan_executor_coverage
         .get("selected_step_ids")
@@ -13040,7 +12842,7 @@ pub fn assemble_root_scenario_report(
     bytes_storage_counters: &JsonValue,
     bytes_storage_no_copy: bool,
 ) -> PlanExecutorResult<RootScenarioReportAssembly> {
-    let report_assembly_core = json!({
+    let report_assembly_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-scenario-report-assembly-v1",
         "selected_step_count": selected_step_count,
         "semantic_delta_count": semantic_delta_signatures.len(),
@@ -13048,13 +12850,8 @@ pub fn assemble_root_scenario_report(
         "assertion_checkpoint_count": assertion_checkpoints.len(),
         "list_projection_count": executed_list_projection_count,
         "list_retain_count": executed_list_retain_count,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
-    let executor_report = json!({
+    }));
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-list-scenario-v1",
         "selected_step_count": selected_step_count,
         "initialized_root_state_count": initialized_root_state_count,
@@ -13074,11 +12871,6 @@ pub fn assemble_root_scenario_report(
         "executed_list_projection_chunk_count": executed_list_projection_chunk_count,
         "projected_list_row_count": projected_list_row_count,
         "list_slot_count": plan.storage_layout.list_slots.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
         "report_assembly_core": report_assembly_core,
         "state_summary": state_summary,
         "list_summary": list_summary,
@@ -13092,7 +12884,7 @@ pub fn assemble_root_scenario_report(
         "assertion_checkpoints": assertion_checkpoints,
         "bytes_storage_counters": bytes_storage_counters,
         "bytes_storage_no_copy": bytes_storage_no_copy,
-    });
+    }));
     Ok(RootScenarioReportAssembly { executor_report })
 }
 
@@ -13125,7 +12917,7 @@ pub fn assemble_root_scenario_step_report(
     bytes_storage_counters: JsonValue,
     bytes_storage_no_copy: bool,
 ) -> RootScenarioStepReportAssembly {
-    let report_assembly_core = json!({
+    let report_assembly_core = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-scenario-step-report-assembly-v1",
         "step_id": step_id,
         "source": source,
@@ -13133,12 +12925,7 @@ pub fn assemble_root_scenario_step_report(
         "semantic_delta_count": semantic_delta_signatures.len(),
         "update_count": updates.len(),
         "indexed_update_count": indexed_updates.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     let step_report = json!({
         "step_id": step_id,
         "source": source,
@@ -13375,7 +13162,7 @@ pub fn select_root_source_event_work(
     }
 
     let plan_hash = plan_sha256(plan)?;
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-source-event-work-selection-v1",
         "source": source_route,
         "source_id": source_id.0,
@@ -13388,12 +13175,7 @@ pub fn select_root_source_event_work(
         "derived_op_count": derived_op_count,
         "has_list_remove_work": has_list_remove_work,
         "root_update_key_gate": root_update_key_gate,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     Ok(RootSourceEventWork {
         plan_hash,
@@ -13450,7 +13232,7 @@ pub fn dispatch_root_scenario_step(
         )
         .into());
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-scenario-step-dispatch-v1",
         "source": source_route,
         "source_id": work.source_id.0,
@@ -13467,12 +13249,7 @@ pub fn dispatch_root_scenario_step(
         "root_update_key_matches": root_update_key_matches,
         "executable_work": executable_work,
         "work_selection_core": work.executor_report,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootScenarioStepDispatch {
         plan_hash: work.plan_hash,
         source_label: work.source_label,
@@ -13501,19 +13278,14 @@ pub fn validate_root_scenario_materialized_work(
         )
         .into());
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-scenario-materialized-work-v1",
         "source": source_route,
         "update_op_count": update_op_count,
         "derived_value_count": derived_value_count,
         "has_list_remove_work": has_list_remove_work,
         "executable_work": executable_work,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootScenarioMaterializedWork {
         executable_work,
         executor_report,
@@ -13717,7 +13489,7 @@ pub fn prepare_root_scenario_step(
         );
     }
 
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-scenario-step-preparation-v1",
         "source": source_route,
         "source_id": source_id.0,
@@ -13727,12 +13499,7 @@ pub fn prepare_root_scenario_step(
         "root_update_key_matches": dispatch.root_update_key_matches,
         "dispatch_core": dispatch.executor_report,
         "materialized_work_core": materialized_work.executor_report,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
 
     Ok(RootScenarioStepPreparation {
         source_id,
@@ -13813,17 +13580,12 @@ pub fn assemble_source_derived_step_deltas(
         semantic_deltas.push(delta);
         reports.push(report);
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-source-derived-step-deltas-v1",
         "derived_value_count": derived_values.len(),
         "semantic_delta_count": semantic_deltas.len(),
         "report_count": reports.len(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     SourceDerivedStepDeltas {
         semantic_delta_signatures,
         semantic_deltas,
@@ -14554,7 +14316,7 @@ pub fn select_root_update_execution_surface(
     } else {
         RootUpdateExecutionSurfaceKind::RuntimeBranch
     };
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-update-execution-surface-v1",
         "update_op_id": op_id.0,
         "json_supported": evaluation.supported,
@@ -14565,12 +14327,7 @@ pub fn select_root_update_execution_surface(
             RootUpdateExecutionSurfaceKind::RuntimeBranch => "runtime-branch",
             RootUpdateExecutionSurfaceKind::SkippedByGuard => "skipped-by-guard",
         },
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     RootUpdateExecutionSurface {
         kind,
         core_value_is_bytes,
@@ -14633,7 +14390,7 @@ pub fn execute_root_json_update_branch(
         None
     };
     let executor_evaluator_report = evaluator_report.clone();
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-json-update-execution-v1",
         "update_op_id": op.id.0,
         "source_id": source_id.0,
@@ -14644,12 +14401,7 @@ pub fn execute_root_json_update_branch(
         },
         "executed_update_ready": executed.is_some(),
         "evaluator_core": executor_evaluator_report,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootJsonUpdateExecution {
         surface_kind: execution_surface.kind,
         executed,
@@ -14680,18 +14432,13 @@ pub fn apply_root_json_state_value(
             "value": value.clone(),
         })
     });
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-json-state-write-v1",
         "update_op_id": update_op_id.0,
         "target_state": target_state_label,
         "target_state_id": target_state_id.0,
         "changed": changed,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(RootJsonStateWrite {
         target_state_id,
         target_state_label,
@@ -15208,7 +14955,7 @@ fn root_json_update_outcome(
                 (Some(kind), payload, constant_id, constant_value)
             })
             .unwrap_or((None, JsonValue::Null, JsonValue::Null, JsonValue::Null));
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-json-update-evaluator-v1",
         "update_op_id": op_id.0,
         "supported": supported,
@@ -15216,12 +14963,7 @@ fn root_json_update_outcome(
         "unsupported_reason": unsupported_reason,
         "target_state_id": target_state_id.map(|id| id.0),
         "expression_kind": expression_kind,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     RootJsonUpdateEvaluation {
         supported,
         skipped_by_guard,
@@ -18288,19 +18030,14 @@ fn root_bytes_read_outcome_with_bytes(
     update_constant_id: JsonValue,
     update_constant_value: JsonValue,
 ) -> RootBytesReadEvaluation {
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-bytes-read-evaluator-v1",
         "update_op_id": op_id.0,
         "target_state_id": target_state_id.map(|id| id.0),
         "supported": supported,
         "unsupported_reason": unsupported_reason,
         "expression_kind": expression_kind,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     RootBytesReadEvaluation {
         supported,
         unsupported_reason: executor_report
@@ -18330,19 +18067,14 @@ fn indexed_bytes_read_outcome(
     update_constant_id: JsonValue,
     update_constant_value: JsonValue,
 ) -> IndexedBytesReadEvaluation {
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-bytes-read-evaluator-v1",
         "update_op_id": op_id.0,
         "target_state_id": target_state_id.map(|id| id.0),
         "supported": supported,
         "unsupported_reason": unsupported_reason,
         "expression_kind": expression_kind,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     IndexedBytesReadEvaluation {
         supported,
         unsupported_reason: executor_report
@@ -18374,7 +18106,7 @@ fn indexed_bytes_write_outcome(
     update_constant_id: JsonValue,
     update_constant_value: JsonValue,
 ) -> IndexedBytesWriteEvaluation {
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-indexed-bytes-write-evaluator-v1",
         "update_op_id": op_id.0,
         "target_state_id": target_state_id.map(|id| id.0),
@@ -18382,12 +18114,7 @@ fn indexed_bytes_write_outcome(
         "unsupported_reason": unsupported_reason,
         "expression_kind": expression_kind,
         "bytes_commit": bytes.is_some(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     IndexedBytesWriteEvaluation {
         supported,
         unsupported_reason,
@@ -18447,7 +18174,7 @@ fn root_bytes_write_outcome_with_host_effect(
     update_constant_id: JsonValue,
     update_constant_value: JsonValue,
 ) -> RootBytesWriteEvaluation {
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-bytes-write-evaluator-v1",
         "update_op_id": op_id.0,
         "target_state_id": target_state_id.map(|id| id.0),
@@ -18456,12 +18183,7 @@ fn root_bytes_write_outcome_with_host_effect(
         "expression_kind": expression_kind,
         "fixed_mutation": fixed_mutation.is_some(),
         "bytes_commit": bytes.is_some(),
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     RootBytesWriteEvaluation {
         supported,
         unsupported_reason,
@@ -18637,7 +18359,7 @@ pub fn list_row_default_fields(
             }
         }
     }
-    let executor_report = json!({
+    let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-list-row-default-fields-v1",
         "list_id": list_slot.list_id.0,
         "scope_id": list_slot.scope_id.map(|scope_id| scope_id.0),
@@ -18645,12 +18367,7 @@ pub fn list_row_default_fields(
         "inferred_record_bool_default_count": inferred_record_bool_default_count,
         "bytes_field_count": bytes_field_count,
         "fixed_byte_bank_count": fixed_byte_bank_count,
-        "runtime_ast_eval_count": 0,
-        "executable_string_path_count": 0,
-        "unknown_plan_op_count": 0,
-        "graph_rebuild_count": 0,
-        "graph_clones_per_item": 0,
-    });
+    }));
     Ok(ListRowDefaultFields {
         fields,
         private_bytes,

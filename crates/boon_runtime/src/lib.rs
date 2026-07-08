@@ -42,12 +42,9 @@ use boon_compiler::{
 };
 #[cfg(test)]
 use boon_compiler::{
-    compile_parsed_program_to_runtime_ir, compiler_derived_equation_plan_from_ir,
-    compiler_generic_derived_plan_from_ir, compiler_list_projections_from_ir,
-    compiler_runtime_program_from_ir, compiler_source_route_root_text_transform_targets_from_ir,
-    compiler_source_route_router_targets_from_ir, compiler_source_route_sources_from_ir,
+    compile_parsed_program_to_runtime_ir, compiler_generic_derived_plan_from_ir,
+    compiler_runtime_program_from_ir, compiler_source_route_sources_from_ir,
     compiler_storage_initial_rows_from_ir, compiler_storage_list_slots_from_ir,
-    compiler_typed_program_inventory_counts_from_ir,
     compiler_typed_program_report_metadata_from_ir, parse_project, parse_source,
 };
 #[cfg(test)]
@@ -143,7 +140,7 @@ use smallvec::SmallVec;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::ops::Bound;
@@ -3896,6 +3893,7 @@ struct PlanExecutorRuntimeState {
     initialized_state_count: usize,
     list_store: PlanExecutorListStore,
     list_next_keys: BTreeMap<usize, u64>,
+    root_derived_dependency_index: PlanRootDerivedDependencyIndex,
     bytes_counter_baseline: RuntimeBytesStorageCounters,
     list_append_row_bool_delta_lists: BTreeSet<usize>,
     per_step: Vec<JsonValue>,
@@ -3914,23 +3912,314 @@ struct PlanExecutorRuntimeState {
     assertion_checkpoints: Vec<JsonValue>,
 }
 
+#[derive(Clone, Default)]
+struct PlanRootDerivedDependencyIndex {
+    ops: BTreeMap<usize, boon_plan::PlanOp>,
+    by_state: BTreeMap<StateId, BTreeSet<usize>>,
+    by_field: BTreeMap<usize, BTreeSet<usize>>,
+    output_to_op: BTreeMap<usize, usize>,
+    output_by_label: BTreeMap<String, usize>,
+    required_output_fields: BTreeSet<usize>,
+    published_output_fields: BTreeSet<usize>,
+    observed_root_paths: BTreeSet<String>,
+    observed_filtering_enabled: bool,
+}
+
+impl PlanRootDerivedDependencyIndex {
+    fn new(plan: &MachinePlan, observed_root_paths: &BTreeSet<String>) -> Self {
+        let mut index = Self::default();
+        for op in plan
+            .regions
+            .iter()
+            .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+            .flat_map(|region| region.ops.iter())
+            .filter(|op| !op.indexed)
+            .filter(|op| plan_root_derived_op_supported(op))
+        {
+            let Some(ValueRef::Field(output_id)) = op.output else {
+                continue;
+            };
+            let op_id = op.id.0;
+            index.output_to_op.insert(output_id.0, op_id);
+            let label = plan_derived_field_label(plan, output_id.0);
+            index.output_by_label.insert(label.clone(), output_id.0);
+            index
+                .output_by_label
+                .insert(local_field_name(&label), output_id.0);
+            for input in &op.inputs {
+                match input {
+                    ValueRef::State(state_id) => {
+                        index.by_state.entry(*state_id).or_default().insert(op_id);
+                    }
+                    ValueRef::Field(field_id) => {
+                        index.by_field.entry(field_id.0).or_default().insert(op_id);
+                    }
+                    _ => {}
+                }
+            }
+            index.ops.insert(op_id, op.clone());
+        }
+        index.observed_filtering_enabled = !observed_root_paths.is_empty();
+        index.observed_root_paths = observed_root_paths.clone();
+        index.published_output_fields =
+            index.initial_published_output_fields(plan, observed_root_paths);
+        index.required_output_fields =
+            index.required_output_fields_for_published_outputs(&index.published_output_fields);
+        index
+    }
+
+    fn initial_published_output_fields(
+        &self,
+        plan: &MachinePlan,
+        observed_root_paths: &BTreeSet<String>,
+    ) -> BTreeSet<usize> {
+        if observed_root_paths.is_empty() {
+            return self.output_to_op.keys().copied().collect();
+        }
+        self.output_to_op
+            .keys()
+            .copied()
+            .filter(|field_id| {
+                let label = plan_derived_field_label(plan, *field_id);
+                root_label_is_observed_by_paths(observed_root_paths, &label)
+                    || root_label_is_observed_by_paths(
+                        observed_root_paths,
+                        &local_field_name(&label),
+                    )
+            })
+            .collect()
+    }
+
+    fn required_output_fields_for_published_outputs(
+        &self,
+        published: &BTreeSet<usize>,
+    ) -> BTreeSet<usize> {
+        let mut required = published.clone();
+        let mut queue = published.iter().copied().collect::<VecDeque<_>>();
+        while let Some(field_id) = queue.pop_front() {
+            let Some(op_id) = self.output_to_op.get(&field_id) else {
+                continue;
+            };
+            let Some(op) = self.ops.get(op_id) else {
+                continue;
+            };
+            for input in &op.inputs {
+                let ValueRef::Field(input_field_id) = input else {
+                    continue;
+                };
+                if self.output_to_op.contains_key(&input_field_id.0)
+                    && required.insert(input_field_id.0)
+                {
+                    queue.push_back(input_field_id.0);
+                }
+            }
+        }
+        required
+    }
+
+    fn enqueue_initial_candidates(
+        &self,
+        dirty_state_ids: &BTreeSet<StateId>,
+        dirty_field_ids: &BTreeSet<usize>,
+        queue: &mut VecDeque<usize>,
+        queued: &mut BTreeSet<usize>,
+    ) {
+        let mut candidates = BTreeSet::new();
+        for state_id in dirty_state_ids {
+            if let Some(op_ids) = self.by_state.get(state_id) {
+                candidates.extend(op_ids.iter().copied());
+            }
+        }
+        for field_id in dirty_field_ids {
+            if let Some(op_ids) = self.by_field.get(field_id) {
+                candidates.extend(op_ids.iter().copied());
+            }
+        }
+        for op_id in candidates {
+            if self.op_output_is_required(op_id) && queued.insert(op_id) {
+                queue.push_back(op_id);
+            }
+        }
+    }
+
+    fn enqueue_field_dependents(
+        &self,
+        field_id: usize,
+        queue: &mut VecDeque<usize>,
+        queued: &mut BTreeSet<usize>,
+    ) {
+        if let Some(op_ids) = self.by_field.get(&field_id) {
+            for op_id in op_ids {
+                if self.op_output_is_required(*op_id) && queued.insert(*op_id) {
+                    queue.push_back(*op_id);
+                }
+            }
+        }
+    }
+
+    fn op_output_is_required(&self, op_id: usize) -> bool {
+        self.ops.get(&op_id).is_some_and(|op| {
+            let Some(ValueRef::Field(output_id)) = op.output else {
+                return false;
+            };
+            self.required_output_fields.contains(&output_id.0)
+        })
+    }
+
+    fn output_should_publish(&self, field_id: usize) -> bool {
+        if !self.observed_filtering_enabled {
+            return true;
+        }
+        self.published_output_fields.contains(&field_id)
+    }
+
+    fn should_filter_publication(&self) -> bool {
+        self.observed_filtering_enabled
+    }
+
+    fn field_id_for_delta(&self, delta: &JsonValue) -> Option<usize> {
+        if delta.get("kind").and_then(JsonValue::as_str) != Some("FieldSet") {
+            return None;
+        }
+        let field_path = delta.get("field_path").and_then(JsonValue::as_str)?;
+        self.output_by_label.get(field_path).copied()
+    }
+
+    fn delta_should_publish(&self, delta: &JsonValue) -> bool {
+        if !self.observed_filtering_enabled {
+            return true;
+        }
+        if let Some(field_id) = self.field_id_for_delta(delta) {
+            return self.output_should_publish(field_id);
+        }
+        let Some(field_path) = delta.get("field_path").and_then(JsonValue::as_str) else {
+            return false;
+        };
+        root_label_is_observed_by_paths(&self.observed_root_paths, field_path)
+            || root_label_is_observed_by_paths(
+                &self.observed_root_paths,
+                &local_field_name(field_path),
+            )
+    }
+}
+
 #[derive(Clone)]
 struct PlanExecutorLiveSession {
     plan: Arc<MachinePlan>,
     generic_output_plan: RuntimeGenericDerivedPlan,
+    observed_root_paths: BTreeSet<String>,
     state: PlanExecutorRuntimeState,
     host_file_root: Option<PathBuf>,
     next_step: usize,
 }
 
+fn order_root_update_ops_for_staged_dependencies(
+    ops: Vec<boon_plan::PlanOp>,
+) -> Vec<boon_plan::PlanOp> {
+    if ops.len() < 2 {
+        return ops;
+    }
+    let mut writers_by_state: BTreeMap<StateId, Vec<usize>> = BTreeMap::new();
+    for (index, op) in ops.iter().enumerate() {
+        if let Some(ValueRef::State(state_id)) = op.output {
+            writers_by_state.entry(state_id).or_default().push(index);
+        }
+    }
+    if writers_by_state.is_empty() {
+        return ops;
+    }
+
+    let mut edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); ops.len()];
+    let mut indegree = vec![0usize; ops.len()];
+    for (consumer_index, op) in ops.iter().enumerate() {
+        for input in &op.inputs {
+            let ValueRef::State(input_state_id) = input else {
+                continue;
+            };
+            let Some(writers) = writers_by_state.get(input_state_id) else {
+                continue;
+            };
+            for producer_index in writers {
+                if *producer_index == consumer_index {
+                    continue;
+                }
+                if edges[*producer_index].insert(consumer_index) {
+                    indegree[consumer_index] += 1;
+                }
+            }
+        }
+    }
+    if indegree.iter().all(|degree| *degree == 0) {
+        return ops;
+    }
+
+    let mut ready = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut ordered_indexes = Vec::with_capacity(ops.len());
+    while let Some(index) = ready.pop_front() {
+        ordered_indexes.push(index);
+        for dependent in edges[index].iter().copied() {
+            indegree[dependent] = indegree[dependent].saturating_sub(1);
+            if indegree[dependent] == 0 {
+                ready.push_back(dependent);
+            }
+        }
+    }
+    if ordered_indexes.len() != ops.len() {
+        return ops;
+    }
+    ordered_indexes
+        .into_iter()
+        .map(|index| ops[index].clone())
+        .collect()
+}
+
 impl PlanExecutorRuntimeState {
     fn new(plan: &MachinePlan) -> RuntimeResult<Self> {
+        Self::new_with_observed(plan, &BTreeSet::new())
+    }
+
+    fn new_with_observed(
+        plan: &MachinePlan,
+        observed_root_paths: &BTreeSet<String>,
+    ) -> RuntimeResult<Self> {
         let (mut root_state, root_bytes_initialization_core, initialized_state_count) =
             plan_root_scalar_initial_state(plan)?;
         let mut list_store = PlanExecutorListStore::from(initialize_plan_list_state(plan)?);
         list_store.refresh_startup_fields(plan, &root_state.root_state)?;
-        let initial_list_derived_values = root_pure_number_compare_values(plan, &list_store)?
+        let root_derived_dependency_index =
+            PlanRootDerivedDependencyIndex::new(plan, observed_root_paths);
+        let mut initial_root_derived_values =
+            cheap_plan_root_derived_values(plan, &root_state.root_state, &list_store)?;
+        if root_derived_dependency_index.should_filter_publication() {
+            let observed_values = initial_observed_plan_root_derived_values(
+                &root_derived_dependency_index,
+                plan,
+                &root_state.root_state,
+                &list_store,
+            )?;
+            for (field_id, value) in observed_values {
+                initial_root_derived_values.insert(field_id, value);
+            }
+        }
+        if let Ok(root_expression_values) =
+            evaluate_plan_root_row_expression_derived_values(plan, &root_state.root_state)
+        {
+            for (field_id, value) in root_expression_values {
+                initial_root_derived_values
+                    .entry(field_id.0)
+                    .or_insert(value);
+            }
+        }
+        let initial_list_derived_values = initial_root_derived_values
             .into_iter()
+            .filter(|(field_id, _)| {
+                let label = plan_derived_field_label(plan, *field_id);
+                !root_state.root_state.contains_key(&label)
+            })
             .map(|(field_id, value)| (FieldId(field_id), value))
             .collect::<BTreeMap<_, _>>();
         let initial_list_derived_commits = commit_plan_source_derived_values_to_root_state(
@@ -3956,6 +4245,7 @@ impl PlanExecutorRuntimeState {
             initialized_state_count,
             list_store,
             list_next_keys,
+            root_derived_dependency_index,
             bytes_counter_baseline: runtime_bytes_storage_counters_snapshot(),
             list_append_row_bool_delta_lists: BTreeSet::new(),
             per_step: Vec::new(),
@@ -3992,20 +4282,29 @@ impl PlanExecutorRuntimeState {
             return Ok(());
         }
 
+        let step_profile_started = Instant::now();
+        let mut runtime_phase_ms = serde_json::Map::new();
         let step_bytes_counter_start = runtime_bytes_storage_counters_snapshot();
         let generic_event = GenericSourceEvent::require(step)?;
         let event = live_source_event_from_generic(&generic_event);
         let root_json_event = root_json_source_event_from_live(&event);
+        let root_derived_values_before_updates =
+            cached_plan_root_derived_values(plan, &self.root_state.root_state);
+        let phase_started = Instant::now();
         let step_preparation = prepare_plan_root_scenario_step(
             plan,
             generic_event.source,
             &root_json_event,
             &self.root_state.root_state,
         )?;
+        runtime_phase_ms.insert(
+            "prepare_root_scenario_step".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
         let source_id = step_preparation.source_id;
         let source_route_slot = &step_preparation.source_route_slot;
         let derived_values = step_preparation.derived_values;
-        let route_ops = step_preparation.route_ops;
+        let route_ops = order_root_update_ops_for_staged_dependencies(step_preparation.route_ops);
         let root_update_key_matches = step_preparation.root_update_key_matches;
         let root_dispatch_report = step_preparation.root_dispatch_report;
 
@@ -4020,9 +4319,15 @@ impl PlanExecutorRuntimeState {
         let mut indexed_updates = Vec::new();
         let mut pending_indexed_deltas = Vec::new();
         let mut list_removes = Vec::new();
-        let root_derived_values_before_updates =
-            plan_executor_root_derived_values(plan, &self.root_state.root_state, &self.list_store)?;
-        let source_derived_step = assemble_plan_source_derived_step_deltas(plan, &derived_values);
+        let phase_started = Instant::now();
+        let changed_source_derived_values =
+            changed_plan_source_derived_values(plan, &self.root_state.root_state, &derived_values);
+        let source_derived_step =
+            assemble_plan_source_derived_step_deltas(plan, &changed_source_derived_values);
+        let mut dirty_root_field_ids = changed_source_derived_values
+            .keys()
+            .map(|field_id| field_id.0)
+            .collect::<BTreeSet<_>>();
         for (signature, delta) in source_derived_step
             .semantic_delta_signatures
             .iter()
@@ -4047,7 +4352,12 @@ impl PlanExecutorRuntimeState {
             &derived_values,
         );
         derived.extend(root_source_derived_commits);
+        runtime_phase_ms.insert(
+            "source_derived_commit".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
 
+        let phase_started = Instant::now();
         let append_result = self.list_store.append_rows_for_derived_values(
             plan,
             &mut self.list_next_keys,
@@ -4070,7 +4380,12 @@ impl PlanExecutorRuntimeState {
         }
         self.executed_list_append_count += append_result.appended_row_count;
         self.emitted_source_bind_count += append_result.source_bind_count;
+        runtime_phase_ms.insert(
+            "append_rows_for_derived_values".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
 
+        let phase_started = Instant::now();
         let remove_event = PlanExecutorLiveSourceEvent {
             source: generic_event.source,
             text: generic_event.text,
@@ -4103,7 +4418,12 @@ impl PlanExecutorRuntimeState {
         self.executed_derived_value_count += remove_result.derived_count;
         derived.extend(remove_result.report_derived);
         list_removes.extend(remove_result.report_rows);
+        runtime_phase_ms.insert(
+            "remove_rows_for_source_event".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
 
+        let phase_started = Instant::now();
         let mut row_resolution_cache = BTreeMap::new();
         for op in &route_ops {
             if !root_update_key_matches {
@@ -4122,6 +4442,7 @@ impl PlanExecutorRuntimeState {
                         &generic_event,
                         &mut self.list_store,
                         &mut row_resolution_cache,
+                        &self.root_state.root_state,
                         &root_derived_values_before_updates,
                         host_file_root,
                     )
@@ -4161,7 +4482,7 @@ impl PlanExecutorRuntimeState {
                             row_event.target_key = Some(target.key);
                             row_event.target_generation = Some(target.generation);
                             let mut per_row_resolution_cache = BTreeMap::new();
-                            plan_executor_list_store_execute_indexed_update_branch(
+                            match plan_executor_list_store_execute_indexed_update_branch(
                                 plan,
                                 op,
                                 source_id,
@@ -4169,16 +4490,34 @@ impl PlanExecutorRuntimeState {
                                 &row_event,
                                 &mut self.list_store,
                                 &mut per_row_resolution_cache,
+                                &self.root_state.root_state,
                                 &root_derived_values_before_updates,
                                 host_file_root,
                             )
-                            .map_err(|error| -> Box<dyn std::error::Error> {
-                                format!(
+                            {
+                                Ok(execution) => Ok(execution),
+                                Err(error)
+                                    if indexed_update_missing_row_local_input(&error.to_string()) =>
+                                {
+                                    Ok(IndexedUpdateBranchExecution {
+                                        semantic_deltas: Vec::new(),
+                                        report_rows: vec![json!({
+                                            "op_id": op.id.0,
+                                            "source_id": source_id.0,
+                                            "key": target.key,
+                                            "generation": target.generation,
+                                            "skipped": true,
+                                            "skip_reason": "missing_row_local_input",
+                                        })],
+                                        updated_row_count: 0,
+                                    })
+                                }
+                                Err(error) => Err(format!(
                                     "PlanExecutor indexed update op {} per-row override for source {}: {error}",
                                     op.id.0, source_id.0
                                 )
-                                .into()
-                            })
+                                .into()),
+                            }
                         } else {
                             plan_executor_list_store_execute_indexed_update_branch(
                                 plan,
@@ -4188,6 +4527,7 @@ impl PlanExecutorRuntimeState {
                                 &generic_event,
                                 &mut self.list_store,
                                 &mut row_resolution_cache,
+                                &self.root_state.root_state,
                                 &root_derived_values_before_updates,
                                 host_file_root,
                             )
@@ -4235,7 +4575,7 @@ impl PlanExecutorRuntimeState {
                     .into()
                 })
             };
-            let collection = collect_plan_root_update_candidate_for_step(
+            collect_plan_root_update_candidate_for_step(
                 plan,
                 op,
                 source_id,
@@ -4247,14 +4587,13 @@ impl PlanExecutorRuntimeState {
                 &mut touched_updates,
                 &mut runtime_branch,
             )?;
-            if collection.inserted_update {
-                refresh_plan_root_row_expression_derived_values_in_state(
-                    plan,
-                    &mut staged_root_state.root_state,
-                );
-            }
         }
+        runtime_phase_ms.insert(
+            "route_ops_collect_updates".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
 
+        let phase_started = Instant::now();
         let root_update_commit_batch = commit_plan_ordered_root_update_candidates(
             &mut self.root_state,
             plan,
@@ -4275,13 +4614,21 @@ impl PlanExecutorRuntimeState {
             changed_root_state_ids_from_update_reports(&root_update_commit_batch.update_reports);
         updates.extend(root_update_commit_batch.update_reports);
         self.executed_update_branch_count += root_update_commit_batch.executed_update_branch_count;
-        pending_indexed_deltas.extend(
-            plan_executor_list_store_refresh_indexed_derived_after_root_changes(
-                plan,
-                &mut self.list_store,
-                &changed_root_state_ids,
-            )?,
+        runtime_phase_ms.insert(
+            "commit_root_updates".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
         );
+
+        let phase_started = Instant::now();
+        if !changed_root_state_ids.is_empty() {
+            pending_indexed_deltas.extend(
+                plan_executor_list_store_refresh_indexed_derived_after_root_changes(
+                    plan,
+                    &mut self.list_store,
+                    &changed_root_state_ids,
+                )?,
+            );
+        }
         let pending_indexed_deltas = coalesce_plan_field_set_deltas(pending_indexed_deltas)?;
         for delta in &pending_indexed_deltas {
             let signature = plan_json_delta_signature(delta)?;
@@ -4290,39 +4637,91 @@ impl PlanExecutorRuntimeState {
             self.semantic_deltas.push(delta.clone());
             step_deltas.push(delta.clone());
         }
-        let root_list_derived_values_after_updates =
-            plan_executor_root_derived_values(plan, &self.root_state.root_state, &self.list_store)?;
-        let root_list_derived_changes = changed_plan_root_derived_deltas(
-            plan,
-            &root_derived_values_before_updates,
-            &root_list_derived_values_after_updates,
+        runtime_phase_ms.insert(
+            "indexed_followup_refresh".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
         );
-        commit_root_list_derived_values_to_root_state(
-            plan,
-            &mut self.root_state.root_state,
-            &root_list_derived_values_after_updates,
-        );
-        for (delta, report) in root_list_derived_changes {
-            if root_field_set_delta_already_recorded(&step_deltas, &delta) {
-                continue;
+
+        let phase_started = Instant::now();
+        let list_structure_changed =
+            append_result.appended_row_count > 0 || !list_removes.is_empty();
+        let root_or_list_changed = !changed_root_state_ids.is_empty()
+            || !pending_indexed_deltas.is_empty()
+            || list_structure_changed
+            || !dirty_root_field_ids.is_empty();
+        if root_or_list_changed {
+            let use_broad_root_derived_refresh =
+                list_structure_changed || !pending_indexed_deltas.is_empty();
+            let root_list_derived_values_after_updates = if use_broad_root_derived_refresh {
+                cheap_plan_root_derived_values(plan, &self.root_state.root_state, &self.list_store)?
+            } else {
+                targeted_plan_root_derived_values(
+                    &self.root_derived_dependency_index,
+                    plan,
+                    &self.root_state.root_state,
+                    &self.list_store,
+                    &changed_root_state_ids,
+                    &mut dirty_root_field_ids,
+                )?
+            };
+            let root_list_derived_changes = changed_plan_root_derived_deltas(
+                plan,
+                &root_derived_values_before_updates,
+                &root_list_derived_values_after_updates,
+            );
+            commit_root_list_derived_values_to_root_state(
+                plan,
+                &mut self.root_state.root_state,
+                &root_list_derived_values_after_updates,
+            );
+            for (delta, report) in root_list_derived_changes {
+                if !self
+                    .root_derived_dependency_index
+                    .delta_should_publish(&delta)
+                {
+                    continue;
+                }
+                if root_field_set_delta_already_recorded(&step_deltas, &delta) {
+                    continue;
+                }
+                let signature = plan_json_delta_signature(&delta)?;
+                step_signatures.push(signature.clone());
+                self.semantic_delta_signatures.push(signature);
+                self.semantic_deltas.push(delta.clone());
+                step_deltas.push(delta);
+                derived.push(report);
+                self.executed_derived_value_count += 1;
             }
-            let signature = plan_json_delta_signature(&delta)?;
-            step_signatures.push(signature.clone());
-            self.semantic_delta_signatures.push(signature);
-            self.semantic_deltas.push(delta.clone());
-            step_deltas.push(delta);
-            derived.push(report);
-            self.executed_derived_value_count += 1;
         }
-        let step_retain_execution = self
-            .list_store
-            .materialize_retains(plan, &self.root_state.root_state)?;
+        runtime_phase_ms.insert(
+            "root_derived_refresh".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
+
+        let phase_started = Instant::now();
+        let retain_inputs_dirty = plan_retain_inputs_dirty(
+            plan,
+            &changed_root_state_ids,
+            &dirty_root_field_ids,
+            list_structure_changed || !pending_indexed_deltas.is_empty(),
+        );
+        let step_retain_execution = if retain_inputs_dirty {
+            self.list_store
+                .materialize_retains(plan, &self.root_state.root_state)?
+        } else {
+            Default::default()
+        };
         self.executed_list_retain_count += step_retain_execution.executed_count;
         self.executed_list_view_count += step_retain_execution.view_count;
         self.retained_list_row_count += step_retain_execution.retained_row_count;
+        runtime_phase_ms.insert(
+            "retain_materialization".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
         let step_bytes_counters = runtime_bytes_storage_counters_snapshot()
             .saturating_delta_since(step_bytes_counter_start);
-        let step_report = assemble_plan_root_scenario_step_report(
+        let phase_started = Instant::now();
+        let mut step_report = assemble_plan_root_scenario_step_report(
             &step.id,
             generic_event.source,
             source_id,
@@ -4350,6 +4749,20 @@ impl PlanExecutorRuntimeState {
             step_bytes_counters.report_json(),
             step_bytes_counters.no_runtime_byte_copies(),
         );
+        runtime_phase_ms.insert(
+            "report_assembly".to_owned(),
+            json!(runtime_elapsed_ms(phase_started)),
+        );
+        runtime_phase_ms.insert(
+            "total".to_owned(),
+            json!(runtime_elapsed_ms(step_profile_started)),
+        );
+        if let Some(report) = step_report.step_report.as_object_mut() {
+            report.insert(
+                "runtime_phase_ms".to_owned(),
+                JsonValue::Object(runtime_phase_ms),
+            );
+        }
         self.per_step.push(step_report.step_report);
         Ok(())
     }
@@ -4369,11 +4782,19 @@ impl PlanExecutorRuntimeState {
         let plan_hash = plan_sha256(plan)?;
         let bytes_storage_counters = runtime_bytes_storage_counters_snapshot()
             .saturating_delta_since(self.bytes_counter_baseline);
-        let state_summary = JsonValue::Object(self.root_state.root_state);
+        let mut state_summary_map = self.root_state.root_state;
+        let root_list_values =
+            cheap_plan_root_derived_values(plan, &state_summary_map, &self.list_store)?;
+        for (field_id, value) in root_list_values {
+            let label = plan_derived_field_label(plan, field_id);
+            state_summary_map.insert(label.clone(), value.clone());
+            state_summary_map.insert(local_field_name(&label), value);
+        }
         let list_summary = plan_list_summary(plan, &self.list_store);
         let projection_execution = self
             .list_store
-            .materialize_projections(plan, state_summary.as_object().unwrap())?;
+            .materialize_projections(plan, &state_summary_map)?;
+        let state_summary = JsonValue::Object(state_summary_map);
         let retain_execution = self
             .list_store
             .materialize_retains(plan, state_summary.as_object().unwrap())?;
@@ -4463,6 +4884,11 @@ impl PlanExecutorLiveSession {
         Self::from_machine_plan(
             compiled.plan,
             runtime_plan.compiled.generic_derived_runtime.clone(),
+            runtime_plan
+                .compiled
+                .document_lowering
+                .observed_root_paths
+                .clone(),
             None,
         )
     }
@@ -4479,6 +4905,11 @@ impl PlanExecutorLiveSession {
         Self::from_machine_plan(
             compiled.plan,
             runtime_plan.compiled.generic_derived_runtime.clone(),
+            runtime_plan
+                .compiled
+                .document_lowering
+                .observed_root_paths
+                .clone(),
             None,
         )
     }
@@ -4491,14 +4922,21 @@ impl PlanExecutorLiveSession {
         Self::from_machine_plan(
             compiled.plan,
             runtime_plan.compiled.generic_derived_runtime.clone(),
+            runtime_plan
+                .compiled
+                .document_lowering
+                .observed_root_paths
+                .clone(),
             source_path.parent().map(Path::to_path_buf),
         )
     }
 
     fn from_compiled_artifact(artifact: &CompiledArtifact) -> RuntimeResult<Self> {
+        let document_lowering = artifact.runtime_document_lowering_tables()?;
         Self::from_machine_plan(
             artifact.machine_plan()?,
             artifact.runtime_generic_derived_plan()?,
+            document_lowering.observed_root_paths,
             None,
         )
     }
@@ -4506,13 +4944,16 @@ impl PlanExecutorLiveSession {
     fn from_machine_plan(
         plan: MachinePlan,
         generic_output_plan: RuntimeGenericDerivedPlan,
+        observed_root_paths: BTreeSet<String>,
         host_file_root: Option<PathBuf>,
     ) -> RuntimeResult<Self> {
         let plan = Arc::new(plan);
-        let state = PlanExecutorRuntimeState::new(plan.as_ref())?;
+        let state =
+            PlanExecutorRuntimeState::new_with_observed(plan.as_ref(), &observed_root_paths)?;
         Ok(Self {
             plan,
             generic_output_plan,
+            observed_root_paths,
             state,
             host_file_root,
             next_step: 1,
@@ -5352,6 +5793,7 @@ fn plan_executor_step_report_to_live_turn_output(
         })
         .transpose()?
         .unwrap_or_default();
+    let render_patches = plan_executor_semantic_deltas_to_render_patches(&semantic_deltas);
     let dirty_key_count = step_report
         .get("touched_state_summary")
         .and_then(JsonValue::as_object)
@@ -5368,11 +5810,12 @@ fn plan_executor_step_report_to_live_turn_output(
         .get("executed_derived_value_count")
         .and_then(JsonValue::as_u64)
         .unwrap_or(0) as usize;
+    let runtime_step_profile = plan_executor_step_profile_from_report(step_report);
     Ok(LiveTurnOutput {
         semantic_deltas,
-        render_patches: Vec::new(),
+        render_patches,
         apply_step_ms,
-        runtime_step_profile: LiveRuntimeStepProfile::default(),
+        runtime_step_profile,
         dirty_key_count,
         recomputed_field_count: executed_update_branch_count
             .saturating_add(executed_indexed_update_count)
@@ -5386,6 +5829,101 @@ fn plan_executor_step_report_to_live_turn_output(
         recompute_candidate_samples: Vec::new(),
         recomputed_field_samples: Vec::new(),
     })
+}
+
+fn plan_executor_step_profile_from_report(step_report: &JsonValue) -> LiveRuntimeStepProfile {
+    let phase = step_report
+        .get("runtime_phase_ms")
+        .and_then(JsonValue::as_object);
+    let phase_ms = |name: &str| -> f64 {
+        phase
+            .and_then(|phase| phase.get(name))
+            .and_then(JsonValue::as_f64)
+            .unwrap_or(0.0)
+    };
+    LiveRuntimeStepProfile {
+        source_action_input_ms: phase_ms("prepare_root_scenario_step"),
+        source_actions_ms: phase_ms("route_ops_collect_updates") + phase_ms("commit_root_updates"),
+        source_action_route_setup_ms: phase_ms("route_ops_collect_updates"),
+        source_action_eval_ms: phase_ms("commit_root_updates"),
+        derived_recompute_ms: phase_ms("root_derived_refresh"),
+        list_delta_ms: phase_ms("append_rows_for_derived_values")
+            + phase_ms("remove_rows_for_source_event")
+            + phase_ms("indexed_followup_refresh"),
+        root_materialization_ms: phase_ms("retain_materialization"),
+        metrics_snapshot_ms: phase_ms("report_assembly"),
+        extra_source_semantics_ms: phase_ms("source_derived_commit"),
+        root_lowering_ms: phase_ms("total"),
+        ..LiveRuntimeStepProfile::default()
+    }
+}
+
+fn plan_executor_semantic_deltas_to_render_patches(
+    semantic_deltas: &[SemanticDelta<'static>],
+) -> Vec<RenderPatch<'static>> {
+    semantic_deltas
+        .iter()
+        .filter_map(plan_executor_semantic_delta_to_render_patch)
+        .collect()
+}
+
+fn plan_executor_semantic_delta_to_render_patch(
+    delta: &SemanticDelta<'static>,
+) -> Option<RenderPatch<'static>> {
+    let mut patch = match delta.kind {
+        "FieldSet" => {
+            let field = delta.field_path.as_ref()?;
+            if let Some(list) = delta.list_id.as_ref() {
+                list_row_field_patch(
+                    "PatchListRowField",
+                    list.as_ref(),
+                    delta.key?,
+                    delta.generation.unwrap_or(1),
+                    field.as_ref(),
+                    delta.value.clone(),
+                )
+            } else {
+                patch(
+                    "PatchRootField",
+                    RenderTarget::Static(Cow::Owned(field.to_string())),
+                    delta.value.clone(),
+                )
+            }
+        }
+        "ListInsert" | "ListRemove" | "ListMove" => invalidated_patch(
+            "InvalidateDocument",
+            RenderInvalidation::ListStructure,
+            RenderTarget::Static(Cow::Borrowed("document")),
+            ProtocolValue::Text(Cow::Owned(
+                delta
+                    .list_id
+                    .as_deref()
+                    .or(delta.field_path.as_deref())
+                    .unwrap_or(delta.kind)
+                    .to_owned(),
+            )),
+        ),
+        "SourceBind" | "SourceUnbind" => invalidated_patch(
+            "InvalidateDocument",
+            RenderInvalidation::SourceBinding,
+            RenderTarget::Static(Cow::Borrowed("document")),
+            ProtocolValue::Text(Cow::Owned(
+                delta
+                    .field_path
+                    .as_deref()
+                    .or(delta.list_id.as_deref())
+                    .unwrap_or(delta.kind)
+                    .to_owned(),
+            )),
+        ),
+        _ => return None,
+    };
+    patch.source_id = delta.source_id;
+    patch.bind_epoch = delta.bind_epoch;
+    patch.list_id = patch.list_id.or_else(|| delta.list_id.clone());
+    patch.key = patch.key.or(delta.key);
+    patch.generation = patch.generation.or(delta.generation);
+    Some(patch)
 }
 
 fn plan_json_semantic_delta_to_typed(delta: &JsonValue) -> RuntimeResult<SemanticDelta<'static>> {
@@ -5479,11 +6017,25 @@ fn execute_machine_plan_initial_state_inner(
     let source_route_metadata_count = core_execution.source_route_metadata_count;
     let mut list_store = PlanExecutorListStore::from(initialize_plan_list_state(plan)?);
     let plan_hash = core_execution.plan_hash;
-    let state_summary = core_execution.state_summary;
-    list_store.refresh_startup_fields(plan, state_summary.as_object().unwrap())?;
+    let mut state_summary_map = core_execution
+        .state_summary
+        .as_object()
+        .cloned()
+        .ok_or("initial state summary is not an object")?;
+    list_store.refresh_startup_fields(plan, &state_summary_map)?;
+    let root_list_values = cheap_plan_root_derived_values(plan, &state_summary_map, &list_store)?;
+    for (field_id, value) in root_list_values {
+        let label = plan_derived_field_label(plan, field_id);
+        state_summary_map.insert(label.clone(), value.clone());
+        state_summary_map.insert(local_field_name(&label), value);
+    }
     let list_summary = plan_list_summary(plan, &list_store);
-    let projection_execution =
-        list_store.materialize_projections(plan, state_summary.as_object().unwrap())?;
+    let projection_execution = list_store.materialize_projections(plan, &state_summary_map)?;
+    commit_projection_summary_to_root_state(
+        &mut state_summary_map,
+        projection_execution.summary.clone(),
+    );
+    let state_summary = JsonValue::Object(state_summary_map);
     let retain_execution =
         list_store.materialize_retains(plan, state_summary.as_object().unwrap())?;
     let list_store_lookup_stats = list_store.lookup_stats_report();
@@ -5538,11 +6090,36 @@ fn execute_machine_plan_root_scenario_inner(
         )
         .into());
     }
-    let mut runtime = PlanExecutorRuntimeState::new(plan)?;
+    let observed_root_paths = observed_root_paths_for_scenario_steps(selected_steps);
+    let mut runtime = PlanExecutorRuntimeState::new_with_observed(plan, &observed_root_paths)?;
     for step in selected_steps {
         runtime.apply_step(plan, step, host_file_root)?;
     }
     runtime.finish(plan)
+}
+
+fn observed_root_paths_for_scenario_steps(selected_steps: &[&ScenarioStep]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for step in selected_steps {
+        paths.extend(step.expect_root_text.keys().cloned());
+        if step.expect_filter.is_some() {
+            paths.insert("store.selected_filter".to_owned());
+            paths.insert("selected_filter".to_owned());
+        }
+        if step.expect_new_text.is_some() {
+            paths.insert("store.new_todo_text".to_owned());
+            paths.insert("new_todo_text".to_owned());
+        }
+        if step.expect_active_count.is_some() {
+            paths.insert("store.active_count".to_owned());
+            paths.insert("active_count".to_owned());
+        }
+        if step.expect_completed_count.is_some() {
+            paths.insert("store.completed_count".to_owned());
+            paths.insert("completed_count".to_owned());
+        }
+    }
+    paths
 }
 
 fn assert_plan_executor_scenario_checkpoint(
@@ -5551,6 +6128,7 @@ fn assert_plan_executor_scenario_checkpoint(
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
     step: &ScenarioStep,
 ) -> RuntimeResult<JsonValue> {
+    let mut checkpoint_root_state = root_state.clone();
     let mut checkpoint_list_state = list_state.clone();
     let mut checkpoint_address_rows = BTreeSet::new();
     if let Some(expect) = &step.expect_cell {
@@ -5566,10 +6144,28 @@ fn assert_plan_executor_scenario_checkpoint(
             &checkpoint_address_rows,
         )?;
     }
+    if let Ok(root_values) =
+        cheap_plan_root_derived_values(plan, &checkpoint_root_state, &checkpoint_list_state)
+    {
+        commit_root_list_derived_values_to_root_state(
+            plan,
+            &mut checkpoint_root_state,
+            &root_values,
+        );
+    }
+    refresh_plan_root_row_expression_derived_values_in_state(plan, &mut checkpoint_root_state);
     let list_state = plan_executor_list_state_for_materialization(&checkpoint_list_state);
+    if let Ok(projection_execution) =
+        boon_plan_executor::materialize_list_projections(plan, &checkpoint_root_state, &list_state)
+    {
+        commit_projection_summary_to_root_state(
+            &mut checkpoint_root_state,
+            projection_execution.summary,
+        );
+    }
     let report = assert_plan_scenario_checkpoint(
         plan,
-        root_state,
+        &checkpoint_root_state,
         &list_state,
         PlanExecutorScenarioCheckpointInput {
             step_id: step.id.clone(),
@@ -5678,6 +6274,7 @@ fn plan_executor_list_store_execute_indexed_update_branch(
     generic_event: &GenericSourceEvent<'_>,
     list_store: &mut PlanExecutorListStore,
     row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
+    root_state: &serde_json::Map<String, JsonValue>,
     root_derived_values_before_updates: &BTreeMap<usize, JsonValue>,
     host_file_root: Option<&Path>,
 ) -> RuntimeResult<IndexedUpdateBranchExecution> {
@@ -5690,6 +6287,7 @@ fn plan_executor_list_store_execute_indexed_update_branch(
         generic_event,
         list_store.rows_by_list_mut(),
         row_resolution_cache,
+        root_state,
         root_derived_values_before_updates,
         host_file_root,
     )
@@ -6054,8 +6652,59 @@ fn plan_executor_insert_projection_summaries(
                 ));
                 insert_nested_json(root, &target, JsonValue::Array(value));
             }
+            PlanListProjection::ChunkValue {
+                source,
+                size,
+                item_field,
+                label_field,
+            } => {
+                let source_value =
+                    plan_executor_projection_source_value(plan, root_state, root, source);
+                let source_row_count = source_value
+                    .and_then(JsonValue::as_array)
+                    .map(Vec::len)
+                    .unwrap_or_default();
+                let value = source_value
+                    .map(|value| {
+                        plan_executor_windowed_chunk_value_projection(
+                            value,
+                            *size,
+                            item_field,
+                            label_field,
+                            limits,
+                        )
+                    })
+                    .unwrap_or_default();
+                materialization.push(materialization_report_for_chunk(
+                    &target,
+                    source_row_count,
+                    limits.chunk_row_start,
+                    limits.chunk_column_start,
+                    &value,
+                ));
+                insert_nested_json(root, &target, JsonValue::Array(value));
+            }
             PlanListProjection::Unknown { .. } => {}
         }
+    }
+}
+
+fn plan_executor_projection_source_value<'a>(
+    plan: &MachinePlan,
+    root_state: &'a serde_json::Map<String, JsonValue>,
+    root: &'a serde_json::Map<String, JsonValue>,
+    source: &ValueRef,
+) -> Option<&'a JsonValue> {
+    match source {
+        ValueRef::Field(field_id) => {
+            let label = plan_derived_field_label(plan, field_id.0);
+            let local = local_field_name(&label);
+            root.get(&label)
+                .or_else(|| root.get(&local))
+                .or_else(|| root_state.get(&label))
+                .or_else(|| root_state.get(&local))
+        }
+        _ => None,
     }
 }
 
@@ -6149,6 +6798,50 @@ fn plan_executor_windowed_chunk_projection(
             if let Some(cell) = list_store.get(&list_id).and_then(|rows| rows.get(index)) {
                 cells.push(plan_executor_row_document_json(plan, list_id, cell));
             }
+        }
+        row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
+        projected_rows.push(JsonValue::Object(row_object));
+    }
+    projected_rows
+}
+
+fn plan_executor_windowed_chunk_value_projection(
+    source: &JsonValue,
+    columns: usize,
+    item_field: &str,
+    label_field: &str,
+    limits: SummaryLimits,
+) -> Vec<JsonValue> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let Some(items) = source.as_array() else {
+        return Vec::new();
+    };
+    let total_rows = items.len().div_ceil(columns);
+    let row_end = limits
+        .chunk_rows
+        .map_or(total_rows, |limit| {
+            limits.chunk_row_start.saturating_add(limit)
+        })
+        .min(total_rows);
+    let projected_columns = limits.chunk_columns.map_or_else(
+        || columns.saturating_sub(limits.chunk_column_start),
+        |limit| columns.saturating_sub(limits.chunk_column_start).min(limit),
+    );
+    let mut projected_rows = Vec::with_capacity(row_end.saturating_sub(limits.chunk_row_start));
+    for row in limits.chunk_row_start..row_end {
+        let mut row_object = serde_json::Map::new();
+        row_object.insert(label_field.to_owned(), json!(row.to_string()));
+        row_object.insert("index".to_owned(), json!(row));
+        let mut cells = Vec::with_capacity(projected_columns);
+        for column_offset in 0..projected_columns {
+            let column = limits.chunk_column_start.saturating_add(column_offset);
+            let index = row.saturating_mul(columns).saturating_add(column);
+            let Some(item) = items.get(index) else {
+                break;
+            };
+            cells.push(item.clone());
         }
         row_object.insert(item_field.to_owned(), JsonValue::Array(cells));
         projected_rows.push(JsonValue::Object(row_object));
@@ -6330,7 +7023,349 @@ fn root_pure_number_compare_values(
     )?)
 }
 
-fn plan_executor_root_derived_values(
+fn cached_plan_root_derived_values(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+) -> BTreeMap<usize, JsonValue> {
+    let mut values = BTreeMap::new();
+    for op in plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+    {
+        if op.indexed {
+            continue;
+        }
+        let Some(ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        let label = plan_derived_field_label(plan, output_id.0);
+        let local_label = local_field_name(&label);
+        if let Some(value) = root_state
+            .get(&label)
+            .or_else(|| root_state.get(&local_label))
+        {
+            values.insert(output_id.0, value.clone());
+        }
+    }
+    values
+}
+
+fn changed_plan_source_derived_values(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    values: &BTreeMap<FieldId, JsonValue>,
+) -> BTreeMap<FieldId, JsonValue> {
+    values
+        .iter()
+        .filter_map(|(field_id, value)| {
+            let label = plan_derived_field_label(plan, field_id.0);
+            let local_label = local_field_name(&label);
+            let current = root_state
+                .get(&label)
+                .or_else(|| root_state.get(&local_label));
+            (current != Some(value)).then(|| (*field_id, value.clone()))
+        })
+        .collect()
+}
+
+fn targeted_plan_root_derived_values(
+    index: &PlanRootDerivedDependencyIndex,
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    dirty_state_ids: &BTreeSet<StateId>,
+    dirty_field_ids: &mut BTreeSet<usize>,
+) -> RuntimeResult<BTreeMap<usize, JsonValue>> {
+    if dirty_state_ids.is_empty() && dirty_field_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut evaluation_state = root_state.clone();
+    evaluation_state
+        .entry("Router/route".to_owned())
+        .or_insert_with(|| json!("/"));
+    let mut values = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    let mut queued = BTreeSet::new();
+    let mut eval_counts = BTreeMap::new();
+    index.enqueue_initial_candidates(dirty_state_ids, dirty_field_ids, &mut queue, &mut queued);
+    while let Some(op_id) = queue.pop_front() {
+        queued.remove(&op_id);
+        let Some(op) = index.ops.get(&op_id) else {
+            continue;
+        };
+        let Some(ValueRef::Field(output_id)) = op.output else {
+            continue;
+        };
+        if !plan_root_derived_op_inputs_dirty(op, dirty_state_ids, dirty_field_ids) {
+            continue;
+        }
+        let eval_count = eval_counts.entry(op_id).or_insert(0usize);
+        *eval_count += 1;
+        if *eval_count > index.ops.len().saturating_add(1) {
+            return Err(format!(
+                "root derived dependency refresh exceeded bounded passes at op {op_id}"
+            )
+            .into());
+        }
+        let value =
+            match eval_targeted_plan_root_derived_op(plan, &evaluation_state, list_state, op) {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
+        let label = plan_derived_field_label(plan, output_id.0);
+        let current_value = evaluation_state
+            .get(&label)
+            .or_else(|| evaluation_state.get(&local_field_name(&label)));
+        if current_value == Some(&value) {
+            continue;
+        }
+        evaluation_state.insert(label.clone(), value.clone());
+        evaluation_state.insert(local_field_name(&label), value.clone());
+        values.insert(output_id.0, value);
+        dirty_field_ids.insert(output_id.0);
+        index.enqueue_field_dependents(output_id.0, &mut queue, &mut queued);
+    }
+    Ok(values)
+}
+
+fn initial_observed_plan_root_derived_values(
+    index: &PlanRootDerivedDependencyIndex,
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+) -> RuntimeResult<BTreeMap<usize, JsonValue>> {
+    if !index.should_filter_publication() {
+        return Ok(BTreeMap::new());
+    }
+    let mut evaluation_state = root_state.clone();
+    evaluation_state
+        .entry("Router/route".to_owned())
+        .or_insert_with(|| json!("/"));
+    let mut values = BTreeMap::new();
+    let mut pending = index
+        .required_output_fields
+        .iter()
+        .filter_map(|field_id| index.output_to_op.get(field_id).copied())
+        .collect::<BTreeSet<_>>();
+    let max_passes = index.ops.len().saturating_add(1).max(1);
+    for _ in 0..max_passes {
+        if pending.is_empty() {
+            return Ok(values);
+        }
+        let mut next_pending = BTreeSet::new();
+        let mut progressed = false;
+        for op_id in pending {
+            let Some(op) = index.ops.get(&op_id) else {
+                continue;
+            };
+            let Some(ValueRef::Field(output_id)) = op.output else {
+                continue;
+            };
+            let value =
+                match eval_targeted_plan_root_derived_op(plan, &evaluation_state, list_state, op) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        next_pending.insert(op_id);
+                        continue;
+                    }
+                };
+            let label = plan_derived_field_label(plan, output_id.0);
+            let local_label = local_field_name(&label);
+            let current_value = evaluation_state
+                .get(&label)
+                .or_else(|| evaluation_state.get(&local_label));
+            if current_value != Some(&value) {
+                evaluation_state.insert(label, value.clone());
+                evaluation_state.insert(local_label, value.clone());
+                values.insert(output_id.0, value);
+                progressed = true;
+            }
+        }
+        if next_pending.is_empty() {
+            return Ok(values);
+        }
+        if !progressed {
+            return Ok(values);
+        }
+        pending = next_pending;
+    }
+    Ok(values)
+}
+
+fn plan_root_derived_op_supported(op: &boon_plan::PlanOp) -> bool {
+    let PlanOpKind::DerivedValue {
+        derived_kind,
+        expression: Some(expression),
+        ..
+    } = &op.kind
+    else {
+        return false;
+    };
+    matches!(
+        (derived_kind, expression),
+        (
+            boon_plan::PlanDerivedKind::Pure | boon_plan::PlanDerivedKind::ListView,
+            PlanDerivedExpression::RowExpression { .. }
+        ) | (
+            boon_plan::PlanDerivedKind::Pure,
+            PlanDerivedExpression::NumberCompareConst { .. }
+        )
+    )
+}
+
+fn plan_root_derived_op_inputs_dirty(
+    op: &boon_plan::PlanOp,
+    dirty_state_ids: &BTreeSet<StateId>,
+    dirty_field_ids: &BTreeSet<usize>,
+) -> bool {
+    op.inputs.iter().any(|input| match input {
+        ValueRef::State(state_id) => dirty_state_ids.contains(state_id),
+        ValueRef::Field(field_id) => dirty_field_ids.contains(&field_id.0),
+        _ => false,
+    })
+}
+
+fn plan_retain_inputs_dirty(
+    plan: &MachinePlan,
+    dirty_state_ids: &BTreeSet<StateId>,
+    dirty_field_ids: &BTreeSet<usize>,
+    dirty_list_data: bool,
+) -> bool {
+    if dirty_list_data {
+        return true;
+    }
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::ListOperations)
+        .flat_map(|region| region.ops.iter())
+        .any(|op| {
+            matches!(
+                &op.kind,
+                PlanOpKind::ListOperation {
+                    retain: Some(_),
+                    ..
+                }
+            ) && op.inputs.iter().any(|input| match input {
+                ValueRef::State(state_id) => dirty_state_ids.contains(state_id),
+                ValueRef::Field(field_id) => dirty_field_ids.contains(&field_id.0),
+                _ => false,
+            })
+        })
+}
+
+fn eval_targeted_plan_root_derived_op(
+    plan: &MachinePlan,
+    root_state: &serde_json::Map<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
+    op: &boon_plan::PlanOp,
+) -> RuntimeResult<Option<JsonValue>> {
+    let PlanOpKind::DerivedValue {
+        derived_kind,
+        expression: Some(expression),
+        ..
+    } = &op.kind
+    else {
+        return Ok(None);
+    };
+    let root_row = plan_executor_root_state_row(root_state);
+    match (derived_kind, expression) {
+        (
+            boon_plan::PlanDerivedKind::Pure | boon_plan::PlanDerivedKind::ListView,
+            PlanDerivedExpression::RowExpression { expression },
+        ) => Ok(Some(eval_plan_row_expression(
+            plan, list_state, &root_row, expression,
+        )?)),
+        (
+            boon_plan::PlanDerivedKind::Pure,
+            PlanDerivedExpression::NumberCompareConst { left, op, right },
+        ) => {
+            let left = eval_plan_row_expression(
+                plan,
+                list_state,
+                &root_row,
+                &PlanRowExpression::Field {
+                    input: left.clone(),
+                },
+            )?;
+            let left = root_json_value_to_number(&left)?;
+            Ok(Some(match op.as_str() {
+                "+" => json!(left + *right),
+                "-" => json!(left - *right),
+                "*" => json!(left * *right),
+                "/" => {
+                    if *right == 0 {
+                        return Ok(Some(root_error_json("div_by_zero")));
+                    }
+                    json!(left / *right)
+                }
+                "%" => {
+                    if *right == 0 {
+                        return Ok(Some(root_error_json("mod_by_zero")));
+                    }
+                    json!(left % *right)
+                }
+                ">" => JsonValue::Bool(left > *right),
+                ">=" => JsonValue::Bool(left >= *right),
+                "<" => JsonValue::Bool(left < *right),
+                "<=" => JsonValue::Bool(left <= *right),
+                "==" => JsonValue::Bool(left == *right),
+                "!=" => JsonValue::Bool(left != *right),
+                other => {
+                    return Err(format!(
+                        "root NumberCompareConst has unsupported operator `{other}`"
+                    )
+                    .into());
+                }
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn plan_executor_root_state_row(
+    root_state: &serde_json::Map<String, JsonValue>,
+) -> PlanListRowState {
+    let mut fields = BTreeMap::new();
+    for (name, value) in root_state {
+        fields.insert(name.clone(), value.clone());
+        fields.insert(local_field_name(name), value.clone());
+    }
+    PlanListRowState {
+        key: 0,
+        generation: 0,
+        fields,
+        private_bytes: BTreeMap::new(),
+        fixed_bytes_banks: BTreeMap::new(),
+    }
+}
+
+fn root_json_value_to_number(value: &JsonValue) -> RuntimeResult<i64> {
+    if value.as_str() == Some("NaN") || value.is_null() {
+        return Ok(0);
+    }
+    if let Some(value) = value.as_i64() {
+        return Ok(value);
+    }
+    if let Some(text) = value.as_str() {
+        return text
+            .parse::<i64>()
+            .map_err(|_| format!("row expression value `{text}` is not a number").into());
+    }
+    Err(format!("row expression value `{value}` is not a number").into())
+}
+
+fn root_error_json(code: &str) -> JsonValue {
+    json!({
+        "$boon_type": "ERROR",
+        "code": code,
+    })
+}
+
+fn cheap_plan_root_derived_values(
     plan: &MachinePlan,
     root_state: &serde_json::Map<String, JsonValue>,
     list_state: &BTreeMap<usize, Vec<PlanListRowState>>,
@@ -6344,13 +7379,20 @@ fn plan_executor_root_derived_values(
     Ok(values)
 }
 
+fn indexed_update_missing_row_local_input(error: &str) -> bool {
+    (error.contains("input field `") && error.contains("` is missing"))
+        || error.contains("cannot read row or root state `")
+}
+
 fn refresh_plan_root_row_expression_derived_values_in_state(
     plan: &MachinePlan,
     root_state: &mut serde_json::Map<String, JsonValue>,
 ) {
     if let Ok(root_values) = evaluate_plan_root_row_expression_derived_values(plan, root_state) {
         for (field_id, value) in root_values {
-            root_state.insert(plan_derived_field_label(plan, field_id.0), value);
+            let label = plan_derived_field_label(plan, field_id.0);
+            root_state.insert(local_field_name(&label), value.clone());
+            root_state.insert(label, value);
         }
     }
 }
@@ -6361,7 +7403,19 @@ fn commit_root_list_derived_values_to_root_state(
     values: &BTreeMap<usize, JsonValue>,
 ) {
     for (field_id, value) in values {
-        root_state.insert(plan_derived_field_label(plan, *field_id), value.clone());
+        let label = plan_derived_field_label(plan, *field_id);
+        root_state.insert(local_field_name(&label), value.clone());
+        root_state.insert(label, value.clone());
+    }
+}
+
+fn commit_projection_summary_to_root_state(
+    root_state: &mut serde_json::Map<String, JsonValue>,
+    summary: serde_json::Map<String, JsonValue>,
+) {
+    for (label, value) in summary {
+        root_state.insert(local_field_name(&label), value.clone());
+        root_state.insert(label, value);
     }
 }
 
@@ -6390,6 +7444,7 @@ fn execute_indexed_update_branch(
     event: &GenericSourceEvent<'_>,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     row_resolution_cache: &mut BTreeMap<(usize, usize), usize>,
+    root_state: &serde_json::Map<String, JsonValue>,
     root_derived_values: &BTreeMap<usize, JsonValue>,
     host_file_root: Option<&Path>,
 ) -> RuntimeResult<IndexedUpdateBranchExecution> {
@@ -6530,6 +7585,7 @@ fn execute_indexed_update_branch(
         source_route_slot,
         &root_json_event,
         row,
+        root_state,
         root_derived_values,
     )?;
     if json_evaluation.supported && json_evaluation.value.is_none() {
@@ -6966,7 +8022,6 @@ fn generic_source_payload_value_for_output(
         }
         SourcePayloadField::Address
         | SourcePayloadField::Key
-        | SourcePayloadField::Named(_)
         | SourcePayloadField::Text => {
             if slot.value_type != boon_plan::PlanValueType::Text {
                 return Err(format!(
@@ -6977,7 +8032,31 @@ fn generic_source_payload_value_for_output(
             }
             Ok((generic_source_payload_json_value(event, field)?, None))
         }
+        SourcePayloadField::Named(_) => match slot.value_type {
+            boon_plan::PlanValueType::Bool => {
+                Ok((generic_source_payload_bool_value(event, field)?, None))
+            }
+            boon_plan::PlanValueType::Text => Ok((generic_source_payload_json_value(event, field)?, None)),
+            _ => Err(format!(
+                "indexed source-payload update branch {op_id} reads named payload but output state `{}` is neither BOOL nor TEXT",
+                plan_state_label(plan, output_state_id.0)
+            )
+            .into()),
+        },
     }
+}
+
+fn generic_source_payload_bool_value(
+    event: &GenericSourceEvent<'_>,
+    field: &SourcePayloadField,
+) -> RuntimeResult<JsonValue> {
+    let SourcePayloadField::Named(name) = field else {
+        return Err("indexed bool source payloads must be named fields".into());
+    };
+    let Some(value) = event.payload.get(name.as_str()).copied() else {
+        return Ok(JsonValue::Bool(true));
+    };
+    source_payload_bool_json_value(name, value)
 }
 
 fn indexed_row_state_text(
@@ -8366,6 +9445,48 @@ fn root_update_value_ref_json(
     }
 }
 
+fn root_json_textlike(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::String(value) => Some(value.clone()),
+        JsonValue::Number(value) => Some(value.to_string()),
+        JsonValue::Bool(value) => Some(bool_label(*value)),
+        _ => None,
+    }
+}
+
+fn root_json_i64(value: &JsonValue) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+}
+
+fn root_number_infix_json_value(
+    left: &JsonValue,
+    op: &str,
+    right: &JsonValue,
+) -> Option<JsonValue> {
+    if matches!(op, "==" | "!=") {
+        let left = root_json_textlike(left)?;
+        let right = root_json_textlike(right)?;
+        return Some(JsonValue::Bool(match op {
+            "==" => left == right,
+            "!=" => left != right,
+            _ => unreachable!(),
+        }));
+    }
+    let left = root_json_i64(left)?;
+    let right = root_json_i64(right)?;
+    Some(match op {
+        "+" => json!(left + right),
+        "-" => json!(left - right),
+        ">" => JsonValue::Bool(left > right),
+        ">=" => JsonValue::Bool(left >= right),
+        "<" => JsonValue::Bool(left < right),
+        "<=" => JsonValue::Bool(left <= right),
+        _ => return None,
+    })
+}
+
 fn root_update_event_field_value(
     event: &LiveSourceEvent,
     source_route_slot: &boon_plan::SourceRoute,
@@ -8813,7 +9934,9 @@ fn refresh_indexed_derived_fields_after_state_change(
                 delta
                     .get("field_path")
                     .and_then(JsonValue::as_str)
-                    .is_some_and(|field| indexed_field_feeds_cross_row_derived_expression(plan, field))
+                    .is_some_and(|field| {
+                        indexed_field_feeds_cross_row_derived_expression(plan, field)
+                    })
             });
     if refresh_other_rows {
         deltas.extend(refresh_other_indexed_derived_fields(
@@ -10126,6 +11249,65 @@ fn execute_root_scalar_update_branch(
             )
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::NumberInfix,
+            source_payload_field: None,
+            update_constant_id: None,
+            ordered_inputs,
+            ..
+        } => {
+            let [left_ref, op_ref, right_ref] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "root NumberInfix update branch {} ordered inputs must be left, op, right; got {:?}",
+                    op.id.0, ordered_inputs
+                )
+                .into());
+            };
+            let left = root_update_value_ref_json(
+                plan,
+                root_state,
+                event,
+                source_route_slot,
+                left_ref,
+                op.id.0,
+            )?;
+            let op_value = root_update_value_ref_json(
+                plan,
+                root_state,
+                event,
+                source_route_slot,
+                op_ref,
+                op.id.0,
+            )?;
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "root NumberInfix update branch {} operator input is not text",
+                    op.id.0
+                )
+            })?;
+            let right = root_update_value_ref_json(
+                plan,
+                root_state,
+                event,
+                source_route_slot,
+                right_ref,
+                op.id.0,
+            )?;
+            let value = root_number_infix_json_value(&left, op_label, &right).ok_or_else(|| {
+                format!(
+                    "root NumberInfix update branch {} cannot evaluate {:?} {} {:?}",
+                    op.id.0, left, op_label, right
+                )
+            })?;
+            (
+                value,
+                None,
+                "number_infix",
+                JsonValue::Null,
+                JsonValue::Null,
+                JsonValue::Null,
+            )
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind: PlanExpressionKind::ReadPath,
             source_payload_field: None,
             update_constant_id: None,
@@ -10738,7 +11920,6 @@ fn source_payload_value_for_output(
         }
         SourcePayloadField::Address
         | SourcePayloadField::Key
-        | SourcePayloadField::Named(_)
         | SourcePayloadField::Text => {
             if slot.value_type != boon_plan::PlanValueType::Text {
                 return Err(format!(
@@ -10749,6 +11930,40 @@ fn source_payload_value_for_output(
             }
             Ok((source_payload_json_value(event, field)?, None))
         }
+        SourcePayloadField::Named(_) => match slot.value_type {
+            boon_plan::PlanValueType::Bool => Ok((source_payload_bool_value(event, field)?, None)),
+            boon_plan::PlanValueType::Text => Ok((source_payload_json_value(event, field)?, None)),
+            _ => Err(format!(
+                "root source-payload update branch {op_id} reads named payload but output state `{}` is neither BOOL nor TEXT",
+                plan_state_label(plan, output_state_id.0)
+            )
+            .into()),
+        },
+    }
+}
+
+fn source_payload_bool_value(
+    event: &LiveSourceEvent,
+    field: &SourcePayloadField,
+) -> RuntimeResult<JsonValue> {
+    let SourcePayloadField::Named(name) = field else {
+        return Err("root bool source payloads must be named fields".into());
+    };
+    let Some(value) = event.payload.get(name.as_str()).map(String::as_str) else {
+        return Ok(JsonValue::Bool(true));
+    };
+    source_payload_bool_json_value(name, value)
+}
+
+fn source_payload_bool_json_value(name: &str, value: &str) -> RuntimeResult<JsonValue> {
+    match value {
+        "true" | "True" | "1" | "yes" | "Yes" | "on" | "On" | "press" | "pressed" => {
+            Ok(JsonValue::Bool(true))
+        }
+        "false" | "False" | "0" | "no" | "No" | "off" | "Off" => Ok(JsonValue::Bool(false)),
+        _ => Err(
+            format!("source event bool payload `{name}` has unsupported value `{value}`").into(),
+        ),
     }
 }
 
@@ -11516,6 +12731,7 @@ impl LiveRuntime {
             normalized_events.push(event);
         }
         let mut semantic_deltas = Vec::new();
+        let mut render_patches = Vec::new();
         let mut apply_step_ms = 0.0;
         let mut dirty_key_count = 0usize;
         let mut recomputed_field_count = 0usize;
@@ -11537,12 +12753,13 @@ impl LiveRuntime {
                 recomputed_field_count.saturating_add(output.recomputed_field_count);
             recompute_candidate_count =
                 recompute_candidate_count.saturating_add(output.recompute_candidate_count);
+            render_patches.extend(output.render_patches);
             semantic_deltas.extend(output.semantic_deltas);
         }
         self.last_source_batch_sequence = Some(batch.sequence_id);
         Ok(LiveTurnOutput {
             semantic_deltas,
-            render_patches: Vec::new(),
+            render_patches,
             apply_step_ms,
             runtime_step_profile: LiveRuntimeStepProfile::default(),
             dirty_key_count,
@@ -13313,7 +14530,6 @@ impl RuntimeStorageInitializationPlan {
             indexed_row_initial_resets,
         })
     }
-
 }
 
 impl RuntimeStorageRootSlot {
@@ -13418,10 +14634,7 @@ impl RuntimeStorageRowTemplate {
         })
     }
 
-    fn restore_row_initial_fields_from_base(
-        &self,
-        fields: &mut ValueColumns,
-    ) -> RuntimeResult<()> {
+    fn restore_row_initial_fields_from_base(&self, fields: &mut ValueColumns) -> RuntimeResult<()> {
         for field in &self.fields {
             let RuntimeInitialValue::RowInitialField { path } = &field.initial_value else {
                 continue;
@@ -28740,6 +29953,17 @@ fn observed_path_is_descendant_of_root(observed: &str, root: &str) -> bool {
         .is_some_and(|tail| tail.starts_with('.'))
 }
 
+fn root_label_is_observed_by_paths(observed_paths: &BTreeSet<String>, label: &str) -> bool {
+    root_path_observation_variants(label)
+        .into_iter()
+        .any(|candidate| {
+            observed_paths.contains(&candidate)
+                || observed_paths
+                    .iter()
+                    .any(|observed| observed_path_is_descendant_of_root(observed, &candidate))
+        })
+}
+
 fn root_paths_observation_overlap(left: &str, right: &str) -> bool {
     let right = root_path_observation_variants(right)
         .into_iter()
@@ -34321,7 +35545,6 @@ impl GenericDerivedPlan {
             _ => false,
         }
     }
-
 }
 
 fn root_derived_source_read_path_matches(root_path: &str, read_path: &str) -> bool {
@@ -39192,12091 +40415,4 @@ fn current_binary_path() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const CORE_COMPILED_ARTIFACT_EXAMPLES: [&str; 3] = ["counter", "todomvc", "cells"];
-
-    struct TestTempRoot {
-        path: PathBuf,
-    }
-
-    impl TestTempRoot {
-        fn new(label: &str) -> Self {
-            let thread = std::thread::current();
-            let thread_name = thread.name().unwrap_or("unnamed");
-            let path = std::env::temp_dir()
-                .join(format!("boon-{label}-{}-{thread_name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-
-        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
-            self.path.join(path)
-        }
-    }
-
-    impl Drop for TestTempRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    struct CompiledArtifactFixture {
-        artifact: CompiledArtifact,
-        compiled: CompiledProgram,
-    }
-
-    fn compiled_artifact_fixture(
-        temp_root: &TestTempRoot,
-        example: &str,
-    ) -> CompiledArtifactFixture {
-        let (source, _, _) = example_paths(example).unwrap();
-        let artifact_path = temp_root.join(format!("{example}.boonc"));
-        emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        CompiledArtifactFixture { artifact, compiled }
-    }
-
-    fn for_core_compiled_artifacts(
-        temp_root: &TestTempRoot,
-        mut check: impl FnMut(&str, &CompiledArtifactFixture),
-    ) {
-        for example in CORE_COMPILED_ARTIFACT_EXAMPLES {
-            let fixture = compiled_artifact_fixture(temp_root, example);
-            check(example, &fixture);
-        }
-    }
-
-    fn for_core_compiled_programs(mut check: impl FnMut(&str, &TypedProgram, &CompiledProgram)) {
-        for example in CORE_COMPILED_ARTIFACT_EXAMPLES {
-            let (source, _, _) = example_paths(example).unwrap();
-            let parsed = parse_source_path_or_manifest_project(&source).unwrap();
-            let ir = lower(&parsed).unwrap();
-            let compiled = CompiledProgram::from_ir(&ir).unwrap();
-            check(example, &ir, &compiled);
-        }
-    }
-
-    #[test]
-    fn source_units_hash_preserves_single_file_hash_compatibility() {
-        let source = "document: Document/new(child: TEXT { ok })";
-        assert_eq!(
-            source_units_hash(&[RuntimeSourceUnit {
-                path: "examples/single.bn".to_owned(),
-                source: source.to_owned(),
-            }]),
-            sha256_bytes(source.as_bytes())
-        );
-        assert_ne!(
-            source_units_hash(&[
-                RuntimeSourceUnit {
-                    path: "examples/a.bn".to_owned(),
-                    source: source.to_owned(),
-                },
-                RuntimeSourceUnit {
-                    path: "examples/b.bn".to_owned(),
-                    source: source.to_owned(),
-                },
-            ]),
-            sha256_bytes(format!("{source}{source}").as_bytes())
-        );
-    }
-
-    #[test]
-    fn plan_executor_source_replay_report_carries_scoped_freshness_and_identity() {
-        let mut report = json!({
-            "command": "run-plan-scenario-events",
-            "command_argv": [
-                "target/debug/boon_cli",
-                "run",
-                "examples/cells.bn",
-                "--scenario",
-                "examples/cells.scn",
-                "--report",
-                "target/reports/bytes-plan/cells-scenario-events-full.json"
-            ],
-            "measurement_mode": "proof",
-            "worktree_fingerprint": "stale-full-worktree",
-            "source_hash": "sourcehash",
-            "scenario_hash": "scenariohash",
-            "target_profile": "native",
-            "plan_hash": "planhash",
-            "plan_version": {"major": 1, "minor": 0},
-            "selected_step_ids": ["edit-a1"],
-            "plan_executor_coverage": {"full_scenario_parity": true}
-        });
-        insert_plan_executor_source_replay_worktree_fields(&mut report);
-        insert_plan_executor_source_replay_identity(&mut report);
-
-        assert_eq!(
-            report
-                .get("worktree_fingerprint_scope")
-                .and_then(JsonValue::as_str),
-            Some(PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE)
-        );
-        assert_eq!(
-            report
-                .get("worktree_fingerprint")
-                .and_then(JsonValue::as_str),
-            Some("stale-full-worktree")
-        );
-        assert_eq!(
-            report
-                .get("worktree_scoped_fingerprint")
-                .and_then(JsonValue::as_str),
-            report
-                .get("worktree_fingerprints")
-                .and_then(JsonValue::as_object)
-                .and_then(|fingerprints| {
-                    fingerprints.get(PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE)
-                })
-                .and_then(JsonValue::as_str)
-        );
-        let inputs = report
-            .get("worktree_fingerprint_scope_inputs")
-            .and_then(JsonValue::as_object)
-            .and_then(|inputs| inputs.get(PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE))
-            .and_then(JsonValue::as_array)
-            .expect("scope inputs should be recorded for audit");
-        assert!(
-            inputs
-                .iter()
-                .any(|path| path.as_str() == Some("crates/boon_runtime"))
-        );
-        assert!(
-            !inputs
-                .iter()
-                .any(|path| path.as_str() == Some("docs/plans/GOAL_PROMPT.md"))
-        );
-        let identity = report
-            .get("source_replay_identity")
-            .expect("source replay identity should be recorded");
-        assert_eq!(
-            identity.get("kind").and_then(JsonValue::as_str),
-            Some(PLAN_EXECUTOR_SOURCE_REPLAY_IDENTITY_KIND)
-        );
-        let canonical_args = identity
-            .get("canonical_args")
-            .and_then(JsonValue::as_array)
-            .expect("canonical args should be recorded");
-        assert!(
-            !canonical_args
-                .iter()
-                .any(|arg| arg.as_str() == Some("--report"))
-        );
-        assert!(!canonical_args.iter().any(|arg| {
-            arg.as_str() == Some("target/reports/bytes-plan/cells-scenario-events-full.json")
-        }));
-        assert_eq!(
-            report.get("source_replay_identity"),
-            plan_executor_source_replay_identity_for_report(&report).as_ref()
-        );
-
-    }
-
-    #[test]
-    fn bytes_machine_plan_identity_requires_command_argv_to_prove_report_command() {
-        let mut embedded_report = json!({
-            "command": "run-plan-root-scalar-scenario",
-            "command_argv": [
-                "target/debug/xtask",
-                "verify-bytes-negative",
-                "--report",
-                "target/reports/bytes-plan/bytes-negative.json"
-            ],
-            "measurement_mode": "proof",
-            "worktree_fingerprint": "unit-full-worktree"
-        });
-        insert_bytes_machine_plan_identity(&mut embedded_report);
-        assert!(
-            embedded_report.get("verifier_identity").is_none(),
-            "library-generated fixture reports must not carry identity for unrelated xtask argv"
-        );
-        assert_eq!(
-            embedded_report
-                .get("worktree_fingerprint_scope")
-                .and_then(JsonValue::as_str),
-            Some(BYTES_MACHINE_PLAN_WORKTREE_FINGERPRINT_SCOPE),
-            "scoped freshness fields are still useful for BYTES reports"
-        );
-
-        let mut cli_report = json!({
-            "command": "run-plan-root-scalar-scenario",
-            "command_argv": [
-                "target/debug/boon_cli",
-                "run-plan-root-scalar-scenario",
-                "examples/bytes_set_plan_ops.bn",
-                "--scenario",
-                "examples/bytes_set_plan_ops.scn",
-                "--steps",
-                "patch-bytes,inspect-patched",
-                "--report",
-                "target/reports/bytes-plan/bytes-negative-base.json"
-            ],
-            "measurement_mode": "proof",
-            "worktree_fingerprint": "unit-full-worktree"
-        });
-        insert_bytes_machine_plan_identity(&mut cli_report);
-        let identity = cli_report
-            .get("verifier_identity")
-            .expect("CLI-shaped MachinePlan report should carry verifier identity");
-        assert_eq!(
-            identity
-                .pointer("/canonical_args/0")
-                .and_then(JsonValue::as_str),
-            Some("examples/bytes_set_plan_ops.bn")
-        );
-        assert!(
-            !identity
-                .get("canonical_args")
-                .and_then(JsonValue::as_array)
-                .unwrap()
-                .iter()
-                .any(|arg| arg.as_str() == Some("--report"))
-        );
-    }
-
-    #[test]
-    fn cached_runtime_parsed_project_reuses_plan_parse() {
-        let units = vec![
-            RuntimeSourceUnit {
-                path: "examples/cache/Helper.bn".to_owned(),
-                source: "FUNCTION label() { TEXT { cached } }\n".to_owned(),
-            },
-            RuntimeSourceUnit {
-                path: "examples/cache/app.bn".to_owned(),
-                source: r#"
-store: [
-    source: SOURCE
-    value:
-        TEXT { cached } |> HOLD value {
-            LATEST {
-                source.event.press |> THEN { TEXT { pressed } }
-            }
-        }
-]
-
-document: Document/new(root: app())
-
-FUNCTION app() {
-    Element/label(
-        element: []
-        label: Helper/label()
-    )
-}
-"#
-                .to_owned(),
-            },
-        ];
-
-        let parsed = cached_runtime_parsed_project("examples/cache/app.bn", &units)
-            .expect("runtime parsed project should be cached");
-        let parsed_again = cached_runtime_parsed_project("examples/cache/app.bn", &units)
-            .expect("runtime parsed project should be reused");
-
-        assert!(
-            Arc::ptr_eq(&parsed, &parsed_again),
-            "parsed program should be reused from the runtime plan cache"
-        );
-        assert!(
-            parsed
-                .functions
-                .iter()
-                .any(|function| function == "Helper/label"),
-            "cached parse should keep project module names"
-        );
-    }
-
-    #[test]
-    fn cells_formula_scans_with_ascii_bytes_after_text_boundary() {
-        let source = include_str!("../../../examples/cells/formula.bn");
-
-        assert!(
-            source.contains("formula_ascii_bytes"),
-            "Cells should keep a named formula TEXT/BYTES boundary"
-        );
-        assert!(
-            source.contains("Text/to_bytes(encoding: Ascii)"),
-            "Cells formula grammar scanning should use an explicit ASCII boundary"
-        );
-        assert!(
-            source.contains("Bytes/find(needle: BYTES[1] { 16u2B })"),
-            "operator scanning should use BYTES, not TEXT"
-        );
-        assert!(
-            source.contains("Bytes/starts_with(prefix: BYTES[4]"),
-            "function-call prefix scanning should use BYTES prefixes"
-        );
-        assert!(
-            !source.contains("Text/find"),
-            "Cells formula grammar scanning should not use text search"
-        );
-    }
-
-    #[test]
-    fn cells_manifest_source_is_generic_boon_without_spreadsheet_shortcuts() {
-        let source = cells_project_source_for_test();
-        for forbidden in ["Formula", "Grid", "List/table", "EXAMPLE", "#"] {
-            assert!(
-                !source.contains(forbidden),
-                "Cells manifest-backed source must not contain `{forbidden}`"
-            );
-        }
-        assert!(
-            source.contains("List/range(from: 0, to: 2599)"),
-            "Cells should generate its official 26x100 model from a generic range"
-        );
-        assert!(
-            source.contains("List/chunk(cells, size: 26"),
-            "Cells should derive sheet rows with generic List/chunk"
-        );
-        let parsed = parse_source("examples/cells.bn", &source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        assert_eq!(cells_range_from_ir(&ir), Some((0, 2599)));
-        assert!(
-            parsed.operators.iter().all(|operator| {
-                !matches!(
-                    operator.as_str(),
-                    "Formula/eval" | "Grid/cells" | "List/table"
-                )
-            }),
-            "Cells should not lower through spreadsheet-specific operators"
-        );
-    }
-
-    fn physical_todomvc_project_for_test() -> ParsedProgram {
-        parse_project(
-            "examples/todo_mvc_physical/RUN.bn",
-            [
-                (
-                    "examples/todo_mvc_physical/Theme/Classic.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/Theme/Classic.bn").to_owned(),
-                ),
-                (
-                    "examples/todo_mvc_physical/Theme/Professional.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/Theme/Professional.bn")
-                        .to_owned(),
-                ),
-                (
-                    "examples/todo_mvc_physical/Theme/Glassmorphism.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/Theme/Glassmorphism.bn")
-                        .to_owned(),
-                ),
-                (
-                    "examples/todo_mvc_physical/Theme/Neobrutalism.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/Theme/Neobrutalism.bn")
-                        .to_owned(),
-                ),
-                (
-                    "examples/todo_mvc_physical/Theme/Neumorphism.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/Theme/Neumorphism.bn")
-                        .to_owned(),
-                ),
-                (
-                    "examples/todo_mvc_physical/Theme/Theme.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/Theme/Theme.bn").to_owned(),
-                ),
-                (
-                    "examples/todo_mvc_physical/Generated/Assets.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/Generated/Assets.bn")
-                        .to_owned(),
-                ),
-                (
-                    "examples/todo_mvc_physical/RUN.bn".to_owned(),
-                    include_str!("../../../examples/todo_mvc_physical/RUN.bn").to_owned(),
-                ),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn physical_todomvc_project_root_for_test() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/todo_mvc_physical")
-    }
-
-    #[test]
-    fn physical_todomvc_source_preserves_original_assets_and_declares_theme_divergence() {
-        let original_root = Path::new(
-            "/home/martinkavik/repos/boon/playground/frontend/src/examples/todo_mvc_physical",
-        );
-        assert!(
-            original_root.exists(),
-            "original physical TodoMVC checkout is required for source preservation proof"
-        );
-        let migrated_root = physical_todomvc_project_root_for_test();
-        for relative in [
-            "Generated/Assets.bn",
-            "assets/icons/checkbox_active.svg",
-            "assets/icons/checkbox_completed.svg",
-        ] {
-            let original = std::fs::read_to_string(original_root.join(relative)).unwrap();
-            let migrated = std::fs::read_to_string(migrated_root.join(relative)).unwrap();
-            let expected = if relative.ends_with(".bn") {
-                original.replace("LINK", "SOURCE")
-            } else {
-                original
-            };
-            assert_eq!(
-                migrated, expected,
-                "{relative} changed beyond LINK to SOURCE"
-            );
-        }
-        let build_source = std::fs::read_to_string(migrated_root.join("BUILD.bn")).unwrap();
-        assert!(
-            build_source.contains("File/read_bytes()"),
-            "BUILD.bn should read icon payloads through BYTES"
-        );
-        assert!(
-            build_source.contains("Bytes/to_text(encoding: Utf8)"),
-            "BUILD.bn should decode icon payloads through an explicit BYTES/TEXT boundary"
-        );
-        for relative in [
-            "Theme/Glassmorphism.bn",
-            "Theme/Neobrutalism.bn",
-            "Theme/Neumorphism.bn",
-            "Theme/Professional.bn",
-        ] {
-            let migrated = std::fs::read_to_string(migrated_root.join(relative)).unwrap();
-            assert!(
-                migrated.contains("CheckboxGlyph =>"),
-                "{relative} should declare the intentional themed checkbox glyph material"
-            );
-            assert!(
-                migrated.contains("checked_border") && migrated.contains("check_color"),
-                "{relative} should declare checked checkbox colors for the themed glyph material"
-            );
-            assert!(
-                !migrated.contains("LINK"),
-                "{relative} should keep the migration-wide SOURCE spelling"
-            );
-        }
-        assert!(
-            migrated_root.join("Theme/Classic.bn").exists(),
-            "Classic is a Boon Circuit scene theme added during migration"
-        );
-        for relative in ["RUN.bn", "Theme/Theme.bn"] {
-            let migrated = std::fs::read_to_string(migrated_root.join(relative)).unwrap();
-            assert!(
-                migrated.contains("Classic"),
-                "{relative} should document the intentional Classic theme divergence"
-            );
-            assert!(
-                !migrated.contains("LINK"),
-                "{relative} should keep the migration-wide SOURCE spelling"
-            );
-        }
-    }
-
-    #[test]
-    fn physical_todomvc_build_assets_match_generated_file() {
-        let root = physical_todomvc_project_root_for_test();
-        let temp_root =
-            std::env::temp_dir().join(format!("boon-physical-build-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_root);
-        copy_dir_for_test(&root, &temp_root);
-        std::fs::write(temp_root.join("Generated/Assets.bn"), "").unwrap();
-
-        let result = run_project_build_file(&temp_root, Path::new("BUILD.bn"), true).unwrap();
-        assert_eq!(result.status, "pass");
-        assert_eq!(result.output_file, "./Generated/Assets.bn");
-        assert_eq!(result.output_binding, "icon");
-        assert_eq!(
-            result.input_files,
-            vec![
-                "assets/icons/checkbox_active.svg".to_owned(),
-                "assets/icons/checkbox_completed.svg".to_owned()
-            ]
-        );
-        assert_eq!(result.input_byte_reads.len(), result.input_files.len());
-        for read in &result.input_byte_reads {
-            assert!(
-                result.input_files.iter().any(|path| path == &read.path),
-                "byte read evidence should point at an input asset: {read:?}"
-            );
-            assert_eq!(read.decoded_as, "Utf8");
-            assert_eq!(read.sha256.len(), 64);
-            assert!(read.byte_len > 0);
-        }
-        assert!(
-            result
-                .operator_evidence
-                .iter()
-                .any(|operator| operator == "File/read_bytes")
-        );
-        assert!(
-            result
-                .operator_evidence
-                .iter()
-                .any(|operator| operator == "Bytes/to_text")
-        );
-        assert!(
-            !result
-                .operator_evidence
-                .iter()
-                .any(|operator| operator == "File/read_text")
-        );
-        assert_eq!(result.written_files, vec!["Generated/Assets.bn".to_owned()]);
-
-        let generated = std::fs::read_to_string(temp_root.join("Generated/Assets.bn")).unwrap();
-        let expected = std::fs::read_to_string(root.join("Generated/Assets.bn")).unwrap();
-        assert_eq!(generated, expected);
-        assert_eq!(result.output_sha256, sha256_bytes(expected.as_bytes()));
-
-        let verified = generated_output_for_project_build_file(&root, Path::new("BUILD.bn"))
-            .expect("checked generated assets should match BUILD.bn output");
-        assert_eq!(verified, expected);
-        let _ = std::fs::remove_dir_all(&temp_root);
-    }
-
-    #[test]
-    fn build_file_runner_rejects_paths_that_escape_project_root() {
-        let root =
-            std::env::temp_dir().join(format!("boon-build-sandbox-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("assets/icons")).unwrap();
-        std::fs::create_dir_all(root.join("Generated")).unwrap();
-        std::fs::write(
-            root.join("assets/icons/checkbox_active.svg"),
-            "<svg><circle /></svg>",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("BUILD.bn"),
-            r#"icons_directory: TEXT { ../assets/icons }
-output_file: TEXT { ./Generated/Assets.bn }
-svg_files: icons_directory |> Directory/entries() |> List/retain(item, if: item.extension == TEXT { svg }) |> List/sort_by(item, key: item.path)
-generation_result: svg_files |> List/map(old, new: old |> icon_code()) |> Text/join_lines() |> File/write_text(path: output_file)
-generation_error_handling: generation_result |> WHEN { Ok => Build/succeed() error => Build/fail() }
-FUNCTION icon_code(item) {
-    item.path |> File/read_bytes() |> WHEN { Ok[bytes] => bytes |> Bytes/to_text(encoding: Utf8) error => FLUSH { error } } |> Url/encode() |> WHEN { encoded => Ok[text: TEXT { {item.file_stem}: data:image/svg+xml;utf8,{encoded} }] }
-}
--- FLUSH
-"#,
-        )
-        .unwrap();
-        let error = run_project_build_file(&root, Path::new("BUILD.bn"), true)
-            .expect_err("parent-directory paths must be rejected");
-        assert!(
-            error.to_string().contains("parent-directory"),
-            "unexpected sandbox error: {error}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    fn copy_dir_for_test(source: &Path, destination: &Path) {
-        std::fs::create_dir_all(destination).unwrap();
-        for entry in std::fs::read_dir(source).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let target = destination.join(entry.file_name());
-            if path.is_dir() {
-                copy_dir_for_test(&path, &target);
-            } else {
-                std::fs::copy(&path, &target).unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn physical_todomvc_root_source_event_default_lowers_to_source_transform() {
-        let parsed = physical_todomvc_project_for_test();
-        let ir = lower_for_runtime(&parsed).unwrap();
-        let generic_derived_plan = compiler_generic_derived_plan_from_ir(&ir);
-        assert!(
-            generic_derived_plan.root_fields.iter().any(|value| {
-                value.path == "theme_options.name"
-                    && value.kind == DerivedValueKind::SourceEventTransform
-            }),
-            "{:#?}",
-            generic_derived_plan
-                .root_fields
-                .iter()
-                .map(|value| format!("{} {:?}", value.path, value.kind))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn physical_todomvc_theme_source_event_lowers_to_source_routes() {
-        let parsed = physical_todomvc_project_for_test();
-        let ir = lower_for_runtime(&parsed).unwrap();
-        let theme_targets = compiler_source_route_root_text_transform_targets_from_ir(&ir);
-        let generic_derived_plan = compiler_generic_derived_plan_from_ir(&ir);
-        let theme_debug = generic_derived_plan
-            .root_fields
-            .iter()
-            .filter(|value| value.path == "theme_options.name")
-            .map(|value| (value.kind.clone(), value.statement.children.len()))
-            .collect::<Vec<_>>();
-        assert!(
-            theme_targets.iter().any(|target| {
-                target.source == "store.elements.theme_switcher.classic"
-                    && target.target == "theme_options.name"
-                    && target.value == CompilerFieldValue::Text("Classic".to_owned())
-            }),
-            "{theme_targets:#?}\n{theme_debug:#?}"
-        );
-        assert!(
-            theme_targets.iter().any(|target| {
-                target.source == "store.elements.theme_switcher.glassmorphism"
-                    && target.target == "theme_options.name"
-                    && target.value == CompilerFieldValue::Text("Glassmorphism".to_owned())
-            }),
-            "{theme_targets:#?}\n{theme_debug:#?}"
-        );
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let glassmorphism_source_id = compiled
-            .source_routes
-            .source_id("store.elements.theme_switcher.glassmorphism")
-            .expect("theme switcher source should compile to a SourceId route");
-        assert!(
-            compiled
-                .source_routes
-                .actions_for_source_id(glassmorphism_source_id)
-                .unwrap()
-                .iter()
-                .any(|action| matches!(
-                    action,
-                    SourceAction::RootTextTransform { target, value }
-                        if target == "theme_options.name"
-                            && value == &FieldValue::Text("Glassmorphism".to_owned())
-                )),
-            "theme switcher source should dispatch through the SourceId action table"
-        );
-    }
-
-    #[test]
-    fn physical_todomvc_router_filter_source_lowers_to_router_target() {
-        let parsed = physical_todomvc_project_for_test();
-        let ir = lower_for_runtime(&parsed).unwrap();
-        let router_targets = compiler_source_route_router_targets_from_ir(&ir);
-        assert!(
-            router_targets.iter().any(|target| {
-                target.source == "store.elements.filter_buttons.completed"
-                    && target.path == "/completed"
-            }),
-            "{router_targets:#?}"
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_emission_is_deterministic_and_schema_valid() {
-        let temp_root = TestTempRoot::new("compiled-artifact-test");
-        let artifact = temp_root.join("todomvc.boonc");
-        let report = temp_root.join("todomvc-compile-report.json");
-        let first = emit_compiled_artifact(
-            Path::new("../../examples/todomvc.bn"),
-            &artifact,
-            Some(&report),
-        )
-        .unwrap();
-        verify_report_schema(&report).unwrap();
-        let first_hash = first["compiled_artifact"]["sha256"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_eq!(first_hash, sha256_file(&artifact).unwrap());
-
-        let second =
-            emit_compiled_artifact(Path::new("../../examples/todomvc.bn"), &artifact, None)
-                .unwrap();
-        assert_eq!(
-            second["compiled_artifact"]["sha256"].as_str(),
-            Some(first_hash.as_str())
-        );
-
-        let artifact_json: JsonValue =
-            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
-        assert_eq!(artifact_json["format"], json!("boonc-json-v1"));
-        assert_eq!(
-            artifact_json["parser_ast_required_for_execution"],
-            json!(false)
-        );
-        assert!(artifact_json["semantic_index"].is_object());
-        assert!(artifact_json["compiled_schedule"]["source_route_op_streams"].is_object());
-        assert!(artifact_json["storage_layout"].is_object());
-        assert_eq!(artifact_json["runtime_plan"]["ast_free"], json!(true));
-        assert_eq!(
-            artifact_json["runtime_plan"]["source_free_runtime_instantiation_ready"],
-            json!(true)
-        );
-        assert_eq!(
-            artifact_json["typed_ir_required_for_mvp_loader"],
-            json!(false)
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["runtime_instantiation_blocked_by"],
-            json!([])
-        );
-        assert!(artifact_json["runtime_plan"]["runtime_symbols"]["paths"].is_array());
-        assert!(artifact_json["runtime_plan"]["scalar_equations"]["branches"].is_array());
-        assert!(artifact_json["runtime_plan"]["list_equations"]["operations"].is_array());
-        assert!(artifact_json["runtime_plan"]["source_routes"]["route_slots"].is_array());
-        assert_eq!(
-            artifact_json["runtime_plan"]["included_runtime_owned_sections"]["runtime_storage_initialization_plan"],
-            json!(true)
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["included_runtime_owned_sections"]["document_lowering_runtime_tables"],
-            json!(true)
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["included_runtime_owned_sections"]["generic_derived_partial_ast_free_plan"],
-            json!(true)
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["storage_initialization"]["storage_runtime_ast_free"],
-            json!(true)
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["document_lowering"]["document_lowering_runtime_ast_free"],
-            json!(true)
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["document_lowering"]["format"],
-            json!("boonc-document-lowering-runtime-tables-json-v1")
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["generic_derived"]["format"],
-            json!("boonc-runtime-generic-derived-partial-json-v1")
-        );
-        assert_eq!(
-            artifact_json["runtime_plan"]["generic_derived"]["generic_derived_runtime_ast_free"],
-            json!(true)
-        );
-        assert!(
-            artifact_json["runtime_plan"]["generic_derived"]["root_fields"]
-                .as_array()
-                .is_some_and(|fields| !fields.is_empty())
-        );
-        assert!(
-            artifact_json["runtime_plan"]["generic_derived"]["indexed_fields"]
-                .as_array()
-                .is_some_and(|fields| !fields.is_empty())
-        );
-        assert!(
-            artifact_json["runtime_plan"]["generic_derived"]["indexed_fields"]
-                .as_array()
-                .is_some_and(|fields| fields.iter().all(|field| field
-                    .get("startup_recompute")
-                    .and_then(|value| value.as_bool())
-                    .is_some())),
-            "indexed generic-derived runtime fields must carry explicit startup_recompute flags"
-        );
-        assert!(
-            artifact_json["runtime_plan"]["generic_derived"]["unsupported_reasons"].is_object()
-        );
-        assert!(
-            artifact_json["runtime_plan"]["document_lowering"]["root_summary_paths"]
-                .as_array()
-                .is_some_and(|paths| !paths.is_empty())
-        );
-        assert!(
-            artifact_json["runtime_plan"]["document_lowering"]["list_summary_fields"]
-                .as_array()
-                .is_some()
-        );
-        assert!(
-            artifact_json["runtime_plan"]["document_lowering"]["projection_storage_resolutions"]
-                .is_object()
-        );
-        assert!(
-            artifact_json["runtime_plan"]["storage_initialization"]["root_slots"]
-                .as_array()
-                .is_some_and(|slots| !slots.is_empty())
-        );
-        assert!(
-            artifact_json["runtime_plan"]["storage_initialization"]["list_slots"]
-                .as_array()
-                .is_some_and(|slots| !slots.is_empty())
-        );
-        assert!(
-            artifact_json["runtime_plan"]["excluded_parser_ast_sections"]
-                .as_array()
-                .is_some_and(|sections| !sections.is_empty())
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_decodes_cells_generic_derived_runtime_plan_without_ast() {
-        let temp_root = TestTempRoot::new("compiled-artifact-generic-derived-test");
-        let artifact_path = temp_root.join("cells.boonc");
-        emit_compiled_artifact(Path::new("../../examples/cells.bn"), &artifact_path, None).unwrap();
-        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let decoded = artifact.runtime_generic_derived_plan().unwrap();
-        assert_eq!(decoded.functions.len(), 21);
-        assert!(
-            decoded.functions.contains_key("formula_ascii_bytes"),
-            "Cells BYTES formula scanner helper should be preserved in the compiled generic-derived plan"
-        );
-        assert_eq!(decoded.supported_root_count(), 2);
-        assert_eq!(decoded.supported_indexed_count(), 7);
-        assert!(
-            decoded.unsupported_reasons.is_empty(),
-            "decoded Cells generic-derived plan should preserve clean coverage: {:?}",
-            decoded.unsupported_reasons
-        );
-        let decoded_function_count = decoded.functions.len();
-
-        let mut corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["generic_derived"]["function_count"] =
-            json!(decoded_function_count + 1);
-        let error =
-            RuntimeGenericDerivedPlan::from_artifact(&corrupt["runtime_plan"]["generic_derived"])
-                .unwrap_err()
-                .to_string();
-        assert!(
-            error.contains("function_count"),
-            "wrong generic-derived count should fail decoding, got {error}"
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_decodes_storage_initialization_runtime_plan_without_ast() {
-        let temp_root = TestTempRoot::new("compiled-artifact-storage-test");
-
-        for_core_compiled_artifacts(&temp_root, |example, fixture| {
-            let decoded = fixture
-                .artifact
-                .runtime_storage_initialization_plan()
-                .unwrap();
-            assert_eq!(
-                decoded.root_slots.len(),
-                fixture.compiled.storage_initialization.root_slots.len(),
-                "decoded root slot count differs for {example}"
-            );
-            assert_eq!(
-                decoded.list_slots.len(),
-                fixture.compiled.storage_initialization.list_slots.len(),
-                "decoded list slot count differs for {example}"
-            );
-            for (decoded_slot, planned_slot) in decoded
-                .root_slots
-                .iter()
-                .zip(fixture.compiled.storage_initialization.root_slots.iter())
-            {
-                assert_eq!(
-                    decoded_slot.path, planned_slot.path,
-                    "decoded root path differs for {example}"
-                );
-                assert_eq!(
-                    decoded_slot.initial_value, planned_slot.initial_value,
-                    "decoded root initial value differs for {} in {example}",
-                    decoded_slot.path
-                );
-            }
-            assert_eq!(
-                decoded.list_slots.len(),
-                fixture.compiled.storage_initialization.list_slots.len(),
-                "decoded list slot count differs for {example}"
-            );
-            for (decoded_slot, planned_slot) in decoded
-                .list_slots
-                .iter()
-                .zip(fixture.compiled.storage_initialization.list_slots.iter())
-            {
-                assert_eq!(
-                    decoded_slot.name, planned_slot.name,
-                    "decoded list name differs for {example}"
-                );
-                assert_eq!(
-                    decoded_slot.capacity, planned_slot.capacity,
-                    "decoded capacity differs for {} in {example}",
-                    decoded_slot.name
-                );
-                assert_eq!(
-                    decoded_slot.row_template.fields.len(),
-                    planned_slot.row_template.fields.len(),
-                    "decoded row-template field count differs for {} in {example}",
-                    decoded_slot.name
-                );
-                assert_eq!(
-                    decoded_slot.initial_rows, planned_slot.initial_rows,
-                    "decoded initial rows differ for {} in {example}",
-                    decoded_slot.name
-                );
-            }
-        });
-
-        let artifact_path = temp_root.join("cells.boonc");
-        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let decoded = artifact.runtime_storage_initialization_plan().unwrap();
-        let mut corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["storage_initialization"]["list_slot_count"] =
-            json!(decoded.list_slots.len() + 1);
-        let error = RuntimeStorageInitializationPlan::from_artifact(
-            &corrupt["runtime_plan"]["storage_initialization"],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("list_slot_count"),
-            "wrong storage list count should fail decoding, got {error}"
-        );
-        corrupt = artifact.body.clone();
-        let (slot_index, field_index) =
-            corrupt["runtime_plan"]["storage_initialization"]["list_slots"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .enumerate()
-                .find_map(|(slot_index, slot)| {
-                    slot["row_template"]["fields"]
-                        .as_array()
-                        .and_then(|fields| (!fields.is_empty()).then_some((slot_index, 0)))
-                })
-                .expect("Cells artifact should have at least one row-template field");
-        corrupt["runtime_plan"]["storage_initialization"]["list_slots"][slot_index]["row_template"]
-            ["fields"][field_index]["field_id"] = json!(usize::MAX);
-        let error = RuntimeStorageInitializationPlan::from_artifact(
-            &corrupt["runtime_plan"]["storage_initialization"],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("field_id"),
-            "wrong row-template field id should fail decoding, got {error}"
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_decodes_document_lowering_runtime_tables_without_ast() {
-        let temp_root = TestTempRoot::new("compiled-artifact-document-lowering-decode-test");
-
-        for_core_compiled_artifacts(&temp_root, |example, fixture| {
-            let decoded = fixture.artifact.runtime_document_lowering_tables().unwrap();
-
-            assert_eq!(
-                decoded.root_summary_paths, fixture.compiled.document_lowering.root_summary_paths,
-                "decoded root summary paths differ for {example}"
-            );
-            assert_eq!(
-                decoded.list_summary_fields, fixture.compiled.document_lowering.list_summary_fields,
-                "decoded list summary fields differ for {example}"
-            );
-            assert_eq!(
-                decoded.dynamic_list_view_lists,
-                fixture.compiled.document_lowering.dynamic_list_view_lists,
-                "decoded dynamic list-view set differs for {example}"
-            );
-            assert_eq!(
-                decoded.projection_storage_resolutions,
-                fixture
-                    .compiled
-                    .document_lowering
-                    .projection_storage_resolutions,
-                "decoded projection storage resolutions differ for {example}"
-            );
-            assert_eq!(
-                decoded.render_slot_table_hash,
-                fixture.compiled.document_lowering.render_slot_table_hash,
-                "decoded render slot table hash differs for {example}"
-            );
-            assert_eq!(
-                decoded.render_slot_count, fixture.compiled.document_lowering.render_slot_count,
-                "decoded render slot count differs for {example}"
-            );
-        });
-
-        let artifact_path = temp_root.join("todomvc.boonc");
-        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let decoded = artifact.runtime_document_lowering_tables().unwrap();
-        let mut corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["document_lowering"]["render_slot_count"] =
-            json!(decoded.render_slots.len() + 1);
-        let error = RuntimeDocumentLoweringTables::from_artifact(
-            &corrupt["runtime_plan"]["document_lowering"],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("render_slot_count"),
-            "wrong render slot count should fail decoding, got {error}"
-        );
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["document_lowering"]["render_patch_lowering"]["root_patch_target_kind"] =
-            json!("wrong");
-        let error = RuntimeDocumentLoweringTables::from_artifact(
-            &corrupt["runtime_plan"]["document_lowering"],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            error.contains("root_patch_target_kind"),
-            "wrong render patch lowering constant should fail decoding, got {error}"
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_decodes_runtime_symbols_and_equation_tables_without_ast() {
-        let temp_root = TestTempRoot::new("compiled-artifact-non-route-tables-test");
-
-        for_core_compiled_artifacts(&temp_root, |example, fixture| {
-            let decoded = fixture.artifact.runtime_non_route_tables().unwrap();
-
-            assert_eq!(
-                decoded
-                    .symbols
-                    .paths
-                    .iter()
-                    .map(|path| path.as_ref())
-                    .collect::<Vec<_>>(),
-                fixture
-                    .compiled
-                    .symbols
-                    .paths
-                    .iter()
-                    .map(|path| path.as_ref())
-                    .collect::<Vec<_>>(),
-                "decoded runtime symbols differ for {example}"
-            );
-            assert_eq!(
-                scalar_equation_plan_artifact(&decoded.scalar_equations),
-                scalar_equation_plan_artifact(&fixture.compiled.scalar_equations),
-                "decoded scalar equations differ for {example}"
-            );
-            assert_eq!(
-                derived_equation_plan_artifact(&decoded.derived_equations),
-                derived_equation_plan_artifact(&fixture.compiled.derived_equations),
-                "decoded derived text transforms differ for {example}"
-            );
-            assert_eq!(
-                list_equation_plan_artifact(&decoded.list_equations),
-                list_equation_plan_artifact(&fixture.compiled.list_equations),
-                "decoded list equations differ for {example}"
-            );
-            assert_eq!(
-                list_projection_plan_artifact(&decoded.list_projections),
-                list_projection_plan_artifact(&fixture.compiled.list_projections),
-                "decoded list projections differ for {example}"
-            );
-            assert_eq!(
-                list_source_binding_plan_artifact(&decoded.list_source_bindings),
-                list_source_binding_plan_artifact(&fixture.compiled.list_source_bindings),
-                "decoded list source bindings differ for {example}"
-            );
-        });
-
-        let artifact_path = temp_root.join("todomvc.boonc");
-        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let decoded = artifact.runtime_non_route_tables().unwrap();
-        let mut corrupt = artifact.body.clone();
-        corrupt["runtime_symbol_count"] = json!(decoded.symbols.len() + 1);
-        let error = RuntimeNonRouteTables::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("runtime_symbols"),
-            "wrong symbol count should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["scalar_equations"]["branches"][0]["expression"]["kind"] =
-            json!("not_a_scalar_expression");
-        let error = RuntimeNonRouteTables::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not_a_scalar_expression"),
-            "wrong scalar expression kind should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["list_equations"]["operations"][0]["kind"]["kind"] =
-            json!("not_a_list_operation");
-        let error = RuntimeNonRouteTables::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not_a_list_operation"),
-            "wrong list operation kind should fail decoding, got {error}"
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_decodes_source_routes_and_action_table_without_ast() {
-        let temp_root = TestTempRoot::new("compiled-artifact-source-routes-test");
-
-        for_core_compiled_artifacts(&temp_root, |example, fixture| {
-            let decoded = fixture.artifact.runtime_source_routes().unwrap();
-            assert_eq!(
-                source_route_plan_artifact(&decoded),
-                source_route_plan_artifact(&fixture.compiled.source_routes),
-                "decoded source routes differ for {example}"
-            );
-        });
-
-        let artifact_path = temp_root.join("todomvc.boonc");
-        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let route_slots = artifact.body["runtime_plan"]["source_routes"]["route_slots"]
-            .as_array()
-            .unwrap();
-        let route_zero_source_id = route_slots[0]["source_id"].as_u64().unwrap() as usize;
-        let route_zero_next = (route_zero_source_id + 1) % route_slots.len();
-
-        let mut corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["route_id"] = json!(999);
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("route_id"),
-            "wrong route id should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["id_slots"][route_zero_source_id] =
-            json!(route_zero_next);
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("id_slots"),
-            "wrong SourceId slot should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["label_slots"][0]["source"] =
-            json!("zzzz.not.sorted");
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("label_slots"),
-            "wrong label slot should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["action_table"][0]["source_id"] = json!(1);
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("action_table"),
-            "wrong action table source id should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["action_table"][route_zero_source_id]["actions"]
-            [0] = json!({"kind": "list_remove", "list": "todos"});
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("action_table"),
-            "action table mismatch should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["root_scalar_targets"] =
-            json!([]);
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("actions do not match"),
-            "route action rebuild mismatch should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["actions"][0]["kind"] =
-            json!("not_a_source_action");
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not_a_source_action"),
-            "bad source action kind should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["payload_fields"][0] =
-            json!("PointerWidth");
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("payload field"),
-            "bad payload field should fail decoding, got {error}"
-        );
-
-        let indexed_text_route = route_slots
-            .iter()
-            .position(|route| {
-                route["actions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|action| action["kind"] == "indexed_text")
-            })
-            .expect("TodoMVC artifact should contain an indexed text route");
-        let indexed_text_action = route_slots[indexed_text_route]["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .position(|action| action["kind"] == "indexed_text")
-            .unwrap();
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][indexed_text_route]["actions"]
-            [indexed_text_action]["text_action"] = json!("not_an_indexed_text_action");
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not_an_indexed_text_action"),
-            "bad indexed text action should fail decoding, got {error}"
-        );
-
-        let indexed_bool_route = route_slots
-            .iter()
-            .position(|route| {
-                route["actions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|action| action["kind"] == "indexed_bool")
-            })
-            .expect("TodoMVC artifact should contain an indexed bool route");
-        let indexed_bool_action = route_slots[indexed_bool_route]["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .position(|action| action["kind"] == "indexed_bool")
-            .unwrap();
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][indexed_bool_route]["actions"]
-            [indexed_bool_action]["bool_action"] = json!("not_an_indexed_bool_action");
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not_an_indexed_bool_action"),
-            "bad indexed bool action should fail decoding, got {error}"
-        );
-
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][0]["root_scalar_targets"][0]["expression"]
-            ["kind"] = json!("not_a_scalar_expression");
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not_a_scalar_expression"),
-            "bad scalar route expression should fail decoding, got {error}"
-        );
-
-        let list_remove_route = route_slots
-            .iter()
-            .position(|route| {
-                route["list_remove_targets"]
-                    .as_array()
-                    .unwrap()
-                    .first()
-                    .is_some()
-            })
-            .expect("TodoMVC artifact should contain a list-remove route");
-        corrupt = artifact.body.clone();
-        corrupt["runtime_plan"]["source_routes"]["route_slots"][list_remove_route]["list_remove_targets"]
-            [0]["predicate"]["kind"] = json!("not_a_list_predicate");
-        let error = SourceRoutePlan::from_artifact_body(&corrupt)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("not_a_list_predicate"),
-            "bad list-remove predicate should fail decoding, got {error}"
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_instantiates_plan_executor_without_source_or_ir() {
-        let temp_root = TestTempRoot::new("compiled-artifact-runtime-load-test");
-
-        for_core_compiled_artifacts(&temp_root, |example, fixture| {
-            assert_eq!(
-                fixture.artifact.body["typed_ir_required_for_mvp_loader"],
-                json!(false),
-                "{example} artifact should not require typed IR for runtime loading"
-            );
-            assert_eq!(
-                fixture.artifact.body["runtime_plan"]["source_free_runtime_instantiation_ready"],
-                json!(true),
-                "{example} artifact should declare source-free runtime instantiation readiness"
-            );
-            let artifact_compiled = CompiledProgram::from_artifact(&fixture.artifact).unwrap();
-            assert_eq!(
-                artifact_compiled.report()["compiled_from_typed_ir"],
-                json!(false),
-                "{example} artifact-backed CompiledProgram report should be honest"
-            );
-            assert_eq!(
-                artifact_compiled.report()["runtime_symbol_count"],
-                fixture.compiled.report()["runtime_symbol_count"],
-                "{example} decoded runtime symbol count should match source compilation"
-            );
-            assert_eq!(
-                artifact_compiled.report()["source_route_op_streams"],
-                fixture.compiled.report()["source_route_op_streams"],
-                "{example} decoded source-route op streams should match source compilation"
-            );
-
-            let mut runtime =
-                PlanExecutorLiveSession::from_compiled_artifact(&fixture.artifact).unwrap();
-            let summary = runtime.state_summary();
-            match example {
-                "counter" => {
-                    assert!(
-                        summary.is_object(),
-                        "counter artifact runtime should produce a generic state summary"
-                    );
-                }
-                "todomvc" => {
-                    assert_eq!(
-                        summary["todos"].as_array().map(Vec::len),
-                        Some(4),
-                        "TodoMVC artifact runtime should materialize initial todos"
-                    );
-                    assert_eq!(summary["store"]["active_count"], json!(3));
-                    assert_eq!(summary["store"]["completed_count"], json!(1));
-                }
-                "cells" => {
-                    assert_eq!(
-                        summary["store"]["selected_input"]["address"], "A0",
-                        "Cells artifact runtime should materialize List/find root view"
-                    );
-                    assert_eq!(
-                        summary["store"]["sheet_rows"].as_array().unwrap().len(),
-                        24,
-                        "Cells artifact runtime should materialize bounded List/chunk root view"
-                    );
-                    assert_eq!(summary["cells"][0]["address"], "A0");
-                    assert_eq!(summary["cells"][0]["default_formula"], "5");
-                    assert_eq!(summary["cells"][0]["value"], "5");
-                }
-                _ => unreachable!(),
-            }
-        });
-
-        let source = temp_root.join("source-deleted-counter.bn");
-        std::fs::copy("../../examples/counter.bn", &source).unwrap();
-        let artifact_path = temp_root.join("source-deleted-counter.boonc");
-        emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-        std::fs::remove_file(&source).unwrap();
-        let artifact = CompiledArtifact::load_from_path(&artifact_path).unwrap();
-        let mut runtime = PlanExecutorLiveSession::from_compiled_artifact(&artifact).unwrap();
-        assert!(
-            runtime.state_summary().is_object(),
-            "artifact runtime load must not depend on source file access"
-        );
-    }
-
-    fn assert_compiled_artifact_scenario_paths_match_source_plan_executor(
-        label: &str,
-        source: &Path,
-        scenario: &Path,
-    ) {
-        let temp_root = TestTempRoot::new(&format!("compiled-artifact-scenario-{label}"));
-        let artifact_path = temp_root.join(format!("{label}.boonc"));
-
-        emit_compiled_artifact(source, &artifact_path, None).unwrap();
-        let inspection = inspect_compiled_artifact_report(&artifact_path, None).unwrap();
-        assert_eq!(
-            inspection["inspection_result"]["runtime_engine"], "plan_executor",
-            "{label} artifact inspection must use the PlanExecutor runtime path"
-        );
-        assert_eq!(
-            inspection["inspection_result"]["plan_executor_runtime_from_artifact"], true,
-            "{label} artifact inspection must deserialize the embedded MachinePlan"
-        );
-        assert_eq!(
-            inspection["inspection_result"]["source_reparse_attempted"], false,
-            "{label} artifact inspection must not reparse source"
-        );
-        assert_eq!(
-            inspection["inspection_result"]["source_file_access"], "not_attempted",
-            "{label} artifact inspection must not touch source files"
-        );
-        let source_output =
-            run_plan_scenario_events(source, scenario, TargetProfile::SoftwareDefault, None)
-                .unwrap();
-        let artifact_output = run_compiled_artifact_scenario(&artifact_path, scenario).unwrap();
-
-        assert_eq!(
-            source_output.report["semantic_deltas"],
-            serde_json::to_value(&artifact_output.semantic_deltas).unwrap(),
-            "{label} artifact scenario semantic deltas must match source PlanExecutor"
-        );
-        assert_eq!(
-            artifact_output.render_patches.len(),
-            0,
-            "{label} PlanExecutor artifact scenario should not claim obsolete render-patch output"
-        );
-        assert_eq!(
-            source_output.state_summary, artifact_output.state_summary,
-            "{label} artifact scenario final state must match source PlanExecutor"
-        );
-        assert_eq!(
-            artifact_output.per_step.len() as u64,
-            source_output.report["plan_executor"]["per_step"]
-                .as_array()
-                .unwrap()
-                .len() as u64,
-            "{label} artifact scenario should execute the same selected PlanExecutor steps"
-        );
-    }
-
-    fn assert_compiled_artifact_example_scenario_matches_source_plan_executor(example: &str) {
-        let (source, scenario, _) = example_paths(example).unwrap();
-        assert_compiled_artifact_scenario_paths_match_source_plan_executor(
-            example, &source, &scenario,
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_runs_representative_scenarios_through_plan_executor() {
-        assert_compiled_artifact_example_scenario_matches_source_plan_executor("todomvc");
-        assert_compiled_artifact_scenario_paths_match_source_plan_executor(
-            "bytes_indexed_source_payload_plan_ops",
-            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.bn"),
-            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.scn"),
-        );
-        std::thread::Builder::new()
-            .name("compiled-artifact-cells-scenario".to_owned())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                assert_compiled_artifact_example_scenario_matches_source_plan_executor("cells");
-            })
-            .expect("Cells artifact scenario thread should start")
-            .join()
-            .expect("Cells artifact scenario should not panic");
-    }
-
-    #[test]
-    fn compiled_artifact_runs_single_file_scenario_after_source_is_deleted() {
-        let temp_root = TestTempRoot::new("compiled-artifact-source-deleted");
-        let source = temp_root.join("todomvc.bn");
-        std::fs::copy("../../examples/todomvc.bn", &source).unwrap();
-        let scenario = Path::new("../../examples/todomvc.scn");
-        let artifact_path = temp_root.join("todomvc.boonc");
-
-        emit_compiled_artifact(&source, &artifact_path, None).unwrap();
-        let source_output =
-            run_plan_scenario_events(&source, scenario, TargetProfile::SoftwareDefault, None)
-                .unwrap();
-        std::fs::remove_file(&source).unwrap();
-        let artifact_output = run_compiled_artifact_scenario(&artifact_path, scenario).unwrap();
-
-        assert_eq!(
-            source_output.report["semantic_deltas"],
-            serde_json::to_value(&artifact_output.semantic_deltas).unwrap(),
-            "deleted-source artifact scenario semantic deltas must match source PlanExecutor"
-        );
-        assert_eq!(
-            source_output.state_summary, artifact_output.state_summary,
-            "deleted-source artifact scenario final state must match source PlanExecutor"
-        );
-    }
-
-    #[test]
-    fn bytecode_report_compiles_counter_scalar_routes_with_interpreter_parity() {
-        let report = verify_expression_bytecode_report(
-            Path::new("../../examples/counter.bn"),
-            Path::new("../../examples/counter.scn"),
-            None,
-        )
-        .unwrap();
-        assert_eq!(report["status"], json!("pass"));
-        let bytecode = &report["expression_bytecode"];
-        assert_eq!(
-            bytecode["execution_surface"],
-            "scalar_source_route_expressions"
-        );
-        assert_eq!(bytecode["interpreter_oracle"], "ScalarEquationPlan");
-        assert_eq!(bytecode["candidate_expression_count"], json!(3));
-        assert_eq!(bytecode["compiled_expression_count"], json!(3));
-        assert_eq!(bytecode["fallback_count"], json!(0));
-        assert_eq!(bytecode["deopt_count"], json!(0));
-        assert_eq!(bytecode["parity_passed"], json!(true));
-        assert_eq!(bytecode["hot_path_ready"], json!(true));
-        assert_eq!(bytecode["op_histogram"]["number_infix"], json!(2));
-        assert_eq!(bytecode["op_histogram"]["const_text"], json!(1));
-    }
-
-    #[test]
-    fn generated_kernel_report_proves_counter_scalar_subset_against_bytecode_and_interpreter() {
-        let parsed = parse_source(
-            "examples/counter.bn",
-            include_str!("../../../examples/counter.bn"),
-        )
-        .unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
-        let report = scalar_generated_kernel_report(&compiled, &scenario).unwrap();
-
-        assert_eq!(report["kernel_kind"], json!("generated_rust_enum_kernel"));
-        assert_eq!(report["candidate_expression_count"], json!(3));
-        assert_eq!(report["generated_kernel_count"], json!(3));
-        assert_eq!(report["fallback_count"], json!(0));
-        assert_eq!(report["deopt_count"], json!(0));
-        assert_eq!(report["parity_passed"], json!(true));
-        assert_eq!(report["hot_path_ready"], json!(true));
-        assert_eq!(
-            report["promotion_decision"],
-            json!("not_promoted_without_release_metric")
-        );
-        assert_eq!(report["bytecode_op_histogram"]["number_infix"], json!(2));
-        assert_eq!(report["bytecode_op_histogram"]["const_text"], json!(1));
-        assert_eq!(
-            report["generated_kernel_histogram"]["generated_number_infix_enum"],
-            json!(2)
-        );
-        assert_eq!(
-            report["generated_kernel_histogram"]["generated_const_text_borrow"],
-            json!(1)
-        );
-        assert_eq!(report["generated_number_op_histogram"]["add"], json!(1));
-        assert_eq!(
-            report["generated_number_op_histogram"]["subtract"],
-            json!(1)
-        );
-        assert_eq!(report["generated_static_borrow_count"], json!(1));
-        assert_eq!(report["generated_dynamic_string_count"], json!(2));
-    }
-
-    #[test]
-    fn generic_derived_runtime_plan_covers_todomvc_supported_fields() {
-        let parsed = parse_source(
-            "examples/todomvc.bn",
-            include_str!("../../../examples/todomvc.bn"),
-        )
-        .unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        assert!(
-            compiled.generic_derived_runtime.supported_root_count() > 0,
-            "TodoMVC should expose at least one supported root generic-derived field"
-        );
-        assert!(
-            compiled.generic_derived_runtime.supported_indexed_count() > 0,
-            "TodoMVC should expose at least one supported indexed generic-derived field"
-        );
-        assert!(
-            compiled
-                .generic_derived_runtime
-                .unsupported_reasons
-                .is_empty(),
-            "TodoMVC generic-derived runtime plan should be fully AST-free supported: {:?}",
-            compiled.generic_derived_runtime.unsupported_reasons
-        );
-        let supported_roots = compiled
-            .generic_derived_runtime
-            .root_fields
-            .iter()
-            .filter(|field| field.statement.is_some())
-            .map(|field| field.path.clone())
-            .collect::<BTreeSet<_>>();
-        assert!(
-            supported_roots.contains("store.title_to_add"),
-            "title_to_add must compile to runtime-owned WHEN/match-arm evaluation"
-        );
-        assert!(
-            supported_roots.contains("store.visible_todos"),
-            "visible_todos must compile to runtime-owned block/list-predicate evaluation"
-        );
-        let supported_indexed = compiled
-            .generic_derived_runtime
-            .indexed_fields
-            .iter()
-            .filter(|field| field.statement.is_some())
-            .map(|field| (field.list.clone(), field.field.clone()))
-            .collect::<BTreeSet<_>>();
-        assert!(supported_indexed.contains(&("todos".to_owned(), "not_completed".to_owned())));
-        assert!(supported_indexed.contains(&("todos".to_owned(), "not_editing".to_owned())));
-    }
-
-    #[test]
-    fn generic_derived_runtime_plan_preserves_reachable_user_functions() {
-        let source = r#"
-prelude: [
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    noop:
-        TEXT { ready } |> HOLD noop {
-            LATEST {
-                sources.noop.text
-            }
-        }
-    decorated:
-        decorate(value: TEXT { raw })
-]
-
-document: Document/new(root: Element/label(element: [], label: store.decorated))
-
-FUNCTION decorate(value) {
-    BLOCK {
-        suffix: TEXT { ok }
-        value |> Text/concat(with: suffix, separator: TEXT { - })
-    }
-}
-"#;
-        let parsed = parse_source("runtime-user-function.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        assert!(
-            compiled
-                .generic_derived_runtime
-                .functions
-                .contains_key("decorate"),
-            "runtime plan should own the reachable user function body"
-        );
-        assert!(
-            compiled
-                .generic_derived_runtime
-                .unsupported_reasons
-                .is_empty(),
-            "runtime user-function fixture should be fully AST-free supported: {:?}",
-            compiled.generic_derived_runtime.unsupported_reasons
-        );
-        assert!(
-            compiled
-                .generic_derived_runtime
-                .root_fields
-                .iter()
-                .any(|field| field.path == "store.decorated" && field.statement.is_some())
-        );
-    }
-
-    #[test]
-    fn cells_generic_derived_runtime_plan_covers_roots_indexes_and_functions() {
-        let parsed = parse_cells_project_for_test();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        assert_eq!(
-            compiled.generic_derived_runtime.supported_root_count(),
-            2,
-            "Cells should support selected_input and sheet_rows root list views"
-        );
-        assert_eq!(
-            compiled.generic_derived_runtime.supported_indexed_count(),
-            7,
-            "Cells should support all indexed derived row fields"
-        );
-        assert!(
-            compiled
-                .generic_derived_runtime
-                .unsupported_reasons
-                .is_empty(),
-            "Cells runtime generic-derived plan should have no blockers: {:?}",
-            compiled.generic_derived_runtime.unsupported_reasons
-        );
-        for function in [
-            "cell_address",
-            "default_formula_for_address",
-            "compute_value",
-        ] {
-            assert!(
-                compiled
-                    .generic_derived_runtime
-                    .functions
-                    .contains_key(function),
-                "runtime plan should include reachable Cells function `{function}`"
-            );
-        }
-    }
-
-    #[test]
-    fn compiled_artifact_inspection_does_not_reparse_source_and_reports_runtime_load() {
-        let temp_root = TestTempRoot::new("compiled-artifact-load-test");
-        let source = temp_root.join("counter.bn");
-        std::fs::copy("../../examples/counter.bn", &source).unwrap();
-        let artifact = temp_root.join("counter.boonc");
-        let compile_report = temp_root.join("counter-compile-report.json");
-        emit_compiled_artifact(&source, &artifact, Some(&compile_report)).unwrap();
-        std::fs::remove_file(&source).unwrap();
-
-        let load_report = temp_root.join("counter-load-report.json");
-        let loaded = inspect_compiled_artifact_report(&artifact, Some(&load_report)).unwrap();
-        verify_report_schema(&load_report).unwrap();
-        assert_eq!(loaded["inspection_result"]["artifact_valid"], json!(true));
-        assert_eq!(
-            loaded["inspection_result"]["runtime_instantiated_from_artifact"],
-            json!(true)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["runtime_engine"],
-            json!("plan_executor")
-        );
-        assert_eq!(
-            loaded["inspection_result"]["plan_executor_runtime_from_artifact"],
-            json!(true)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["plan_executor_provenance"]["generic_fallback_enabled"],
-            json!(false)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["source_free_runtime_load_available"],
-            json!(true)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["source_reparse_required_for_current_runtime"],
-            json!(false)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["typed_ir_required_for_mvp_loader"],
-            json!(false)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["runtime_plan_present"],
-            json!(true)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["runtime_plan_generic_derived_deserialized_from_artifact"],
-            json!(true)
-        );
-        assert!(
-            loaded["inspection_result"]["runtime_plan_generic_derived_deserialized_counts"]
-                .as_object()
-                .is_some_and(|counts| counts
-                    .get("root_supported_count")
-                    .and_then(JsonValue::as_u64)
-                    .is_some())
-        );
-        assert_eq!(
-            loaded["inspection_result"]["runtime_plan_storage_deserialized_from_artifact"],
-            json!(true)
-        );
-        assert!(
-            loaded["inspection_result"]["runtime_plan_storage_deserialized_counts"]
-                .as_object()
-                .is_some_and(|counts| counts
-                    .get("list_slot_count")
-                    .and_then(JsonValue::as_u64)
-                    .is_some())
-        );
-        assert_eq!(
-            loaded["inspection_result"]["runtime_plan_document_lowering_deserialized_from_artifact"],
-            json!(true)
-        );
-        assert!(
-            loaded["inspection_result"]["runtime_plan_document_lowering_deserialized_counts"]
-                .as_object()
-                .is_some_and(|counts| counts
-                    .get("render_slot_count")
-                    .and_then(JsonValue::as_u64)
-                    .is_some())
-        );
-        assert_eq!(
-            loaded["inspection_result"]["runtime_plan_non_route_tables_deserialized_from_artifact"],
-            json!(true)
-        );
-        assert!(
-            loaded["inspection_result"]["runtime_plan_non_route_tables_deserialized_counts"]
-                .as_object()
-                .is_some_and(|counts| counts
-                    .get("runtime_symbol_count")
-                    .and_then(JsonValue::as_u64)
-                    .is_some())
-        );
-        assert_eq!(
-            loaded["inspection_result"]["runtime_plan_source_routes_deserialized_from_artifact"],
-            json!(true)
-        );
-        assert!(
-            loaded["inspection_result"]["runtime_plan_source_routes_deserialized_counts"]
-                .as_object()
-                .is_some_and(|counts| counts
-                    .get("route_count")
-                    .and_then(JsonValue::as_u64)
-                    .is_some())
-        );
-        assert!(
-            !loaded["inspection_result"]["missing_runtime_plan_sections"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|section| section.as_str() == Some("runtime_plan"))
-        );
-        assert!(
-            !loaded["inspection_result"]["missing_runtime_plan_sections"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|section| section.as_str() == Some("generic_derived_ast_free_plan"))
-        );
-        assert!(
-            !loaded["inspection_result"]["missing_runtime_plan_sections"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|section| section.as_str() == Some("runtime_storage_initialization_plan"))
-        );
-        assert!(
-            !loaded["inspection_result"]["missing_runtime_plan_sections"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|section| section.as_str() == Some("document_lowering_runtime_tables"))
-        );
-        assert_eq!(
-            loaded["inspection_result"]["source_reparse_attempted"],
-            json!(false)
-        );
-        assert_eq!(
-            loaded["inspection_result"]["source_file_access"],
-            json!("not_attempted")
-        );
-        assert_eq!(
-            loaded["inspection_result"]["scenario_execution_available"],
-            json!(false)
-        );
-        assert_eq!(
-            loaded["compiled_artifact"]["sha256"].as_str(),
-            Some(sha256_file(&artifact).unwrap().as_str())
-        );
-    }
-
-    #[test]
-    fn document_lowering_runtime_tables_drive_runtime_summary_metadata() {
-        for_core_compiled_programs(|example, _ir, compiled| {
-            let expected_root_state_paths = compiled.root_state_paths.clone();
-            let expected_list_summary_fields = compiled.list_summary_fields.clone();
-            let expected_dynamic_list_view_lists = compiled.dynamic_list_view_lists.clone();
-
-            assert_eq!(
-                compiled.document_lowering.root_summary_paths, expected_root_state_paths,
-                "document root summary paths differ for {example}"
-            );
-            assert_eq!(
-                compiled.document_lowering.list_summary_fields, expected_list_summary_fields,
-                "document list summary fields differ for {example}"
-            );
-            assert_eq!(
-                compiled.document_lowering.dynamic_list_view_lists,
-                expected_dynamic_list_view_lists,
-                "document dynamic list-view list set differs for {example}"
-            );
-        });
-    }
-
-    #[test]
-    fn compiled_artifact_rejects_non_ast_free_runtime_plan() {
-        let temp_root = TestTempRoot::new("compiled-artifact-runtime-plan-test");
-        let artifact = temp_root.join("counter.boonc");
-        emit_compiled_artifact(Path::new("../../examples/counter.bn"), &artifact, None).unwrap();
-        let mut artifact_json: JsonValue =
-            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
-        artifact_json["runtime_plan"]["ast_free"] = json!(false);
-        write_json(&artifact, &artifact_json).unwrap();
-        let error = inspect_compiled_artifact_report(&artifact, None).unwrap_err();
-        assert!(
-            error.to_string().contains("runtime_plan must be AST-free"),
-            "unexpected runtime_plan validation error: {error}"
-        );
-    }
-
-    #[test]
-    fn compiled_artifact_rejects_non_ast_free_document_lowering_plan() {
-        let temp_root = TestTempRoot::new("compiled-artifact-document-lowering-test");
-        let artifact = temp_root.join("counter.boonc");
-        emit_compiled_artifact(Path::new("../../examples/counter.bn"), &artifact, None).unwrap();
-        let mut artifact_json: JsonValue =
-            serde_json::from_slice(&std::fs::read(&artifact).unwrap()).unwrap();
-        artifact_json["runtime_plan"]["document_lowering"]["document_lowering_runtime_ast_free"] =
-            json!(false);
-        write_json(&artifact, &artifact_json).unwrap();
-        let error = inspect_compiled_artifact_report(&artifact, None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("runtime_plan document_lowering must be AST-free"),
-            "unexpected document lowering validation error: {error}"
-        );
-    }
-
-    #[test]
-    fn runtime_completeness_and_adapter_flags_are_derived_from_slices() {
-        let parsed = parse_source(
-            "examples/todomvc.bn",
-            include_str!("../../../examples/todomvc.bn"),
-        )
-        .unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let program_metadata = compiler_typed_program_report_metadata_from_ir(&ir);
-        let inventory_counts = compiler_typed_program_inventory_counts_from_ir(&ir);
-        let slices = generic_runtime_slices_report(&compiled, &program_metadata, &inventory_counts);
-
-        assert!(
-            derive_generic_interpreter_complete(&program_metadata, &compiled, &slices),
-            "baseline TodoMVC slices should satisfy the generic interpreter contract"
-        );
-        assert!(
-            !derive_example_behavior_adapter(&compiled, &slices),
-            "baseline TodoMVC slices should not report an example behavior adapter"
-        );
-
-        let mut incomplete_slices = slices.clone();
-        incomplete_slices["generic_runtime_shell"] = json!(false);
-        assert!(
-            !derive_generic_interpreter_complete(&program_metadata, &compiled, &incomplete_slices),
-            "generic_interpreter_complete must fail when a required current-example slice fails"
-        );
-
-        let mut adapter_slices = slices;
-        adapter_slices["surface_driver_borrows_generic_storage_for_tick"] = json!(true);
-        assert!(
-            derive_example_behavior_adapter(&compiled, &adapter_slices),
-            "example_behavior_adapter must reflect adapter evidence instead of staying hardcoded false"
-        );
-    }
-
-    #[test]
-    fn schema_accepts_failing_blocker_audits_only_as_blocker_evidence() {
-        let path = std::env::temp_dir().join(format!(
-            "boon-readiness-schema-{}-{}.json",
-            std::process::id(),
-            now_string()
-        ));
-        let mut report = json!({
-            "status": "fail",
-            "report_version": 1,
-            "generated_at_utc": now_string(),
-            "command": "audit-goal-readiness",
-            "command_argv": ["audit-goal-readiness", "--report", "target/reports/goal-readiness.json"],
-            "measurement_mode": "proof",
-            "exit_status": 1,
-            "git_commit": git_commit(),
-            "worktree_fingerprint": worktree_fingerprint(),
-            "binary_hash": current_binary_hash(),
-            "binary_path": current_binary_path(),
-            "source_hash": "n/a",
-            "scenario_hash": "n/a",
-            "program_hash": "n/a",
-            "budget_hash": "n/a",
-            "graph_node_count": 0,
-            "per_step_pass_fail": [
-                {"id": "human-report-present", "pass": false, "detail": "missing real human report"}
-            ],
-            "blockers": ["missing fresh real human report"],
-            "artifact_sha256s": []
-        });
-
-        write_json(&path, &report).unwrap();
-        verify_report_schema(&path).unwrap();
-
-        report["command"] = json!("verify-runtime-finality");
-        report["command_argv"] = json!([
-            "verify-runtime-finality",
-            "--report",
-            "target/reports/runtime-finality.json"
-        ]);
-        report["per_step_pass_fail"] = json!([
-            {"id": "runtime-finality:parser:real-ast-not-text-lines", "pass": false, "detail": "parser blocker"}
-        ]);
-        report["blockers"] = json!([
-            "parser still depends on line/text/path heuristics instead of a structured AST"
-        ]);
-        write_json(&path, &report).unwrap();
-        verify_report_schema(&path).unwrap();
-
-        report["command"] = json!("verify-example-negative");
-        write_json(&path, &report).unwrap();
-        assert!(
-            verify_report_schema(&path)
-                .unwrap_err()
-                .to_string()
-                .contains("did not pass")
-        );
-
-        report["command"] = json!("audit-machine-readiness");
-        report["command_argv"] = json!([
-            "audit-machine-readiness",
-            "--report",
-            "target/reports/debug/machine-readiness.json"
-        ]);
-        write_json(&path, &report).unwrap();
-        verify_report_schema(&path).unwrap();
-
-        report["command"] = json!("audit-goal-readiness");
-        report["blockers"] = json!([]);
-        write_json(&path, &report).unwrap();
-        assert!(
-            verify_report_schema(&path)
-                .unwrap_err()
-                .to_string()
-                .contains("blockers")
-        );
-
-        report["blockers"] = json!(["missing fresh real human report"]);
-        report["per_step_pass_fail"] = json!([
-            {"id": "schema-only", "pass": true, "detail": "not a readiness blocker"}
-        ]);
-        write_json(&path, &report).unwrap();
-        assert!(
-            verify_report_schema(&path)
-                .unwrap_err()
-                .to_string()
-                .contains("no failing per-step check")
-        );
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn playground_surface_schema_requires_visible_manual_test_controls() {
-        let mut report = playground_surface_fixture();
-        verify_playground_surface_report(&report, Path::new("memory:playground")).unwrap();
-
-        report["playground_surface"]["code_editor"] = json!(false);
-        assert!(
-            verify_playground_surface_report(&report, Path::new("memory:playground"))
-                .unwrap_err()
-                .to_string()
-                .contains("code_editor")
-        );
-
-        let mut zero_bounds = playground_surface_fixture();
-        zero_bounds["playground_surface_visible_bounds"]["semantic_delta_log"]["elements"][0]["bounds"]
-            ["width"] = json!(0.0);
-        assert!(
-            verify_playground_surface_report(&zero_bounds, Path::new("memory:playground"))
-                .unwrap_err()
-                .to_string()
-                .contains("semantic_delta_log")
-        );
-    }
-
-    fn playground_surface_fixture() -> JsonValue {
-        let mut surface = serde_json::Map::new();
-        let mut bounds = serde_json::Map::new();
-        for key in [
-            "example_selector",
-            "code_editor",
-            "run_reset_step_controls",
-            "render_preview",
-            "semantic_delta_log",
-            "selected_value_inspector",
-            "dependency_explanation_panel",
-        ] {
-            surface.insert(key.to_owned(), json!(true));
-            bounds.insert(
-                key.to_owned(),
-                json!({
-                    "pass": true,
-                    "elements": [{
-                        "element_id": format!("{key}_fixture"),
-                        "visible": true,
-                        "bounds": {"x": 1.0, "y": 1.0, "width": 10.0, "height": 10.0}
-                    }]
-                }),
-            );
-        }
-        json!({
-            "playground_surface": surface,
-            "playground_surface_visible_bounds": bounds
-        })
-    }
-
-    #[test]
-    fn report_list_slot_count_uses_generic_state_arrays() {
-        let summary = json!({
-            "store": {"selected": "A0"},
-            "sheet": [{"address": "A0"}, {"address": "A1"}],
-            "columns": [{"label": "A"}]
-        });
-        assert_eq!(report_list_slot_count(&summary), json!(2));
-
-        let empty_summary = json!({"store": {"selected": "A0"}});
-        assert!(
-            report_list_slot_count(&empty_summary)
-                .get("unavailable_reason")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn root_scalar_same_event_flush_follows_qualified_derived_dependencies() {
-        let source = r#"
-store: [
-    elements: [
-        select: SOURCE
-    ]
-    active:
-        TEXT { a } |> HOLD active {
-            LATEST {
-                elements.select.text
-            }
-        }
-    selected:
-        active |> WHEN {
-            TEXT { b } => TEXT { B }
-            __ => TEXT { A }
-        }
-    default_label:
-        selected |> Text/concat(with: TEXT { ready }, separator: ":")
-    cursor:
-        default_label |> HOLD cursor {
-            LATEST {
-                elements.select.text |> THEN { default_label }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: store.cursor))
-"#;
-        let mut runtime = PlanExecutorLiveSession::from_source(
-            "root-scalar-same-event-flush",
-            source,
-            TargetProfile::SoftwareDefault,
-        )
-        .unwrap();
-        assert_eq!(runtime.state_summary()["store"]["cursor"], "A:ready");
-
-        let step_report = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.select".to_owned(),
-                text: Some("b".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let output = plan_executor_step_report_to_live_turn_output(&step_report, 0.0)
-            .expect("step report should convert to live output");
-
-        let state_summary = runtime.state_summary();
-        assert_eq!(state_summary["store"]["active"], "b");
-        assert_eq!(state_summary["store"]["selected"], "B");
-        assert_eq!(state_summary["store"]["default_label"], "B:ready");
-        assert_eq!(
-            state_summary["store"]["cursor"], "B:ready",
-            "cursor must read the same-event recomputed default_label, not the stale initial value"
-        );
-        assert!(
-            output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "FieldSet"
-                    && delta.field_path.as_deref() == Some("store.cursor")
-                    && matches!(&delta.value, ProtocolValue::Text(value) if value == "B:ready")
-            }),
-            "cursor update should be emitted from the PlanExecutor same-turn currentness path: {:#?}",
-            output.semantic_deltas
-        );
-    }
-
-    #[test]
-    fn root_scalar_same_event_direct_scalar_read_defers_root_flush_until_final() {
-        let source = r#"
-store: [
-    elements: [
-        input: SOURCE
-    ]
-    a:
-        TEXT { old } |> HOLD a {
-            LATEST {
-                elements.input.text
-            }
-        }
-    b:
-        a |> HOLD b {
-            LATEST {
-                elements.input.text |> THEN { a }
-            }
-        }
-    label:
-        a |> Text/concat(with: b, separator: "/")
-]
-
-document: Document/new(root: Element/label(element: [], label: store.label))
-"#;
-        let mut runtime =
-            LiveRuntime::from_source("root-scalar-direct-read-defers-flush", source).unwrap();
-        assert_eq!(runtime.state_summary()["store"]["label"], "old/old");
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.input".to_owned(),
-                text: Some("new".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-
-        let state_summary = output.state_summary;
-        assert_eq!(state_summary["store"]["a"], "new");
-        assert_eq!(
-            state_summary["store"]["b"], "new",
-            "direct scalar reads should see the just-committed root scalar without flushing derived roots first"
-        );
-        assert_eq!(state_summary["store"]["label"], "new/new");
-    }
-
-    #[test]
-    fn root_derived_structured_parent_dirties_dependents_without_empty_text_patch() {
-        let source = r#"
-store: [
-    elements: [
-        cursor_input: SOURCE
-    ]
-    cursor:
-        TEXT { 42 s } |> HOLD cursor {
-            LATEST {
-                elements.cursor_input.text
-            }
-        }
-    page_ref: [
-        ref_type: TEXT { PageRef }
-        cursor: cursor
-    ]
-    page_label:
-        page_ref.cursor |> Text/concat(with: page_ref.ref_type, separator: " ")
-]
-
-document: Document/new(root: Element/label(element: [], label: store.page_label))
-"#;
-        let mut runtime =
-            LiveRuntime::from_source("root-structured-parent-no-empty-patch", source).unwrap();
-        let initial_summary = runtime.state_summary();
-        assert_eq!(
-            initial_summary["store"]["page_label"], "42 s PageRef",
-            "initial PlanExecutor summary: {initial_summary:#?}"
-        );
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.cursor_input".to_owned(),
-                text: Some("150 s".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        assert_eq!(output.state_summary["store"]["page_label"], "150 s PageRef");
-        assert!(
-            output.semantic_deltas.iter().any(|delta| {
-                delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("store.page_label")
-            }),
-            "expected dependent label delta after structured root change: {:#?}",
-            output.semantic_deltas
-        );
-        assert!(
-            output.semantic_deltas.iter().all(|delta| {
-                !(delta.kind == "FieldSet"
-                    && delta.field_path.as_deref() == Some("store.page_ref")
-                    && matches!(&delta.value, ProtocolValue::Text(value) if value.is_empty()))
-            }),
-            "structured root records must not be emitted as empty-text patches: {:#?}",
-            output.semantic_deltas
-        );
-    }
-
-    #[test]
-    fn structured_root_changed_reads_only_dirty_changed_children() {
-        let previous = FieldValue::Json(json!({
-            "ref_type": "PageRef",
-            "cursor": "42 s",
-            "metadata": {
-                "stable": "yes",
-                "version": 1
-            }
-        }));
-        let value = BoonValue::Record(BTreeMap::from([
-            ("ref_type".to_owned(), BoonValue::Text("PageRef".to_owned())),
-            ("cursor".to_owned(), BoonValue::Text("150 s".to_owned())),
-            (
-                "metadata".to_owned(),
-                BoonValue::Record(BTreeMap::from([
-                    ("stable".to_owned(), BoonValue::Text("yes".to_owned())),
-                    ("version".to_owned(), BoonValue::Number(2)),
-                ])),
-            ),
-        ]));
-
-        let changed_reads = root_changed_read_keys_for_materialized_value(
-            "store.page_ref",
-            &value,
-            Some(&previous),
-        );
-        let reads = changed_reads
-            .iter()
-            .filter_map(|read| match read {
-                GenericReadKey::Root { field } => Some(field.as_str()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let child_reads = changed_reads
-            .iter()
-            .filter_map(|read| match read {
-                GenericReadKey::RootChild { root, path } => Some((root.as_str(), path.as_str())),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert!(reads.contains("store.page_ref"));
-        assert!(reads.contains("page_ref"));
-        assert!(child_reads.contains(&("store.page_ref", "cursor")));
-        assert!(child_reads.contains(&("store.page_ref", "metadata.version")));
-        assert!(
-            !child_reads.contains(&("store.page_ref", "ref_type"))
-                && !child_reads.contains(&("store.page_ref", "metadata.stable")),
-            "stable sibling fields must not be dirtied by structured root diff: {changed_reads:#?}"
-        );
-    }
-
-    #[test]
-    fn structured_root_changed_reads_skip_unchanged_list_ref_children() {
-        let previous = FieldValue::Json(json!({
-            "cursor": "42 s",
-            "rows": "selected_cursor_pair_rows",
-            "selection": {
-                "list": "selected_signal_lane_rows",
-                "indices": [0, 2]
-            }
-        }));
-        let value = BoonValue::Record(BTreeMap::from([
-            ("cursor".to_owned(), BoonValue::Text("150 s".to_owned())),
-            (
-                "rows".to_owned(),
-                BoonValue::ListRef("selected_cursor_pair_rows".to_owned()),
-            ),
-            (
-                "selection".to_owned(),
-                BoonValue::ListSelection {
-                    list: "selected_signal_lane_rows".to_owned(),
-                    indices: list_selection_indices(vec![0, 2]),
-                },
-            ),
-        ]));
-
-        let changed_reads = root_changed_read_keys_for_materialized_value(
-            "store.bridge_cursor_values",
-            &value,
-            Some(&previous),
-        );
-        let reads = changed_reads
-            .iter()
-            .filter_map(|read| match read {
-                GenericReadKey::Root { field } => Some(field.as_str()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let child_reads = changed_reads
-            .iter()
-            .filter_map(|read| match read {
-                GenericReadKey::RootChild { root, path } => Some((root.as_str(), path.as_str())),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert!(reads.contains("store.bridge_cursor_values"));
-        assert!(reads.contains("bridge_cursor_values"));
-        assert!(child_reads.contains(&("store.bridge_cursor_values", "cursor")));
-        assert!(
-            !child_reads.contains(&("store.bridge_cursor_values", "rows"))
-                && !child_reads.contains(&("store.bridge_cursor_values", "selection")),
-            "stable list reference children must not be dirtied by structured root diff: {changed_reads:#?}"
-        );
-    }
-
-    #[test]
-    fn derived_text_transform_recognizes_row_alias_inline_key_match() {
-        let source = r#"
-HOLD
-store: [
-    todos:
-        LIST {
-            [title: TEXT { Ship physical TodoMVC }]
-        }
-        |> List/map(todo, new: new_todo(title: todo.title))
-    selected_todo_id: LATEST {
-        None
-        todos
-            |> List/map(old, new: LATEST {
-                old.todo_elements.editing_todo_title_element.event.key_down.key
-                    |> WHEN { Escape => None, __ => SKIP }
-                old.todo_elements.todo_title_element.event.double_click
-                    |> THEN { old.id }
-            })
-            |> List/latest()
-    }
-]
-
-FUNCTION new_todo(title) {
-    [
-        todo_elements: [
-            editing_todo_title_element: SOURCE
-            todo_title_element: SOURCE
-        ]
-        id: TodoId[id: Ulid/generate()]
-        title: title
-    ]
-}
-"#;
-        let parsed = parse_source("runtime-row-alias-inline-key-match.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let selected = ir
-            .derived_values
-            .iter()
-            .find(|value| value.path == "store.selected_todo_id")
-            .expect("selected_todo_id should lower as a derived value");
-        let derived_equations =
-            DerivedEquationPlan::from_compiler(compiler_derived_equation_plan_from_ir(&ir));
-        let expression = derived_equations
-            .text_transforms
-            .iter()
-            .find(|transform| {
-                transform.target == selected.path
-                    && transform.source == "todo.todo_elements.editing_todo_title_element"
-            })
-            .map(|transform| &transform.expression)
-            .expect("compiler-derived transform should include row-alias inline key match");
-        assert_eq!(
-            *expression,
-            RuntimeDerivedTextExpression::MatchConst {
-                input: "old.todo_elements.editing_todo_title_element.event.key_down.key".to_owned(),
-                arms: vec![
-                    UpdateMatchArm {
-                        pattern: "Escape".to_owned(),
-                        output: "None".to_owned(),
-                    },
-                    UpdateMatchArm {
-                        pattern: "__".to_owned(),
-                        output: "SKIP".to_owned(),
-                    },
-                ],
-            },
-            "compiler-derived transform should compile the row-alias inline key match, statement={:?}",
-            selected.statement
-        );
-    }
-
-    #[test]
-    fn cells_selected_input_list_find_materializes_single_row_storage() {
-        let source = cells_project_source_for_test();
-        let mut runtime =
-            LiveRuntime::from_source("cells-selected-input-list-find-storage", &source).unwrap();
-        let initial = runtime.document_state_summary();
-        assert_eq!(initial["store"]["selected_input"]["address"], "A0");
-        assert_eq!(
-            json_scalar_text(&initial["store"]["selected_input"]["value"]).as_deref(),
-            Some("5")
-        );
-
-        let output = commit_cell(&mut runtime, "B0", "=A0+1");
-        assert_eq!(
-            output.state_summary["store"]["selected_input"]["address"],
-            "B0"
-        );
-        assert_eq!(
-            json_scalar_text(&output.state_summary["store"]["selected_input"]["value"]).as_deref(),
-            Some("6")
-        );
-    }
-
-    #[test]
-    fn cells_selected_input_document_state_values_use_indexed_list_find_projection() {
-        let source = cells_project_source_for_test();
-        let mut runtime =
-            LiveRuntime::from_source("cells-selected-input-targeted-values", &source).unwrap();
-        runtime
-            .apply_source_event_turn(LiveSourceEvent {
-                source: "cell.sources.editor.select".to_owned(),
-                address: Some("B0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let values = runtime.document_state_values(&[
-            "store.selected_input.address".to_owned(),
-            "store.selected_input.editing_text".to_owned(),
-            "store.selected_input.sources.editor.blur".to_owned(),
-        ]);
-        assert_eq!(values["store.selected_input.address"], "B0");
-        assert_eq!(values["store.selected_input.editing_text"], "=add(A0,A1)");
-        assert_eq!(
-            values["store.selected_input.sources.editor.blur"]["source_path"],
-            "cell.sources.editor.blur"
-        );
-        let summary = runtime.document_state_summary();
-        assert_eq!(summary["store"]["selected_input"]["address"], "B0");
-    }
-
-    #[test]
-    fn cells_window_document_summary_keeps_selected_projection_current() {
-        let source = cells_project_source_for_test();
-        let mut runtime =
-            LiveRuntime::from_source("cells-selected-input-window-summary", &source).unwrap();
-        runtime
-            .apply_source_event_turn(LiveSourceEvent {
-                source: "cell.sources.editor.select".to_owned(),
-                address: Some("B0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-
-        let summary = runtime.document_state_summary_for_window(0, 24, 0, 10);
-        assert_eq!(summary["store"]["selected_address"], "B0");
-        assert_eq!(summary["store"]["selected_input"]["address"], "B0");
-        assert_eq!(
-            summary["store"]["selected_input"]["editing_text"],
-            "=add(A0,A1)"
-        );
-        let rows = summary["store"]["sheet_rows"].as_array().unwrap();
-        let cells = rows[0]["cells"].as_array().unwrap();
-        assert_eq!(cells[0]["address"], "A0");
-        assert_eq!(cells[1]["address"], "B0");
-    }
-
-    #[test]
-    fn cells_visible_value_edit_keeps_window_summary_bounded_and_current() {
-        let source = cells_project_source_for_test();
-        let mut runtime =
-            LiveRuntime::from_source("cells-chunk-row-field-edit-skip", &source).unwrap();
-
-        let initial = runtime.document_state_summary_for_window(0, 24, 0, 10);
-        assert_eq!(initial["store"]["sheet_rows"].as_array().unwrap().len(), 24);
-
-        runtime
-            .apply_source_event_turn(LiveSourceEvent {
-                source: "cell.sources.editor.commit".to_owned(),
-                text: Some("20".to_owned()),
-                key: Some("Enter".to_owned()),
-                address: Some("A0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .expect("visible cell commit should apply");
-        let updated = runtime.document_state_summary_for_window(0, 24, 0, 10);
-        assert_eq!(updated["store"]["sheet_rows"].as_array().unwrap().len(), 24);
-        assert_eq!(
-            json_scalar_text(&updated["store"]["sheet_rows"][0]["cells"][0]["value"]).as_deref(),
-            Some("20")
-        );
-    }
-
-    #[test]
-    fn runtime_live_cache_source_compile_uses_compiler_runtime_ir_facade() {
-        let source = format!("{}\n", include_str!("../../../examples/counter.bn"));
-        let (_plan, profile) = cached_runtime_plan_from_source_profiled(
-            "runtime-live-cache-compiler-facade.bn",
-            &source,
-        )
-        .unwrap();
-
-        assert_eq!(profile["owner"], "boon_compiler");
-        assert_eq!(profile["surface"], "runtime-ir");
-        assert!(
-            profile["runtime_program_build_ms"].as_f64().is_some(),
-            "runtime should report only the remaining local runtime program build after compiler-owned parse/lower/verify: {profile}"
-        );
-    }
-
-    #[test]
-    fn runtime_full_static_cache_source_compile_uses_compiler_full_ir_facade() {
-        let source = format!("{}\n", include_str!("../../../examples/counter.bn"));
-        let units = vec![RuntimeSourceUnit {
-            path: "runtime-full-cache-compiler-facade.bn".to_owned(),
-            source,
-        }];
-        let (_plan, profile) =
-            cached_full_runtime_plan_from_project_profiled("runtime-full-cache", &units).unwrap();
-
-        assert_eq!(profile["owner"], "boon_compiler");
-        assert_eq!(profile["surface"], "full-ir");
-        assert!(
-            profile["runtime_program_build_ms"].as_f64().is_some(),
-            "runtime full/static cache should report only the remaining local runtime program build after compiler-owned full parse/lower/verify: {profile}"
-        );
-    }
-
-    #[test]
-    fn runtime_parsed_program_lowering_uses_compiler_runtime_ir_facade() {
-        let source = include_str!("../../../examples/counter.bn");
-        let parsed = parse_source(
-            "runtime-parsed-program-compiler-facade.bn".to_owned(),
-            source.to_owned(),
-        )
-        .unwrap();
-        let ir = lower_for_runtime(&parsed).unwrap();
-        let program_metadata = compiler_typed_program_report_metadata_from_ir(&ir);
-
-        assert!(
-            program_metadata.expression_count > 0,
-            "runtime parsed-program lowering should still produce usable runtime IR"
-        );
-        assert!(
-            program_metadata.static_schedule_verified,
-            "compiler-owned parsed-program lowering should preserve verification"
-        );
-    }
-
-    #[test]
-    fn generic_derived_state_skips_unchanged_root_read_replacement() {
-        let mut state = GenericDerivedState::default();
-        let mut reads = root_read_keys_for_path("store.selected_address")
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        reads.insert(list_read_key("cells"));
-        reads.insert(list_column_read_key("cells", "address"));
-
-        assert!(
-            state.replace_root_reads("store.selected_input".to_owned(), reads.clone()),
-            "first root read registration should install dependency edges"
-        );
-        let reads_before = state.root_reads_by_field.clone();
-        let dependents_before = state.root_dependents_by_read.clone();
-
-        assert!(
-            !state.replace_root_reads("store.selected_input".to_owned(), reads),
-            "unchanged root read registration should not churn dependency edges"
-        );
-        assert_eq!(state.root_reads_by_field, reads_before);
-        assert_eq!(state.root_dependents_by_read, dependents_before);
-
-        let shared_read = list_read_key("cells");
-        let removed_read = list_column_read_key("cells", "address");
-        let added_read = list_column_read_key("cells", "value");
-        let mut changed_reads = BTreeSet::new();
-        changed_reads.insert(shared_read.clone());
-        changed_reads.insert(added_read.clone());
-        assert!(
-            state.replace_root_reads("store.selected_input".to_owned(), changed_reads),
-            "changed root reads should update only the dependency edge diff"
-        );
-        assert!(
-            state
-                .root_dependents_by_read
-                .get(&shared_read)
-                .is_some_and(|dependents| dependents.contains("store.selected_input")),
-            "shared read edge should remain registered"
-        );
-        assert!(
-            !state.root_dependents_by_read.contains_key(&removed_read),
-            "removed read edge should be deleted"
-        );
-        assert!(
-            state
-                .root_dependents_by_read
-                .get(&added_read)
-                .is_some_and(|dependents| dependents.contains("store.selected_input")),
-            "added read edge should be registered"
-        );
-    }
-
-    #[test]
-    fn example_paths_resolve_from_examples_directory() {
-        let (source, scenario, budget) = example_paths("todo").unwrap();
-        assert!(source.ends_with(Path::new("examples/todomvc.bn")));
-        assert!(scenario.ends_with(Path::new("examples/todomvc.scn")));
-        assert!(budget.ends_with(Path::new("examples/todomvc.budget.toml")));
-
-        let (source, scenario, budget) = example_paths("cells").unwrap();
-        assert!(source.ends_with(Path::new("examples/cells.bn")));
-        assert!(scenario.ends_with(Path::new("examples/cells.scn")));
-        assert!(budget.ends_with(Path::new("examples/cells.budget.toml")));
-
-        let err = example_paths("../cells").unwrap_err();
-        assert!(err.to_string().contains("invalid example name"));
-    }
-
-    #[test]
-    fn manifest_source_files_are_loaded_as_one_cells_project() {
-        let entry = example_manifest_entry("cells").unwrap();
-        assert_eq!(
-            entry.source_files,
-            vec![
-                "examples/cells/defaults.bn".to_owned(),
-                "examples/cells/formula.bn".to_owned(),
-                "examples/cells/cell.bn".to_owned(),
-                "examples/cells/model.bn".to_owned(),
-                "examples/cells/columns.bn".to_owned(),
-                "examples/cells/store.bn".to_owned(),
-                "examples/cells/view.bn".to_owned(),
-                "examples/cells.bn".to_owned()
-            ]
-        );
-        let compiled =
-            compile_source_path_to_full_ir(Path::new("../../examples/cells.bn")).unwrap();
-        let parsed = compiled.parsed;
-        let ir = compiled.ir;
-        assert_eq!(parsed.files.len(), 8);
-        assert!(
-            parsed
-                .functions
-                .iter()
-                .any(|function| function == "new_cell")
-        );
-        assert!(
-            parsed
-                .functions
-                .iter()
-                .any(|function| function == "new_sheet_column")
-        );
-        assert!(
-            parsed
-                .functions
-                .iter()
-                .any(|function| function == "compute_value")
-        );
-        assert!(
-            parsed
-                .operators
-                .iter()
-                .all(|operator| !operator.starts_with(&["For", "mula", "/"].concat()))
-        );
-        assert!(
-            parsed
-                .functions
-                .iter()
-                .any(|function| function == "cells_app")
-        );
-        let generic_derived_plan = compiler_generic_derived_plan_from_ir(&ir);
-        assert!(generic_derived_plan.indexed_fields.iter().any(|value| {
-            value.list == "cells" && value.field == "value" && value.kind == DerivedValueKind::Pure
-        }));
-        let source_routes = compiler_source_route_sources_from_ir(&ir);
-        assert!(source_routes.iter().any(|source| {
-            source.path == "cell.sources.editor.commit"
-                && source.payload_fields
-                    == vec![
-                        CompilerSourcePayloadField::Address,
-                        CompilerSourcePayloadField::Text,
-                    ]
-        }));
-    }
-
-    #[test]
-    fn source_initializers_are_read_from_boon_text() {
-        let todo_source = include_str!("../../../examples/todomvc.bn")
-            .replace("Read documentation", "Source title A")
-            .replace("Buy groceries", "Source title B");
-        let parsed = parse_source("examples/todomvc.bn", todo_source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        assert_eq!(
-            todomvc_initial_titles_from_ir(&ir).unwrap(),
-            vec![
-                "Source title A",
-                "Finish TodoMVC renderer",
-                "Walk the dog",
-                "Source title B"
-            ]
-        );
-
-        let cells_source = cells_project_source_for_test().replace(
-            "List/range(from: 0, to: 2599)",
-            "List/range(from: 0, to: 11)",
-        );
-        let parsed = parse_source("examples/cells.bn", &cells_source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        assert_eq!(cells_range_from_ir(&ir), Some((0, 11)));
-
-        let cells_source = cells_project_source_for_test().replace(
-            "[address: TEXT { A0 }, field: TEXT { default_formula }, value: TEXT { 5 }]",
-            "[address: TEXT { A0 }, field: TEXT { default_formula }, value: TEXT { 9 }]",
-        );
-        let parsed = parse_source("examples/cells.bn", &cells_source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let defaults = compiler_storage_initial_rows_from_ir(&ir)
-            .into_iter()
-            .find(|rows| rows.list == "cells_default_values")
-            .expect("Cells source should lower generic default values");
-        assert!(!defaults.rows.is_empty());
-        assert!(defaults.rows.iter().any(|row| {
-            row.fields.iter().any(|field| {
-                field.name == "address"
-                    && matches!(&field.value, CompilerInitialValue::Text(value) if value == "A0")
-            }) && row.fields.iter().any(|field| {
-                field.name == "value"
-                    && matches!(&field.value, CompilerInitialValue::Text(value) if value == "9")
-            })
-        }));
-        let mut runtime =
-            LiveRuntime::from_source("cells-defaults-from-boon", &cells_source).unwrap();
-        let summary = runtime.document_state_summary();
-        let a0 = summary
-            .get("cells")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|cells| {
-                cells
-                    .iter()
-                    .find(|cell| cell.get("address") == Some(&json!("A0")))
-            })
-            .expect("Cells state summary should include A0");
-        assert_eq!(a0.get("formula_text"), Some(&json!("9")));
-        assert_eq!(
-            a0.get("value").and_then(json_scalar_text).as_deref(),
-            Some("9")
-        );
-    }
-
-    #[test]
-    fn list_range_materializes_generic_rows_from_boon_source() {
-        let source = r#"
-numbers:
-    List/range(from: 0, to: 2)
-    |> List/map(number, new: new_number(number: number))
-
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    noop:
-        TEXT { ready } |> HOLD noop {
-            LATEST {
-                sources.noop.text
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Numbers }))
-
-FUNCTION new_number(number) {
-    [
-        index: number.index
-        value: number.value
-    ]
-}
-"#;
-        let parsed = parse_source("range-list.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let numbers = compiler_storage_list_slots_from_ir(&ir)
-            .into_iter()
-            .find(|slot| slot.name == "numbers")
-            .expect("range source should lower numbers list");
-        assert_eq!(
-            numbers.initializer_kind,
-            CompilerStorageListInitializerKind::Range { from: 0, to: 2 }
-        );
-
-        let mut runtime = LiveRuntime::from_source("range-list", source).unwrap();
-        let summary = runtime.state_summary();
-        let rows = summary["numbers"].as_array().unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["index"], "0");
-        assert_eq!(rows[0]["value"], "0");
-        assert_eq!(rows[2]["index"], "2");
-        assert_eq!(rows[2]["value"], "2");
-    }
-
-    #[test]
-    fn materialization_windowed_list_summary_reports_logical_and_stable_rows() {
-        let source = r#"
-numbers:
-    List/range(from: 0, to: 9)
-    |> List/map(number, new: new_number(number: number))
-
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    noop:
-        TEXT { ready } |> HOLD noop {
-            LATEST {
-                sources.noop.text
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Numbers }))
-
-FUNCTION new_number(number) {
-    [
-        index: number.index
-        value: number.value
-    ]
-}
-"#;
-        let mut runtime =
-            LiveRuntime::from_source("generic-window-materialization", source).unwrap();
-        let summary = runtime.document_state_summary_for_window(4, 3, 0, 1);
-        let rows = summary["numbers"].as_array().unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0]["value"], "4");
-        assert_eq!(rows[2]["value"], "6");
-
-        let materialization = summary["__boon_materialization"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["collection"] == "numbers")
-            .expect("numbers materialization report should be present");
-        assert_eq!(materialization["logical_item_count"], json!(10));
-        assert_eq!(materialization["materialized_item_count"], json!(3));
-        assert_eq!(materialization["visible"]["start"], json!(4));
-        assert_eq!(materialization["visible"]["end"], json!(7));
-        assert_eq!(materialization["first_stable_key"]["row_key"], json!(5));
-        assert_eq!(materialization["last_stable_key"]["row_key"], json!(7));
-    }
-
-    #[test]
-    fn generic_rows_preserve_nested_field_records_and_lists() {
-        let source = r#"
-rows:
-    LIST {
-        [id: TEXT { alpha }, name: TEXT { Alpha }]
-    }
-    |> List/map(row, new: new_row(row: row))
-
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    noop:
-        TEXT { ready } |> HOLD noop {
-            LATEST {
-                sources.noop.text
-            }
-        }
-    page_ref:
-        [
-            ref_type: TEXT { PageRef }
-            page_kind: TEXT { signal_page }
-            status: TEXT { FILE_READY }
-        ]
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
-
-FUNCTION new_row(row) {
-    [
-        id: row.id
-        name: row.name
-        hit_regions: [
-            address: row.id
-            label_target: row.name
-        ]
-        page_refs: [
-            signal_page_ref: [
-                page_kind: TEXT { signal_page }
-                address: row.id
-            ]
-        ]
-        root_page_refs: [
-            signal_page_ref: store.page_ref
-        ]
-        segments: LIST {
-            [
-                signal_id: row.id
-                label: row.name
-            ]
-        }
-    ]
-}
-"#;
-        let mut runtime = LiveRuntime::from_source("nested-row-fields", source).unwrap();
-        let summary = runtime.state_summary();
-        assert_eq!(summary["store"]["page_ref"]["page_kind"], "signal_page");
-        let row = &summary["rows"][0];
-        assert_eq!(row["hit_regions"]["address"], "alpha");
-        assert_eq!(row["hit_regions"]["label_target"], "Alpha");
-        assert_eq!(
-            row["page_refs"]["signal_page_ref"]["page_kind"],
-            "signal_page"
-        );
-        assert_eq!(row["page_refs"]["signal_page_ref"]["address"], "alpha");
-        assert_eq!(
-            row["root_page_refs"]["signal_page_ref"]["page_kind"],
-            "signal_page"
-        );
-        assert_eq!(
-            row["root_page_refs"]["signal_page_ref"]["status"],
-            "FILE_READY"
-        );
-        assert_eq!(
-            row["segments"][0]["signal_id"], "alpha",
-            "nested inline LIST field should survive row storage: {row:#?}"
-        );
-        assert_eq!(row["segments"][0]["label"], "Alpha");
-    }
-
-    #[test]
-    fn materialization_chunk_projection_reports_page_counts_and_stable_keys() {
-        let source = r#"
-items:
-    LIST {
-        [name: TEXT { zero }]
-        [name: TEXT { one }]
-        [name: TEXT { two }]
-        [name: TEXT { three }]
-        [name: TEXT { four }]
-    }
-    |> List/map(item, new: new_item(item: item))
-
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    noop:
-        TEXT { ready } |> HOLD noop {
-            LATEST {
-                sources.noop.text
-            }
-        }
-    pages:
-        List/chunk(items, size: 2, items: entries, label: row_number)
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Items }))
-
-FUNCTION new_item(item) {
-    [
-        name: item.name
-    ]
-}
-"#;
-        let mut runtime = LiveRuntime::from_source("generic-page-materialization", source).unwrap();
-        let summary = runtime.document_state_summary_for_window(1, 1, 0, 2);
-        let pages = summary["store"]["pages"].as_array().unwrap();
-        assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0]["entries"][0]["name"], "two");
-        assert_eq!(pages[0]["entries"][1]["name"], "three");
-
-        let materialization = summary["__boon_materialization"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["collection"] == "store.pages")
-            .expect("page materialization report should be present");
-        assert_eq!(materialization["logical_item_count"], json!(5));
-        assert_eq!(materialization["materialized_item_count"], json!(2));
-        assert_eq!(materialization["visible"]["row_start"], json!(1));
-        assert_eq!(materialization["visible"]["row_end"], json!(2));
-        assert_eq!(materialization["first_stable_key"]["row_key"], json!(3));
-        assert_eq!(materialization["last_stable_key"]["row_key"], json!(4));
-    }
-
-    #[test]
-    fn list_find_and_chunk_project_generic_record_lists_without_grid_identity() {
-        let source = r#"
-sheet:
-    LIST {
-        [address: TEXT { A0 }, value: TEXT { 1 }]
-        [address: TEXT { B0 }, value: TEXT { 2 }]
-        [address: TEXT { C0 }, value: TEXT { 3 }]
-    }
-    |> List/map(entry, new: new_entry(entry: entry))
-
-store: [
-    sources: [
-        selected: SOURCE
-    ]
-    selected:
-        TEXT { B0 } |> HOLD selected {
-            LATEST {
-                sources.selected.text
-            }
-        }
-    selected_input:
-        List/find(sheet, field: address, value: selected)
-    visible_rows:
-        List/chunk(sheet, size: 2, items: entries, label: row_number)
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Sheet }))
-
-FUNCTION new_entry(entry) {
-    [
-        address: entry.address
-        value: entry.value
-    ]
-}
-"#;
-        let parsed = parse_source("generic-list-projections.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let projections = compiler_list_projections_from_ir(&ir);
-        assert!(projections.iter().any(|projection| {
-            projection.target == "store.selected_input"
-                && projection.list == "sheet"
-                && projection.kind
-                    == CompilerListProjectionKind::Find {
-                        field: "address".to_owned(),
-                        value: "store.selected".to_owned(),
-                    }
-        }));
-        assert!(projections.iter().any(|projection| {
-            projection.target == "store.visible_rows"
-                && projection.list == "sheet"
-                && projection.kind
-                    == CompilerListProjectionKind::Chunk {
-                        item_field: "entries".to_owned(),
-                        label_field: "row_number".to_owned(),
-                    }
-                && projection.columns == 2
-        }));
-
-        let mut runtime = LiveRuntime::from_source("generic-list-projections", source).unwrap();
-        let summary = runtime.document_state_summary();
-        assert_eq!(summary["store"]["selected_input"]["address"], "B0");
-        assert_eq!(summary["store"]["selected_input"]["value"], "2");
-        let provenance = runtime.engine_provenance_report();
-        assert_eq!(
-            provenance["list_store_lookup_stats"]["exact_lookup_count"], 1,
-            "document summary List/find projection should use the PlanExecutor list store exact index"
-        );
-        assert_eq!(
-            provenance["list_store_lookup_stats"]["exact_lookup_hit_count"], 1,
-            "List/find projection should hit the exact field index"
-        );
-        assert_eq!(
-            provenance["list_store_lookup_stats"]["exact_lookup_candidate_count"], 1,
-            "B0 has one matching projected row"
-        );
-        assert_eq!(
-            provenance["list_store_lookup_stats"]["exact_lookup_row_scan_count"], 0,
-            "List/find projection should not scan rows after the store index is available"
-        );
-        assert_eq!(summary["store"]["visible_rows"][0]["row_number"], "0");
-        assert_eq!(
-            summary["store"]["visible_rows"][0]["entries"][0]["address"],
-            "A0"
-        );
-        assert_eq!(
-            summary["store"]["visible_rows"][0]["entries"][1]["address"],
-            "B0"
-        );
-        assert_eq!(
-            summary["store"]["visible_rows"][1]["entries"][0]["address"],
-            "C0"
-        );
-    }
-
-    #[test]
-    fn list_user_key_fields_do_not_collide_with_runtime_identity() {
-        let source = r#"
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    selected:
-        TEXT { clk } |> HOLD selected {
-            LATEST {
-                sources.noop.text
-            }
-        }
-    records:
-        LIST {
-            [key: TEXT { clk }, window_key: "simple.vcd|Close|Center", value: TEXT { signal }, end: 150]
-            [key: TEXT { reset_n }, window_key: "simple.vcd|Fit|Center", value: TEXT { reset }, end: 250]
-        }
-    selected_value:
-        List/find_value(records, field: "key", value: selected, target: "value", fallback: TEXT { missing })
-    selected_end:
-        List/find_value(records, field: "window_key", value: TEXT { simple.vcd|Close|Center }, target: "end", fallback: 0)
-        |> Text/to_number()
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
-"#;
-        let mut runtime = LiveRuntime::from_source("list-user-key-fields", source).unwrap();
-        let summary = runtime.document_state_summary();
-        assert_eq!(summary["store"]["selected_value"], "signal");
-        assert_eq!(summary["store"]["selected_end"], 150);
-        assert_eq!(summary["store"]["records"][0]["key"], "clk");
-        assert_eq!(
-            summary["store"]["records"][0]["window_key"],
-            "simple.vcd|Close|Center"
-        );
-        assert_eq!(summary["store"]["records"][0]["$boon"]["row_key"], 1);
-        assert!(summary["store"]["records"][0]["generation"].is_null());
-    }
-
-    #[test]
-    fn source_event_propagates_through_derived_hold_trigger_in_same_turn() {
-        let source = r#"
-store: [
-    elements: [
-        select_next: SOURCE
-    ]
-    selected_event:
-        LATEST {
-            elements.select_next.event.press |> THEN { TEXT { second } }
-        }
-    selected:
-        TEXT { first } |> HOLD selected {
-            LATEST {
-                selected_event
-            }
-        }
-    response:
-        TEXT { response:first } |> HOLD response {
-            LATEST {
-                selected_event |> THEN {
-                    TEXT { response } |> Text/concat(with: selected_event, separator: ":")
-                }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: store.response))
-"#;
-        let mut runtime = LiveRuntime::from_source("derived-hold-trigger-same-turn", source)
-            .expect("runtime should initialize");
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.select_next".to_owned(),
-                ..LiveSourceEvent::default()
-            })
-            .expect("source event should apply");
-        assert_eq!(output.state_summary["store"]["selected_event"], "second");
-        assert_eq!(output.state_summary["store"]["selected"], "second");
-        assert_eq!(output.state_summary["store"]["response"], "response:second");
-    }
-
-    #[test]
-    fn list_field_selectors_cannot_name_runtime_identity_fields() {
-        assert_eq!(checked_boon_field_name("key").unwrap(), "key");
-        assert_eq!(
-            checked_boon_field_name("TEXT { window_key }").unwrap(),
-            "window_key"
-        );
-        for (field, token) in [
-            ("row_key", "row_key"),
-            ("hidden_generation", "hidden_generation"),
-            ("$boon.row_key", "$boon"),
-        ] {
-            let error = checked_boon_field_name(field).expect_err("hidden field should fail");
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("hidden runtime identity `{token}`")),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn text_concat_builds_labels_from_numbers_and_text() {
-        let source = r#"
-store: [
-    elements: [
-        noop: SOURCE
-    ]
-    held: Text/empty() |> HOLD held { LATEST {} }
-    count: 4
-    scope: TEXT { top.cpu }
-    names: TEXT { data_bus[7:0], data_valid }
-    scoped_label:
-        count
-        |> Text/concat(with: TEXT { results in }, separator: " ")
-        |> Text/concat(with: scope, separator: " ")
-    results_label:
-        count
-        |> Text/concat(with: TEXT { results: }, separator: " ")
-        |> Text/concat(with: names, separator: " ")
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Text concat }))
-"#;
-        let mut runtime = LiveRuntime::from_source("text-concat-labels", source).unwrap();
-        let summary = runtime.state_summary();
-        assert_eq!(summary["store"]["scoped_label"], "4 results in top.cpu");
-        assert_eq!(
-            summary["store"]["results_label"],
-            "4 results: data_bus[7:0], data_valid"
-        );
-    }
-
-    #[test]
-    fn indexed_text_const_source_updates_row_state_from_ir() {
-        let source = r#"
-store: [
-    elements: [
-        rename: SOURCE
-    ]
-    markers:
-        LIST {
-            [label: TEXT { 42 ns }]
-        }
-        |> List/map(marker, new: new_marker(marker: marker, store: store))
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Markers }))
-
-FUNCTION new_marker(marker, store) {
-    [
-        marker_elements: [
-            remove_marker: SOURCE
-        ]
-        label:
-            marker.label |> HOLD label {
-                LATEST {
-                    store.elements.rename.event.press |> THEN { TEXT { data stable } }
-                }
-            }
-    ]
-}
-"#;
-        let mut runtime = LiveRuntime::from_source("indexed-text-const-row-update", source)
-            .expect("runtime should load const indexed text source");
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("42 ns".to_owned()),
-        );
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.rename".to_owned()),
-        );
-        expected.insert(
-            "target_text".to_owned(),
-            toml::Value::String("42 ns".to_owned()),
-        );
-        let step = ScenarioStep {
-            id: "rename-marker-row".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            expect_semantic_delta_contains: vec!["FieldSet:label".to_owned()],
-            ..ScenarioStep::default()
-        };
-        let output = runtime
-            .apply_source_event_for_step(
-                &step,
-                LiveSourceEvent {
-                    source: "store.elements.rename".to_owned(),
-                    target_text: Some("42 ns".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        assert!(output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet"
-                && delta.list_id.as_deref() == Some("markers")
-                && delta.field_path.as_deref() == Some("label")
-                && matches!(&delta.value, ProtocolValue::Text(value) if value == "data stable")
-        }));
-        let summary = output.state_summary;
-        assert_eq!(summary["markers"][0]["label"], "data stable");
-    }
-
-    #[test]
-    fn source_const_text_appends_structural_list_row_from_ir() {
-        let source = r#"
-store: [
-    elements: [
-        create_group: SOURCE
-        collapse_group: SOURCE
-        reset: SOURCE
-    ]
-    group_to_create:
-        LATEST {
-            elements.create_group.event.press |> THEN { TEXT { Core bus group } }
-        }
-    groups:
-        LIST {}
-        |> List/append(item: group_to_create |> THEN {
-            [name: group_to_create, role: TEXT { Bus }]
-        })
-        |> List/map(group, new: new_group(group: group, store: store))
-        |> List/remove(group, when:
-            LATEST {
-                elements.reset.event.press |> THEN { True }
-            }
-        )
-    markers:
-        LIST {
-            [label: TEXT { 42 ns }]
-        }
-        |> List/map(marker, new: new_marker(marker: marker))
-        |> List/remove(marker, when:
-            LATEST {
-                elements.reset.event.press |> THEN { True }
-            }
-        )
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Groups }))
-
-FUNCTION new_group(group, store) {
-    [
-        group_elements: [
-            collapse_group: SOURCE
-        ]
-        name: group.name
-        role:
-            group.role |> HOLD role { LATEST {} }
-        collapsed:
-            False |> HOLD collapsed {
-                LATEST {
-                    store.elements.collapse_group.event.press |> THEN { True }
-                }
-            }
-    ]
-}
-
-FUNCTION new_marker(marker) {
-    [
-        label: marker.label
-    ]
-}
-"#;
-        let mut runtime = LiveRuntime::from_source("source-const-append-row", source)
-            .expect("runtime should load const append source");
-        let mut create_expected = BTreeMap::new();
-        create_expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.create_group".to_owned()),
-        );
-        let create_step = ScenarioStep {
-            id: "create-group".to_owned(),
-            expected_source_event: Some(create_expected),
-            expect_semantic_delta_contains: vec!["ListInsert".to_owned()],
-            ..ScenarioStep::default()
-        };
-        let create_output = runtime
-            .apply_source_event_for_step(
-                &create_step,
-                LiveSourceEvent {
-                    source: "store.elements.create_group".to_owned(),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        assert!(create_output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "ListInsert"
-                && delta.list_id.as_deref() == Some("groups")
-                && matches!(&delta.value, ProtocolValue::Text(value) if value == "Core bus group")
-        }));
-        assert_eq!(
-            create_output.state_summary["groups"][0]["name"],
-            "Core bus group"
-        );
-        assert_eq!(create_output.state_summary["groups"][0]["role"], "Bus");
-
-        let mut collapse_expected = BTreeMap::new();
-        collapse_expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.collapse_group".to_owned()),
-        );
-        let collapse_step = ScenarioStep {
-            id: "collapse-group".to_owned(),
-            expected_source_event: Some(collapse_expected),
-            expect_semantic_delta_contains: vec!["FieldSet:collapsed".to_owned()],
-            ..ScenarioStep::default()
-        };
-        let collapse_output = runtime
-            .apply_source_event_for_step(
-                &collapse_step,
-                LiveSourceEvent {
-                    source: "store.elements.collapse_group".to_owned(),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        assert!(collapse_output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet"
-                && delta.list_id.as_deref() == Some("groups")
-                && delta.field_path.as_deref() == Some("collapsed")
-                && matches!(&delta.value, ProtocolValue::Bool(true))
-        }));
-
-        let mut reset_expected = BTreeMap::new();
-        reset_expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.reset".to_owned()),
-        );
-        let reset_step = ScenarioStep {
-            id: "reset-groups-and-markers".to_owned(),
-            expected_source_event: Some(reset_expected),
-            expect_semantic_delta_contains: vec!["ListRemove".to_owned()],
-            ..ScenarioStep::default()
-        };
-        let reset_output = runtime
-            .apply_source_event_for_step(
-                &reset_step,
-                LiveSourceEvent {
-                    source: "store.elements.reset".to_owned(),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        let removed_lists = reset_output
-            .semantic_deltas
-            .iter()
-            .filter(|delta| delta.kind == "ListRemove")
-            .filter_map(|delta| delta.list_id.as_deref())
-            .collect::<BTreeSet<_>>();
-        assert!(removed_lists.contains("groups"));
-        assert!(removed_lists.contains("markers"));
-    }
-
-    #[test]
-    fn source_routes_are_dense_by_hidden_source_id() {
-        let parsed = parse_source(
-            "examples/todomvc.bn",
-            include_str!("../../../examples/todomvc.bn"),
-        )
-        .unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-
-        assert!(
-            compiled.source_routes.len() > 0,
-            "TodoMVC must compile source routes from typed IR"
-        );
-        let source_metadata = compiler_source_route_sources_from_ir(&ir);
-        for route in &compiled.source_routes.route_slots {
-            let source_id = route.source_id;
-            let by_id = compiled
-                .source_routes
-                .for_source_id(source_id)
-                .expect("dense SourceId slot must resolve to a route");
-            assert_eq!(by_id.source, route.source);
-            let source = source_metadata
-                .iter()
-                .find(|source| source.source_id == source_id.as_usize())
-                .expect("compiler source metadata must include dense SourceId");
-            assert_eq!(
-                source.path, route.source,
-                "dense route slot must match the compiler source metadata table"
-            );
-        }
-
-        let input_source = source_metadata
-            .iter()
-            .find(|source| source.path == "store.sources.new_todo_input.key_down")
-            .expect("TodoMVC input key source must be present in compiler source metadata");
-        let input_route = compiled
-            .source_routes
-            .for_source_id(SourceId(input_source.source_id))
-            .expect("TodoMVC input source id must resolve through dense route slots");
-        let input_actions = compiled
-            .source_routes
-            .actions_for_source_id(SourceId(input_source.source_id))
-            .expect("TodoMVC input source id must resolve through SourceActionTable");
-        assert!(
-            input_route.has_list_append_target("todos"),
-            "append routing must be found from SourceId, not a label scan"
-        );
-        assert!(
-            input_actions.iter().any(
-                |action| matches!(action, SourceAction::ListAppend { list, .. } if list == "todos")
-            ),
-            "append action must be found from SourceActionTable, not route-kind inference"
-        );
-        assert_eq!(
-            compiled.source_routes.source_id(&input_source.path),
-            Some(SourceId(input_source.source_id)),
-            "source label fallback must resolve through the sorted compiled label index"
-        );
-        assert!(
-            compiled
-                .source_routes
-                .label_slots
-                .windows(2)
-                .all(|window| window[0].source < window[1].source),
-            "source label slots must stay sorted for binary-search fallback"
-        );
-
-        let report = compiled.report();
-        assert!(
-            report["runtime_symbol_count"].as_u64().unwrap_or_default() > 0,
-            "compiled programs must own diagnostic symbols instead of relying on leaked strings"
-        );
-        assert_eq!(
-            report["runtime_symbol_ownership"],
-            json!("compiled_program_owned")
-        );
-        assert_eq!(
-            report["source_route_index_kind"],
-            json!("dense_source_id_slots")
-        );
-        assert_eq!(
-            report["source_route_label_lookup_kind"],
-            json!("sorted_source_label_binary_search")
-        );
-        assert_eq!(
-            report["source_routes_with_ids"].as_u64(),
-            report["source_route_count"].as_u64()
-        );
-        assert!(
-            report["source_route_id_slot_count"]
-                .as_u64()
-                .expect("source route id slot count must be numeric")
-                >= report["source_route_count"]
-                    .as_u64()
-                    .expect("source route count must be numeric")
-        );
-        assert_eq!(
-            report["source_action_hot_path_access"],
-            json!("shared_compiled_arc_slice_by_source_id")
-        );
-        assert_eq!(
-            report["source_action_hot_path_vector_clone_count"],
-            json!(0)
-        );
-        assert!(
-            report["source_route_op_stream_count"]
-                .as_u64()
-                .unwrap_or_default()
-                > 0,
-            "compiled route report must expose SourceId-keyed action op streams"
-        );
-        assert!(
-            report["source_route_total_action_op_count"]
-                .as_u64()
-                .unwrap_or_default()
-                >= input_actions.len() as u64,
-            "compiled route report must count action ops"
-        );
-        assert_eq!(report["source_route_fallback_count"], json!(0));
-        assert_eq!(report["source_route_deopt_count"], json!(0));
-        let op_streams = report["source_route_op_streams"]["routes"]
-            .as_array()
-            .expect("compiled report must include per-route op streams");
-        assert!(op_streams.iter().any(|route| {
-            route["source_id"].as_u64() == Some(input_source.source_id as u64)
-                && route["action_op_count"].as_u64().unwrap_or_default() > 0
-                && route["fallback_reasons"]
-                    .as_array()
-                    .is_some_and(Vec::is_empty)
-                && route["deopt_reasons"].as_array().is_some_and(Vec::is_empty)
-        }));
-    }
-
-    #[test]
-    fn todomvc_like_names_do_not_create_todomvc_routes_without_ir_actions() {
-        let source = r#"
-store: [
-    sources: [
-        new_todo_input: [
-            events: [
-                key_down: SOURCE
-            ]
-        ]
-    ]
-
-    todos: LIST {
-        [title: TEXT { Looks like TodoMVC }, completed: False]
-    }
-
-    count:
-        0 |> HOLD count {
-            LATEST {
-                sources.new_todo_input.events.key_down.key |> WHEN {
-                    Enter => count + 1
-                    __ => SKIP
-                }
-            }
-        }
-]
-
-document: Document/new(
-    root: fake_todomvc_app()
-)
-
-FUNCTION fake_todomvc_app() {
-    Element/label(
-        element: []
-        style: [width: Fill, height: 40]
-        label: store.count
-    )
-}
-"#;
-        let parsed = parse_source("examples/todomvc-looking-not-todomvc.bn", source).unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let source_id = compiled
-            .source_routes
-            .source_id("store.sources.new_todo_input.key_down")
-            .expect("TodoMVC-looking source name must still compile to a typed SourceId");
-        let actions = compiled
-            .source_routes
-            .actions_for_source_id(source_id)
-            .expect("typed SourceId must resolve to compiled route actions");
-
-        assert!(
-            actions.iter().all(
-                |action| !matches!(action, SourceAction::ListAppend { list, .. } if list == "todos")
-            ),
-            "TodoMVC-looking names must not synthesize list append behavior without IR append actions"
-        );
-        assert!(
-            actions.iter().all(
-                |action| !matches!(action, SourceAction::ListRemove { list } if list == "todos")
-            ),
-            "TodoMVC-looking names must not synthesize list remove behavior without IR remove actions"
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, SourceAction::RootScalar)),
-            "the real IR action should still be present"
-        );
-    }
-
-    #[test]
-    fn list_predicates_preserve_ir_paths_without_todo_aliases() {
-        assert!(matches!(
-            runtime_list_predicate_from_compiler(CompilerListPredicate::FieldBool {
-                path: "task.done".to_owned()
-            }),
-            RuntimeListPredicate::FieldBool { path } if path == "task.done"
-        ));
-        assert!(matches!(
-            runtime_list_predicate_from_compiler(CompilerListPredicate::FieldBoolNot {
-                path: "task.done".to_owned()
-            }),
-            RuntimeListPredicate::FieldBoolNot { path } if path == "task.done"
-        ));
-        assert!(matches!(
-            runtime_list_predicate_from_compiler(CompilerListPredicate::SelectorVisibility {
-                selector: "store.filter".to_owned(),
-                row_field: "task.done".to_owned(),
-            }),
-            RuntimeListPredicate::SelectorVisibility {
-                selector,
-                row_field,
-            } if selector == "store.filter" && row_field == "task.done"
-        ));
-    }
-
-    #[test]
-    fn runtime_value_summaries_return_every_requested_path() {
-        let source = r#"
-store: [
-    elements: [
-        noop: SOURCE
-    ]
-    held:
-        TEXT { ready } |> HOLD held {
-            LATEST {}
-        }
-    one: TEXT { one }
-    two: TEXT { two }
-    three: TEXT { three }
-    four: TEXT { four }
-    five: TEXT { five }
-    six: TEXT { six }
-    seven: TEXT { seven }
-    eight: TEXT { eight }
-    nine: TEXT { nine }
-]
-
-document: Document/new(root: Element/label(element: [], label: store.one))
-"#;
-        let mut runtime = LiveRuntime::from_source("value-summary-path-count", source).unwrap();
-        let paths = [
-            "store.one",
-            "store.two",
-            "store.three",
-            "store.four",
-            "store.five",
-            "store.six",
-            "store.seven",
-            "store.eight",
-            "store.nine",
-        ]
-        .iter()
-        .map(|path| (*path).to_owned())
-        .collect::<Vec<_>>();
-        let values = runtime.runtime_value_summaries(&paths, 2, 4, 2);
-
-        for path in &paths {
-            assert!(
-                values.get(path).is_some(),
-                "explicit summary path `{path}` should not be silently dropped: {values:#}"
-            );
-        }
-        assert_eq!(
-            values["store.nine"],
-            json!({"kind": "string", "value": "nine"})
-        );
-    }
-
-    #[test]
-    fn row_scoped_source_without_row_context_does_not_bulk_apply_indexed_bool() {
-        let source = r#"
-signals:
-    LIST {
-        [name: TEXT { clk }]
-        [name: TEXT { reset }]
-    }
-    |> List/map(signal, new: new_signal(signal: signal))
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Signals }))
-
-FUNCTION new_signal(signal) {
-    [
-        signal_elements: [
-            select_signal: SOURCE
-        ]
-        name: signal.name
-        selected:
-            False |> HOLD selected {
-                LATEST {
-                    signal_elements.select_signal.event.press |> THEN { True }
-                }
-            }
-    ]
-}
-"#;
-        let mut runtime =
-            LiveRuntime::from_source("row-scoped-source-needs-row-context", source).unwrap();
-        let error = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "signal.signal_elements.select_signal".to_owned(),
-                ..LiveSourceEvent::default()
-            })
-            .expect_err("row-scoped source without row context must not bulk-select all rows");
-        let message = error.to_string();
-        assert!(
-            message.contains("scoped source")
-                && message
-                    .contains("needs target_key, row lookup payload, address, or target_text")
-                && message.contains("to resolve a row"),
-            "unexpected missing-row-context error: {message}"
-        );
-    }
-
-    #[test]
-    fn root_read_key_aliases_match_store_local_without_nested_leaf_collision() {
-        let keys = root_read_keys_for_path("store.group.value");
-        let fields = keys
-            .iter()
-            .filter_map(|key| match key {
-                GenericReadKey::Root { field } => Some(field.as_str()),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(fields, BTreeSet::from(["store.group.value", "group.value"]));
-        assert!(keys.contains(&GenericReadKey::RootChild {
-            root: "store.group".to_owned(),
-            path: "value".to_owned(),
-        }));
-        assert!(
-            keys.iter()
-                .any(|key| root_read_key_matches_path(key, "store.group.value"))
-        );
-        assert!(root_read_key_matches_path(
-            &GenericReadKey::Root {
-                field: "group.value".to_owned(),
-            },
-            "store.group.value"
-        ));
-        assert!(
-            !root_read_key_matches_path(
-                &GenericReadKey::Root {
-                    field: "value".to_owned(),
-                },
-                "store.group.value"
-            ),
-            "a nested store root must not publish the bare leaf alias because it can collide with a real top-level store root"
-        );
-
-        let nested_cursor = root_read_keys_for_path("store.page_ref.cursor")
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        assert!(
-            !nested_cursor.contains(&GenericReadKey::Root {
-                field: "cursor".to_owned()
-            }),
-            "store.page_ref.cursor must not collide with store.cursor dependents"
-        );
-        assert!(
-            !root_read_key_matches_path(
-                &GenericReadKey::Root {
-                    field: "cursor".to_owned(),
-                },
-                "store.page_ref.cursor"
-            ),
-            "matching must follow the same no-nested-leaf dependency contract"
-        );
-        assert!(root_read_key_matches_path(
-            &GenericReadKey::Root {
-                field: "value".to_owned(),
-            },
-            "store.value"
-        ));
-
-        let deduped = root_read_keys_for_path("store.value")
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            deduped.len(),
-            root_read_keys_for_path("store.value").len(),
-            "store-local and leaf aliases that are equal must not be emitted twice"
-        );
-    }
-
-    #[test]
-    fn derived_root_summary_recomputes_pure_dependency_before_stored_scalar_alias() {
-        let source = r#"
-store: [
-    elements: [
-        select_file: SOURCE
-    ]
-    active_file:
-        TEXT { simple.vcd } |> HOLD active_file {
-            LATEST {
-                elements.select_file.text
-            }
-        }
-    descriptor_file:
-        active_file
-    byte_length:
-        descriptor_file |> WHEN {
-            TEXT { simple_test.ghw } => 833
-            TEXT { wave_27.fst } => 28860652
-            __ => 311
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Wave }))
-"#;
-        let mut runtime = LiveRuntime::from_source("derived-root-summary-byte-length", source)
-            .expect("runtime should initialize");
-        let initial = runtime.state_summary();
-        assert_eq!(initial["store"]["descriptor_file"], "simple.vcd");
-        assert_eq!(initial["store"]["byte_length"], 311);
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.select_file".to_owned(),
-                text: Some("simple_test.ghw".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .expect("file selection source event should apply");
-        assert_eq!(
-            output.state_summary["store"]["active_file"],
-            "simple_test.ghw"
-        );
-        assert_eq!(
-            output.state_summary["store"]["descriptor_file"],
-            "simple_test.ghw"
-        );
-        assert_eq!(
-            output.state_summary["store"]["byte_length"], 833,
-            "pure root dependencies in summaries must read the current derived value, not the stale scalar alias"
-        );
-
-        let summary = runtime.state_summary();
-        assert_eq!(summary["store"]["descriptor_file"], "simple_test.ghw");
-        assert_eq!(summary["store"]["byte_length"], 833);
-
-        let sparse = runtime.runtime_value_summaries(
-            &["byte_length".to_owned(), "store.byte_length".to_owned()],
-            3,
-            8,
-            4,
-        );
-        assert_eq!(
-            sparse["byte_length"],
-            json!({"kind": "number", "value": 833}),
-            "unqualified sparse summaries must recompute current pure roots before reading stale scalar aliases"
-        );
-        assert_eq!(
-            sparse["store.byte_length"],
-            json!({"kind": "number", "value": 833}),
-            "qualified sparse summaries must recompute current pure roots before reading stale scalar aliases"
-        );
-    }
-
-    #[test]
-    fn text_match_patterns_rejoin_pathlike_punctuation_without_spaces() {
-        let tokens = |parts: &[&str]| {
-            parts
-                .iter()
-                .map(|part| (*part).to_owned())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            text_match_pattern_value(&tokens(&["simple_test", ".", "ghw"])),
-            "simple_test.ghw"
-        );
-        assert_eq!(
-            text_match_pattern_value(&tokens(&["-", "simple", ".", "vcd"])),
-            "- simple.vcd"
-        );
-        assert_eq!(
-            text_match_pattern_value(&tokens(&["simple_tb", ".", "s", "group"])),
-            "simple_tb.s group"
-        );
-        assert_eq!(
-            text_match_pattern_value(&tokens(&["https", ":", "/", "/", "kavik", ".", "cz", "/"])),
-            "https://kavik.cz/"
-        );
-        assert_eq!(
-            text_match_pattern_value(&tokens(&["data_bus", "[", "7", ":", "0", "]"])),
-            "data_bus[7:0]"
-        );
-    }
-
-    #[test]
-    fn root_derived_revisits_earlier_dependent_after_later_dependency_changes() {
-        let source = r#"
-store: [
-    elements: [
-        reload: SOURCE
-    ]
-    base:
-        TEXT { cold } |> HOLD base {
-            LATEST {
-                elements.reload.event.press |> THEN { TEXT { hot } }
-            }
-        }
-    a_output:
-        base |> WHEN {
-            TEXT { hot } => z_input
-            __ => TEXT { cold-output }
-        }
-    z_input:
-        base |> WHEN {
-            TEXT { hot } => TEXT { fresh }
-            __ => TEXT { stale }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: store.a_output))
-"#;
-        let mut runtime = LiveRuntime::from_source("root-derived-revisit", source)
-            .expect("runtime should initialize");
-        assert_eq!(runtime.state_summary()["store"]["a_output"], "cold-output");
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.elements.reload".to_owned(),
-                ..LiveSourceEvent::default()
-            })
-            .expect("reload source event should apply");
-        assert_eq!(output.state_summary["store"]["z_input"], "fresh");
-        assert_eq!(output.state_summary["store"]["a_output"], "fresh");
-    }
-
-    #[test]
-    fn generic_source_event_ingests_expected_event_payloads() {
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("cell.sources.editor.commit".to_owned()),
-        );
-        expected.insert("text".to_owned(), toml::Value::String("=A0+1".to_owned()));
-        expected.insert("key".to_owned(), toml::Value::String("Enter".to_owned()));
-        expected.insert("address".to_owned(), toml::Value::String("B0".to_owned()));
-        expected.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Buy groceries".to_owned()),
-        );
-        let step = ScenarioStep {
-            id: "source-ingest".to_owned(),
-            expected_source_event: Some(expected),
-            ..ScenarioStep::default()
-        };
-
-        let event = GenericSourceEvent::require(&step).unwrap();
-        assert_eq!(event.source, "cell.sources.editor.commit");
-        assert_eq!(event.text, Some("=A0+1"));
-        assert_eq!(event.key, Some("Enter"));
-        assert_eq!(event.address, Some("B0"));
-        assert_eq!(event.target_text, Some("Buy groceries"));
-
-        let missing = ScenarioStep {
-            id: "missing-source".to_owned(),
-            ..ScenarioStep::default()
-        };
-        assert!(GenericSourceEvent::require(&missing).is_err());
-    }
-
-    #[test]
-    fn generic_source_event_rejects_named_bytes_payload_keys_in_v1() {
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.receive".to_owned()),
-        );
-        expected.insert(
-            "blob_bytes_hex".to_owned(),
-            toml::Value::String("01fe04".to_owned()),
-        );
-        let step = ScenarioStep {
-            id: "named-bytes-payload".to_owned(),
-            expected_source_event: Some(expected),
-            ..ScenarioStep::default()
-        };
-
-        let error = GenericSourceEvent::require(&step)
-            .expect_err("named byte payload keys must be rejected in v1")
-            .to_string();
-        assert!(
-            error
-                .contains("named BYTES source payload key `blob_bytes_hex` is not supported in v1"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn list_memory_dense_key_slots_survive_remove_and_move() {
-        let mut list = ListMemory::from_values([
-            todo_generic_row("a"),
-            todo_generic_row("b"),
-            todo_generic_row("c"),
-            todo_generic_row("d"),
-        ]);
-        let (first_key, _) = list.row_identity(0).unwrap();
-        let (second_key, _) = list.row_identity(1).unwrap();
-        let (third_key, _) = list.row_identity(2).unwrap();
-        let (fourth_key, _) = list.row_identity(3).unwrap();
-
-        let removed = list.remove_index(1);
-        assert_eq!(removed.key, second_key);
-        assert_eq!(list.bound_index(second_key, 1), None);
-        assert_eq!(list.len(), 3);
-        assert_eq!(list.slot_capacity(), 4);
-        assert_eq!(list.valid_slot_count(), 3);
-        assert_eq!(list.free_slot_count(), 1);
-        assert_eq!(list.bound_index(first_key, 1), Some(0));
-        assert_eq!(list.bound_index(third_key, 1), Some(1));
-        assert_eq!(list.bound_index(fourth_key, 1), Some(2));
-
-        list.move_index(2, 0).unwrap();
-        assert_eq!(list.bound_index(fourth_key, 1), Some(0));
-        assert_eq!(list.bound_index(first_key, 1), Some(1));
-        assert_eq!(list.bound_index(third_key, 1), Some(2));
-
-        let (new_key, generation) = list.append(todo_generic_row("e"));
-        assert_eq!(generation, 1);
-        assert_ne!(new_key, second_key);
-        assert_eq!(list.slot_capacity(), 4);
-        assert_eq!(list.valid_slot_count(), 4);
-        assert_eq!(list.free_slot_count(), 0);
-        assert_eq!(list.bound_index(new_key, 1), Some(3));
-    }
-
-    #[test]
-    fn list_memory_scalar_json_set_value_preserves_scalar_json_type() {
-        let mut columns = ValueColumns::default();
-        columns.insert_value("count".to_owned(), FieldValue::Json(json!(0)));
-        columns.insert_value("title".to_owned(), FieldValue::Text("row".to_owned()));
-        columns.insert_value("meta".to_owned(), FieldValue::Json(json!({"nested": true})));
-        let mut list = ListMemory::from_values([RuntimeRowSnapshot { columns }]);
-
-        list.set_value(0, "count", FieldValue::Json(json!(3)))
-            .expect("scalar JSON should update an existing scalar JSON column");
-        assert_eq!(
-            list.snapshot_index(0).unwrap().columns.owned_value("count"),
-            Some(FieldValue::Json(json!(3)))
-        );
-
-        let scalar_into_text = list
-            .set_value(0, "title", FieldValue::Json(json!(4)))
-            .expect_err("scalar JSON must not silently overwrite a text column")
-            .to_string();
-        assert!(
-            scalar_into_text.contains("cannot write scalar JSON into text runtime value `title`"),
-            "unexpected error: {scalar_into_text}"
-        );
-
-        let structured_input = list
-            .set_value(0, "count", FieldValue::Json(json!({"bad": true})))
-            .expect_err("structured JSON must not pass through scalar set_value")
-            .to_string();
-        assert!(
-            structured_input.contains("cannot write structured JSON value `count`"),
-            "unexpected error: {structured_input}"
-        );
-
-        let structured_existing = list
-            .set_value(0, "meta", FieldValue::Json(json!(5)))
-            .expect_err("scalar set_value must not overwrite structured JSON columns")
-            .to_string();
-        assert!(
-            structured_existing.contains(
-                "cannot overwrite structured runtime value `meta` through scalar set_value"
-            ),
-            "unexpected error: {structured_existing}"
-        );
-    }
-
-    #[test]
-    fn source_store_dense_source_id_slots_reject_unbound_sources() {
-        let mut sources = SourceStore::with_capacity(4);
-        sources
-            .bind_row(
-                "todos",
-                10,
-                1,
-                &[
-                    "todo.sources.todo_checkbox.click".to_owned(),
-                    "todo.sources.title_input.commit".to_owned(),
-                ],
-            )
-            .unwrap();
-        let binding = sources
-            .row_bindings("todos", 10, 1)
-            .find(|binding| binding.source_path == "todo.sources.todo_checkbox.click")
-            .cloned()
-            .unwrap();
-        assert!(sources.is_bound(
-            "todos",
-            10,
-            1,
-            &binding.source_path,
-            Some(binding.source_id),
-            Some(binding.bind_epoch),
-        ));
-
-        sources.unbind_row("todos", 10, 1);
-        sources.assert_invariants();
-        assert!(!sources.is_bound(
-            "todos",
-            10,
-            1,
-            &binding.source_path,
-            Some(binding.source_id),
-            Some(binding.bind_epoch),
-        ));
-    }
-
-    #[test]
-    fn source_store_stale_unbinds_do_not_drop_live_row_slots() {
-        let mut sources = SourceStore::with_capacity(4);
-        let paths = [
-            "todo.sources.todo_checkbox.click".to_owned(),
-            "todo.sources.title_input.commit".to_owned(),
-        ];
-        sources.bind_row("todos", 10, 1, &paths).unwrap();
-        let binding = sources
-            .row_bindings("todos", 10, 1)
-            .find(|binding| binding.source_path == paths[0])
-            .cloned()
-            .unwrap();
-
-        for (list, key, generation) in [("todos", 11, 1), ("todos", 10, 2), ("projects", 10, 1)] {
-            sources.unbind_row(list, key, generation);
-            sources.assert_invariants();
-            assert_eq!(sources.len(), 2);
-            assert_eq!(sources.row_binding_count("todos", 10, 1), 2);
-            assert!(sources.is_bound(
-                "todos",
-                10,
-                1,
-                &binding.source_path,
-                Some(binding.source_id),
-                Some(binding.bind_epoch),
-            ));
-        }
-
-        sources.unbind_row("todos", 10, 1);
-        sources.assert_invariants();
-        assert_eq!(sources.len(), 0);
-        assert_eq!(sources.row_binding_count("todos", 10, 1), 0);
-        assert!(!sources.is_bound(
-            "todos",
-            10,
-            1,
-            &binding.source_path,
-            Some(binding.source_id),
-            Some(binding.bind_epoch),
-        ));
-
-        sources.unbind_row("todos", 10, 1);
-        sources.assert_invariants();
-        assert_eq!(sources.len(), 0);
-    }
-
-    #[test]
-    fn source_store_rebinding_same_row_paths_is_idempotent() {
-        let mut sources = SourceStore::with_capacity(4);
-        let paths = [
-            "todo.sources.todo_checkbox.click".to_owned(),
-            "todo.sources.title_input.commit".to_owned(),
-        ];
-        sources.bind_row("todos", 10, 1, &paths).unwrap();
-        let first_binding = sources
-            .row_bindings("todos", 10, 1)
-            .find(|binding| binding.source_path == paths[0])
-            .cloned()
-            .unwrap();
-
-        sources.bind_row("todos", 10, 1, &paths).unwrap();
-        sources.assert_invariants();
-
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources.row_binding_count("todos", 10, 1), 2);
-        assert!(sources.is_bound(
-            "todos",
-            10,
-            1,
-            &first_binding.source_path,
-            Some(first_binding.source_id),
-            Some(first_binding.bind_epoch),
-        ));
-    }
-
-    #[test]
-    fn source_store_rebinds_removed_keys_but_rejects_active_identity_collision() {
-        let mut sources = SourceStore::with_capacity(4);
-        let first_paths = ["todo.sources.first.click".to_owned()];
-        sources.bind_row("todos", 10, 1, &first_paths).unwrap();
-        sources.assert_invariants();
-
-        assert!(
-            sources
-                .bind_row("todos", 10, 2, &["todo.sources.second.click".to_owned()])
-                .is_err()
-        );
-        sources
-            .bind_row(
-                "projects",
-                10,
-                1,
-                &["project.sources.name.click".to_owned()],
-            )
-            .unwrap();
-        sources.assert_invariants();
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources.row_binding_count("todos", 10, 1), 1);
-        assert_eq!(sources.row_binding_count("projects", 10, 1), 1);
-
-        sources.unbind_row("todos", 10, 1);
-        sources.assert_invariants();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources.row_binding_count("todos", 10, 1), 0);
-        assert_eq!(sources.row_binding_count("projects", 10, 1), 1);
-
-        sources.unbind_row("projects", 10, 1);
-        sources.assert_invariants();
-        assert_eq!(sources.len(), 0);
-
-        let second_paths = [
-            "todo.sources.second.click".to_owned(),
-            "todo.sources.second.commit".to_owned(),
-        ];
-        sources.bind_row("todos", 10, 2, &second_paths).unwrap();
-        sources.assert_invariants();
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources.row_binding_count("todos", 10, 2), 2);
-        assert_eq!(sources.row_binding_count("todos", 10, 1), 0);
-    }
-
-    #[test]
-    fn row_identity_source_binding_resolution_reports_mismatch_reasons() {
-        let mut sources = SourceStore::with_capacity(4);
-        sources
-            .bind_row(
-                "todos",
-                10,
-                1,
-                &[
-                    "todo.sources.todo_checkbox.click".to_owned(),
-                    "todo.sources.title_input.commit".to_owned(),
-                ],
-            )
-            .unwrap();
-        let binding = sources
-            .row_bindings("todos", 10, 1)
-            .find(|binding| binding.source_path == "todo.sources.todo_checkbox.click")
-            .cloned()
-            .unwrap();
-        let matched = sources.binding_resolution_report(
-            "todos",
-            10,
-            1,
-            &binding.source_path,
-            Some(binding.source_id),
-            Some(binding.bind_epoch),
-        );
-        assert_eq!(matched["matched"], json!(true));
-        assert_eq!(matched["reason"], json!("matched"));
-        assert_eq!(matched["requested"]["row_key"], json!(10));
-        assert_eq!(matched["requested"]["generation"], json!(1));
-        assert_eq!(
-            matched["requested"]["bind_epoch"],
-            json!(binding.bind_epoch)
-        );
-
-        let stale_epoch = sources.binding_resolution_report(
-            "todos",
-            10,
-            1,
-            &binding.source_path,
-            Some(binding.source_id),
-            Some(binding.bind_epoch + 1),
-        );
-        assert_eq!(stale_epoch["matched"], json!(false));
-        assert_eq!(stale_epoch["reason"], json!("bind_epoch_mismatch"));
-
-        let stale_generation = sources.binding_resolution_report(
-            "todos",
-            10,
-            2,
-            &binding.source_path,
-            Some(binding.source_id),
-            Some(binding.bind_epoch),
-        );
-        assert_eq!(stale_generation["matched"], json!(false));
-        assert_eq!(stale_generation["reason"], json!("generation_mismatch"));
-
-        sources.unbind_row("todos", 10, 1);
-        let unbound = sources.binding_resolution_report(
-            "todos",
-            10,
-            1,
-            &binding.source_path,
-            Some(binding.source_id),
-            Some(binding.bind_epoch),
-        );
-        assert_eq!(unbound["matched"], json!(false));
-        assert_eq!(unbound["reason"], json!("source_id_unbound"));
-    }
-
-    #[test]
-    fn source_store_row_binding_storage_grows_without_panic() {
-        let mut sources = SourceStore::with_capacity(64);
-        let path_refs = vec!["todo.sources.dynamic.change".to_owned(); 64];
-        sources.bind_row("todos", 10, 1, &path_refs).unwrap();
-        sources.assert_invariants();
-        assert_eq!(sources.len(), 64);
-        assert_eq!(sources.row_binding_count("todos", 10, 1), 64);
-    }
-
-    #[test]
-    fn cells_deltas_use_hidden_list_slots_not_visible_address_hashes() {
-        let mut runtime =
-            LiveRuntime::from_source("cells-hidden-keys", &cells_project_source_for_test())
-                .unwrap();
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "cell.sources.editor.commit".to_owned(),
-                text: Some("41".to_owned()),
-                address: Some("A0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let expected_key = output
-            .semantic_deltas
-            .iter()
-            .find(|delta| {
-                delta.list_id.as_deref() == Some("cells")
-                    && delta.field_path.as_deref() == Some("formula_text")
-            })
-            .and_then(|delta| delta.key)
-            .expect("Cells commit should emit a keyed formula_text delta");
-        assert!(
-            output
-                .semantic_deltas
-                .iter()
-                .filter(|delta| delta.list_id.is_some())
-                .all(|delta| delta.list_id.as_deref() == Some("cells"))
-        );
-        assert!(
-            output
-                .semantic_deltas
-                .iter()
-                .filter(|delta| {
-                    delta.kind == "FieldSet"
-                        && delta.list_id.as_deref() == Some("cells")
-                        && delta.field_path.as_deref() == Some("formula_text")
-                })
-                .all(|delta| delta.key == Some(expected_key))
-        );
-        assert!(output.semantic_deltas.iter().all(|delta| {
-            delta
-                .key
-                .is_none_or(|key| key != cell_address_hash_for_test("A0"))
-        }));
-        assert_ne!(expected_key, cell_address_hash_for_test("A0"));
-    }
-
-    #[test]
-    fn cells_edit_state_updates_are_derived_from_ir_branches() {
-        let source = cells_project_source_for_test()
-            .replace("change: SOURCE", "input: SOURCE")
-            .replace("commit: SOURCE", "apply: SOURCE")
-            .replace("cancel: SOURCE", "revert: SOURCE")
-            .replace(
-                "sources.editor.events.change",
-                "sources.editor.events.input",
-            )
-            .replace("sources.editor.change", "sources.editor.input")
-            .replace("sources.editor.commit", "sources.editor.apply")
-            .replace("sources.editor.cancel", "sources.editor.revert");
-        let parsed = parse_source("examples/cells.bn", source).unwrap();
-        lower(&parsed).unwrap();
-        let mut runtime =
-            LiveRuntime::from_source("renamed-cells-sources", &parsed.source).unwrap();
-        let _output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "cell.sources.editor.apply".to_owned(),
-                text: Some("123".to_owned()),
-                address: Some("A0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let document_summary = runtime.document_state_summary();
-        let a0 = cell_summary(&document_summary, "A0");
-        assert_eq!(a0.get("formula_text"), Some(&json!("123")));
-        assert_eq!(a0.get("editing_text"), Some(&json!("123")));
-        assert_eq!(
-            a0.get("value").and_then(json_scalar_text).as_deref(),
-            Some("123")
-        );
-        assert_eq!(a0.get("editing"), Some(&json!(false)));
-
-        let mut action = BTreeMap::new();
-        action.insert(
-            "kind".to_owned(),
-            toml::Value::String("key_down".to_owned()),
-        );
-        action.insert(
-            "target".to_owned(),
-            toml::Value::String("A0 editor".to_owned()),
-        );
-        action.insert("key".to_owned(), toml::Value::String("Escape".to_owned()));
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("cell.sources.editor.revert".to_owned()),
-        );
-        expected.insert("address".to_owned(), toml::Value::String("A0".to_owned()));
-        let step = ScenarioStep {
-            id: "renamed-cell-revert".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..ScenarioStep::default()
-        };
-        let output = runtime
-            .apply_source_event_for_step(
-                &step,
-                LiveSourceEvent {
-                    source: "cell.sources.editor.revert".to_owned(),
-                    address: Some("A0".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            )
-            .unwrap();
-        let document_summary = runtime.document_state_summary();
-        let a0 = cell_summary(&document_summary, "A0");
-        assert_eq!(a0.get("editing_text"), Some(&json!("123")));
-        assert_eq!(a0.get("editing"), Some(&json!(false)));
-        assert!(output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet"
-                && delta.list_id.as_deref() == Some("cells")
-                && delta.field_path.as_deref() == Some("editing_text")
-        }));
-    }
-
-    #[test]
-    fn cells_escape_cancel_restores_uncommitted_draft_from_row_formula_text() {
-        let mut runtime =
-            LiveRuntime::from_source("cells-cancel-draft", &cells_project_source_for_test())
-                .unwrap();
-        runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "cell.sources.editor.change".to_owned(),
-                text: Some("42".to_owned()),
-                address: Some("A0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let changed_summary = runtime.document_state_summary();
-        let changed_a0 = cell_summary(&changed_summary, "A0");
-        assert_eq!(changed_a0.get("formula_text"), Some(&json!("5")));
-        assert_eq!(changed_a0.get("editing_text"), Some(&json!("42")));
-        assert_eq!(changed_a0.get("editing"), Some(&json!(true)));
-
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "cell.sources.editor.cancel".to_owned(),
-                key: Some("Escape".to_owned()),
-                address: Some("A0".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let document_summary = runtime.document_state_summary();
-        let a0 = cell_summary(&document_summary, "A0");
-        assert_eq!(a0.get("formula_text"), Some(&json!("5")));
-        assert_eq!(a0.get("editing_text"), Some(&json!("5")));
-        assert_eq!(a0.get("editing"), Some(&json!(false)));
-        assert!(output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet"
-                && delta.list_id.as_deref() == Some("cells")
-                && delta.field_path.as_deref() == Some("editing_text")
-        }));
-    }
-
-    #[test]
-    fn latest_candidate_uses_greatest_source_sequence() {
-        let selected = latest_value(
-            "test.value",
-            &[
-                LatestCandidate::new(TickSeq(1), "old"),
-                LatestCandidate::new(TickSeq(3), "new"),
-                LatestCandidate::new(TickSeq(2), "middle"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(selected, Some("new"));
-    }
-
-    #[test]
-    fn latest_candidate_rejects_equal_sequence_conflict() {
-        let err = latest_value(
-            "test.value",
-            &[
-                LatestCandidate::new(TickSeq(7), "left"),
-                LatestCandidate::new(TickSeq(7), "right"),
-            ],
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("ambiguous LATEST write"));
-    }
-
-    #[test]
-    fn then_gate_converts_presence_to_latest_candidate() {
-        let present = then_value(EventPulse::present(TickSeq(9)), "value").unwrap();
-        assert_eq!(present.seq, TickSeq(9));
-        assert_eq!(present.value, "value");
-        assert!(
-            then_value(
-                EventPulse {
-                    seq: TickSeq(10),
-                    present: false,
-                },
-                "value",
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn while_gate_is_continuous_selection_not_loop() {
-        assert_eq!(while_value(true, "visible"), Some("visible"));
-        assert_eq!(while_value(false, "visible"), None);
-    }
-
-    #[test]
-    fn dirty_key_count_is_allocation_free_unique_scan() {
-        let deltas = [
-            field_delta(
-                Some(7),
-                Some(1),
-                "title",
-                ProtocolValue::Text(Cow::Borrowed("a")),
-            ),
-            field_delta(Some(7), Some(1), "editing", ProtocolValue::Bool(true)),
-            field_delta(Some(9), Some(1), "completed", ProtocolValue::Bool(false)),
-            field_delta(
-                None,
-                None,
-                "store.selected_filter",
-                ProtocolValue::Text(Cow::Borrowed("All")),
-            ),
-        ];
-        assert_eq!(dirty_key_count(&deltas), 2);
-    }
-
-    #[test]
-    fn dirty_keysets_track_list_field_keys_and_reuse_storage() {
-        let deltas = [
-            field_delta(
-                Some(7),
-                Some(1),
-                "title",
-                ProtocolValue::Text(Cow::Borrowed("a")),
-            ),
-            field_delta(Some(7), Some(1), "completed", ProtocolValue::Bool(true)),
-            field_delta(Some(9), Some(1), "completed", ProtocolValue::Bool(false)),
-            field_delta(
-                None,
-                None,
-                "store.selected_filter",
-                ProtocolValue::Text(Cow::Borrowed("All")),
-            ),
-        ];
-        let mut dirty = DirtyKeySets::with_capacity(4);
-        assert_eq!(dirty.mark_deltas(&deltas), 2);
-        assert_eq!(dirty.entries.len(), 3);
-        let capacity = dirty.entries.capacity();
-
-        dirty.mark_indexes("cells", "value", &[0, 2, 2, 5]);
-        assert_eq!(dirty.key_count(), 3);
-        assert_eq!(dirty.entries.capacity(), capacity);
-    }
-
-    #[test]
-    fn dirty_metrics_report_density_duplicates_and_recommendation() {
-        let deltas = [
-            field_delta(
-                Some(7),
-                Some(1),
-                "title",
-                ProtocolValue::Text(Cow::Borrowed("a")),
-            ),
-            field_delta(Some(7), Some(1), "completed", ProtocolValue::Bool(true)),
-            field_delta(Some(9), Some(1), "completed", ProtocolValue::Bool(false)),
-        ];
-        let mut dirty = DirtyKeySets::with_capacity(deltas.len());
-        dirty.mark_deltas(&deltas);
-
-        let metrics = dirty.metrics(
-            4,
-            3,
-            vec!["todos[0].visible".to_owned(), "todos[1].visible".to_owned()],
-        );
-        let report = metrics.to_report();
-
-        assert_eq!(metrics.entry_count, 3);
-        assert_eq!(metrics.unique_key_count, 2);
-        assert_eq!(metrics.duplicate_attempt_count, 1);
-        assert_eq!(metrics.fanout_recompute_candidate_count, 3);
-        assert_eq!(metrics.density_estimate, 0.5);
-        assert_eq!(metrics.representation_boundary, "DirtyKeySets");
-        assert_eq!(metrics.recommended_representation, "fixed_bitset");
-        assert_eq!(report["top_recompute_causes"][0], "todos[0].visible");
-    }
-
-    #[test]
-    fn list_index_text_lookup_preserves_visible_order_and_survives_mutation() {
-        let mut list = ListMemory::from_values([
-            todo_generic_row("duplicate"),
-            todo_generic_row("middle"),
-            todo_generic_row("duplicate"),
-        ]);
-
-        let (index, probe) = list.find_textlike_indexed("title", "duplicate");
-        assert_eq!(index, Some(0));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 2);
-
-        list.move_index(2, 0).unwrap();
-        let (index, probe) = list.find_textlike_indexed("title", "duplicate");
-        assert_eq!(index, Some(0));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 2);
-
-        list.set_textlike(0, "title", "changed").unwrap();
-        let (index, probe) = list.find_textlike_indexed("title", "duplicate");
-        assert_eq!(index, Some(1));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 1);
-    }
-
-    #[test]
-    fn list_existing_text_index_lookup_is_read_only_and_ordered() {
-        let mut list = ListMemory::from_values([
-            todo_generic_row("duplicate"),
-            todo_generic_row("middle"),
-            todo_generic_row("duplicate"),
-        ]);
-
-        assert_eq!(
-            list.find_textlike_existing_index("title", "duplicate"),
-            None,
-            "read-only lookup must not build an index"
-        );
-        assert!(list.text_lookup_indexes.is_empty());
-
-        let (index, probe) = list.find_textlike_indexed("title", "duplicate");
-        assert_eq!(index, Some(0));
-        assert!(probe.used_index);
-
-        assert_eq!(
-            list.find_textlike_existing_index("title", "duplicate"),
-            Some(0)
-        );
-        list.move_index(2, 0).unwrap();
-        assert_eq!(
-            list.find_textlike_existing_index("title", "duplicate"),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn list_index_text_lookup_survives_unrelated_text_field_mutation() {
-        fn cell_row(address: &str, formula: &str) -> RuntimeRowSnapshot {
-            let mut columns = ValueColumns::default();
-            columns.insert_value("address".to_owned(), FieldValue::Text(address.to_owned()));
-            columns.insert_value(
-                "formula_text".to_owned(),
-                FieldValue::Text(formula.to_owned()),
-            );
-            RuntimeRowSnapshot { columns }
-        }
-
-        let mut list = ListMemory::from_values([
-            cell_row("A0", "1"),
-            cell_row("B0", "2"),
-            cell_row("C0", "3"),
-        ]);
-
-        let (indices, probe) = list.find_textlike_indices_indexed("address", "B0");
-        assert_eq!(indices, Some(vec![1]));
-        assert!(probe.used_index);
-        assert_eq!(list.text_lookup_indexes.len(), 1);
-        assert_eq!(
-            list.text_lookup_indexes[0].field_id,
-            FieldSlotId::from_path("address")
-        );
-
-        list.set_textlike(1, "formula_text", "=add(A0,C0)").unwrap();
-
-        assert_eq!(
-            list.text_lookup_indexes.len(),
-            1,
-            "updating formula_text should not evict the address lookup index"
-        );
-        assert_eq!(
-            list.text_lookup_indexes[0].field_id,
-            FieldSlotId::from_path("address")
-        );
-        let (indices, probe) = list.find_textlike_indices_indexed("address", "B0");
-        assert_eq!(indices, Some(vec![1]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 1);
-
-        list.set_textlike(1, "address", "B1").unwrap();
-
-        assert!(
-            list.text_lookup_indexes.is_empty(),
-            "updating address must still evict the address lookup index"
-        );
-        let (indices, probe) = list.find_textlike_indices_indexed("address", "B0");
-        assert_eq!(indices, Some(vec![]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 0);
-    }
-
-    #[test]
-    fn list_batch_text_write_preserves_unrelated_text_lookup_indexes() {
-        fn cell_row(address: &str, formula: &str) -> RuntimeRowSnapshot {
-            let mut columns = ValueColumns::default();
-            columns.insert_value("address".to_owned(), FieldValue::Text(address.to_owned()));
-            columns.insert_value(
-                "formula_text".to_owned(),
-                FieldValue::Text(formula.to_owned()),
-            );
-            RuntimeRowSnapshot { columns }
-        }
-
-        let mut list = ListMemory::from_values([
-            cell_row("A0", "1"),
-            cell_row("B0", "2"),
-            cell_row("C0", "3"),
-        ]);
-
-        let (indices, probe) = list.find_textlike_indices_indexed("address", "B0");
-        assert_eq!(indices, Some(vec![1]));
-        assert!(probe.used_index);
-        let changed = list
-            .set_or_replace_text_values(
-                "formula_text",
-                vec!["1".to_owned(), "=add(A0,C0)".to_owned(), "3".to_owned()],
-            )
-            .unwrap();
-        assert_eq!(changed, vec![1]);
-        assert_eq!(
-            list.text_lookup_indexes.len(),
-            1,
-            "batch-updating formula_text should not evict the address lookup index"
-        );
-        assert_eq!(
-            list.text_lookup_indexes[0].field_id,
-            FieldSlotId::from_path("address")
-        );
-        let (indices, probe) = list.find_textlike_indices_indexed("address", "B0");
-        assert_eq!(indices, Some(vec![1]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 1);
-
-        let changed = list
-            .set_or_replace_text_values(
-                "address",
-                vec!["A0".to_owned(), "B1".to_owned(), "C0".to_owned()],
-            )
-            .unwrap();
-        assert_eq!(changed, vec![1]);
-        assert!(
-            list.text_lookup_indexes.is_empty(),
-            "batch-updating address must evict the address lookup index"
-        );
-    }
-
-    #[test]
-    fn list_index_text_lookup_returns_all_matches_in_visible_order() {
-        let mut list = ListMemory::from_values([
-            todo_generic_row("duplicate"),
-            todo_generic_row("middle"),
-            todo_generic_row("duplicate"),
-        ]);
-
-        let (indices, probe) = list.find_textlike_indices_indexed("title", "duplicate");
-        assert_eq!(indices, Some(vec![0, 2]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 2);
-
-        list.move_index(2, 0).unwrap();
-        let (indices, probe) = list.find_textlike_indices_indexed("title", "duplicate");
-        assert_eq!(indices, Some(vec![0, 1]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 2);
-
-        list.set_textlike(0, "title", "changed").unwrap();
-        let (indices, probe) = list.find_textlike_indices_indexed("title", "duplicate");
-        assert_eq!(indices, Some(vec![1]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 1);
-    }
-
-    #[test]
-    fn list_index_text_lookup_intersects_selection_without_reordering() {
-        let mut list = ListMemory::from_values([
-            todo_generic_row("duplicate"),
-            todo_generic_row("middle"),
-            todo_generic_row("duplicate"),
-            todo_generic_row("other"),
-            todo_generic_row("duplicate"),
-        ]);
-
-        let selection = [4, 1, 0, 3];
-        let (indices, probe) =
-            list.find_textlike_indices_in_selection_indexed("title", "duplicate", &selection, true);
-        assert_eq!(indices, Some(vec![4, 0]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, selection.len());
-
-        let (indices, probe) = list.find_textlike_indices_in_selection_indexed(
-            "title",
-            "duplicate",
-            &selection,
-            false,
-        );
-        assert_eq!(indices, Some(vec![1, 3]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, selection.len());
-    }
-
-    #[test]
-    fn list_sorted_index_complement_preserves_visible_order() {
-        assert_eq!(
-            list_indices_not_in_sorted(6, &[1, 1, 3, 9]),
-            vec![0, 2, 4, 5]
-        );
-        assert_eq!(list_indices_not_in_sorted(4, &[]), vec![0, 1, 2, 3]);
-        assert_eq!(
-            list_indices_not_in_sorted(4, &[0, 1, 2, 3]),
-            Vec::<usize>::new()
-        );
-    }
-
-    #[test]
-    fn list_index_numeric_lookup_intersects_selection_and_skips_nonnumeric_not_equal() {
-        fn score_row(score: Option<&str>, label: &str) -> RuntimeRowSnapshot {
-            let mut columns = ValueColumns::default();
-            if let Some(score) = score {
-                columns.insert_value("score".to_owned(), FieldValue::Text(score.to_owned()));
-            }
-            columns.insert_value("label".to_owned(), FieldValue::Text(label.to_owned()));
-            RuntimeRowSnapshot { columns }
-        }
-
-        let mut list = ListMemory::from_values([
-            score_row(Some("1"), "one"),
-            score_row(Some("2"), "two"),
-            score_row(None, "missing"),
-            score_row(Some("n/a"), "bad"),
-            score_row(Some("3"), "three"),
-        ]);
-
-        let selection = [4, 3, 2, 1, 0];
-        let (indices, probe) =
-            list.find_numeric_indices_in_selection_indexed("score", 2, "!=", true, &selection);
-        assert_eq!(indices, Some(vec![4, 0]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, selection.len());
-
-        let selection = [4, 0, 1];
-        let (indices, probe) =
-            list.find_numeric_indices_in_selection_indexed("score", 0, ">", true, &selection);
-        assert_eq!(indices, Some(vec![4, 0, 1]));
-        assert!(probe.used_index);
-        assert_eq!(probe.candidate_count, 3);
-    }
-
-    #[test]
-    fn list_index_report_counters_include_task_0301_fields() {
-        let report = RuntimeListScanCounters {
-            rows_scanned: 10,
-            row_occurrences_scanned: 3,
-            order_slots_refreshed: 2,
-            summary_fields_scanned: 4,
-            dirty_entries_deduplicated: 1,
-            route_candidates_visited: 5,
-            text_lookup_index_hits: 1,
-            text_lookup_index_misses: 0,
-            text_lookup_index_candidates: 2,
-            numeric_lookup_index_hits: 1,
-            numeric_lookup_index_misses: 0,
-            numeric_lookup_index_candidates: 2,
-            list_find_rows_scanned: 1,
-            filter_text_contains_rows_scanned: 2,
-            filter_field_rows_scanned: 3,
-            move_field_rows_scanned: 4,
-            join_field_rows_scanned: 5,
-            map_join_field_fusions: 1,
-            map_join_field_rows_fused: 2,
-            list_view_direct_rows: 3,
-            list_view_row_ref_materializations_avoided: 3,
-            retain_rows_scanned: 6,
-        }
-        .to_report();
-
-        for field in [
-            "rows_scanned",
-            "row_occurrences_scanned",
-            "order_slots_refreshed",
-            "summary_fields_scanned",
-            "dirty_entries_deduplicated",
-            "route_candidates_visited",
-            "text_lookup_index_hits",
-            "text_lookup_index_misses",
-            "text_lookup_index_candidates",
-            "numeric_lookup_index_hits",
-            "numeric_lookup_index_misses",
-            "numeric_lookup_index_candidates",
-            "list_find_rows_scanned",
-            "filter_text_contains_rows_scanned",
-            "filter_field_rows_scanned",
-            "move_field_rows_scanned",
-            "join_field_rows_scanned",
-            "map_join_field_fusions",
-            "map_join_field_rows_fused",
-            "list_view_direct_rows",
-            "list_view_row_ref_materializations_avoided",
-            "retain_rows_scanned",
-        ] {
-            assert!(report.get(field).is_some(), "missing counter `{field}`");
-        }
-    }
-
-    #[test]
-    fn plan_executor_root_find_value_resolves_runtime_list_ref() {
-        let source = r#"
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    selected:
-        TEXT { row-2 } |> HOLD selected {
-            LATEST {
-                sources.noop.text
-            }
-        }
-    records:
-        LIST {
-            [key: TEXT { row-1 }, value: TEXT { first }]
-            [key: TEXT { row-2 }, value: TEXT { second }]
-            [key: TEXT { row-2 }, value: TEXT { duplicate }]
-        }
-    selected_value:
-        List/find_value(records, field: "key", value: selected, target: "value", fallback: TEXT { missing })
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
-"#;
-        let mut runtime =
-            LiveRuntime::from_source("plan-executor-list-find-value", source).unwrap();
-        let summary = runtime.document_state_summary();
-        assert_eq!(
-            summary["store"]["selected_value"], "second",
-            "PlanExecutor root List/find_value should expose the first matching target value"
-        );
-        let output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "store.sources.noop".to_owned(),
-                text: Some("row-1".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .expect("source event should update selected row");
-        assert_eq!(
-            output.state_summary["store"]["selected_value"], "first",
-            "PlanExecutor root List/find_value should update from runtime list rows"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn plan_executor_root_find_projection_resolves_runtime_list_ref() {
-        let source = r#"
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    selected:
-        TEXT { row-2 } |> HOLD selected {
-            LATEST {
-                sources.noop.text
-            }
-        }
-    records:
-        LIST {
-            [key: TEXT { row-1 }, value: TEXT { first }]
-            [key: TEXT { row-2 }, value: TEXT { second }]
-            [key: TEXT { row-2 }, value: TEXT { duplicate }]
-        }
-    selected_record:
-        List/find(records, field: "key", value: selected)
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
-"#;
-        let compiled = compile_source_text_to_machine_plan(
-            "plan-executor-list-find",
-            source,
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("root List/find fixture should compile to a MachinePlan");
-        let initial = execute_machine_plan_initial_state(&compiled.plan)
-            .expect("PlanExecutor initial state should materialize root List/find projection");
-        assert_eq!(
-            initial.report["executed_list_projection_find_count"], 1,
-            "root List/find should lower to a PlanExecutor list projection"
-        );
-
-        let mut runtime = LiveRuntime::from_source("plan-executor-list-find", source).unwrap();
-        let summary = runtime.document_state_summary();
-        assert_eq!(summary["store"]["selected_record"]["key"], "row-2");
-        assert_eq!(summary["store"]["selected_record"]["value"], "second");
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn exact_list_lookup_invalidation_tracks_old_and_new_text_values() {
-        let cached_reads = BTreeSet::from([list_lookup_text_read_key("records", "key", "row-2")]);
-        let guards = BTreeMap::new();
-        let root_numbers = BTreeMap::new();
-
-        let mut unrelated_change = BTreeSet::new();
-        insert_changed_list_field_read_keys_for_values(
-            &mut unrelated_change,
-            "records",
-            0,
-            "key",
-            Some(&FieldValue::Text("row-1".to_owned())),
-            Some(&FieldValue::Text("row-3".to_owned())),
-        );
-        assert!(
-            !cache_entry_invalidated_by_reads(
-                &cached_reads,
-                &guards,
-                &unrelated_change,
-                &root_numbers
-            ),
-            "a row that changes between unrelated key values must not invalidate an exact lookup"
-        );
-
-        let mut changed_to_match = BTreeSet::new();
-        insert_changed_list_field_read_keys_for_values(
-            &mut changed_to_match,
-            "records",
-            0,
-            "key",
-            Some(&FieldValue::Text("row-1".to_owned())),
-            Some(&FieldValue::Text("row-2".to_owned())),
-        );
-        assert!(
-            cache_entry_invalidated_by_reads(
-                &cached_reads,
-                &guards,
-                &changed_to_match,
-                &root_numbers
-            ),
-            "a row changing to the expected lookup value must invalidate the exact lookup"
-        );
-
-        let mut changed_from_match = BTreeSet::new();
-        insert_changed_list_field_read_keys_for_values(
-            &mut changed_from_match,
-            "records",
-            1,
-            "key",
-            Some(&FieldValue::Text("row-2".to_owned())),
-            Some(&FieldValue::Text("row-3".to_owned())),
-        );
-        assert!(
-            cache_entry_invalidated_by_reads(
-                &cached_reads,
-                &guards,
-                &changed_from_match,
-                &root_numbers
-            ),
-            "a row changing away from the expected lookup value must invalidate the exact lookup"
-        );
-    }
-
-    #[test]
-    fn record_columns_cache_fragment_is_stable_across_field_insert_order() {
-        let mut left = ValueColumns::default();
-        left.insert_value("title".to_owned(), FieldValue::Text("A".to_owned()));
-        left.insert_value("completed".to_owned(), FieldValue::Bool(true));
-        left.insert_value("status".to_owned(), FieldValue::Enum("Ready".to_owned()));
-
-        let mut right = ValueColumns::default();
-        right.insert_value("status".to_owned(), FieldValue::Enum("Ready".to_owned()));
-        right.insert_value("completed".to_owned(), FieldValue::Bool(true));
-        right.insert_value("title".to_owned(), FieldValue::Text("A".to_owned()));
-
-        assert_eq!(
-            boon_value_cache_fragment(&BoonValue::RecordColumns(left)),
-            boon_value_cache_fragment(&BoonValue::RecordColumns(right))
-        );
-    }
-
-    #[test]
-    fn record_columns_cache_fragment_separates_field_value_types() {
-        let mut text_true = ValueColumns::default();
-        text_true.insert_value("flag".to_owned(), FieldValue::Text("true".to_owned()));
-        let mut bool_true = ValueColumns::default();
-        bool_true.insert_value("flag".to_owned(), FieldValue::Bool(true));
-        assert_ne!(
-            boon_value_cache_fragment(&BoonValue::RecordColumns(text_true)),
-            boon_value_cache_fragment(&BoonValue::RecordColumns(bool_true))
-        );
-
-        let mut text_a = ValueColumns::default();
-        text_a.insert_value("kind".to_owned(), FieldValue::Text("A".to_owned()));
-        let mut enum_a = ValueColumns::default();
-        enum_a.insert_value("kind".to_owned(), FieldValue::Enum("A".to_owned()));
-        assert_ne!(
-            boon_value_cache_fragment(&BoonValue::RecordColumns(text_a)),
-            boon_value_cache_fragment(&BoonValue::RecordColumns(enum_a))
-        );
-    }
-
-    #[test]
-    fn bytes_value_summary_hides_inline_payload() {
-        let bytes = RuntimeBytes::inline(Bytes::from_static(b"abc"));
-        let summary = bytes.report_json();
-
-        assert_eq!(summary["$boon_type"], "BYTES");
-        assert_eq!(summary["storage"], "inline");
-        assert_eq!(summary["byte_len"], 3);
-        assert_eq!(summary["digest"], sha256_bytes(b"abc"));
-        assert!(
-            summary.get("inline_bytes").is_none(),
-            "public summaries must not expose inline bytes: {summary:#?}"
-        );
-
-        let artifact = bytes.artifact_json();
-        assert_eq!(artifact["inline_bytes"], json!([97, 98, 99]));
-        assert_eq!(
-            RuntimeBytes::from_artifact(&artifact, "test.bytes")
-                .expect("bytes artifact should restore"),
-            bytes
-        );
-    }
-
-    #[test]
-    fn large_dynamic_bytes_use_shared_storage_without_public_inline_payload() {
-        let small = RuntimeBytes::dynamic(Bytes::from(vec![1; SOURCE_EVENT_INLINE_BYTES_LIMIT]));
-        assert_eq!(small.report_json()["storage"], "inline");
-
-        let payload = vec![7; SOURCE_EVENT_INLINE_BYTES_LIMIT + 1];
-        let bytes = RuntimeBytes::dynamic(Bytes::from(payload.clone()));
-        let summary = bytes.report_json();
-
-        assert_eq!(summary["$boon_type"], "BYTES");
-        assert_eq!(summary["storage"], "shared");
-        assert_eq!(
-            summary["byte_len"],
-            (SOURCE_EVENT_INLINE_BYTES_LIMIT + 1) as u64
-        );
-        assert_eq!(summary["digest"], sha256_bytes(&payload));
-        assert!(
-            summary.get("inline_bytes").is_none(),
-            "public summaries must not expose shared bytes: {summary:#?}"
-        );
-        assert_eq!(
-            bytes
-                .inline_bytes()
-                .expect("shared runtime bytes should be executable")
-                .as_ref(),
-            payload.as_slice()
-        );
-
-        let artifact = bytes.artifact_json();
-        assert_eq!(artifact["storage"], "shared");
-        assert_eq!(
-            RuntimeBytes::from_artifact(&artifact, "test.shared_bytes")
-                .expect("shared bytes artifact should restore"),
-            bytes
-        );
-    }
-
-    #[test]
-    fn runtime_bytes_from_artifact_rejects_malformed_private_state() {
-        let cases = [
-            (
-                "missing-inline-bytes",
-                json!({
-                    "$boon_type": "BYTES",
-                    "storage": "inline",
-                    "digest": "abc",
-                    "byte_len": 1
-                }),
-                "missing `inline_bytes`",
-            ),
-            (
-                "non-array-inline-bytes",
-                json!({
-                    "$boon_type": "BYTES",
-                    "storage": "inline",
-                    "digest": "abc",
-                    "byte_len": 1,
-                    "inline_bytes": "not-array"
-                }),
-                "inline_bytes is not an array",
-            ),
-            (
-                "non-byte-inline-entry",
-                json!({
-                    "$boon_type": "BYTES",
-                    "storage": "inline",
-                    "digest": "abc",
-                    "byte_len": 1,
-                    "inline_bytes": ["x"]
-                }),
-                "inline_bytes[0] must be a byte",
-            ),
-            (
-                "out-of-range-inline-entry",
-                json!({
-                    "$boon_type": "BYTES",
-                    "storage": "inline",
-                    "digest": "abc",
-                    "byte_len": 1,
-                    "inline_bytes": [300]
-                }),
-                "inline_bytes[0] must be in 0..=255",
-            ),
-            (
-                "byte-len-mismatch",
-                json!({
-                    "$boon_type": "BYTES",
-                    "storage": "inline",
-                    "digest": "abc",
-                    "byte_len": 2,
-                    "inline_bytes": [1]
-                }),
-                "declare byte_len 2 but carry 1 byte(s)",
-            ),
-            (
-                "empty-digest",
-                json!({
-                    "$boon_type": "BYTES",
-                    "storage": "inline",
-                    "digest": "",
-                    "byte_len": 1,
-                    "inline_bytes": [1]
-                }),
-                "runtime bytes must carry a digest",
-            ),
-            (
-                "unsupported-storage",
-                json!({
-                    "$boon_type": "BYTES",
-                    "storage": "mystery",
-                    "digest": "abc",
-                    "byte_len": 1,
-                    "inline_bytes": [1]
-                }),
-                "storage has unsupported value `mystery`",
-            ),
-        ];
-
-        for (id, artifact, expected) in cases {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                RuntimeBytes::from_artifact(&artifact, id)
-            }));
-            match result {
-                Ok(Err(error)) => {
-                    let error = error.to_string();
-                    assert!(
-                        error.contains(expected),
-                        "case {id} returned wrong structured error: {error}"
-                    );
-                }
-                Ok(Ok(value)) => panic!("case {id} accepted malformed artifact: {value:#?}"),
-                Err(payload) => {
-                    let message = payload
-                        .downcast_ref::<&str>()
-                        .map(|message| (*message).to_owned())
-                        .or_else(|| payload.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "<non-string panic payload>".to_owned());
-                    panic!("case {id} panicked while rejecting malformed artifact: {message}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn typed_row_bytes_concat_evaluates_private_bytes_and_feeds_length() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: vec![boon_plan::PlanConstant {
-                id: boon_plan::PlanConstantId(0),
-                value: boon_plan::PlanConstantValue::Bytes {
-                    byte_len: 2,
-                    sha256: sha256_bytes(&[4, 5]),
-                    inline_bytes: Some(vec![4, 5]),
-                },
-            }],
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 1,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: Vec::new(),
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: vec![boon_plan::DebugEntry {
-                    id: "field:0".to_owned(),
-                    label: "row.payload".to_owned(),
-                }],
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let payload = PlanExecutorBytes::from_inline(
-            sha256_bytes(&[1, 2, 3]),
-            3,
-            vec![1, 2, 3],
-            "typed row bytes concat test payload",
-        )
-        .expect("valid row payload bytes");
-        let row = PlanListRowState {
-            key: 7,
-            generation: 1,
-            fields: BTreeMap::from([("payload".to_owned(), payload.report_json())]),
-            private_bytes: BTreeMap::from([("payload".to_owned(), payload)]),
-            fixed_bytes_banks: BTreeMap::new(),
-        };
-        let concat = PlanRowExpression::BytesConcat {
-            left: Box::new(PlanRowExpression::Field {
-                input: ValueRef::Field(FieldId(0)),
-            }),
-            right: Box::new(PlanRowExpression::Constant {
-                constant_id: boon_plan::PlanConstantId(0),
-            }),
-        };
-
-        let concat_value = eval_plan_row_expression(&plan, &BTreeMap::new(), &row, &concat)
-            .expect("typed row Bytes/concat should evaluate");
-        assert_eq!(concat_value["$boon_type"], "BYTES");
-        assert_eq!(concat_value["storage"], "row_inline");
-        assert_eq!(concat_value["byte_len"], 5);
-        assert_eq!(concat_value["inline_bytes"], json!([1, 2, 3, 4, 5]));
-
-        let length = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesLength {
-                input: Box::new(concat),
-            },
-        )
-        .expect("typed row Bytes/length should consume Bytes/concat output");
-        assert_eq!(length, json!(5));
-    }
-
-    #[test]
-    fn typed_row_bytes_to_text_evaluates_private_bytes() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: vec![
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(0),
-                    value: boon_plan::PlanConstantValue::Text {
-                        value: "Utf8".to_owned(),
-                    },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(1),
-                    value: boon_plan::PlanConstantValue::Text {
-                        value: "414243".to_owned(),
-                    },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(2),
-                    value: boon_plan::PlanConstantValue::Text {
-                        value: "QUJD".to_owned(),
-                    },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(3),
-                    value: boon_plan::PlanConstantValue::Number { value: 2 },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(4),
-                    value: boon_plan::PlanConstantValue::Number { value: 1 },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(5),
-                    value: boon_plan::PlanConstantValue::Number { value: 0 },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(6),
-                    value: boon_plan::PlanConstantValue::Text {
-                        value: "Big".to_owned(),
-                    },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(7),
-                    value: boon_plan::PlanConstantValue::Text {
-                        value: "Little".to_owned(),
-                    },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(8),
-                    value: boon_plan::PlanConstantValue::Number { value: 255 },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(9),
-                    value: boon_plan::PlanConstantValue::Number { value: 258 },
-                },
-                boon_plan::PlanConstant {
-                    id: boon_plan::PlanConstantId(10),
-                    value: boon_plan::PlanConstantValue::Number { value: -1 },
-                },
-            ],
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 11,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: Vec::new(),
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: vec![boon_plan::DebugEntry {
-                    id: "field:0".to_owned(),
-                    label: "row.payload".to_owned(),
-                }],
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let payload = PlanExecutorBytes::from_inline(
-            sha256_bytes(b"ABC"),
-            3,
-            b"ABC".to_vec(),
-            "typed row bytes to text test payload",
-        )
-        .expect("valid row payload bytes");
-        let row = PlanListRowState {
-            key: 7,
-            generation: 1,
-            fields: BTreeMap::from([("payload".to_owned(), payload.report_json())]),
-            private_bytes: BTreeMap::from([("payload".to_owned(), payload)]),
-            fixed_bytes_banks: BTreeMap::new(),
-        };
-        let decode = PlanRowExpression::BytesToText {
-            input: Box::new(PlanRowExpression::Field {
-                input: ValueRef::Field(FieldId(0)),
-            }),
-            encoding: Some(Box::new(PlanRowExpression::Constant {
-                constant_id: boon_plan::PlanConstantId(0),
-            })),
-        };
-
-        let text = eval_plan_row_expression(&plan, &BTreeMap::new(), &row, &decode)
-            .expect("typed row Bytes/to_text should evaluate private bytes");
-        assert_eq!(text, json!("ABC"));
-
-        let hex = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesToHex {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-            },
-        )
-        .expect("typed row Bytes/to_hex should evaluate private bytes");
-        assert_eq!(hex, json!("414243"));
-
-        let base64 = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesToBase64 {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-            },
-        )
-        .expect("typed row Bytes/to_base64 should evaluate private bytes");
-        assert_eq!(base64, json!("QUJD"));
-
-        let decoded_hex = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesFromHex {
-                input: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(1),
-                }),
-            },
-        )
-        .expect("typed row Bytes/from_hex should evaluate text input");
-        assert_eq!(decoded_hex["$boon_type"], "BYTES");
-        assert_eq!(decoded_hex["storage"], "row_inline");
-        assert_eq!(decoded_hex["inline_bytes"], json!([65, 66, 67]));
-
-        let decoded_base64 = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesFromBase64 {
-                input: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(2),
-                }),
-            },
-        )
-        .expect("typed row Bytes/from_base64 should evaluate text input");
-        assert_eq!(decoded_base64["$boon_type"], "BYTES");
-        assert_eq!(decoded_base64["storage"], "row_inline");
-        assert_eq!(decoded_base64["inline_bytes"], json!([65, 66, 67]));
-
-        let taken = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesTake {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-                byte_count: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(3),
-                }),
-            },
-        )
-        .expect("typed row Bytes/take should evaluate private bytes");
-        assert_eq!(taken["$boon_type"], "BYTES");
-        assert_eq!(taken["storage"], "row_inline");
-        assert_eq!(taken["inline_bytes"], json!([65, 66]));
-
-        let dropped = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesDrop {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-                byte_count: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(4),
-                }),
-            },
-        )
-        .expect("typed row Bytes/drop should evaluate private bytes");
-        assert_eq!(dropped["$boon_type"], "BYTES");
-        assert_eq!(dropped["storage"], "row_inline");
-        assert_eq!(dropped["inline_bytes"], json!([66, 67]));
-
-        let zeroed = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesZeros {
-                byte_count: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(3),
-                }),
-            },
-        )
-        .expect("typed row Bytes/zeros should evaluate private bytes");
-        assert_eq!(zeroed["$boon_type"], "BYTES");
-        assert_eq!(zeroed["storage"], "row_inline");
-        assert_eq!(zeroed["inline_bytes"], json!([0, 0]));
-
-        let read_unsigned = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesReadUnsigned {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-                offset: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(5),
-                }),
-                byte_count: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(3),
-                }),
-                endian: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(6),
-                }),
-            },
-        )
-        .expect("typed row Bytes/read_unsigned should evaluate private bytes");
-        assert_eq!(read_unsigned, json!(16_706));
-
-        let read_signed = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesReadSigned {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-                offset: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(5),
-                }),
-                byte_count: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(4),
-                }),
-                endian: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(7),
-                }),
-            },
-        )
-        .expect("typed row Bytes/read_signed should evaluate private bytes");
-        assert_eq!(read_signed, json!(65));
-
-        let set = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesSet {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-                index: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(4),
-                }),
-                value: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(8),
-                }),
-            },
-        )
-        .expect("typed row Bytes/set should evaluate private bytes");
-        assert_eq!(set["$boon_type"], "BYTES");
-        assert_eq!(set["storage"], "row_inline");
-        assert_eq!(set["inline_bytes"], json!([65, 255, 67]));
-
-        let write_unsigned = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesWriteUnsigned {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-                offset: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(5),
-                }),
-                byte_count: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(3),
-                }),
-                endian: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(6),
-                }),
-                value: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(9),
-                }),
-            },
-        )
-        .expect("typed row Bytes/write_unsigned should evaluate private bytes");
-        assert_eq!(write_unsigned["$boon_type"], "BYTES");
-        assert_eq!(write_unsigned["storage"], "row_inline");
-        assert_eq!(write_unsigned["inline_bytes"], json!([1, 2, 67]));
-
-        let write_signed = eval_plan_row_expression(
-            &plan,
-            &BTreeMap::new(),
-            &row,
-            &PlanRowExpression::BytesWriteSigned {
-                input: Box::new(PlanRowExpression::Field {
-                    input: ValueRef::Field(FieldId(0)),
-                }),
-                offset: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(5),
-                }),
-                byte_count: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(4),
-                }),
-                endian: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(7),
-                }),
-                value: Box::new(PlanRowExpression::Constant {
-                    constant_id: boon_plan::PlanConstantId(10),
-                }),
-            },
-        )
-        .expect("typed row Bytes/write_signed should evaluate private bytes");
-        assert_eq!(write_signed["$boon_type"], "BYTES");
-        assert_eq!(write_signed["storage"], "row_inline");
-        assert_eq!(write_signed["inline_bytes"], json!([255, 66, 67]));
-    }
-
-    #[test]
-    fn fixed_source_bytes_constructor_zero_fills_empty_body() {
-        let BoonValue::Bytes(bytes) =
-            finish_bytes_constructor(&BytesSizeSyntax::Fixed(4), 0, Vec::new())
-                .expect("fixed empty BYTES constructor should zero-fill")
-        else {
-            panic!("fixed bytes constructor should produce BYTES");
-        };
-        let artifact = bytes.artifact_json();
-        assert_eq!(artifact["byte_len"], 4);
-        assert_eq!(artifact["inline_bytes"], json!([0, 0, 0, 0]));
-    }
-
-    #[test]
-    fn fixed_source_bytes_constructor_rejects_non_empty_zero_length_body() {
-        let error = finish_bytes_constructor(&BytesSizeSyntax::Fixed(4), 1, Vec::new())
-            .expect_err("non-empty zero-length body must not be zero-filled");
-        assert!(
-            error
-                .to_string()
-                .contains("fixed BYTES length must match exactly")
-        );
-    }
-
-    #[test]
-    fn bytes_runtime_builtins_report_deterministic_errors() {
-        let runtime_bytes = Some(BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(
-            b"\xff",
-        ))));
-
-        let assert_error = |function: &str,
-                            input: Option<BoonValue>,
-                            args: Vec<EvaluatedCallArg>,
-                            expected: &str| {
-            let value = eval_bytes_builtin(function, input, &args)
-                .unwrap_or_else(|error| panic!("{function} should be recoverable: {error}"));
-            assert_eq!(value, BoonValue::Error(expected.to_owned()));
-        };
-
-        assert_error(
-            "Bytes/get",
-            runtime_bytes.clone(),
-            vec![EvaluatedCallArg {
-                name: Some("index".to_owned()),
-                value: BoonValue::Number(1),
-            }],
-            "bytes_out_of_bounds",
-        );
-        assert_error(
-            "Bytes/slice",
-            runtime_bytes.clone(),
-            vec![
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(2),
-                },
-            ],
-            "bytes_out_of_bounds",
-        );
-        assert_error(
-            "Bytes/from_hex",
-            Some(BoonValue::Text("0G".to_owned())),
-            Vec::new(),
-            "bytes_invalid_hex",
-        );
-        assert_error(
-            "Bytes/from_base64",
-            Some(BoonValue::Text("!!!=".to_owned())),
-            Vec::new(),
-            "bytes_invalid_base64",
-        );
-        assert_error(
-            "Bytes/to_text",
-            runtime_bytes.clone(),
-            vec![EvaluatedCallArg {
-                name: Some("encoding".to_owned()),
-                value: BoonValue::Text("Utf8".to_owned()),
-            }],
-            "bytes_decode_error_utf8",
-        );
-        assert_error(
-            "Bytes/to_text",
-            runtime_bytes.clone(),
-            vec![EvaluatedCallArg {
-                name: Some("encoding".to_owned()),
-                value: BoonValue::Text("Ascii".to_owned()),
-            }],
-            "bytes_decode_error_ascii",
-        );
-        assert_error(
-            "Text/to_bytes",
-            Some(BoonValue::Text("h\u{00e9}".to_owned())),
-            vec![EvaluatedCallArg {
-                name: Some("encoding".to_owned()),
-                value: BoonValue::Text("Ascii".to_owned()),
-            }],
-            "bytes_encode_error_ascii",
-        );
-        assert_error(
-            "Bytes/read_unsigned",
-            runtime_bytes.clone(),
-            vec![
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-                EvaluatedCallArg {
-                    name: Some("endian".to_owned()),
-                    value: BoonValue::Text("Middle".to_owned()),
-                },
-            ],
-            "bytes_invalid_endian",
-        );
-
-        assert_error(
-            "Bytes/read_unsigned",
-            runtime_bytes,
-            vec![
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(3),
-                },
-                EvaluatedCallArg {
-                    name: Some("endian".to_owned()),
-                    value: BoonValue::Text("Little".to_owned()),
-                },
-            ],
-            "bytes_invalid_byte_count",
-        );
-        assert_error(
-            "Bytes/write_unsigned",
-            Some(BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(
-                b"\xff",
-            )))),
-            vec![
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-                EvaluatedCallArg {
-                    name: Some("endian".to_owned()),
-                    value: BoonValue::Text("Little".to_owned()),
-                },
-                EvaluatedCallArg {
-                    name: Some("value".to_owned()),
-                    value: BoonValue::Number(256),
-                },
-            ],
-            "bytes_numeric_overflow",
-        );
-    }
-
-    #[test]
-    fn bytes_runtime_builtins_reject_compiler_rejected_arg_shapes() {
-        let runtime_bytes = Some(BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(
-            b"\x01\x02\x03\x04",
-        ))));
-
-        let assert_error = |function: &str,
-                            input: Option<BoonValue>,
-                            args: Vec<EvaluatedCallArg>,
-                            expected: &str| {
-            let value = eval_bytes_builtin(function, input, &args)
-                .unwrap_or_else(|error| panic!("{function} should be recoverable: {error}"));
-            assert_eq!(value, BoonValue::Error(expected.to_owned()));
-        };
-
-        assert_error(
-            "Bytes/get",
-            runtime_bytes.clone(),
-            vec![EvaluatedCallArg {
-                name: None,
-                value: BoonValue::Number(0),
-            }],
-            "bytes_positional_args_unsupported",
-        );
-        assert_error(
-            "Bytes/slice",
-            None,
-            vec![
-                EvaluatedCallArg {
-                    name: None,
-                    value: BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(
-                        b"\x01\x02\x03\x04",
-                    ))),
-                },
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(2),
-                },
-            ],
-            "bytes_positional_args_unsupported",
-        );
-        assert_error(
-            "Text/to_bytes",
-            Some(BoonValue::Text("hi".to_owned())),
-            Vec::new(),
-            "bytes_missing_encoding",
-        );
-        assert_error(
-            "Bytes/to_text",
-            runtime_bytes.clone(),
-            Vec::new(),
-            "bytes_missing_encoding",
-        );
-        assert_error(
-            "Text/to_bytes",
-            Some(BoonValue::Text("hi".to_owned())),
-            vec![EvaluatedCallArg {
-                name: Some("encoding".to_owned()),
-                value: BoonValue::Text("utf8".to_owned()),
-            }],
-            "bytes_unsupported_encoding",
-        );
-        assert_error(
-            "Bytes/read_unsigned",
-            runtime_bytes.clone(),
-            vec![
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-                EvaluatedCallArg {
-                    name: Some("endian".to_owned()),
-                    value: BoonValue::Text("LE".to_owned()),
-                },
-            ],
-            "bytes_invalid_endian",
-        );
-        assert_error(
-            "Bytes/read_unsigned",
-            runtime_bytes.clone(),
-            vec![
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-            ],
-            "bytes_missing_endian",
-        );
-        assert_error(
-            "Bytes/read_unsigned",
-            runtime_bytes.clone(),
-            vec![
-                EvaluatedCallArg {
-                    name: Some("offset".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("count".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-                EvaluatedCallArg {
-                    name: Some("endian".to_owned()),
-                    value: BoonValue::Text("Little".to_owned()),
-                },
-            ],
-            "bytes_unexpected_arg",
-        );
-        assert_error(
-            "Bytes/get",
-            runtime_bytes.clone(),
-            vec![
-                EvaluatedCallArg {
-                    name: Some("index".to_owned()),
-                    value: BoonValue::Number(0),
-                },
-                EvaluatedCallArg {
-                    name: Some("surprise".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-            ],
-            "bytes_unexpected_arg",
-        );
-        assert_error(
-            "Bytes/zeros",
-            runtime_bytes.clone(),
-            vec![EvaluatedCallArg {
-                name: Some("byte_count".to_owned()),
-                value: BoonValue::Number(1),
-            }],
-            "bytes_unexpected_input_arg",
-        );
-        assert_error(
-            "Bytes/zeros",
-            None,
-            vec![
-                EvaluatedCallArg {
-                    name: Some("input".to_owned()),
-                    value: BoonValue::Bytes(RuntimeBytes::inline(Bytes::from_static(b"\x01"))),
-                },
-                EvaluatedCallArg {
-                    name: Some("byte_count".to_owned()),
-                    value: BoonValue::Number(1),
-                },
-            ],
-            "bytes_unexpected_arg",
-        );
-    }
-
-    #[test]
-    fn bytes_runtime_builtins_accept_compiler_allowed_named_pair_args() {
-        let left = RuntimeBytes::inline(Bytes::from_static(b"\x01\x02"));
-        let right = RuntimeBytes::inline(Bytes::from_static(b"\x03"));
-        let same = RuntimeBytes::inline(Bytes::from_static(b"\x01\x02"));
-
-        let concat = eval_bytes_builtin(
-            "Bytes/concat",
-            None,
-            &[
-                EvaluatedCallArg {
-                    name: Some("left".to_owned()),
-                    value: BoonValue::Bytes(left.clone()),
-                },
-                EvaluatedCallArg {
-                    name: Some("right".to_owned()),
-                    value: BoonValue::Bytes(right),
-                },
-            ],
-        )
-        .expect("named pair concat should be recoverable");
-        let BoonValue::Bytes(concat) = concat else {
-            panic!("named pair concat should return BYTES, got {concat:#?}");
-        };
-        assert_eq!(concat.inline_bytes().unwrap().as_ref(), b"\x01\x02\x03");
-
-        let equal = eval_bytes_builtin(
-            "Bytes/equal",
-            None,
-            &[
-                EvaluatedCallArg {
-                    name: Some("left".to_owned()),
-                    value: BoonValue::Bytes(left),
-                },
-                EvaluatedCallArg {
-                    name: Some("right".to_owned()),
-                    value: BoonValue::Bytes(same),
-                },
-            ],
-        )
-        .expect("named pair equal should be recoverable");
-        assert_eq!(equal, BoonValue::Bool(true));
-
-        let encoded = eval_bytes_builtin(
-            "Text/to_bytes",
-            None,
-            &[
-                EvaluatedCallArg {
-                    name: Some("text".to_owned()),
-                    value: BoonValue::Text("hi".to_owned()),
-                },
-                EvaluatedCallArg {
-                    name: Some("encoding".to_owned()),
-                    value: BoonValue::Text("Utf8".to_owned()),
-                },
-            ],
-        )
-        .expect("named text conversion should be recoverable");
-        let BoonValue::Bytes(encoded) = encoded else {
-            panic!("named Text/to_bytes should return BYTES, got {encoded:#?}");
-        };
-        assert_eq!(encoded.inline_bytes().unwrap().as_ref(), b"hi");
-    }
-
-    #[test]
-    fn cpu_plan_executor_initializes_bytes_scalar_from_machine_plan() {
-        let path =
-            std::env::temp_dir().join(format!("boon-plan-bytes-initial-{}.bn", std::process::id()));
-        fs::write(
-            &path,
-            r#"
-source: SOURCE
-payload:
-    BYTES[4] { 16u01, 16u02, 16u03, 16u04 } |> HOLD payload { LATEST {} }
-"#,
-        )
-        .unwrap();
-
-        let output = run_plan_initial_state(&path, TargetProfile::SoftwareDefault, None).expect(
-            "minimal executable BYTES[4] MachinePlan should initialize through CPU PlanExecutor",
-        );
-
-        assert_eq!(output.state_summary["payload"]["$boon_type"], "BYTES");
-        assert_eq!(output.state_summary["payload"]["storage"], "inline");
-        assert_eq!(output.state_summary["payload"]["byte_len"], 4);
-        assert_eq!(
-            output.state_summary["payload"]["digest"],
-            "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
-        );
-        assert!(
-            output.state_summary["payload"]
-                .get("inline_bytes")
-                .is_none(),
-            "public PlanExecutor state summary must not expose payload bytes: {:#?}",
-            output.state_summary
-        );
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(
-            output.report["plan_executor"]["executor"],
-            "cpu-plan-initial-state-v1"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["report_assembly_core"]["executor"],
-            "cpu-plan-initial-state-report-assembly-v1"
-        );
-        assert_eq!(output.report["plan_executor"]["initialized_state_count"], 1);
-        assert_eq!(output.report["plan_executor"]["runtime_ast_eval_count"], 0);
-        assert_eq!(
-            output.report["plan_executor"]["executable_string_path_count"],
-            0
-        );
-        assert_eq!(output.report["plan_executor"]["unknown_plan_op_count"], 0);
-        assert_eq!(output.report["capability_summary"]["executable"], true);
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_todomvc_multi_event_subset() {
-        let steps = vec![
-            "add-test-todo-type".to_owned(),
-            "filter-active".to_owned(),
-            "filter-completed".to_owned(),
-            "filter-all".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/todomvc.bn"),
-            Path::new("../../examples/todomvc.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("TodoMVC root scalar subset should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(
-            output.report["plan_executor"]["executor"],
-            "cpu-plan-root-list-scenario-v1"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["report_assembly_core"]["executor"],
-            "cpu-plan-root-scenario-report-assembly-v1"
-        );
-        assert_eq!(output.state_summary["store.new_todo_text"], "Test todo");
-        assert_eq!(output.state_summary["store.selected_filter"], "All");
-        assert_eq!(output.state_summary["store.new_todo_focused"], true);
-        assert!(output.report.get("comparison_status").is_none());
-        assert_eq!(
-            output.report["command_report_assembly_core"]["executor"],
-            "cpu-plan-root-scenario-command-report-assembly-v1"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            4
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"],
-            "source_payload"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["report_assembly_core"]["executor"],
-            "cpu-plan-root-scenario-step-report-assembly-v1"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][1]["updates"][0]["expression_kind"],
-            "const"
-        );
-        assert_eq!(output.report["plan_executor"]["runtime_ast_eval_count"], 0);
-        assert_eq!(
-            output.report["plan_executor"]["executable_string_path_count"],
-            0
-        );
-    }
-
-    fn assert_root_scenario_product_only(report: &JsonValue) {
-        assert!(report.get("comparison_status").is_none());
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_typed_root_expression_kinds() {
-        let pid = std::process::id();
-        let source_path = std::env::temp_dir().join(format!("boon-root-scalar-exprs-{pid}.bn"));
-        let scenario_path = std::env::temp_dir().join(format!("boon-root-scalar-exprs-{pid}.scn"));
-        fs::write(
-            &source_path,
-            r#"
-store: [
-    toggle: SOURCE
-    input: [change: SOURCE]
-    source_text:
-        TEXT { Seed } |> HOLD source_text { LATEST {} }
-    flag:
-        False |> HOLD flag {
-            LATEST {
-                store.toggle |> THEN { store.flag |> Bool/not() }
-            }
-        }
-    mirrored:
-        TEXT { old } |> HOLD mirrored {
-            LATEST {
-                store.toggle |> THEN { store.source_text }
-            }
-        }
-    copied:
-        TEXT { old } |> HOLD copied {
-            LATEST {
-                store.input.change.text |> THEN { store.input.change.text }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
-"#,
-        )
-        .unwrap();
-        fs::write(
-            &scenario_path,
-            format!(
-                r#"
-name = "root scalar expressions"
-source = "{}"
-
-[[step]]
-id = "toggle"
-expected_source_event = {{ source = "store.toggle" }}
-
-[[step]]
-id = "copy"
-expected_source_event = {{ source = "store.input.change", text = "Typed payload" }}
-"#,
-                source_path.display()
-            ),
-        )
-        .unwrap();
-
-        let steps = vec!["toggle".to_owned(), "copy".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            &source_path,
-            &scenario_path,
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("root scalar typed expression kinds should replay through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(output.state_summary["store.flag"], true);
-        assert_eq!(output.state_summary["store.mirrored"], "Seed");
-        assert_eq!(output.state_summary["store.copied"], "Typed payload");
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            3
-        );
-        let toggle_updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("toggle step should report root updates");
-        let expression_kinds = toggle_updates
-            .iter()
-            .map(|update| update["expression_kind"].as_str().unwrap())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(expression_kinds, BTreeSet::from(["bool_not", "read_path"]));
-        let copy_update = &output.report["plan_executor"]["per_step"][1]["updates"][0];
-        assert_eq!(copy_update["expression_kind"], "source_payload");
-        assert_eq!(copy_update["source_payload_field"], "Text");
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-
-        let _ = fs::remove_file(source_path);
-        let _ = fs::remove_file(scenario_path);
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_prefix_concat_update_branches() {
-        let pid = std::process::id();
-        let source_path = std::env::temp_dir().join(format!("boon-root-prefix-concat-{pid}.bn"));
-        let scenario_path = std::env::temp_dir().join(format!("boon-root-prefix-concat-{pid}.scn"));
-        fs::write(
-            &source_path,
-            r#"
-store: [
-    file_input: SOURCE
-    select: SOURCE
-    source_text:
-        TEXT { second } |> HOLD source_text { LATEST {} }
-    payload_label:
-        TEXT { - local file } |> HOLD payload_label {
-            LATEST {
-                TEXT { - } |> Text/concat(with: file_input.text, separator: " ")
-            }
-        }
-    root_label:
-        TEXT { response:first } |> HOLD root_label {
-            LATEST {
-                select.event.press |> THEN {
-                    TEXT { response } |> Text/concat(with: source_text, separator: ":")
-                }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Prefix }))
-"#,
-        )
-        .unwrap();
-        fs::write(
-            &scenario_path,
-            format!(
-                r#"
-name = "root prefix concat"
-source = "{}"
-
-[[step]]
-id = "payload"
-expected_source_event = {{ source = "store.file_input", text = "wave_27.fst" }}
-
-[[step]]
-id = "root"
-expected_source_event = {{ source = "store.select" }}
-"#,
-                source_path.display()
-            ),
-        )
-        .unwrap();
-
-        let output = run_plan_root_scalar_scenario(
-            &source_path,
-            &scenario_path,
-            TargetProfile::SoftwareDefault,
-            &["payload".to_owned(), "root".to_owned()],
-            None,
-        )
-        .expect("prefix concat branches should replay through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(output.state_summary["store.payload_label"], "- wave_27.fst");
-        assert_eq!(output.state_summary["store.root_label"], "response:second");
-        let expression_kinds = output.report["plan_executor"]["per_step"]
-            .as_array()
-            .expect("prefix scenario should report per-step updates")
-            .iter()
-            .flat_map(|step| step["updates"].as_array().into_iter().flatten())
-            .filter_map(|update| update["expression_kind"].as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            expression_kinds,
-            BTreeSet::from(["prefix_payload_concat", "prefix_root_concat"])
-        );
-        assert_eq!(output.report["plan_executor"]["runtime_ast_eval_count"], 0);
-        assert_eq!(
-            output.report["plan_executor"]["executable_string_path_count"],
-            0
-        );
-        assert_eq!(output.report["plan_executor"]["unknown_plan_op_count"], 0);
-
-        let _ = fs::remove_file(source_path);
-        let _ = fs::remove_file(scenario_path);
-    }
-
-    #[test]
-    fn run_plan_route_reports_full_source_event_delta_batch() {
-        let pid = std::process::id();
-        let source_path = std::env::temp_dir().join(format!("boon-route-full-event-{pid}.bn"));
-        fs::write(
-            &source_path,
-            r#"
-store: [
-    toggle: SOURCE
-    source_text:
-        TEXT { Seed } |> HOLD source_text { LATEST {} }
-    flag:
-        False |> HOLD flag {
-            LATEST {
-                store.toggle |> THEN { store.flag |> Bool/not() }
-            }
-        }
-    mirrored:
-        TEXT { old } |> HOLD mirrored {
-            LATEST {
-                store.toggle |> THEN { store.source_text }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
-"#,
-        )
-        .unwrap();
-
-        let output = run_plan_source_route(
-            &source_path,
-            TargetProfile::SoftwareDefault,
-            "store.toggle",
-            "store.flag",
-            LiveSourceEvent {
-                source: "store.toggle".to_owned(),
-                ..LiveSourceEvent::default()
-            },
-            None,
-        )
-        .expect("route proof should execute the full selected source event");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.flag"], true);
-        assert!(output.report.get("comparison_status").is_none());
-        assert_eq!(
-            output.report["command_report_assembly_core"]["executor"],
-            "cpu-plan-source-route-command-report-assembly-v1"
-        );
-        assert_eq!(
-            output.report["semantic_delta_signatures"],
-            json!(["FieldSet:store.flag", "FieldSet:store.mirrored"])
-        );
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            2
-        );
-        assert_eq!(
-            output.report["plan_executor"]["full_state_summary"]["store.mirrored"],
-            "Seed"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["semantic_deltas"],
-            output.report["semantic_deltas"]
-        );
-        assert_eq!(
-            output.report["plan_executor"]["full_execution_validation_core"]["executor"],
-            "cpu-plan-source-route-full-execution-validation-v1"
-        );
-        assert_eq!(
-            output.report["route_surface"]["full_execution_validation_core"]["matched"],
-            true
-        );
-        assert_eq!(
-            output.report["route_surface"]["executor_core"]["executor"],
-            "cpu-plan-source-route-execution-context-v1"
-        );
-        assert_eq!(
-            output.report["route_surface"]["executor_core"]["selection_core"]["executor"],
-            "cpu-plan-source-route-selection-v1"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["report_assembly_core"]["executor"],
-            "cpu-plan-source-route-report-assembly-v1"
-        );
-        assert_eq!(
-            output.report["route_surface"]["report_assembly_core"]["executor"],
-            "cpu-plan-source-route-report-assembly-v1"
-        );
-
-        let _ = fs::remove_file(source_path);
-    }
-
-    #[test]
-    fn cells_plan_executor_scenario_events_are_product_only() {
-        std::thread::Builder::new()
-            .name("cells-plan-product-events".to_owned())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                let output = run_plan_scenario_events(
-                    Path::new("../../examples/cells.bn"),
-                    Path::new("../../examples/cells.scn"),
-                    TargetProfile::SoftwareDefault,
-                    None,
-                )
-                .expect("Cells expected-source-event scenario should run through PlanExecutor");
-
-                assert!(
-                    output.report.get("comparison_status").is_none(),
-                    "Cells product scenario events must not emit comparison status"
-                );
-                assert_eq!(
-                    output.report["status"], "pass",
-                    "Cells event replay report should pass through the product PlanExecutor path"
-                );
-                assert_eq!(
-                    output.report["command_report_assembly_core"]["executor"],
-                    "cpu-plan-scenario-events-command-report-assembly-v1"
-                );
-                assert_eq!(
-                    output.report["plan_executor"]["command_output_core"]["executor"],
-                    "cpu-plan-scenario-events-command-output-v1"
-                );
-                assert_eq!(
-                    output.report["plan_executor_coverage"]["executor"],
-                    "cpu-plan-root-scenario-coverage-report-v1"
-                );
-                assert_eq!(
-                    output.report["plan_executor_coverage"]["covers_assertion_only_steps"],
-                    true
-                );
-                assert_eq!(
-                    output.report["plan_executor_coverage"]["full_scenario_parity"],
-                    true
-                );
-                assert_eq!(
-                    output.report["plan_executor_coverage"]["assertion_checkpoint_count"],
-                    6
-                );
-                assert_eq!(
-                    output.report["plan_executor"]["list_projections"][0]["executor"],
-                    "cpu-plan-list-projection-materializer-v1"
-                );
-                assert_eq!(
-                    output.report["plan_executor"]["assertion_checkpoints"]
-                        .as_array()
-                        .expect("Cells product report should expose assertion checkpoints")
-                        .iter()
-                        .map(|checkpoint| checkpoint["step_id"].as_str().unwrap().to_owned())
-                        .collect::<Vec<_>>(),
-                    vec![
-                        "initial",
-                        "initial-add-function",
-                        "initial-sum-function",
-                        "initial-empty-cell-is-blank",
-                        "a0-recomputes-after-cycle-break",
-                        "d0-updated-by-fanout"
-                    ]
-                );
-            })
-            .expect("Cells PlanExecutor product scenario thread should start")
-            .join()
-            .expect("Cells PlanExecutor product scenario should not panic");
-    }
-
-    #[test]
-    fn plan_field_set_delta_coalescing_keeps_last_same_target_only() {
-        let row_value = |key: u64, value: JsonValue| {
-            json!({
-                "kind": "FieldSet",
-                "list_id": "cells",
-                "key": key,
-                "generation": 1,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": "value",
-                "value": value,
-            })
-        };
-        let deltas = vec![
-            row_value(4, json!("")),
-            json!({
-                "kind": "SourceBind",
-                "list_id": "cells",
-                "key": 4,
-                "generation": 1,
-                "source_id": 99,
-                "bind_epoch": 99,
-                "field_path": "cell.sources.editor.commit",
-                "value": "cell.sources.editor.commit",
-            }),
-            row_value(5, json!("separate row")),
-            row_value(4, json!(12)),
-        ];
-
-        let coalesced = coalesce_plan_field_set_deltas(deltas).expect("coalescing should not fail");
-
-        assert_eq!(coalesced.len(), 3);
-        assert_eq!(coalesced[0]["kind"], "SourceBind");
-        assert_eq!(coalesced[1]["key"], 5);
-        assert_eq!(coalesced[1]["value"], "separate row");
-        assert_eq!(coalesced[2]["key"], 4);
-        assert_eq!(coalesced[2]["value"], 12);
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_length_update() {
-        let steps = vec!["measure-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_length_plan_ops.bn"),
-            Path::new("../../examples/bytes_length_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/length root scalar fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.byte_len"], 4);
-        assert_eq!(
-            output.state_summary["payload"]["digest"],
-            "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a"
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_complete"],
-            true
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
-            0
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            1
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"],
-            "bytes_length"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["updates"][0]["value"],
-            4
-        );
-        assert_eq!(
-            output.report["plan_executor"]["bytes_storage_no_copy"], true,
-            "Bytes/length should only read fixed inline bytes during the measured tick"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["bytes_storage_counters"]["copy_from_slice_bytes"],
-            0
-        );
-        assert_eq!(
-            output.report["plan_executor"]["bytes_storage_counters"]["vec_clone_bytes"],
-            0
-        );
-        assert_eq!(
-            output.report["plan_executor"]["bytes_storage_counters"]["vec_alloc_bytes"],
-            0
-        );
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_source_payload_update() {
-        let steps = vec!["receive-bytes".to_owned(), "inspect-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_source_payload_plan_ops.bn"),
-            Path::new("../../examples/bytes_source_payload_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("BYTES source payload fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.received_len"], 3);
-        assert_eq!(output.state_summary["store.received_byte"], 254);
-        assert_eq!(
-            output.state_summary["store.received"]["digest"],
-            "2096dcbc716cabc261901f6c15ce242d3bb589284cf8e97ba196710211d7e99a"
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            3
-        );
-        let receive_update = &output.report["plan_executor"]["per_step"][0]["updates"][0];
-        assert_eq!(receive_update["expression_kind"], "source_payload");
-        assert_eq!(receive_update["source_payload_field"], "Bytes");
-        assert_eq!(
-            output.report["semantic_delta_signatures"],
-            json!([
-                "FieldSet:store.received",
-                "FieldSet:store.received_len",
-                "FieldSet:store.received_byte"
-            ])
-        );
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_indexed_bytes_source_payload_update() {
-        let steps = vec![
-            "receive-beta-bytes".to_owned(),
-            "inspect-beta-bytes".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.bn"),
-            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("indexed BYTES source payload fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_indexed_update_count"],
-            3
-        );
-        let indexed_update = &output.report["plan_executor"]["per_step"][0]["indexed_updates"][0];
-        assert_eq!(indexed_update["expression_kind"], "source_payload");
-        assert_eq!(indexed_update["source_payload_field"], "Bytes");
-        assert_eq!(indexed_update["key"], 2);
-        assert_eq!(indexed_update["field_path"], "payload");
-        assert_eq!(
-            indexed_update["value"]["digest"],
-            "2096dcbc716cabc261901f6c15ce242d3bb589284cf8e97ba196710211d7e99a"
-        );
-        assert_eq!(
-            indexed_update["bytes_storage"]["storage"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(indexed_update["bytes_storage"]["byte_bank_used"], true);
-        assert_eq!(indexed_update["bytes_storage"]["byte_len"], 3);
-        assert_eq!(
-            output.report["semantic_delta_signatures"],
-            json!([
-                "FieldSet:payload",
-                "FieldSet:payload_len",
-                "FieldSet:payload_second"
-            ])
-        );
-        let inspect_updates = output.report["plan_executor"]["per_step"][1]["indexed_updates"]
-            .as_array()
-            .expect("inspect step should update indexed row BYTES projections");
-        assert_eq!(inspect_updates.len(), 2);
-        assert!(inspect_updates.iter().any(|update| {
-            update["expression_kind"] == "bytes_length"
-                && update["field_path"] == "payload_len"
-                && update["value"] == json!(3)
-                && update["executor_core"]["executor"] == "cpu-plan-indexed-bytes-read-evaluator-v1"
-        }));
-        assert!(inspect_updates.iter().any(|update| {
-            update["expression_kind"] == "bytes_get"
-                && update["field_path"] == "payload_second"
-                && update["value"] == json!(254)
-                && update["executor_core"]["executor"] == "cpu-plan-indexed-bytes-read-evaluator-v1"
-        }));
-        let rows = output.report["plan_executor"]["list_summary"]["rows"]["rows"]
-            .as_array()
-            .expect("indexed BYTES fixture should report rows");
-        let beta = rows
-            .iter()
-            .find(|row| row["key"] == json!(2))
-            .expect("beta row should be present in PlanExecutor list summary");
-        assert_eq!(beta["fields"]["payload_len"], json!(3));
-        assert_eq!(beta["fields"]["payload_second"], json!(254));
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_indexed_bytes_equal_update() {
-        let steps = vec![
-            "receive-beta-bytes".to_owned(),
-            "inspect-beta-equal".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_indexed_equal_plan_ops.bn"),
-            Path::new("../../examples/bytes_indexed_equal_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("indexed Bytes/equal fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_indexed_update_count"],
-            3
-        );
-
-        let inspect_updates = output.report["plan_executor"]["per_step"][1]["indexed_updates"]
-            .as_array()
-            .expect("inspect step should expose indexed Bytes/equal updates");
-        assert_eq!(inspect_updates.len(), 2);
-        let same_update = inspect_updates
-            .iter()
-            .find(|update| update["field_path"] == "payload_matches")
-            .expect("payload_matches update should execute");
-        assert_eq!(same_update["expression_kind"], "bytes_equal");
-        assert_eq!(same_update["value"], true);
-        assert_eq!(
-            same_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-read-evaluator-v1"
-        );
-        assert_eq!(same_update["bytes_access"]["read_only"], true);
-        assert_eq!(
-            same_update["bytes_access"]["inputs"][0]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(
-            same_update["bytes_access"]["inputs"][1]["access_source"],
-            "indexed_row_private_bytes"
-        );
-        assert_eq!(
-            same_update["bytes_access"]["inputs"][0]["byte_bank_used"],
-            true
-        );
-        assert_eq!(
-            same_update["bytes_access"]["inputs"][1]["byte_bank_used"],
-            false
-        );
-
-        let different_update = inspect_updates
-            .iter()
-            .find(|update| update["field_path"] == "payload_differs")
-            .expect("payload_differs update should execute");
-        assert_eq!(different_update["expression_kind"], "bytes_equal");
-        assert_eq!(different_update["value"], false);
-        assert_eq!(
-            different_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-read-evaluator-v1"
-        );
-
-        let rows = output.report["plan_executor"]["list_summary"]["rows"]["rows"]
-            .as_array()
-            .expect("indexed Bytes/equal fixture should report rows");
-        let beta = rows
-            .iter()
-            .find(|row| row["key"] == json!(2))
-            .expect("beta row should be present in PlanExecutor list summary");
-        assert_eq!(beta["fields"]["payload_matches"], true);
-        assert_eq!(beta["fields"]["payload_differs"], false);
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_indexed_bytes_search_updates() {
-        let steps = vec![
-            "receive-beta-bytes".to_owned(),
-            "inspect-beta-search".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_indexed_search_plan_ops.bn"),
-            Path::new("../../examples/bytes_indexed_search_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("indexed Bytes search fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_indexed_update_count"],
-            22
-        );
-
-        let inspect_updates = output.report["plan_executor"]["per_step"][1]["indexed_updates"]
-            .as_array()
-            .expect("inspect step should expose indexed Bytes search updates");
-        assert_eq!(inspect_updates.len(), 21);
-        let expected_text = [
-            ("payload_hex", "bytes_to_hex", json!("01fe0405ff")),
-            ("payload_base64", "bytes_to_base64", json!("Af4EBf8=")),
-            ("decoded_text", "bytes_to_text", json!("ABC")),
-        ];
-        for (field_path, expression_kind, value) in expected_text {
-            let update = inspect_updates
-                .iter()
-                .find(|update| update["field_path"] == field_path)
-                .unwrap_or_else(|| panic!("{field_path} update should execute"));
-            assert_eq!(update["expression_kind"], expression_kind);
-            assert_eq!(update["value"], value);
-            assert_eq!(
-                update["executor_core"]["executor"],
-                "cpu-plan-indexed-bytes-read-evaluator-v1"
-            );
-            assert_eq!(update["bytes_access"]["read_only"], true);
-        }
-
-        let expected_bytes_digest =
-            "b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78";
-        let expected_bytes = [
-            ("encoded_text_bytes", "text_to_bytes", "row.text_source"),
-            ("decoded_hex_bytes", "bytes_from_hex", "row.hex_source"),
-            (
-                "decoded_base64_bytes",
-                "bytes_from_base64",
-                "row.base64_source",
-            ),
-        ];
-        for (field_path, expression_kind, input_field) in expected_bytes {
-            let update = inspect_updates
-                .iter()
-                .find(|update| update["field_path"] == field_path)
-                .unwrap_or_else(|| panic!("{field_path} update should execute"));
-            assert_eq!(update["expression_kind"], expression_kind);
-            assert_eq!(update["value"]["byte_len"], json!(3));
-            assert_eq!(update["value"]["digest"], expected_bytes_digest);
-            assert_eq!(
-                update["executor_core"]["executor"],
-                "cpu-plan-indexed-bytes-write-evaluator-v1"
-            );
-            assert_eq!(update["bytes_access"]["read_only"], true);
-            assert_eq!(update["bytes_access"]["input"]["input_field"], input_field);
-            assert_eq!(
-                update["bytes_storage"]["storage"],
-                "indexed_fixed_byte_bank"
-            );
-            assert_eq!(update["bytes_storage"]["byte_bank_used"], true);
-            assert_eq!(update["bytes_storage"]["byte_len"], json!(3));
-        }
-
-        let expected_slices = [
-            (
-                "payload_mid",
-                "bytes_slice",
-                2,
-                "9df02aeff60f85979be4737edbcd69757628a81b9b1201a48c64ab6b2eb18126",
-                json!({"offset": 1, "byte_count": 2}),
-            ),
-            (
-                "payload_take",
-                "bytes_take",
-                2,
-                "6077f477043ae8cefee8bd0f88b7db444863c754a0fb128ecec260de45f50b4e",
-                json!(2),
-            ),
-            (
-                "payload_drop",
-                "bytes_drop",
-                3,
-                "99c24dfd75d0145b9fe75fa80f6e4fcae7066f24a3f91195c675a849db264541",
-                json!(2),
-            ),
-        ];
-        for (field_path, expression_kind, byte_len, digest, update_constant_value) in
-            expected_slices
-        {
-            let update = inspect_updates
-                .iter()
-                .find(|update| update["field_path"] == field_path)
-                .unwrap_or_else(|| panic!("{field_path} update should execute"));
-            assert_eq!(update["expression_kind"], expression_kind);
-            assert_eq!(update["value"]["byte_len"], json!(byte_len));
-            assert_eq!(update["value"]["digest"], digest);
-            assert_eq!(update["update_constant_value"], update_constant_value);
-            assert_eq!(
-                update["executor_core"]["executor"],
-                "cpu-plan-indexed-bytes-write-evaluator-v1"
-            );
-            assert_eq!(update["bytes_access"]["read_only"], false);
-            assert_eq!(
-                update["bytes_access"]["input_access_source"],
-                "indexed_fixed_byte_bank"
-            );
-            assert_eq!(
-                update["bytes_access"]["output_storage_kind"],
-                "bytes_slice_view"
-            );
-            assert_eq!(
-                update["bytes_storage"]["storage"],
-                "indexed_fixed_byte_bank"
-            );
-            assert_eq!(update["bytes_storage"]["byte_bank_used"], true);
-            assert_eq!(update["bytes_storage"]["byte_len"], json!(byte_len));
-        }
-
-        let zeros_update = inspect_updates
-            .iter()
-            .find(|update| update["field_path"] == "zero_fill")
-            .expect("zero_fill update should execute");
-        assert_eq!(zeros_update["expression_kind"], "bytes_zeros");
-        assert_eq!(zeros_update["value"]["byte_len"], json!(3));
-        assert_eq!(
-            zeros_update["value"]["digest"],
-            "709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c"
-        );
-        assert!(zeros_update["update_constant_id"].is_number());
-        assert_eq!(zeros_update["update_constant_value"], json!(3));
-        assert_eq!(
-            zeros_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-write-evaluator-v1"
-        );
-        assert_eq!(
-            zeros_update["bytes_storage"]["storage"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(zeros_update["bytes_storage"]["byte_bank_used"], true);
-        assert_eq!(zeros_update["bytes_storage"]["byte_len"], json!(3));
-
-        let concat_update = inspect_updates
-            .iter()
-            .find(|update| update["field_path"] == "payload_joined")
-            .expect("payload_joined update should execute");
-        assert_eq!(concat_update["expression_kind"], "bytes_concat");
-        assert_eq!(concat_update["value"]["byte_len"], json!(7));
-        assert_eq!(
-            concat_update["value"]["digest"],
-            "4825013d9d795bb73ad5e21ce6963c7c858ed984a8fa720a1d393554a04f43ee"
-        );
-        assert_eq!(
-            concat_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-write-evaluator-v1"
-        );
-        assert_eq!(
-            concat_update["executor_core"]["bytes_copy_cost"]["reason"],
-            "bytes_concat_output_vec"
-        );
-        assert_eq!(concat_update["bytes_access"]["read_only"], false);
-        assert_eq!(concat_update["bytes_access"]["inputs"][0]["role"], "left");
-        assert_eq!(concat_update["bytes_access"]["inputs"][1]["role"], "right");
-        assert_eq!(
-            concat_update["bytes_storage"]["storage"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(concat_update["bytes_storage"]["byte_bank_used"], true);
-        assert_eq!(concat_update["bytes_storage"]["byte_len"], json!(7));
-
-        let read_u16_update = inspect_updates
-            .iter()
-            .find(|update| update["field_path"] == "read_u16_be")
-            .expect("read_u16_be update should execute");
-        assert_eq!(read_u16_update["expression_kind"], "bytes_read_unsigned");
-        assert_eq!(read_u16_update["value"], json!(65028));
-        assert_eq!(
-            read_u16_update["update_constant_value"],
-            json!({"offset": 1, "byte_count": 2, "endian": "Big"})
-        );
-        assert_eq!(
-            read_u16_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-read-evaluator-v1"
-        );
-        assert_eq!(read_u16_update["bytes_access"]["read_only"], true);
-        assert_eq!(
-            read_u16_update["bytes_access"]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-
-        let read_i8_update = inspect_updates
-            .iter()
-            .find(|update| update["field_path"] == "read_i8_last")
-            .expect("read_i8_last update should execute");
-        assert_eq!(read_i8_update["expression_kind"], "bytes_read_signed");
-        assert_eq!(read_i8_update["value"], json!(-1));
-        assert_eq!(
-            read_i8_update["update_constant_value"],
-            json!({"offset": 4, "byte_count": 1, "endian": "Little"})
-        );
-        assert_eq!(
-            read_i8_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-read-evaluator-v1"
-        );
-        assert_eq!(read_i8_update["bytes_access"]["read_only"], true);
-        assert_eq!(
-            read_i8_update["bytes_access"]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-
-        let expected_numeric_writes = [
-            (
-                "write_u16_le",
-                "bytes_write_unsigned",
-                5,
-                "8d220d82abb00ef958463bc77f36fcc1879cf87225bb513b2946fedfdb5d4300",
-                json!({"offset": 2, "byte_count": 2, "endian": "Little", "value": 4660}),
-                2,
-            ),
-            (
-                "write_i8_first",
-                "bytes_write_signed",
-                5,
-                "b22348517e4e632ac2a247feaa534cb664204a3b5eeb77acb1b0fc306ae63b29",
-                json!({"offset": 0, "byte_count": 1, "endian": "Little", "value": -1}),
-                1,
-            ),
-        ];
-        for (field_path, expression_kind, byte_len, digest, update_constant_value, patch_count) in
-            expected_numeric_writes
-        {
-            let update = inspect_updates
-                .iter()
-                .find(|update| update["field_path"] == field_path)
-                .unwrap_or_else(|| panic!("{field_path} update should execute"));
-            assert_eq!(update["expression_kind"], expression_kind);
-            assert_eq!(update["value"]["byte_len"], json!(byte_len));
-            assert_eq!(update["value"]["digest"], digest);
-            assert_eq!(update["update_constant_value"], update_constant_value);
-            assert_eq!(
-                update["executor_core"]["executor"],
-                "cpu-plan-indexed-bytes-write-evaluator-v1"
-            );
-            assert_eq!(update["bytes_access"]["read_only"], false);
-            assert_eq!(
-                update["bytes_access"]["access_source"],
-                "indexed_fixed_byte_bank"
-            );
-            assert_eq!(update["bytes_access"]["byte_bank_used"], true);
-            assert_eq!(update["bytes_access"]["mutation_kind"], "inline_bytes_copy");
-            assert_eq!(update["bytes_access"]["patch_count"], json!(patch_count));
-            assert_eq!(
-                update["bytes_storage"]["storage"],
-                "indexed_fixed_byte_bank"
-            );
-            assert_eq!(update["bytes_storage"]["byte_bank_used"], true);
-            assert_eq!(update["bytes_storage"]["byte_len"], json!(byte_len));
-        }
-
-        let is_empty_update = inspect_updates
-            .iter()
-            .find(|update| update["field_path"] == "payload_empty")
-            .expect("payload_empty update should execute");
-        assert_eq!(is_empty_update["expression_kind"], "bytes_is_empty");
-        assert_eq!(is_empty_update["value"], false);
-        assert_eq!(
-            is_empty_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-read-evaluator-v1"
-        );
-        assert_eq!(is_empty_update["bytes_access"]["read_only"], true);
-        assert_eq!(
-            is_empty_update["bytes_access"]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-
-        let expected = [
-            ("found_index", "bytes_find", json!(1), "haystack", "needle"),
-            (
-                "missing_index",
-                "bytes_find",
-                JsonValue::Null,
-                "haystack",
-                "needle",
-            ),
-            (
-                "starts",
-                "bytes_starts_with",
-                json!(true),
-                "input",
-                "prefix",
-            ),
-            ("ends", "bytes_ends_with", json!(true), "input", "suffix"),
-            (
-                "not_ends",
-                "bytes_ends_with",
-                json!(false),
-                "input",
-                "suffix",
-            ),
-        ];
-        for (field_path, expression_kind, value, left_role, right_role) in expected {
-            let update = inspect_updates
-                .iter()
-                .find(|update| update["field_path"] == field_path)
-                .unwrap_or_else(|| panic!("{field_path} update should execute"));
-            assert_eq!(update["expression_kind"], expression_kind);
-            assert_eq!(update["value"], value);
-            assert_eq!(
-                update["executor_core"]["executor"],
-                "cpu-plan-indexed-bytes-read-evaluator-v1"
-            );
-            assert_eq!(update["bytes_access"]["read_only"], true);
-            assert_eq!(update["bytes_access"]["inputs"][0]["role"], left_role);
-            assert_eq!(update["bytes_access"]["inputs"][1]["role"], right_role);
-        }
-
-        let rows = output.report["plan_executor"]["list_summary"]["rows"]["rows"]
-            .as_array()
-            .expect("indexed Bytes search fixture should report rows");
-        let beta = rows
-            .iter()
-            .find(|row| row["key"] == json!(2))
-            .expect("beta row should be present in PlanExecutor list summary");
-        assert_eq!(beta["fields"]["payload_hex"], json!("01fe0405ff"));
-        assert_eq!(beta["fields"]["payload_base64"], json!("Af4EBf8="));
-        assert_eq!(beta["fields"]["decoded_text"], json!("ABC"));
-        assert_eq!(beta["fields"]["encoded_text_bytes"]["byte_len"], json!(3));
-        assert_eq!(
-            beta["fields"]["encoded_text_bytes"]["digest"],
-            expected_bytes_digest
-        );
-        assert_eq!(beta["fields"]["decoded_hex_bytes"]["byte_len"], json!(3));
-        assert_eq!(
-            beta["fields"]["decoded_hex_bytes"]["digest"],
-            expected_bytes_digest
-        );
-        assert_eq!(beta["fields"]["decoded_base64_bytes"]["byte_len"], json!(3));
-        assert_eq!(
-            beta["fields"]["decoded_base64_bytes"]["digest"],
-            expected_bytes_digest
-        );
-        assert_eq!(beta["fields"]["payload_mid"]["byte_len"], json!(2));
-        assert_eq!(
-            beta["fields"]["payload_mid"]["digest"],
-            "9df02aeff60f85979be4737edbcd69757628a81b9b1201a48c64ab6b2eb18126"
-        );
-        assert_eq!(beta["fields"]["payload_take"]["byte_len"], json!(2));
-        assert_eq!(
-            beta["fields"]["payload_take"]["digest"],
-            "6077f477043ae8cefee8bd0f88b7db444863c754a0fb128ecec260de45f50b4e"
-        );
-        assert_eq!(beta["fields"]["payload_drop"]["byte_len"], json!(3));
-        assert_eq!(
-            beta["fields"]["payload_drop"]["digest"],
-            "99c24dfd75d0145b9fe75fa80f6e4fcae7066f24a3f91195c675a849db264541"
-        );
-        assert_eq!(beta["fields"]["zero_fill"]["byte_len"], json!(3));
-        assert_eq!(
-            beta["fields"]["zero_fill"]["digest"],
-            "709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c"
-        );
-        assert_eq!(beta["fields"]["payload_joined"]["byte_len"], json!(7));
-        assert_eq!(
-            beta["fields"]["payload_joined"]["digest"],
-            "4825013d9d795bb73ad5e21ce6963c7c858ed984a8fa720a1d393554a04f43ee"
-        );
-        assert_eq!(beta["fields"]["read_u16_be"], json!(65028));
-        assert_eq!(beta["fields"]["read_i8_last"], json!(-1));
-        assert_eq!(beta["fields"]["write_u16_le"]["byte_len"], json!(5));
-        assert_eq!(
-            beta["fields"]["write_u16_le"]["digest"],
-            "8d220d82abb00ef958463bc77f36fcc1879cf87225bb513b2946fedfdb5d4300"
-        );
-        assert_eq!(beta["fields"]["write_i8_first"]["byte_len"], json!(5));
-        assert_eq!(
-            beta["fields"]["write_i8_first"]["digest"],
-            "b22348517e4e632ac2a247feaa534cb664204a3b5eeb77acb1b0fc306ae63b29"
-        );
-        assert_eq!(beta["fields"]["payload_empty"], false);
-        assert_eq!(beta["fields"]["found_index"], json!(1));
-        assert_eq!(beta["fields"]["missing_index"], JsonValue::Null);
-        assert_eq!(beta["fields"]["starts"], true);
-        assert_eq!(beta["fields"]["ends"], true);
-        assert_eq!(beta["fields"]["not_ends"], false);
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_indexed_same_event_bytes_dependency() {
-        let steps = vec!["receive-beta-bytes-and-read".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_indexed_same_event_dependency_plan_ops.bn"),
-            Path::new("../../examples/bytes_indexed_same_event_dependency_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("indexed same-event BYTES dependency fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_indexed_update_count"],
-            5
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["bytes_storage_no_copy"],
-            true
-        );
-
-        let updates = output.report["plan_executor"]["per_step"][0]["indexed_updates"]
-            .as_array()
-            .expect("same-event step should expose indexed updates");
-        assert_eq!(updates.len(), 5);
-        assert_eq!(updates[0]["expression_kind"], "source_payload");
-        assert_eq!(updates[0]["source_payload_field"], "Bytes");
-        assert_eq!(updates[0]["field_path"], "payload");
-        assert_eq!(
-            updates[0]["value"]["digest"],
-            "2096dcbc716cabc261901f6c15ce242d3bb589284cf8e97ba196710211d7e99a"
-        );
-
-        let set_update = updates
-            .iter()
-            .find(|update| update["expression_kind"] == "bytes_set")
-            .expect("same-event indexed Bytes/set update should execute");
-        assert_eq!(set_update["field_path"], "patched");
-        assert_eq!(set_update["value"]["byte_len"], 3);
-        assert_eq!(
-            set_update["value"]["digest"],
-            "9a82810e040052967f7d74664630d0f6f1665873bfffa36fd4ffe40be1241b73"
-        );
-        assert_eq!(
-            set_update["bytes_access"]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(set_update["bytes_access"]["byte_bank_used"], true);
-        assert_eq!(
-            set_update["bytes_storage"]["storage"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(set_update["bytes_storage"]["byte_bank_used"], true);
-        assert_eq!(
-            set_update["executor_core"]["executor"],
-            "cpu-plan-indexed-bytes-write-evaluator-v1"
-        );
-
-        let length_update = updates
-            .iter()
-            .find(|update| update["expression_kind"] == "bytes_length")
-            .expect("same-event indexed Bytes/length update should execute");
-        assert_eq!(length_update["field_path"], "payload_len");
-        assert_eq!(length_update["value"], 3);
-        assert_eq!(
-            length_update["bytes_access"]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(length_update["bytes_access"]["byte_bank_used"], true);
-
-        let get_update = updates
-            .iter()
-            .find(|update| update["expression_kind"] == "bytes_get")
-            .expect("same-event indexed Bytes/get update should execute");
-        assert_eq!(get_update["field_path"], "payload_second");
-        assert_eq!(get_update["value"], 254);
-        assert_eq!(
-            get_update["bytes_access"]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(get_update["bytes_access"]["byte_bank_used"], true);
-        assert_eq!(get_update["bytes_access"]["index"], 1);
-
-        let patched_get_update = updates
-            .iter()
-            .find(|update| update["field_path"] == "patched_first")
-            .expect("same-event indexed Bytes/get from patched output should execute");
-        assert_eq!(patched_get_update["expression_kind"], "bytes_get");
-        assert_eq!(patched_get_update["value"], 170);
-        assert_eq!(
-            patched_get_update["bytes_access"]["access_source"],
-            "indexed_fixed_byte_bank"
-        );
-        assert_eq!(patched_get_update["bytes_access"]["byte_bank_used"], true);
-        assert_eq!(patched_get_update["bytes_access"]["index"], 0);
-
-        for key in [
-            "copy_from_slice_bytes",
-            "vec_clone_bytes",
-            "vec_alloc_bytes",
-            "zero_fill_bytes",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"]["per_step"][0]["bytes_storage_counters"][key], 0,
-                "same-event indexed fixed-bank dependency tick should keep {key}=0"
-            );
-        }
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_rejects_duplicate_indexed_update_branches() {
-        let steps = vec!["receive-beta-bytes".to_owned()];
-        let result = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_indexed_duplicate_update_conflict_plan_ops.bn"),
-            Path::new("../../examples/bytes_indexed_duplicate_update_conflict_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        );
-        let error = match result {
-            Ok(output) => panic!(
-                "duplicate same-row indexed update branches unexpectedly passed: {:?}",
-                output.report
-            ),
-            Err(error) => error.to_string(),
-        };
-        assert!(
-            error.contains("duplicate direct `LATEST` branch"),
-            "unexpected duplicate indexed branch error: {error}"
-        );
-        assert!(
-            error.contains("receive.bytes"),
-            "error should identify the duplicate source trigger: {error}"
-        );
-    }
-
-    #[test]
-    fn run_plan_route_rejects_named_bytes_payload_keys_in_v1() {
-        let mut payload_bytes = BTreeMap::new();
-        payload_bytes.insert("blob".to_owned(), vec![1, 254, 4]);
-
-        let result = run_plan_source_route(
-            Path::new("../../examples/bytes_source_payload_plan_ops.bn"),
-            TargetProfile::SoftwareDefault,
-            "store.receive",
-            "store.received",
-            LiveSourceEvent {
-                source: "store.receive".to_owned(),
-                payload_bytes,
-                ..LiveSourceEvent::default()
-            },
-            None,
-        )
-        .map_err(|error| error.to_string());
-        let error = match result {
-            Ok(_) => "direct route API accepted named byte payload keys in v1".to_owned(),
-            Err(error) => error,
-        };
-
-        assert!(
-            error.contains("named BYTES source payload key `blob` is not supported in v1"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_is_empty_update() {
-        let steps = vec!["measure-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_is_empty_plan_ops.bn"),
-            Path::new("../../examples/bytes_is_empty_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/is_empty root scalar fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.empty_is_empty"], true);
-        assert_eq!(output.state_summary["store.filled_is_empty"], false);
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_complete"],
-            true
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
-            0
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            2
-        );
-        assert_eq!(
-            output.report["plan_executor"]["executed_derived_value_count"],
-            0
-        );
-        assert_eq!(
-            output.report["plan_executor"]["executed_list_append_count"],
-            0
-        );
-        assert_eq!(
-            output.report["plan_executor"]["executed_list_remove_count"],
-            0
-        );
-        assert_eq!(
-            output.report["plan_executor"]["executed_indexed_update_count"],
-            0
-        );
-
-        let updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("PlanExecutor report should expose update array");
-        let update_for = |target: &str| {
-            updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
-        };
-        let empty_update = update_for("store.empty_is_empty");
-        assert_eq!(empty_update["expression_kind"], "bytes_is_empty");
-        assert_eq!(empty_update["value"], true);
-        assert_eq!(empty_update["source_payload_field"], JsonValue::Null);
-        assert_eq!(empty_update["update_constant_id"], JsonValue::Null);
-        assert_eq!(empty_update["update_constant_value"], JsonValue::Null);
-        assert_eq!(empty_update["selected_op_indexed"], false);
-        assert_eq!(
-            empty_update["selected_op_unresolved_executable_ref_count"],
-            0
-        );
-
-        let filled_update = update_for("store.filled_is_empty");
-        assert_eq!(filled_update["expression_kind"], "bytes_is_empty");
-        assert_eq!(filled_update["value"], false);
-        assert_eq!(filled_update["source_payload_field"], JsonValue::Null);
-        assert_eq!(filled_update["update_constant_id"], JsonValue::Null);
-        assert_eq!(filled_update["update_constant_value"], JsonValue::Null);
-        assert_eq!(filled_update["selected_op_indexed"], false);
-        assert_eq!(
-            filled_update["selected_op_unresolved_executable_ref_count"],
-            0
-        );
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_get_update() {
-        let steps = vec!["measure-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_get_plan_ops.bn"),
-            Path::new("../../examples/bytes_get_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/get root scalar fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.selected_byte"], 254);
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_complete"],
-            true
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
-            0
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            1
-        );
-
-        let update = &output.report["plan_executor"]["per_step"][0]["updates"][0];
-        assert_eq!(update["target_state"], "store.selected_byte");
-        assert_eq!(update["expression_kind"], "bytes_get");
-        assert_eq!(update["value"], 254);
-        assert!(update["update_constant_id"].is_number());
-        assert_eq!(update["update_constant_value"], 2);
-        assert_eq!(update["source_payload_field"], JsonValue::Null);
-        assert_eq!(update["selected_op_indexed"], false);
-        assert_eq!(update["selected_op_unresolved_executable_ref_count"], 0);
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_equal_update() {
-        let steps = vec!["measure-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_equal_plan_ops.bn"),
-            Path::new("../../examples/bytes_equal_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/equal root scalar fixture should execute through PlanExecutor");
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.same"], true);
-        assert_eq!(output.state_summary["store.different"], false);
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_complete"],
-            true
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
-            0
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            2
-        );
-        assert_eq!(
-            output.report["plan_executor"]["bytes_storage_no_copy"], true,
-            "Bytes/equal should read inputs without allocating byte buffers"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["bytes_storage_counters"]["vec_alloc_bytes"], 0,
-            "Bytes/equal should not report output buffer allocation"
-        );
-
-        let updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("PlanExecutor report should expose update array");
-        let update_for = |target: &str| {
-            updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
-        };
-        let same_update = update_for("store.same");
-        assert_eq!(same_update["expression_kind"], "bytes_equal");
-        assert_eq!(
-            same_update["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(same_update["value"], true);
-        assert_eq!(same_update["source_payload_field"], JsonValue::Null);
-        assert_eq!(same_update["update_constant_id"], JsonValue::Null);
-        assert_eq!(same_update["update_constant_value"], JsonValue::Null);
-        assert_eq!(same_update["selected_op_indexed"], false);
-        assert_eq!(
-            same_update["selected_op_unresolved_executable_ref_count"],
-            0
-        );
-
-        let different_update = update_for("store.different");
-        assert_eq!(different_update["expression_kind"], "bytes_equal");
-        assert_eq!(different_update["value"], false);
-        assert_eq!(different_update["source_payload_field"], JsonValue::Null);
-        assert_eq!(different_update["update_constant_id"], JsonValue::Null);
-        assert_eq!(different_update["update_constant_value"], JsonValue::Null);
-        assert_eq!(different_update["selected_op_indexed"], false);
-        assert_eq!(
-            different_update["selected_op_unresolved_executable_ref_count"],
-            0
-        );
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_search_updates() {
-        let steps = vec!["build-bytes".to_owned(), "measure-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_search_plan_ops.bn"),
-            Path::new("../../examples/bytes_search_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/search root scalar fixture should execute through PlanExecutor");
-
-        let joined_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "74f81fe167d99b4cb41d6d0ccda82278caee9f3e2f25d5e5a3936ff3dcec60d0",
-            "byte_len": 5
-        });
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.joined"], joined_summary);
-        assert_eq!(output.state_summary["store.found_index"], 2);
-        assert_eq!(output.state_summary["store.missing_index"], JsonValue::Null);
-        assert_eq!(output.state_summary["store.empty_index"], 0);
-        assert_eq!(output.state_summary["store.starts"], true);
-        assert_eq!(output.state_summary["store.not_starts"], false);
-        assert_eq!(output.state_summary["store.ends"], true);
-        assert_eq!(output.state_summary["store.not_ends"], false);
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_complete"],
-            true
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
-            0
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            8
-        );
-
-        let first_step_updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("first step should expose updates");
-        assert_eq!(first_step_updates.len(), 1);
-        assert_eq!(first_step_updates[0]["target_state"], "store.joined");
-        assert_eq!(first_step_updates[0]["expression_kind"], "bytes_concat");
-        assert_eq!(first_step_updates[0]["value"], joined_summary);
-        assert!(
-            first_step_updates[0]["value"].get("inline_bytes").is_none(),
-            "public BYTES summaries must not expose inline bytes"
-        );
-
-        let second_step_updates = output.report["plan_executor"]["per_step"][1]["updates"]
-            .as_array()
-            .expect("second step should expose updates");
-        let update_for = |target: &str| {
-            second_step_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {second_step_updates:#?}"))
-        };
-        let found_update = update_for("store.found_index");
-        assert_eq!(found_update["expression_kind"], "bytes_find");
-        assert_eq!(
-            found_update["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(found_update["value"], 2);
-        assert_eq!(found_update["source_payload_field"], JsonValue::Null);
-        assert_eq!(found_update["update_constant_id"], JsonValue::Null);
-        assert_eq!(found_update["update_constant_value"], JsonValue::Null);
-
-        let missing_update = update_for("store.missing_index");
-        assert_eq!(missing_update["expression_kind"], "bytes_find");
-        assert_eq!(missing_update["value"], JsonValue::Null);
-
-        let empty_update = update_for("store.empty_index");
-        assert_eq!(empty_update["expression_kind"], "bytes_find");
-        assert_eq!(empty_update["value"], 0);
-
-        assert_eq!(
-            update_for("store.starts")["expression_kind"],
-            "bytes_starts_with"
-        );
-        assert_eq!(
-            update_for("store.starts")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(update_for("store.starts")["value"], true);
-        assert_eq!(
-            update_for("store.not_starts")["expression_kind"],
-            "bytes_starts_with"
-        );
-        assert_eq!(update_for("store.not_starts")["value"], false);
-        assert_eq!(
-            update_for("store.ends")["expression_kind"],
-            "bytes_ends_with"
-        );
-        assert_eq!(
-            update_for("store.ends")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(update_for("store.ends")["value"], true);
-        assert_eq!(
-            update_for("store.not_ends")["expression_kind"],
-            "bytes_ends_with"
-        );
-        assert_eq!(update_for("store.not_ends")["value"], false);
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_encoding_updates() {
-        let steps = vec![
-            "build-bytes".to_owned(),
-            "encode-bytes".to_owned(),
-            "decode-text".to_owned(),
-            "inspect-decoded".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_encoding_plan_ops.bn"),
-            Path::new("../../examples/bytes_encoding_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/encoding root scalar fixture should execute through PlanExecutor");
-
-        let joined_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a",
-            "byte_len": 4
-        });
-        let zeros_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
-            "byte_len": 4
-        });
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.joined"], joined_summary);
-        assert_eq!(output.state_summary["store.hex"], "01020304");
-        assert_eq!(output.state_summary["store.base64"], "AQIDBA==");
-        assert_eq!(output.state_summary["store.zeros"], zeros_summary);
-        assert_eq!(output.state_summary["store.decoded_hex"], joined_summary);
-        assert_eq!(output.state_summary["store.decoded_base64"], joined_summary);
-        assert_eq!(output.state_summary["store.zeros_len"], 4);
-        assert_eq!(output.state_summary["store.decoded_hex_byte"], 3);
-        assert_eq!(output.state_summary["store.decoded_base64_hex"], "01020304");
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            9
-        );
-
-        let decode_updates = output.report["plan_executor"]["per_step"][2]["updates"]
-            .as_array()
-            .expect("decode step should expose updates");
-        let update_for = |target: &str| {
-            decode_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {decode_updates:#?}"))
-        };
-        assert_eq!(update_for("store.zeros")["expression_kind"], "bytes_zeros");
-        assert_eq!(update_for("store.zeros")["update_constant_value"], 4);
-        assert_eq!(
-            update_for("store.decoded_hex")["expression_kind"],
-            "bytes_from_hex"
-        );
-        assert_eq!(
-            update_for("store.decoded_hex")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-write-evaluator-v1"
-        );
-        assert_eq!(
-            update_for("store.decoded_base64")["expression_kind"],
-            "bytes_from_base64"
-        );
-        assert_eq!(
-            update_for("store.decoded_base64")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-write-evaluator-v1"
-        );
-        for update in decode_updates {
-            assert!(
-                update["value"].get("inline_bytes").is_none(),
-                "public BYTES summaries must not expose inline bytes"
-            );
-        }
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_numeric_updates() {
-        let steps = vec![
-            "measure-bytes".to_owned(),
-            "write-bytes".to_owned(),
-            "inspect-written".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_numeric_plan_ops.bn"),
-            Path::new("../../examples/bytes_numeric_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/numeric root scalar fixture should execute through PlanExecutor");
-
-        let written_unsigned_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "c76b0857a5d51757ff556afe25625f9224c305e4960e24bd5dc25451cb460093",
-            "byte_len": 8
-        });
-        let written_signed_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "080aff601f9266cd9cc3f3c86e0add56283d3635a0aa200f3801cf7bda944bec",
-            "byte_len": 8
-        });
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.read_u16_le"], 513);
-        assert_eq!(output.state_summary["store.read_u16_be"], 258);
-        assert_eq!(output.state_summary["store.read_i16_be"], -2);
-        assert_eq!(output.state_summary["store.read_i8"], -128);
-        assert_eq!(
-            output.state_summary["store.written_unsigned"],
-            written_unsigned_summary
-        );
-        assert_eq!(
-            output.state_summary["store.written_signed"],
-            written_signed_summary
-        );
-        assert_eq!(
-            output.state_summary["store.written_unsigned_hex"],
-            "0102fffe7f801234"
-        );
-        assert_eq!(
-            output.state_summary["store.written_signed_hex"],
-            "0102fffe7fff0010"
-        );
-        assert_eq!(output.state_summary["store.written_unsigned_read"], 4660);
-        assert_eq!(output.state_summary["store.written_signed_read"], -129);
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            10
-        );
-
-        let measure_updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("measure step should expose updates");
-        let measure_update_for = |target: &str| {
-            measure_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| {
-                    panic!("missing measure update for {target}: {measure_updates:#?}")
-                })
-        };
-        assert_eq!(
-            measure_update_for("store.read_u16_le")["expression_kind"],
-            "bytes_read_unsigned"
-        );
-        assert_eq!(
-            measure_update_for("store.read_u16_le")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(measure_update_for("store.read_u16_le")["value"], 513);
-        assert_eq!(
-            measure_update_for("store.read_u16_le")["update_constant_value"],
-            json!({"offset": 0, "byte_count": 2, "endian": "Little"})
-        );
-        assert_eq!(
-            measure_update_for("store.read_u16_be")["update_constant_value"],
-            json!({"offset": 0, "byte_count": 2, "endian": "Big"})
-        );
-        assert_eq!(
-            measure_update_for("store.read_i16_be")["expression_kind"],
-            "bytes_read_signed"
-        );
-        assert_eq!(
-            measure_update_for("store.read_i16_be")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(measure_update_for("store.read_i16_be")["value"], -2);
-        assert_eq!(
-            measure_update_for("store.read_i8")["update_constant_value"],
-            json!({"offset": 5, "byte_count": 1, "endian": "Little"})
-        );
-
-        let write_updates = output.report["plan_executor"]["per_step"][1]["updates"]
-            .as_array()
-            .expect("write step should expose updates");
-        let write_update_for = |target: &str| {
-            write_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing write update for {target}: {write_updates:#?}"))
-        };
-        assert_eq!(
-            write_update_for("store.written_unsigned")["expression_kind"],
-            "bytes_write_unsigned"
-        );
-        assert_eq!(
-            write_update_for("store.written_unsigned")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-write-evaluator-v1"
-        );
-        assert_eq!(
-            write_update_for("store.written_unsigned")["value"],
-            written_unsigned_summary
-        );
-        assert_eq!(
-            write_update_for("store.written_unsigned")["update_constant_value"],
-            json!({"offset": 6, "byte_count": 2, "endian": "Big", "value": 4660})
-        );
-        assert_eq!(
-            write_update_for("store.written_signed")["expression_kind"],
-            "bytes_write_signed"
-        );
-        assert_eq!(
-            write_update_for("store.written_signed")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-write-evaluator-v1"
-        );
-        assert_eq!(
-            write_update_for("store.written_signed")["value"],
-            written_signed_summary
-        );
-        assert_eq!(
-            write_update_for("store.written_signed")["update_constant_value"],
-            json!({"offset": 4, "byte_count": 2, "endian": "Little", "value": -129})
-        );
-        for update in write_updates {
-            assert!(
-                update["value"].get("inline_bytes").is_none(),
-                "public BYTES summaries must not expose inline bytes"
-            );
-        }
-
-        let inspect_updates = output.report["plan_executor"]["per_step"][2]["updates"]
-            .as_array()
-            .expect("inspect step should expose updates");
-        let inspect_update_for = |target: &str| {
-            inspect_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| {
-                    panic!("missing inspect update for {target}: {inspect_updates:#?}")
-                })
-        };
-        assert_eq!(
-            inspect_update_for("store.written_unsigned_hex")["value"],
-            "0102fffe7f801234"
-        );
-        assert_eq!(
-            inspect_update_for("store.written_signed_hex")["value"],
-            "0102fffe7fff0010"
-        );
-        assert_eq!(
-            inspect_update_for("store.written_unsigned_read")["expression_kind"],
-            "bytes_read_unsigned"
-        );
-        assert_eq!(
-            inspect_update_for("store.written_unsigned_read")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(
-            inspect_update_for("store.written_unsigned_read")["value"],
-            4660
-        );
-        assert_eq!(
-            inspect_update_for("store.written_signed_read")["expression_kind"],
-            "bytes_read_signed"
-        );
-        assert_eq!(
-            inspect_update_for("store.written_signed_read")["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(
-            inspect_update_for("store.written_signed_read")["value"],
-            -129
-        );
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_concat_update() {
-        let steps = vec!["measure-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_concat_plan_ops.bn"),
-            Path::new("../../examples/bytes_concat_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Bytes/concat root scalar fixture should execute through PlanExecutor");
-
-        let expected_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "4fdcf430d9a09a049ecb6b373b31776fa149c6b4fd54d6229534c8f971c29b89",
-            "byte_len": 5
-        });
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.joined_pipe"], expected_summary);
-        assert_eq!(output.state_summary["store.joined_call"], expected_summary);
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_complete"],
-            true
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
-            0
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            2
-        );
-
-        let updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("PlanExecutor report should expose update array");
-        let update_for = |target: &str| {
-            updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
-        };
-        for target in ["store.joined_pipe", "store.joined_call"] {
-            let update = update_for(target);
-            assert_eq!(update["expression_kind"], "bytes_concat");
-            assert_eq!(update["value"], expected_summary);
-            assert_eq!(update["source_payload_field"], JsonValue::Null);
-            assert_eq!(update["update_constant_id"], JsonValue::Null);
-            assert_eq!(update["update_constant_value"], JsonValue::Null);
-            assert_eq!(update["selected_op_indexed"], false);
-            assert_eq!(update["selected_op_unresolved_executable_ref_count"], 0);
-        }
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_chained_bytes_concat_state() {
-        let steps = vec!["join-bytes".to_owned(), "inspect-joined".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_concat_chain_plan_ops.bn"),
-            Path::new("../../examples/bytes_concat_chain_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("chained BYTES fixture should execute through PlanExecutor");
-
-        let joined_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "4fdcf430d9a09a049ecb6b373b31776fa149c6b4fd54d6229534c8f971c29b89",
-            "byte_len": 5
-        });
-        let joined_again_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "a9290f6579e270419a97e9c69d022898df14bb2bfb3db13d9729b45d1862443a",
-            "byte_len": 7
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.joined"], joined_summary);
-        assert_eq!(output.state_summary["store.joined_len"], 5);
-        assert_eq!(output.state_summary["store.joined_byte"], 254);
-        assert_eq!(
-            output.state_summary["store.joined_again"],
-            joined_again_summary
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            4
-        );
-
-        let first_step_updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("first step should expose updates");
-        assert_eq!(first_step_updates.len(), 1);
-        assert_eq!(first_step_updates[0]["target_state"], "store.joined");
-        assert_eq!(first_step_updates[0]["expression_kind"], "bytes_concat");
-        assert_eq!(first_step_updates[0]["value"], joined_summary);
-
-        let second_step_updates = output.report["plan_executor"]["per_step"][1]["updates"]
-            .as_array()
-            .expect("second step should expose updates");
-        let update_for = |target: &str| {
-            second_step_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {second_step_updates:#?}"))
-        };
-        assert_eq!(
-            update_for("store.joined_len")["expression_kind"],
-            "bytes_length"
-        );
-        assert_eq!(update_for("store.joined_len")["value"], 5);
-        assert_eq!(
-            update_for("store.joined_byte")["expression_kind"],
-            "bytes_get"
-        );
-        assert_eq!(update_for("store.joined_byte")["value"], 254);
-        assert_eq!(
-            update_for("store.joined_again")["expression_kind"],
-            "bytes_concat"
-        );
-        assert_eq!(
-            update_for("store.joined_again")["value"],
-            joined_again_summary
-        );
-
-        for value in [
-            &output.state_summary["store.joined"],
-            &output.state_summary["store.joined_again"],
-            &first_step_updates[0]["value"],
-            &update_for("store.joined_again")["value"],
-        ] {
-            assert!(
-                value.get("inline_bytes").is_none(),
-                "public BYTES summaries must not expose inline bytes: {value:#?}"
-            );
-        }
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_text_bytes_conversion_chain() {
-        let steps = vec!["encode-text".to_owned(), "decode-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_text_conversion_plan_ops.bn"),
-            Path::new("../../examples/bytes_text_conversion_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("text/BYTES conversion fixture should execute through PlanExecutor");
-
-        let encoded_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
-            "byte_len": 2
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.encoded"], encoded_summary);
-        assert_eq!(output.state_summary["store.encoded_len"], 2);
-        assert_eq!(output.state_summary["store.decoded"], "hi");
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_complete"],
-            true
-        );
-        assert_eq!(
-            output.report["capability_summary"]["cpu_plan_executor_unsupported_op_count"],
-            0
-        );
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            3
-        );
-
-        let first_step_updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("first step should expose updates");
-        assert_eq!(first_step_updates.len(), 1);
-        let encode_update = &first_step_updates[0];
-        assert_eq!(encode_update["target_state"], "store.encoded");
-        assert_eq!(encode_update["expression_kind"], "text_to_bytes");
-        assert_eq!(
-            encode_update["executor_core"]["executor"],
-            "cpu-plan-root-bytes-write-evaluator-v1"
-        );
-        assert_eq!(encode_update["value"], encoded_summary);
-        assert!(encode_update["update_constant_id"].is_number());
-        assert_eq!(encode_update["update_constant_value"], "utf8");
-        assert_eq!(encode_update["source_payload_field"], JsonValue::Null);
-        assert!(
-            encode_update["value"].get("inline_bytes").is_none(),
-            "public Text/to_bytes update summary must not expose inline bytes"
-        );
-
-        let second_step_updates = output.report["plan_executor"]["per_step"][1]["updates"]
-            .as_array()
-            .expect("second step should expose updates");
-        let update_for = |target: &str| {
-            second_step_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {second_step_updates:#?}"))
-        };
-        let len_update = update_for("store.encoded_len");
-        assert_eq!(len_update["expression_kind"], "bytes_length");
-        assert_eq!(len_update["value"], 2);
-        let decode_update = update_for("store.decoded");
-        assert_eq!(decode_update["expression_kind"], "bytes_to_text");
-        assert_eq!(
-            decode_update["executor_core"]["executor"],
-            "cpu-plan-root-bytes-read-evaluator-v1"
-        );
-        assert_eq!(decode_update["value"], "hi");
-        assert!(decode_update["update_constant_id"].is_number());
-        assert_eq!(decode_update["update_constant_value"], "utf8");
-        assert_eq!(decode_update["source_payload_field"], JsonValue::Null);
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_bytes_slice_take_drop_chain() {
-        let steps = vec!["split-bytes".to_owned(), "inspect-splits".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_slice_take_drop_plan_ops.bn"),
-            Path::new("../../examples/bytes_slice_take_drop_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("slice/take/drop BYTES fixture should execute through PlanExecutor");
-
-        let sliced_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "56e75135f0ade48aa22e0f12a1b8dbdacf1eacadc82f5af7c1b46757dc4dd697",
-            "byte_len": 3
-        });
-        let taken_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "a00291e8229d191815f2cbd2aa49d3b783585deae8012ca5941f011ceb9eb119",
-            "byte_len": 4
-        });
-        let dropped_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "69694cc0dd6646b54f6934e4d2778f79e94e54a2d9ca44ed87799cc5db400b6a",
-            "byte_len": 4
-        });
-        let joined_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "a499a56927c382e4ada0f391b7f618af78f16063a72fd0f222837e80c14fbde9",
-            "byte_len": 7
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.sliced"], sliced_summary);
-        assert_eq!(output.state_summary["store.taken"], taken_summary);
-        assert_eq!(output.state_summary["store.dropped"], dropped_summary);
-        assert_eq!(output.state_summary["store.sliced_len"], 3);
-        assert_eq!(output.state_summary["store.taken_byte"], 19);
-        assert_eq!(output.state_summary["store.dropped_joined"], joined_summary);
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            6
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["bytes_storage_no_copy"], true,
-            "slice/take/drop step should reuse Bytes views without measured byte-buffer copies"
-        );
-        for key in [
-            "copy_from_slice_bytes",
-            "vec_clone_bytes",
-            "vec_alloc_bytes",
-            "zero_fill_bytes",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"]["per_step"][0]["bytes_storage_counters"][key], 0,
-                "first slice/take/drop step counter {key} must stay zero"
-            );
-        }
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][1]["bytes_storage_no_copy"], false,
-            "concat step should report measured byte-buffer copy cost"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["bytes_storage_no_copy"], false,
-            "overall two-step fixture should report the measured concat copy cost"
-        );
-        for key in ["copy_from_slice_bytes", "vec_alloc_bytes"] {
-            assert!(
-                output.report["plan_executor"]["bytes_storage_counters"][key]
-                    .as_u64()
-                    .unwrap_or_default()
-                    > 0,
-                "overall counter {key} should include executor-owned concat copy cost"
-            );
-        }
-
-        let first_step_updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("first step should expose updates");
-        let second_step_updates = output.report["plan_executor"]["per_step"][1]["updates"]
-            .as_array()
-            .expect("second step should expose updates");
-        let update_index_for = |updates: &[JsonValue], target: &str| {
-            updates
-                .iter()
-                .position(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
-        };
-        let slice_index = update_index_for(first_step_updates, "store.sliced");
-        let slice_update = &first_step_updates[slice_index];
-        assert_eq!(slice_update["expression_kind"], "bytes_slice");
-        assert_eq!(slice_update["value"], sliced_summary);
-        assert_eq!(
-            slice_update["update_constant_value"],
-            json!({"offset": 1, "byte_count": 3})
-        );
-        assert!(slice_update["update_constant_id"].is_array());
-        assert_eq!(
-            first_step_updates[update_index_for(first_step_updates, "store.taken")]["expression_kind"],
-            "bytes_take"
-        );
-        assert_eq!(
-            first_step_updates[update_index_for(first_step_updates, "store.dropped")]["expression_kind"],
-            "bytes_drop"
-        );
-        assert_eq!(
-            second_step_updates[update_index_for(second_step_updates, "store.sliced_len")]["expression_kind"],
-            "bytes_length"
-        );
-        assert_eq!(
-            second_step_updates[update_index_for(second_step_updates, "store.taken_byte")]["expression_kind"],
-            "bytes_get"
-        );
-        let joined_index = update_index_for(second_step_updates, "store.dropped_joined");
-        assert_eq!(
-            second_step_updates[joined_index]["expression_kind"],
-            "bytes_concat"
-        );
-        assert_eq!(second_step_updates[joined_index]["value"], joined_summary);
-
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_rejects_static_out_of_bounds_bytes_slice() {
-        let pid = std::process::id();
-        let source_path = std::env::temp_dir().join(format!("boon-oob-slice-{pid}.bn"));
-        let scenario_path = std::env::temp_dir().join(format!("boon-oob-slice-{pid}.scn"));
-        fs::write(
-            &source_path,
-            r#"
-payload:
-    BYTES[3] { 16u01, 16u02, 16u03 } |> HOLD payload { LATEST {} }
-
-store: [
-    slice: SOURCE
-    sliced:
-        BYTES[2] {} |> HOLD sliced {
-            LATEST {
-                store.slice |> THEN { payload |> Bytes/slice(offset: 2, byte_count: 2) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
-        )
-        .unwrap();
-        fs::write(
-            &scenario_path,
-            format!(
-                r#"
-name = "out of bounds bytes slice"
-source = "{}"
-
-[[step]]
-id = "slice"
-expected_source_event = {{ source = "store.slice" }}
-"#,
-                source_path.display()
-            ),
-        )
-        .unwrap();
-
-        let result = run_plan_root_scalar_scenario(
-            &source_path,
-            &scenario_path,
-            TargetProfile::SoftwareDefault,
-            &["slice".to_owned()],
-            None,
-        );
-        let Err(error) = result else {
-            panic!("out-of-bounds Bytes/slice must not produce an accepted plan report");
-        };
-        let error = error.to_string();
-        assert!(
-            error.contains("`Bytes/slice` byte range 2..4 is out of bounds for fixed BYTES[3]"),
-            "unexpected static out-of-bounds slice error: {error}"
-        );
-
-        let _ = fs::remove_file(source_path);
-        let _ = fs::remove_file(scenario_path);
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_rejects_invalid_utf8_bytes_to_text() {
-        let pid = std::process::id();
-        let source_path = std::env::temp_dir().join(format!("boon-invalid-utf8-{pid}.bn"));
-        let scenario_path = std::env::temp_dir().join(format!("boon-invalid-utf8-{pid}.scn"));
-        fs::write(
-            &source_path,
-            r#"
-bad_payload:
-    BYTES[2] { 16uC3, 16u28 } |> HOLD bad_payload { LATEST {} }
-
-store: [
-    decode: SOURCE
-    decoded:
-        TEXT { old } |> HOLD decoded {
-            LATEST {
-                store.decode |> THEN { bad_payload |> Bytes/to_text(encoding: Utf8) }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
-        )
-        .unwrap();
-        fs::write(
-            &scenario_path,
-            format!(
-                r#"
-name = "invalid utf8 bytes to text"
-source = "{}"
-
-[[step]]
-id = "decode"
-expected_source_event = {{ source = "store.decode" }}
-"#,
-                source_path.display()
-            ),
-        )
-        .unwrap();
-
-        let result = run_plan_root_scalar_scenario(
-            &source_path,
-            &scenario_path,
-            TargetProfile::SoftwareDefault,
-            &["decode".to_owned()],
-            None,
-        );
-        let Err(error) = result else {
-            panic!("invalid UTF-8 bytes must not produce an accepted plan report");
-        };
-        let error = error.to_string();
-        assert!(
-            error.contains("not valid UTF-8"),
-            "unexpected invalid UTF-8 error: {error}"
-        );
-
-        let _ = fs::remove_file(source_path);
-        let _ = fs::remove_file(scenario_path);
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_chained_bytes_set_state() {
-        let steps = vec!["patch-bytes".to_owned(), "inspect-patched".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_set_plan_ops.bn"),
-            Path::new("../../examples/bytes_set_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("chained Bytes/set fixture should execute through PlanExecutor");
-
-        let patched_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "9c5ec9570d8bf71994dfc97037803d9a280ba40f6dab32591c949310e0d9fdd8",
-            "byte_len": 4
-        });
-        let joined_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "de71c0407a4cf40db6a195c3d88787156c590b5643bbf50c758660c71189c91e",
-            "byte_len": 6
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.patched"], patched_summary);
-        assert_eq!(output.state_summary["store.patched_byte"], 170);
-        assert_eq!(output.state_summary["store.patched_len"], 4);
-        assert_eq!(output.state_summary["store.patched_joined"], joined_summary);
-        assert_root_scenario_product_only(&output.report);
-        assert_eq!(
-            output.report["plan_executor"]["executed_update_branch_count"],
-            4
-        );
-
-        let first_step_updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("first step should expose updates");
-        assert_eq!(first_step_updates.len(), 1);
-        let set_update = &first_step_updates[0];
-        assert_eq!(set_update["target_state"], "store.patched");
-        assert_eq!(set_update["expression_kind"], "bytes_set");
-        assert_eq!(set_update["value"], patched_summary);
-        assert!(set_update["update_constant_id"].is_array());
-        assert_eq!(
-            set_update["update_constant_value"],
-            json!({"index": 2, "value": 170})
-        );
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["bytes_storage_no_copy"], true,
-            "fixed Bytes/set should mutate the preallocated root byte bank without measured byte-buffer allocation"
-        );
-        for key in [
-            "copy_from_slice_bytes",
-            "vec_clone_bytes",
-            "vec_alloc_bytes",
-            "zero_fill_bytes",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"]["per_step"][0]["bytes_storage_counters"][key], 0,
-                "fixed Bytes/set measured tick should keep {key}=0"
-            );
-        }
-
-        let second_step_updates = output.report["plan_executor"]["per_step"][1]["updates"]
-            .as_array()
-            .expect("second step should expose updates");
-        let update_for = |target: &str| {
-            second_step_updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {second_step_updates:#?}"))
-        };
-        assert_eq!(
-            update_for("store.patched_byte")["expression_kind"],
-            "bytes_get"
-        );
-        assert_eq!(update_for("store.patched_byte")["value"], 170);
-        assert_eq!(
-            update_for("store.patched_len")["expression_kind"],
-            "bytes_length"
-        );
-        assert_eq!(update_for("store.patched_len")["value"], 4);
-        assert_eq!(
-            update_for("store.patched_joined")["expression_kind"],
-            "bytes_concat"
-        );
-        assert_eq!(update_for("store.patched_joined")["value"], joined_summary);
-
-        for value in [
-            &output.state_summary["store.patched"],
-            &output.state_summary["store.patched_joined"],
-            &set_update["value"],
-            &update_for("store.patched_joined")["value"],
-        ] {
-            assert!(
-                value.get("inline_bytes").is_none(),
-                "public BYTES summaries must not expose inline bytes: {value:#?}"
-            );
-        }
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    #[test]
-    fn root_scalar_plan_executor_replays_same_event_bytes_dependency() {
-        let steps = vec!["patch-and-read-bytes".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/bytes_same_event_dependency_plan_ops.bn"),
-            Path::new("../../examples/bytes_same_event_dependency_plan_ops.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("same-event Bytes/set dependency fixture should execute through PlanExecutor");
-
-        let patched_summary = json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "9c5ec9570d8bf71994dfc97037803d9a280ba40f6dab32591c949310e0d9fdd8",
-            "byte_len": 4
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.state_summary["store.patched"], patched_summary);
-        assert_eq!(output.state_summary["store.patched_byte"], 170);
-        assert_eq!(output.state_summary["store.patched_len"], 4);
-        assert_root_scenario_product_only(&output.report);
-
-        let updates = output.report["plan_executor"]["per_step"][0]["updates"]
-            .as_array()
-            .expect("same-event step should expose updates");
-        let update_for = |target: &str| {
-            updates
-                .iter()
-                .find(|update| update["target_state"] == target)
-                .unwrap_or_else(|| panic!("missing update for {target}: {updates:#?}"))
-        };
-        assert_eq!(updates.len(), 3);
-        assert_eq!(update_for("store.patched")["expression_kind"], "bytes_set");
-        assert_eq!(update_for("store.patched")["value"], patched_summary);
-        assert_eq!(update_for("store.patched_byte")["value"], 170);
-        assert_eq!(update_for("store.patched_len")["value"], 4);
-        assert_eq!(
-            output.report["plan_executor"]["per_step"][0]["bytes_storage_no_copy"], true,
-            "same-event fixed-bank Bytes/set/read path should avoid measured byte-buffer copies"
-        );
-        for key in [
-            "copy_from_slice_bytes",
-            "vec_clone_bytes",
-            "vec_alloc_bytes",
-            "zero_fill_bytes",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"]["per_step"][0]["bytes_storage_counters"][key], 0,
-                "same-event fixed-bank dependency tick should keep {key}=0"
-            );
-        }
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                output.report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-        for value in [
-            &output.state_summary["store.patched"],
-            &update_for("store.patched")["value"],
-        ] {
-            assert!(
-                value.get("inline_bytes").is_none(),
-                "public BYTES summaries must not expose inline bytes: {value:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn root_list_plan_executor_replays_todomvc_submit() {
-        let steps = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/todomvc.bn"),
-            Path::new("../../examples/todomvc.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("TodoMVC submit should execute through root-list PlanExecutor slice");
-
-        let report = &output.report;
-        assert_eq!(report["status"], "pass");
-        assert_eq!(
-            report["plan_executor"]["executor"],
-            "cpu-plan-root-list-scenario-v1"
-        );
-        assert_eq!(output.state_summary["store.new_todo_text"], "");
-        assert_root_scenario_product_only(report);
-        assert_eq!(report["plan_executor"]["executed_derived_value_count"], 2);
-        assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
-        assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 6);
-
-        let expected_signatures = json!([
-            "FieldSet:store.new_todo_text",
-            "FieldSet:store.title_to_add",
-            "ListInsert",
-            "SourceBind:todo.sources.remove_todo_button.press",
-            "SourceBind:todo.sources.editing_todo_title_element.change",
-            "SourceBind:todo.sources.editing_todo_title_element.key_down",
-            "SourceBind:todo.sources.editing_todo_title_element.blur",
-            "SourceBind:todo.sources.todo_title_element.double_click",
-            "SourceBind:todo.sources.todo_checkbox.click",
-            "FieldSet:not_editing",
-            "FieldSet:not_completed",
-            "FieldSet:store.new_todo_text",
-            "FieldSet:store.active_count"
-        ]);
-        assert_eq!(report["semantic_delta_signatures"], expected_signatures);
-
-        let todos = &report["plan_executor"]["list_summary"]["todos"];
-        assert_eq!(todos["row_count"], 5);
-        assert_eq!(todos["active_count"], 4);
-        assert_eq!(todos["completed_count"], 1);
-        assert_eq!(
-            todos["titles"],
-            json!([
-                "Read documentation",
-                "Finish TodoMVC renderer",
-                "Walk the dog",
-                "Buy groceries",
-                "Test todo"
-            ])
-        );
-        assert_eq!(todos["rows"][4]["key"], 5);
-        assert_eq!(todos["rows"][4]["generation"], 1);
-        assert_eq!(todos["rows"][4]["fields"]["title"], "Test todo");
-        assert_eq!(todos["rows"][4]["fields"]["completed"], false);
-        assert_eq!(todos["rows"][4]["fields"]["not_editing"], true);
-        assert_eq!(todos["rows"][4]["fields"]["not_completed"], true);
-
-        assert_eq!(report["semantic_deltas"][2]["kind"], "ListInsert");
-        assert_eq!(report["semantic_deltas"][2]["list_id"], "todos");
-        assert_eq!(report["semantic_deltas"][2]["key"], 5);
-        assert_eq!(report["semantic_deltas"][2]["generation"], 1);
-        assert_eq!(report["semantic_deltas"][2]["value"], "Test todo");
-        let expected_source_paths = [
-            "todo.sources.remove_todo_button.press",
-            "todo.sources.editing_todo_title_element.change",
-            "todo.sources.editing_todo_title_element.key_down",
-            "todo.sources.editing_todo_title_element.blur",
-            "todo.sources.todo_title_element.double_click",
-            "todo.sources.todo_checkbox.click",
-        ];
-        for (offset, expected_path) in expected_source_paths.iter().enumerate() {
-            let delta = &report["semantic_deltas"][3 + offset];
-            let expected_id = 25 + offset as u64;
-            assert_eq!(delta["kind"], "SourceBind");
-            assert_eq!(delta["list_id"], "todos");
-            assert_eq!(delta["key"], 5);
-            assert_eq!(delta["generation"], 1);
-            assert_eq!(delta["source_id"], expected_id);
-            assert_eq!(delta["bind_epoch"], expected_id);
-            assert_eq!(delta["field_path"], *expected_path);
-            assert_eq!(delta["value"], *expected_path);
-        }
-        assert_eq!(report["semantic_deltas"][9]["field_path"], "not_editing");
-        assert_eq!(report["semantic_deltas"][9]["value"], true);
-        assert_eq!(report["semantic_deltas"][10]["field_path"], "not_completed");
-        assert_eq!(report["semantic_deltas"][10]["value"], true);
-        assert_eq!(
-            report["semantic_deltas"][11]["field_path"],
-            "store.new_todo_text"
-        );
-        assert_eq!(report["semantic_deltas"][11]["value"], "");
-        assert_eq!(
-            report["semantic_deltas"][12]["field_path"],
-            "store.active_count"
-        );
-        assert_eq!(report["semantic_deltas"][12]["value"], 4);
-        assert_eq!(
-            report["plan_executor"]["per_step"][1]["updates"][0]["candidate_update_op_ids"],
-            json!([32, 33])
-        );
-        assert_eq!(
-            report["plan_executor"]["per_step"][1]["updates"][0]["update_constant_value"],
-            ""
-        );
-    }
-
-    #[test]
-    fn root_list_plan_executor_replays_todomvc_dynamic_checkbox_toggle() {
-        let steps = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-            "filter-active".to_owned(),
-            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/todomvc.bn"),
-            Path::new("../../examples/todomvc.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect(
-            "TodoMVC dynamic checkbox toggle should execute through indexed PlanExecutor slice",
-        );
-
-        let report = &output.report;
-        assert_eq!(report["status"], "pass");
-        assert_root_scenario_product_only(report);
-        assert_eq!(report["plan_executor"]["executed_indexed_update_count"], 1);
-        assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
-        assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 6);
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-
-        let toggle_step = &report["plan_executor"]["per_step"][3];
-        assert_eq!(
-            toggle_step["semantic_delta_signatures"],
-            json!([
-                "FieldSet:completed",
-                "FieldSet:not_completed",
-                "FieldSet:store.active_count",
-                "FieldSet:store.completed_count"
-            ])
-        );
-        assert_eq!(toggle_step["executed_indexed_update_count"], 1);
-        let indexed = &toggle_step["indexed_updates"][0];
-        assert_eq!(indexed["source"], "todo.sources.todo_checkbox.click");
-        assert_eq!(indexed["source_id"], 14);
-        assert_eq!(indexed["source_binding_id"], 30);
-        assert_eq!(indexed["bind_epoch"], 30);
-        assert_eq!(indexed["update_op_id"], 45);
-        assert_eq!(indexed["candidate_update_op_ids"], json!([45]));
-        assert_eq!(indexed["selected_op_indexed"], true);
-        assert_eq!(indexed["selected_op_unresolved_executable_ref_count"], 0);
-        assert_eq!(indexed["expression_kind"], "bool_not");
-        assert_eq!(indexed["list"], "todos");
-        assert_eq!(indexed["key"], 5);
-        assert_eq!(indexed["generation"], 1);
-        assert_eq!(indexed["row_resolution"]["method"], "target_text");
-        assert_eq!(indexed["row_resolution"]["target_text"], "Test todo");
-        assert_eq!(indexed["row_resolution"]["source_binding_id"], 30);
-        assert_eq!(indexed["field_path"], "completed");
-        assert_eq!(indexed["value"], true);
-        assert_eq!(indexed["row_fields"]["title"], "Test todo");
-        assert_eq!(indexed["row_fields"]["completed"], true);
-        assert_eq!(indexed["row_fields"]["not_completed"], false);
-        assert_eq!(indexed["row_fields"]["not_editing"], true);
-
-        let todos = &report["plan_executor"]["list_summary"]["todos"];
-        assert_eq!(todos["row_count"], 5);
-        assert_eq!(todos["active_count"], 3);
-        assert_eq!(todos["completed_count"], 2);
-        assert_eq!(todos["rows"][4]["key"], 5);
-        assert_eq!(todos["rows"][4]["generation"], 1);
-        assert_eq!(todos["rows"][4]["fields"]["title"], "Test todo");
-        assert_eq!(todos["rows"][4]["fields"]["completed"], true);
-        assert_eq!(todos["rows"][4]["fields"]["not_completed"], false);
-
-        let visible = &report["plan_executor"]["list_view_summary"]["store.visible_todos"];
-        assert_eq!(report["plan_executor"]["executed_list_retain_count"], 4);
-        assert_eq!(report["plan_executor"]["executed_list_view_count"], 4);
-        assert_eq!(report["plan_executor"]["retained_list_row_count"], 16);
-        assert_eq!(visible["row_count"], 3);
-        assert_eq!(
-            visible["titles"],
-            json!(["Read documentation", "Walk the dog", "Buy groceries"])
-        );
-        assert_eq!(visible["rows"][0]["key"], 1);
-        assert_eq!(visible["rows"][0]["generation"], 1);
-        assert_eq!(visible["rows"][1]["key"], 3);
-        assert_eq!(visible["rows"][1]["source_row_index"], 2);
-        assert_eq!(visible["rows"][2]["key"], 4);
-        assert_eq!(
-            report["plan_executor"]["list_retains"][0]["predicate"]["selector_value"],
-            "Active"
-        );
-        assert_eq!(
-            report["plan_executor"]["list_retains"][0]["executor"],
-            "cpu-plan-list-retain-materializer-v1"
-        );
-        assert_eq!(
-            toggle_step["list_view_summary"]["store.visible_todos"]["row_count"],
-            3
-        );
-    }
-
-    fn selected_plan_executor_source_steps<'a>(
-        scenario: &'a Scenario,
-        selected_step_ids: Option<&[&str]>,
-    ) -> Vec<&'a ScenarioStep> {
-        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
-        let selected_indices = if let Some(selected_step_ids) = selected_step_ids {
-            let selected_step_ids = selected_step_ids
-                .iter()
-                .map(|step| (*step).to_owned())
-                .collect::<Vec<_>>();
-            select_plan_explicit_root_scenario_steps(
-                &scenario.name,
-                &scenario_step_meta,
-                &selected_step_ids,
-            )
-            .expect("explicit PlanExecutor scenario steps should be accepted")
-            .selected_indices
-        } else {
-            select_plan_scenario_event_steps(&scenario.name, &scenario_step_meta)
-                .expect("PlanExecutor source-event scenario steps should be accepted")
-                .selected_indices
-        };
-        selected_indices
-            .into_iter()
-            .map(|index| &scenario.step[index])
-            .collect::<Vec<_>>()
-    }
-
-    fn runtime_units_for_source_path(source_path: &Path) -> Vec<RuntimeSourceUnit> {
-        compiler_source_units_for_path(source_path)
-            .expect("source units should load")
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>()
-    }
-
-    fn assert_no_plan_executor_fallback_counters(label: &str, surface: &str, report: &JsonValue) {
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                report[key],
-                json!(0),
-                "{label} {surface} fallback counter {key} must stay zero"
-            );
-        }
-    }
-
-    fn assert_plan_executor_execution_matches(
-        label: &str,
-        surface: &str,
-        actual: &RootScenarioExecution,
-        expected: &RootScenarioExecution,
-    ) {
-        assert_eq!(
-            actual.state_summary, expected.state_summary,
-            "{label} {surface} final state must match whole scenario PlanExecutor"
-        );
-        assert_eq!(
-            actual.semantic_delta_signatures, expected.semantic_delta_signatures,
-            "{label} {surface} semantic delta signatures must match whole scenario PlanExecutor"
-        );
-        assert_eq!(
-            actual.semantic_deltas, expected.semantic_deltas,
-            "{label} {surface} semantic deltas must match whole scenario PlanExecutor"
-        );
-        assert_eq!(
-            actual.per_step.len(),
-            expected.per_step.len(),
-            "{label} {surface} per-step count must match whole scenario PlanExecutor"
-        );
-        for (actual_step, expected_step) in actual.per_step.iter().zip(expected.per_step.iter()) {
-            for key in [
-                "source",
-                "semantic_delta_signatures",
-                "semantic_deltas",
-                "executed_update_branch_count",
-                "executed_indexed_update_count",
-                "executed_list_append_count",
-            ] {
-                assert_eq!(
-                    actual_step[key], expected_step[key],
-                    "{label} {surface} per-step field {key} must match"
-                );
-            }
-        }
-        assert_eq!(
-            actual.executor_report["executed_update_branch_count"],
-            expected.executor_report["executed_update_branch_count"],
-            "{label} {surface} root update count must match"
-        );
-        assert_eq!(
-            actual.executor_report["executed_indexed_update_count"],
-            expected.executor_report["executed_indexed_update_count"],
-            "{label} {surface} indexed update count must match"
-        );
-        assert_eq!(
-            actual.executor_report["executed_list_append_count"],
-            expected.executor_report["executed_list_append_count"],
-            "{label} {surface} list append count must match"
-        );
-        assert_no_plan_executor_fallback_counters(label, surface, &actual.executor_report);
-    }
-
-    fn assert_live_state_contains_root_scenario_values(
-        label: &str,
-        surface: &str,
-        actual: &JsonValue,
-        expected: &JsonValue,
-    ) {
-        let expected = expected
-            .as_object()
-            .expect("root scenario summary should be an object");
-        for (path, expected_value) in expected {
-            let actual_value = runtime_value_at_path(actual, path).unwrap_or_else(|| {
-                panic!("{label} {surface} live state is missing root path `{path}`")
-            });
-            assert_eq!(
-                actual_value, expected_value,
-                "{label} {surface} root path `{path}` must match whole scenario PlanExecutor"
-            );
-        }
-    }
-
-    fn assert_plan_executor_live_surfaces_match_scenario_events(
-        label: &str,
-        source_label: &str,
-        source_path: &Path,
-        scenario_path: &Path,
-        selected_step_ids: Option<&[&str]>,
-    ) {
-        let runtime_units = runtime_units_for_source_path(source_path);
-        let compiled = compile_source_units_to_machine_plan(
-            source_label,
-            &compiler_source_units_from_runtime_units(&runtime_units),
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("source units should compile to a MachinePlan");
-        let scenario = parse_scenario(scenario_path).expect("scenario should parse");
-        let selected_steps = selected_plan_executor_source_steps(&scenario, selected_step_ids);
-        let whole = execute_machine_plan_root_scenario_inner(
-            &compiled.plan,
-            &selected_steps,
-            source_path.parent(),
-        )
-        .expect("whole scenario PlanExecutor runner should pass");
-        assert_no_plan_executor_fallback_counters(label, "whole", &whole.executor_report);
-
-        let mut persistent = PlanExecutorRuntimeState::new(&compiled.plan)
-            .expect("persistent PlanExecutor runtime should initialize");
-        for step in &selected_steps {
-            persistent
-                .apply_step(&compiled.plan, step, source_path.parent())
-                .expect("persistent PlanExecutor step should apply");
-        }
-        let incremental = persistent
-            .finish(&compiled.plan)
-            .expect("persistent PlanExecutor runtime should finish");
-        assert_plan_executor_execution_matches(label, "apply_step", &incremental, &whole);
-
-        let mut live_state = PlanExecutorRuntimeState::new(&compiled.plan)
-            .expect("persistent PlanExecutor live runtime should initialize");
-        for (sequence, step) in selected_steps.iter().enumerate() {
-            let generic_event =
-                GenericSourceEvent::require(step).expect("scenario step should contain source");
-            live_state
-                .apply_live_source_event(
-                    &compiled.plan,
-                    live_source_event_from_generic(&generic_event),
-                    sequence + 1,
-                    source_path.parent(),
-                )
-                .expect("PlanExecutor live source event should apply");
-        }
-        let live = live_state
-            .finish(&compiled.plan)
-            .expect("persistent PlanExecutor live runtime should finish");
-        assert_plan_executor_execution_matches(label, "live_source_event", &live, &whole);
-
-        let mut session = PlanExecutorLiveSession::from_project(
-            source_label,
-            &runtime_units,
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("PlanExecutor live session should initialize from source units");
-        assert_eq!(session.provenance_report()["engine"], "plan_executor");
-        assert_eq!(
-            session.provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        for step in &selected_steps {
-            let generic_event =
-                GenericSourceEvent::require(step).expect("scenario step should contain source");
-            let report = session
-                .apply_source_event(live_source_event_from_generic(&generic_event))
-                .expect("PlanExecutor live session source event should apply");
-            assert_eq!(
-                report["source"], generic_event.source,
-                "{label} PlanExecutorLiveSession should report the applied source"
-            );
-        }
-        let session_output = session
-            .finish()
-            .expect("PlanExecutor live session should finish");
-        assert_plan_executor_execution_matches(
-            label,
-            "PlanExecutorLiveSession",
-            &session_output,
-            &whole,
-        );
-
-        let batch_events = selected_steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| {
-                let generic_event =
-                    GenericSourceEvent::require(step).expect("scenario step should contain source");
-                SourceBatchEvent {
-                    event_id: (index + 1) as u64,
-                    event: live_source_event_from_generic(&generic_event),
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project(source_label, &runtime_units)
-            .expect("LiveRuntime PlanExecutor mode should initialize");
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        let output = runtime
-            .apply_source_batch_turn(SourceBatch {
-                sequence_id: 1,
-                events: batch_events,
-            })
-            .expect("LiveRuntime PlanExecutor batch should apply");
-        assert_live_state_contains_root_scenario_values(
-            label,
-            "LiveRuntime batch",
-            &runtime.state_summary(),
-            &whole.state_summary,
-        );
-        assert_eq!(
-            serde_json::to_value(&output.semantic_deltas)
-                .expect("typed semantic deltas should serialize"),
-            whole.semantic_deltas,
-            "{label} LiveRuntime batch semantic deltas must match whole scenario PlanExecutor"
-        );
-        assert!(
-            output.render_patches.is_empty(),
-            "{label} PlanExecutor live batch must not synthesize obsolete render patches"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn plan_executor_live_surfaces_match_representative_scenario_events() {
-        assert_plan_executor_live_surfaces_match_scenario_events(
-            "todomvc",
-            "examples/todomvc.bn",
-            Path::new("../../examples/todomvc.bn"),
-            Path::new("../../examples/todomvc.scn"),
-            Some(&[
-                "add-test-todo-type",
-                "add-test-todo-submit",
-                "filter-active",
-                "toggle-dynamic-test-todo-under-active-filter",
-            ]),
-        );
-        assert_plan_executor_live_surfaces_match_scenario_events(
-            "bytes-source-payload",
-            "examples/bytes_source_payload_plan_ops.bn",
-            Path::new("../../examples/bytes_source_payload_plan_ops.bn"),
-            Path::new("../../examples/bytes_source_payload_plan_ops.scn"),
-            None,
-        );
-        assert_plan_executor_live_surfaces_match_scenario_events(
-            "bytes-indexed-source-payload",
-            "examples/bytes_indexed_source_payload_plan_ops.bn",
-            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.bn"),
-            Path::new("../../examples/bytes_indexed_source_payload_plan_ops.scn"),
-            None,
-        );
-        std::thread::Builder::new()
-            .name("cells-plan-live-surfaces".to_owned())
-            .stack_size(16 * 1024 * 1024)
-            .spawn(|| {
-                assert_plan_executor_live_surfaces_match_scenario_events(
-                    "cells",
-                    "examples/cells.bn",
-                    Path::new("../../examples/cells.bn"),
-                    Path::new("../../examples/cells.scn"),
-                    None,
-                );
-            })
-            .expect("Cells live-surface parity thread should start")
-            .join()
-            .expect("Cells live-surface parity should not panic");
-    }
-
-    #[test]
-    fn persistent_plan_executor_runtime_matches_whole_todomvc_scenario_runner() {
-        let compiled = compile_source_path_to_machine_plan(
-            Path::new("../../examples/todomvc.bn"),
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("TodoMVC should compile to a MachinePlan");
-        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
-            .expect("TodoMVC scenario should parse");
-        let selected_step_ids = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-            "filter-active".to_owned(),
-            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
-        ];
-        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
-        let step_selection = select_plan_explicit_root_scenario_steps(
-            &scenario.name,
-            &scenario_step_meta,
-            &selected_step_ids,
-        )
-        .expect("selected TodoMVC steps should be accepted");
-        let selected_steps = step_selection
-            .selected_indices
-            .iter()
-            .map(|index| &scenario.step[*index])
-            .collect::<Vec<_>>();
-
-        let whole = execute_machine_plan_root_scenario_inner(
-            &compiled.plan,
-            &selected_steps,
-            Path::new("../../examples/todomvc.bn").parent(),
-        )
-        .expect("whole scenario PlanExecutor runner should pass");
-
-        let mut persistent = PlanExecutorRuntimeState::new(&compiled.plan)
-            .expect("persistent PlanExecutor runtime should initialize");
-        for step in &selected_steps {
-            persistent
-                .apply_step(
-                    &compiled.plan,
-                    step,
-                    Path::new("../../examples/todomvc.bn").parent(),
-                )
-                .expect("persistent PlanExecutor step should apply");
-        }
-        let incremental = persistent
-            .finish(&compiled.plan)
-            .expect("persistent PlanExecutor runtime should finish");
-
-        assert_eq!(incremental.state_summary, whole.state_summary);
-        assert_eq!(
-            incremental.semantic_delta_signatures,
-            whole.semantic_delta_signatures
-        );
-        assert_eq!(incremental.semantic_deltas, whole.semantic_deltas);
-        assert_eq!(incremental.per_step, whole.per_step);
-        assert_eq!(
-            incremental.executor_report["executor"],
-            "cpu-plan-root-list-scenario-v1"
-        );
-        assert_eq!(
-            incremental.executor_report["runtime_ast_eval_count"],
-            json!(0)
-        );
-        assert_eq!(
-            incremental.executor_report["executable_string_path_count"],
-            json!(0)
-        );
-        assert_eq!(
-            incremental.executor_report["unknown_plan_op_count"],
-            json!(0)
-        );
-        assert_eq!(
-            incremental.executor_report["executed_indexed_update_count"],
-            json!(1)
-        );
-        assert_eq!(incremental.executor_report, whole.executor_report);
-    }
-
-    #[test]
-    fn persistent_plan_executor_runtime_accepts_live_source_events() {
-        let compiled = compile_source_path_to_machine_plan(
-            Path::new("../../examples/todomvc.bn"),
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("TodoMVC should compile to a MachinePlan");
-        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
-            .expect("TodoMVC scenario should parse");
-        let selected_step_ids = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-            "filter-active".to_owned(),
-            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
-        ];
-        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
-        let step_selection = select_plan_explicit_root_scenario_steps(
-            &scenario.name,
-            &scenario_step_meta,
-            &selected_step_ids,
-        )
-        .expect("selected TodoMVC steps should be accepted");
-        let selected_steps = step_selection
-            .selected_indices
-            .iter()
-            .map(|index| &scenario.step[*index])
-            .collect::<Vec<_>>();
-        let whole = execute_machine_plan_root_scenario_inner(
-            &compiled.plan,
-            &selected_steps,
-            Path::new("../../examples/todomvc.bn").parent(),
-        )
-        .expect("whole scenario PlanExecutor runner should pass");
-
-        let mut live_session = PlanExecutorRuntimeState::new(&compiled.plan)
-            .expect("persistent PlanExecutor runtime should initialize");
-        for (sequence, step) in selected_steps.iter().enumerate() {
-            let generic_event =
-                GenericSourceEvent::require(step).expect("scenario step should contain source");
-            live_session
-                .apply_live_source_event(
-                    &compiled.plan,
-                    live_source_event_from_generic(&generic_event),
-                    sequence + 1,
-                    Path::new("../../examples/todomvc.bn").parent(),
-                )
-                .expect("PlanExecutor live source event should apply");
-        }
-        let live = live_session
-            .finish(&compiled.plan)
-            .expect("persistent PlanExecutor live runtime should finish");
-
-        assert_eq!(live.state_summary, whole.state_summary);
-        assert_eq!(
-            live.semantic_delta_signatures,
-            whole.semantic_delta_signatures
-        );
-        assert_eq!(live.semantic_deltas, whole.semantic_deltas);
-        assert_eq!(live.per_step.len(), whole.per_step.len());
-        for (live_step, whole_step) in live.per_step.iter().zip(whole.per_step.iter()) {
-            assert_eq!(live_step["source"], whole_step["source"]);
-            assert_eq!(
-                live_step["semantic_delta_signatures"],
-                whole_step["semantic_delta_signatures"]
-            );
-            assert_eq!(live_step["semantic_deltas"], whole_step["semantic_deltas"]);
-            assert_eq!(
-                live_step["executed_update_branch_count"],
-                whole_step["executed_update_branch_count"]
-            );
-            assert_eq!(
-                live_step["executed_indexed_update_count"],
-                whole_step["executed_indexed_update_count"]
-            );
-            assert_eq!(
-                live_step["executed_list_append_count"],
-                whole_step["executed_list_append_count"]
-            );
-        }
-        assert_eq!(
-            live.executor_report["executed_update_branch_count"],
-            whole.executor_report["executed_update_branch_count"]
-        );
-        assert_eq!(
-            live.executor_report["executed_indexed_update_count"],
-            whole.executor_report["executed_indexed_update_count"]
-        );
-        assert_eq!(
-            live.executor_report["executed_list_append_count"],
-            whole.executor_report["executed_list_append_count"]
-        );
-        assert_eq!(
-            live.executor_report["runtime_ast_eval_count"],
-            whole.executor_report["runtime_ast_eval_count"]
-        );
-        assert_eq!(
-            live.executor_report["executable_string_path_count"],
-            whole.executor_report["executable_string_path_count"]
-        );
-        assert_eq!(
-            live.executor_report["unknown_plan_op_count"],
-            whole.executor_report["unknown_plan_op_count"]
-        );
-    }
-
-    #[test]
-    fn plan_executor_live_session_from_project_accepts_live_source_events() {
-        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load");
-        let runtime_units = compiler_units
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let compiled = compile_source_units_to_machine_plan(
-            "examples/todomvc.bn",
-            &compiler_source_units_from_runtime_units(&runtime_units),
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("TodoMVC source units should compile to a MachinePlan");
-        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
-            .expect("TodoMVC scenario should parse");
-        let selected_step_ids = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-            "filter-active".to_owned(),
-            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
-        ];
-        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
-        let step_selection = select_plan_explicit_root_scenario_steps(
-            &scenario.name,
-            &scenario_step_meta,
-            &selected_step_ids,
-        )
-        .expect("selected TodoMVC steps should be accepted");
-        let selected_steps = step_selection
-            .selected_indices
-            .iter()
-            .map(|index| &scenario.step[*index])
-            .collect::<Vec<_>>();
-        let whole = execute_machine_plan_root_scenario_inner(
-            &compiled.plan,
-            &selected_steps,
-            Path::new("../../examples/todomvc.bn").parent(),
-        )
-        .expect("whole scenario PlanExecutor runner should pass");
-
-        let mut session = PlanExecutorLiveSession::from_project(
-            "examples/todomvc.bn",
-            &runtime_units,
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("PlanExecutor live session should initialize from source units");
-        assert_eq!(session.provenance_report()["engine"], "plan_executor");
-        assert_eq!(
-            session.provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        for step in &selected_steps {
-            let generic_event =
-                GenericSourceEvent::require(step).expect("scenario step should contain source");
-            let report = session
-                .apply_source_event(live_source_event_from_generic(&generic_event))
-                .expect("PlanExecutor live source event should apply");
-            assert_eq!(report["source"], generic_event.source);
-        }
-        let live = session
-            .finish()
-            .expect("PlanExecutor live session should finish");
-
-        assert_eq!(live.state_summary, whole.state_summary);
-        assert_eq!(
-            live.semantic_delta_signatures,
-            whole.semantic_delta_signatures
-        );
-        assert_eq!(live.semantic_deltas, whole.semantic_deltas);
-        assert_eq!(
-            live.executor_report["executed_indexed_update_count"],
-            whole.executor_report["executed_indexed_update_count"]
-        );
-        assert_eq!(live.executor_report["runtime_ast_eval_count"], json!(0));
-        assert_eq!(
-            live.executor_report["executable_string_path_count"],
-            json!(0)
-        );
-        assert_eq!(live.executor_report["unknown_plan_op_count"], json!(0));
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_batch_matches_whole_todomvc_scenario_runner() {
-        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load");
-        let runtime_units = compiler_units
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let compiled = compile_source_units_to_machine_plan(
-            "examples/todomvc.bn",
-            &compiler_source_units_from_runtime_units(&runtime_units),
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("TodoMVC source units should compile to a MachinePlan");
-        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
-            .expect("TodoMVC scenario should parse");
-        let selected_step_ids = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-            "filter-active".to_owned(),
-            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
-        ];
-        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
-        let step_selection = select_plan_explicit_root_scenario_steps(
-            &scenario.name,
-            &scenario_step_meta,
-            &selected_step_ids,
-        )
-        .expect("selected TodoMVC steps should be accepted");
-        let selected_steps = step_selection
-            .selected_indices
-            .iter()
-            .map(|index| &scenario.step[*index])
-            .collect::<Vec<_>>();
-        let whole = execute_machine_plan_root_scenario_inner(
-            &compiled.plan,
-            &selected_steps,
-            Path::new("../../examples/todomvc.bn").parent(),
-        )
-        .expect("whole scenario PlanExecutor runner should pass");
-        let batch_events = selected_steps
-            .iter()
-            .enumerate()
-            .map(|(index, step)| {
-                let generic_event =
-                    GenericSourceEvent::require(step).expect("scenario step should contain source");
-                SourceBatchEvent {
-                    event_id: (index + 1) as u64,
-                    event: live_source_event_from_generic(&generic_event),
-                }
-            })
-            .collect::<Vec<_>>();
-
-        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
-            .expect("LiveRuntime PlanExecutor mode should initialize");
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        let output = runtime
-            .apply_source_batch_turn(SourceBatch {
-                sequence_id: 1,
-                events: batch_events,
-            })
-            .expect("LiveRuntime PlanExecutor batch should apply");
-
-        assert_live_state_contains_root_scenario_values(
-            "todomvc",
-            "LiveRuntime batch",
-            &runtime.state_summary(),
-            &whole.state_summary,
-        );
-        assert_eq!(
-            serde_json::to_value(&output.semantic_deltas)
-                .expect("typed semantic deltas should serialize"),
-            whole.semantic_deltas
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        assert!(
-            output.render_patches.is_empty(),
-            "PlanExecutor live turn must not synthesize obsolete render patches during this slice"
-        );
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_rejects_batch_sequence_and_event_id_conflicts() {
-        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load")
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
-            .expect("TodoMVC should initialize through PlanExecutor");
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-
-        let output = runtime
-            .apply_source_batch_turn(SourceBatch {
-                sequence_id: 1,
-                events: vec![
-                    SourceBatchEvent {
-                        event_id: 1,
-                        event: LiveSourceEvent {
-                            source: "store.sources.new_todo_input.change".to_owned(),
-                            text: Some("Batch todo".to_owned()),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                    SourceBatchEvent {
-                        event_id: 2,
-                        event: LiveSourceEvent {
-                            source: "store.sources.new_todo_input.key_down".to_owned(),
-                            key: Some("Enter".to_owned()),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                ],
-            })
-            .expect("PlanExecutor batch should dispatch ordered public source events");
-        assert!(
-            output.semantic_deltas.iter().any(
-                |delta| delta.kind == "ListInsert" && delta.list_id.as_deref() == Some("todos")
-            ),
-            "ordered source batch must dispatch through public source events"
-        );
-
-        let error = runtime
-            .apply_source_batch_turn(SourceBatch::single(
-                1,
-                3,
-                LiveSourceEvent {
-                    source: "store.sources.new_todo_input.change".to_owned(),
-                    text: Some("stale sequence".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-            ))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("sequence conflict"),
-            "equal-sequence LATEST conflicts must be rejected deterministically, got `{error}`"
-        );
-
-        let error = runtime
-            .apply_source_batch_turn(SourceBatch {
-                sequence_id: 2,
-                events: vec![
-                    SourceBatchEvent {
-                        event_id: 9,
-                        event: LiveSourceEvent {
-                            source: "store.sources.new_todo_input.change".to_owned(),
-                            text: Some("duplicate event id".to_owned()),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                    SourceBatchEvent {
-                        event_id: 9,
-                        event: LiveSourceEvent {
-                            source: "store.sources.new_todo_input.key_down".to_owned(),
-                            key: Some("Enter".to_owned()),
-                            ..LiveSourceEvent::default()
-                        },
-                    },
-                ],
-            })
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("event IDs must be strictly increasing"),
-            "batch event ID conflicts must be reported deterministically, got `{error}`"
-        );
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_routes_duplicate_todo_title_by_occurrence() {
-        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load")
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
-            .expect("TodoMVC should initialize through PlanExecutor");
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-
-        for sequence_id in 1..=2 {
-            runtime
-                .apply_source_batch_turn(SourceBatch {
-                    sequence_id,
-                    events: vec![
-                        SourceBatchEvent {
-                            event_id: 1,
-                            event: LiveSourceEvent {
-                                source: "store.sources.new_todo_input.change".to_owned(),
-                                text: Some("Duplicate".to_owned()),
-                                ..LiveSourceEvent::default()
-                            },
-                        },
-                        SourceBatchEvent {
-                            event_id: 2,
-                            event: LiveSourceEvent {
-                                source: "store.sources.new_todo_input.key_down".to_owned(),
-                                key: Some("Enter".to_owned()),
-                                ..LiveSourceEvent::default()
-                            },
-                        },
-                    ],
-                })
-                .expect("duplicate TodoMVC submit should apply through PlanExecutor");
-        }
-
-        let output = runtime
-            .apply_source_batch_turn(SourceBatch::single(
-                3,
-                1,
-                LiveSourceEvent {
-                    source: "todo.sources.todo_checkbox.click".to_owned(),
-                    target_text: Some("Duplicate".to_owned()),
-                    target_occurrence: Some(2),
-                    ..LiveSourceEvent::default()
-                },
-            ))
-            .expect("second duplicate checkbox click should route by occurrence");
-        assert!(output.semantic_deltas.iter().any(|delta| {
-            delta.kind == "FieldSet" && delta.field_path.as_deref() == Some("completed")
-        }));
-
-        let state = runtime.document_state_summary();
-        let duplicates = state
-            .get("todos")
-            .and_then(JsonValue::as_array)
-            .expect("TodoMVC summary should include todos")
-            .iter()
-            .filter(|todo| todo["title"] == "Duplicate")
-            .collect::<Vec<_>>();
-        assert_eq!(duplicates.len(), 2);
-        assert_eq!(duplicates[0]["completed"], false);
-        assert_eq!(duplicates[1]["completed"], true);
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_profiled_constructor_reports_no_fallback_provenance() {
-        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load")
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-
-        let (runtime, profile) =
-            LiveRuntime::from_project_profiled("examples/todomvc.bn", &runtime_units)
-                .expect("profiled PlanExecutor constructor should initialize TodoMVC");
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        assert_eq!(profile["engine"], "plan_executor");
-        assert_eq!(profile["generic_fallback_enabled"], false);
-        assert_eq!(
-            profile["runtime"]["provenance"]["engine"],
-            json!("plan_executor")
-        );
-    }
-
-    #[test]
-    fn live_runtime_default_source_constructor_uses_plan_executor_for_document_programs() {
-        let runtime = LiveRuntime::from_source(
-            "examples/counter.bn",
-            include_str!("../../../examples/counter.bn"),
-        )
-        .expect("Counter should initialize through the default LiveRuntime constructor");
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn live_runtime_default_project_constructor_uses_plan_executor_for_document_programs() {
-        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load")
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units).expect(
-            "TodoMVC should initialize through the default LiveRuntime project constructor",
-        );
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn live_runtime_default_profiled_constructor_reports_plan_executor_selection() {
-        let runtime_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load")
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let (runtime, profile) =
-            LiveRuntime::from_project_profiled("examples/todomvc.bn", &runtime_units)
-                .expect("TodoMVC profiled default constructor should initialize");
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        assert_eq!(profile["engine"], "plan_executor");
-        assert_eq!(profile["generic_fallback_enabled"], false);
-        assert_eq!(
-            profile["default_runtime_selection"],
-            "plan_executor_document_runtime"
-        );
-    }
-
-    #[test]
-    fn live_runtime_default_constructor_keeps_world_output_on_plan_executor() {
-        let mut runtime = LiveRuntime::from_source(
-            "examples/hello_3d/RUN.bn",
-            include_str!("../../../examples/hello_3d/RUN.bn"),
-        )
-        .expect("default LiveRuntime should initialize through PlanExecutor");
-
-        assert_eq!(
-            runtime.engine_provenance_report()["engine"],
-            "plan_executor"
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-        runtime
-            .world_scene_output()
-            .expect("world output should execute through default PlanExecutor runtime");
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_document_summary_exposes_todomvc_rows_and_sources() {
-        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load");
-        let runtime_units = compiler_units
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
-            .expect("TodoMVC scenario should parse");
-        let selected_step_ids = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-            "filter-active".to_owned(),
-            "toggle-dynamic-test-todo-under-active-filter".to_owned(),
-        ];
-        let scenario_step_meta = plan_executor_scenario_step_meta(&scenario.step);
-        let step_selection = select_plan_explicit_root_scenario_steps(
-            &scenario.name,
-            &scenario_step_meta,
-            &selected_step_ids,
-        )
-        .expect("selected TodoMVC steps should be accepted");
-        let batch_events = step_selection
-            .selected_indices
-            .iter()
-            .enumerate()
-            .map(|(index, step_index)| {
-                let step = &scenario.step[*step_index];
-                let generic_event =
-                    GenericSourceEvent::require(step).expect("scenario step should contain source");
-                SourceBatchEvent {
-                    event_id: (index + 1) as u64,
-                    event: live_source_event_from_generic(&generic_event),
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
-            .expect("LiveRuntime PlanExecutor mode should initialize");
-        runtime
-            .apply_source_batch_turn(SourceBatch {
-                sequence_id: 1,
-                events: batch_events,
-            })
-            .expect("PlanExecutor batch should apply");
-
-        let summary = runtime.document_state_summary();
-        assert_eq!(summary["store"]["selected_filter"], "Active");
-        let todos = summary["todos"]
-            .as_array()
-            .expect("todos should be summarized");
-        let dynamic = todos
-            .iter()
-            .find(|row| row["title"] == "Test todo")
-            .expect("dynamic TodoMVC row should be present");
-        assert_eq!(dynamic["completed"], true);
-        assert_eq!(dynamic["$boon"]["row_key"], 5);
-        assert_eq!(
-            dynamic["sources"]["todo_checkbox"]["click"]["list_id"],
-            "todos"
-        );
-        assert_eq!(
-            dynamic["sources"]["todo_checkbox"]["click"]["target_key"],
-            dynamic["$boon"]["row_key"]
-        );
-        let visible = summary["store"]["visible_todos"]
-            .as_array()
-            .expect("visible_todos retain should be a document array");
-        assert!(
-            visible.iter().all(|row| row["completed"] == false),
-            "Active filter document summary should expose only active visible rows: {visible:?}"
-        );
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_document_summary_exposes_root_list_map_projection() {
-        let source = r#"
-store: [
-    sources: [
-        noop: SOURCE
-    ]
-    noop:
-        TEXT { ready } |> HOLD noop {
-            LATEST {
-                sources.noop.text
-            }
-        }
-    rows:
-        LIST {
-            [id: TEXT { a }, name: TEXT { A }]
-            [id: TEXT { b }, name: TEXT { B }]
-        }
-    projected:
-        rows |> List/map(row, new: projected_row(row: row))
-]
-
-FUNCTION projected_row(row) {
-    [
-        id: row.id
-        label: row.id |> Text/concat(with: row.name, separator: "=")
-        nested: [
-            label: row.name |> Text/concat(with: TEXT { nested }, separator: "/")
-        ]
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
-"#;
-        let compiled = compile_source_text_to_machine_plan(
-            "root-list-map-summary",
-            source,
-            TargetProfile::SoftwareDefault,
-        )
-        .expect("root List/map fixture should compile to a MachinePlan");
-        let projected_field = compiled
-            .plan
-            .debug_map
-            .derived_values
-            .iter()
-            .find(|entry| entry.label == "store.projected")
-            .and_then(|entry| entry.id.strip_prefix("field:"))
-            .and_then(|id| id.parse::<usize>().ok())
-            .expect("store.projected should be a derived field");
-        let projected_op = compiled
-            .plan
-            .regions
-            .iter()
-            .flat_map(|region| region.ops.iter())
-            .find(|op| op.output == Some(ValueRef::Field(FieldId(projected_field))))
-            .expect("store.projected should have a plan op");
-        assert!(
-            matches!(
-                &projected_op.kind,
-                PlanOpKind::DerivedValue {
-                    derived_kind: boon_plan::PlanDerivedKind::ListView,
-                    expression: Some(PlanDerivedExpression::RowExpression { .. }),
-                    ..
-                }
-            ),
-            "root List/map ListView must carry an executable row expression: {projected_op:#?}"
-        );
-
-        let mut runtime = LiveRuntime::from_source("root-list-map-summary", source)
-            .expect("root List/map projection should initialize through PlanExecutor");
-
-        let summary = runtime.document_state_summary();
-        let projected = summary["store"]["projected"]
-            .as_array()
-            .expect("root List/map projection should be a document array");
-        assert_eq!(projected.len(), 2);
-        assert_eq!(projected[0]["id"], "a");
-        assert_eq!(projected[0]["label"], "a=A");
-        assert_eq!(projected[0]["nested"]["label"], "A/nested");
-        assert_eq!(projected[1]["id"], "b");
-        assert_eq!(projected[1]["label"], "b=B");
-        assert_eq!(projected[1]["nested"]["label"], "B/nested");
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_source_inventory_and_values_are_plan_owned() {
-        let compiler_units = compiler_source_units_for_path(Path::new("../../examples/todomvc.bn"))
-            .expect("TodoMVC source units should load");
-        let runtime_units = compiler_units
-            .into_iter()
-            .map(|unit| RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let mut runtime = LiveRuntime::from_project("examples/todomvc.bn", &runtime_units)
-            .expect("LiveRuntime PlanExecutor mode should initialize");
-
-        assert!(runtime.has_source_path("store.sources.new_todo_input.change"));
-        assert!(runtime.has_source_path("store.sources.new_todo_input.events.change"));
-        assert!(runtime.source_payload_has_text("store.sources.new_todo_input.events.change"));
-        assert!(!runtime.source_payload_has_text("store.sources.new_todo_input.events.key_down"));
-
-        let output = runtime
-            .apply_source_event_for_document(LiveSourceEvent {
-                source: "store.sources.new_todo_input.events.change".to_owned(),
-                text: Some("Plan-owned query".to_owned()),
-                source_id: None,
-                ..LiveSourceEvent::default()
-            })
-            .expect("PlanExecutor mode should resolve source_id from MachinePlan routes");
-        assert_eq!(
-            output.state_summary["store"]["new_todo_text"],
-            "Plan-owned query"
-        );
-
-        let values = runtime.document_state_values(&["store.new_todo_text".to_owned()]);
-        assert_eq!(values["store.new_todo_text"], "Plan-owned query");
-        let summaries =
-            runtime.runtime_value_summaries(&["store.new_todo_text".to_owned()], 3, 8, 4);
-        assert_eq!(
-            summaries["store.new_todo_text"],
-            json!({"kind": "string", "value": "Plan-owned query"})
-        );
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-
-        let scenario = parse_scenario(Path::new("../../examples/todomvc.scn"))
-            .expect("TodoMVC scenario should parse");
-        let step = scenario
-            .step
-            .iter()
-            .find(|step| step.id == "add-test-todo-submit")
-            .expect("TodoMVC scenario should include add-test-todo-submit");
-        let generic_event =
-            GenericSourceEvent::require(step).expect("scenario step should contain source");
-        let sparse = runtime
-            .apply_source_event_for_step_value_summaries(
-                step,
-                live_source_event_from_generic(&generic_event),
-                &["store.new_todo_text".to_owned()],
-            )
-            .expect("PlanExecutor sparse step helper should stay PlanExecutor-only");
-        assert_eq!(
-            sparse.value_summaries["store.new_todo_text"]["kind"],
-            "string"
-        );
-        assert_eq!(sparse.value_summaries["store.new_todo_text"]["value"], "");
-        assert_eq!(
-            runtime.engine_provenance_report()["generic_fallback_enabled"],
-            false
-        );
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_rejects_missing_outputs_without_fallback() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-store: [
-    elements: [noop: SOURCE]
-    value: TEXT { ready }
-]
-
-document: Document/new(root: Element/label(element: [], label: store.value))
-"#;
-        let mut runtime = LiveRuntime::from_source("plan-executor-output-guard", source)
-            .expect("source should initialize in PlanExecutor mode");
-        let world_error = runtime
-            .world_scene_output()
-            .expect_err("PlanExecutor mode must not fall back for world output")
-            .to_string();
-        assert!(
-            world_error.contains("requires a top-level `world:` value"),
-            "unexpected world output error: {world_error}"
-        );
-        let solid_error = runtime
-            .solid_model_output()
-            .expect_err("PlanExecutor mode must not fall back for solid output")
-            .to_string();
-        assert!(
-            solid_error.contains("requires a top-level `manufacturing:` value"),
-            "unexpected solid output error: {solid_error}"
-        );
-    }
-
-    #[test]
-    fn live_runtime_plan_executor_cells_window_summary_is_bounded_and_current() {
-        let mut runtime = LiveRuntime::from_source(
-            "cells-plan-window-summary",
-            &cells_project_source_for_test(),
-        )
-        .expect("Cells should initialize in explicit PlanExecutor mode");
-        let output = runtime
-            .apply_source_event_for_document_window(
-                LiveSourceEvent {
-                    source: "cell.sources.editor.select".to_owned(),
-                    address: Some("B0".to_owned()),
-                    ..LiveSourceEvent::default()
-                },
-                0,
-                24,
-                0,
-                10,
-            )
-            .expect("Cells select source should apply through PlanExecutor mode");
-        assert_eq!(
-            output.state_summary["store"]["selected_input"]["address"],
-            "B0"
-        );
-
-        let summary = runtime.document_state_summary_for_window(0, 24, 0, 10);
-        assert_eq!(summary["store"]["selected_address"], "B0");
-        assert_eq!(summary["store"]["selected_input"]["address"], "B0");
-        assert_eq!(
-            summary["store"]["selected_input"]["editing_text"],
-            "=add(A0,A1)"
-        );
-        let rows = summary["store"]["sheet_rows"]
-            .as_array()
-            .expect("sheet_rows should be summarized as rows");
-        assert_eq!(rows.len(), 24);
-        let first_row_cells = rows[0]["cells"]
-            .as_array()
-            .expect("sheet row should contain cells");
-        assert_eq!(first_row_cells.len(), 10);
-        assert_eq!(first_row_cells[0]["address"], "A0");
-        assert_eq!(first_row_cells[1]["address"], "B0");
-        assert!(
-            summary["__boon_materialization"]
-                .as_array()
-                .unwrap_or(&Vec::new())
-                .iter()
-                .any(|entry| entry["collection"] == "store.sheet_rows"),
-            "window summary should report bounded sheet_rows materialization"
-        );
-
-        let values = runtime.document_state_values(&[
-            "store.selected_input.address".to_owned(),
-            "store.selected_input.editing_text".to_owned(),
-        ]);
-        assert_eq!(values["store.selected_input.address"], "B0");
-        assert_eq!(values["store.selected_input.editing_text"], "=add(A0,A1)");
-        let summaries = runtime.runtime_value_summaries(
-            &["store.selected_input.editing_text".to_owned()],
-            3,
-            8,
-            4,
-        );
-        assert_eq!(
-            summaries["store.selected_input.editing_text"],
-            json!({"kind": "string", "value": "=add(A0,A1)"})
-        );
-    }
-
-    #[test]
-    fn root_list_plan_executor_replays_todomvc_delete_row() {
-        let steps = vec![
-            "add-test-todo-type".to_owned(),
-            "add-test-todo-submit".to_owned(),
-            "delete-dynamic-test-todo".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/todomvc.bn"),
-            Path::new("../../examples/todomvc_plan_slices.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("TodoMVC row delete should execute through scoped list-remove PlanExecutor slice");
-
-        let report = &output.report;
-        assert_eq!(report["status"], "pass");
-        assert_root_scenario_product_only(report);
-        assert_eq!(report["plan_executor"]["executed_list_remove_count"], 1);
-        assert_eq!(report["plan_executor"]["emitted_source_unbind_count"], 6);
-        assert_eq!(report["plan_executor"]["executed_list_append_count"], 1);
-        assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 6);
-        assert_eq!(report["plan_executor"]["executed_indexed_update_count"], 0);
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-
-        let delete_step = &report["plan_executor"]["per_step"][2];
-        assert_eq!(
-            delete_step["semantic_delta_signatures"],
-            json!([
-                "SourceUnbind:todo.sources.remove_todo_button.press",
-                "SourceUnbind:todo.sources.editing_todo_title_element.change",
-                "SourceUnbind:todo.sources.editing_todo_title_element.key_down",
-                "SourceUnbind:todo.sources.editing_todo_title_element.blur",
-                "SourceUnbind:todo.sources.todo_title_element.double_click",
-                "SourceUnbind:todo.sources.todo_checkbox.click",
-                "ListRemove",
-                "FieldSet:store.active_count"
-            ])
-        );
-        let removed = &delete_step["list_removes"][0];
-        assert_eq!(removed["source"], "todo.sources.remove_todo_button.press");
-        assert_eq!(removed["source_id"], 9);
-        assert_eq!(removed["source_binding_id"], 25);
-        assert_eq!(removed["bind_epoch"], 25);
-        assert_eq!(removed["remove_op_id"], 51);
-        assert_eq!(removed["list"], "todos");
-        assert_eq!(removed["row_index"], 4);
-        assert_eq!(removed["key"], 5);
-        assert_eq!(removed["generation"], 1);
-        assert_eq!(removed["row_resolution"]["method"], "key_generation");
-        assert_eq!(removed["row_resolution"]["target_key"], 5);
-        assert_eq!(removed["row_resolution"]["target_generation"], 1);
-        assert_eq!(removed["row_resolution"]["target_text"], "Test todo");
-        assert_eq!(removed["row_fields"]["title"], "Test todo");
-        assert_eq!(removed["row_fields"]["completed"], false);
-        assert_eq!(removed["source_unbinds"].as_array().unwrap().len(), 6);
-        assert_eq!(removed["source_unbinds"][0]["source_id"], 25);
-        assert_eq!(
-            removed["source_unbinds"][0]["field_path"],
-            "todo.sources.remove_todo_button.press"
-        );
-        assert_eq!(removed["source_unbinds"][5]["source_id"], 30);
-        assert_eq!(
-            removed["source_unbinds"][5]["field_path"],
-            "todo.sources.todo_checkbox.click"
-        );
-
-        let todos = &report["plan_executor"]["list_summary"]["todos"];
-        assert_eq!(todos["row_count"], 4);
-        assert_eq!(todos["active_count"], 3);
-        assert_eq!(todos["completed_count"], 1);
-        assert_eq!(
-            todos["titles"],
-            json!([
-                "Read documentation",
-                "Finish TodoMVC renderer",
-                "Walk the dog",
-                "Buy groceries"
-            ])
-        );
-        assert_eq!(todos["rows"][3]["key"], 4);
-        assert_eq!(todos["rows"][3]["fields"]["title"], "Buy groceries");
-    }
-
-    #[test]
-    fn root_list_plan_executor_replays_todomvc_clear_completed() {
-        let steps = vec!["clear-completed".to_owned()];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/todomvc.bn"),
-            Path::new("../../examples/todomvc.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("TodoMVC clear-completed should execute through row-field list-remove slice");
-
-        let report = &output.report;
-        assert_eq!(report["status"], "pass");
-        assert_root_scenario_product_only(report);
-        assert_eq!(report["plan_executor"]["executed_list_remove_count"], 1);
-        assert_eq!(report["plan_executor"]["emitted_source_unbind_count"], 6);
-        assert_eq!(report["plan_executor"]["executed_derived_value_count"], 2);
-        for key in [
-            "runtime_ast_eval_count",
-            "executable_string_path_count",
-            "unknown_plan_op_count",
-            "graph_rebuild_count",
-            "graph_clones_per_item",
-        ] {
-            assert_eq!(
-                report["plan_executor"][key], 0,
-                "fallback counter {key} must stay zero"
-            );
-        }
-
-        let clear_step = &report["plan_executor"]["per_step"][0];
-        assert_eq!(
-            clear_step["semantic_delta_signatures"],
-            json!([
-                "SourceUnbind:todo.sources.remove_todo_button.press",
-                "SourceUnbind:todo.sources.editing_todo_title_element.change",
-                "SourceUnbind:todo.sources.editing_todo_title_element.key_down",
-                "SourceUnbind:todo.sources.editing_todo_title_element.blur",
-                "SourceUnbind:todo.sources.todo_title_element.double_click",
-                "SourceUnbind:todo.sources.todo_checkbox.click",
-                "ListRemove",
-                "FieldSet:store.completed_count",
-                "FieldSet:store.has_completed"
-            ])
-        );
-        let removed = &clear_step["list_removes"][0];
-        assert_eq!(
-            removed["source"],
-            "store.sources.clear_completed_button.press"
-        );
-        assert_eq!(removed["source_id"], 5);
-        assert!(removed["source_binding_id"].is_null());
-        assert!(removed["bind_epoch"].is_null());
-        assert_eq!(removed["remove_op_id"], 50);
-        assert_eq!(removed["key"], 2);
-        assert_eq!(removed["generation"], 1);
-        assert_eq!(removed["row_resolution"]["method"], "predicate");
-        assert_eq!(removed["row_resolution"]["predicate"], "row_field_bool");
-        assert_eq!(removed["row_resolution"]["predicate_field"], "completed");
-        assert_eq!(removed["row_resolution"]["predicate_value"], true);
-        assert_eq!(removed["row_fields"]["title"], "Finish TodoMVC renderer");
-        assert_eq!(removed["row_fields"]["completed"], true);
-        assert_eq!(removed["source_unbinds"].as_array().unwrap().len(), 6);
-        assert_eq!(removed["source_unbinds"][0]["source_id"], 7);
-        assert_eq!(removed["source_unbinds"][5]["source_id"], 12);
-        assert_eq!(
-            clear_step["derived"][0]["field_path"],
-            "store.completed_count"
-        );
-        assert_eq!(clear_step["derived"][0]["value"], 0);
-        assert_eq!(
-            clear_step["derived"][1]["field_path"],
-            "store.has_completed"
-        );
-        assert_eq!(
-            clear_step["derived"][1]["expression_kind"],
-            "number_compare_const"
-        );
-        assert_eq!(clear_step["derived"][1]["value"], false);
-
-        let todos = &report["plan_executor"]["list_summary"]["todos"];
-        assert_eq!(todos["row_count"], 3);
-        assert_eq!(todos["active_count"], 3);
-        assert_eq!(todos["completed_count"], 0);
-        assert_eq!(
-            todos["titles"],
-            json!(["Read documentation", "Walk the dog", "Buy groceries"])
-        );
-    }
-
-    #[test]
-    fn root_list_plan_executor_enter_whitespace_clears_without_append() {
-        let steps = vec![
-            "reject-empty-todo-type".to_owned(),
-            "reject-empty-todo-submit".to_owned(),
-        ];
-        let output = run_plan_root_scalar_scenario(
-            Path::new("../../examples/todomvc.bn"),
-            Path::new("../../examples/todomvc.scn"),
-            TargetProfile::SoftwareDefault,
-            &steps,
-            None,
-        )
-        .expect("Whitespace Enter should execute without appending a row");
-
-        let report = &output.report;
-        assert_eq!(report["status"], "pass");
-        assert_eq!(output.state_summary["store.new_todo_text"], "");
-        assert_root_scenario_product_only(report);
-        assert_eq!(report["plan_executor"]["executed_derived_value_count"], 0);
-        assert_eq!(report["plan_executor"]["executed_list_append_count"], 0);
-        assert_eq!(report["plan_executor"]["emitted_source_bind_count"], 0);
-        assert_eq!(
-            report["plan_executor"]["list_summary"]["todos"]["row_count"],
-            4
-        );
-        assert_eq!(
-            report["semantic_delta_signatures"],
-            json!([
-                "FieldSet:store.new_todo_text",
-                "FieldSet:store.new_todo_text"
-            ])
-        );
-        assert!(
-            report["semantic_deltas"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|delta| delta["kind"] != "ListInsert")
-        );
-    }
-
-    #[test]
-    fn bytes_field_and_list_storage_round_trip_as_typed_columns() {
-        let payload = RuntimeBytes::inline(Bytes::from_static(b"wave-page"));
-        let mut columns = ValueColumns::default();
-        columns.insert_value("payload".to_owned(), FieldValue::Bytes(payload.clone()));
-        columns.insert_value("label".to_owned(), FieldValue::Text("visible".to_owned()));
-
-        let summary = value_columns_json(&columns);
-        assert_eq!(summary["payload"]["$boon_type"], "BYTES");
-        assert_eq!(summary["payload"]["byte_len"], 9);
-        assert!(
-            summary["payload"].get("inline_bytes").is_none(),
-            "record summary must not inline payload bytes: {summary:#?}"
-        );
-
-        let list = ListMemory::from_values([RuntimeRowSnapshot {
-            columns: columns.clone(),
-        }]);
-        assert!(matches!(
-            list.value(0, "payload"),
-            Some(FieldValueRef::Bytes(value)) if value == &payload
-        ));
-        assert_eq!(
-            list.snapshot_slot(list.visible_slot(0).unwrap()).columns,
-            columns
-        );
-
-        let mut json_like = ValueColumns::default();
-        json_like.insert_value(
-            "payload".to_owned(),
-            FieldValue::Json(payload.report_json()),
-        );
-        assert_ne!(
-            boon_value_cache_fragment(&BoonValue::RecordColumns(columns)),
-            boon_value_cache_fragment(&BoonValue::RecordColumns(json_like)),
-            "typed BYTES must not collide with equivalent-looking JSON metadata"
-        );
-    }
-
-    #[test]
-    fn bridge_value_bytes_and_refs_convert_to_runtime_bytes() {
-        let inline = BridgeValue::inline_bytes(
-            sha256_bytes(b"bridge-inline"),
-            Bytes::from_static(b"bridge-inline"),
-        );
-        let inline_field = bridge_value_to_field_value(&inline)
-            .expect("inline bridge bytes should convert to runtime bytes");
-        let FieldValue::Bytes(inline_bytes) = inline_field else {
-            panic!("inline bridge bytes should become FieldValue::Bytes");
-        };
-        assert_eq!(inline_bytes.byte_len, b"bridge-inline".len() as u64);
-        assert_eq!(inline_bytes.report_json()["storage"], "inline");
-
-        let blob = BridgeBlobRef {
-            digest: "sha256:blob".to_owned(),
-            byte_len: 4096,
-            media_type: "application/octet-stream".to_owned(),
-            storage: "fixture-bounded-pages".to_owned(),
-            encoding: "fst".to_owned(),
-        };
-        let blob_field = bridge_value_to_field_value(&BridgeValue::BlobRef(blob.clone()))
-            .expect("blob ref should convert to bytes metadata");
-        let FieldValue::Bytes(blob_bytes) = blob_field else {
-            panic!("blob ref should become FieldValue::Bytes");
-        };
-        assert_eq!(blob_bytes.report_json()["storage"], "blob_ref");
-        assert_eq!(blob_bytes.report_json()["digest"], blob.digest);
-        assert_eq!(blob_bytes.report_json()["byte_len"], blob.byte_len);
-
-        let page = BridgePageRef {
-            artifact_digest: "sha256:artifact".to_owned(),
-            schema_version: 1,
-            schema_hash: "sha256:schema".to_owned(),
-            request_fingerprint: "request".to_owned(),
-            response_fingerprint: "response".to_owned(),
-            input_digest: "sha256:input".to_owned(),
-            page_digest: "sha256:page".to_owned(),
-            generation: 7,
-            offset: 128,
-            limit: 256,
-            row_count: 32,
-            sample_count: 64,
-            transition_count: 16,
-            byte_length: 2048,
-            byte_len: 2048,
-            status: "ready".to_owned(),
-        };
-        let page_field = bridge_value_to_field_value(&BridgeValue::PageRef(page.clone()))
-            .expect("page ref should convert to bytes metadata");
-        let FieldValue::Bytes(page_bytes) = page_field else {
-            panic!("page ref should become FieldValue::Bytes");
-        };
-        let page_summary = page_bytes.report_json();
-        assert_eq!(page_summary["storage"], "page_ref");
-        assert_eq!(page_summary["digest"], page.page_digest);
-        assert_eq!(page_summary["artifact_digest"], page.artifact_digest);
-        assert_eq!(page_summary["byte_len"], page.byte_len);
-    }
-
-    #[test]
-    fn bridge_completion_payload_sidecars_reach_runtime_bytes_boundary() {
-        use boon_bridge::{
-            BRIDGE_ABI_VERSION, BridgeCompletionPayloads, BridgeCompletionStatus,
-            BridgeEffectScheduler, BridgeExportKind, BridgeExportMetadata, BridgeModuleMetadata,
-            BridgeProviderMetadata, BridgeRegistry, BridgeSchema, BridgeSchemaShape,
-            BridgeTaskCompletion, BridgeTaskRequest, CANONICAL_SCHEMA_VERSION, bridge_bytes_digest,
-        };
-
-        let input = BridgeSchema {
-            name: "PayloadRuntimeRequest".to_owned(),
-            version: CANONICAL_SCHEMA_VERSION,
-            shape: BridgeSchemaShape::Record {
-                fields: BTreeMap::new(),
-            },
-        };
-        let output = BridgeSchema {
-            name: "PayloadRuntimeOutput".to_owned(),
-            version: CANONICAL_SCHEMA_VERSION,
-            shape: BridgeSchemaShape::Record {
-                fields: BTreeMap::from([
-                    ("blob".to_owned(), BridgeSchemaShape::BlobRef),
-                    ("inline".to_owned(), BridgeSchemaShape::Bytes),
-                    ("page".to_owned(), BridgeSchemaShape::PageRef),
-                    ("status".to_owned(), BridgeSchemaShape::Text),
-                ]),
-            },
-        };
-        let export = BridgeExportMetadata {
-            name: "load_payloads".to_owned(),
-            kind: BridgeExportKind::Effect,
-            input_schema_version: input.version,
-            input_schema_hash: input.hash(),
-            output_schema_version: output.version,
-            output_schema_hash: output.hash(),
-            required_capabilities: Vec::new(),
-        };
-        let mut registry = BridgeRegistry::new();
-        registry
-            .register_module(BridgeModuleMetadata {
-                module: "payloads.v1".to_owned(),
-                abi_version: BRIDGE_ABI_VERSION.to_owned(),
-                canonical_schema_version: CANONICAL_SCHEMA_VERSION,
-                provider: BridgeProviderMetadata {
-                    provider: "payload-runtime-test".to_owned(),
-                    provider_version: "0.1.fixture".to_owned(),
-                    bridge_crate: "boon_payload_runtime_test_bridge".to_owned(),
-                    bridge_crate_version: "0.1.0".to_owned(),
-                    features: vec!["bytes-boundary".to_owned()],
-                },
-                exports: BTreeMap::from([("load_payloads".to_owned(), export.clone())]),
-            })
-            .expect("payload runtime test module should register once");
-        registry
-            .register_export_schemas("payloads.v1", "load_payloads", input, output)
-            .expect("payload runtime schemas should match metadata");
-
-        let blob_bytes = Bytes::from_static(b"raw waveform blob bytes");
-        let page_bytes = Bytes::from_static(b"decoded waveform page bytes");
-        let inline_bytes = Bytes::from_static(b"inline header");
-        let blob_ref = BridgeBlobRef {
-            digest: bridge_bytes_digest(blob_bytes.as_ref()),
-            byte_len: blob_bytes.len() as u64,
-            media_type: "application/vnd.boon.wave-page".to_owned(),
-            storage: "bridge-payload-store".to_owned(),
-            encoding: "packed-wave-page".to_owned(),
-        };
-        let page_ref = BridgePageRef {
-            artifact_digest: "sha256:artifact".to_owned(),
-            schema_version: CANONICAL_SCHEMA_VERSION,
-            schema_hash: "sha256:schema".to_owned(),
-            request_fingerprint: "request:fingerprint".to_owned(),
-            response_fingerprint: "response:fingerprint".to_owned(),
-            input_digest: "sha256:input".to_owned(),
-            page_digest: bridge_bytes_digest(page_bytes.as_ref()),
-            generation: 1,
-            offset: 0,
-            limit: page_bytes.len() as u64,
-            row_count: 2,
-            sample_count: 8,
-            transition_count: 4,
-            byte_length: page_bytes.len() as u64,
-            byte_len: page_bytes.len() as u64,
-            status: "ready".to_owned(),
-        };
-        let inline_digest = bridge_bytes_digest(inline_bytes.as_ref());
-
-        let request = BridgeTaskRequest::new(
-            &export,
-            "payloads.v1",
-            "payload-runtime",
-            1,
-            BridgeValue::Record(BTreeMap::new()),
-            Vec::new(),
-            "cancel:payload-runtime",
-            0,
-        );
-        let mut scheduler = BridgeEffectScheduler::new(128);
-        scheduler
-            .schedule(&registry, request.clone())
-            .expect("payload runtime request should schedule");
-        let output = BridgeValue::Record(BTreeMap::from([
-            ("blob".to_owned(), BridgeValue::BlobRef(blob_ref.clone())),
-            (
-                "inline".to_owned(),
-                BridgeValue::inline_bytes(inline_digest.clone(), inline_bytes.clone()),
-            ),
-            ("page".to_owned(), BridgeValue::PageRef(page_ref.clone())),
-            ("status".to_owned(), BridgeValue::Text("ready".to_owned())),
-        ]));
-        let mut payloads = BridgeCompletionPayloads::new();
-        payloads
-            .insert_blob(&blob_ref, blob_bytes)
-            .expect("blob sidecar should match blob ref");
-        payloads
-            .insert_page(&page_ref, page_bytes)
-            .expect("page sidecar should match page ref");
-        let accepted = scheduler
-            .complete_with_payloads(
-                BridgeTaskCompletion::for_request(
-                    &request,
-                    BridgeCompletionStatus::Ok,
-                    Some(output),
-                    Vec::new(),
-                ),
-                &payloads,
-            )
-            .expect("completion with matching payload sidecars should be accepted");
-
-        let summary = bridge_completion_output_runtime_summary(&accepted)
-            .expect("accepted bridge completion should convert to runtime summary")
-            .expect("OK completion should carry output");
-        assert_eq!(summary["status"], "ready");
-        assert_eq!(summary["blob"]["$boon_type"], "BYTES");
-        assert_eq!(summary["blob"]["storage"], "blob_ref");
-        assert_eq!(summary["blob"]["digest"], blob_ref.digest);
-        assert_eq!(summary["blob"]["byte_len"], blob_ref.byte_len);
-        assert!(summary["blob"].get("inline_bytes").is_none());
-        assert_eq!(summary["page"]["$boon_type"], "BYTES");
-        assert_eq!(summary["page"]["storage"], "page_ref");
-        assert_eq!(summary["page"]["digest"], page_ref.page_digest);
-        assert_eq!(summary["page"]["artifact_digest"], page_ref.artifact_digest);
-        assert_eq!(summary["page"]["byte_len"], page_ref.byte_len);
-        assert!(summary["page"].get("inline_bytes").is_none());
-        assert_eq!(summary["inline"]["$boon_type"], "BYTES");
-        assert_eq!(summary["inline"]["storage"], "inline");
-        assert_eq!(summary["inline"]["digest"], inline_digest);
-        assert_eq!(summary["inline"]["byte_len"], inline_bytes.len() as u64);
-        assert!(summary["inline"].get("inline_bytes").is_none());
-
-        let restored: BridgeTaskCompletion = serde_json::from_value(
-            serde_json::to_value(&accepted).expect("completion should serialize"),
-        )
-        .expect("completion should deserialize");
-        assert_eq!(
-            bridge_completion_output_runtime_summary(&restored)
-                .expect("restored completion should convert"),
-            Some(summary),
-            "runtime BYTES summaries must be deterministic across completion replay metadata"
-        );
-    }
-
-    #[test]
-    fn record_columns_cache_fragment_sorts_nested_json_objects() {
-        fn object(entries: Vec<(&str, JsonValue)>) -> JsonValue {
-            let mut map = serde_json::Map::new();
-            for (key, value) in entries {
-                map.insert(key.to_owned(), value);
-            }
-            JsonValue::Object(map)
-        }
-
-        let nested_left = object(vec![
-            ("z", JsonValue::String("last".to_owned())),
-            ("a", JsonValue::String("first".to_owned())),
-        ]);
-        let nested_right = object(vec![
-            ("a", JsonValue::String("first".to_owned())),
-            ("z", JsonValue::String("last".to_owned())),
-        ]);
-
-        let mut left = ValueColumns::default();
-        left.insert_value(
-            "payload".to_owned(),
-            FieldValue::Json(object(vec![
-                (
-                    "b",
-                    JsonValue::Array(vec![JsonValue::Bool(true), nested_left]),
-                ),
-                ("a", JsonValue::Number(1.into())),
-            ])),
-        );
-        let mut right = ValueColumns::default();
-        right.insert_value(
-            "payload".to_owned(),
-            FieldValue::Json(object(vec![
-                ("a", JsonValue::Number(1.into())),
-                (
-                    "b",
-                    JsonValue::Array(vec![JsonValue::Bool(true), nested_right]),
-                ),
-            ])),
-        );
-
-        let fragment = boon_value_cache_fragment(&BoonValue::RecordColumns(left));
-        assert_eq!(
-            fragment,
-            boon_value_cache_fragment(&BoonValue::RecordColumns(right))
-        );
-        assert!(
-            fragment.contains("json:object"),
-            "fragment should keep a typed JSON object tag: {fragment}"
-        );
-        assert!(
-            fragment.contains("json:array"),
-            "fragment should keep a typed JSON array tag: {fragment}"
-        );
-    }
-
-    #[test]
-    fn value_columns_keep_field_slots_sorted_for_dense_lookup() {
-        let mut columns = ValueColumns::default();
-        columns.insert_value("title".to_owned(), FieldValue::Text("A".to_owned()));
-        columns.insert_value("completed".to_owned(), FieldValue::Bool(false));
-        columns.insert_value("editing".to_owned(), FieldValue::Bool(true));
-        columns.insert_value(
-            "selected_filter".to_owned(),
-            FieldValue::Enum("All".to_owned()),
-        );
-        columns.set_or_insert_text("edit_text", "draft").unwrap();
-        columns.set_textlike("title", "B").unwrap();
-        columns.set_bool("completed", true).unwrap();
-
-        assert_eq!(columns.textlike("title"), Some("B"));
-        assert_eq!(columns.textlike("edit_text"), Some("draft"));
-        assert_eq!(columns.bool_value("completed"), Some(true));
-        assert_eq!(columns.bool_value("editing"), Some(true));
-        assert_eq!(columns.textlike("selected_filter"), Some("All"));
-        assert!(
-            columns
-                .text
-                .windows(2)
-                .all(|window| window[0].field_id < window[1].field_id)
-        );
-        assert!(
-            columns
-                .bools
-                .windows(2)
-                .all(|window| window[0].field_id < window[1].field_id)
-        );
-        assert!(
-            columns
-                .enums
-                .windows(2)
-                .all(|window| window[0].field_id < window[1].field_id)
-        );
-    }
-
-    #[test]
-    fn runtime_field_slots_use_name_hashes_not_example_field_tables() {
-        for field in [
-            "title",
-            "completed",
-            "formula_text",
-            "editing_text",
-            "value",
-            "error",
-        ] {
-            assert_eq!(
-                runtime_field_id_from_name(field),
-                FieldId(stable_runtime_field_id(field))
-            );
-        }
-    }
-
-    #[test]
-    fn runtime_field_slot_collision_diagnostics_preserve_readable_labels() {
-        let diagnostics = field_slot_collision_diagnostics_from_names([
-            "field_collision_1469".to_owned(),
-            "field_collision_2806".to_owned(),
-            "title".to_owned(),
-        ]);
-
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics[0].field_id,
-            stable_runtime_field_id("field_collision_1469")
-        );
-        assert_eq!(
-            diagnostics[0].labels,
-            vec![
-                "field_collision_1469".to_owned(),
-                "field_collision_2806".to_owned()
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_executor_list_store_exact_lookup_invalidates_after_mutation() {
-        let mut first_fields = BTreeMap::new();
-        first_fields.insert("address".to_owned(), json!("A0"));
-        let mut second_fields = BTreeMap::new();
-        second_fields.insert("address".to_owned(), json!("B0"));
-        let mut store = PlanExecutorListStore::from(BTreeMap::from([(
-            7,
-            vec![
-                PlanListRowState {
-                    key: 10,
-                    generation: 0,
-                    fields: first_fields,
-                    private_bytes: BTreeMap::new(),
-                    fixed_bytes_banks: BTreeMap::new(),
-                },
-                PlanListRowState {
-                    key: 11,
-                    generation: 0,
-                    fields: second_fields,
-                    private_bytes: BTreeMap::new(),
-                    fixed_bytes_banks: BTreeMap::new(),
-                },
-            ],
-        )]));
-
-        assert_eq!(
-            store.exact_field_lookup(7, "address", &json!("B0")),
-            Some(1)
-        );
-        store.set_row_field(7, 1, "address", json!("C0")).unwrap();
-
-        assert_eq!(store.exact_field_lookup(7, "address", &json!("B0")), None);
-        assert_eq!(
-            store.exact_field_lookup(7, "address", &json!("C0")),
-            Some(1)
-        );
-        assert_eq!(
-            store.lookup_stats_report(),
-            json!({
-                "exact_lookup_count": 3,
-                "exact_lookup_hit_count": 2,
-                "exact_lookup_miss_count": 1,
-                "exact_lookup_candidate_count": 2,
-                "exact_lookup_row_scan_count": 0,
-                "exact_index_build_count": 2,
-                "exact_index_build_row_count": 4,
-            })
-        );
-    }
-
-    #[test]
-    fn scenario_delta_expectations_reject_missing_semantic_or_render_patch() {
-        let semantic_step = ScenarioStep {
-            id: "missing-semantic".to_owned(),
-            expect_semantic_delta_contains: vec!["ListInsert".to_owned()],
-            ..ScenarioStep::default()
-        };
-        let render_step = ScenarioStep {
-            id: "missing-render".to_owned(),
-            expect_render_delta_contains: vec!["BindSource".to_owned()],
-            ..ScenarioStep::default()
-        };
-        let deltas = [field_delta(
-            Some(1),
-            Some(1),
-            "completed",
-            ProtocolValue::Bool(true),
-        )];
-        let patches = [patch(
-            "InvalidateDocument",
-            RenderTarget::Static(Cow::Borrowed("document")),
-            ProtocolValue::CheckedProperty(true),
-        )];
-
-        assert!(assert_delta_expectations(&semantic_step, &deltas, &patches).is_err());
-        assert!(assert_delta_expectations(&render_step, &deltas, &patches).is_err());
-    }
-
-    #[test]
-    fn pure_boon_cells_helpers_support_documented_arithmetic_ops() {
-        let mut runtime =
-            LiveRuntime::from_source("cells-arithmetic", &cells_project_source_for_test()).unwrap();
-        for (formula, expected) in [
-            ("=8+2", "10"),
-            ("=8-2", "6"),
-            ("=8*2", "16"),
-            ("=8/2", "4"),
-            ("=add(8,2)", "10"),
-        ] {
-            let output = commit_cell(&mut runtime, "A0", formula);
-            assert_eq!(
-                cell_summary_field_text(&output.state_summary, "A0", "value").as_deref(),
-                Some(expected)
-            );
-            assert!(cell_summary_field_has_no_error(&output.state_summary, "A0"));
-        }
-        let output = commit_cell(&mut runtime, "A0", "=8/0");
-        assert_eq!(
-            cell_summary(&output.state_summary, "A0")["error"],
-            "div_by_zero"
-        );
-        let output = commit_cell(&mut runtime, "D0", "");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "D0", "value").as_deref(),
-            Some("")
-        );
-        let output = commit_cell(&mut runtime, "E0", "=D0+2");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "E0", "value").as_deref(),
-            Some("2")
-        );
-        let output = commit_cell(&mut runtime, "A0", "caf\u{00e9}");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "A0", "value").as_deref(),
-            Some("caf\u{00e9}")
-        );
-        assert_eq!(
-            cell_summary_field_has_no_error(&output.state_summary, "A0"),
-            true
-        );
-        let output = commit_cell(&mut runtime, "A0", "=caf\u{00e9}+1");
-        assert_eq!(
-            cell_summary(&output.state_summary, "A0")["error"],
-            "parse_error"
-        );
-        commit_cell(&mut runtime, "A0", "5");
-        commit_cell(&mut runtime, "A1", "10");
-        commit_cell(&mut runtime, "A2", "15");
-        let output = commit_cell(&mut runtime, "C0", "=sum(A0:A2)");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
-            Some("30")
-        );
-        assert_eq!(
-            cell_summary_field_has_no_error(&output.state_summary, "C0"),
-            true
-        );
-    }
-
-    #[test]
-    fn cells_unrelated_row_commit_preserves_default_sum_until_formula_changes() {
-        let mut runtime = LiveRuntime::from_source(
-            "cells-unrelated-row-commit",
-            &cells_project_source_for_test(),
-        )
-        .unwrap();
-        let initial = runtime.document_state_summary();
-        assert_eq!(cell_summary(&initial, "C0")["formula_text"], "=sum(A0:A2)");
-        assert_eq!(
-            cell_summary_field_text(&initial, "C0", "value").as_deref(),
-            Some("30")
-        );
-
-        let output = commit_cell(&mut runtime, "A3", "20");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "A3", "value").as_deref(),
-            Some("20")
-        );
-        assert_eq!(
-            cell_summary(&output.state_summary, "C0")["formula_text"],
-            "=sum(A0:A2)"
-        );
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
-            Some("30"),
-            "editing A3 must not change the C0 sum until C0 references A3"
-        );
-    }
-
-    #[test]
-    fn pure_boon_cells_replacing_reference_removes_stale_dependents() {
-        let mut runtime =
-            LiveRuntime::from_source("cells-replace-reference", &cells_project_source_for_test())
-                .unwrap();
-        commit_cell(&mut runtime, "A0", "1");
-        let output = commit_cell(&mut runtime, "B0", "=A0+1");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
-            Some("2")
-        );
-
-        let output = commit_cell(&mut runtime, "B0", "5");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
-            Some("5")
-        );
-
-        let output = commit_cell(&mut runtime, "A0", "10");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "A0", "value").as_deref(),
-            Some("10")
-        );
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
-            Some("5")
-        );
-        assert!(
-            !output.semantic_deltas.iter().any(|delta| {
-                delta.field_path.as_deref() == Some("value")
-                    && matches!(delta.value, ProtocolValue::Text(ref value) if value.as_ref() == "11")
-            }),
-            "B0 must not keep a stale dependency on A0 after becoming a literal"
-        );
-    }
-
-    #[test]
-    fn pure_boon_cells_fanout_recomputes_from_generic_read_index() {
-        let mut runtime =
-            LiveRuntime::from_source("cells-fanout", &cells_project_source_for_test()).unwrap();
-        commit_cell(&mut runtime, "A0", "1");
-        commit_cell(&mut runtime, "B0", "=A0+1");
-        commit_cell(&mut runtime, "C0", "=A0+2");
-        commit_cell(&mut runtime, "D0", "=A0+3");
-
-        let output = commit_cell(&mut runtime, "A0", "10");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "B0", "value").as_deref(),
-            Some("11")
-        );
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
-            Some("12")
-        );
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "D0", "value").as_deref(),
-            Some("13")
-        );
-        let value_delta_count = output
-            .semantic_deltas
-            .iter()
-            .filter(|delta| delta.field_path.as_deref() == Some("value"))
-            .count();
-        assert!(
-            value_delta_count < 16,
-            "A0 fanout must stay sparse instead of emitting full-grid value deltas"
-        );
-    }
-
-    #[test]
-    fn pure_boon_cells_range_formula_updates_from_member_change() {
-        let mut runtime =
-            LiveRuntime::from_source("cells-range-fanout", &cells_project_source_for_test())
-                .unwrap();
-        commit_cell(&mut runtime, "A3", "20");
-        let output = commit_cell(&mut runtime, "C0", "=sum(A0:A3)");
-        assert_eq!(
-            cell_summary_field_text(&output.state_summary, "C0", "value").as_deref(),
-            Some("50")
-        );
-
-        let output = runtime
-            .apply_source_event_turn(LiveSourceEvent {
-                source: "cell.sources.editor.commit".to_owned(),
-                text: Some("30".to_owned()),
-                key: Some("Enter".to_owned()),
-                address: Some("A3".to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        let summary = runtime.document_state_summary();
-        assert_eq!(
-            cell_summary_field_text(&summary, "A3", "value").as_deref(),
-            Some("30")
-        );
-        assert_eq!(
-            cell_summary_field_text(&summary, "C0", "value").as_deref(),
-            Some("60"),
-            "range dependencies should invalidate formulas that read the changed member"
-        );
-        assert!(
-            output.recomputed_field_samples.len() < 16,
-            "range fanout accounting should stay sparse instead of reporting a full Cells grid recompute, got {:?}",
-            output.recomputed_field_samples
-        );
-    }
-
-    #[test]
-    fn scalar_match_const_uses_default_arm_for_unmatched_values() {
-        let equations = ScalarEquationPlan {
-            source_paths: Vec::new(),
-            branches: vec![ScalarUpdateBranch {
-                target: "store.active_signal".to_owned(),
-                source: "store.elements.select_data".to_owned(),
-                guard: None,
-                expression: ScalarUpdateExpression::MatchConst {
-                    input: "store.active_signal".to_owned(),
-                    arms: vec![
-                        UpdateMatchArm {
-                            pattern: "data_bus".to_owned(),
-                            output: "none".to_owned(),
-                        },
-                        UpdateMatchArm {
-                            pattern: "__".to_owned(),
-                            output: "data_bus".to_owned(),
-                        },
-                    ],
-                },
-            }],
-        };
-        let value = equations
-            .eval_text(
-                "store.active_signal",
-                "store.elements.select_data",
-                None,
-                None,
-                None,
-                &BTreeMap::new(),
-                None,
-                None,
-                None,
-                None,
-                |path| (path == "store.active_signal").then(|| "temperature".to_owned()),
-                |_| None,
-            )
-            .unwrap();
-        assert_eq!(value, Some(Cow::Owned("data_bus".to_owned())));
-    }
-
-    #[test]
-    fn scalar_match_value_reports_bad_nested_output_instead_of_skip() {
-        let equations = ScalarEquationPlan {
-            source_paths: vec!["store.elements.keyboard_capture".to_owned()],
-            branches: vec![ScalarUpdateBranch {
-                target: "store.zoom_step".to_owned(),
-                source: "store.elements.keyboard_capture".to_owned(),
-                guard: None,
-                expression: ScalarUpdateExpression::MatchValueConst {
-                    input: "elements.keyboard_capture.key".to_owned(),
-                    arms: vec![
-                        UpdateValueMatchArm {
-                            pattern: "W".to_owned(),
-                            output: UpdateValueExpression::NumberInfix {
-                                left: "store.zoom_step".to_owned(),
-                                op: "*".to_owned(),
-                                right: "2".to_owned(),
-                            },
-                        },
-                        UpdateValueMatchArm {
-                            pattern: "__".to_owned(),
-                            output: UpdateValueExpression::Const {
-                                value: "SKIP".to_owned(),
-                            },
-                        },
-                    ],
-                },
-            }],
-        };
-        let error = equations
-            .eval_text(
-                "store.zoom_step",
-                "store.elements.keyboard_capture",
-                Some("W"),
-                None,
-                None,
-                &BTreeMap::new(),
-                None,
-                None,
-                None,
-                None,
-                |path| (path == "store.zoom_step").then(|| "1".to_owned()),
-                |_| None,
-            )
-            .expect_err("unsupported nested update operator should not silently skip");
-        let error = error.to_string();
-        assert!(
-            error.contains("cannot evaluate update value numeric infix `store.zoom_step * 2`"),
-            "unexpected runtime error: {error}"
-        );
-    }
-
-    #[test]
-    fn world_output_lowers_generic_boon_value_to_world_scene() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-world: World/new(
-    camera: World/perspective_camera(
-        transform: World/transform(translation: [x: 0, y: 1, z: 6])
-        vertical_fov_degrees: 60
-    )
-    lights: LIST {
-        World/light(
-            id: TEXT { key }
-            transform: World/transform(translation: [x: 2, y: 4, z: 3])
-            intensity: 4
-        )
-    }
-    materials: LIST {
-        World/material(
-            id: TEXT { blue }
-            base_color: [r: 0, g: 1, b: 1, a: 1]
-            roughness: 1
-            metallic: 0
-        )
-    }
-    geometries: LIST {
-        World/primitive(
-            id: TEXT { cube }
-            kind: Cube
-            size: [x: 2, y: 2, z: 2]
-        )
-    }
-    instances: LIST {
-        World/model(
-            id: TEXT { cube_instance }
-            geometry: TEXT { cube }
-            material: TEXT { blue }
-            transform: World/transform(rotation_z_degrees: 45)
-            part_id: TEXT { body }
-            feature_id: TEXT { cube_feature }
-            pick_id: 7
-        )
-    }
-)
-"#;
-        let mut runtime = LiveRuntime::from_source("world-output-runtime-lowering", source)
-            .expect("world output source should compile");
-        let output = runtime
-            .world_scene_output()
-            .expect("world output should lower into a WorldScene");
-        let metrics = output.scene.metrics();
-        assert_eq!(output.output_root, "world");
-        assert_eq!(metrics.camera_count, 1);
-        assert_eq!(metrics.light_count, 1);
-        assert_eq!(metrics.geometry_count, 1);
-        assert_eq!(metrics.appearance_count, 1);
-        assert_eq!(metrics.instance_count, 1);
-        assert_eq!(metrics.pickable_instance_count, 1);
-        let target = output
-            .scene
-            .pick_target(PickId(7))
-            .expect("pick id should map to the lowered instance");
-        assert_eq!(
-            target.semantic_id.as_deref(),
-            Some("world:instance:cube_instance")
-        );
-        assert_eq!(target.label.as_deref(), Some("cube_instance"));
-
-        let mut rotated = output.scene.clone();
-        let instance_id = *rotated.instances.keys().next().unwrap();
-        rotated.instances.get_mut(&instance_id).unwrap().transform =
-            Transform3D::IDENTITY.with_rotation_z_degrees(90.0);
-        let patch = WorldScene::diff(&output.scene, &rotated);
-        let report = rotated
-            .apply_patch(&patch)
-            .expect("world transform patch should apply");
-        assert_eq!(report.transform_update_count, 1);
-        assert_eq!(report.geometry_rebuild_count, 0);
-    }
-
-    #[test]
-    fn manufacturing_output_lowers_generic_boon_value_to_solid_model() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { bracket_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { bracket }
-            geometry: Solid/difference(
-                base: Solid/rounded_box(size: [x: 70, y: 34, z: 6], radius: 2)
-                tools: LIST {
-                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: -23, y: 0, z: 0])
-                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: 23, y: 0, z: 0])
-                }
-            )
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-    instances: LIST {
-        Part/instance(id: TEXT { bracket_a }, part: TEXT { bracket }, label: TEXT { Bracket A })
-        Part/instance(id: TEXT { bracket_b }, part: TEXT { bracket }, label: TEXT { Bracket B })
-    }
-)
-"#;
-        let mut runtime = LiveRuntime::from_source("manufacturing-output-runtime-lowering", source)
-            .expect("manufacturing output source should compile");
-        let output = runtime
-            .solid_model_output()
-            .expect("manufacturing output should lower into a SolidModelBundle");
-        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
-        let validation = output.bundle.validate();
-        assert_eq!(output.output_root, "manufacturing");
-        assert_eq!(solid_metrics.subtractive_cylinder_count, 2);
-        assert_eq!(assembly_metrics.part_count, 1);
-        assert_eq!(assembly_metrics.instance_count, 2);
-        assert_eq!(assembly_metrics.printable_part_count, 1);
-        assert_eq!(assembly_metrics.physical_material_part_count, 1);
-        assert_eq!(assembly_metrics.shared_geometry_instance_count, 2);
-        assert_eq!(
-            validation.status,
-            solid_model::SolidValidationStatus::Pass,
-            "{validation:?}"
-        );
-    }
-
-    #[test]
-    fn manufacturing_output_lowers_cone_and_torus_constructors() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { curved_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { cone_part }
-            geometry: Solid/cone(radius0: 8, radius1: 3, height: 20)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-        Part/new(
-            id: TEXT { torus_part }
-            geometry: Solid/torus(major_radius: 12, minor_radius: 2)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
-        let mut runtime = LiveRuntime::from_source("curved-solid-output-runtime-lowering", source)
-            .expect("curved solid output source should compile");
-        let output = runtime
-            .solid_model_output()
-            .expect("curved solid output should lower into a SolidModelBundle");
-        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
-        let validation = output.bundle.validate();
-        let lowered_ops = output
-            .bundle
-            .solids
-            .values()
-            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
-            .collect::<Vec<_>>();
-
-        assert_eq!(output.output_root, "manufacturing");
-        assert_eq!(solid_metrics.primitive_node_count, 2);
-        assert_eq!(assembly_metrics.part_count, 2);
-        assert_eq!(assembly_metrics.printable_part_count, 2);
-        assert_eq!(
-            validation.status,
-            solid_model::SolidValidationStatus::Pass,
-            "{validation:?}"
-        );
-        assert!(
-            lowered_ops
-                .iter()
-                .any(|op| matches!(op, solid_model::SolidOp::Cone { .. })),
-            "{lowered_ops:?}"
-        );
-        assert!(
-            lowered_ops
-                .iter()
-                .any(|op| matches!(op, solid_model::SolidOp::Torus { .. })),
-            "{lowered_ops:?}"
-        );
-    }
-
-    #[test]
-    fn manufacturing_output_lowers_shell_constructor() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { shell_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { shell_part }
-            geometry: Solid/shell(
-                child: Solid/box(size: [x: 40, y: 24, z: 16])
-                thickness: 2
-            )
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
-        let mut runtime = LiveRuntime::from_source("shell-solid-output-runtime-lowering", source)
-            .expect("shell solid output source should compile");
-        let output = runtime
-            .solid_model_output()
-            .expect("shell solid output should lower into a SolidModelBundle");
-        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
-        let validation = output.bundle.validate();
-        let lowered_ops = output
-            .bundle
-            .solids
-            .values()
-            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
-            .collect::<Vec<_>>();
-
-        assert_eq!(output.output_root, "manufacturing");
-        assert_eq!(solid_metrics.primitive_node_count, 1);
-        assert_eq!(solid_metrics.transform_node_count, 1);
-        assert_eq!(assembly_metrics.part_count, 1);
-        assert_eq!(assembly_metrics.printable_part_count, 1);
-        assert_eq!(
-            validation.status,
-            solid_model::SolidValidationStatus::Pass,
-            "{validation:?}"
-        );
-        assert!(
-            lowered_ops.iter().any(|op| matches!(
-                op,
-                solid_model::SolidOp::Shell {
-                    thickness,
-                    ..
-                } if (*thickness - 2.0).abs() < f64::EPSILON
-            )),
-            "{lowered_ops:?}"
-        );
-    }
-
-    #[test]
-    fn manufacturing_output_lowers_extrude_constructor() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { extrude_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { extrude_part }
-            geometry: Solid/extrude(size: [x: 36, y: 18, z: 0], height: 12)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
-        let mut runtime = LiveRuntime::from_source("extrude-solid-output-runtime-lowering", source)
-            .expect("extrude solid output source should compile");
-        let output = runtime
-            .solid_model_output()
-            .expect("extrude solid output should lower into a SolidModelBundle");
-        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
-        let validation = output.bundle.validate();
-        let lowered_ops = output
-            .bundle
-            .solids
-            .values()
-            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
-            .collect::<Vec<_>>();
-        let profile_count = output
-            .bundle
-            .solids
-            .values()
-            .map(|graph| graph.profiles.len())
-            .sum::<usize>();
-
-        assert_eq!(output.output_root, "manufacturing");
-        assert_eq!(solid_metrics.primitive_node_count, 1);
-        assert_eq!(assembly_metrics.part_count, 1);
-        assert_eq!(assembly_metrics.printable_part_count, 1);
-        assert_eq!(profile_count, 1);
-        assert_eq!(
-            validation.status,
-            solid_model::SolidValidationStatus::Pass,
-            "{validation:?}"
-        );
-        assert!(
-            lowered_ops.iter().any(|op| matches!(
-                op,
-                solid_model::SolidOp::Extrude {
-                    height,
-                    ..
-                } if (*height - 12.0).abs() < f64::EPSILON
-            )),
-            "{lowered_ops:?}"
-        );
-    }
-
-    #[test]
-    fn manufacturing_output_lowers_revolve_constructor() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { revolve_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { revolve_part }
-            geometry: Solid/revolve(inner_radius: 4, outer_radius: 9, height: 12)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
-        let mut runtime = LiveRuntime::from_source("revolve-solid-output-runtime-lowering", source)
-            .expect("revolve solid output source should compile");
-        let output = runtime
-            .solid_model_output()
-            .expect("revolve solid output should lower into a SolidModelBundle");
-        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
-        let validation = output.bundle.validate();
-        let lowered_ops = output
-            .bundle
-            .solids
-            .values()
-            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
-            .collect::<Vec<_>>();
-        let profile_count = output
-            .bundle
-            .solids
-            .values()
-            .map(|graph| graph.profiles.len())
-            .sum::<usize>();
-
-        assert_eq!(output.output_root, "manufacturing");
-        assert_eq!(solid_metrics.primitive_node_count, 1);
-        assert_eq!(assembly_metrics.part_count, 1);
-        assert_eq!(assembly_metrics.printable_part_count, 1);
-        assert_eq!(profile_count, 1);
-        assert_eq!(
-            validation.status,
-            solid_model::SolidValidationStatus::Pass,
-            "{validation:?}"
-        );
-        assert!(
-            lowered_ops
-                .iter()
-                .any(|op| matches!(op, solid_model::SolidOp::Revolve { .. })),
-            "{lowered_ops:?}"
-        );
-    }
-
-    #[test]
-    fn manufacturing_output_lowers_loft_constructor() {
-        let source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { loft_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { loft_part }
-            geometry: Solid/loft(
-                bottom_size: [x: 36, y: 20, z: 0]
-                top_size: [x: 18, y: 10, z: 0]
-                height: 12
-            )
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
-        let mut runtime = LiveRuntime::from_source("loft-solid-output-runtime-lowering", source)
-            .expect("loft solid output source should compile");
-        let output = runtime
-            .solid_model_output()
-            .expect("loft solid output should lower into a SolidModelBundle");
-        let (solid_metrics, assembly_metrics) = output.bundle.metrics();
-        let validation = output.bundle.validate();
-        let lowered_ops = output
-            .bundle
-            .solids
-            .values()
-            .flat_map(|graph| graph.nodes.values().map(|node| &node.op))
-            .collect::<Vec<_>>();
-        let profile_count = output
-            .bundle
-            .solids
-            .values()
-            .map(|graph| graph.profiles.len())
-            .sum::<usize>();
-
-        assert_eq!(output.output_root, "manufacturing");
-        assert_eq!(solid_metrics.primitive_node_count, 1);
-        assert_eq!(assembly_metrics.part_count, 1);
-        assert_eq!(assembly_metrics.printable_part_count, 1);
-        assert_eq!(profile_count, 2);
-        assert_eq!(
-            validation.status,
-            solid_model::SolidValidationStatus::Pass,
-            "{validation:?}"
-        );
-        assert!(
-            lowered_ops.iter().any(|op| matches!(
-                op,
-                solid_model::SolidOp::Loft {
-                    profiles
-                } if profiles.len() == 2
-            )),
-            "{lowered_ops:?}"
-        );
-    }
-
-    fn cell_address_hash_for_test(address: &str) -> u64 {
-        let hash = sha256_bytes(address.as_bytes());
-        let bytes = hex_prefix_to_bytes(&hash, 8);
-        u64::from_le_bytes(bytes.try_into().unwrap())
-    }
-
-    fn cell_summary<'a>(summary: &'a JsonValue, address: &str) -> &'a JsonValue {
-        summary
-            .get("cells")
-            .and_then(JsonValue::as_array)
-            .and_then(|cells| {
-                cells
-                    .iter()
-                    .find(|cell| cell.get("address") == Some(&json!(address)))
-            })
-            .unwrap_or_else(|| panic!("Cells state summary should include {address}"))
-    }
-
-    fn cell_summary_field_text(summary: &JsonValue, address: &str, field: &str) -> Option<String> {
-        cell_summary(summary, address)
-            .get(field)
-            .and_then(json_scalar_text)
-    }
-
-    fn cell_summary_field_has_no_error(summary: &JsonValue, address: &str) -> bool {
-        let error = &cell_summary(summary, address)["error"];
-        error.is_null() || error.as_str() == Some("")
-    }
-
-    fn commit_cell(runtime: &mut LiveRuntime, address: &str, text: &str) -> LiveStepOutput {
-        let mut output = runtime
-            .apply_source_event(LiveSourceEvent {
-                source: "cell.sources.editor.commit".to_owned(),
-                text: Some(text.to_owned()),
-                address: Some(address.to_owned()),
-                ..LiveSourceEvent::default()
-            })
-            .unwrap();
-        if output.state_summary.get("cells").is_none() {
-            output.state_summary = runtime.document_state_summary();
-        }
-        output
-    }
-
-    fn hex_prefix_to_bytes(hash: &str, len: usize) -> Vec<u8> {
-        (0..len)
-            .map(|index| u8::from_str_radix(&hash[index * 2..index * 2 + 2], 16).unwrap())
-            .collect()
-    }
-
-    fn todo_checkbox_expected_source(target_text: &str) -> BTreeMap<String, toml::Value> {
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
-        );
-        expected.insert(
-            "target_text".to_owned(),
-            toml::Value::String(target_text.to_owned()),
-        );
-        expected
-    }
-}
+mod tests;

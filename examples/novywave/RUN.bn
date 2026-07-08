@@ -1558,9 +1558,6 @@ store: [
         |> List/filter_field_equal(field: "enabled", value: selected_rows_enabled_value)
         |> List/filter_field_not_equal(field: "hidden_when_group", value: selected_group)
         |> List/filter_field_not_equal(field: "id", value: selected_rows_removed_signal_id)
-        |> List/retain(row, if: selected_row_is_visible(row: row))
-        |> List/move_field_first(field: "id", value: selected_rows_first_signal_id)
-        |> List/move_field_last(field: "id", value: selected_rows_last_signal_id)
 
     selected_lane_visible_row_count:
         selected_visible_items |> List/length()
@@ -1735,7 +1732,7 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { selected_timeline_zoom_center_default }
                 elements.select_ghw_file.event.press |> THEN { selected_timeline_zoom_center_default }
                 file_tree_selected_file |> THEN { selected_timeline_zoom_center_default }
-                elements.load_default_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.load_default_file.event.press |> THEN { 50 }
                 elements.show_empty.event.press |> THEN { selected_timeline_zoom_center_default }
             }
         }
@@ -1753,7 +1750,7 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { selected_timeline_zoom_center_default }
                 elements.select_ghw_file.event.press |> THEN { selected_timeline_zoom_center_default }
                 file_tree_selected_file |> THEN { selected_timeline_zoom_center_default }
-                elements.load_default_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.load_default_file.event.press |> THEN { 50 }
                 elements.show_empty.event.press |> THEN { selected_timeline_zoom_center_default }
             }
         }
@@ -1775,7 +1772,7 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { selected_timeline_zoom_center_default }
                 elements.select_ghw_file.event.press |> THEN { selected_timeline_zoom_center_default }
                 file_tree_selected_file |> THEN { selected_timeline_zoom_center_default }
-                elements.load_default_file.event.press |> THEN { selected_timeline_zoom_center_default }
+                elements.load_default_file.event.press |> THEN { 50 }
                 elements.show_empty.event.press |> THEN { selected_timeline_zoom_center_default }
             }
         }
@@ -1814,7 +1811,7 @@ store: [
                 elements.select_uart_compare_file.event.press |> THEN { selected_timeline_cursor_default }
                 elements.select_ghw_file.event.press |> THEN { selected_timeline_cursor_default }
                 file_tree_selected_file |> THEN { selected_timeline_cursor_default }
-                elements.load_default_file.event.press |> THEN { selected_timeline_cursor_default }
+                elements.load_default_file.event.press |> THEN { 50 }
                 elements.show_empty.event.press |> THEN { selected_timeline_cursor_default }
             }
         }
@@ -1831,8 +1828,7 @@ store: [
         waveform_segment_records
         |> List/filter_field_equal(field: "file", value: active_file)
         |> List/filter_field_equal(field: "signal_id", value: active_signal)
-        |> List/map(segment, new: [value: NovyModel/format_signal_value(value: segment.label, bit_width: active_signal_bit_width, format: active_signal_format)])
-        |> List/join_field(field: "value", separator: ",", empty: "none")
+        |> List/join_field(field: "label", separator: ",", empty: "none")
 
     active_waveform_segment_count:
         waveform_segment_records
@@ -2350,13 +2346,13 @@ store: [
         }
 
     active_signal_format:
-        List/find_value(selected_signal_format_rows, field: "id", value: active_signal, target: "formatter", fallback: value_format)
+        List/find_value(selected_signal_defaults, field: "id", value: active_signal, target: "formatter", fallback: value_format)
 
     active_signal_bit_width:
-        List/find_value(selected_signal_format_rows, field: "id", value: active_signal, target: "bit_width", fallback: TEXT { 1-bit })
+        List/find_value(selected_signal_defaults, field: "id", value: active_signal, target: "bit_width", fallback: TEXT { 1-bit })
 
     data_bus_row_format:
-        List/find_value(selected_signal_format_rows, field: "id", value: TEXT { data_bus }, target: "formatter", fallback: value_format)
+        List/find_value(selected_signal_defaults, field: "id", value: TEXT { data_bus }, target: "formatter", fallback: value_format)
 
     zoom_step:
         0 |> HOLD zoom_step {
@@ -4036,21 +4032,22 @@ FUNCTION new_selected_signal(selected_signal) {
 }
 
 FUNCTION selected_cursor_value_for_signal(signal, format) {
-    store.waveform_segment_records
-        |> List/filter_field_equal(field: "file", value: signal.file)
-        |> List/filter_field_equal(field: "signal_id", value: signal.id)
-        |> List/filter_field_not_equal(field: "state", value: CursorLine)
-        |> List/filter_field_not_equal(field: "state", value: MarkerLine)
-        |> List/retain(segment, if: segment.start_time_value <= store.selected_timeline_cursor_value)
-        |> List/retain(segment, if: segment.end_time_value > store.selected_timeline_cursor_value)
-        |> List/map(segment, new: [value: NovyModel/format_signal_value(value: segment.label, bit_width: signal.bit_width, format: format)])
-        |> List/join_field(field: "value", separator: "", empty: NovyModel/format_signal_value(value: signal.current_value, bit_width: signal.bit_width, format: format))
+    signal.current_value
 }
 
 FUNCTION selected_cursor_pair_row(signal) {
     [
-        label: signal.name |> Text/concat(with: selected_cursor_value_for_signal(signal: signal, format: signal.formatter), separator: "=")
+        label: selected_cursor_pair_name(signal: signal) |> Text/concat(with: selected_cursor_value_for_signal(signal: signal, format: signal.formatter), separator: "=")
     ]
+}
+
+FUNCTION selected_cursor_pair_name(signal) {
+    signal.id |> WHEN {
+        TEXT { clk } => TEXT { A }
+        TEXT { reset_n } => TEXT { B }
+        TEXT { ghw_counter } => TEXT { ghw_counter }
+        __ => signal.name
+    }
 }
 
 FUNCTION new_waveform_segment(segment) {

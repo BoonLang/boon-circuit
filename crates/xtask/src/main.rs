@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,6 +34,7 @@ type XtaskCommandSpec = (&'static str, XtaskCommandHandler);
 
 #[rustfmt::skip]
 const XTASK_COMMANDS: &[XtaskCommandSpec] = &[
+    ("audit-test-inventory", audit_test_inventory),
     ("bytes-plan-phase0-baseline", bytes_plan_phase0_baseline),
     ("verify-example-negative", verify_negative),
     ("verify-bytes-type-system", verify_bytes_type_system),
@@ -158,6 +160,873 @@ fn print_help() {
 
 fn xtask_command_exists(command: &str) -> bool {
     XTASK_COMMANDS.iter().any(|spec| spec.0 == command)
+}
+
+fn audit_test_inventory(args: &[String]) -> XtaskResult {
+    let mut report_path = PathBuf::from("target/test-inventory/current.json");
+    let mut markdown_path = PathBuf::from("target/test-inventory/current.md");
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--report" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("--report requires a path".into());
+                };
+                report_path = PathBuf::from(value);
+            }
+            "--markdown" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("--markdown requires a path".into());
+                };
+                markdown_path = PathBuf::from(value);
+            }
+            "--no-markdown" => {
+                markdown_path = PathBuf::new();
+            }
+            other => return Err(format!("unknown audit-test-inventory arg `{other}`").into()),
+        }
+        index += 1;
+    }
+
+    let mut rust_files = Vec::new();
+    collect_files_with_extension(Path::new("crates"), "rs", &mut rust_files)?;
+    rust_files.sort();
+
+    let mut scenario_files = Vec::new();
+    collect_files_with_extension(Path::new("examples"), "scn", &mut scenario_files)?;
+    scenario_files.sort();
+
+    let mut total_rust_lines = 0usize;
+    let mut production_lines = 0usize;
+    let mut unit_test_lines = 0usize;
+    let mut integration_test_lines = 0usize;
+    let mut moved_test_files = Vec::new();
+    let mut test_groups: BTreeMap<String, TestInventoryGroupSummary> = BTreeMap::new();
+    let mut top_mixed_files = Vec::new();
+    let mut crate_summaries: BTreeMap<String, TestInventoryCrateSummary> = BTreeMap::new();
+    let mut classifications: BTreeMap<String, usize> = BTreeMap::new();
+    let mut moved_tests = Vec::new();
+    let mut remaining_inline_test_attrs = 0usize;
+    let mut remaining_inline_mod_tests = 0usize;
+
+    for path in &rust_files {
+        let source = fs::read_to_string(path)?;
+        let line_count = source.lines().count();
+        let path_text = normalize_path(path);
+        let crate_name = crate_name_from_path(path).unwrap_or_else(|| "unknown".to_owned());
+        total_rust_lines += line_count;
+        let is_unit_test = is_unit_test_inventory_path(&path_text);
+        let is_integration_test = is_integration_test_inventory_path(&path_text);
+        let summary = crate_summaries.entry(crate_name.clone()).or_default();
+        summary.rust_files += 1;
+        summary.total_lines += line_count;
+
+        if is_unit_test {
+            unit_test_lines += line_count;
+            summary.unit_test_lines += line_count;
+            test_groups.insert(
+                path_text.clone(),
+                TestInventoryGroupSummary {
+                    path: path_text.clone(),
+                    crate_name: crate_name.clone(),
+                    lines: line_count,
+                    private_heavy: path_text.contains("/src/"),
+                    ..TestInventoryGroupSummary::default()
+                },
+            );
+            moved_test_files.push(json!({
+                "path": path_text,
+                "crate": crate_name,
+                "lines": line_count,
+                "kind": "unit-test"
+            }));
+            for test in extract_test_inventory_entries(&path_text, &crate_name, &source) {
+                *classifications
+                    .entry(test.classification.clone())
+                    .or_insert(0) += 1;
+                summary.test_count += 1;
+                summary.private_heavy_test_count += usize::from(test.private_heavy);
+                *summary
+                    .classifications
+                    .entry(test.classification.clone())
+                    .or_insert(0) += 1;
+                if let Some(group) = test_groups.get_mut(&path_text) {
+                    group.test_count += 1;
+                    group.private_heavy_test_count += usize::from(test.private_heavy);
+                    *group
+                        .classifications
+                        .entry(test.classification.clone())
+                        .or_insert(0) += 1;
+                    if group.sample_tests.len() < 5 {
+                        group.sample_tests.push(test.name.clone());
+                    }
+                }
+                moved_tests.push(test.to_json());
+            }
+        } else if is_integration_test {
+            integration_test_lines += line_count;
+            summary.integration_test_lines += line_count;
+        } else {
+            production_lines += line_count;
+            summary.production_lines += line_count;
+            let inline_test_attrs = count_inline_test_attrs(&source);
+            let inline_mod_tests = count_inline_mod_tests(&source);
+            let cfg_test_count = count_cfg_test_attrs(&source);
+            remaining_inline_test_attrs += inline_test_attrs;
+            remaining_inline_mod_tests += inline_mod_tests;
+            if cfg_test_count > 0 || inline_test_attrs > 0 || inline_mod_tests > 0 {
+                top_mixed_files.push(json!({
+                    "path": path_text,
+                    "crate": crate_name,
+                    "lines": line_count,
+                    "cfg_test_count": cfg_test_count,
+                    "inline_test_attr_count": inline_test_attrs,
+                    "inline_mod_tests_count": inline_mod_tests
+                }));
+            }
+        }
+    }
+
+    top_mixed_files.sort_by(|left, right| {
+        let left_score = left
+            .get("cfg_test_count")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        let right_score = right
+            .get("cfg_test_count")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0);
+        right_score.cmp(&left_score)
+    });
+    if top_mixed_files.len() > 25 {
+        top_mixed_files.truncate(25);
+    }
+
+    moved_test_files.sort_by(|left, right| {
+        let left_lines = left.get("lines").and_then(JsonValue::as_u64).unwrap_or(0);
+        let right_lines = right.get("lines").and_then(JsonValue::as_u64).unwrap_or(0);
+        right_lines.cmp(&left_lines)
+    });
+
+    let scenario_lines = scenario_files
+        .iter()
+        .map(|path| fs::read_to_string(path).map(|source| source.lines().count()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
+    let e2e_coverage = test_inventory_e2e_coverage();
+    let mut group_summary_json = test_groups
+        .into_values()
+        .map(|summary| summary.to_json())
+        .collect::<Vec<_>>();
+    group_summary_json.sort_by(|left, right| {
+        let left_lines = left.get("lines").and_then(JsonValue::as_u64).unwrap_or(0);
+        let right_lines = right.get("lines").and_then(JsonValue::as_u64).unwrap_or(0);
+        right_lines.cmp(&left_lines)
+    });
+    let large_private_heavy_groups = group_summary_json
+        .iter()
+        .filter(|group| {
+            group.get("lines").and_then(JsonValue::as_u64).unwrap_or(0) >= 1000
+                && group
+                    .get("private_heavy_test_count")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(0)
+                    > 0
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let crate_summary_json = crate_summaries
+        .into_iter()
+        .map(|(crate_name, summary)| {
+            json!({
+                "crate": crate_name,
+                "rust_files": summary.rust_files,
+                "total_lines": summary.total_lines,
+                "production_lines": summary.production_lines,
+                "unit_test_lines": summary.unit_test_lines,
+                "integration_test_lines": summary.integration_test_lines,
+                "test_count": summary.test_count,
+                "private_heavy_test_count": summary.private_heavy_test_count,
+                "classifications": summary.classifications,
+            })
+        })
+        .collect::<Vec<_>>();
+    let test_path_percent = if total_rust_lines == 0 {
+        0.0
+    } else {
+        ((unit_test_lines + integration_test_lines) as f64 * 100.0) / total_rust_lines as f64
+    };
+    let totals = json!({
+        "total_rust_files": rust_files.len(),
+        "total_rust_lines": total_rust_lines,
+        "production_lines": production_lines,
+        "unit_test_lines": unit_test_lines,
+        "integration_test_lines": integration_test_lines,
+        "scenario_e2e_lines": scenario_lines,
+        "test_path_percent": test_path_percent,
+    });
+    let top_moved_test_files = moved_test_files
+        .iter()
+        .take(25)
+        .cloned()
+        .collect::<Vec<_>>();
+    let top_remaining_mixed_production_files = top_mixed_files.clone();
+    let private_heavy_test_count_by_crate = crate_summary_json
+        .iter()
+        .filter_map(|summary| {
+            let crate_name = summary.get("crate")?.as_str()?.to_owned();
+            let count = summary.get("private_heavy_test_count")?.as_u64()? as usize;
+            Some((crate_name, count))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let test_classifications_by_crate = crate_summary_json
+        .iter()
+        .filter_map(|summary| {
+            let crate_name = summary.get("crate")?.as_str()?.to_owned();
+            let classifications = summary
+                .get("classifications")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            Some((crate_name, classifications))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let report = json!({
+        "kind": "boon_test_inventory",
+        "schema_version": 1,
+        "generated_at_unix_seconds": current_unix_seconds(),
+        "command": "audit-test-inventory",
+        "scope": {
+            "rust": "crates/**/*.rs",
+            "scenario": "examples/**/*.scn"
+        },
+        "loc": {
+            "total_rust_files": rust_files.len(),
+            "total_rust_lines": total_rust_lines,
+            "production_lines": production_lines,
+                "unit_test_lines": unit_test_lines,
+                "integration_test_lines": integration_test_lines,
+                "scenario_e2e_lines": scenario_lines,
+                "test_path_percent": test_path_percent
+        },
+        "totals": totals,
+        "remaining_mixed_production_files": {
+            "inline_test_attr_count": remaining_inline_test_attrs,
+            "inline_mod_tests_count": remaining_inline_mod_tests,
+            "top_files": top_mixed_files
+        },
+        "top_remaining_mixed_production_files": top_remaining_mixed_production_files,
+        "moved_test_files": moved_test_files,
+        "top_moved_test_files": top_moved_test_files,
+        "moved_tests": {
+            "count": moved_tests.len(),
+            "classifications": classifications.clone(),
+            "entries": moved_tests
+        },
+        "classification_counts": classifications,
+        "test_groups": {
+            "count": group_summary_json.len(),
+            "large_private_heavy_threshold_lines": 1000,
+            "large_private_heavy_count": large_private_heavy_groups.len(),
+            "large_private_heavy_groups": large_private_heavy_groups,
+            "entries": group_summary_json
+        },
+        "crate_summaries": crate_summary_json,
+        "private_heavy_test_count_by_crate": private_heavy_test_count_by_crate,
+        "test_classifications_by_crate": test_classifications_by_crate,
+        "e2e_coverage": e2e_coverage,
+    });
+
+    if let Some(parent) = report_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    if !markdown_path.as_os_str().is_empty() {
+        if let Some(parent) = markdown_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&markdown_path, test_inventory_markdown(&report))?;
+    }
+
+    println!(
+        "test inventory: production_lines={} unit_test_lines={} integration_test_lines={} moved_tests={} report={}",
+        production_lines,
+        unit_test_lines,
+        integration_test_lines,
+        moved_tests.len(),
+        report_path.display()
+    );
+    if !markdown_path.as_os_str().is_empty() {
+        println!("test inventory markdown: {}", markdown_path.display());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct TestInventoryCrateSummary {
+    rust_files: usize,
+    total_lines: usize,
+    production_lines: usize,
+    unit_test_lines: usize,
+    integration_test_lines: usize,
+    test_count: usize,
+    private_heavy_test_count: usize,
+    classifications: BTreeMap<String, usize>,
+}
+
+struct TestInventoryEntry {
+    crate_name: String,
+    path: String,
+    name: String,
+    classification: String,
+    reason: String,
+    private_heavy: bool,
+    start_line: usize,
+}
+
+impl TestInventoryEntry {
+    fn to_json(&self) -> JsonValue {
+        json!({
+            "crate": self.crate_name,
+            "path": self.path,
+            "name": self.name,
+            "classification": self.classification,
+            "reason": self.reason,
+            "private_heavy": self.private_heavy,
+            "start_line": self.start_line,
+        })
+    }
+}
+
+#[derive(Default)]
+struct TestInventoryGroupSummary {
+    path: String,
+    crate_name: String,
+    lines: usize,
+    private_heavy: bool,
+    test_count: usize,
+    private_heavy_test_count: usize,
+    classifications: BTreeMap<String, usize>,
+    sample_tests: Vec<String>,
+}
+
+impl TestInventoryGroupSummary {
+    fn to_json(&self) -> JsonValue {
+        let dominant_classification = dominant_classification(&self.classifications);
+        let audit_status = test_inventory_group_audit_status(
+            dominant_classification.as_deref(),
+            self.classifications.len() > 1,
+        );
+        let cleanup_disposition = test_inventory_group_cleanup_disposition(
+            dominant_classification.as_deref(),
+            self.classifications.len() > 1,
+        );
+        json!({
+            "path": self.path,
+            "crate": self.crate_name,
+            "lines": self.lines,
+            "private_heavy": self.private_heavy,
+            "test_count": self.test_count,
+            "private_heavy_test_count": self.private_heavy_test_count,
+            "classifications": self.classifications,
+            "dominant_classification": dominant_classification,
+            "mixed_classification": self.classifications.len() > 1,
+            "audit_status": audit_status,
+            "cleanup_disposition": cleanup_disposition,
+            "recommended_action": test_inventory_group_recommended_action(
+                dominant_classification.as_deref(),
+                self.classifications.len() > 1
+            ),
+            "sample_tests": self.sample_tests,
+        })
+    }
+}
+
+fn dominant_classification(classifications: &BTreeMap<String, usize>) -> Option<String> {
+    classifications
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+        .map(|(classification, _)| classification.clone())
+}
+
+fn test_inventory_group_recommended_action(
+    dominant_classification: Option<&str>,
+    mixed: bool,
+) -> &'static str {
+    match dominant_classification {
+        Some("behavior") if mixed => {
+            "classified mixed behavior group; split by behavior/API-gap before LOC cleanup"
+        }
+        Some("behavior") => "move durable coverage toward public runtime/native/e2e APIs",
+        Some("diagnostic-api-gap") if mixed => {
+            "classified mixed diagnostic group; keep only product-diagnostic-backed coverage"
+        }
+        Some("diagnostic-api-gap") => {
+            "keep only if backed by product diagnostics/reports; avoid test-only debug APIs"
+        }
+        Some("internal-invariant") if mixed => {
+            "classified mixed invariant group; split out behavior or diagnostic tests before pruning"
+        }
+        Some("internal-invariant") => {
+            "keep as compact private unit coverage unless a public behavior test is clearer"
+        }
+        Some("overspecified") if mixed => {
+            "classified mixed overspecified group; extract real behavior then delete private wiring tests"
+        }
+        Some("overspecified") => "delete or replace with smaller public behavior/e2e coverage",
+        Some("obsolete-surface") if mixed => {
+            "classified mixed obsolete-surface group; preserve live behavior only, then delete surface tests"
+        }
+        Some("obsolete-surface") => {
+            "delete in cleanup unless this surface is restored as current product"
+        }
+        _ => "manual audit required",
+    }
+}
+
+fn test_inventory_group_audit_status(
+    dominant_classification: Option<&str>,
+    mixed: bool,
+) -> &'static str {
+    match (dominant_classification, mixed) {
+        (Some(_), true) => "classified-mixed",
+        (Some(_), false) => "classified",
+        (None, _) => "unclassified",
+    }
+}
+
+fn test_inventory_group_cleanup_disposition(
+    dominant_classification: Option<&str>,
+    mixed: bool,
+) -> &'static str {
+    match dominant_classification {
+        Some("behavior") if mixed => "split-then-move-to-public-behavior-coverage",
+        Some("behavior") => "move-to-public-behavior-coverage",
+        Some("diagnostic-api-gap") if mixed => "split-then-replace-with-product-diagnostics",
+        Some("diagnostic-api-gap") => "replace-with-product-diagnostics-or-keep-temporarily",
+        Some("internal-invariant") if mixed => "split-then-keep-compact-invariants",
+        Some("internal-invariant") => "keep-compact-private-invariant",
+        Some("overspecified") if mixed => "split-then-delete-overspecified-coverage",
+        Some("overspecified") => "delete-or-replace-with-public-coverage",
+        Some("obsolete-surface") if mixed => "split-then-delete-obsolete-surface-coverage",
+        Some("obsolete-surface") => "delete-obsolete-surface-coverage",
+        _ => "manual-audit-required",
+    }
+}
+
+fn collect_files_with_extension(
+    root: &Path,
+    extension: &str,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_with_extension(&path, extension, files)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some(extension) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn crate_name_from_path(path: &Path) -> Option<String> {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == "crates" {
+            return components
+                .next()
+                .map(|component| component.as_os_str().to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+fn is_unit_test_inventory_path(path: &str) -> bool {
+    path.contains("/src/tests.rs")
+        || path.contains("/src/tests/")
+        || (path.contains("/src/") && path.contains("_tests/"))
+        || path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.ends_with("_tests.rs"))
+}
+
+fn is_integration_test_inventory_path(path: &str) -> bool {
+    path.contains("/tests/") && !path.contains("/src/tests/")
+}
+
+fn extract_test_inventory_entries(
+    path: &str,
+    crate_name: &str,
+    source: &str,
+) -> Vec<TestInventoryEntry> {
+    let lines = source.lines().collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim() == "#[test]" {
+            let start_line = index + 1;
+            let mut function_line = index + 1;
+            while function_line < lines.len() && !lines[function_line].contains("fn ") {
+                function_line += 1;
+            }
+            if function_line < lines.len() {
+                let name = parse_test_function_name(lines[function_line])
+                    .unwrap_or_else(|| format!("unknown_test_at_line_{start_line}"));
+                let next_test = lines
+                    .iter()
+                    .enumerate()
+                    .skip(function_line + 1)
+                    .find_map(|(line_index, line)| (line.trim() == "#[test]").then_some(line_index))
+                    .unwrap_or(lines.len());
+                let body = lines[index..next_test].join("\n");
+                let (classification, reason) =
+                    classify_test_inventory_entry(crate_name, path, &name, &body);
+                entries.push(TestInventoryEntry {
+                    crate_name: crate_name.to_owned(),
+                    path: path.to_owned(),
+                    name,
+                    classification: classification.to_owned(),
+                    reason: reason.to_owned(),
+                    private_heavy: path.contains("/src/"),
+                    start_line,
+                });
+                index = next_test;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    entries
+}
+
+fn parse_test_function_name(line: &str) -> Option<String> {
+    let start = line.find("fn ")? + 3;
+    let rest = &line[start..];
+    let end = rest
+        .char_indices()
+        .find_map(|(index, ch)| (!(ch == '_' || ch.is_ascii_alphanumeric())).then_some(index))
+        .unwrap_or(rest.len());
+    (!rest[..end].is_empty()).then(|| rest[..end].to_owned())
+}
+
+fn count_inline_test_attrs(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed == "#[test]" || trimmed.starts_with("#[test(")
+        })
+        .count()
+}
+
+fn count_inline_mod_tests(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("mod tests {"))
+        .count()
+}
+
+fn count_cfg_test_attrs(source: &str) -> usize {
+    source
+        .lines()
+        .filter(|line| line.trim_start().starts_with("#[cfg(test)]"))
+        .count()
+}
+
+fn classify_test_inventory_entry(
+    crate_name: &str,
+    path: &str,
+    name: &str,
+    body: &str,
+) -> (&'static str, &'static str) {
+    let haystack = format!(
+        "{} {} {} {}",
+        crate_name.to_ascii_lowercase(),
+        path.to_ascii_lowercase(),
+        name.to_ascii_lowercase(),
+        body.to_ascii_lowercase()
+    );
+    if contains_any(
+        &haystack,
+        &[
+            "boon_3mf",
+            "3mf",
+            "manufacturing",
+            "print",
+            "bracket",
+            "parametric_car",
+            "solid",
+            "mesh",
+            "slice",
+            "world_scene",
+        ],
+    ) {
+        return (
+            "obsolete-surface",
+            "covers 3d/manufacturing/old-surface behavior that should be challenged in cleanup",
+        );
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "report",
+            "proof",
+            "schema",
+            "verifier",
+            "verify_",
+            "telemetry",
+            "evidence",
+            "manifest",
+            "fingerprint",
+            "worktree",
+            "budget",
+            "readback",
+            "gpu",
+            "perf",
+            "metric",
+            "native_dev",
+            "dev_window",
+            "render_graph",
+        ],
+    ) {
+        return (
+            "diagnostic-api-gap",
+            "debug/report/verifier behavior should be reachable through real diagnostics",
+        );
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "counter",
+            "todomvc",
+            "todo_mvc",
+            "cells",
+            "novywave",
+            "click",
+            "select",
+            "input",
+            "toggle",
+            "filter",
+            "launch",
+            "scenario",
+            "source_route",
+            "interaction",
+        ],
+    ) {
+        return (
+            "behavior",
+            "user-visible behavior should move toward public/runtime/native/e2e coverage",
+        );
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "tamper",
+            "forged",
+            "fabricated",
+            "reject",
+            "rejected",
+            "negative",
+            "exact",
+            "golden",
+            "ordering",
+            "hash",
+            "stale",
+            "denylist",
+            "private",
+        ],
+    ) {
+        return (
+            "overspecified",
+            "likely checks implementation shape or negative harness machinery",
+        );
+    }
+    (
+        "internal-invariant",
+        "compact algorithmic or lowering invariant unless a later audit finds public behavior value",
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn test_inventory_e2e_coverage() -> Vec<JsonValue> {
+    [
+        (
+            "counter click updates value",
+            "verify-native-counter-interaction-speed",
+        ),
+        (
+            "TodoMVC add/toggle/filter works",
+            "verify-native-gpu-preview-e2e",
+        ),
+        (
+            "Physical TodoMVC launches and handles core input",
+            "verify-native-todomvc-physical-reference-parity",
+        ),
+        (
+            "Cells click selects exactly one cell and updates formula/value input",
+            "verify-native-cells-visible-click-e2e",
+        ),
+        (
+            "NovyWave core interaction works",
+            "verify-native-gpu-novywave-interaction-speed",
+        ),
+        (
+            "Dev window accepts click and mouse wheel and reports changes",
+            "verify-native-dev-window-editor",
+        ),
+    ]
+    .into_iter()
+    .map(|(requirement, command)| {
+        json!({
+            "requirement": requirement,
+            "xtask_command": command,
+            "command_exists": xtask_command_exists(command),
+        })
+    })
+    .collect()
+}
+
+fn test_inventory_markdown(report: &JsonValue) -> String {
+    let loc = &report["loc"];
+    let moved = &report["moved_tests"];
+    let mut markdown = String::new();
+    markdown.push_str("# Boon Test Inventory\n\n");
+    markdown.push_str("Generated by `cargo xtask audit-test-inventory`.\n\n");
+    markdown.push_str("## LOC\n\n");
+    markdown.push_str(&format!(
+        "- Total Rust lines: {}\n",
+        loc["total_rust_lines"].as_u64().unwrap_or(0)
+    ));
+    markdown.push_str(&format!(
+        "- Production lines: {}\n",
+        loc["production_lines"].as_u64().unwrap_or(0)
+    ));
+    markdown.push_str(&format!(
+        "- Unit-test lines: {}\n",
+        loc["unit_test_lines"].as_u64().unwrap_or(0)
+    ));
+    markdown.push_str(&format!(
+        "- Integration-test lines: {}\n",
+        loc["integration_test_lines"].as_u64().unwrap_or(0)
+    ));
+    markdown.push_str(&format!(
+        "- Scenario e2e lines: {}\n",
+        loc["scenario_e2e_lines"].as_u64().unwrap_or(0)
+    ));
+    markdown.push_str(&format!(
+        "- Test path percent: {:.1}%\n\n",
+        loc["test_path_percent"].as_f64().unwrap_or(0.0)
+    ));
+
+    markdown.push_str("## Classification Counts\n\n");
+    if let Some(classifications) = moved["classifications"].as_object() {
+        for (classification, count) in classifications {
+            markdown.push_str(&format!(
+                "- `{classification}`: {}\n",
+                count.as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    markdown.push('\n');
+
+    markdown.push_str("## Largest Moved Test Files\n\n");
+    if let Some(files) = report["moved_test_files"].as_array() {
+        for file in files.iter().take(20) {
+            markdown.push_str(&format!(
+                "- `{}`: {} lines\n",
+                file["path"].as_str().unwrap_or("unknown"),
+                file["lines"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    markdown.push('\n');
+
+    markdown.push_str("## Private-Heavy Counts By Crate\n\n");
+    if let Some(crates) = report["crate_summaries"].as_array() {
+        for crate_summary in crates {
+            let count = crate_summary["private_heavy_test_count"]
+                .as_u64()
+                .unwrap_or(0);
+            if count > 0 {
+                markdown.push_str(&format!(
+                    "- `{}`: {count}\n",
+                    crate_summary["crate"].as_str().unwrap_or("unknown")
+                ));
+            }
+        }
+    }
+    markdown.push('\n');
+
+    markdown.push_str("## Large Private-Heavy Test Groups\n\n");
+    if let Some(groups) = report["test_groups"]["large_private_heavy_groups"].as_array() {
+        for group in groups.iter().take(30) {
+            markdown.push_str(&format!(
+                "- `{}`: {} lines, {} tests, status `{}`, dominant `{}`, disposition `{}`, action: {}\n",
+                group["path"].as_str().unwrap_or("unknown"),
+                group["lines"].as_u64().unwrap_or(0),
+                group["test_count"].as_u64().unwrap_or(0),
+                group["audit_status"].as_str().unwrap_or("unknown"),
+                group["dominant_classification"]
+                    .as_str()
+                    .unwrap_or("unknown"),
+                group["cleanup_disposition"].as_str().unwrap_or("unknown"),
+                group["recommended_action"]
+                    .as_str()
+                    .unwrap_or("manual audit")
+            ));
+        }
+    }
+    markdown.push('\n');
+
+    markdown.push_str("## Current App E2E Command Coverage\n\n");
+    if let Some(coverage) = report["e2e_coverage"].as_array() {
+        for entry in coverage {
+            markdown.push_str(&format!(
+                "- {}: `{}` exists={}\n",
+                entry["requirement"].as_str().unwrap_or("unknown"),
+                entry["xtask_command"].as_str().unwrap_or("unknown"),
+                entry["command_exists"].as_bool().unwrap_or(false)
+            ));
+        }
+    }
+    markdown.push('\n');
+
+    markdown.push_str("## Remaining Mixed Production Files\n\n");
+    let mixed = &report["remaining_mixed_production_files"];
+    markdown.push_str(&format!(
+        "- Inline `#[test]` attrs in production paths: {}\n",
+        mixed["inline_test_attr_count"].as_u64().unwrap_or(0)
+    ));
+    markdown.push_str(&format!(
+        "- Inline `mod tests {{ ... }}` blocks in production paths: {}\n",
+        mixed["inline_mod_tests_count"].as_u64().unwrap_or(0)
+    ));
+    if let Some(files) = mixed["top_files"].as_array() {
+        for file in files.iter().take(20) {
+            markdown.push_str(&format!(
+                "- `{}`: cfg(test) count {}\n",
+                file["path"].as_str().unwrap_or("unknown"),
+                file["cfg_test_count"].as_u64().unwrap_or(0)
+            ));
+        }
+    }
+    markdown
 }
 
 fn verify_todomvc_negative(_args: &[String]) -> XtaskResult {
@@ -3968,8 +4837,7 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "compiler_owns_machine_plan_backend_source={compiler_owns_machine_plan_backend_source}, facade_delegates_to_plan_backend={facade_delegates_to_plan_backend}, plan_imports_parser_ast={plan_imports_parser_ast}"
         ),
         (!machine_plan_backend_owned_by_compiler).then(|| {
-            "TypedProgram-to-MachinePlan lowering is not fully owned by boon_compiler"
-                .to_owned()
+            "TypedProgram-to-MachinePlan lowering is not fully owned by boon_compiler".to_owned()
         }),
     );
 
@@ -13649,21 +14517,81 @@ macro_rules! unified_architecture_required_report_rows {
 
 fn unified_architecture_required_reports() -> &'static [UnifiedArchitectureRequiredReport] {
     unified_architecture_required_report_rows![
-        ("runtime-change-sets", "target/reports/unified/runtime-change-sets.json", "verify-runtime-change-sets"),
-        ("document-batch-patches", "target/reports/unified/document-batch-patches.json", "verify-document-batch-patches"),
-        ("retained-layout-deltas", "target/reports/unified/retained-layout-deltas.json", "verify-retained-layout-deltas"),
-        ("text-cache-layers", "target/reports/unified/text-cache-layers.json", "verify-text-cache-layers"),
-        ("render-patch-contract", "target/reports/unified/render-patch-contract.json", "verify-render-patch-contract"),
-        ("wgpu-retained-arenas", "target/reports/native-gpu/wgpu-retained-arenas.json", "verify-wgpu-retained-arenas"),
-        ("wgpu-readback", "target/reports/native-gpu/wgpu-readback.json", "verify-wgpu-readback"),
-        ("semantic-scene", "target/reports/unified/semantic-scene.json", "verify-semantic-scene"),
-        ("accessibility-adapters", "target/reports/unified/accessibility-adapters.json", "verify-accessibility-adapters"),
-        ("3d-hello-cube", "target/reports/unified/3d-hello-cube.json", "verify-3d-hello-cube"),
-        ("solid-graph", "target/reports/unified/solid-graph.json", "verify-solid-graph"),
-        ("3d-printable-bracket", "target/reports/unified/3d-printable-bracket.json", "verify-3d-printable-bracket"),
-        ("manufacturing-slices", "target/reports/unified/manufacturing-slices.json", "verify-manufacturing-slices"),
-        ("3mf-export", "target/reports/unified/3mf-export.json", "verify-3mf-export"),
-        ("3d-parametric-car", "target/reports/unified/3d-parametric-car.json", "verify-3d-parametric-car"),
+        (
+            "runtime-change-sets",
+            "target/reports/unified/runtime-change-sets.json",
+            "verify-runtime-change-sets"
+        ),
+        (
+            "document-batch-patches",
+            "target/reports/unified/document-batch-patches.json",
+            "verify-document-batch-patches"
+        ),
+        (
+            "retained-layout-deltas",
+            "target/reports/unified/retained-layout-deltas.json",
+            "verify-retained-layout-deltas"
+        ),
+        (
+            "text-cache-layers",
+            "target/reports/unified/text-cache-layers.json",
+            "verify-text-cache-layers"
+        ),
+        (
+            "render-patch-contract",
+            "target/reports/unified/render-patch-contract.json",
+            "verify-render-patch-contract"
+        ),
+        (
+            "wgpu-retained-arenas",
+            "target/reports/native-gpu/wgpu-retained-arenas.json",
+            "verify-wgpu-retained-arenas"
+        ),
+        (
+            "wgpu-readback",
+            "target/reports/native-gpu/wgpu-readback.json",
+            "verify-wgpu-readback"
+        ),
+        (
+            "semantic-scene",
+            "target/reports/unified/semantic-scene.json",
+            "verify-semantic-scene"
+        ),
+        (
+            "accessibility-adapters",
+            "target/reports/unified/accessibility-adapters.json",
+            "verify-accessibility-adapters"
+        ),
+        (
+            "3d-hello-cube",
+            "target/reports/unified/3d-hello-cube.json",
+            "verify-3d-hello-cube"
+        ),
+        (
+            "solid-graph",
+            "target/reports/unified/solid-graph.json",
+            "verify-solid-graph"
+        ),
+        (
+            "3d-printable-bracket",
+            "target/reports/unified/3d-printable-bracket.json",
+            "verify-3d-printable-bracket"
+        ),
+        (
+            "manufacturing-slices",
+            "target/reports/unified/manufacturing-slices.json",
+            "verify-manufacturing-slices"
+        ),
+        (
+            "3mf-export",
+            "target/reports/unified/3mf-export.json",
+            "verify-3mf-export"
+        ),
+        (
+            "3d-parametric-car",
+            "target/reports/unified/3d-parametric-car.json",
+            "verify-3d-parametric-car"
+        ),
     ]
 }
 
@@ -45316,6 +46244,9 @@ fn verify_native_gpu_novywave_interaction_speed(
     let max_resize_p95_ms =
         native_gpu_budget_f64("novywave_interaction.release", "resize_to_present_ms_p95")
             .unwrap_or(33.4);
+    let phase_watchdog_ms = value_arg(args, "--phase-watchdog-ms")
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
     let entry = boon_runtime::example_manifest_entry("novywave")?;
     let source = boon_runtime::source_text_for_entry(&entry)?;
     let source_files = manifest_source_files(&entry);
@@ -45347,6 +46278,7 @@ fn verify_native_gpu_novywave_interaction_speed(
     let max_p95_ms_arg = max_p95_ms.to_string();
     let max_max_ms_arg = max_max_ms.to_string();
     let max_resize_p95_ms_arg = max_resize_p95_ms.to_string();
+    let phase_watchdog_ms_arg = phase_watchdog_ms.map(|value| value.to_string());
     let role_report_arg = role_report.display().to_string();
     let record_hot_path_profiles = args.iter().any(|arg| arg == "--record-hot-path-profiles");
     let role_run = run_native_role_command(build.success, &binary_path, &role_report, |command| {
@@ -45370,6 +46302,9 @@ fn verify_native_gpu_novywave_interaction_speed(
                 "--report",
                 &role_report_arg,
             ]);
+        if let Some(phase_watchdog_ms_arg) = phase_watchdog_ms_arg.as_deref() {
+            command.args(["--phase-watchdog-ms", phase_watchdog_ms_arg]);
+        }
         if record_hot_path_profiles {
             command.arg("--record-hot-path-profiles");
         }
@@ -45577,7 +46512,8 @@ fn verify_native_gpu_novywave_interaction_speed(
             "profile": "release",
             "source_path": entry.source,
             "scenario_path": entry.scenario,
-            "source_hash": file_hash(&entry.source),
+            "source_hash": source_hash,
+            "source_file_hash": file_hash(&entry.source),
             "source_files_hash": source_hash,
             "scenario_hash": file_hash(&entry.scenario),
             "source_files": source_files,
@@ -45589,6 +46525,7 @@ fn verify_native_gpu_novywave_interaction_speed(
             "max_p95_ms": max_p95_ms,
             "max_max_ms": max_max_ms,
             "max_resize_p95_ms": max_resize_p95_ms,
+            "phase_watchdog_ms": phase_watchdog_ms,
             "input_to_visible_ms_p50_p95_max": input_to_visible,
             "hover_to_overlay_ms_p50_p95_max": hover_to_overlay,
             "click_to_cursor_ms_p50_p95_max": click_to_cursor,
@@ -52931,11 +53868,16 @@ fn sidecarize_native_gate_report(
         .file_stem()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or(command);
-    let sidecar_dir = PathBuf::from("target/artifacts/native-gpu/report-sidecars").join(format!(
-        "{report_stem}-{}-{}",
-        std::process::id(),
-        monotonic_now_ns().unwrap_or_else(|| current_unix_seconds().saturating_mul(1_000_000_000))
-    ));
+    static REPORT_SIDECAR_DIR_NONCE: AtomicU64 = AtomicU64::new(1);
+    let sidecar_nonce = REPORT_SIDECAR_DIR_NONCE.fetch_add(1, Ordering::Relaxed);
+    let sidecar_dir = std::env::current_dir()?
+        .join("target/artifacts/native-gpu/report-sidecars")
+        .join(format!(
+            "{report_stem}-{}-{}-{sidecar_nonce}",
+            std::process::id(),
+            monotonic_now_ns()
+                .unwrap_or_else(|| current_unix_seconds().saturating_mul(1_000_000_000))
+        ));
     fs::create_dir_all(&sidecar_dir)?;
     let mut sidecars = Vec::new();
     let mut unique_sidecars_by_digest = BTreeMap::<String, serde_json::Value>::new();
@@ -55934,64 +56876,354 @@ macro_rules! bytes_machine_plan_required_report_rows {
 
 fn bytes_machine_plan_required_reports() -> &'static [BytesMachinePlanRequiredReport] {
     bytes_machine_plan_required_report_rows![
-        ("phase0-baseline", "target/reports/bytes-plan/phase0-baseline.json", "bytes-plan-phase0-baseline", "diagnostic"),
-        ("bytes-initial-dump-plan", "target/reports/bytes-plan/bytes-initial-dump-plan.json", "dump-plan", "diagnostic"),
-        ("bytes-initial-run-plan", "target/reports/bytes-plan/bytes-initial-run-plan.json", "run-plan", "proof"),
-        ("root-scalar-plan-ops-dump-plan", "target/reports/bytes-plan/root-scalar-plan-ops-dump-plan.json", "dump-plan", "diagnostic"),
-        ("root-scalar-plan-ops-scenario", "target/reports/bytes-plan/root-scalar-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-length-scenario", "target/reports/bytes-plan/bytes-length-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-is-empty-scenario", "target/reports/bytes-plan/bytes-is-empty-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-get-scenario", "target/reports/bytes-plan/bytes-get-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-equal-scenario", "target/reports/bytes-plan/bytes-equal-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-concat-scenario", "target/reports/bytes-plan/bytes-concat-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-concat-chain-scenario", "target/reports/bytes-plan/bytes-concat-chain-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-set-scenario", "target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-same-event-dependency-scenario", "target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-indexed-same-event-dependency-scenario", "target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-text-conversion-scenario", "target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-slice-take-drop-scenario", "target/reports/bytes-plan/bytes-slice-take-drop-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-dynamic-slice-dump-plan", "target/reports/bytes-plan/bytes-dynamic-slice-dump-plan.json", "dump-plan", "diagnostic"),
-        ("bytes-dynamic-slice-scenario", "target/reports/bytes-plan/bytes-dynamic-slice-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-search-scenario", "target/reports/bytes-plan/bytes-search-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-encoding-scenario", "target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-numeric-scenario", "target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-set-conversion-bank-dump-plan", "target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json", "dump-plan", "diagnostic"),
-        ("bytes-set-conversion-bank-scenario", "target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-constant-expr-dump-plan", "target/reports/bytes-plan/bytes-constant-expr-dump-plan.json", "dump-plan", "diagnostic"),
-        ("bytes-constant-expr-scenario", "target/reports/bytes-plan/bytes-constant-expr-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-source-payload-dump-plan", "target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json", "dump-plan", "diagnostic"),
-        ("bytes-source-payload-route", "target/reports/bytes-plan/bytes-source-payload-route-run-plan.json", "run-plan-route", "proof"),
-        ("bytes-source-payload-large-route", "target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json", "run-plan-route", "proof"),
-        ("bytes-source-payload-scenario", "target/reports/bytes-plan/bytes-source-payload-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-indexed-source-payload-dump-plan", "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json", "dump-plan", "diagnostic"),
-        ("bytes-indexed-source-payload-route", "target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json", "run-plan-route", "proof"),
-        ("bytes-indexed-source-payload-scenario", "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-indexed-equal-scenario", "target/reports/bytes-plan/bytes-indexed-equal-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-indexed-search-scenario", "target/reports/bytes-plan/bytes-indexed-search-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-append-row-refresh-dump-plan", "target/reports/bytes-plan/bytes-append-row-refresh-dump-plan.json", "dump-plan", "diagnostic"),
-        ("bytes-append-row-refresh-scenario", "target/reports/bytes-plan/bytes-append-row-refresh-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("bytes-type-system", "target/reports/bytes-plan/bytes-type-system.json", "verify-bytes-type-system", "proof"),
-        ("bytes-default-engine-readiness", "target/reports/bytes-plan/bytes-default-engine-readiness.json", "verify-bytes-default-engine-readiness", "proof"),
-        ("bytes-negative", "target/reports/bytes-plan/bytes-negative.json", "verify-bytes-negative", "proof"),
-        ("bytes-machine-plan-adversarial", "target/reports/bytes-plan/bytes-machine-plan-adversarial.json", "verify-bytes-machine-plan-adversarial", "proof"),
-        ("bytes-file-read-plan", "target/reports/bytes-plan/bytes-file-read-plan.json", "verify-bytes-file-read-plan", "proof"),
-        ("bytes-file-write-plan", "target/reports/bytes-plan/bytes-file-write-plan.json", "verify-bytes-file-write-plan", "proof"),
-        ("bytes-storage-profile", "target/reports/bytes-plan/bytes-storage-profile.json", "verify-bytes-storage-profile", "proof"),
-        ("bytes-fixed-warm-tick", "target/reports/bytes-plan/bytes-fixed-warm-tick.json", "verify-bytes-fixed-warm-tick", "proof"),
-        ("bytes-byte-bank-layout", "target/reports/bytes-plan/bytes-byte-bank-layout.json", "verify-bytes-byte-bank-layout", "proof"),
-        ("build-bytes-boundary", "target/reports/bytes-plan/build-bytes-boundary.json", "verify-build-bytes-boundary", "proof"),
-        ("todomvc-dump-plan", "target/reports/bytes-plan/todomvc-dump-plan.json", "dump-plan", "diagnostic"),
-        ("todomvc-submit", "target/reports/bytes-plan/todomvc-submit-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-toggle", "target/reports/bytes-plan/todomvc-toggle-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-toggle-all", "target/reports/bytes-plan/todomvc-toggle-all-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-dynamic-delete", "target/reports/bytes-plan/todomvc-dynamic-delete-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-clear-completed", "target/reports/bytes-plan/todomvc-clear-completed-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-edit-commit", "target/reports/bytes-plan/todomvc-edit-commit-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-edit-cancel", "target/reports/bytes-plan/todomvc-edit-cancel-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-edit-blur", "target/reports/bytes-plan/todomvc-edit-blur-root-list-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("todomvc-root-scalar", "target/reports/bytes-plan/todomvc-root-scalar-scenario-run-plan.json", "run-plan-root-scalar-scenario", "proof"),
-        ("cells-dump-plan", "target/reports/bytes-plan/cells-dump-plan.json", "dump-plan", "diagnostic"),
-        ("cells-ascii-formula", "target/reports/bytes-plan/cells-ascii-formula-run.json", "run-plan-scenario-events", "proof"),
+        (
+            "phase0-baseline",
+            "target/reports/bytes-plan/phase0-baseline.json",
+            "bytes-plan-phase0-baseline",
+            "diagnostic"
+        ),
+        (
+            "bytes-initial-dump-plan",
+            "target/reports/bytes-plan/bytes-initial-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "bytes-initial-run-plan",
+            "target/reports/bytes-plan/bytes-initial-run-plan.json",
+            "run-plan",
+            "proof"
+        ),
+        (
+            "root-scalar-plan-ops-dump-plan",
+            "target/reports/bytes-plan/root-scalar-plan-ops-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "root-scalar-plan-ops-scenario",
+            "target/reports/bytes-plan/root-scalar-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-length-scenario",
+            "target/reports/bytes-plan/bytes-length-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-is-empty-scenario",
+            "target/reports/bytes-plan/bytes-is-empty-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-get-scenario",
+            "target/reports/bytes-plan/bytes-get-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-equal-scenario",
+            "target/reports/bytes-plan/bytes-equal-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-concat-scenario",
+            "target/reports/bytes-plan/bytes-concat-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-concat-chain-scenario",
+            "target/reports/bytes-plan/bytes-concat-chain-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-set-scenario",
+            "target/reports/bytes-plan/bytes-set-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-same-event-dependency-scenario",
+            "target/reports/bytes-plan/bytes-same-event-dependency-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-indexed-same-event-dependency-scenario",
+            "target/reports/bytes-plan/bytes-indexed-same-event-dependency-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-text-conversion-scenario",
+            "target/reports/bytes-plan/bytes-text-conversion-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-slice-take-drop-scenario",
+            "target/reports/bytes-plan/bytes-slice-take-drop-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-dynamic-slice-dump-plan",
+            "target/reports/bytes-plan/bytes-dynamic-slice-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "bytes-dynamic-slice-scenario",
+            "target/reports/bytes-plan/bytes-dynamic-slice-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-search-scenario",
+            "target/reports/bytes-plan/bytes-search-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-encoding-scenario",
+            "target/reports/bytes-plan/bytes-encoding-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-numeric-scenario",
+            "target/reports/bytes-plan/bytes-numeric-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-set-conversion-bank-dump-plan",
+            "target/reports/bytes-plan/bytes-set-conversion-bank-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "bytes-set-conversion-bank-scenario",
+            "target/reports/bytes-plan/bytes-set-conversion-bank-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-constant-expr-dump-plan",
+            "target/reports/bytes-plan/bytes-constant-expr-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "bytes-constant-expr-scenario",
+            "target/reports/bytes-plan/bytes-constant-expr-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-source-payload-dump-plan",
+            "target/reports/bytes-plan/bytes-source-payload-plan-ops-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "bytes-source-payload-route",
+            "target/reports/bytes-plan/bytes-source-payload-route-run-plan.json",
+            "run-plan-route",
+            "proof"
+        ),
+        (
+            "bytes-source-payload-large-route",
+            "target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json",
+            "run-plan-route",
+            "proof"
+        ),
+        (
+            "bytes-source-payload-scenario",
+            "target/reports/bytes-plan/bytes-source-payload-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-indexed-source-payload-dump-plan",
+            "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "bytes-indexed-source-payload-route",
+            "target/reports/bytes-plan/bytes-indexed-source-payload-route-run-plan.json",
+            "run-plan-route",
+            "proof"
+        ),
+        (
+            "bytes-indexed-source-payload-scenario",
+            "target/reports/bytes-plan/bytes-indexed-source-payload-plan-ops-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-indexed-equal-scenario",
+            "target/reports/bytes-plan/bytes-indexed-equal-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-indexed-search-scenario",
+            "target/reports/bytes-plan/bytes-indexed-search-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-append-row-refresh-dump-plan",
+            "target/reports/bytes-plan/bytes-append-row-refresh-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "bytes-append-row-refresh-scenario",
+            "target/reports/bytes-plan/bytes-append-row-refresh-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "bytes-type-system",
+            "target/reports/bytes-plan/bytes-type-system.json",
+            "verify-bytes-type-system",
+            "proof"
+        ),
+        (
+            "bytes-default-engine-readiness",
+            "target/reports/bytes-plan/bytes-default-engine-readiness.json",
+            "verify-bytes-default-engine-readiness",
+            "proof"
+        ),
+        (
+            "bytes-negative",
+            "target/reports/bytes-plan/bytes-negative.json",
+            "verify-bytes-negative",
+            "proof"
+        ),
+        (
+            "bytes-machine-plan-adversarial",
+            "target/reports/bytes-plan/bytes-machine-plan-adversarial.json",
+            "verify-bytes-machine-plan-adversarial",
+            "proof"
+        ),
+        (
+            "bytes-file-read-plan",
+            "target/reports/bytes-plan/bytes-file-read-plan.json",
+            "verify-bytes-file-read-plan",
+            "proof"
+        ),
+        (
+            "bytes-file-write-plan",
+            "target/reports/bytes-plan/bytes-file-write-plan.json",
+            "verify-bytes-file-write-plan",
+            "proof"
+        ),
+        (
+            "bytes-storage-profile",
+            "target/reports/bytes-plan/bytes-storage-profile.json",
+            "verify-bytes-storage-profile",
+            "proof"
+        ),
+        (
+            "bytes-fixed-warm-tick",
+            "target/reports/bytes-plan/bytes-fixed-warm-tick.json",
+            "verify-bytes-fixed-warm-tick",
+            "proof"
+        ),
+        (
+            "bytes-byte-bank-layout",
+            "target/reports/bytes-plan/bytes-byte-bank-layout.json",
+            "verify-bytes-byte-bank-layout",
+            "proof"
+        ),
+        (
+            "build-bytes-boundary",
+            "target/reports/bytes-plan/build-bytes-boundary.json",
+            "verify-build-bytes-boundary",
+            "proof"
+        ),
+        (
+            "todomvc-dump-plan",
+            "target/reports/bytes-plan/todomvc-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "todomvc-submit",
+            "target/reports/bytes-plan/todomvc-submit-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-toggle",
+            "target/reports/bytes-plan/todomvc-toggle-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-toggle-all",
+            "target/reports/bytes-plan/todomvc-toggle-all-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-dynamic-delete",
+            "target/reports/bytes-plan/todomvc-dynamic-delete-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-clear-completed",
+            "target/reports/bytes-plan/todomvc-clear-completed-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-edit-commit",
+            "target/reports/bytes-plan/todomvc-edit-commit-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-edit-cancel",
+            "target/reports/bytes-plan/todomvc-edit-cancel-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-edit-blur",
+            "target/reports/bytes-plan/todomvc-edit-blur-root-list-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "todomvc-root-scalar",
+            "target/reports/bytes-plan/todomvc-root-scalar-scenario-run-plan.json",
+            "run-plan-root-scalar-scenario",
+            "proof"
+        ),
+        (
+            "cells-dump-plan",
+            "target/reports/bytes-plan/cells-dump-plan.json",
+            "dump-plan",
+            "diagnostic"
+        ),
+        (
+            "cells-ascii-formula",
+            "target/reports/bytes-plan/cells-ascii-formula-run.json",
+            "run-plan-scenario-events",
+            "proof"
+        ),
     ]
 }
 
@@ -62665,19 +63897,71 @@ impl BytesFileWriteFabricatedPlanResult {
 fn bytes_file_write_fabricated_plan_negative_cases() -> Vec<BytesFileWriteFabricatedPlanCase> {
     use BytesFileWriteFabricatedPlanMutation::*;
     bytes_file_write_fabricated_plan_cases![
-        ("fabricated-missing-bytes-operand", "operand-shape", MissingBytesOperand),
-        ("fabricated-extra-path-operand", "operand-shape", ExtraPathOperand),
-        ("fabricated-row-field-path-op-not-indexed", "indexed-row-field-path", RowFieldPathOpNotIndexed),
-        ("fabricated-row-field-path-input-missing", "indexed-row-field-path", RowFieldPathInputMissing),
-        ("fabricated-row-field-path-foreign-list", "indexed-row-field-path", RowFieldPathForeignList),
-        ("fabricated-missing-path-constant", "constant-binding", MissingPathConstant),
-        ("fabricated-non-text-path-constant", "constant-binding", NonTextPathConstant),
-        ("fabricated-non-static-parent-path", "path-policy", NonStaticParentPath),
-        ("fabricated-missing-source-input", "operand-shape", MissingSourceInput),
-        ("fabricated-extra-source-input", "operand-shape", ExtraSourceInput),
-        ("fabricated-source-payload-input-declared", "operand-shape", SourcePayloadInputDeclared),
-        ("fabricated-update-constant-present", "operand-shape", UpdateConstantPresent),
-        ("fabricated-source-payload-field-present", "operand-shape", SourcePayloadFieldPresent),
+        (
+            "fabricated-missing-bytes-operand",
+            "operand-shape",
+            MissingBytesOperand
+        ),
+        (
+            "fabricated-extra-path-operand",
+            "operand-shape",
+            ExtraPathOperand
+        ),
+        (
+            "fabricated-row-field-path-op-not-indexed",
+            "indexed-row-field-path",
+            RowFieldPathOpNotIndexed
+        ),
+        (
+            "fabricated-row-field-path-input-missing",
+            "indexed-row-field-path",
+            RowFieldPathInputMissing
+        ),
+        (
+            "fabricated-row-field-path-foreign-list",
+            "indexed-row-field-path",
+            RowFieldPathForeignList
+        ),
+        (
+            "fabricated-missing-path-constant",
+            "constant-binding",
+            MissingPathConstant
+        ),
+        (
+            "fabricated-non-text-path-constant",
+            "constant-binding",
+            NonTextPathConstant
+        ),
+        (
+            "fabricated-non-static-parent-path",
+            "path-policy",
+            NonStaticParentPath
+        ),
+        (
+            "fabricated-missing-source-input",
+            "operand-shape",
+            MissingSourceInput
+        ),
+        (
+            "fabricated-extra-source-input",
+            "operand-shape",
+            ExtraSourceInput
+        ),
+        (
+            "fabricated-source-payload-input-declared",
+            "operand-shape",
+            SourcePayloadInputDeclared
+        ),
+        (
+            "fabricated-update-constant-present",
+            "operand-shape",
+            UpdateConstantPresent
+        ),
+        (
+            "fabricated-source-payload-field-present",
+            "operand-shape",
+            SourcePayloadFieldPresent
+        ),
         ("fabricated-input-not-bytes", "type-policy", InputNotBytes),
         ("fabricated-output-not-text", "type-policy", OutputNotText),
     ]
@@ -63102,48 +64386,98 @@ fn bytes_file_write_report_negative_cases(
     let mut forged_summary_digest = base.clone();
     forged_summary_digest["file_write_summary"]["sha256"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_write_report_negative_case!(cases, "forged-summary-digest", "file-artifact-binding", forged_summary_digest);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-summary-digest",
+        "file-artifact-binding",
+        forged_summary_digest
+    );
 
     let mut forged_host_effect_digest = base.clone();
     forged_host_effect_digest["plan_executor"]["per_step"][0]["updates"][0]["host_effect"]["sha256"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_write_report_negative_case!(cases, "forged-host-effect-digest", "executor-host-effect-binding", forged_host_effect_digest);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-host-effect-digest",
+        "executor-host-effect-binding",
+        forged_host_effect_digest
+    );
 
     let mut forged_len = base.clone();
     forged_len["file_write_summary"]["byte_len"] = json!(99);
-    push_bytes_file_write_report_negative_case!(cases, "forged-byte-length", "file-artifact-binding", forged_len);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-byte-length",
+        "file-artifact-binding",
+        forged_len
+    );
 
     let mut forged_last_byte = base.clone();
     forged_last_byte["file_write_summary"]["last_byte"] = json!(0);
-    push_bytes_file_write_report_negative_case!(cases, "forged-last-byte", "file-artifact-binding", forged_last_byte);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-last-byte",
+        "file-artifact-binding",
+        forged_last_byte
+    );
 
     let mut inline_payload_leak = base.clone();
     inline_payload_leak["plan_executor"]["per_step"][0]["updates"][0]["host_effect"]["inline_bytes"] =
         json!([222, 173, 190, 239]);
-    push_bytes_file_write_report_negative_case!(cases, "public-inline-bytes-leak", "payload-leak", inline_payload_leak);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "public-inline-bytes-leak",
+        "payload-leak",
+        inline_payload_leak
+    );
 
     let mut expression_kind_downgrade = base.clone();
     expression_kind_downgrade["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
         json!("read_path");
-    push_bytes_file_write_report_negative_case!(cases, "expression-kind-downgrade", "typed-op-binding", expression_kind_downgrade);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "expression-kind-downgrade",
+        "typed-op-binding",
+        expression_kind_downgrade
+    );
 
     let mut missing_update = base.clone();
     missing_update["plan_executor"]["per_step"][0]["updates"] = json!([]);
-    push_bytes_file_write_report_negative_case!(cases, "missing-file-write-update", "executor-shape", missing_update);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "missing-file-write-update",
+        "executor-shape",
+        missing_update
+    );
 
     let mut nonzero_ast = base.clone();
     nonzero_ast["plan_executor"]["runtime_ast_eval_count"] = json!(1);
-    push_bytes_file_write_report_negative_case!(cases, "nonzero-runtime-ast-eval", "fallback-counter", nonzero_ast);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "nonzero-runtime-ast-eval",
+        "fallback-counter",
+        nonzero_ast
+    );
 
     let mut forged_plan_hash = base.clone();
     forged_plan_hash["plan_hash"] =
         json!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-    push_bytes_file_write_report_negative_case!(cases, "forged-plan-hash", "plan-binding", forged_plan_hash);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-plan-hash",
+        "plan-binding",
+        forged_plan_hash
+    );
 
     let mut forged_binary_hash = base.clone();
     forged_binary_hash["binary_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_write_report_negative_case!(cases, "forged-binary-hash", "binary-binding", forged_binary_hash);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-binary-hash",
+        "binary-binding",
+        forged_binary_hash
+    );
 
     let mut missing_live_negative = base.clone();
     missing_live_negative
@@ -63154,12 +64488,22 @@ fn bytes_file_write_report_negative_cases(
         .as_object_mut()
         .expect("report must be object")
         .remove("live_negative_case_count");
-    push_bytes_file_write_report_negative_case!(cases, "missing-live-negative-evidence", "live-negative-evidence", missing_live_negative);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "missing-live-negative-evidence",
+        "live-negative-evidence",
+        missing_live_negative
+    );
 
     let mut forged_live_negative_detail = base.clone();
     forged_live_negative_detail["live_negative_cases"][0]["detail"] =
         json!("PlanExecutor accepted forged live-negative evidence");
-    push_bytes_file_write_report_negative_case!(cases, "forged-live-negative-detail", "live-negative-evidence", forged_live_negative_detail);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-live-negative-detail",
+        "live-negative-evidence",
+        forged_live_negative_detail
+    );
 
     let mut missing_fabricated_plan_negative_evidence = base.clone();
     if let Some(object) = missing_fabricated_plan_negative_evidence.as_object_mut() {
@@ -63177,29 +64521,54 @@ fn bytes_file_write_report_negative_cases(
                 .is_some_and(|id| id.starts_with("fabricated-plan-negative-"))
         });
     }
-    push_bytes_file_write_report_negative_case!(cases, "missing-fabricated-plan-negative-evidence", "fabricated-plan-negative-evidence", missing_fabricated_plan_negative_evidence);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "missing-fabricated-plan-negative-evidence",
+        "fabricated-plan-negative-evidence",
+        missing_fabricated_plan_negative_evidence
+    );
 
     let mut forged_fabricated_plan_negative_hash = base.clone();
     forged_fabricated_plan_negative_hash["fabricated_plan_negative_cases"][0]["mutated_plan_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_write_report_negative_case!(cases, "forged-fabricated-plan-negative-hash", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_hash);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-fabricated-plan-negative-hash",
+        "fabricated-plan-negative-binding",
+        forged_fabricated_plan_negative_hash
+    );
 
     let mut forged_fabricated_plan_negative_check = base.clone();
     forged_fabricated_plan_negative_check["fabricated_plan_negative_cases"][0]["expected_failed_check_ids"] =
         json!(["capability-summary-derived-counts"]);
-    push_bytes_file_write_report_negative_case!(cases, "forged-fabricated-plan-negative-check", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_check);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-fabricated-plan-negative-check",
+        "fabricated-plan-negative-binding",
+        forged_fabricated_plan_negative_check
+    );
 
     let mut forged_fabricated_plan_runtime_executed = base.clone();
     forged_fabricated_plan_runtime_executed["fabricated_plan_negative_cases"][0]["runtime_executed"] =
         json!(true);
-    push_bytes_file_write_report_negative_case!(cases, "forged-fabricated-plan-runtime-executed", "fabricated-plan-negative-boundary", forged_fabricated_plan_runtime_executed);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "forged-fabricated-plan-runtime-executed",
+        "fabricated-plan-negative-boundary",
+        forged_fabricated_plan_runtime_executed
+    );
 
     let mut fabricated_plan_extra_runtime_claim = base.clone();
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["selected_step_ids"] =
         json!(["write-file-bytes"]);
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["plan_executor"] =
         json!({"executor": "fake-runtime-claim"});
-    push_bytes_file_write_report_negative_case!(cases, "fabricated-plan-extra-runtime-claim", "fabricated-plan-negative-boundary", fabricated_plan_extra_runtime_claim);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "fabricated-plan-extra-runtime-claim",
+        "fabricated-plan-negative-boundary",
+        fabricated_plan_extra_runtime_claim
+    );
 
     let mut fabricated_plan_duplicate_case = base.clone();
     if let Some(cases_array) = fabricated_plan_duplicate_case
@@ -63213,7 +64582,12 @@ fn bytes_file_write_report_negative_cases(
         }
         fabricated_plan_duplicate_case["fabricated_plan_negative_cases"] = json!(duplicated);
     }
-    push_bytes_file_write_report_negative_case!(cases, "fabricated-plan-duplicate-case", "fabricated-plan-negative-binding", fabricated_plan_duplicate_case);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "fabricated-plan-duplicate-case",
+        "fabricated-plan-negative-binding",
+        fabricated_plan_duplicate_case
+    );
 
     let mut missing_negative = base.clone();
     missing_negative
@@ -63224,7 +64598,12 @@ fn bytes_file_write_report_negative_cases(
         .as_object_mut()
         .expect("report must be object")
         .remove("negative_case_count");
-    push_bytes_file_write_report_negative_case!(cases, "missing-negative-evidence", "negative-evidence", missing_negative);
+    push_bytes_file_write_report_negative_case!(
+        cases,
+        "missing-negative-evidence",
+        "negative-evidence",
+        missing_negative
+    );
 
     cases
 }
@@ -63761,43 +65140,88 @@ fn bytes_file_read_report_negative_cases(
     let mut forged_summary_digest = base.clone();
     forged_summary_digest["file_read_summary"]["sha256"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_read_report_negative_case!(cases, "forged-summary-digest", "file-artifact-binding", forged_summary_digest);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-summary-digest",
+        "file-artifact-binding",
+        forged_summary_digest
+    );
 
     let mut forged_update_digest = base.clone();
     forged_update_digest["plan_executor"]["per_step"][0]["updates"][0]["value"]["digest"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_read_report_negative_case!(cases, "forged-update-digest", "executor-value-binding", forged_update_digest);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-update-digest",
+        "executor-value-binding",
+        forged_update_digest
+    );
 
     let mut forged_state_digest = base.clone();
     forged_state_digest["state_summary"]["store.file_bytes"]["digest"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_read_report_negative_case!(cases, "forged-state-digest", "state-binding", forged_state_digest);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-state-digest",
+        "state-binding",
+        forged_state_digest
+    );
 
     let mut forged_len = base.clone();
     forged_len["file_read_summary"]["byte_len"] = json!(175);
-    push_bytes_file_read_report_negative_case!(cases, "forged-byte-length", "file-artifact-binding", forged_len);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-byte-length",
+        "file-artifact-binding",
+        forged_len
+    );
 
     let mut forged_first_byte = base.clone();
     forged_first_byte["file_read_summary"]["first_byte"] = json!(61);
-    push_bytes_file_read_report_negative_case!(cases, "forged-first-byte", "file-artifact-binding", forged_first_byte);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-first-byte",
+        "file-artifact-binding",
+        forged_first_byte
+    );
 
     let mut forged_followup_len = base.clone();
     forged_followup_len["state_summary"]["store.file_len"] = json!(175);
-    push_bytes_file_read_report_negative_case!(cases, "forged-followup-bytes-length", "bytes-consumer-binding", forged_followup_len);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-followup-bytes-length",
+        "bytes-consumer-binding",
+        forged_followup_len
+    );
 
     let mut forged_followup_first = base.clone();
     forged_followup_first["state_summary"]["store.first_byte"] = json!(61);
-    push_bytes_file_read_report_negative_case!(cases, "forged-followup-bytes-get", "bytes-consumer-binding", forged_followup_first);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-followup-bytes-get",
+        "bytes-consumer-binding",
+        forged_followup_first
+    );
 
     let mut inline_payload_leak = base.clone();
     inline_payload_leak["plan_executor"]["per_step"][0]["updates"][0]["value"]["inline_bytes"] =
         json!([60, 115, 118, 103]);
-    push_bytes_file_read_report_negative_case!(cases, "public-inline-bytes-leak", "payload-leak", inline_payload_leak);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "public-inline-bytes-leak",
+        "payload-leak",
+        inline_payload_leak
+    );
 
     let mut expression_kind_downgrade = base.clone();
     expression_kind_downgrade["plan_executor"]["per_step"][0]["updates"][0]["expression_kind"] =
         json!("read_path");
-    push_bytes_file_read_report_negative_case!(cases, "expression-kind-downgrade", "typed-op-binding", expression_kind_downgrade);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "expression-kind-downgrade",
+        "typed-op-binding",
+        expression_kind_downgrade
+    );
 
     let mut path_escape = base.clone();
     path_escape["file_read_summary"]["path"] =
@@ -63806,25 +65230,50 @@ fn bytes_file_read_report_negative_cases(
         json!("todo_mvc_physical/assets/icons/checkbox_active.svg");
     path_escape["plan_executor"]["per_step"][0]["updates"][0]["update_constant_value"]["path"] =
         json!("../todo_mvc_physical/assets/icons/checkbox_active.svg");
-    push_bytes_file_read_report_negative_case!(cases, "path-parent-escape", "path-policy", path_escape);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "path-parent-escape",
+        "path-policy",
+        path_escape
+    );
 
     let mut missing_artifact = base.clone();
     missing_artifact["file_read_summary"]["artifact_path"] =
         json!("examples/todo_mvc_physical/assets/icons/missing.svg");
-    push_bytes_file_read_report_negative_case!(cases, "missing-artifact", "artifact-binding", missing_artifact);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "missing-artifact",
+        "artifact-binding",
+        missing_artifact
+    );
 
     let mut missing_file_read_op = base.clone();
     missing_file_read_op["plan_executor"]["per_step"][0]["updates"] = json!([]);
-    push_bytes_file_read_report_negative_case!(cases, "missing-file-read-update", "executor-shape", missing_file_read_op);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "missing-file-read-update",
+        "executor-shape",
+        missing_file_read_op
+    );
 
     let mut nonzero_fallback = base.clone();
     nonzero_fallback["plan_executor"]["runtime_ast_eval_count"] = json!(1);
-    push_bytes_file_read_report_negative_case!(cases, "nonzero-runtime-ast-eval", "fallback-counter", nonzero_fallback);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "nonzero-runtime-ast-eval",
+        "fallback-counter",
+        nonzero_fallback
+    );
 
     let mut forged_plan_hash = base.clone();
     forged_plan_hash["plan_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_read_report_negative_case!(cases, "forged-plan-hash", "plan-binding", forged_plan_hash);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-plan-hash",
+        "plan-binding",
+        forged_plan_hash
+    );
 
     let mut missing_negative_evidence = base.clone();
     if let Some(object) = missing_negative_evidence.as_object_mut() {
@@ -63842,40 +65291,80 @@ fn bytes_file_read_report_negative_cases(
                 .is_some_and(|id| id.starts_with("negative-"))
         });
     }
-    push_bytes_file_read_report_negative_case!(cases, "missing-negative-evidence", "negative-evidence", missing_negative_evidence);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "missing-negative-evidence",
+        "negative-evidence",
+        missing_negative_evidence
+    );
 
     let mut forged_semantic_delta = base.clone();
     forged_semantic_delta["semantic_deltas"][0]["value"]["digest"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_read_report_negative_case!(cases, "forged-semantic-delta-digest", "semantic-delta-binding", forged_semantic_delta);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-semantic-delta-digest",
+        "semantic-delta-binding",
+        forged_semantic_delta
+    );
 
     let mut forged_executor_step_id = base.clone();
     forged_executor_step_id["plan_executor"]["per_step"][0]["step_id"] = json!("wrong-step");
-    push_bytes_file_read_report_negative_case!(cases, "forged-executor-step-id", "executor-trace-binding", forged_executor_step_id);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-executor-step-id",
+        "executor-trace-binding",
+        forged_executor_step_id
+    );
 
     let mut forged_file_read_update_op_id = base.clone();
     forged_file_read_update_op_id["plan_executor"]["per_step"][0]["updates"][0]["update_op_id"] =
         json!(999);
-    push_bytes_file_read_report_negative_case!(cases, "forged-file-read-update-op-id", "executor-trace-binding", forged_file_read_update_op_id);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-file-read-update-op-id",
+        "executor-trace-binding",
+        forged_file_read_update_op_id
+    );
 
     let mut host_root_path_rebind = base.clone();
     host_root_path_rebind["file_read_summary"]["host_root"] = json!("");
     host_root_path_rebind["file_read_summary"]["path"] =
         json!("examples/todo_mvc_physical/assets/icons/checkbox_active.svg");
-    push_bytes_file_read_report_negative_case!(cases, "host-root-path-rebind", "file-artifact-binding", host_root_path_rebind);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "host-root-path-rebind",
+        "file-artifact-binding",
+        host_root_path_rebind
+    );
 
     let mut forged_program_hash = base.clone();
     forged_program_hash["program_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_read_report_negative_case!(cases, "forged-program-hash", "source-binding", forged_program_hash);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-program-hash",
+        "source-binding",
+        forged_program_hash
+    );
 
     let mut forged_graph_node_count = base.clone();
     forged_graph_node_count["graph_node_count"] = json!(999);
-    push_bytes_file_read_report_negative_case!(cases, "forged-graph-node-count", "source-binding", forged_graph_node_count);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-graph-node-count",
+        "source-binding",
+        forged_graph_node_count
+    );
 
     let mut forged_summary_mode = base.clone();
     forged_summary_mode["file_read_summary"]["mode"] = json!("generic-proof");
-    push_bytes_file_read_report_negative_case!(cases, "forged-summary-mode", "file-artifact-binding", forged_summary_mode);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-summary-mode",
+        "file-artifact-binding",
+        forged_summary_mode
+    );
 
     let mut missing_live_negative_evidence = base.clone();
     if let Some(object) = missing_live_negative_evidence.as_object_mut() {
@@ -63893,12 +65382,22 @@ fn bytes_file_read_report_negative_cases(
                 .is_some_and(|id| id.starts_with("live-negative-"))
         });
     }
-    push_bytes_file_read_report_negative_case!(cases, "missing-live-negative-evidence", "live-negative-evidence", missing_live_negative_evidence);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "missing-live-negative-evidence",
+        "live-negative-evidence",
+        missing_live_negative_evidence
+    );
 
     let mut forged_live_negative_expected_error = base.clone();
     forged_live_negative_expected_error["live_negative_cases"][0]["expected_error_contains"] =
         json!("forged expected error");
-    push_bytes_file_read_report_negative_case!(cases, "forged-live-negative-expected-error", "live-negative-binding", forged_live_negative_expected_error);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-live-negative-expected-error",
+        "live-negative-binding",
+        forged_live_negative_expected_error
+    );
 
     let mut forged_live_negative_target_kind = base.clone();
     if let Some(case) = forged_live_negative_target_kind
@@ -63914,7 +65413,12 @@ fn bytes_file_read_report_negative_cases(
     {
         case["target_kind"] = json!("file");
     }
-    push_bytes_file_read_report_negative_case!(cases, "forged-live-negative-target-kind", "live-negative-binding", forged_live_negative_target_kind);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-live-negative-target-kind",
+        "live-negative-binding",
+        forged_live_negative_target_kind
+    );
 
     let mut missing_fabricated_plan_negative_evidence = base.clone();
     if let Some(object) = missing_fabricated_plan_negative_evidence.as_object_mut() {
@@ -63932,29 +65436,54 @@ fn bytes_file_read_report_negative_cases(
                 .is_some_and(|id| id.starts_with("fabricated-plan-negative-"))
         });
     }
-    push_bytes_file_read_report_negative_case!(cases, "missing-fabricated-plan-negative-evidence", "fabricated-plan-negative-evidence", missing_fabricated_plan_negative_evidence);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "missing-fabricated-plan-negative-evidence",
+        "fabricated-plan-negative-evidence",
+        missing_fabricated_plan_negative_evidence
+    );
 
     let mut forged_fabricated_plan_negative_hash = base.clone();
     forged_fabricated_plan_negative_hash["fabricated_plan_negative_cases"][0]["mutated_plan_hash"] =
         json!("0000000000000000000000000000000000000000000000000000000000000000");
-    push_bytes_file_read_report_negative_case!(cases, "forged-fabricated-plan-negative-hash", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_hash);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-fabricated-plan-negative-hash",
+        "fabricated-plan-negative-binding",
+        forged_fabricated_plan_negative_hash
+    );
 
     let mut forged_fabricated_plan_negative_check = base.clone();
     forged_fabricated_plan_negative_check["fabricated_plan_negative_cases"][0]["expected_failed_check_ids"] =
         json!(["capability-summary-derived-counts"]);
-    push_bytes_file_read_report_negative_case!(cases, "forged-fabricated-plan-negative-check", "fabricated-plan-negative-binding", forged_fabricated_plan_negative_check);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-fabricated-plan-negative-check",
+        "fabricated-plan-negative-binding",
+        forged_fabricated_plan_negative_check
+    );
 
     let mut forged_fabricated_plan_runtime_executed = base.clone();
     forged_fabricated_plan_runtime_executed["fabricated_plan_negative_cases"][0]["runtime_executed"] =
         json!(true);
-    push_bytes_file_read_report_negative_case!(cases, "forged-fabricated-plan-runtime-executed", "fabricated-plan-negative-boundary", forged_fabricated_plan_runtime_executed);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "forged-fabricated-plan-runtime-executed",
+        "fabricated-plan-negative-boundary",
+        forged_fabricated_plan_runtime_executed
+    );
 
     let mut fabricated_plan_extra_runtime_claim = base.clone();
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["selected_step_ids"] =
         json!(["load"]);
     fabricated_plan_extra_runtime_claim["fabricated_plan_negative_cases"][0]["plan_executor"] =
         json!({"executor": "fake-runtime-claim"});
-    push_bytes_file_read_report_negative_case!(cases, "fabricated-plan-extra-runtime-claim", "fabricated-plan-negative-boundary", fabricated_plan_extra_runtime_claim);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "fabricated-plan-extra-runtime-claim",
+        "fabricated-plan-negative-boundary",
+        fabricated_plan_extra_runtime_claim
+    );
 
     let mut fabricated_plan_duplicate_case = base.clone();
     if let Some(cases_array) = fabricated_plan_duplicate_case
@@ -63968,7 +65497,12 @@ fn bytes_file_read_report_negative_cases(
         }
         fabricated_plan_duplicate_case["fabricated_plan_negative_cases"] = json!(duplicated);
     }
-    push_bytes_file_read_report_negative_case!(cases, "fabricated-plan-duplicate-case", "fabricated-plan-negative-binding", fabricated_plan_duplicate_case);
+    push_bytes_file_read_report_negative_case!(
+        cases,
+        "fabricated-plan-duplicate-case",
+        "fabricated-plan-negative-binding",
+        fabricated_plan_duplicate_case
+    );
 
     cases
 }
@@ -64054,20 +65588,76 @@ impl BytesFileReadFabricatedPlanResult {
 fn bytes_file_read_fabricated_plan_negative_cases() -> Vec<BytesFileReadFabricatedPlanCase> {
     use BytesFileReadFabricatedPlanMutation::*;
     bytes_file_read_fabricated_plan_cases![
-        ("fabricated-missing-path-operand", "operand-shape", MissingPathOperand),
-        ("fabricated-extra-path-operand", "operand-shape", ExtraPathOperand),
-        ("fabricated-row-field-path-op-not-indexed", "indexed-row-field-path", RowFieldPathOpNotIndexed),
-        ("fabricated-row-field-path-input-missing", "indexed-row-field-path", RowFieldPathInputMissing),
-        ("fabricated-row-field-path-foreign-list", "indexed-row-field-path", RowFieldPathForeignList),
-        ("fabricated-missing-path-constant", "constant-binding", MissingPathConstant),
-        ("fabricated-non-text-path-constant", "constant-binding", NonTextPathConstant),
-        ("fabricated-non-static-parent-path", "path-policy", NonStaticParentPath),
-        ("fabricated-missing-source-input", "operand-shape", MissingSourceInput),
-        ("fabricated-extra-source-input", "operand-shape", ExtraSourceInput),
-        ("fabricated-state-input-declared", "operand-shape", StateInputDeclared),
-        ("fabricated-source-payload-input-declared", "operand-shape", SourcePayloadInputDeclared),
-        ("fabricated-update-constant-present", "operand-shape", UpdateConstantPresent),
-        ("fabricated-source-payload-field-present", "operand-shape", SourcePayloadFieldPresent),
+        (
+            "fabricated-missing-path-operand",
+            "operand-shape",
+            MissingPathOperand
+        ),
+        (
+            "fabricated-extra-path-operand",
+            "operand-shape",
+            ExtraPathOperand
+        ),
+        (
+            "fabricated-row-field-path-op-not-indexed",
+            "indexed-row-field-path",
+            RowFieldPathOpNotIndexed
+        ),
+        (
+            "fabricated-row-field-path-input-missing",
+            "indexed-row-field-path",
+            RowFieldPathInputMissing
+        ),
+        (
+            "fabricated-row-field-path-foreign-list",
+            "indexed-row-field-path",
+            RowFieldPathForeignList
+        ),
+        (
+            "fabricated-missing-path-constant",
+            "constant-binding",
+            MissingPathConstant
+        ),
+        (
+            "fabricated-non-text-path-constant",
+            "constant-binding",
+            NonTextPathConstant
+        ),
+        (
+            "fabricated-non-static-parent-path",
+            "path-policy",
+            NonStaticParentPath
+        ),
+        (
+            "fabricated-missing-source-input",
+            "operand-shape",
+            MissingSourceInput
+        ),
+        (
+            "fabricated-extra-source-input",
+            "operand-shape",
+            ExtraSourceInput
+        ),
+        (
+            "fabricated-state-input-declared",
+            "operand-shape",
+            StateInputDeclared
+        ),
+        (
+            "fabricated-source-payload-input-declared",
+            "operand-shape",
+            SourcePayloadInputDeclared
+        ),
+        (
+            "fabricated-update-constant-present",
+            "operand-shape",
+            UpdateConstantPresent
+        ),
+        (
+            "fabricated-source-payload-field-present",
+            "operand-shape",
+            SourcePayloadFieldPresent
+        ),
         ("fabricated-output-not-bytes", "type-policy", OutputNotBytes),
     ]
 }
@@ -66297,18 +67887,66 @@ enum BytesMachinePlanAggregateMutation {
 
 fn bytes_machine_plan_aggregate_tamper_cases() -> Vec<BytesMachinePlanAggregateTamperCase> {
     bytes_machine_plan_aggregate_tamper_cases![
-        ("aggregate-missing-child-report-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", RemoveChild),
-        ("aggregate-stale-child-artifact-hash-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", StaleArtifactHash),
-        ("aggregate-edited-child-success-flag-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", EditedSuccessFlag),
-        ("aggregate-runtime-ast-fallback-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", RuntimeAstEval),
-        ("aggregate-executable-string-path-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", ExecutableStringPath),
-        ("aggregate-unknown-plan-op-rejected", "target/reports/bytes-plan/bytes-file-read-plan.json", UnknownPlanOp),
-        ("aggregate-storage-profile-indexed-private-bytes-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileIndexedPrivateBytesTamper),
-        ("aggregate-storage-profile-large-dynamic-state-summary-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicStateSummaryTamper),
-        ("aggregate-storage-profile-large-dynamic-shared-storage-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicSharedStorageTamper),
-        ("aggregate-storage-profile-large-dynamic-byte-len-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicByteLenTamper),
-        ("aggregate-storage-profile-large-dynamic-host-digest-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicHostDigestTamper),
-        ("aggregate-storage-profile-large-dynamic-bytes-access-len-tamper-rejected", "target/reports/bytes-plan/bytes-storage-profile.json", StorageProfileLargeDynamicBytesAccessLenTamper),
+        (
+            "aggregate-missing-child-report-rejected",
+            "target/reports/bytes-plan/bytes-file-read-plan.json",
+            RemoveChild
+        ),
+        (
+            "aggregate-stale-child-artifact-hash-rejected",
+            "target/reports/bytes-plan/bytes-file-read-plan.json",
+            StaleArtifactHash
+        ),
+        (
+            "aggregate-edited-child-success-flag-rejected",
+            "target/reports/bytes-plan/bytes-file-read-plan.json",
+            EditedSuccessFlag
+        ),
+        (
+            "aggregate-runtime-ast-fallback-rejected",
+            "target/reports/bytes-plan/bytes-file-read-plan.json",
+            RuntimeAstEval
+        ),
+        (
+            "aggregate-executable-string-path-rejected",
+            "target/reports/bytes-plan/bytes-file-read-plan.json",
+            ExecutableStringPath
+        ),
+        (
+            "aggregate-unknown-plan-op-rejected",
+            "target/reports/bytes-plan/bytes-file-read-plan.json",
+            UnknownPlanOp
+        ),
+        (
+            "aggregate-storage-profile-indexed-private-bytes-tamper-rejected",
+            "target/reports/bytes-plan/bytes-storage-profile.json",
+            StorageProfileIndexedPrivateBytesTamper
+        ),
+        (
+            "aggregate-storage-profile-large-dynamic-state-summary-tamper-rejected",
+            "target/reports/bytes-plan/bytes-storage-profile.json",
+            StorageProfileLargeDynamicStateSummaryTamper
+        ),
+        (
+            "aggregate-storage-profile-large-dynamic-shared-storage-tamper-rejected",
+            "target/reports/bytes-plan/bytes-storage-profile.json",
+            StorageProfileLargeDynamicSharedStorageTamper
+        ),
+        (
+            "aggregate-storage-profile-large-dynamic-byte-len-tamper-rejected",
+            "target/reports/bytes-plan/bytes-storage-profile.json",
+            StorageProfileLargeDynamicByteLenTamper
+        ),
+        (
+            "aggregate-storage-profile-large-dynamic-host-digest-tamper-rejected",
+            "target/reports/bytes-plan/bytes-storage-profile.json",
+            StorageProfileLargeDynamicHostDigestTamper
+        ),
+        (
+            "aggregate-storage-profile-large-dynamic-bytes-access-len-tamper-rejected",
+            "target/reports/bytes-plan/bytes-storage-profile.json",
+            StorageProfileLargeDynamicBytesAccessLenTamper
+        ),
     ]
 }
 
@@ -66601,14 +68239,29 @@ fn bytes_source_payload_report_negative_cases(
         json!("Text");
 
     vec![
-        bytes_report_negative_case!("source-payload-missing-bytes-artifact", missing_payload_bytes),
+        bytes_report_negative_case!(
+            "source-payload-missing-bytes-artifact",
+            missing_payload_bytes
+        ),
         bytes_report_negative_case!("source-payload-forged-digest", forged_payload_digest),
         bytes_report_negative_case!("source-payload-forged-byte-len", forged_payload_len),
         bytes_report_negative_case!("source-payload-missing-inline-bytes", missing_inline_bytes),
-        bytes_report_negative_case!("source-payload-inline-byte-out-of-range", out_of_range_inline_byte),
-        bytes_report_negative_case!("source-payload-forged-route-field", forged_route_surface_payload_field),
-        bytes_report_negative_case!("source-payload-forged-executor-field", forged_executor_payload_field),
-        bytes_report_negative_case!("source-payload-forged-update-field", forged_update_payload_field),
+        bytes_report_negative_case!(
+            "source-payload-inline-byte-out-of-range",
+            out_of_range_inline_byte
+        ),
+        bytes_report_negative_case!(
+            "source-payload-forged-route-field",
+            forged_route_surface_payload_field
+        ),
+        bytes_report_negative_case!(
+            "source-payload-forged-executor-field",
+            forged_executor_payload_field
+        ),
+        bytes_report_negative_case!(
+            "source-payload-forged-update-field",
+            forged_update_payload_field
+        ),
     ]
 }
 
@@ -66637,10 +68290,19 @@ fn bytes_large_source_payload_report_negative_cases(
     artifact_inline_leak["source_event"]["payload_bytes"]["bytes"]["inline_bytes"] = json!([1]);
 
     vec![
-        bytes_report_negative_case!("source-payload-large-missing-artifact-listing", missing_artifact_listing),
-        bytes_report_negative_case!("source-payload-large-forged-artifact-sha256", forged_artifact_sha256),
+        bytes_report_negative_case!(
+            "source-payload-large-missing-artifact-listing",
+            missing_artifact_listing
+        ),
+        bytes_report_negative_case!(
+            "source-payload-large-forged-artifact-sha256",
+            forged_artifact_sha256
+        ),
         bytes_report_negative_case!("source-payload-large-inline-over-limit", inline_over_limit),
-        bytes_report_negative_case!("source-payload-large-artifact-inline-leak", artifact_inline_leak),
+        bytes_report_negative_case!(
+            "source-payload-large-artifact-inline-leak",
+            artifact_inline_leak
+        ),
     ]
 }
 
@@ -69236,6639 +70898,15 @@ fn source_hash_for_report_source_files(
     if source_files.len() == 1 {
         return Ok(boon_runtime::sha256_file(Path::new(&source_files[0]))?);
     }
-    Ok(boon_runtime::source_units_hash(
-        &source_files
-            .iter()
-            .map(|path| {
-                Ok(boon_runtime::RuntimeSourceUnit {
-                    path: path.clone(),
-                    source: std::fs::read_to_string(path)?,
-                })
-            })
-            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
-    ))
+    let mut canonical = Vec::new();
+    for path in source_files {
+        canonical.extend_from_slice(path.as_bytes());
+        canonical.push(0);
+        canonical.extend_from_slice(&std::fs::read(path)?);
+        canonical.push(0xff);
+    }
+    Ok(boon_runtime::sha256_bytes(&canonical))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn advertised_xtask_commands_are_unique() {
-        let mut seen = BTreeSet::new();
-        for command in XTASK_COMMANDS {
-            assert!(
-                seen.insert(command.0),
-                "duplicate xtask command `{}`",
-                command.0
-            );
-        }
-    }
-
-    #[test]
-    fn cells_visible_click_retained_update_contract_rejects_address_selection_fallback() {
-        let sample = json!({
-            "index": 0,
-            "interaction_timing": {
-                "layout_source": "visible_state_sync",
-                "summary_source": "retained_current",
-                "render_patch_count": 1,
-                "coalesced_render_patch_count": 0,
-                "document_patch_fast_path_rejected": false,
-                "layout_patch_profile": {
-                    "render_scene_patch_applied": true
-                }
-            },
-            "present_probe": {
-                "last_external_render_proof": {
-                    "render_scene_patch_source": "input-overlay-sidecar",
-                    "retained_bound_sync": {
-                        "status": "pass",
-                        "selection_overlay_source": "generic-selected-node-set",
-                        "address_selection_fallback_count": 0
-                    }
-                }
-            }
-        });
-        let pass_probe = json!({
-            "click_samples": [sample.clone()]
-        });
-        let pass_summary = cells_visible_click_retained_update_contract_summary(&pass_probe);
-        assert_eq!(
-            pass_summary
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            pass_summary
-                .get("address_selection_fallback_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-
-        let mut address_fallback_sample = sample;
-        address_fallback_sample["present_probe"]["last_external_render_proof"]["retained_bound_sync"]
-            ["selection_overlay_source"] = json!("address-source-intent");
-        address_fallback_sample["present_probe"]["last_external_render_proof"]["retained_bound_sync"]
-            ["address_selection_fallback_count"] = json!(1);
-        let fail_probe = json!({
-            "click_samples": [address_fallback_sample]
-        });
-        let fail_summary = cells_visible_click_retained_update_contract_summary(&fail_probe);
-        assert_eq!(
-            fail_summary
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        assert_eq!(
-            fail_summary
-                .get("address_selection_fallback_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            fail_summary
-                .pointer("/sample_failures/0/reason")
-                .and_then(serde_json::Value::as_str),
-            Some("address_selection_fallback_used")
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_contracts_accept_deferred_product_patch_visual_proof() {
-        let probe = json!({
-            "click_samples": [
-                {
-                    "index": 0,
-                    "target_address": "A2",
-                    "product_formula_state_current": true,
-                    "native_input_timing": {
-                        "fast_path": "simple_source_click_deferred_runtime",
-                        "live_events_ms": 0.0,
-                        "runtime_work": {
-                            "runtime_invoked": false,
-                            "source": "deferred_runtime_not_invoked",
-                            "rows_scanned": 0,
-                            "list_find_rows_scanned": 0,
-                            "summary_fields_scanned": 0,
-                            "root_materialization_candidates": 0,
-                            "recomputed_fields": 0
-                        }
-                    },
-                    "visual_formula_probe": {
-                        "retained_bound_sync": {
-                            "status": "pass",
-                            "changed": true,
-                            "target_node_count": 3,
-                            "text_update_count": 1,
-                            "style_update_count": 2,
-                            "selection_overlay_source": "generic-selected-node-set",
-                            "address_selection_fallback_count": 0
-                        }
-                    }
-                }
-            ]
-        });
-
-        let retained_summary = cells_visible_click_retained_update_contract_summary(&probe);
-        assert_eq!(
-            retained_summary
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            retained_summary
-                .get("deferred_retained_input_patch_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-
-        let runtime_summary = cells_visible_click_runtime_work_contract_summary(&probe);
-        assert_eq!(
-            runtime_summary
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            runtime_summary
-                .pointer("/runtime_work_source_counts/deferred_runtime_not_invoked")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_requires_live_probe_post_present_proof_isolation() {
-        let sidecar_only = json!({
-            "post_present_proof_isolation": {
-                "status": "pass",
-                "product_path_status": "pass",
-                "proof_worker_status": "lagging",
-                "product_latency_includes_proof_completion": false,
-                "product_blocks_on_proof_subscribers": false,
-                "proof_latency_reported_separately": true
-            }
-        });
-        let promoted = cells_visible_click_post_present_proof_isolation(&json!({}));
-
-        assert!(promoted.is_null());
-        assert_eq!(
-            sidecar_only
-                .pointer("/post_present_proof_isolation/proof_worker_status")
-                .and_then(serde_json::Value::as_str),
-            Some("lagging")
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_keeps_live_probe_post_present_proof_isolation() {
-        let live_probe = json!({
-            "post_present_proof_isolation": {
-                "status": "pass",
-                "product_path_status": "pass",
-                "proof_worker_status": "settled",
-                "product_latency_includes_proof_completion": false,
-                "product_blocks_on_proof_subscribers": false,
-                "proof_latency_reported_separately": true
-            }
-        });
-        let promoted = cells_visible_click_post_present_proof_isolation(&live_probe);
-
-        assert_eq!(
-            promoted
-                .get("proof_worker_status")
-                .and_then(serde_json::Value::as_str),
-            Some("settled")
-        );
-    }
-
-    fn cells_visible_click_test_post_present_isolation() -> serde_json::Value {
-        json!({
-            "status": "pass",
-            "product_path_status": "pass",
-            "proof_worker_status": "lagging",
-            "product_latency_includes_proof_completion": false,
-            "product_blocks_on_proof_subscribers": false,
-            "proof_latency_reported_separately": true,
-            "proof_completion_required_for_product_present": false,
-            "report_write_in_hot_path": false,
-            "report_serialization_in_hot_path": false,
-            "pre_present_request_count": 0,
-            "hot_path_report_write_count": 0,
-            "hot_path_report_serialization_count": 0,
-            "subscriber_error_count": 0,
-            "worker_error_count": 0,
-            "queued_request_count": 2,
-            "recent_queue_count": 4
-        })
-    }
-
-    fn cells_visible_click_test_hardware_adapter() -> serde_json::Value {
-        json!({
-            "adapter_name": "test-gpu",
-            "adapter_backend": "Vulkan",
-            "adapter_device": 1,
-            "adapter_vendor": 2,
-            "adapter_device_type": "DiscreteGpu",
-            "adapter_is_software": false
-        })
-    }
-
-    fn cells_visible_click_test_software_adapter() -> serde_json::Value {
-        json!({
-            "adapter_name": "llvmpipe",
-            "adapter_backend": "Vulkan",
-            "adapter_device": 0,
-            "adapter_vendor": 0,
-            "adapter_device_type": "Cpu",
-            "adapter_is_software": true
-        })
-    }
-
-    fn cells_visible_click_test_product_patch() -> serde_json::Value {
-        json!({
-            "schema_version": 1,
-            "status": "pass",
-            "owner": "preview_active_scene",
-            "patch_kind": "direct_input_overlay_render_scene_patch",
-            "source": "retained_bound_sync",
-            "active_scene_identity": "active-preview-scene:test",
-            "route_identity": "route:test",
-            "touched_node_count": 3,
-            "touched_node_samples": ["input-alpha", "choice-alpha", "choice-beta"],
-            "retained_text_update_count": 1,
-            "retained_style_update_count": 2,
-            "hover_node_count": 0,
-            "focus_node_count": 1,
-            "direct_render_scene_patch": true,
-            "full_scene_build_before_present": false,
-            "proof_json_required": false,
-            "latest_report_required": false
-        })
-    }
-
-    fn cells_visible_click_test_product_render_graph() -> serde_json::Value {
-        json!({
-            "schema_version": 1,
-            "status": "pass",
-            "owner": "preview_active_scene",
-            "graph_kind": "product_render_graph",
-            "renderer_graph_kind": "boon_native_gpu_product_frame_graph",
-            "renderer_graph_execution_kind": "retained_product_frame_graph_linear_v1",
-            "renderer_graph_plan_hash": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-            "renderer_graph_pass_count": 5,
-            "renderer_graph_product_pass_count": 4,
-            "renderer_graph_proof_pass_count": 0,
-            "renderer_graph_resource_count": 7,
-            "renderer_graph_product_resource_count": 6,
-            "renderer_graph_resource_lifetime_hash": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "renderer_graph_retained_resource_epoch_hash": "23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
-            "renderer_graph_retained_state_resource_count": 7,
-            "renderer_graph_retained_dirty_resource_count": 2,
-            "renderer_graph_retained_reused_resource_count": 5,
-            "renderer_graph_scheduler_kind": "renderer_owned_product_frame_schedule_v1",
-            "renderer_graph_schedule_hash": "3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012",
-            "renderer_graph_schedule_decision_count": 7,
-            "renderer_graph_dirty_resource_decision_count": 2,
-            "renderer_graph_reuse_resource_decision_count": 3,
-            "renderer_graph_per_present_resource_decision_count": 2,
-            "active_scene_identity": "active-preview-scene:test",
-            "render_scene_identity": "render-scene:test",
-            "pass_count": 5,
-            "product_pass_count": 4,
-            "proof_pass_count": 0,
-            "dirty_chunk_count": 3,
-            "upload_bytes": 128,
-            "encode_time_ms": 0.7,
-            "cache_hit": false,
-            "proof_readback_in_product_graph": false,
-            "stale_epoch_rejection_count": 0,
-            "plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "passes": [
-                {
-                    "schema_version": 1,
-                    "pass_id": "native-gpu:renderer-scene-key",
-                    "pass_kind": "scene_identity",
-                    "source": "RenderScene",
-                    "target": "SceneCacheKey",
-                    "product_visible": true,
-                    "proof_or_readback": false
-                },
-                {
-                    "schema_version": 1,
-                    "pass_id": "native-gpu:renderer-quad-prepare-upload",
-                    "pass_kind": "retained_quad_prepare_and_dirty_upload",
-                    "source": "RenderSceneItems",
-                    "target": "RetainedGpuBuffers",
-                    "product_visible": true,
-                    "proof_or_readback": false
-                },
-                {
-                    "schema_version": 1,
-                    "pass_id": "native-gpu:renderer-ui-draw",
-                    "pass_kind": "ui_draw_pass",
-                    "source": "RetainedGpuBuffers",
-                    "target": "ColorTarget",
-                    "product_visible": true,
-                    "proof_or_readback": false
-                },
-                {
-                    "schema_version": 1,
-                    "pass_id": "native-gpu:renderer-retained-metrics",
-                    "pass_kind": "retained_metrics",
-                    "source": "RenderScene",
-                    "target": "FrameMetrics",
-                    "product_visible": false,
-                    "proof_or_readback": false
-                },
-                {
-                    "schema_version": 1,
-                    "pass_id": "native-gpu:renderer-text-draw",
-                    "pass_kind": "text_draw_pass",
-                    "source": "TextRuns",
-                    "target": "ColorTarget",
-                    "product_visible": true,
-                    "proof_or_readback": false
-                }
-            ]
-        })
-    }
-
-    fn cells_visible_click_test_present_plan() -> serde_json::Value {
-        json!({
-            "schema_version": 1,
-            "status": "pass",
-            "owner": "preview_active_scene",
-            "plan_kind": "product_present_plan",
-            "render_target_kind": "visible-surface-direct",
-            "pass_count": 5,
-            "product_pass_count": 4,
-            "proof_pass_count": 0,
-            "proof_readback_in_product_passes": false,
-            "plan_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        })
-    }
-
-    #[test]
-    fn cells_visible_click_product_commit_currentness_does_not_require_readback_proof() {
-        let frame_key = json!({
-            "frame_seq": 12,
-            "present_id": 12,
-            "input_event_seq": 9,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 7,
-            "layout_revision": 2,
-            "render_scene_revision": 5
-        });
-        let product_commit = json!({
-            "frame_lane": "product_interaction",
-            "input_to_present_ms": 8.0,
-            "frame_evidence_key": frame_key,
-            "product_frame": {
-                "product_patch": cells_visible_click_test_product_patch()
-            },
-            "render_graph": cells_visible_click_test_product_render_graph(),
-            "present_plan": cells_visible_click_test_present_plan()
-        });
-        let product_match = json!({
-            "status": "pass",
-            "match_method": "exact_product_commit",
-            "product_frame_commit": product_commit
-        });
-
-        assert!(cells_visible_click_product_commit_proves_visible_update(
-            &product_match,
-            product_match
-                .get("product_frame_commit")
-                .expect("test product commit"),
-            8.0,
-        ));
-        assert!(
-            cells_visible_click_product_present_probe_proves_visible_update(&json!({
-                "status": "pass",
-                "input_accept_to_present_ms": 8.0,
-                "product_frame_commit": product_match["product_frame_commit"].clone(),
-                "readback_probe": {
-                    "status": "proof-pending"
-                }
-            }))
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_lane_contracts_accept_split_product_and_proof_paths() {
-        let product_frames = json!({
-            "status": "pass",
-            "source": "app_window_product_frame_commits",
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
-            "adapter_status": "hardware",
-            "product_frame_sample_count": 16,
-            "exact_product_commit_match_count": 16,
-            "typed_product_patch_count": 16,
-            "typed_product_result_count": 16,
-            "product_render_graph_count": 16,
-            "product_render_graph_renderer_owned_count": 16,
-            "present_plan_count": 16,
-            "product_result_missing_count": 0,
-            "product_patch_full_scene_build_count": 0,
-            "product_patch_proof_json_required_count": 0,
-            "product_patch_latest_report_required_count": 0,
-            "product_render_graph_missing_count": 0,
-            "product_render_graph_renderer_owned_missing_count": 0,
-            "present_plan_missing_count": 0,
-            "product_render_graph_proof_readback_count": 0,
-            "present_plan_proof_readback_in_product_pass_count": 0,
-            "hard_failure_count": 0,
-            "input_to_present_ms": {
-                "p95": 12.0,
-                "max": 20.0
-            },
-            "input_to_formula_visible_ms": {
-                "p95": 11.0,
-                "max": 19.0
-            }
-        });
-        let runtime = json!({"status": "pass"});
-        let retained = json!({"status": "pass"});
-        let isolation = cells_visible_click_test_post_present_isolation();
-        let product_contract = cells_visible_click_product_only_ux_contract(
-            &product_frames,
-            &runtime,
-            &retained,
-            &isolation,
-            true,
-            "demand_driven",
-            16.7,
-            33.4,
-        );
-        assert_eq!(
-            product_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-
-        let probe = json!({
-            "visual_capture_method": "app-owned-wgpu-readback",
-            "readback_ok": true,
-            "proof_current_changed": true,
-            "click_samples": [
-                {
-                    "index": 0,
-                    "visual_proof_proves_presented_frame": true,
-                    "proof_current_changed": true,
-                    "product_frame_evidence_key": {
-                        "frame_seq": 10,
-                        "input_event_seq": 7
-                    },
-                    "proof_frame_evidence_key": {
-                        "frame_seq": 11,
-                        "input_event_seq": 7
-                    }
-                }
-            ]
-        });
-        let proof_contract = cells_visible_click_proof_only_contract(&probe, 3);
-        assert_eq!(
-            proof_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-
-        let isolation_contract = cells_visible_click_proof_isolation_contract(&isolation);
-        assert_eq!(
-            isolation_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_lane_contracts_reject_proof_coupling_and_missing_proof() {
-        let product_frames = json!({
-            "status": "pass",
-            "source": "app_window_product_frame_commits",
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
-            "adapter_status": "hardware",
-            "product_frame_sample_count": 16,
-            "exact_product_commit_match_count": 16,
-            "typed_product_patch_count": 16,
-            "typed_product_result_count": 16,
-            "product_result_missing_count": 0,
-            "product_patch_full_scene_build_count": 0,
-            "product_patch_proof_json_required_count": 0,
-            "product_patch_latest_report_required_count": 0,
-            "hard_failure_count": 0,
-            "input_to_present_ms": {
-                "p95": 12.0,
-                "max": 20.0
-            },
-            "input_to_formula_visible_ms": {
-                "p95": 11.0,
-                "max": 19.0
-            }
-        });
-        let runtime = json!({"status": "pass"});
-        let retained = json!({"status": "pass"});
-        let mut isolation = cells_visible_click_test_post_present_isolation();
-        isolation["product_latency_includes_proof_completion"] = json!(true);
-        let product_contract = cells_visible_click_product_only_ux_contract(
-            &product_frames,
-            &runtime,
-            &retained,
-            &isolation,
-            true,
-            "demand_driven",
-            16.7,
-            33.4,
-        );
-        assert_eq!(
-            product_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-
-        let proof_contract = cells_visible_click_proof_only_contract(
-            &json!({
-                "visual_capture_method": "app-owned-wgpu-readback",
-                "readback_ok": true,
-                "proof_current_changed": true,
-                "click_samples": [{
-                    "index": 0,
-                    "visual_proof_proves_presented_frame": false,
-                    "proof_current_changed": true,
-                    "product_frame_evidence_key": {
-                        "frame_seq": 10,
-                        "input_event_seq": 7
-                    }
-                }]
-            }),
-            3,
-        );
-        assert_eq!(
-            proof_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-
-        let isolation_contract = cells_visible_click_proof_isolation_contract(&isolation);
-        assert_eq!(
-            isolation_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_product_contract_rejects_software_adapter() {
-        let product_frames = json!({
-            "status": "pass",
-            "source": "app_window_product_frame_commits",
-            "adapter_identity": cells_visible_click_test_software_adapter(),
-            "adapter_status": "software",
-            "product_frame_sample_count": 16,
-            "exact_product_commit_match_count": 16,
-            "typed_product_patch_count": 16,
-            "typed_product_result_count": 16,
-            "product_result_missing_count": 0,
-            "product_patch_full_scene_build_count": 0,
-            "product_patch_proof_json_required_count": 0,
-            "product_patch_latest_report_required_count": 0,
-            "hard_failure_count": 0,
-            "input_to_present_ms": {
-                "p95": 8.0,
-                "max": 12.0
-            },
-            "input_to_formula_visible_ms": {
-                "p95": 8.0,
-                "max": 12.0
-            }
-        });
-        let product_contract = cells_visible_click_product_only_ux_contract(
-            &product_frames,
-            &json!({"status": "pass"}),
-            &json!({"status": "pass"}),
-            &cells_visible_click_test_post_present_isolation(),
-            true,
-            "demand_driven",
-            16.7,
-            33.4,
-        );
-
-        assert_eq!(
-            product_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        assert_eq!(
-            product_contract
-                .get("adapter_status")
-                .and_then(serde_json::Value::as_str),
-            Some("software")
-        );
-        assert_eq!(
-            product_contract
-                .get("software_adapter_wall_clock_budget_exempt")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_product_contract_rejects_missing_typed_product_patch_summary() {
-        let product_frames = json!({
-            "status": "pass",
-            "source": "app_window_product_frame_commits",
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
-            "adapter_status": "hardware",
-            "product_frame_sample_count": 16,
-            "exact_product_commit_match_count": 16,
-            "typed_product_patch_count": 0,
-            "typed_product_result_count": 16,
-            "product_result_missing_count": 0,
-            "product_patch_full_scene_build_count": 0,
-            "product_patch_proof_json_required_count": 0,
-            "product_patch_latest_report_required_count": 0,
-            "hard_failure_count": 0,
-            "input_to_present_ms": {
-                "p95": 8.0,
-                "max": 12.0
-            },
-            "input_to_formula_visible_ms": {
-                "p95": 8.0,
-                "max": 12.0
-            }
-        });
-        let product_contract = cells_visible_click_product_only_ux_contract(
-            &product_frames,
-            &json!({"status": "pass"}),
-            &json!({"status": "pass"}),
-            &cells_visible_click_test_post_present_isolation(),
-            true,
-            "demand_driven",
-            16.7,
-            33.4,
-        );
-
-        assert_eq!(
-            product_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        assert_eq!(product_contract["typed_product_patch_count"], json!(0));
-    }
-
-    #[test]
-    fn cells_visible_click_product_contract_rejects_missing_typed_product_result() {
-        let product_frames = json!({
-            "status": "pass",
-            "source": "app_window_product_frame_commits",
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
-            "adapter_status": "hardware",
-            "product_frame_sample_count": 16,
-            "exact_product_commit_match_count": 16,
-            "typed_product_patch_count": 16,
-            "typed_product_result_count": 0,
-            "product_result_missing_count": 16,
-            "product_patch_full_scene_build_count": 0,
-            "product_patch_proof_json_required_count": 0,
-            "product_patch_latest_report_required_count": 0,
-            "hard_failure_count": 0,
-            "input_to_present_ms": {
-                "p95": 8.0,
-                "max": 12.0
-            },
-            "input_to_formula_visible_ms": {
-                "p95": 8.0,
-                "max": 12.0
-            }
-        });
-        let product_contract = cells_visible_click_product_only_ux_contract(
-            &product_frames,
-            &json!({"status": "pass"}),
-            &json!({"status": "pass"}),
-            &cells_visible_click_test_post_present_isolation(),
-            true,
-            "demand_driven",
-            16.7,
-            33.4,
-        );
-
-        assert_eq!(
-            product_contract
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        assert_eq!(product_contract["typed_product_result_count"], json!(0));
-        assert_eq!(product_contract["product_result_missing_count"], json!(16));
-    }
-
-    #[test]
-    fn cells_visible_click_product_commit_scope_separates_timing_from_adapter() {
-        let key = json!({
-            "frame_seq": 7,
-            "present_id": 7,
-            "input_event_seq": 4,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 6,
-            "layout_revision": 1,
-            "render_scene_revision": 4
-        });
-        let live_probe = json!({
-            "adapter_identity": cells_visible_click_test_software_adapter(),
-            "click_samples": [{
-                "index": 0,
-                "target_address": "A2",
-                "product_frame_evidence_key": key,
-                "input_accept_to_present_ms": 8.0,
-                "input_accept_to_formula_visible_ms": 8.0,
-                "product_formula_state_current": true
-            }],
-            "recent_product_frame_commits": [{
-                "frame_lane": "product_interaction",
-                "input_event_seq": 4,
-                "input_to_present_ms": 8.0,
-                "product_result_source": "native_product_render_result",
-                "product_result_owner": "preview_active_scene",
-                "product_result_kind": "active_preview_scene_patch",
-                "input_timing": {
-                    "input_wake_to_input_accept_ms": 1.0,
-                    "input_wake_to_present_ms": 9.0
-                },
-                "frame_evidence_key": {
-                    "frame_seq": 7,
-                    "present_id": 7,
-                    "input_event_seq": 4,
-                    "surface_id": "preview:test",
-                    "surface_epoch": 1,
-                    "content_revision": 6,
-                    "layout_revision": 1,
-                    "render_scene_revision": 4
-                },
-                "product_frame": {
-                    "product_patch": cells_visible_click_test_product_patch()
-                },
-                "render_graph": cells_visible_click_test_product_render_graph(),
-                "present_plan": cells_visible_click_test_present_plan()
-            }]
-        });
-
-        let summary =
-            cells_visible_click_app_window_product_commit_scope_summary(&live_probe, 1, 16.7, 33.4);
-
-        assert_eq!(summary["timing_status"], json!("pass"));
-        assert_eq!(summary["status"], json!("fail"));
-        assert_eq!(summary["adapter_status"], json!("software"));
-        assert_eq!(
-            summary["input_to_present_ms"]["p95"],
-            json!(8.0),
-            "timing evidence should stay visible even when hardware evidence fails"
-        );
-        assert_eq!(summary["hard_failure_count"], json!(0));
-        assert_eq!(summary["missed_frame_count"], json!(0));
-        assert_eq!(summary["exact_product_commit_match_count"], json!(1));
-        assert_eq!(summary["typed_product_patch_count"], json!(1));
-        assert_eq!(summary["typed_product_result_count"], json!(1));
-        assert_eq!(summary["product_result_missing_count"], json!(0));
-        assert_eq!(summary["product_patch_missing_count"], json!(0));
-    }
-
-    #[test]
-    fn cells_visible_click_product_commit_scope_requires_typed_product_patch() {
-        let key = json!({
-            "frame_seq": 8,
-            "present_id": 8,
-            "input_event_seq": 5,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 7,
-            "layout_revision": 1,
-            "render_scene_revision": 5
-        });
-        let live_probe = json!({
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
-            "click_samples": [{
-                "index": 0,
-                "target_address": "A2",
-                "product_frame_evidence_key": key,
-                "input_accept_to_present_ms": 8.0,
-                "input_accept_to_formula_visible_ms": 8.0,
-                "product_formula_state_current": true
-            }],
-            "recent_product_frame_commits": [{
-                "frame_lane": "product_interaction",
-                "input_event_seq": 5,
-                "input_to_present_ms": 8.0,
-                "product_result_source": "native_product_render_result",
-                "product_result_owner": "preview_active_scene",
-                "product_result_kind": "active_preview_scene_patch",
-                "input_timing": {
-                    "input_wake_to_input_accept_ms": 1.0,
-                    "input_wake_to_present_ms": 9.0
-                },
-                "frame_evidence_key": {
-                    "frame_seq": 8,
-                    "present_id": 8,
-                    "input_event_seq": 5,
-                    "surface_id": "preview:test",
-                    "surface_epoch": 1,
-                    "content_revision": 7,
-                    "layout_revision": 1,
-                    "render_scene_revision": 5
-                }
-            }]
-        });
-
-        let summary =
-            cells_visible_click_app_window_product_commit_scope_summary(&live_probe, 1, 16.7, 33.4);
-
-        assert_eq!(summary["status"], json!("fail"));
-        assert_eq!(summary["timing_status"], json!("fail"));
-        assert_eq!(summary["exact_product_commit_match_count"], json!(1));
-        assert_eq!(summary["typed_product_patch_count"], json!(0));
-        assert_eq!(summary["product_patch_missing_count"], json!(1));
-        assert_eq!(
-            summary["sample_failures"][0]["reason"],
-            json!("missing_typed_product_patch")
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_product_commit_scope_requires_typed_product_result() {
-        let key = json!({
-            "frame_seq": 9,
-            "present_id": 9,
-            "input_event_seq": 6,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 8,
-            "layout_revision": 1,
-            "render_scene_revision": 6
-        });
-        let live_probe = json!({
-            "adapter_identity": cells_visible_click_test_hardware_adapter(),
-            "click_samples": [{
-                "index": 0,
-                "target_address": "A2",
-                "product_frame_evidence_key": key,
-                "input_accept_to_present_ms": 8.0,
-                "input_accept_to_formula_visible_ms": 8.0,
-                "product_formula_state_current": true
-            }],
-            "recent_product_frame_commits": [{
-                "frame_lane": "product_interaction",
-                "input_event_seq": 6,
-                "input_to_present_ms": 8.0,
-                "product_result_source": "missing_product_result",
-                "input_timing": {
-                    "input_wake_to_input_accept_ms": 1.0,
-                    "input_wake_to_present_ms": 9.0
-                },
-                "frame_evidence_key": {
-                    "frame_seq": 9,
-                    "present_id": 9,
-                    "input_event_seq": 6,
-                    "surface_id": "preview:test",
-                    "surface_epoch": 1,
-                    "content_revision": 8,
-                    "layout_revision": 1,
-                    "render_scene_revision": 6
-                },
-                "product_frame": {
-                    "product_patch": cells_visible_click_test_product_patch()
-                }
-            }]
-        });
-
-        let summary =
-            cells_visible_click_app_window_product_commit_scope_summary(&live_probe, 1, 16.7, 33.4);
-
-        assert_eq!(summary["status"], json!("fail"));
-        assert_eq!(summary["timing_status"], json!("fail"));
-        assert_eq!(summary["exact_product_commit_match_count"], json!(1));
-        assert_eq!(summary["typed_product_patch_count"], json!(1));
-        assert_eq!(summary["typed_product_result_count"], json!(0));
-        assert_eq!(
-            summary["sample_failures"][0]["reason"],
-            json!("missing_typed_product_result")
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_product_commit_for_interaction_prefers_accepted_input_commit() {
-        let accepted_key = json!({
-            "frame_seq": 7,
-            "present_id": 7,
-            "input_event_seq": 4,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 6,
-            "layout_revision": 1,
-            "render_scene_revision": 4
-        });
-        let presented_key = json!({
-            "frame_seq": 8,
-            "present_id": 8,
-            "input_event_seq": 5,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 6,
-            "layout_revision": 1,
-            "render_scene_revision": 4
-        });
-        let report = json!({
-            "accepted_host_input_event_wake_count": 4,
-            "input_to_present_accounted_event_wake_count": 4,
-            "presented_input_event_wake_count": 5,
-            "frame_evidence_key": presented_key,
-            "recent_product_frame_commits": [{
-                "frame_lane": "product_interaction",
-                "input_event_seq": 4,
-                "input_to_present_ms": 10.996183,
-                "frame_evidence_key": accepted_key
-            }]
-        });
-
-        let (commit, source, input_event_seq) =
-            cells_visible_click_product_commit_for_interaction(&report, 5);
-
-        assert_eq!(
-            source,
-            "recent_product_frame_commits_by_accepted_input_event_seq"
-        );
-        assert_eq!(input_event_seq, Some(4));
-        assert_eq!(
-            commit
-                .and_then(|commit| commit.get("frame_evidence_key"))
-                .cloned(),
-            Some(accepted_key)
-        );
-    }
-
-    #[test]
-    fn cells_visible_click_product_commit_match_rejects_nearby_input_generation_even_for_same_frame_context()
-     {
-        let commit_key = json!({
-            "frame_seq": 350,
-            "present_id": 350,
-            "input_event_seq": 130,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 251,
-            "layout_revision": 1,
-            "render_scene_revision": 90
-        });
-        let visible_product_key = json!({
-            "frame_seq": 353,
-            "present_id": 353,
-            "input_event_seq": 131,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 251,
-            "layout_revision": 1,
-            "render_scene_revision": 90
-        });
-        let proof_key = json!({
-            "frame_seq": 356,
-            "present_id": 356,
-            "input_event_seq": 131,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 251,
-            "layout_revision": 1,
-            "render_scene_revision": 90
-        });
-        let report = json!({
-            "recent_product_frame_commits": [{
-                "frame_lane": "product_interaction",
-                "input_event_seq": 130,
-                "input_to_present_ms": 10.838645,
-                "frame_evidence_key": commit_key
-            }]
-        });
-
-        let matched = cells_visible_click_product_commit_match_from_report(
-            &report,
-            Some(&visible_product_key),
-            Some(&proof_key),
-            Some(10.838645),
-        );
-
-        assert_eq!(matched["status"], json!("missing"));
-        assert_eq!(matched["match_method"], json!("missing_product_commit"));
-    }
-
-    #[test]
-    fn cells_visible_click_product_commit_match_rejects_nearby_input_generation_for_different_context()
-     {
-        let report = json!({
-            "recent_product_frame_commits": [{
-                "frame_lane": "product_interaction",
-                "input_event_seq": 130,
-                "input_to_present_ms": 10.838645,
-                "frame_evidence_key": {
-                    "frame_seq": 350,
-                    "present_id": 350,
-                    "input_event_seq": 130,
-                    "surface_id": "preview:test",
-                    "surface_epoch": 1,
-                    "content_revision": 251,
-                    "layout_revision": 1,
-                    "render_scene_revision": 90
-                }
-            }]
-        });
-        let stale_visible_key = json!({
-            "frame_seq": 353,
-            "present_id": 353,
-            "input_event_seq": 131,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 252,
-            "layout_revision": 1,
-            "render_scene_revision": 90
-        });
-
-        let matched = cells_visible_click_product_commit_match_from_report(
-            &report,
-            Some(&stale_visible_key),
-            Some(&stale_visible_key),
-            Some(10.838645),
-        );
-
-        assert_eq!(matched["status"], json!("missing"));
-        assert_eq!(matched["match_method"], json!("missing_product_commit"));
-    }
-
-    #[test]
-    fn cells_visible_click_preview_hold_scales_with_target_count() {
-        assert_eq!(cells_visible_click_preview_hold_ms(0), 90_000);
-        assert_eq!(cells_visible_click_preview_hold_ms(4), 90_000);
-        assert_eq!(cells_visible_click_preview_hold_ms(64), 350_000);
-    }
-
-    #[test]
-    fn cells_visible_click_verifier_requests_wait_for_readback_backpressure() {
-        assert!(cells_visible_click_interactive_readback_busy(&json!({
-            "render_loop_state": {
-                "last_interactive_surface_readback_pending": true
-            }
-        })));
-        assert!(!cells_visible_click_interactive_readback_busy(&json!({
-            "last_interactive_surface_readback_pending": false
-        })));
-
-        assert!(cells_visible_click_verifier_frame_request_consumed(
-            &json!({
-                "last_poll_diagnostics": {
-                    "verifier_frame_request": {
-                        "consumed_count": 42
-                    }
-                }
-            }),
-            42,
-        ));
-        assert!(!cells_visible_click_verifier_frame_request_consumed(
-            &json!({
-                "last_poll_diagnostics": {
-                    "verifier_frame_request": {
-                        "consumed_count": 41
-                    }
-                }
-            }),
-            42,
-        ));
-    }
-
-    #[test]
-    fn cells_visible_click_visual_proof_requires_exact_product_frame_key() {
-        let product_key = json!({
-            "frame_seq": 7,
-            "present_id": 7,
-            "input_event_seq": 4,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 6,
-            "layout_revision": 1,
-            "render_scene_revision": 4
-        });
-        let later_key = json!({
-            "frame_seq": 10,
-            "present_id": 10,
-            "input_event_seq": 5,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "content_revision": 6,
-            "layout_revision": 1,
-            "render_scene_revision": 4
-        });
-        let product_present_probe = json!({
-            "status": "pass",
-            "frame_evidence_key": product_key
-        });
-        let later_readback_probe = json!({
-            "status": "pass",
-            "frame_evidence_key": later_key,
-            "last_external_render_proof": {
-                "proof": {
-                    "frame_evidence_key": later_key
-                }
-            }
-        });
-        let later_visual_probe = json!({
-            "status": "pass",
-            "structured_external_visible_surface_probe": {
-                "proof_frame_evidence_key": later_key
-            }
-        });
-
-        assert!(
-            cells_visual_formula_probe_needs_exact_product_replacement(
-                &product_present_probe,
-                Some(&later_readback_probe),
-                Some(&later_visual_probe),
-            ),
-            "a later-frame proof is proof lag, not the product sample's visual proof"
-        );
-        assert!(!cells_visual_formula_probe_proves_frame_key(
-            Some(&later_readback_probe),
-            Some(&later_visual_probe),
-            product_present_probe.get("frame_evidence_key").unwrap(),
-        ));
-
-        let exact_readback_probe = json!({
-            "status": "pass",
-            "frame_evidence_key": product_present_probe["frame_evidence_key"],
-            "last_external_render_proof": {
-                "proof": {
-                    "frame_evidence_key": product_present_probe["frame_evidence_key"]
-                }
-            }
-        });
-        let exact_visual_probe = json!({
-            "status": "pass",
-            "structured_external_visible_surface_probe": {
-                "proof_frame_evidence_key": product_present_probe["frame_evidence_key"]
-            }
-        });
-
-        assert!(cells_visual_formula_probe_proves_frame_key(
-            Some(&exact_readback_probe),
-            Some(&exact_visual_probe),
-            product_present_probe.get("frame_evidence_key").unwrap(),
-        ));
-        assert!(!cells_visual_formula_probe_needs_exact_product_replacement(
-            &product_present_probe,
-            Some(&exact_readback_probe),
-            Some(&exact_visual_probe),
-        ));
-    }
-
-    #[test]
-    fn native_gpu_handoff_requires_cells_visible_click_release_report() {
-        let reports = native_gpu_handoff_required_reports();
-        let report = reports
-            .iter()
-            .find(|report| report.label == "cells-visible-click-e2e-release")
-            .expect("native GPU handoff must require the Cells visible-click release gate");
-        assert_eq!(
-            report.path,
-            PathBuf::from("target/reports/native-gpu/cells-visible-click-e2e-release.json")
-        );
-        assert_eq!(report.command, "verify-native-cells-visible-click-e2e");
-        assert_eq!(report.required_argv, &[("--profile", "release")]);
-    }
-
-    #[test]
-    fn native_gpu_handoff_requires_present_floor_report() {
-        let reports = native_gpu_handoff_required_reports();
-        let report = reports
-            .iter()
-            .find(|report| report.label == "present-floor")
-            .expect("native GPU handoff must require the focus-safe present-floor gate");
-        assert_eq!(
-            report.path,
-            PathBuf::from("target/reports/native-gpu/present-floor.json")
-        );
-        assert_eq!(report.command, "verify-native-gpu-present-floor");
-        assert_eq!(report.required_argv, &[]);
-    }
-
-    #[test]
-    fn native_gpu_handoff_preview_e2e_requires_release_hardware_reports() {
-        let reports = native_gpu_handoff_required_reports();
-        for label in [
-            "preview-e2e-todomvc",
-            "preview-e2e-cells",
-            "preview-e2e-todo_mvc_physical",
-        ] {
-            let report = reports
-                .iter()
-                .find(|report| report.label == label)
-                .expect("native GPU handoff must require preview E2E reports");
-            assert!(report.required_argv.contains(&("--profile", "release")));
-            assert!(
-                report
-                    .required_argv
-                    .contains(&("--require-hardware-adapter", ""))
-            );
-        }
-    }
-
-    #[test]
-    fn native_gpu_handoff_manifest_rejects_preview_source_replay_dependencies() {
-        let reports = native_gpu_handoff_required_reports();
-        for label in [
-            "preview-e2e-todomvc",
-            "preview-e2e-cells",
-            "preview-e2e-todo_mvc_physical",
-        ] {
-            let report = reports
-                .iter()
-                .find(|report| report.label == label)
-                .expect("native GPU handoff must include preview E2E report");
-            assert!(
-                report.upstream_dependencies.is_empty(),
-                "{label} must not consume PlanExecutor source replay as native proof"
-            );
-        }
-    }
-
-    #[test]
-    fn native_gpu_handoff_manifest_has_unique_bounded_reports_and_docs_source() {
-        let reports = native_gpu_handoff_required_reports();
-        assert!(reports.len() >= 17);
-        let mut labels = BTreeSet::new();
-        let mut paths = BTreeSet::new();
-        for report in &reports {
-            assert!(
-                labels.insert(report.label),
-                "duplicate label {}",
-                report.label
-            );
-            assert!(
-                paths.insert(report.path.clone()),
-                "duplicate path {}",
-                report.path.display()
-            );
-            assert!(xtask_command_exists(report.command));
-            assert!(report.max_report_bytes > 0);
-            let mut upstream_labels = BTreeSet::new();
-            for dependency in report.upstream_dependencies {
-                assert!(
-                    upstream_labels.insert(dependency.label),
-                    "duplicate upstream label {} for native report {}",
-                    dependency.label,
-                    report.label
-                );
-                assert_eq!(dependency.measurement_mode, "proof");
-                assert_eq!(dependency.kind, "consumes-native-report");
-                assert!(xtask_command_exists(dependency.command));
-                assert_eq!(dependency.owner_aggregate, "verify-native-gpu-all");
-            }
-        }
-        let cells = reports
-            .iter()
-            .find(|report| report.label == "cells-visible-click-e2e-release")
-            .unwrap();
-        assert!(cells.max_sidecar_bytes > 0);
-        let present_floor = reports
-            .iter()
-            .find(|report| report.label == "present-floor")
-            .unwrap();
-        assert_eq!(present_floor.max_sidecar_bytes, 0);
-
-        let agents = fs::read_to_string(workspace_relative_path("AGENTS.md")).unwrap();
-        let architecture = fs::read_to_string(workspace_relative_path(
-            "docs/architecture/NATIVE_GPU_PIPELINE.md",
-        ))
-        .unwrap();
-        assert!(agents.contains(NATIVE_GPU_HANDOFF_MANIFEST_PATH));
-        assert!(architecture.contains(NATIVE_GPU_HANDOFF_MANIFEST_PATH));
-        assert!(!agents.contains("cargo xtask verify-platform-contract --report"));
-        assert!(!architecture.contains("cargo xtask verify-platform-contract --report"));
-    }
-
-    #[test]
-    fn blocker_audit_treats_manifest_commands_as_manifest_owned() {
-        assert!(report_is_blocker_audit(&json!({
-            "command": "verify-native-gpu-preview-e2e"
-        })));
-        assert!(report_is_blocker_audit(&json!({
-            "command": "verify-native-cells-visible-click-e2e"
-        })));
-        assert!(report_is_blocker_audit(&json!({
-            "command": "verify-native-gpu-novywave-visual"
-        })));
-        assert!(!report_is_blocker_audit(&json!({
-            "command": "verify-obsolete-native-proof"
-        })));
-    }
-
-    #[test]
-    fn schema_summary_large_native_gpu_skip_excludes_handoff_and_roles() {
-        let mut handoff_paths = BTreeSet::new();
-        handoff_paths.insert(PathBuf::from(
-            "target/reports/native-gpu/cells-visible-click-e2e-release.json",
-        ));
-        assert!(schema_summary_native_gpu_large_non_handoff_report(
-            Path::new("target/reports/native-gpu/cells-visible-click-e2e-experiment.json"),
-            20 * 1024 * 1024,
-            &handoff_paths
-        ));
-        assert!(!schema_summary_native_gpu_large_non_handoff_report(
-            Path::new("target/reports/native-gpu/cells-visible-click-e2e-release.json"),
-            20 * 1024 * 1024,
-            &handoff_paths
-        ));
-        assert!(!schema_summary_native_gpu_large_non_handoff_report(
-            Path::new("target/reports/native-gpu/roles/preview-loop.json"),
-            20 * 1024 * 1024,
-            &handoff_paths
-        ));
-        assert!(!schema_summary_native_gpu_large_non_handoff_report(
-            Path::new("target/reports/native-gpu/cells-visible-click-e2e-experiment.json"),
-            1024,
-            &handoff_paths
-        ));
-    }
-
-    #[test]
-    fn product_render_graph_cells_sample_count_reads_json_sidecar_ref() {
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-product-graph-sidecar-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sidecar = dir.join("click_samples.json");
-        write_json(
-            &sidecar,
-            &json!([
-                {
-                    "product_frame_commit": {
-                        "render_graph": {
-                            "encode_time_ms": 0.25
-                        }
-                    }
-                },
-                {
-                    "product_frame_commit": {
-                        "render_graph": {
-                            "encode_time_ms": 0.5
-                        }
-                    }
-                }
-            ]),
-        )
-        .unwrap();
-        let report = json!({
-            "click_samples": {
-                "sidecar": true,
-                "kind": "json-sidecar-ref",
-                "json_pointer_replaced": "/click_samples",
-                "path": sidecar.display().to_string(),
-                "sha256": cached_sha256_file(&sidecar).unwrap(),
-                "byte_len": fs::metadata(&sidecar).unwrap().len()
-            }
-        });
-        assert_eq!(
-            native_product_render_graph_cells_encode_time_sample_count(&report),
-            2
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn native_report_sidecar_total_raw_bytes_derives_unique_paths_when_total_missing() {
-        let report = json!({
-            "report_json_sidecars": [
-                {"path": "target/a.json", "byte_len": 10},
-                {"path": "target/a.json", "byte_len": 10, "deduplicated_ref": true},
-                {"path": "target/b.json", "byte_len": 25}
-            ]
-        });
-        assert_eq!(native_report_sidecar_total_raw_bytes(&report), 35);
-
-        let declared = json!({
-            "report_json_sidecar_total_raw_bytes": 99,
-            "report_json_sidecars": [
-                {"path": "target/a.json", "byte_len": 10}
-            ]
-        });
-        assert_eq!(native_report_sidecar_total_raw_bytes(&declared), 99);
-    }
-
-    #[test]
-    fn present_floor_default_path_is_focus_safe_product_hardware_only() {
-        assert!(present_floor_default_focus_safe_hardware_requested(&[
-            "verify-native-gpu-present-floor".to_owned()
-        ]));
-        assert!(!present_floor_default_focus_safe_hardware_requested(&[
-            "verify-native-gpu-present-floor".to_owned(),
-            "--unsupported-mode".to_owned()
-        ]));
-        assert!(!present_floor_default_focus_safe_hardware_requested(&[
-            "verify-native-gpu-present-floor".to_owned(),
-            "--surface".to_owned(),
-            "raw-clear".to_owned()
-        ]));
-    }
-
-    #[test]
-    fn present_floor_focus_safe_hardware_request_uses_product_surface_path() {
-        assert!(present_floor_focus_safe_hardware_requested(&[
-            "verify-native-gpu-present-floor".to_owned(),
-            "--surface".to_owned(),
-            "product-preview".to_owned(),
-            "--hardware".to_owned(),
-            "--focus-safe".to_owned()
-        ]));
-        assert!(!present_floor_focus_safe_hardware_requested(&[
-            "verify-native-gpu-present-floor".to_owned(),
-            "--surface".to_owned(),
-            "product-preview".to_owned(),
-            "--hardware".to_owned()
-        ]));
-        assert!(!present_floor_focus_safe_hardware_requested(&[
-            "verify-native-gpu-present-floor".to_owned(),
-            "--surface".to_owned(),
-            "raw-clear".to_owned(),
-            "--hardware".to_owned(),
-            "--focus-safe".to_owned()
-        ]));
-    }
-
-    #[test]
-    fn present_floor_verifier_identity_ignores_inner_probe_arg() {
-        let public_args = required_xtask_refresh_argv(
-            "verify-native-gpu-present-floor",
-            &[],
-            Path::new("r.json"),
-        );
-        let inner_args = vec![
-            "verify-native-gpu-present-floor".to_owned(),
-            "--inner-app-window".to_owned(),
-            "--report".to_owned(),
-            "r.json".to_owned(),
-        ];
-        assert_eq!(
-            verifier_identity_for_command_args(
-                "verify-native-gpu-present-floor",
-                "proof",
-                &inner_args
-            ),
-            verifier_identity_for_command_args(
-                "verify-native-gpu-present-floor",
-                "proof",
-                &public_args
-            )
-        );
-    }
-
-    #[test]
-    fn bytes_verifier_identity_accepts_boon_cli_run_plan_args() {
-        let args = vec![
-            "target/debug/boon_cli".to_owned(),
-            "run-plan".to_owned(),
-            "examples/bytes_initial.bn".to_owned(),
-            "--report".to_owned(),
-            "ignored-report-path.json".to_owned(),
-        ];
-        let identity = verifier_identity_for_command_args("run-plan", "proof", &args).unwrap();
-        assert_eq!(
-            identity
-                .get("contract_version")
-                .and_then(serde_json::Value::as_str),
-            Some(BYTES_MACHINE_PLAN_VERIFIER_CONTRACT_VERSION)
-        );
-        assert!(
-            !identity
-                .get("canonical_args")
-                .and_then(serde_json::Value::as_array)
-                .unwrap()
-                .iter()
-                .any(|arg| arg.as_str() == Some("--report"))
-        );
-        let report = json!({
-            "command": "run-plan",
-            "command_argv": args,
-            "measurement_mode": "proof",
-            "verifier_identity": identity
-        });
-        assert!(report_verifier_identity_matches_report(&report));
-    }
-
-    #[test]
-    fn refresh_queue_dry_run_consumes_structured_argv() {
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-refresh-queue-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let aggregate = dir.join("aggregate.json");
-        let output = dir.join("refresh-report.json");
-        let child = dir.join("child.json");
-        write_json(
-            &aggregate,
-            &json!({
-                "status": "fail",
-                "command": "verify-native-gpu-all",
-                "refresh_commands": [{
-                    "label": "platform-contract",
-                    "path": child.display().to_string(),
-                    "reason": "identity-freshness",
-                    "command": "stale display command ignored by runner",
-                    "argv": [
-                        current_binary_path(),
-                        "verify-platform-contract",
-                        "--report",
-                        child.display().to_string()
-                    ]
-                }]
-            }),
-        )
-        .unwrap();
-        run_report_refresh_queue(&[
-            "run-report-refresh-queue".to_owned(),
-            aggregate.display().to_string(),
-            "--dry-run".to_owned(),
-            "--report".to_owned(),
-            output.display().to_string(),
-        ])
-        .unwrap();
-        let report = read_json(&output).unwrap();
-        assert_eq!(
-            report.get("status").and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            report
-                .get("selected_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report
-                .pointer("/results/kind")
-                .and_then(serde_json::Value::as_str),
-            Some("json-sidecar-ref")
-        );
-        let results = json_pointer_value_or_sidecar(&report, "/results").unwrap();
-        assert_eq!(
-            results
-                .pointer("/0/status")
-                .and_then(serde_json::Value::as_str),
-            Some("dry-run")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_refresh_queue_rejects_source_replay_commands() {
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-native-refresh-queue-rejects-source-replay-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let aggregate = dir.join("aggregate.json");
-        let output = dir.join("refresh-report.json");
-        let child = dir.join("child.json");
-        write_json(
-            &aggregate,
-            &json!({
-                "status": "fail",
-                "command": "verify-native-gpu-all",
-                "refresh_commands": [{
-                    "label": "bad-source-replay",
-                    "path": child.display().to_string(),
-                    "reason": "identity-freshness",
-                    "command": "boon_cli run examples/cells.bn --report child.json",
-                    "argv": [
-                        "boon_cli",
-                        "run",
-                        "examples/cells.bn",
-                        "--report",
-                        child.display().to_string()
-                    ]
-                }]
-            }),
-        )
-        .unwrap();
-        let result = run_report_refresh_queue(&[
-            "run-report-refresh-queue".to_owned(),
-            aggregate.display().to_string(),
-            "--dry-run".to_owned(),
-            "--report".to_owned(),
-            output.display().to_string(),
-        ]);
-        assert!(
-            result
-                .err()
-                .is_some_and(|error| error.to_string().contains("blocked")),
-            "invalid native refresh command should block the gate"
-        );
-        let report = read_json(&output).unwrap();
-        assert_eq!(
-            report.get("status").and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        assert_eq!(
-            report
-                .get("invalid_command_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report.pointer("/boon_cli_prebuild/required"),
-            Some(&json!(false)),
-            "native refresh must reject boon_cli entries without entering the BYTES prebuild lane"
-        );
-        let results = json_pointer_value_or_sidecar(&report, "/results").unwrap();
-        assert_eq!(
-            results
-                .pointer("/0/reason")
-                .and_then(serde_json::Value::as_str),
-            Some("invalid-command")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn refresh_queue_selection_expands_upstream_dependencies() {
-        let aggregate = json!({
-            "refresh_commands": [
-                {
-                    "label": "preview-e2e-cells",
-                    "path": "target/reports/native-gpu/preview-e2e-cells.json",
-                    "reason": "identity-freshness",
-                    "argv": [current_binary_path(), "verify-native-gpu-preview-e2e"]
-                },
-                {
-                    "label": "cells-visible-click-e2e-release",
-                    "path": "target/reports/native-gpu/cells-visible-click-e2e-release.json",
-                    "reason": "upstream-schema-or-identity-freshness",
-                    "required_by": "preview-e2e-cells",
-                    "owner_aggregate": "verify-native-gpu-all",
-                    "owner_aggregate_report_path": "target/reports/native-gpu-all.json",
-                    "argv": [current_binary_path(), "verify-native-cells-visible-click-e2e"]
-                }
-            ]
-        });
-        let labels = ["preview-e2e-cells".to_owned()]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let plan = plan_refresh_queue_entries(&aggregate, &labels, 1);
-        let selected_labels = selected_labels_for_refresh_entries(&plan.selected);
-        assert_eq!(plan.dependency_expansion_count, 1);
-        assert_eq!(plan.selected.len(), 2);
-        assert!(selected_labels.contains("preview-e2e-cells"));
-        assert!(selected_labels.contains("cells-visible-click-e2e-release"));
-        assert_eq!(
-            plan.selected[0]
-                .get("label")
-                .and_then(serde_json::Value::as_str),
-            Some("cells-visible-click-e2e-release")
-        );
-        assert_eq!(
-            plan.selected[0]
-                .get("refresh_phase")
-                .and_then(serde_json::Value::as_str),
-            Some("upstream-dependency")
-        );
-    }
-
-    #[test]
-    fn refresh_queue_selection_expands_report_dependency_graph_edges() {
-        let aggregate = json!({
-            "refresh_commands": [
-                {
-                    "label": "preview-e2e-cells",
-                    "path": "target/reports/native-gpu/preview-e2e-cells.json",
-                    "reason": "upstream-identity-freshness",
-                    "required_by": "preview-e2e-todo_mvc_physical",
-                    "owner_aggregate": "verify-native-gpu-all",
-                    "owner_aggregate_report_path": "target/reports/native-gpu-all.json",
-                    "argv": [current_binary_path(), "verify-native-gpu-preview-e2e", "--example", "cells"]
-                },
-                {
-                    "label": "preview-e2e-todo_mvc_physical",
-                    "path": "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
-                    "reason": "upstream-identity-freshness",
-                    "required_by": "todomvc-physical-reference-parity",
-                    "owner_aggregate": "verify-native-gpu-all",
-                    "owner_aggregate_report_path": "target/reports/native-gpu-all.json",
-                    "argv": [current_binary_path(), "verify-native-gpu-preview-e2e"]
-                },
-                {
-                    "label": "preview-e2e-todo_mvc_physical",
-                    "path": "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
-                    "reason": "identity-freshness-fast-path",
-                    "argv": [current_binary_path(), "verify-native-gpu-preview-e2e"]
-                },
-                {
-                    "label": "todomvc-physical-reference-parity",
-                    "path": "target/reports/native-gpu/todomvc-physical-reference-parity.json",
-                    "reason": "identity-freshness-fast-path",
-                    "argv": [current_binary_path(), "verify-native-todomvc-physical-reference-parity"]
-                }
-            ],
-            "report_dependency_graph": {
-                "kind": "report-dependency-dag-v1",
-                "edges": [
-                    {
-                        "from": "todomvc-physical-reference-parity",
-                        "to": "preview-e2e-todo_mvc_physical",
-                        "kind": "consumes-native-report"
-                    },
-                    {
-                        "from": "preview-e2e-todo_mvc_physical",
-                        "to": "preview-e2e-cells",
-                        "kind": "consumes-native-report"
-                    }
-                ]
-            }
-        });
-        let labels = ["todomvc-physical-reference-parity".to_owned()]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let plan = plan_refresh_queue_entries(&aggregate, &labels, 1);
-        let selected_labels = selected_labels_for_refresh_entries(&plan.selected)
-            .into_iter()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            selected_labels,
-            vec![
-                "preview-e2e-cells".to_owned(),
-                "preview-e2e-todo_mvc_physical".to_owned(),
-                "todomvc-physical-reference-parity".to_owned()
-            ]
-        );
-        assert_eq!(plan.dependency_expansion_count, 2);
-        assert_eq!(plan.selected.len(), 3);
-        assert_eq!(
-            plan.selected[0]
-                .get("label")
-                .and_then(serde_json::Value::as_str),
-            Some("preview-e2e-cells")
-        );
-        assert_eq!(
-            plan.selected[1]
-                .get("label")
-                .and_then(serde_json::Value::as_str),
-            Some("preview-e2e-todo_mvc_physical")
-        );
-        assert_eq!(
-            plan.selected[1]
-                .get("refresh_phase")
-                .and_then(serde_json::Value::as_str),
-            Some("upstream-dependency")
-        );
-        assert_eq!(
-            plan.selected[2]
-                .get("label")
-                .and_then(serde_json::Value::as_str),
-            Some("todomvc-physical-reference-parity")
-        );
-    }
-
-    #[test]
-    fn refresh_queue_limit_prioritizes_upstream_dependencies() {
-        let aggregate = json!({
-            "refresh_commands": [
-                {
-                    "label": "platform-contract",
-                    "path": "target/reports/native-gpu/platform-contract.json",
-                    "reason": "identity-freshness",
-                    "argv": [current_binary_path(), "verify-platform-contract"]
-                },
-                {
-                    "label": "cells-visible-click-e2e-release",
-                    "path": "target/reports/native-gpu/cells-visible-click-e2e-release.json",
-                    "reason": "upstream-schema-or-identity-freshness",
-                    "required_by": "preview-e2e-cells",
-                    "owner_aggregate": "verify-native-gpu-all",
-                    "owner_aggregate_report_path": "target/reports/native-gpu-all.json",
-                    "argv": [current_binary_path(), "verify-native-cells-visible-click-e2e"]
-                }
-            ]
-        });
-        let plan = plan_refresh_queue_entries(&aggregate, &BTreeSet::new(), 1);
-        assert_eq!(plan.selected.len(), 1);
-        assert_eq!(
-            plan.selected[0]
-                .get("label")
-                .and_then(serde_json::Value::as_str),
-            Some("cells-visible-click-e2e-release")
-        );
-        assert_eq!(
-            plan.selection_mode,
-            "dependency-order-full-queue".to_owned()
-        );
-    }
-
-    #[test]
-    fn refresh_queue_until_clean_dry_run_reports_closed_loop_without_rerun() {
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-refresh-queue-loop-dry-run-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let aggregate = dir.join("aggregate.json");
-        let output = dir.join("refresh-report.json");
-        let child = dir.join("child.json");
-        write_json(
-            &aggregate,
-            &json!({
-                "status": "fail",
-                "command": "verify-native-gpu-all",
-                "refresh_debt_child_count": 1,
-                "refresh_commands": [{
-                    "label": "platform-contract",
-                    "path": child.display().to_string(),
-                    "reason": "identity-freshness",
-                    "argv": [
-                        current_binary_path(),
-                        "verify-platform-contract",
-                        "--report",
-                        child.display().to_string()
-                    ]
-                }]
-            }),
-        )
-        .unwrap();
-        run_report_refresh_queue(&[
-            "run-report-refresh-queue".to_owned(),
-            aggregate.display().to_string(),
-            "--dry-run".to_owned(),
-            "--until-clean".to_owned(),
-            "--max-runs".to_owned(),
-            "4".to_owned(),
-            "--report".to_owned(),
-            output.display().to_string(),
-        ])
-        .unwrap();
-        let report = read_json(&output).unwrap();
-        assert_eq!(
-            report.get("status").and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            report
-                .get("closed_loop_requested")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("closed_loop_max_runs")
-                .and_then(serde_json::Value::as_u64),
-            Some(4)
-        );
-        assert_eq!(
-            report
-                .get("closed_loop_stop_reason")
-                .and_then(serde_json::Value::as_str),
-            Some("dry-run")
-        );
-        assert_eq!(
-            report
-                .get("post_refresh_aggregate_rerun_requested")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("post_refresh_aggregate_rerun_executed")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn refresh_queue_closed_loop_alias_requests_until_clean() {
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-refresh-queue-closed-loop-alias-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let aggregate = dir.join("aggregate.json");
-        let output = dir.join("refresh-report.json");
-        let child = dir.join("child.json");
-        write_json(
-            &aggregate,
-            &json!({
-                "status": "fail",
-                "command": "verify-native-gpu-all",
-                "refresh_debt_child_count": 1,
-                "refresh_commands": [{
-                    "label": "platform-contract",
-                    "path": child.display().to_string(),
-                    "reason": "identity-freshness",
-                    "argv": [
-                        current_binary_path(),
-                        "verify-platform-contract",
-                        "--report",
-                        child.display().to_string()
-                    ]
-                }]
-            }),
-        )
-        .unwrap();
-        run_report_refresh_queue(&[
-            "run-report-refresh-queue".to_owned(),
-            aggregate.display().to_string(),
-            "--dry-run".to_owned(),
-            "--closed-loop".to_owned(),
-            "--max-runs".to_owned(),
-            "2".to_owned(),
-            "--report".to_owned(),
-            output.display().to_string(),
-        ])
-        .unwrap();
-        let report = read_json(&output).unwrap();
-        assert_eq!(
-            report
-                .get("closed_loop_requested")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("closed_loop_stop_reason")
-                .and_then(serde_json::Value::as_str),
-            Some("dry-run")
-        );
-        assert_eq!(
-            report
-                .get("post_refresh_aggregate_rerun_requested")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn refresh_queue_reruns_native_aggregate_argv() {
-        let aggregate = json!({
-            "command": "verify-native-gpu-all",
-            "refresh_debt_child_count": 3,
-            "refresh_commands": []
-        });
-        let path = Path::new("target/reports/native-gpu-all.json");
-        let argv = aggregate_rerun_argv(&aggregate, path).expect("native aggregate rerun argv");
-        assert!(
-            Path::new(&argv[0])
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .is_some_and(|file_name| file_name.starts_with("xtask"))
-        );
-        assert_eq!(
-            argv.get(1).map(String::as_str),
-            Some("verify-native-gpu-all")
-        );
-        assert!(argv.iter().any(|arg| arg == "--check-existing"));
-        assert!(string_args_contains_pair(
-            &argv,
-            "--report",
-            "target/reports/native-gpu-all.json"
-        ));
-        assert!(!refresh_queue_command_allowed(
-            &argv,
-            "run-report-refresh-queue",
-            "verify-native-gpu-all"
-        ));
-    }
-
-    #[test]
-    fn refresh_queue_partial_mode_detects_selected_label_burndown() {
-        let post = json!({
-            "failure_taxonomy": {
-                "refresh_debt_child_count": 2
-            },
-            "refresh_commands": [
-                {"label": "cells-visible-click-e2e-release", "path": "cells.json"},
-                {"label": "preview-e2e-cells", "path": "preview.json"}
-            ]
-        });
-        let selected = ["cells-visible-click-e2e-release".to_owned()]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let remaining = refresh_commands_for_labels(&post, &selected);
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(
-            remaining[0]
-                .get("label")
-                .and_then(serde_json::Value::as_str),
-            Some("cells-visible-click-e2e-release")
-        );
-        let burned_down = ["preview-e2e-todomvc".to_owned()]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        assert!(refresh_commands_for_labels(&post, &burned_down).is_empty());
-        assert_eq!(aggregate_refresh_debt_child_count(&post), 2);
-    }
-
-    #[test]
-    fn refresh_queue_closed_loop_selection_honors_labels_and_limit() {
-        let aggregate = json!({
-            "refresh_commands": [
-                {"label": "a", "path": "a.json"},
-                {"label": "b", "path": "b.json"},
-                {"label": "c", "path": "c.json"}
-            ]
-        });
-        let labels = ["b".to_owned(), "c".to_owned()]
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let (selected, skipped) = select_refresh_queue_entries(&aggregate, &labels, 1);
-        assert_eq!(selected.len(), 1);
-        assert_eq!(skipped, 2);
-        assert_eq!(
-            selected[0].get("label").and_then(serde_json::Value::as_str),
-            Some("b")
-        );
-        assert_eq!(
-            selected_labels_for_refresh_entries(&selected),
-            ["b".to_owned()].into_iter().collect::<BTreeSet<_>>()
-        );
-    }
-
-    #[test]
-    fn native_gpu_worktree_fingerprint_scope_tracks_product_inputs_not_plan_ledgers() {
-        let paths = worktree_fingerprint_scope_paths(NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-        assert!(paths.contains(&"crates"));
-        assert!(paths.contains(&"examples"));
-        assert!(paths.contains(&"budgets/native-gpu.toml"));
-        assert!(paths.contains(&"docs/architecture/NATIVE_GPU_PIPELINE.md"));
-        assert!(paths.contains(&"docs/architecture/native_gpu_handoff_manifest.json"));
-        assert!(!paths.contains(&"docs/plans/GOAL_PROMPT.md"));
-    }
-
-    #[test]
-    fn source_replay_worktree_fingerprint_scope_tracks_execution_inputs_not_plan_ledgers() {
-        assert_eq!(
-            worktree_fingerprint_scope_for_command("run-plan-scenario-events"),
-            boon_runtime::PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE
-        );
-        let paths = worktree_fingerprint_scope_paths(
-            boon_runtime::PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE,
-        );
-        assert!(paths.contains(&"crates/boon_runtime"));
-        assert!(paths.contains(&"crates/boon_plan_executor"));
-        assert!(paths.contains(&"crates/boon_compiler"));
-        assert!(!paths.contains(&"crates/boon_native_gpu"));
-        assert!(!paths.contains(&"docs/plans/GOAL_PROMPT.md"));
-        assert!(!paths.contains(&"docs/architecture/NATIVE_GPU_PIPELINE.md"));
-    }
-
-    #[test]
-    fn report_worktree_freshness_prefers_matching_native_scoped_fingerprint() {
-        let current_scoped = worktree_fingerprint_for_scope(NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-        let mut fingerprints = serde_json::Map::new();
-        fingerprints.insert(
-            NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE.to_owned(),
-            json!(current_scoped.clone()),
-        );
-        let report = json!({
-            "worktree_fingerprint": "stale-full-worktree",
-            "worktree_fingerprints": fingerprints
-        });
-        let scoped = report_worktree_freshness(&report, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-        assert!(scoped.fresh);
-        assert_eq!(scoped.basis, "scoped");
-        assert_eq!(scoped.scope, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-        assert_eq!(
-            scoped.report_fingerprint.as_deref(),
-            Some(current_scoped.as_str())
-        );
-
-        let missing_scoped_report = json!({
-            "worktree_fingerprint": "stale-full-worktree"
-        });
-        let missing_scoped =
-            report_worktree_freshness(&missing_scoped_report, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-        assert!(!missing_scoped.fresh);
-        assert_eq!(missing_scoped.basis, "missing-scoped");
-        assert_eq!(missing_scoped.scope, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-    }
-
-    #[test]
-    fn report_worktree_freshness_prefers_matching_source_replay_scoped_fingerprint() {
-        let scope = boon_runtime::PLAN_EXECUTOR_SOURCE_REPLAY_WORKTREE_FINGERPRINT_SCOPE;
-        let current_scoped = worktree_fingerprint_for_scope(scope);
-        let mut fingerprints = serde_json::Map::new();
-        fingerprints.insert(scope.to_owned(), json!(current_scoped.clone()));
-        let report = json!({
-            "worktree_fingerprint": "stale-full-worktree",
-            "worktree_fingerprints": fingerprints
-        });
-        let scoped = report_worktree_freshness(&report, scope);
-        assert!(scoped.fresh);
-        assert_eq!(scoped.basis, "scoped");
-        assert_eq!(scoped.scope, scope);
-        assert_eq!(
-            scoped.report_fingerprint.as_deref(),
-            Some(current_scoped.as_str())
-        );
-    }
-
-    #[test]
-    fn product_status_uses_top_level_status_only() {
-        let report = json!({
-            "status": "pass",
-            "plan_executor_status": "fail"
-        });
-        assert!(report_status_pass(&report));
-
-        let failed_product = json!({
-            "status": "fail",
-            "plan_executor_status": "pass"
-        });
-        assert!(!report_status_pass(&failed_product));
-        assert!(report_status_pass(&json!({"status": "pass"})));
-    }
-
-    #[test]
-    fn native_gpu_integrity_accepts_current_scoped_fingerprint_with_stale_full_fingerprint() {
-        let current_scoped = worktree_fingerprint_for_scope(NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-        let mut fingerprints = serde_json::Map::new();
-        fingerprints.insert(
-            NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE.to_owned(),
-            json!(current_scoped),
-        );
-        let report = json!({
-            "status": "pass",
-            "command": "verify-native-gpu-preview-e2e",
-            "native_gpu_contract": true,
-            "generated_at_utc": current_unix_seconds().to_string(),
-            "git_commit": git_commit(),
-            "worktree_fingerprint": "stale-full-worktree",
-            "worktree_fingerprints": fingerprints,
-            "binary_hash": current_binary_hash()
-        });
-        let reasons = native_gpu_report_integrity_reasons(&report, false, true);
-        assert!(
-            reasons.is_empty(),
-            "current scoped native fingerprint should satisfy integrity: {reasons:?}"
-        );
-
-        let mut stale_scoped = report.clone();
-        stale_scoped["worktree_fingerprints"][NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE] =
-            json!("stale-scoped-worktree");
-        let stale_reasons = native_gpu_report_integrity_reasons(&stale_scoped, false, true);
-        assert!(
-            stale_reasons
-                .iter()
-                .any(|reason| reason.contains("worktree_fingerprint is stale")),
-            "stale scoped native fingerprint must fail integrity: {stale_reasons:?}"
-        );
-    }
-
-    #[test]
-    fn native_gpu_aggregate_fast_paths_stale_identity_before_child_contract_validation() {
-        const REQUIRED_ARGV: &[(&str, &str)] = &[("--example", "cells")];
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-native-stale-fast-path-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let child = dir.join("stale-child.json");
-        let aggregate = dir.join("aggregate.json");
-        write_json(
-            &child,
-            &json!({
-                "status": "fail",
-                "report_version": 1,
-                "generated_at_utc": "1",
-                "command": "verify-native-gpu-preview-e2e",
-                "command_argv": [
-                    current_binary_path(),
-                    "verify-native-gpu-preview-e2e",
-                    "--example",
-                    "cells",
-                    "--report",
-                    child.display().to_string()
-                ],
-                "measurement_mode": "proof",
-                "exit_status": 1,
-                "git_commit": "stale-git",
-                "worktree_fingerprint": "stale-worktree",
-                "binary_hash": "stale-binary",
-                "binary_path": current_binary_path(),
-                "source_hash": "n/a",
-                "scenario_hash": "n/a",
-                "program_hash": "n/a",
-                "budget_hash": "n/a",
-                "graph_node_count": 0,
-                "per_step_pass_fail": [],
-                "artifact_sha256s": [],
-                "native_gpu_contract": false,
-                "blockers": ["this would be a product-contract blocker if stale validation were not fast-pathed"]
-            }),
-        )
-        .unwrap();
-        let result = verify_native_gpu_report_bundle(
-            &[
-                "verify-native-gpu-all".to_owned(),
-                "--check-existing".to_owned(),
-                "--report".to_owned(),
-                aggregate.display().to_string(),
-            ],
-            "verify-native-gpu-all",
-            vec![NativeGpuRequiredReport {
-                label: "stale-child",
-                path: child.clone(),
-                command: "verify-native-gpu-preview-e2e",
-                required_argv: REQUIRED_ARGV,
-                upstream_dependencies: &[],
-                requires_native_gpu_contract: true,
-                max_report_bytes: u64::MAX,
-                max_sidecar_bytes: u64::MAX,
-            }],
-            "test-native-stale-fast-path",
-        );
-        assert!(result.is_err());
-        let report = read_json(&aggregate).unwrap();
-        assert_eq!(
-            report
-                .get("refresh_debt_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report
-                .get("product_contract_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-        assert_eq!(
-            report
-                .get("identity_fast_refresh_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/control_plane_validation_mode")
-                .and_then(serde_json::Value::as_str),
-            Some("identity-fast-refresh")
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/schema_validation_skipped")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/refresh_commands/0/reason")
-                .and_then(serde_json::Value::as_str),
-            Some("identity-freshness-fast-path")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_gpu_aggregate_does_not_refresh_scoped_verifier_identity_with_stale_binary_hash() {
-        const REQUIRED_ARGV: &[(&str, &str)] = &[("--example", "cells")];
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-native-scoped-identity-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let child = dir.join("scoped-child.json");
-        let aggregate = dir.join("aggregate.json");
-        let command_argv =
-            required_xtask_refresh_argv("verify-native-gpu-preview-e2e", REQUIRED_ARGV, &child);
-        let mut child_report = json!({
-            "status": "pass",
-            "report_version": 1,
-            "generated_at_utc": current_unix_seconds().to_string(),
-            "command": "verify-native-gpu-preview-e2e",
-            "command_argv": command_argv,
-            "measurement_mode": "proof",
-            "exit_status": 0,
-            "git_commit": git_commit(),
-            "binary_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "binary_path": current_binary_path(),
-            "source_hash": "n/a",
-            "scenario_hash": "n/a",
-            "program_hash": "n/a",
-            "budget_hash": file_hash("budgets/native-gpu.toml"),
-            "graph_node_count": 0,
-            "per_step_pass_fail": [{"id": "shape", "pass": true}],
-            "artifact_sha256s": [],
-            "native_gpu_contract": true
-        });
-        if let Some(object) = child_report.as_object_mut() {
-            insert_worktree_fingerprint_fields(object, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-            object.insert(
-                "verifier_identity".to_owned(),
-                verifier_identity_for_command_args(
-                    "verify-native-gpu-preview-e2e",
-                    "proof",
-                    object
-                        .get("command_argv")
-                        .and_then(serde_json::Value::as_array)
-                        .unwrap()
-                        .iter()
-                        .map(|arg| arg.as_str().unwrap().to_owned())
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )
-                .unwrap(),
-            );
-        }
-        write_json(&child, &child_report).unwrap();
-
-        let result = verify_native_gpu_report_bundle(
-            &[
-                "verify-native-gpu-all".to_owned(),
-                "--check-existing".to_owned(),
-                "--report".to_owned(),
-                aggregate.display().to_string(),
-            ],
-            "verify-native-gpu-all",
-            vec![NativeGpuRequiredReport {
-                label: "scoped-child",
-                path: child.clone(),
-                command: "verify-native-gpu-preview-e2e",
-                required_argv: REQUIRED_ARGV,
-                upstream_dependencies: &[],
-                requires_native_gpu_contract: true,
-                max_report_bytes: u64::MAX,
-                max_sidecar_bytes: u64::MAX,
-            }],
-            "test-native-scoped-identity",
-        );
-        assert!(
-            result
-                .as_ref()
-                .err()
-                .is_some_and(|error| error.to_string().contains("aggregate_scope")),
-            "one-child unit fixture should fail only the canonical handoff aggregate shape: {result:?}"
-        );
-        let report = read_json(&aggregate).unwrap();
-        assert_eq!(
-            report
-                .get("refresh_debt_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-        assert_eq!(
-            report
-                .get("true_blocker_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-        assert_eq!(
-            report
-                .get("identity_fast_refresh_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/binary_hash_matches")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/verifier_identity_fresh")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/binary_freshness_basis")
-                .and_then(serde_json::Value::as_str),
-            Some("scoped-verifier-identity")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_gpu_aggregate_refreshes_stale_scoped_verifier_identity() {
-        const REQUIRED_ARGV: &[(&str, &str)] = &[("--example", "cells")];
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-native-stale-scoped-identity-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let child = dir.join("stale-scoped-child.json");
-        let aggregate = dir.join("aggregate.json");
-        let command_argv =
-            required_xtask_refresh_argv("verify-native-gpu-preview-e2e", REQUIRED_ARGV, &child);
-        let stale_identity_argv = required_xtask_refresh_argv(
-            "verify-native-gpu-preview-e2e",
-            &[("--example", "todomvc")],
-            &child,
-        );
-        let mut child_report = json!({
-            "status": "pass",
-            "report_version": 1,
-            "generated_at_utc": current_unix_seconds().to_string(),
-            "command": "verify-native-gpu-preview-e2e",
-            "command_argv": command_argv,
-            "measurement_mode": "proof",
-            "exit_status": 0,
-            "git_commit": git_commit(),
-            "binary_hash": current_binary_hash(),
-            "binary_path": current_binary_path(),
-            "source_hash": "n/a",
-            "scenario_hash": "n/a",
-            "program_hash": "n/a",
-            "budget_hash": file_hash("budgets/native-gpu.toml"),
-            "graph_node_count": 0,
-            "per_step_pass_fail": [{"id": "shape", "pass": true}],
-            "artifact_sha256s": [],
-            "native_gpu_contract": true
-        });
-        if let Some(object) = child_report.as_object_mut() {
-            insert_worktree_fingerprint_fields(object, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-            object.insert(
-                "verifier_identity".to_owned(),
-                verifier_identity_for_command_args(
-                    "verify-native-gpu-preview-e2e",
-                    "proof",
-                    &stale_identity_argv,
-                )
-                .unwrap(),
-            );
-        }
-        write_json(&child, &child_report).unwrap();
-
-        let result = verify_native_gpu_report_bundle(
-            &[
-                "verify-native-gpu-all".to_owned(),
-                "--check-existing".to_owned(),
-                "--report".to_owned(),
-                aggregate.display().to_string(),
-            ],
-            "verify-native-gpu-all",
-            vec![NativeGpuRequiredReport {
-                label: "stale-scoped-child",
-                path: child.clone(),
-                command: "verify-native-gpu-preview-e2e",
-                required_argv: REQUIRED_ARGV,
-                upstream_dependencies: &[],
-                requires_native_gpu_contract: true,
-                max_report_bytes: u64::MAX,
-                max_sidecar_bytes: u64::MAX,
-            }],
-            "test-native-stale-scoped-identity",
-        );
-        assert!(result.is_err());
-        let report = read_json(&aggregate).unwrap();
-        assert_eq!(
-            report
-                .get("refresh_debt_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report
-                .get("identity_fast_refresh_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/binary_hash_matches")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/verifier_identity_fresh")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/binary_freshness_basis")
-                .and_then(serde_json::Value::as_str),
-            Some("stale-verifier-identity")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_gpu_aggregate_treats_child_reported_stale_dependency_as_refresh_debt() {
-        let dir = std::env::temp_dir().join(format!(
-            "boon-xtask-native-child-reported-freshness-{}-{}",
-            std::process::id(),
-            monotonic_now_ns().unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let child = dir.join("stale-preview-dependent-child.json");
-        let aggregate = dir.join("aggregate.json");
-        let command_argv = required_xtask_refresh_argv(
-            "verify-native-todomvc-physical-reference-parity",
-            &[],
-            &child,
-        );
-        let mut child_report = json!({
-            "status": "fail",
-            "report_version": 1,
-            "generated_at_utc": current_unix_seconds().to_string(),
-            "command": "verify-native-todomvc-physical-reference-parity",
-            "command_argv": command_argv,
-            "measurement_mode": "proof",
-            "exit_status": 1,
-            "git_commit": git_commit(),
-            "binary_hash": current_binary_hash(),
-            "binary_path": current_binary_path(),
-            "source_hash": "n/a",
-            "scenario_hash": "n/a",
-            "program_hash": "n/a",
-            "budget_hash": file_hash("budgets/native-gpu.toml"),
-            "graph_node_count": 0,
-            "per_step_pass_fail": [{
-                "id": "fresh-current-preview-evidence",
-                "pass": false,
-                "detail": "preview E2E report is stale"
-            }],
-            "artifact_sha256s": [],
-            "native_gpu_contract": true,
-            "blockers": [
-                "physical TodoMVC reference parity is using a stale preview E2E report or framebuffer artifact"
-            ]
-        });
-        if let Some(object) = child_report.as_object_mut() {
-            insert_worktree_fingerprint_fields(object, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
-            object.insert(
-                "verifier_identity".to_owned(),
-                verifier_identity_for_command_args(
-                    "verify-native-todomvc-physical-reference-parity",
-                    "proof",
-                    object
-                        .get("command_argv")
-                        .and_then(serde_json::Value::as_array)
-                        .unwrap()
-                        .iter()
-                        .map(|arg| arg.as_str().unwrap().to_owned())
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )
-                .unwrap(),
-            );
-        }
-        write_json(&child, &child_report).unwrap();
-
-        let result = verify_native_gpu_report_bundle(
-            &[
-                "verify-native-gpu-all".to_owned(),
-                "--check-existing".to_owned(),
-                "--report".to_owned(),
-                aggregate.display().to_string(),
-            ],
-            "verify-native-gpu-all",
-            vec![NativeGpuRequiredReport {
-                label: "stale-preview-dependent-child",
-                path: child.clone(),
-                command: "verify-native-todomvc-physical-reference-parity",
-                required_argv: &[],
-                upstream_dependencies: &[],
-                requires_native_gpu_contract: true,
-                max_report_bytes: u64::MAX,
-                max_sidecar_bytes: u64::MAX,
-            }],
-            "test-native-child-reported-freshness",
-        );
-        assert!(result.is_err());
-        let report = read_json(&aggregate).unwrap();
-        assert_eq!(
-            report
-                .get("refresh_debt_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report
-                .get("true_blocker_child_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-        assert_eq!(
-            report
-                .pointer("/child_reports/0/child_report_blockers_freshness_only")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/refresh_commands/0/reason")
-                .and_then(serde_json::Value::as_str),
-            Some("child-reported-freshness")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn manifest_refresh_argv_does_not_inherit_observed_cells_flags() {
-        let path = Path::new("target/reports/native-gpu/cells-visible-click-e2e-release.json");
-        let canonical = required_xtask_refresh_argv(
-            "verify-native-cells-visible-click-e2e",
-            &[("--profile", "release")],
-            path,
-        );
-        assert!(string_args_contains_pair(
-            &canonical,
-            "--profile",
-            "release"
-        ));
-        assert!(
-            !canonical.iter().any(|arg| arg == "--headed-host-input"),
-            "manifest-canonical refresh argv must not inherit stale observed flags: {canonical:?}"
-        );
-    }
-
-    #[test]
-    fn bytes_required_reports_have_canonical_refresh_argv() {
-        for required in bytes_machine_plan_required_reports() {
-            let path = Path::new(required.path);
-            let replay = bytes_machine_plan_required_report_refresh_argv(required, path);
-            assert!(
-                refresh_queue_command_allowed(
-                    &replay,
-                    "run-report-refresh-queue",
-                    "verify-bytes-machine-plan-all"
-                ),
-                "{} canonical refresh argv is not allowed: {replay:?}",
-                required.label
-            );
-            assert!(string_args_contains_pair(
-                &replay,
-                "--report",
-                required.path
-            ));
-            assert!(
-                !replay.iter().any(|arg| matches!(
-                    arg.as_str(),
-                    "--engine"
-                )),
-                "{} canonical refresh argv contains engine-selection args: {replay:?}",
-                required.label
-            );
-        }
-    }
-
-    #[test]
-    fn bytes_machine_plan_proof_commands_require_plan_executor_counters() {
-        let required = BytesMachinePlanRequiredReport {
-            label: "root-scalar-plan-ops-scenario",
-            path: "target/reports/bytes-plan/root-scalar-plan-ops-scenario-run-plan.json",
-            command: "run-plan-root-scalar-scenario",
-            measurement_mode: "proof",
-        };
-        assert!(bytes_machine_plan_report_requires_plan_executor_counters(
-            &required
-        ));
-    }
-
-    #[test]
-    fn bytes_machine_plan_diagnostic_commands_do_not_require_plan_executor_counters() {
-        let required = BytesMachinePlanRequiredReport {
-            label: "root-scalar-plan-ops-dump-plan",
-            path: "target/reports/bytes-plan/root-scalar-plan-ops-dump-plan.json",
-            command: "dump-plan",
-            measurement_mode: "diagnostic",
-        };
-        assert!(!bytes_machine_plan_report_requires_plan_executor_counters(
-            &required
-        ));
-    }
-
-    #[test]
-    fn native_preview_e2e_has_no_plan_executor_replay_dependency() {
-        let dependencies = native_gpu_required_report_upstream_dependencies("preview-e2e-cells");
-        assert!(
-            dependencies.is_empty(),
-            "native preview E2E must prove native behavior from native reports, not PlanExecutor source replay"
-        );
-    }
-
-    #[test]
-    fn native_gpu_handoff_manifest_models_physical_parity_preview_dependency() {
-        let dependencies =
-            native_gpu_required_report_upstream_dependencies("todomvc-physical-reference-parity");
-        assert_eq!(dependencies.len(), 1);
-        let dependency = &dependencies[0];
-        assert_eq!(dependency.kind, "consumes-native-report");
-        assert_eq!(dependency.label, "preview-e2e-todo_mvc_physical");
-        assert_eq!(
-            dependency.path,
-            "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json"
-        );
-        assert_eq!(dependency.command, "verify-native-gpu-preview-e2e");
-        assert_eq!(dependency.owner_aggregate, "verify-native-gpu-all");
-        assert_eq!(
-            dependency.owner_aggregate_report_path,
-            "target/reports/native-gpu-all.json"
-        );
-        let replay =
-            native_gpu_upstream_dependency_refresh_argv(dependency, Path::new(dependency.path));
-        assert_eq!(
-            replay.get(1).map(String::as_str),
-            Some("verify-native-gpu-preview-e2e")
-        );
-        assert!(string_args_contains_pair(
-            &replay,
-            "--example",
-            "todo_mvc_physical"
-        ));
-        assert!(string_args_contains_pair(&replay, "--profile", "release"));
-        assert!(replay.iter().any(|arg| arg == "--require-hardware-adapter"));
-    }
-
-    #[test]
-    fn non_preview_native_reports_have_no_source_replay_dependency() {
-        assert!(native_gpu_required_report_upstream_dependencies("present-floor").is_empty());
-        assert!(
-            native_gpu_required_report_upstream_dependencies("cells-visible-click-e2e-release")
-                .is_empty()
-        );
-    }
-
-    fn present_floor_contract_report(p95: f64) -> serde_json::Value {
-        json!({
-            "command": "verify-native-gpu-present-floor",
-            "product_only": true,
-            "operator_host_input": false,
-            "real_os_input": false,
-            "sample_input_after_initial_frames": false,
-            "observed_real_os_input": false,
-            "observed_input_event_wake_count": 0,
-            "readback_in_hot_path": false,
-            "proof_readback_in_hot_path": false,
-            "hot_path_proof_readback_count": 0,
-            "measured_frame_count": 32,
-            "max_presented_frame_ms_p95": 16.7,
-            "max_presented_frame_ms_max": 33.4,
-            "max_presented_frame_ms_bounded_outlier_count": 1,
-            "max_presented_frame_ms_bounded_outlier_cap": 66.8,
-            "presented_frame_ms_bounded_outlier_count": 0,
-            "presented_frame_ms_bounded_outlier_policy_pass": true,
-            "proof_mode": "counters",
-            "render_hook_ms_p95": null,
-            "render_loop_mode": "demand_driven",
-            "surface_class": "product-preview-app-window-surface",
-            "focus_safe": true,
-            "hardware_requested": true,
-            "presented_frame_ms_p50_p95_p99_max": {
-                "p50": 8.0,
-                "p95": p95,
-                "p99": p95,
-                "max": p95,
-                "sample_count": 32
-            },
-            "surface_acquire_ms_p50_p95_p99_max": {
-                "p50": 0.1,
-                "p95": 0.2,
-                "p99": 0.2,
-                "max": 0.2,
-                "sample_count": 32
-            },
-            "queue_submit_ms_p50_p95_p99_max": {
-                "p50": 0.1,
-                "p95": 0.2,
-                "p99": 0.2,
-                "max": 0.2,
-                "sample_count": 32
-            },
-            "frame_present_ms_p50_p95_p99_max": {
-                "p50": 0.1,
-                "p95": 0.2,
-                "p99": 0.2,
-                "max": 0.2,
-                "sample_count": 32
-            }
-        })
-    }
-
-    #[test]
-    fn present_floor_label_contract_accepts_counters_only_product_report() {
-        let report = present_floor_contract_report(12.0);
-        assert!(
-            native_gpu_label_contract_blockers("present-floor", &report).is_empty(),
-            "{:?}",
-            native_gpu_label_contract_blockers("present-floor", &report)
-        );
-    }
-
-    #[test]
-    fn present_floor_label_contract_accepts_product_preview_surface_report() {
-        let mut report = present_floor_contract_report(12.0);
-        report["surface_class"] = json!("product-preview-app-window-surface");
-        report["focus_safe"] = json!(true);
-        report["hardware_requested"] = json!(true);
-        assert!(
-            native_gpu_label_contract_blockers("present-floor", &report).is_empty(),
-            "{:?}",
-            native_gpu_label_contract_blockers("present-floor", &report)
-        );
-    }
-
-    #[test]
-    fn present_floor_label_contract_rejects_raw_current_window_report() {
-        let mut report = present_floor_contract_report(12.0);
-        report["surface_class"] = json!("raw-app-window-clear-only-preview-surface");
-        report["focus_safe"] = json!(false);
-        report["hardware_requested"] = json!(false);
-        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("focus_safe")),
-            "present-floor contract must reject non-focus-safe reports: {blockers:?}"
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("product-preview present-floor surface")),
-            "present-floor contract must reject raw current-window surface reports: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn present_floor_label_contract_accepts_bounded_max_outlier() {
-        let mut report = present_floor_contract_report(12.0);
-        report["presented_frame_ms_p50_p95_p99_max"]["max"] = json!(52.7);
-        report["presented_frame_ms_bounded_outlier_count"] = json!(1);
-        report["presented_frame_ms_bounded_outlier_policy_pass"] = json!(true);
-        assert!(
-            native_gpu_label_contract_blockers("present-floor", &report).is_empty(),
-            "{:?}",
-            native_gpu_label_contract_blockers("present-floor", &report)
-        );
-    }
-
-    #[test]
-    fn present_floor_label_contract_rejects_unbounded_max_outlier() {
-        let mut report = present_floor_contract_report(12.0);
-        report["presented_frame_ms_p50_p95_p99_max"]["max"] = json!(80.0);
-        report["presented_frame_ms_bounded_outlier_count"] = json!(2);
-        report["presented_frame_ms_bounded_outlier_policy_pass"] = json!(false);
-        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("bounded outlier policy")),
-            "present-floor contract must reject unbounded max outliers: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn present_floor_label_contract_rejects_hot_path_readback() {
-        let mut report = present_floor_contract_report(12.0);
-        report["readback_in_hot_path"] = json!(true);
-        report["proof_readback_in_hot_path"] = json!(true);
-        report["hot_path_proof_readback_count"] = json!(1);
-        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("readback_in_hot_path")),
-            "present-floor contract must reject readback in the product path: {blockers:?}"
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("hot_path_proof_readback_count")),
-            "present-floor contract must reject proof readback work in the product path: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn native_ux_integrity_rejects_pre_present_proof_coupling() {
-        let report = json!({
-            "command": "verify-native-gpu-preview-e2e",
-            "product_proof_built_pre_present": true,
-            "pre_present_proof_request_count": 2,
-            "last_product_render_frame": {
-                "proof_json_built_pre_present": true,
-                "render_hook_proof_built_pre_present": true
-            },
-            "post_present_proof_requests": [
-                {
-                    "kind": "visible_bound_text",
-                    "built_pre_present": true
-                }
-            ]
-        });
-        let mut reasons = Vec::new();
-        collect_native_gpu_ux_product_path_reasons(&report, &mut reasons);
-        assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.contains("product_proof_built_pre_present=true")),
-            "native UX integrity must reject pre-present product proof coupling: {reasons:?}"
-        );
-        assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.contains("pre_present_proof_request_count")),
-            "native UX integrity must reject pre-present proof counters: {reasons:?}"
-        );
-        assert!(
-            reasons
-                .iter()
-                .any(|reason| reason.contains("built_pre_present=true")),
-            "native UX integrity must reject pre-present proof request rows: {reasons:?}"
-        );
-    }
-
-    #[test]
-    fn stale_path_ledger_rejects_product_forbidden_proof() {
-        let dir = PathBuf::from(format!(
-            "target/tmp/xtask-stale-path-ledger-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create stale-path test dir");
-        let linked_report = dir.join("preview-loop.json");
-        let base_report = dir.join("cells-visible-click.json");
-        let ledger = dir.join("ledger.json");
-        let output = dir.join("out.json");
-        write_json(
-            &linked_report,
-            &json!({
-                "product_proof_built_pre_present": true
-            }),
-        )
-        .expect("write linked report");
-        write_json(
-            &base_report,
-            &json!({
-                "preview_loop_report": linked_report
-            }),
-        )
-        .expect("write base report");
-        write_json(
-            &ledger,
-            &json!({
-                "schema_version": 1,
-                "rows": [{
-                    "id": "reject-product-forbidden-proof",
-                    "mode": "product-forbidden",
-                    "current_owner": "test",
-                    "typed_replacement": "post-present proof queue",
-                    "report_path": base_report,
-                    "linked_report_path_pointer": "/preview_loop_report",
-                    "symbol_or_field": "product_proof_built_pre_present",
-                    "json_pointer": "/product_proof_built_pre_present",
-                    "expected": false,
-                    "positive_gate": "test positive gate",
-                    "negative_gate": "pre-present proof coupling must be false",
-                    "removal_condition": "test removal"
-                }]
-            }),
-        )
-        .expect("write ledger");
-
-        let result = verify_native_gpu_stale_path_ledger(&[
-            "verify-native-gpu-stale-path-ledger".to_owned(),
-            "--ledger".to_owned(),
-            ledger.display().to_string(),
-            "--report".to_owned(),
-            output.display().to_string(),
-        ]);
-
-        assert!(
-            result.is_err(),
-            "stale path ledger must reject product-forbidden pre-present proof rows"
-        );
-        let report = read_json(&output).expect("read failing stale-path report");
-        assert_eq!(
-            report.get("status").and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        assert!(
-            report
-                .get("blockers")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|blockers| blockers.iter().any(|blocker| blocker
-                    .as_str()
-                    .is_some_and(|text| text.contains("product_proof_built_pre_present")))),
-            "failing report should name the stale pre-present proof field: {report}"
-        );
-    }
-
-    #[test]
-    fn stale_path_ledger_accepts_removed_product_forbidden_field() {
-        let dir = PathBuf::from(format!(
-            "target/tmp/xtask-stale-path-ledger-removed-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create stale-path removed test dir");
-        let base_report = dir.join("cells-visible-click.json");
-        let ledger = dir.join("ledger.json");
-        let output = dir.join("out.json");
-        write_json(
-            &base_report,
-            &json!({
-                "status": "pass"
-            }),
-        )
-        .expect("write base report");
-        write_json(
-            &ledger,
-            &json!({
-                "schema_version": 1,
-                "rows": [{
-                    "id": "removed-product-forbidden-proof",
-                    "mode": "product-forbidden",
-                    "current_owner": "test",
-                    "typed_replacement": "post-present proof queue",
-                    "report_path": base_report,
-                    "linked_report_path_pointer": "/preview_loop_report",
-                    "symbol_or_field": "product_proof_built_pre_present",
-                    "json_pointer": "/product_proof_built_pre_present",
-                    "expected": false,
-                    "positive_gate": "test positive gate",
-                    "negative_gate": "pre-present proof coupling must be false or absent",
-                    "removal_condition": "test removal"
-                }]
-            }),
-        )
-        .expect("write ledger");
-
-        verify_native_gpu_stale_path_ledger(&[
-            "verify-native-gpu-stale-path-ledger".to_owned(),
-            "--ledger".to_owned(),
-            ledger.display().to_string(),
-            "--report".to_owned(),
-            output.display().to_string(),
-        ])
-        .expect("removed product-forbidden stale path should pass");
-        let report = read_json(&output).expect("read passing stale-path report");
-        assert_eq!(
-            report.get("status").and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            report
-                .get("product_forbidden_absent_pass_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            report
-                .pointer("/row_results/0/absent_counts_as_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn stale_path_ledger_rejects_non_product_forbidden_modes() {
-        let dir = PathBuf::from(format!(
-            "target/tmp/xtask-stale-path-ledger-mode-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create stale-path mode test dir");
-        let base_report = dir.join("cells-visible-click.json");
-        let ledger = dir.join("ledger.json");
-        let output = dir.join("out.json");
-        write_json(
-            &base_report,
-            &json!({
-                "status": "pass",
-                "some_counter": 0
-            }),
-        )
-        .expect("write base report");
-        write_json(
-            &ledger,
-            &json!({
-                "schema_version": 1,
-                "rows": [{
-                    "id": "obsolete-diagnostic-mode",
-                    "mode": "diagnostic-only",
-                    "current_owner": "test",
-                    "typed_replacement": "product forbidden row",
-                    "report_path": base_report,
-                    "symbol_or_field": "some_counter",
-                    "json_pointer": "/some_counter",
-                    "expected": 0,
-                    "positive_gate": "test positive gate",
-                    "negative_gate": "test negative gate",
-                    "removal_condition": "test removal"
-                }]
-            }),
-        )
-        .expect("write ledger");
-
-        let result = verify_native_gpu_stale_path_ledger(&[
-            "verify-native-gpu-stale-path-ledger".to_owned(),
-            "--ledger".to_owned(),
-            ledger.display().to_string(),
-            "--report".to_owned(),
-            output.display().to_string(),
-        ]);
-
-        assert!(
-            result.is_err(),
-            "stale path ledger must reject obsolete non-product modes"
-        );
-        let report = read_json(&output).expect("read failing stale-path mode report");
-        assert_eq!(
-            report.get("status").and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        assert!(
-            report
-                .get("blockers")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|blockers| blockers.iter().any(|blocker| blocker
-                    .as_str()
-                    .is_some_and(|text| text.contains("product-forbidden")))),
-            "failing report should name the only accepted mode: {report}"
-        );
-    }
-
-    #[test]
-    fn present_floor_label_contract_rejects_observed_input() {
-        let mut report = present_floor_contract_report(12.0);
-        report["observed_real_os_input"] = json!(true);
-        report["observed_input_event_wake_count"] = json!(1);
-        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("observed_real_os_input")),
-            "present-floor contract must reject observed input: {blockers:?}"
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("observed_input_event_wake_count")),
-            "present-floor contract must reject input wake events: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn present_floor_label_contract_rejects_over_budget_p95() {
-        let report = present_floor_contract_report(18.0);
-        let blockers = native_gpu_label_contract_blockers("present-floor", &report);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("presented_frame_ms.p95=18")),
-            "present-floor contract must reject over-budget p95: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn native_gpu_label_contract_rejects_cells_visible_click_address_selection_fallback() {
-        let report = json!({
-            "command": "verify-native-cells-visible-click-e2e",
-            "profile": "release",
-            "operator_host_input": true,
-            "real_os_input": false,
-            "input_injection_method": "preview_verifier_app_owned_native_input_adapter",
-            "direct_runtime_state_mutation": false,
-            "target_count": 16,
-            "input_accept_to_formula_visible_ms_p95": 12.0,
-            "input_wake_to_formula_visible_ms_p95": 12.0,
-            "click_to_formula_visible_ms_p95": 24.0,
-            "max_click_to_formula_ms": 16.7,
-            "max_click_to_present_ms": 33.4,
-            "steady_input_accept_to_formula_visible_ms": {
-                "p95": 12.0
-            },
-            "steady_input_accept_to_present_ms": {
-                "p95": 11.0
-            },
-            "steady_input_wake_to_input_accept_ms": {
-                "p95": 4.0
-            },
-            "steady_input_wake_to_present_ms": {
-                "p95": 12.0
-            },
-            "steady_input_wake_to_formula_visible_ms": {
-                "p95": 12.0
-            },
-            "preview_perf_stats": {
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "p95": 12.0,
-                    "sample_count": 16
-                },
-                "render_loop_mode": "demand_driven",
-                "missed_frame_count": 0
-            },
-            "post_present_proof_isolation": {
-                "status": "pass",
-                "product_path_status": "pass",
-                "product_latency_includes_proof_completion": false,
-                "product_blocks_on_proof_subscribers": false,
-                "proof_latency_reported_separately": true,
-                "proof_completion_required_for_product_present": false,
-                "report_write_in_hot_path": false,
-                "report_serialization_in_hot_path": false,
-                "pre_present_request_count": 0,
-                "hot_path_report_write_count": 0,
-                "hot_path_report_serialization_count": 0,
-                "subscriber_error_count": 0,
-                "worker_error_count": 0,
-                "queued_request_count": 2,
-                "recent_queue_count": 16
-            },
-            "product_only_ux_contract": {
-                "status": "pass",
-                "source": "app_window_product_frame_commits",
-                "proof_completion_required": false,
-                "input_to_present_ms": {
-                    "p95": 12.0,
-                    "max": 12.0
-                },
-                "input_to_formula_visible_ms": {
-                    "p95": 12.0,
-                    "max": 12.0
-                },
-                "product_latency_includes_proof_completion": false,
-                "product_blocks_on_proof_subscribers": false,
-                "hot_path_report_write_count": 0,
-                "product_render_graph_count": 16,
-                "product_render_graph_renderer_owned_count": 16,
-                "present_plan_count": 16,
-                "product_render_graph_missing_count": 0,
-                "product_render_graph_renderer_owned_missing_count": 0,
-                "present_plan_missing_count": 0,
-                "product_render_graph_proof_readback_count": 0,
-                "present_plan_proof_readback_in_product_pass_count": 0,
-                "product_patch_full_scene_build_count": 0
-            },
-            "proof_only_contract": {
-                "status": "pass",
-                "visual_capture_method": "app-owned-wgpu-readback",
-                "click_sample_count": 16,
-                "exact_visual_proof_sample_count": 0,
-                "current_structured_visual_proof_sample_count": 16,
-                "proof_lag_max_frames": 1,
-                "proof_lag_frame_budget": 8
-            },
-            "proof_isolation_contract": {
-                "status": "pass",
-                "product_latency_includes_proof_completion": false,
-                "hot_path_report_write_count": 0
-            },
-            "preview_loop_product_path_contract": {
-                "status": "pass",
-                "source": "app_window_product_frame_commits",
-                "input_to_present_ms_p95": 12.0,
-                "input_to_present_sample_count": 16,
-                "missed_frame_count": 0,
-                "product_frame_scope": {
-                    "input_to_present_ms_max": 12.0,
-                    "hard_failure_count": 0
-                },
-                "renders_per_second": 60.0,
-                "render_loop_mode": "demand_driven",
-                "frame_pacing_state": "requested_animation_burst",
-                "budget_ms": 16.7
-            },
-            "preview_loop_input_to_present_ms_p95": 230.0,
-            "preview_loop_input_to_present_sample_count": 16,
-            "preview_loop_missed_frame_count": 2,
-            "preview_loop_render_loop_mode": "demand_driven",
-            "click_to_visible_max_budget_or_bounded_outliers_pass": true,
-            "proof_current_changed": true,
-            "retained_update_contract": {
-                "status": "pass",
-                "address_selection_fallback_count": 0
-            },
-            "runtime_work_contract": {
-                "status": "pass"
-            },
-            "formula_transition_contract": {
-                "status": "pass"
-            },
-            "selected_cell_transition_contract": {
-                "status": "pass"
-            }
-        });
-        assert!(
-            native_gpu_label_contract_blockers("cells-visible-click-e2e-release", &report)
-                .is_empty(),
-            "well-formed release visible-click report should satisfy the label contract"
-        );
-        let mut isolated_real_window_report = report.clone();
-        isolated_real_window_report["operator_host_input"] = json!(false);
-        isolated_real_window_report["real_os_input"] = json!(true);
-        isolated_real_window_report["input_injection_method"] = json!(
-            "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_preview_ipc_fallback"
-        );
-        let blockers = native_gpu_label_contract_blockers(
-            "cells-visible-click-e2e-release",
-            &isolated_real_window_report,
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("canonical headed app-owned host input")),
-            "isolated Weston must not satisfy the handoff visible-click label contract: {blockers:?}"
-        );
-        let headed_report = report.clone();
-        let mut headed_warmup_report = headed_report.clone();
-        headed_warmup_report["target_count"] = json!(64);
-        headed_warmup_report["steady_input_wake_to_input_accept_ms"] = json!({"p95": null});
-        headed_warmup_report["steady_input_wake_to_present_ms"] = json!({"p95": null});
-        headed_warmup_report["steady_input_wake_to_formula_visible_ms"] = json!({"p95": null});
-        headed_warmup_report["product_only_ux_contract"]["sample_count"] = json!(60);
-        headed_warmup_report["product_only_ux_contract"]["product_render_graph_count"] = json!(60);
-        headed_warmup_report["product_only_ux_contract"]["product_render_graph_renderer_owned_count"] =
-            json!(60);
-        headed_warmup_report["product_only_ux_contract"]["present_plan_count"] = json!(60);
-        headed_warmup_report["proof_only_contract"]["click_sample_count"] = json!(64);
-        headed_warmup_report["proof_only_contract"]["current_structured_visual_proof_sample_count"] =
-            json!(64);
-        headed_warmup_report["preview_loop_product_path_contract"]
-            .as_object_mut()
-            .unwrap()
-            .remove("input_to_present_sample_count");
-        headed_warmup_report["preview_loop_product_path_contract"]["product_frame_scope"]["required_sample_count"] =
-            json!(64);
-        headed_warmup_report["preview_loop_product_path_contract"]["product_frame_scope"]["warmup_sample_count"] =
-            json!(4);
-        headed_warmup_report["preview_loop_product_path_contract"]["product_frame_scope"]["measured_required_sample_count"] =
-            json!(60);
-        headed_warmup_report["preview_loop_product_path_contract"]["product_frame_scope"]["product_frame_sample_count"] =
-            json!(60);
-        assert!(
-            native_gpu_label_contract_blockers(
-                "cells-visible-click-e2e-release",
-                &headed_warmup_report
-            )
-            .is_empty(),
-            "headed reports with warmup-excluded product samples and null wake timing should satisfy the label contract: {:?}",
-            native_gpu_label_contract_blockers(
-                "cells-visible-click-e2e-release",
-                &headed_warmup_report
-            )
-        );
-
-        let mut proof_coupled_report = report.clone();
-        proof_coupled_report["post_present_proof_isolation"]["product_latency_includes_proof_completion"] =
-            json!(true);
-        let blockers = native_gpu_label_contract_blockers(
-            "cells-visible-click-e2e-release",
-            &proof_coupled_report,
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("product_latency_includes_proof_completion")),
-            "label contract must reject product/proof latency coupling: {blockers:?}"
-        );
-
-        let mut missing_graph_report = report.clone();
-        missing_graph_report["product_only_ux_contract"]["product_render_graph_count"] = json!(0);
-        let blockers = native_gpu_label_contract_blockers(
-            "cells-visible-click-e2e-release",
-            &missing_graph_report,
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("product_render_graph_count")),
-            "label contract must reject missing product render graph evidence: {blockers:?}"
-        );
-
-        let mut missing_proof_report = report.clone();
-        missing_proof_report["proof_only_contract"]["current_structured_visual_proof_sample_count"] =
-            json!(4);
-        missing_proof_report["proof_only_contract"]["status"] = json!("fail");
-        let blockers = native_gpu_label_contract_blockers(
-            "cells-visible-click-e2e-release",
-            &missing_proof_report,
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("proof_only_contract")),
-            "label contract must reject missing proof-lane samples: {blockers:?}"
-        );
-
-        let mut bounded_outlier_report = report.clone();
-        bounded_outlier_report["preview_loop_product_path_contract"]["missed_frame_count"] =
-            json!(1);
-        bounded_outlier_report["preview_loop_product_path_contract"]["product_frame_scope"]["input_to_present_ms_max"] =
-            json!(19.0);
-        assert!(
-            native_gpu_label_contract_blockers(
-                "cells-visible-click-e2e-release",
-                &bounded_outlier_report
-            )
-            .is_empty(),
-            "release label contract should accept p95-good product frames with bounded max outliers"
-        );
-
-        let mut unbounded_outlier_report = bounded_outlier_report;
-        unbounded_outlier_report["preview_loop_product_path_contract"]["product_frame_scope"]["input_to_present_ms_max"] =
-            json!(40.0);
-        let blockers = native_gpu_label_contract_blockers(
-            "cells-visible-click-e2e-release",
-            &unbounded_outlier_report,
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("bounded max")),
-            "label contract must reject product max outliers above max_click_to_present_ms: {blockers:?}"
-        );
-
-        let mut fallback_report = report;
-        fallback_report["retained_update_contract"]["address_selection_fallback_count"] = json!(1);
-        let blockers =
-            native_gpu_label_contract_blockers("cells-visible-click-e2e-release", &fallback_report);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("address selection fallback")),
-            "label contract must reject selection fallback: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn native_gpu_label_contract_rejects_isolated_weston_preview_e2e_input() {
-        let report = json!({
-            "command": "verify-native-gpu-preview-e2e",
-            "input_injection_method": "isolated-weston-headless-with-weston-test-control",
-            "operator_host_input": false,
-            "real_os_input": true
-        });
-        let blockers = native_gpu_label_contract_blockers("preview-e2e-cells", &report);
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("BoonDriver/app-owned host input")),
-            "isolated Weston must not satisfy preview E2E handoff input contract: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn diagnostic_snapshots_drop_null_frame_evidence_placeholders() {
-        let real_key = json!({
-            "frame_seq": 7,
-            "content_revision": 11,
-            "layout_revision": 13,
-            "render_scene_revision": 17,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "input_event_seq": null,
-            "present_id": 7,
-            "proof_request_id": null
-        });
-        let sanitized = remove_null_frame_evidence_keys(json!({
-            "initial_readback_probe": {
-                "status": "fail",
-                "last_report": {
-                    "frame_evidence_key": null,
-                    "preview_perf_stats": {
-                        "frame_evidence_key": null
-                    }
-                }
-            },
-            "readback_probe": {
-                "capture_method": "wgpu-visible-surface-copy-src-readback",
-                "frame_evidence_key": real_key,
-                "content_revision": 11,
-                "rendered_frame_count": 7,
-                "surface_epoch": 1
-            }
-        }));
-
-        assert!(
-            sanitized
-                .pointer("/initial_readback_probe/last_report/frame_evidence_key")
-                .is_none()
-        );
-        assert!(
-            sanitized
-                .pointer(
-                    "/initial_readback_probe/last_report/preview_perf_stats/frame_evidence_key"
-                )
-                .is_none()
-        );
-        assert!(
-            sanitized
-                .pointer("/readback_probe/frame_evidence_key")
-                .is_some()
-        );
-        let mut reasons = Vec::new();
-        collect_native_gpu_frame_evidence_reasons(&sanitized, "$", &mut reasons);
-        assert!(
-            reasons.is_empty(),
-            "sanitized diagnostics should not create frame evidence blockers: {reasons:?}"
-        );
-    }
-
-    #[test]
-    fn native_real_window_input_method_does_not_use_operator_host_token() {
-        let report = json!({
-            "status": "pass",
-            "native_gpu_contract": true,
-            "generated_at_utc": current_unix_seconds().to_string(),
-            "git_commit": git_commit(),
-            "worktree_fingerprint": worktree_fingerprint(),
-            "binary_hash": current_binary_hash(),
-            "real_os_input": true,
-            "operator_host_input": false,
-            "input_injection_method": "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_preview_ipc_fallback"
-        });
-        let reasons = native_gpu_report_integrity_reasons(&report, false, true);
-        assert!(
-            !reasons
-                .iter()
-                .any(|reason| reason == "operator host input cannot claim real_os_input=true"),
-            "real-window driver evidence must not be classified as operator-host input: {reasons:?}"
-        );
-
-        let mut bad_report = report;
-        bad_report["input_injection_method"] = json!(
-            "weston_test_control_real_wayland_pointer_move_settle_then_button_only_no_operator_host_fallback"
-        );
-        let bad_reasons = native_gpu_report_integrity_reasons(&bad_report, false, true);
-        assert!(
-            bad_reasons
-                .iter()
-                .any(|reason| reason == "operator host input cannot claim real_os_input=true"),
-            "operator-host token should still be rejected: {bad_reasons:?}"
-        );
-    }
-
-    #[test]
-    fn post_present_artifacts_synthesize_external_render_proof_for_frame() {
-        let frame_key = json!({
-            "frame_seq": 12,
-            "content_revision": 3,
-            "layout_revision": 4,
-            "render_scene_revision": 5,
-            "surface_id": "preview:test",
-            "surface_epoch": 1,
-            "input_event_seq": 9,
-            "present_id": 12,
-            "proof_request_id": null
-        });
-        let layout_dir = PathBuf::from("target/artifacts/native-gpu/document-layout");
-        std::fs::create_dir_all(&layout_dir).unwrap();
-        let layout_path = layout_dir.join(format!(
-            "xtask-post-present-proof-layout-{}.json",
-            std::process::id()
-        ));
-        std::fs::write(
-            &layout_path,
-            serde_json::to_vec_pretty(&json!({
-                "source_intents": [
-                    {
-                        "node": "cell-b0",
-                        "intent": "row_lookup",
-                        "lookup_field": "address",
-                        "lookup_value": "B0"
-                    }
-                ],
-                "layout_frame": {
-                    "display_list": [
-                        {
-                            "node": "cell-b0",
-                            "kind": "button",
-                            "text": "15",
-                            "bounds": {"x": 80.0, "y": 80.0, "width": 80.0, "height": 24.0},
-                            "style": {"selected": true}
-                        }
-                    ]
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let layout_hash = boon_runtime::sha256_file(&layout_path).unwrap();
-        let layout_path_text = layout_path.to_string_lossy().to_string();
-        let report = json!({
-            "frame_evidence_key": frame_key,
-            "last_render_target_kind": "visible-surface-direct",
-            "recent_post_present_proof_artifacts": [
-                {
-                    "status": "pass",
-                    "kind": "visible_bound_text",
-                    "frame_evidence_key": frame_key,
-                    "payload": {
-                        "status": "pass",
-                        "layout_frame_hash": layout_hash,
-                        "entries": [
-                            {
-                                "text": "=A1+B2",
-                                "paths": ["store.selected_input.editing_text"],
-                                "selected": false,
-                                "focused": true
-                            },
-                            {
-                                "node": "cell-b0",
-                                "text": "15",
-                                "paths": ["@row:2:1:display_text"],
-                                "selected": true,
-                                "focused": true,
-                                "text_truncated": false
-                            }
-                        ]
-                    }
-                },
-                {
-                    "status": "pass",
-                    "kind": "retained_bound_sync",
-                    "frame_evidence_key": frame_key,
-                    "payload": {
-                        "status": "pass",
-                        "changed": true,
-                        "text_update_count": 1
-                    }
-                }
-            ],
-            "matching_interactive_readback_artifact_for_frame": {
-                "capture_method": "wgpu-visible-surface-copy-src-readback",
-                "path": "target/artifacts/native-gpu/test.png",
-                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "frame_evidence_key": frame_key
-            }
-        });
-
-        let proof = cells_post_present_external_render_proof_for_frame(
-            &report,
-            report.get("frame_evidence_key").unwrap(),
-        )
-        .expect("post-present proof");
-
-        assert_eq!(
-            proof.pointer("/status").and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            proof.pointer("/source").and_then(serde_json::Value::as_str),
-            Some("post_present_proof_artifacts_by_frame_evidence_key")
-        );
-        assert_eq!(
-            proof.pointer("/proof/frame_evidence_key"),
-            report.get("frame_evidence_key")
-        );
-        assert_eq!(
-            proof
-                .pointer("/proof/capture_method")
-                .and_then(serde_json::Value::as_str),
-            Some("wgpu-visible-surface-copy-src-readback")
-        );
-        assert_eq!(
-            proof
-                .pointer("/visible_bound_text/entries/0/text")
-                .and_then(serde_json::Value::as_str),
-            Some("=A1+B2")
-        );
-        assert_eq!(
-            proof
-                .pointer("/retained_bound_sync/text_update_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            proof
-                .pointer("/layout_artifact")
-                .and_then(serde_json::Value::as_str),
-            Some(layout_path_text.as_str())
-        );
-        assert_eq!(
-            proof
-                .pointer("/input_overlay_focus_state/selected_address")
-                .and_then(serde_json::Value::as_str),
-            Some("B0")
-        );
-        let _ = std::fs::remove_file(layout_path);
-    }
-
-    #[test]
-    fn cells_visual_formula_probe_requires_expected_formula_bar_text_value() {
-        let artifact_dir = std::env::temp_dir().join(format!(
-            "boon-cells-formula-probe-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&artifact_dir).unwrap();
-        let before_path = artifact_dir.join("before.png");
-        let after_path = artifact_dir.join("after.png");
-        let stale_after_path = artifact_dir.join("stale-after.png");
-        let layout_path = artifact_dir.join("layout.json");
-        let mut before = image::RgbaImage::from_pixel(480, 260, image::Rgba([255, 255, 255, 255]));
-        for y in 76..100 {
-            for x in 49..129 {
-                before.put_pixel(x, y, image::Rgba([217, 232, 255, 255]));
-            }
-            for x in 130..210 {
-                before.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
-            }
-        }
-        let mut after = before.clone();
-        for y in 8..38 {
-            for x in 8..48 {
-                after.put_pixel(x, y, image::Rgba([224, 235, 246, 255]));
-            }
-            for x in 80..472 {
-                after.put_pixel(x, y, image::Rgba([220, 230, 240, 255]));
-            }
-        }
-        for y in 76..100 {
-            for x in 49..129 {
-                after.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
-            }
-            for x in 130..210 {
-                after.put_pixel(x, y, image::Rgba([217, 232, 255, 255]));
-            }
-        }
-        before.save(&before_path).unwrap();
-        after.save(&after_path).unwrap();
-        before.save(&stale_after_path).unwrap();
-        std::fs::write(
-            &layout_path,
-            serde_json::to_string(&json!({
-                "source_intents": [
-                    {"node": "formula-address", "intent": "address", "source_path": "A0"},
-                    {"node": "cell-a0", "intent": "address", "source_path": "A0"},
-                    {"node": "cell-b0", "intent": "address", "source_path": "B0"}
-                ],
-                "layout_frame": {
-                    "display_list": [
-                        {
-                            "node": "formula-address",
-                            "kind": "text",
-                            "text": "A0",
-                            "bounds": {"x": 8.0, "y": 8.0, "width": 40.0, "height": 30.0},
-                            "style": {}
-                        },
-                        {
-                            "node": "formula-input",
-                            "kind": "text_input",
-                            "text": "5",
-                            "bounds": {"x": 80.0, "y": 8.0, "width": 392.0, "height": 30.0},
-                            "style": {}
-                        },
-                        {
-                            "node": "cell-a0",
-                            "kind": "button",
-                            "text": "5",
-                            "bounds": {"x": 49.0, "y": 76.0, "width": 80.0, "height": 24.0},
-                            "style": {"selected": true}
-                        },
-                        {
-                            "node": "cell-b0",
-                            "kind": "button",
-                            "text": "15",
-                            "bounds": {"x": 130.0, "y": 76.0, "width": 80.0, "height": 24.0},
-                            "style": {"selected": false}
-                        }
-                    ]
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let after_path_text = after_path.to_string_lossy().to_string();
-        let before_path_text = before_path.to_string_lossy().to_string();
-        let stale_after_path_text = stale_after_path.to_string_lossy().to_string();
-        let layout_path_text = layout_path.to_string_lossy().to_string();
-        let probe = json!({
-            "status": "pass",
-            "accepted_by_hash_change": true,
-            "accepted_by_retained_bound_text_sync": true,
-            "readback_artifact_after": {
-                "path": after_path_text
-            },
-            "last_external_render_proof": {
-                "status": "pass",
-                "layout_artifact": layout_path_text,
-                "retained_bound_sync": {
-                    "status": "pass",
-                    "changed": true,
-                    "text_update_count": 1,
-                    "text_update_binding_paths": [
-                        {
-                            "node": "formula-input",
-                            "paths": ["store.selected_input.editing_text"]
-                        }
-                    ],
-                    "text_update_values": [
-                        {
-                            "node": "formula-input",
-                            "text": "=add(A0,A1)",
-                            "paths": ["store.selected_input.editing_text"]
-                        }
-                    ]
-                }
-            }
-        });
-
-        assert_eq!(
-            cells_visual_formula_probe_from_readback(
-                &probe,
-                Some(&before_path_text),
-                "A0",
-                "B0",
-                "5",
-                "=add(A0,A1)",
-            )
-            .get("status")
-            .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            cells_visual_formula_probe_from_readback(
-                &probe,
-                Some(&before_path_text),
-                "A0",
-                "C0",
-                "5",
-                "=sum(A0:A2)",
-            )
-            .get("status")
-            .and_then(serde_json::Value::as_str),
-            Some("fail"),
-            "the Cells visible-click proof must not pass when the top formula input patched to a stale value"
-        );
-        let mut stale_visual_probe = probe.clone();
-        stale_visual_probe["readback_artifact_after"] = json!({
-            "path": stale_after_path_text
-        });
-        assert_eq!(
-            cells_visual_formula_probe_from_readback(
-                &stale_visual_probe,
-                Some(&before_path_text),
-                "A0",
-                "B0",
-                "5",
-                "=add(A0,A1)",
-            )
-            .get("status")
-            .and_then(serde_json::Value::as_str),
-            Some("fail"),
-            "full-frame/readback metadata must not pass when the top formula-bar crop did not change"
-        );
-
-        let metadata_only_probe = json!({
-            "status": "pass",
-            "accepted_by_hash_change": false,
-            "accepted_by_retained_bound_text_sync": true,
-            "readback_artifact_after": {
-                "path": after_path_text
-            },
-            "last_external_render_proof": probe["last_external_render_proof"].clone()
-        });
-        let metadata_only_result = cells_visual_formula_probe_from_readback(
-            &metadata_only_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            metadata_only_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail"),
-            "retained text-input sync metadata is diagnostic only; Cells visible-click proof needs app-owned visual evidence"
-        );
-        assert_eq!(
-            metadata_only_result
-                .get("retained_text_sync_matches")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-
-        let frame_key = json!({
-            "frame_seq": 9,
-            "content_revision": 7,
-            "layout_revision": 3,
-            "render_scene_revision": 5,
-            "surface_id": "preview:test-surface",
-            "surface_epoch": 1,
-            "input_event_seq": 4,
-            "present_id": 9,
-            "proof_request_id": null
-        });
-        let structured_probe = json!({
-            "status": "pass",
-            "accepted_by_hash_change": false,
-            "accepted_by_retained_bound_text_sync": true,
-            "accepted_by_structured_external_render_proof": true,
-            "structured_external_render_proof_is_current": true,
-            "frame_evidence_key": frame_key.clone(),
-            "last_external_render_proof": {
-                "status": "pass",
-                "layout_artifact": layout_path_text,
-                "visible_surface_rendered": true,
-                "visible_present_path": true,
-                "render_target_kind": "visible-surface-direct",
-                "input_overlay_focus_state": {
-                    "previous_selected_address": "A0",
-                    "selected_address": "B0"
-                },
-                "input_overlay_focused_node_probe": {
-                    "status": "pass",
-                    "focused": true,
-                    "style_selected": true,
-                    "style_focused": true
-                },
-                "proof": {
-                    "status": "pass",
-                    "capture_method": "wgpu-visible-surface-copy-src-readback",
-                    "replacement_proof": "render-loop visible surface readback artifact",
-                    "frame_evidence_key": frame_key.clone(),
-                    "metrics": {
-                        "preview_blocked_on_ipc_count": 0
-                    }
-                },
-                "retained_bound_sync": {
-                    "status": "pass",
-                    "changed": true,
-                    "text_update_count": 2,
-                    "text_update_values": [
-                        {
-                            "node": "formula-input",
-                            "text": "=add(A0,A1)",
-                            "paths": ["store.selected_input.editing_text"]
-                        },
-                        {
-                            "node": "formula-address",
-                            "text": "B0",
-                            "paths": ["store.selected_address"]
-                        }
-                    ]
-                }
-            }
-        });
-        let structured_result = cells_visual_formula_probe_from_readback(
-            &structured_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            structured_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "same-frame structured visible-surface WGPU proof should replace duplicate interaction readback"
-        );
-        assert_eq!(
-            structured_result
-                .pointer("/structured_external_visible_surface_probe/frame_evidence_matches")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        let mut visible_bound_text_probe = structured_probe.clone();
-        visible_bound_text_probe["last_external_render_proof"]["retained_bound_sync"] = json!({
-            "status": "pass",
-            "changed": false,
-            "text_update_count": 0,
-            "text_update_values": []
-        });
-        visible_bound_text_probe["last_external_render_proof"]["visible_bound_text"] = json!({
-            "status": "pass",
-            "source": "layout-frame-current-bound-text",
-            "entry_count": 2,
-            "entry_limit": 512,
-            "truncated": false,
-            "entries": [
-                {
-                    "node": "formula-input",
-                    "text": "=add(A0,A1)",
-                    "text_truncated": false,
-                    "paths": ["store.selected_input.editing_text"]
-                },
-                {
-                    "node": "formula-address",
-                    "text": "B0",
-                    "text_truncated": false,
-                    "paths": ["store.selected_input.address"]
-                }
-            ]
-        });
-        let visible_bound_text_result = cells_visual_formula_probe_from_readback(
-            &visible_bound_text_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            visible_bound_text_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "same-frame visible bound text should prove current formula/address even when no retained text delta was recorded"
-        );
-        assert_eq!(
-            visible_bound_text_result
-                .pointer("/structured_external_visible_surface_probe/visible_formula_text_current")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        let mut selected_visible_node_probe = visible_bound_text_probe.clone();
-        selected_visible_node_probe["last_external_render_proof"]["input_overlay_focus_state"] = json!({
-            "previous_selected_address": "B0",
-            "selected_address": null,
-            "selected_node_count": 1,
-            "selected_node_samples": ["cell-b0"],
-            "selection_proxy": false
-        });
-        selected_visible_node_probe["last_external_render_proof"]["input_overlay_focused_node_probe"] = json!({
-            "status": "missing_focused_node"
-        });
-        selected_visible_node_probe["last_external_render_proof"]["visible_bound_text"]["entries"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
-                "node": "cell-b0",
-                "text": "15",
-                "text_truncated": false,
-                "paths": ["@row:2:1:display_text"],
-                "source_intents": [
-                    {
-                        "node": "cell-b0",
-                        "intent": "row_lookup",
-                        "lookup_field": "address",
-                        "lookup_value": "B0"
-                    }
-                ],
-                "selected": true,
-                "focused": false,
-                "kind": "Button"
-            }));
-        let selected_visible_node_result = cells_visual_formula_probe_from_readback(
-            &selected_visible_node_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            selected_visible_node_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "same-frame visible selected-node proof should prove selection when focus overlay metadata is absent"
-        );
-        assert_eq!(
-            selected_visible_node_result
-                .pointer(
-                    "/structured_external_visible_surface_probe/visible_selected_node_matches_address"
-                )
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            selected_visible_node_result
-                .pointer("/structured_external_visible_surface_probe/focused_node_probe_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        let mut selected_entry_source_intent_probe = selected_visible_node_probe.clone();
-        selected_entry_source_intent_probe["last_external_render_proof"]["layout_artifact"] =
-            serde_json::Value::Null;
-        let selected_entry_source_intent_result = cells_visual_formula_probe_from_readback(
-            &selected_entry_source_intent_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            selected_entry_source_intent_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "post-present visible-bound-text source intents should prove the selected node when a patched layout artifact file is unavailable"
-        );
-        assert_eq!(
-            selected_entry_source_intent_result
-                .pointer(
-                    "/structured_external_visible_surface_probe/visible_selected_node_matches_address"
-                )
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        let mut selected_node_stale_address_probe = selected_visible_node_probe.clone();
-        selected_node_stale_address_probe["last_external_render_proof"]["visible_bound_text"]["entries"]
-            [1]["text"] = json!("A0");
-        let selected_node_stale_address_result = cells_visual_formula_probe_from_readback(
-            &selected_node_stale_address_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            selected_node_stale_address_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "same-frame selected-node/source-intent proof should prove the selected address when the formula address text artifact is stale"
-        );
-        assert_eq!(
-            selected_node_stale_address_result
-                .pointer(
-                    "/structured_external_visible_surface_probe/visible_selected_node_matches_address"
-                )
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            selected_node_stale_address_result
-                .pointer("/structured_external_visible_surface_probe/visible_address_text_current")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        let mut first_click_visible_probe = visible_bound_text_probe.clone();
-        first_click_visible_probe["last_external_render_proof"]["input_overlay_focus_state"] = json!({
-            "previous_selected_address": null,
-            "selected_address": "B0",
-            "selected_node_count": 1
-        });
-        let first_click_visible_result = cells_visual_formula_probe_from_readback(
-            &first_click_visible_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            first_click_visible_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "a first click can prove the selected cell with one focused selected target node plus current visible bound text"
-        );
-        let mut focus_address_structured_probe = structured_probe.clone();
-        focus_address_structured_probe["last_external_render_proof"]["retained_bound_sync"]["text_update_values"] = json!([
-            {
-                "node": "formula-input",
-                "text": "=add(A0,A1)",
-                "paths": ["store.selected_input.editing_text"]
-            }
-        ]);
-        let focus_address_result = cells_visual_formula_probe_from_readback(
-            &focus_address_structured_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            focus_address_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "same-frame focus/selected-node evidence should prove the selected address when the visible formula text is current"
-        );
-        assert_eq!(
-            focus_address_result
-                .pointer("/structured_external_visible_surface_probe/address_text_retained_visible")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            focus_address_result
-                .pointer("/structured_external_visible_surface_probe/focus_state_matches")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-
-        let mut stale_structured_probe = structured_probe.clone();
-        stale_structured_probe["last_external_render_proof"]["proof"]["frame_evidence_key"]["present_id"] =
-            json!(8);
-        let stale_structured_result = cells_visual_formula_probe_from_readback(
-            &stale_structured_probe,
-            Some(&before_path_text),
-            "A0",
-            "B0",
-            "5",
-            "=add(A0,A1)",
-        );
-        assert_eq!(
-            stale_structured_result
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("fail"),
-            "structured visible-surface proof must not pass with stale frame identity"
-        );
-        assert_eq!(
-            stale_structured_result
-                .pointer("/structured_external_visible_surface_probe/frame_evidence_matches")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        let _ = std::fs::remove_dir_all(&artifact_dir);
-    }
-
-    #[test]
-    fn scenario_integrity_rejects_target_text_only_selector() {
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Duplicate".to_owned()),
-        );
-        let step = boon_runtime::ScenarioStep {
-            id: "target-text-only".to_owned(),
-            user_action: Some(action),
-            ..Default::default()
-        };
-
-        assert!(!scenario_user_action_target_text_is_disambiguated(&step));
-    }
-
-    #[test]
-    fn scenario_integrity_accepts_target_text_with_control_selector() {
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert("target".to_owned(), toml::Value::String("row".to_owned()));
-        action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Duplicate".to_owned()),
-        );
-        let step = boon_runtime::ScenarioStep {
-            id: "target-text-with-target".to_owned(),
-            user_action: Some(action),
-            ..Default::default()
-        };
-
-        assert!(scenario_user_action_target_text_is_disambiguated(&step));
-    }
-
-    #[test]
-    fn scenario_integrity_detects_authored_raw_coordinates() {
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target".to_owned(),
-            toml::Value::String("canvas".to_owned()),
-        );
-        action.insert("pointer_x".to_owned(), toml::Value::String("42".to_owned()));
-        let step = boon_runtime::ScenarioStep {
-            id: "raw-coordinate".to_owned(),
-            user_action: Some(action),
-            ..Default::default()
-        };
-
-        assert_eq!(
-            scenario_user_action_raw_coordinate_fields(&step),
-            vec!["pointer_x".to_owned()]
-        );
-    }
-
-    #[test]
-    fn scenario_integrity_requires_public_source_intent_for_actions() {
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target".to_owned(),
-            toml::Value::String("button".to_owned()),
-        );
-        let missing = boon_runtime::ScenarioStep {
-            id: "missing-source-intent".to_owned(),
-            user_action: Some(action.clone()),
-            ..Default::default()
-        };
-        assert!(!scenario_input_action_has_expected_source_intent(&missing));
-
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("store.elements.button".to_owned()),
-        );
-        let present = boon_runtime::ScenarioStep {
-            id: "has-source-intent".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..Default::default()
-        };
-        assert!(scenario_input_action_has_expected_source_intent(&present));
-    }
-
-    #[test]
-    fn scenario_integrity_rejects_row_action_without_identity_or_selector() {
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Duplicate todo".to_owned()),
-        );
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
-        );
-        expected.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Duplicate todo".to_owned()),
-        );
-        let step = boon_runtime::ScenarioStep {
-            id: "row-without-identity-or-selector".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..Default::default()
-        };
-
-        assert!(!scenario_row_action_has_public_identity_or_justified_selector(&step));
-    }
-
-    #[test]
-    fn scenario_integrity_accepts_row_action_with_public_identity() {
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Duplicate todo".to_owned()),
-        );
-        action.insert("target_key".to_owned(), toml::Value::Integer(42));
-        action.insert("target_generation".to_owned(), toml::Value::Integer(1));
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
-        );
-        let step = boon_runtime::ScenarioStep {
-            id: "row-with-public-identity".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..Default::default()
-        };
-
-        assert!(scenario_row_action_has_public_identity_or_justified_selector(&step));
-    }
-
-    #[test]
-    fn scenario_integrity_accepts_row_action_with_justified_selector() {
-        let mut action = BTreeMap::new();
-        action.insert("kind".to_owned(), toml::Value::String("click".to_owned()));
-        action.insert(
-            "target".to_owned(),
-            toml::Value::String("todo checkbox".to_owned()),
-        );
-        action.insert(
-            "target_text".to_owned(),
-            toml::Value::String("Duplicate todo".to_owned()),
-        );
-        let mut expected = BTreeMap::new();
-        expected.insert(
-            "source".to_owned(),
-            toml::Value::String("todo.sources.todo_checkbox.click".to_owned()),
-        );
-        let step = boon_runtime::ScenarioStep {
-            id: "row-with-selector".to_owned(),
-            user_action: Some(action),
-            expected_source_event: Some(expected),
-            ..Default::default()
-        };
-
-        assert!(scenario_row_action_has_public_identity_or_justified_selector(&step));
-    }
-
-    #[test]
-    fn scenario_integrity_accepts_documented_non_source_action_exemption() {
-        let mut action = BTreeMap::new();
-        action.insert(
-            "kind".to_owned(),
-            toml::Value::String("pointer_hover".to_owned()),
-        );
-        action.insert(
-            "target".to_owned(),
-            toml::Value::String("delete button".to_owned()),
-        );
-        let step = boon_runtime::ScenarioStep {
-            id: "hover-without-source-event".to_owned(),
-            user_action: Some(action),
-            source_intent_exemption: Some(
-                "hover only exposes an affordance; click routes the source event".to_owned(),
-            ),
-            ..Default::default()
-        };
-
-        assert!(scenario_input_action_has_expected_source_intent(&step));
-    }
-
-    #[test]
-    fn scenario_integrity_provenance_allows_generated_or_phased_refs() {
-        let generated = boon_runtime::ScenarioRefProvenance {
-            id: "vertical-wheel-scroll".to_owned(),
-            phases: vec!["scroll_focus".to_owned()],
-            provenance: "native generated scroll probe".to_owned(),
-            generated_probe: true,
-        };
-        let phased = boon_runtime::ScenarioRefProvenance {
-            id: "zoom-in".to_owned(),
-            phases: vec!["input".to_owned(), "scroll_focus".to_owned()],
-            provenance: "same authored step feeds both phases".to_owned(),
-            generated_probe: false,
-        };
-        let unphased = boon_runtime::ScenarioRefProvenance {
-            id: "ambiguous".to_owned(),
-            phases: vec!["input".to_owned()],
-            provenance: "single phase is not enough for duplicate refs".to_owned(),
-            generated_probe: false,
-        };
-
-        assert!(scenario_ref_provenance_allows_duplicate(&generated));
-        assert!(scenario_ref_provenance_allows_duplicate(&phased));
-        assert!(!scenario_ref_provenance_allows_duplicate(&unphased));
-    }
-
-    #[test]
-    fn manifest_scroll_coverage_accepts_real_window_report_keys() {
-        let report = json!({
-            "status": "fail",
-            "app_owned_window_vertical_wheel_input": true,
-            "real_horizontal_wheel_input": true,
-            "materialized_range_before_after": {
-                "status": "real-window-wheel-input"
-            },
-            "required_real_window_speed_proven": false,
-            "preview_frame_ms_p95": 20.1
-        });
-
-        assert!(native_scroll_report_vertical_input_covered(&report));
-        assert!(native_scroll_report_horizontal_input_covered(&report));
-        assert!(native_scroll_report_materialized_range_covered(&report));
-        assert_eq!(
-            report
-                .get("required_real_window_speed_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false),
-            "scenario coverage must not rewrite an over-budget scroll-speed report into a speed pass"
-        );
-    }
-
-    #[test]
-    fn manifest_scroll_coverage_rejects_planned_wheel_without_axis_evidence() {
-        let report = json!({
-            "operator_host_wheel_input": true,
-            "materialized_range_before_after": {
-                "status": "waiting-for-host-wheel-input"
-            }
-        });
-
-        assert!(!native_scroll_report_vertical_input_covered(&report));
-        assert!(!native_scroll_report_horizontal_input_covered(&report));
-        assert!(!native_scroll_report_materialized_range_covered(&report));
-    }
-
-    #[test]
-    fn native_idle_wake_target_helpers_accept_wrapped_press_intents() {
-        let layout = json!({
-            "layout_proof": {
-                "source_intent_assertions": [
-                    {"node": "decrement", "intent": "decrement_button", "source_path": "store.sources.decrement_button"},
-                    {"node": "decrement", "intent": "press", "source_path": "store.sources.decrement_button.press"},
-                    {"node": "decrement", "intent": "target", "source_path": "-"},
-                    {"node": "increment", "intent": "increment_button", "source_path": "store.sources.increment_button"},
-                    {"node": "increment", "intent": "press", "source_path": "store.sources.increment_button.press"},
-                    {"node": "increment", "intent": "target", "source_path": "+"}
-                ],
-                "hit_target_assertions": [
-                    {"id": "hit:decrement", "node": "decrement", "bounds": {"x": 306.0, "y": 166.0, "width": 96.0, "height": 40.0}},
-                    {"id": "hit:increment", "node": "increment", "bounds": {"x": 518.0, "y": 166.0, "width": 96.0, "height": 40.0}}
-                ]
-            }
-        });
-        let scenario_path = PathBuf::from("target/tmp/xtask-native-idle-wake-counter-test.scn");
-        std::fs::create_dir_all(
-            scenario_path
-                .parent()
-                .expect("scenario temp path should have a parent"),
-        )
-        .expect("create scenario temp dir");
-        std::fs::write(
-            &scenario_path,
-            r#"
-name = "counter-test"
-source = "examples/counter.bn"
-
-[[step]]
-id = "press-increment"
-expected_source_event = { source = "store.sources.increment_button.press", target_text = "+" }
-"#,
-        )
-        .expect("write scenario");
-
-        let target = native_preview_driver_target_from_scenario(&layout, &scenario_path)
-            .or_else(|| native_preview_driver_target("counter", &layout))
-            .expect("wrapped Counter layout should expose a source-bound hit target");
-        assert_eq!(
-            target.get("node").and_then(serde_json::Value::as_str),
-            Some("increment")
-        );
-    }
-
-    #[test]
-    fn native_preview_route_evidence_uses_embedded_prelaunch_layout_probe() {
-        let report = json!({
-            "operator_host_input": true,
-            "hit_target_assertions": [],
-            "source_intent_assertions": [],
-            "operator_host_input_evidence": {
-                "target_region": {
-                    "id": "hit:primary",
-                    "node": "primary",
-                    "bounds": {"x": 10.0, "y": 20.0, "width": 80.0, "height": 24.0},
-                    "basis": "prelaunch-generic-document-layout-proof"
-                },
-                "host_events": [
-                    {"kind": "pointer_down", "button": "left"}
-                ]
-            },
-            "prelaunch_layout_probe": {
-                "hit_target_assertions": [
-                    {
-                        "id": "hit:secondary",
-                        "node": "secondary",
-                        "bounds": {"x": 100.0, "y": 20.0, "width": 80.0, "height": 24.0}
-                    },
-                    {
-                        "id": "hit:primary",
-                        "node": "primary",
-                        "bounds": {"x": 10.0, "y": 20.0, "width": 80.0, "height": 24.0}
-                    }
-                ],
-                "source_intent_assertions": [
-                    {
-                        "node": "secondary",
-                        "intent": "click",
-                        "source_path": "store.sources.secondary.click"
-                    },
-                    {
-                        "node": "primary",
-                        "intent": "click",
-                        "source_path": "store.sources.primary.click"
-                    }
-                ]
-            }
-        });
-
-        let evidence = native_preview_host_route_evidence("generic", &report);
-        assert_eq!(
-            evidence.get("status").and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            evidence
-                .pointer("/target_hit_region/node")
-                .and_then(serde_json::Value::as_str),
-            Some("primary")
-        );
-        assert_eq!(
-            evidence
-                .pointer("/source_intents/0/source_path")
-                .and_then(serde_json::Value::as_str),
-            Some("store.sources.primary.click")
-        );
-    }
-
-    #[test]
-    fn native_visible_reality_accepts_cosmic_portrait_dev_surface_with_area() {
-        let report = native_visible_reality_surface_report(1020, 1080);
-
-        let harness = native_visible_reality_harness(&report);
-
-        assert_eq!(
-            harness.get("status").and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "blockers={:?}",
-            harness.get("blockers")
-        );
-    }
-
-    #[test]
-    fn native_visible_reality_uses_physical_size_for_window_usability() {
-        let mut report = native_visible_reality_surface_report(1180, 820);
-        report["dev_surface_proof"]["readback_artifact"]["width"] = json!(1920);
-        report["dev_surface_proof"]["readback_artifact"]["height"] = json!(540);
-        report["dev_surface_proof"]["readback_artifact"]["nonblank_samples"] = json!(1920 * 540);
-
-        let harness = native_visible_reality_harness(&report);
-
-        assert_eq!(
-            harness.get("status").and_then(serde_json::Value::as_str),
-            Some("pass"),
-            "blockers={:?}",
-            harness.get("blockers")
-        );
-    }
-
-    #[test]
-    fn native_visible_reality_rejects_tiny_dev_surface() {
-        let report = native_visible_reality_surface_report(820, 720);
-
-        let harness = native_visible_reality_harness(&report);
-
-        assert_eq!(
-            harness.get("status").and_then(serde_json::Value::as_str),
-            Some("fail")
-        );
-        let blockers = harness
-            .get("blockers")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            blockers.iter().any(|blocker| blocker
-                .as_str()
-                .is_some_and(|text| text.contains("dev_surface_proof.physical_size"))),
-            "blockers={blockers:?}"
-        );
-    }
-
-    #[test]
-    fn native_runtime_assertion_requires_live_preview_route_not_source_replay() {
-        let live_report = json!({
-            "native_runtime_assertion_evidence": {
-                "status": "pass",
-                "live_preview_process_route": true,
-                "public_runtime_api": "boon_runtime::LiveRuntime::apply_source_event_for_document_window",
-                "assertions": [{"id": "live-preview-route", "pass": true}],
-                "outputs": [{"path": "store.items", "value": "changed"}]
-            }
-        });
-        let source_replay_report = json!({
-            "native_runtime_assertion_evidence": {
-                "status": "pass",
-                "assertions": [{
-                    "source_scenario_replay": {
-                        "status": "pass"
-                    }
-                }]
-            },
-            "native_host_input_route_evidence": {
-                "status": "pass",
-                "acknowledged_source_events": [{"source": "store.add"}]
-            }
-        });
-
-        assert!(native_runtime_assertion_proves_live_preview_route(
-            &live_report
-        ));
-        assert!(
-            !native_runtime_assertion_proves_live_preview_route(&source_replay_report),
-            "PlanExecutor source replay must stay semantic evidence, not native proof"
-        );
-        let route_only_report = json!({
-            "native_runtime_assertion_evidence": {
-                "status": "pass",
-                "live_preview_process_route": true,
-                "public_runtime_api": "boon_runtime::LiveRuntime::source_intent_route",
-                "assertions": [{"id": "route-only", "pass": true}],
-                "outputs": []
-            }
-        });
-        assert!(
-            !native_runtime_assertion_proves_live_preview_route(&route_only_report),
-            "source-intent route reachability without preview runtime outputs is not native runtime proof"
-        );
-    }
-
-    fn native_visible_reality_surface_report(dev_width: u64, dev_height: u64) -> serde_json::Value {
-        let surface = |role: &str, width: u64, height: u64| {
-            json!({
-                "pid": 10,
-                "window_id": format!("{role}:window"),
-                "surface_id": format!("{role}:surface"),
-                "surface_epoch": 1,
-                "window_backend": "app_window-wayland",
-                "display_server": "wayland",
-                "wgpu_strategy": "NotMainThread",
-                "wgpu_surface_strategy": "NotMainThread",
-                "main_thread_id": "ThreadId(1)",
-                "render_thread_id": "ThreadId(2)",
-                "logical_size": {"width": width, "height": height, "scale": 1.0},
-                "physical_size": {"width": width, "height": height},
-                "presented_frame": true,
-                "interactive_frame_loop": true,
-                "role": role,
-                "readback_artifact": {
-                    "capture_method": "wgpu-visible-surface-copy-src-readback",
-                    "width": width,
-                    "height": height,
-                    "nonblank_samples": width.saturating_mul(height),
-                    "unique_rgba_values": 16
-                }
-            })
-        };
-        let mut dev_surface = surface("dev", dev_width, dev_height);
-        let external_render_proof = json!({
-            "status": "pass",
-            "visible_surface_rendered": true,
-            "visible_present_path": true,
-            "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
-            "visible_surface_metrics": {
-                "render_scene_source": "document-render-scene-patch",
-                "draw_calls": 4,
-                "asset_ref_count": 0,
-                "asset_refs": [],
-                "asset_cache_hits": 0,
-                "asset_cache_misses": 0,
-                "asset_cache_evictions": 0,
-                "asset_cache_entry_count": 0,
-                "asset_cache_byte_count": 0,
-                "asset_cache_byte_cap": 0,
-                "asset_cache_byte_cap_hit": false,
-                "asset_decode_count": 0,
-                "asset_raster_count": 0,
-                "asset_upload_count": 0,
-                "asset_upload_bytes": 0,
-                "asset_failure_diagnostics": [],
-                "color_only_rect_fallback": false,
-                "rect_cap_hit": false,
-                "text_cap_hit": false,
-                "retained_chunk_count": 1,
-                "retained_chunk_hit_count": 1,
-                "retained_chunk_miss_count": 0,
-                "dirty_chunk_count": 0,
-                "retained_chunk_sample_count": 1,
-                "retained_chunk_inventory_truncated": false,
-                "retained_chunks": [{
-                    "id": "chunk:test-dev",
-                    "node": "dev-root",
-                    "kind": "panel",
-                    "bounds": {"x": 0.0, "y": 0.0, "width": dev_width, "height": dev_height},
-                    "transform": {"x": 0.0, "y": 0.0, "scale": 1.0},
-                    "style_identity": {"style_id": 1},
-                    "dependency_set": ["dev-root"],
-                    "gpu_buffer_range": {"start": 0, "end": 6},
-                    "text_run_ids": [],
-                    "texture_asset_refs": [],
-                    "generation": 1,
-                    "cache_status": "hit"
-                }]
-            },
-            "content_bounds_fill_ratio": 1.0,
-            "dev_ui_source": "boon-dev-editor-debug-shell",
-            "dev_editor_visible": true,
-            "fixture_grid_used": false
-        });
-        dev_surface["external_render_proof"] = external_render_proof.clone();
-        json!({
-            "preview_surface_proof": {
-                "pid": 10,
-                "window_id": "preview:window",
-                "surface_id": "preview:surface",
-                "surface_epoch": 1,
-                "window_backend": "app_window-wayland",
-                "display_server": "wayland",
-                "wgpu_strategy": "NotMainThread",
-                "wgpu_surface_strategy": "NotMainThread",
-                "main_thread_id": "ThreadId(1)",
-                "render_thread_id": "ThreadId(2)",
-                "logical_size": {"width": 1920, "height": 1080, "scale": 1.0},
-                "physical_size": {"width": 1920, "height": 1080},
-                "presented_frame": true,
-                "interactive_frame_loop": true,
-                "role": "preview",
-                "readback_artifact": {
-                    "capture_method": "wgpu-visible-surface-copy-src-readback",
-                    "width": 1920,
-                    "height": 1080,
-                    "nonblank_samples": 2073600,
-                    "unique_rgba_values": 16
-                },
-                "product_render_graph_visible_proof": {
-                    "status": "pass"
-                },
-                "external_render_proof": external_render_proof
-            },
-            "dev_surface_proof": dev_surface,
-            "preview_surface_proof_status": "unused",
-            "native_runtime_assertion_evidence": {
-                "status": "pass",
-                "live_preview_process_route": true,
-                "assertions": [{
-                    "id": "live-preview-route",
-                    "pass": true
-                }]
-            },
-            "native_host_input_route_evidence": {
-                "status": "pass",
-                "changes_visible_frame": true
-            }
-        })
-    }
-
-    fn preview_surface_with_metrics(
-        mut surface: serde_json::Value,
-        metrics: serde_json::Value,
-    ) -> serde_json::Value {
-        surface["visible_surface_metrics"] = metrics;
-        surface
-    }
-
-    #[test]
-    fn preview_e2e_surface_proof_does_not_republish_top_level_alias() {
-        let visible_proof = native_visible_reality_surface_report(1020, 1080)
-            .pointer("/dev_surface_proof/external_render_proof")
-            .cloned()
-            .expect("fixture should include a real visible render proof");
-        assert!(native_visible_render_proof_is_usable(&visible_proof));
-
-        let mut report = json!({
-            "preview_native_gpu_render_proof": {
-                "status": "pass",
-                "proof": {
-                    "artifact": {
-                        "present_result": "copy-to-present-scaffold",
-                        "acquired_surface_texture": false
-                    }
-                },
-                "visible_surface_rendered": false,
-                "visible_present_path": false
-            },
-            "preview_surface_proof": {
-                "external_render_proof": visible_proof.clone()
-            }
-        });
-
-        native_preview_e2e_promote_child_role_evidence(&mut report);
-
-        assert_eq!(
-            report.get("preview_native_gpu_render_proof"),
-            Some(&json!({
-                "status": "pass",
-                "proof": {
-                    "artifact": {
-                        "present_result": "copy-to-present-scaffold",
-                        "acquired_surface_texture": false
-                    }
-                },
-                "visible_surface_rendered": false,
-                "visible_present_path": false
-            }))
-        );
-        assert!(
-            report
-                .get("preview_native_gpu_render_proof_source")
-                .is_none(),
-            "surface-scoped proof must not be republished as a top-level acceptance alias"
-        );
-        assert!(preview_surface_visible_proof_ok(&report));
-    }
-
-    #[test]
-    fn multiwindow_visible_proof_must_be_surface_scoped() {
-        let visible_proof = native_visible_reality_surface_report(1020, 1080)
-            .pointer("/dev_surface_proof/external_render_proof")
-            .cloned()
-            .expect("fixture should include a real visible render proof");
-        assert!(native_visible_render_proof_is_usable(&visible_proof));
-
-        let alias_only = json!({
-            "preview_native_gpu_render_proof": visible_proof
-        });
-        assert!(!multiwindow_surface_visible_proof_ok(&alias_only));
-        assert!(
-            alias_only
-                .get("preview_native_gpu_render_proof_source")
-                .is_none(),
-            "alias-only proof must not be republished as accepted surface evidence"
-        );
-
-        let surface_scoped = json!({
-            "preview_surface_proof": {
-                "external_render_proof": alias_only["preview_native_gpu_render_proof"].clone()
-            }
-        });
-        assert!(multiwindow_surface_visible_proof_ok(&surface_scoped));
-
-        let direct_surface_scoped = json!({
-            "preview_surface_proof": native_visible_reality_surface_report(1020, 1080)["preview_surface_proof"].clone()
-        });
-        assert!(multiwindow_surface_visible_proof_ok(&direct_surface_scoped));
-    }
-
-    #[test]
-    fn preview_e2e_delegates_full_manifest_inputs_when_native_smoke_passes() {
-        let report = json!({
-            "evidence_tier": "boon-driver",
-            "visible_reality_harness": {"status": "pass"},
-            "dev_shell_interaction_probe": {"status": "pass"},
-            "native_host_input_route_evidence": {"status": "pass"},
-            "native_runtime_assertion_evidence": {"status": "pass"},
-            "runtime_state_assertions": [
-                {"id": "preview-ipc-host-input-0", "pass": true},
-                {"id": "preview-ipc-host-input-25", "pass": true}
-            ]
-        });
-
-        let evidence = native_preview_manifest_scenario_evidence("todomvc", &report);
-
-        assert_eq!(
-            evidence.get("status").and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert!(
-            evidence
-                .get("delegated_input_scenario_count")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|count| count > 0),
-            "full semantic scenario steps should be explicit delegated entries: {evidence:?}"
-        );
-        assert!(
-            evidence
-                .pointer("/semantic_input_scenario_coverage/entries")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|entries| entries.iter().any(|entry| {
-                    entry.get("kind").and_then(serde_json::Value::as_str) == Some("input-scenario")
-                        && entry.get("status").and_then(serde_json::Value::as_str)
-                            == Some("delegated")
-                })),
-            "input scenario entries should disclose delegated coverage: {evidence:?}"
-        );
-    }
-
-    #[test]
-    fn scroll_hot_path_rejects_render_hook_offscreen_proof() {
-        let mut blockers = Vec::new();
-        require_scroll_render_hook_app_owned_proof_skipped(
-            &mut blockers,
-            &json!({
-                "preview_surface_proof": {
-                    "external_render_proof": {
-                        "render_backend_trait": "boon_native_gpu::render_app_owned_scene_pixels",
-                        "offscreen_app_owned_scene_readback_skipped": false
-                    }
-                }
-            }),
-        );
-        assert!(blockers.iter().any(|blocker| {
-            blocker.contains("offscreen_app_owned_scene_readback_skipped must be true")
-        }));
-        assert!(blockers.iter().any(|blocker| {
-            blocker.contains("render_backend_trait must not use render_app_owned_scene_pixels")
-        }));
-
-        let mut blockers = Vec::new();
-        require_scroll_render_hook_app_owned_proof_skipped(
-            &mut blockers,
-            &json!({
-                "preview_surface_proof": {
-                    "external_render_proof": {
-                        "render_backend_trait": "boon_native_gpu::encode_render_scene_to_surface",
-                        "offscreen_app_owned_scene_readback_skipped": true
-                    }
-                }
-            }),
-        );
-        assert!(blockers.is_empty(), "{blockers:?}");
-    }
-
-    #[test]
-    fn scroll_hot_path_rejects_isolated_weston_handoff_evidence() {
-        let mut blockers = Vec::new();
-        require_common_scroll_hot_path_fields(
-            &mut blockers,
-            &json!({
-                "input_injection_method": "isolated-weston-test-control-axis-specific-scroll-only",
-                "launcher_command": "isolated-weston-real-window",
-                "wheel_input_evidence_source": "axis-specific-real-window-adapter",
-                "speed_timing_window": "post-real-window-input",
-                "runtime_dispatch_count_for_passive_scroll": 0,
-                "graph_rebuild_count": 0,
-                "preview_blocked_on_ipc_count": 0,
-                "scroll_root_ids": ["preview"],
-                "hit_region_ids": ["hit:preview"],
-                "invalidation_classes": ["scroll-transform"],
-                "passive_scroll_path_kind": "retained-property-tree",
-                "generalized_passive_scroll_path": true,
-                "dev_editor_fast_path_kind": "retained-property-tree",
-                "passive_scroll_targeting_policy": "generic-layout-axis-largest-area-scroll-region",
-                "native_scroll_input_route_evidence": {
-                    "status": "pass",
-                    "private_runtime_dispatch_used": false
-                },
-                "passive_scroll_property_tree_proof": {"status": "pass"},
-                "passive_scroll_repaint_proof": {"status": "pass"},
-                "scroll_retained_scene_contract": {"status": "pass"},
-                "render_graph_contract": {"status": "pass"},
-                "post_present_proof_isolation": {"status": "pass"},
-                "preview_loop_product_path_contract": {"status": "pass"},
-                "product_path_ux_timing": {"status": "pass"}
-            }),
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("isolated Weston evidence")),
-            "isolated Weston scroll evidence must not satisfy handoff hot-path contract: {blockers:?}"
-        );
-    }
-
-    #[test]
-    fn scroll_loop_promotion_accepts_newer_epoch_same_frame_readback_without_external_proof() {
-        let frame_key = json!({
-            "frame_seq": 36,
-            "content_revision": 26,
-            "layout_revision": 3,
-            "render_scene_revision": 4,
-            "surface_id": "preview:test-surface",
-            "surface_epoch": 3,
-            "input_event_seq": 60,
-            "present_id": 36,
-            "proof_request_id": null
-        });
-        let loop_report = json!({
-            "status": "pass",
-            "surface_id": "preview:test-surface",
-            "surface_epoch": 3,
-            "frame_evidence_key": frame_key.clone(),
-            "preview_perf_stats": {
-                "render_loop_mode": "demand_driven",
-                "product_frame_count": 4,
-                "product_path_input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 4,
-                    "p50": 6.0,
-                    "p95": 8.0,
-                    "p99": 9.0,
-                    "max": 10.0
-                }
-            },
-            "observed_input_adapter": {
-                "installed": true,
-                "real_os_events_observed": true,
-                "synthetic_input_probe": true,
-                "input_injection_method": "app_window_per_window_interactive_synthetic_scroll_harness",
-                "mouse_scroll_event_count": 30,
-                "mouse_motion_event_count": 30,
-                "scroll_delta_x": 9600.0,
-                "scroll_delta_y": 19200.0,
-                "mouse_last_window_protocol_id": 7,
-                "mouse_window_pos": {
-                    "x": 514.0,
-                    "y": 545.0,
-                    "window_width": 1020.0,
-                    "window_height": 1082.0
-                }
-            },
-            "last_interactive_readback_artifact": {
-                "capture_method": "wgpu-visible-surface-copy-src-readback",
-                "readback_poll_status": "completed_before_deadline",
-                "nonblank_samples": 32,
-                "frame_evidence_key": frame_key.clone()
-            },
-            "matching_interactive_readback_artifact_for_frame_status": "matched"
-        });
-        let mut report = json!({
-            "preview_surface_proof": {
-                "surface_id": "preview:test-surface",
-                "surface_epoch": 1,
-                "input_adapter": {
-                    "installed": true,
-                    "real_os_events_observed": false,
-                    "synthetic_input_probe": true,
-                    "mouse_scroll_event_count": 0,
-                    "scroll_delta_x": 0.0,
-                    "scroll_delta_y": 0.0
-                }
-            }
-        });
-
-        assert!(same_frame_scroll_readback_proven(&loop_report));
-        promote_scroll_loop_report_evidence(
-            &mut report,
-            &loop_report,
-            "preview_surface_proof",
-            "preview_loop_report",
-        );
-
-        assert_eq!(
-            report
-                .get("scroll_loop_report_evidence_promoted")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("scroll_loop_report_surface_id_match")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("scroll_loop_report_surface_epoch_advanced")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("scroll_loop_report_same_frame_readback_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/native_input_adapter/mouse_scroll_event_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(30)
-        );
-        assert_eq!(
-            report
-                .get("app_owned_window_input")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("real_window_input")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report.pointer("/readback_artifacts/0/frame_evidence_key"),
-            Some(&frame_key)
-        );
-    }
-
-    #[test]
-    fn axis_specific_scroll_timing_promotes_post_input_window() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 24.0,
-            "axis_specific_real_window_scroll_observation": {
-                "status": "pass",
-                "vertical_observation": {
-                    "render_hook_app_owned_proof_skipped": true,
-                    "surface_post_input_frame_timing": {
-                        "first_presented_frame_ms": 300.0,
-                        "measured_frame_count": 59,
-                        "command_record_ms_max": 5.5,
-                        "command_record_ms_p50": 1.1,
-                        "command_record_ms_p95": 4.5,
-                        "encoder_finish_ms_max": 0.7,
-                        "encoder_finish_ms_p50": 0.2,
-                        "encoder_finish_ms_p95": 0.6,
-                        "queue_submit_ms_max": 0.9,
-                        "queue_submit_ms_p50": 0.3,
-                        "queue_submit_ms_p95": 0.8,
-                        "frame_present_ms_max": 9.7,
-                        "frame_present_ms_p50": 6.1,
-                        "frame_present_ms_p95": 8.6,
-                        "post_present_bookkeeping_ms_max": 0.5,
-                        "post_present_bookkeeping_ms_p50": 0.1,
-                        "post_present_bookkeeping_ms_p95": 0.4,
-                        "presented_frame_ms_max": 17.6,
-                        "presented_frame_ms_p50": 10.1,
-                        "presented_frame_ms_p95": 12.3,
-                        "presented_frame_ms_p99": 17.6,
-                        "presented_frame_ms_over_16_7_indices": [12],
-                        "presented_frame_ms_over_16_7_max": 17.6,
-                        "render_hook_ms_p95": 3.2,
-                        "sample_frame_count": 60,
-                        "warmup_frame_count": 3
-                    }
-                },
-                "horizontal_observation": {
-                    "render_hook_app_owned_proof_skipped": true,
-                    "surface_post_input_frame_timing": {
-                        "first_presented_frame_ms": 310.0,
-                        "measured_frame_count": 59,
-                        "command_record_ms_max": 6.5,
-                        "command_record_ms_p50": 1.2,
-                        "command_record_ms_p95": 5.5,
-                        "encoder_finish_ms_max": 0.8,
-                        "encoder_finish_ms_p50": 0.3,
-                        "encoder_finish_ms_p95": 0.7,
-                        "queue_submit_ms_max": 1.0,
-                        "queue_submit_ms_p50": 0.4,
-                        "queue_submit_ms_p95": 0.9,
-                        "frame_present_ms_max": 10.7,
-                        "frame_present_ms_p50": 6.2,
-                        "frame_present_ms_p95": 9.6,
-                        "post_present_bookkeeping_ms_max": 0.6,
-                        "post_present_bookkeeping_ms_p50": 0.2,
-                        "post_present_bookkeeping_ms_p95": 0.5,
-                        "presented_frame_ms_max": 16.8,
-                        "presented_frame_ms_p50": 10.2,
-                        "presented_frame_ms_p95": 14.9,
-                        "presented_frame_ms_p99": 16.8,
-                        "presented_frame_ms_over_16_7_indices": [20],
-                        "presented_frame_ms_over_16_7_max": 16.8,
-                        "render_hook_ms_p95": 3.4,
-                        "sample_frame_count": 60,
-                        "warmup_frame_count": 3
-                    }
-                }
-            }
-        });
-
-        assert!(promote_axis_specific_scroll_timing(&mut report));
-        assert_eq!(
-            report
-                .get("preview_frame_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(14.9)
-        );
-        assert_eq!(
-            report
-                .pointer("/wheel_to_visible_ms_p95_per_axis/vertical")
-                .and_then(serde_json::Value::as_f64),
-            Some(12.3)
-        );
-        assert_eq!(
-            report
-                .pointer("/wheel_to_visible_ms_p95_per_axis/horizontal")
-                .and_then(serde_json::Value::as_f64),
-            Some(14.9)
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_frame_timing/measured_frame_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(118)
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_measured_frame_count_per_axis/vertical")
-                .and_then(serde_json::Value::as_u64),
-            Some(59)
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_measured_frame_count_per_axis/horizontal")
-                .and_then(serde_json::Value::as_u64),
-            Some(59)
-        );
-        assert_eq!(
-            report
-                .get("speed_timing_window")
-                .and_then(serde_json::Value::as_str),
-            Some("axis-specific-post-real-window-input")
-        );
-        assert_eq!(
-            report
-                .get("render_hook_app_owned_proof_skipped_for_axis_timing")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_frame_timing/presented_frame_ms_over_16_7_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(2)
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_frame_timing/presented_frame_ms_over_16_7_indices")
-                .and_then(serde_json::Value::as_array)
-                .cloned(),
-            Some(vec![json!(12), json!(79)])
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_frame_timing/command_record_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(5.5)
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_frame_timing/frame_present_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(9.6)
-        );
-        assert_eq!(
-            report
-                .pointer("/post_input_frame_timing/post_present_bookkeeping_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(0.5)
-        );
-    }
-
-    #[test]
-    fn axis_specific_product_path_timing_promotes_sustained_samples() {
-        let product_sample = |axis: &str, attempt: u64, p95: f64| {
-            json!({
-                "axis": axis,
-                "attempt": attempt,
-                "render_loop_mode": "demand_driven",
-                "frame_pacing_state": "requested_animation_burst",
-                "requested_animation_burst_count": 1,
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 1,
-                    "p50": p95 - 1.0,
-                    "p95": p95,
-                    "p99": p95 + 0.2,
-                    "max": p95 + 0.5
-                }
-            })
-        };
-        let mut report = json!({
-            "preview_frame_ms_p95": 24.0,
-            "speed_timing_window": "axis-specific-post-real-window-input",
-            "axis_specific_real_window_scroll_observation": {
-                "status": "pass",
-                "combined_input_adapter": {
-                    "installed": true,
-                    "real_os_events_observed": true,
-                    "synthetic_input_probe": false,
-                    "mouse_scroll_event_count": 4,
-                    "scroll_delta_x": 240.0,
-                    "scroll_delta_y": 360.0
-                },
-                "product_path_timing": {
-                    "status": "pass",
-                    "source": "axis-specific-product-path-input-to-present",
-                    "render_loop_mode": "demand_driven",
-                    "frame_pacing": {"state": "requested_animation_burst"},
-                    "requested_animation_burst_count": 4,
-                    "input_to_present_ms_p50_p95_p99_max": {
-                        "sample_count": 4,
-                        "p50": 8.0,
-                        "p95": 9.0,
-                        "p99": 9.2,
-                        "max": 9.5
-                    },
-                    "present_call_ms_p50_p95_p99_max": {
-                        "sample_count": 4,
-                        "p50": 5.0,
-                        "p95": 6.0,
-                        "p99": 6.2,
-                        "max": 6.5
-                    },
-                    "frame_present_call_ms_p50_p95_p99_max": {
-                        "sample_count": 4,
-                        "p50": 5.0,
-                        "p95": 6.0,
-                        "p99": 6.2,
-                        "max": 6.5
-                    },
-                    "surface_acquire_call_ms_p50_p95_p99_max": {
-                        "sample_count": 4,
-                        "p50": 0.2,
-                        "p95": 0.3,
-                        "p99": 0.4,
-                        "max": 0.5
-                    },
-                    "queue_submit_call_ms_p50_p95_p99_max": {
-                        "sample_count": 4,
-                        "p50": 0.4,
-                        "p95": 0.5,
-                        "p99": 0.6,
-                        "max": 0.7
-                    },
-                    "present_path_ms_p50_p95_p99_max": {
-                        "sample_count": 4,
-                        "p50": 5.6,
-                        "p95": 6.8,
-                        "p99": 7.1,
-                        "max": 7.7
-                    },
-                    "samples": [
-                        product_sample("vertical", 1, 7.0),
-                        product_sample("vertical", 2, 8.0),
-                        product_sample("horizontal", 1, 8.5),
-                        product_sample("horizontal", 2, 9.0)
-                    ]
-                },
-                "vertical_observation": {
-                    "measured_loop_report": {
-                        "present_path_mode": "direct_visible_surface",
-                        "present_path_requested_mode": "direct_visible_surface",
-                        "present_path_selection_reason": "default_direct_visible_surface_with_separate_readback",
-                        "present_path_hooks_present": true,
-                        "present_path_surface_copy_to_present_supported": true,
-                        "present_path_readback_enabled": true,
-                        "last_render_target_kind": "visible-surface-direct"
-                    },
-                    "render_hook_app_owned_proof_skipped": true,
-                    "surface_post_input_frame_timing": {
-                        "measured_frame_count": 30,
-                        "presented_frame_ms_p50": 18.0,
-                        "presented_frame_ms_p95": 24.0,
-                        "presented_frame_ms_p99": 25.0,
-                        "presented_frame_ms_max": 25.0,
-                        "command_record_ms_p95": 3.0,
-                        "encoder_finish_ms_p95": 0.3,
-                        "queue_submit_ms_p95": 12.0,
-                        "frame_present_ms_p95": 8.0,
-                        "sample_frame_count": 30,
-                        "warmup_frame_count": 3
-                    }
-                },
-                "horizontal_observation": {
-                    "measured_loop_report": {
-                        "present_path_mode": "direct_visible_surface",
-                        "present_path_requested_mode": "direct_visible_surface",
-                        "present_path_selection_reason": "default_direct_visible_surface_with_separate_readback",
-                        "present_path_hooks_present": true,
-                        "present_path_surface_copy_to_present_supported": true,
-                        "present_path_readback_enabled": true,
-                        "last_render_target_kind": "visible-surface-direct"
-                    },
-                    "render_hook_app_owned_proof_skipped": true,
-                    "surface_post_input_frame_timing": {
-                        "measured_frame_count": 30,
-                        "presented_frame_ms_p50": 19.0,
-                        "presented_frame_ms_p95": 25.0,
-                        "presented_frame_ms_p99": 26.0,
-                        "presented_frame_ms_max": 26.0,
-                        "command_record_ms_p95": 3.2,
-                        "encoder_finish_ms_p95": 0.4,
-                        "queue_submit_ms_p95": 12.2,
-                        "frame_present_ms_p95": 8.1,
-                        "sample_frame_count": 30,
-                        "warmup_frame_count": 3
-                    }
-                }
-            },
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_name": "hardware",
-                "adapter_device_type": "DiscreteGpu",
-                "adapter_is_software": false,
-                "present_mode": "Mailbox"
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1,
-                    "queue_write_count": 0
-            }))
-        });
-
-        assert!(promote_axis_specific_scroll_timing(&mut report));
-        add_native_scroll_model_evidence(&mut report, "generic", false);
-
-        assert_eq!(
-            report
-                .pointer("/preview_perf_stats/input_to_present_ms_p50_p95_p99_max/sample_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(4)
-        );
-        assert_eq!(
-            report
-                .pointer("/preview_perf_stats/present_path_ms_p50_p95_p99_max/p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(6.8)
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/present_path_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(6.8)
-        );
-        assert_eq!(
-            report
-                .pointer("/frame_budget_split/preview_perf_frame_present_call_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(6.0)
-        );
-        assert_eq!(
-            report
-                .get("present_path_mode")
-                .and_then(serde_json::Value::as_str),
-            Some("direct_visible_surface")
-        );
-        assert_eq!(
-            report
-                .get("present_path_requested_mode")
-                .and_then(serde_json::Value::as_str),
-            Some("direct_visible_surface")
-        );
-        assert_eq!(
-            report
-                .get("present_path_selection_reason")
-                .and_then(serde_json::Value::as_str),
-            Some("default_direct_visible_surface_with_separate_readback")
-        );
-        assert_eq!(
-            report
-                .get("present_path_hooks_present")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("present_path_surface_copy_to_present_supported")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("present_path_readback_enabled")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("last_render_target_kind")
-                .and_then(serde_json::Value::as_str),
-            Some("visible-surface-direct")
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            report
-                .get("product_path_ux_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("speed_budget_timing_window")
-                .and_then(serde_json::Value::as_str),
-            Some("product-path-input-to-present")
-        );
-        assert_eq!(
-            report
-                .get("speed_budget_frame_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(9.0)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn preview_perf_render_hook_summary_proves_renderer_cpu_budget_when_post_input_split_absent() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 4.0,
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "real_os_events_observed": true,
-                "synthetic_input_probe": true,
-                "mouse_scroll_event_count": 30,
-                "scroll_delta_x": 9600.0,
-                "scroll_delta_y": 19200.0,
-                "mouse_last_window_protocol_id": 7
-            },
-            "preview_perf_stats": {
-                "render_loop_mode": "demand_driven",
-                "frame_pacing": {
-                    "state": "idle"
-                },
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 30,
-                    "p50": 0.5,
-                    "p95": 2.8,
-                    "p99": 3.2,
-                    "max": 3.6
-                },
-                "render_hook_ms_p50_p95_p99_max": {
-                    "sample_count": 37,
-                    "p50": 0.2,
-                    "p95": 1.4,
-                    "p99": 3.0,
-                    "max": 23.0
-                },
-                "present_path_ms_p50_p95_p99_max": {
-                    "sample_count": 37,
-                    "p50": 0.17,
-                    "p95": 0.5,
-                    "p99": 0.6,
-                    "max": 0.7
-                }
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_is_software": false
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1,
-                    "queue_write_count": 0
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "cells", false);
-
-        assert_eq!(
-            report
-                .get("renderer_frame_budget_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("renderer_frame_budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("renderer_cpu_frame_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(1.4)
-        );
-        assert_eq!(
-            report
-                .get("renderer_cpu_frame_timing_source")
-                .and_then(serde_json::Value::as_str),
-            Some("post_input_frame_timing.command_record_ms_p95+encoder_finish_ms_p95")
-        );
-    }
-
-    #[test]
-    fn planned_operator_wheel_input_is_not_observed_scroll_speed_evidence() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 4.0,
-            "operator_host_wheel_input": true,
-            "operator_host_input_evidence": {
-                "host_events": [{"kind": "wheel"}, {"kind": "wheel"}],
-                "deltas": {"vertical_px": 720.0, "horizontal_px": 480.0}
-            },
-            "native_input_adapter": {
-                "mouse_scroll_event_count": 0,
-                "scroll_delta_x": 0.0,
-                "scroll_delta_y": 0.0
-            },
-            "preview_surface_proof": {
-                "adapter_is_software": false
-            }
-        });
-
-        add_native_scroll_model_evidence(&mut report, "cells", false);
-
-        assert_eq!(
-            report
-                .get("wheel_input_evidence_source")
-                .and_then(serde_json::Value::as_str),
-            Some("operator-host-plan")
-        );
-        assert_eq!(
-            report
-                .get("selected_wheel_input_observed")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn software_adapter_over_budget_does_not_prove_scroll_speed() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 24.0,
-            "speed_timing_window": "post-real-window-input",
-            "post_input_frame_timing": {
-                "measured_frame_count": 30,
-                "surface_acquire_ms_p95": 0.2,
-                "command_record_ms_p95": 3.0,
-                "encoder_finish_ms_p95": 0.4,
-                "queue_submit_ms_p95": 12.0,
-                "frame_present_ms_p95": 8.6
-            },
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 2,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_name": "llvmpipe",
-                "adapter_backend": "Vulkan",
-                "adapter_device_type": "Cpu",
-                "adapter_is_software": true,
-                "present_mode": "Immediate",
-                "supported_present_modes": ["Immediate", "Fifo"],
-                "non_vsync_present_mode_available": true,
-                "desired_maximum_frame_latency": 1,
-                "surface_format": "Bgra8UnormSrgb"
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1,
-                    "queue_write_count": 0
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "generic", false);
-
-        assert_eq!(
-            report
-                .get("software_adapter_wall_clock_budget_exempt")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("real_window_speed_adapter_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("real_window_speed_adapter_policy")
-                .and_then(serde_json::Value::as_str),
-            Some("software-diagnostic-only")
-        );
-        assert_eq!(
-            report
-                .get("measured_adapter_name")
-                .and_then(serde_json::Value::as_str),
-            Some("llvmpipe")
-        );
-        assert_eq!(
-            report
-                .get("measured_present_mode")
-                .and_then(serde_json::Value::as_str),
-            Some("Immediate")
-        );
-        assert_eq!(
-            report
-                .get("measured_non_vsync_present_mode_available")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("wall_clock_frame_budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("renderer_frame_budget_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("renderer_frame_budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/non_os_scroll_model/frame_budget_model_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("renderer_cpu_frame_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(3.4)
-        );
-        assert_eq!(
-            report
-                .get("present_blocking_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(20.6)
-        );
-        assert_eq!(
-            report
-                .get("required_real_window_speed_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn software_adapter_under_budget_remains_diagnostic_only() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 12.0,
-            "speed_timing_window": "post-real-window-input",
-            "post_input_frame_timing": {
-                "measured_frame_count": 30,
-                "surface_acquire_ms_p95": 0.2,
-                "command_record_ms_p95": 3.0,
-                "encoder_finish_ms_p95": 0.4,
-                "queue_submit_ms_p95": 4.0,
-                "frame_present_ms_p95": 4.0
-            },
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 2,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_name": "llvmpipe",
-                "adapter_device_type": "Cpu",
-                "adapter_is_software": true,
-                "present_mode": "Immediate",
-                "supported_present_modes": ["Immediate", "Fifo"],
-                "non_vsync_present_mode_available": true
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1,
-                    "queue_write_count": 0
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "generic", false);
-
-        assert_eq!(
-            report
-                .get("wall_clock_frame_budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("real_window_speed_adapter_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("required_real_window_speed_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn product_path_input_to_present_timing_drives_scroll_budget_when_proven() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 24.0,
-            "speed_timing_window": "post-real-window-input",
-            "post_input_frame_timing": {
-                "measured_frame_count": 30,
-                "surface_acquire_ms_p95": 0.2,
-                "command_record_ms_p95": 3.0,
-                "encoder_finish_ms_p95": 0.4,
-                "queue_submit_ms_p95": 12.0,
-                "frame_present_ms_p95": 8.6
-            },
-            "render_loop_state": {
-                "requested_animation_burst_count": 1
-            },
-            "preview_perf_stats": {
-                "render_loop_mode": "demand_driven",
-                "frame_pacing": {"state": "requested_animation_burst"},
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 5,
-                    "p50": 7.0,
-                    "p95": 8.0,
-                    "p99": 8.5,
-                    "max": 9.0
-                }
-            },
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 2,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_name": "hardware",
-                "adapter_device_type": "DiscreteGpu",
-                "adapter_is_software": false,
-                "present_mode": "Mailbox"
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1,
-                    "queue_write_count": 0
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "generic", false);
-
-        assert_eq!(
-            report
-                .get("product_path_ux_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("speed_budget_timing_window")
-                .and_then(serde_json::Value::as_str),
-            Some("product-path-input-to-present")
-        );
-        assert_eq!(
-            report
-                .get("wall_clock_frame_budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("ux_frame_budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("scroll_frame_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(8.0)
-        );
-        assert_eq!(
-            report
-                .get("wheel_to_visible_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(8.0)
-        );
-        assert_eq!(
-            report
-                .get("required_real_window_speed_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn product_path_timing_rejects_idle_samples_for_scroll_budget() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 10.0,
-            "speed_timing_window": "post-real-window-input",
-            "post_input_frame_timing": {
-                "measured_frame_count": 30
-            },
-            "render_loop_state": {
-                "requested_animation_burst_count": 4
-            },
-            "preview_perf_stats": {
-                "render_loop_mode": "demand_driven",
-                "frame_pacing": {"state": "idle"},
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 4,
-                    "p50": 7.0,
-                    "p95": 8.0,
-                    "p99": 8.5,
-                    "max": 9.0
-                }
-            },
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 2,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_name": "hardware",
-                "adapter_device_type": "DiscreteGpu",
-                "adapter_is_software": false,
-                "present_mode": "Mailbox"
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1,
-                    "queue_write_count": 0
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "generic", false);
-
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/status")
-                .and_then(serde_json::Value::as_str),
-            Some("not-requested-animation-burst-sample")
-        );
-        assert_eq!(
-            report
-                .get("product_path_ux_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("speed_budget_timing_window")
-                .and_then(serde_json::Value::as_str),
-            Some("post-real-window-input")
-        );
-    }
-
-    #[test]
-    fn product_path_timing_accepts_product_interaction_samples_after_burst_exits() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 135.0,
-            "speed_timing_window": "product-path-preview-perf-stats",
-            "post_input_frame_timing": {
-                "measured_frame_count": 30
-            },
-            "render_loop_state": {
-                "requested_animation_burst_count": 1
-            },
-            "preview_perf_stats": {
-                "render_loop_mode": "demand_driven",
-                "frame_lane": "product_interaction",
-                "product_frame_count": 30,
-                "frame_pacing": {"state": "idle"},
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 30,
-                    "p50": 0.35,
-                    "p95": 0.75,
-                    "p99": 1.2,
-                    "max": 1.45
-                },
-                "render_hook_ms_p50_p95_p99_max": {
-                    "sample_count": 37,
-                    "p50": 0.17,
-                    "p95": 1.12,
-                    "p99": 25.0,
-                    "max": 25.3
-                },
-                "present_path_ms_p50_p95_p99_max": {
-                    "sample_count": 37,
-                    "p50": 0.12,
-                    "p95": 0.23,
-                    "p99": 0.29,
-                    "max": 0.30
-                }
-            },
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 30,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_name": "hardware",
-                "adapter_device_type": "DiscreteGpu",
-                "adapter_is_software": false,
-                "present_mode": "Mailbox"
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 3,
-                    "queue_write_count": 0
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "cells", false);
-
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/status")
-                .and_then(serde_json::Value::as_str),
-            Some("pass")
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/frame_pacing_state_at_sample")
-                .and_then(serde_json::Value::as_str),
-            Some("idle")
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/product_interaction_lane_sample")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("product_path_ux_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("speed_budget_timing_window")
-                .and_then(serde_json::Value::as_str),
-            Some("product-path-input-to-present")
-        );
-        assert_eq!(
-            report
-                .get("speed_budget_frame_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(0.75)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn scroll_budget_contract_uses_product_ux_lane_when_selected() {
-        let report = json!({
-            "display_server": "wayland",
-            "budget_pass": true,
-            "preview_frame_ms_p95": 29.0,
-            "speed_budget_timing_window": "product-path-input-to-present",
-            "speed_budget_frame_ms_p95": 2.0,
-            "wheel_to_visible_ms_p95": 2.0,
-            "ux_frame_budget_pass": true,
-            "product_path_ux_timing_proven": true,
-            "product_path_ux_timing": {
-                "status": "pass",
-                "proof_latency_excluded": true
-            },
-            "missed_frame_count": 0,
-            "dropped_frame_count": 0,
-            "longest_visible_stall_ms": 2.8,
-            "non_os_scroll_model": {
-                "status": "pass",
-                "frame_budget_model_pass": true
-            }
-        });
-        let mut blockers = Vec::new();
-
-        require_scroll_budget_fields(&mut blockers, &report);
-
-        assert!(
-            blockers.is_empty(),
-            "product UX lane should own scroll speed acceptance; blockers={blockers:?}"
-        );
-    }
-
-    #[test]
-    fn scroll_budget_contract_rejects_polluted_product_ux_lane() {
-        let report = json!({
-            "display_server": "wayland",
-            "budget_pass": true,
-            "preview_frame_ms_p95": 12.0,
-            "speed_budget_timing_window": "product-path-input-to-present",
-            "speed_budget_frame_ms_p95": 18.0,
-            "wheel_to_visible_ms_p95": 18.0,
-            "ux_frame_budget_pass": false,
-            "product_path_ux_timing_proven": true,
-            "product_path_ux_timing": {
-                "status": "pass",
-                "proof_latency_excluded": false
-            },
-            "missed_frame_count": 0,
-            "dropped_frame_count": 0,
-            "longest_visible_stall_ms": 18.0,
-            "non_os_scroll_model": {
-                "status": "pass",
-                "frame_budget_model_pass": true
-            }
-        });
-        let mut blockers = Vec::new();
-
-        require_scroll_budget_fields(&mut blockers, &report);
-
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("ux_frame_budget_pass")),
-            "over-budget UX lane must fail; blockers={blockers:?}"
-        );
-        assert!(
-            blockers
-                .iter()
-                .any(|blocker| blocker.contains("proof_latency_excluded")),
-            "product UX lane must exclude proof latency; blockers={blockers:?}"
-        );
-    }
-
-    #[test]
-    fn product_path_timing_rejects_continuous_probe_for_scroll_budget() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 0.0,
-            "render_loop_state": {
-                "requested_animation_burst_count": 1
-            },
-            "preview_perf_stats": {
-                "render_loop_mode": "continuous_probe",
-                "frame_pacing": {"state": "probe"},
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 3,
-                    "p50": 6.0,
-                    "p95": 7.0,
-                    "p99": 7.5,
-                    "max": 8.0
-                }
-            },
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 2,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_is_software": false
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "generic", false);
-
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/status")
-                .and_then(serde_json::Value::as_str),
-            Some("not-demand-driven-product-path")
-        );
-        assert_eq!(
-            report
-                .get("product_path_ux_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("required_real_window_speed_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn product_path_rejects_single_frame_timing_without_sustained_samples() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 24.0,
-            "frame_input_to_present_ms": 9.0,
-            "render_loop_state": {
-                "requested_animation_burst_count": 1
-            },
-            "preview_perf_stats": {
-                "render_loop_mode": "demand_driven",
-                "frame_pacing": {"state": "requested_animation_burst"},
-                "input_to_present_ms_p50_p95_p99_max": {
-                    "sample_count": 0,
-                    "p50": null,
-                    "p95": null,
-                    "p99": null,
-                    "max": null
-                }
-            },
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 2,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_is_software": false
-            }), json!({
-                    "upload_bytes": 0,
-                    "draw_calls": 1
-            }))
-        });
-
-        add_native_scroll_model_evidence(&mut report, "generic", false);
-
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/timing_source")
-                .and_then(serde_json::Value::as_str),
-            Some("preview_perf_stats.input_to_present_ms_p50_p95_p99_max")
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/sample_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(0)
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/status")
-                .and_then(serde_json::Value::as_str),
-            Some("missing-input-to-present-samples")
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/min_sample_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(4)
-        );
-        assert_eq!(
-            report
-                .pointer("/product_path_ux_timing/sustained_sample_count_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("product_path_input_to_present_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            None
-        );
-        assert_eq!(
-            report
-                .get("speed_budget_frame_ms_p95")
-                .and_then(serde_json::Value::as_f64),
-            Some(24.0)
-        );
-        assert_eq!(
-            report
-                .get("product_path_ux_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-
-        let mut missing_burst = report.clone();
-        missing_burst["render_loop_state"]["requested_animation_burst_count"] = json!(0);
-        add_native_scroll_model_evidence(&mut missing_burst, "generic", false);
-        assert_eq!(
-            missing_burst
-                .pointer("/product_path_ux_timing/status")
-                .and_then(serde_json::Value::as_str),
-            Some("missing-input-to-present-samples")
-        );
-        assert_eq!(
-            missing_burst
-                .get("product_path_ux_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn dev_editor_scroll_budget_uses_dev_surface_adapter_flag() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 12.0,
-            "speed_timing_window": "post-real-window-input",
-            "post_input_frame_timing": {
-                "measured_frame_count": 30
-            },
-            "operator_host_wheel_input": true,
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "installed": true,
-                "mouse_scroll_event_count": 2,
-                "scroll_delta_x": 240.0,
-                "scroll_delta_y": 360.0
-            },
-            "preview_surface_proof": preview_surface_with_metrics(json!({
-                "adapter_is_software": true
-            }), json!({
-                "upload_bytes": 0,
-                "draw_calls": 1,
-                "queue_write_count": 0,
-                "visible_text_runs": 64,
-                "shaped_text_runs": 64,
-                "shaped_run_cache_hits": 64,
-                "shaped_run_cache_misses": 0
-            })),
-            "dev_surface_proof": {
-                "adapter_name": "discrete-gpu",
-                "adapter_backend": "Vulkan",
-                "adapter_device_type": "DiscreteGpu",
-                "adapter_is_software": false,
-                "present_mode": "Mailbox",
-                "supported_present_modes": ["Fifo", "Mailbox"],
-                "non_vsync_present_mode_available": true,
-                "desired_maximum_frame_latency": 1,
-                "surface_format": "Bgra8UnormSrgb"
-            },
-            "line_count": 10000,
-            "longest_line_bytes": 2000
-        });
-
-        add_native_scroll_model_evidence(&mut report, "dev-code-editor", true);
-
-        assert_eq!(
-            report
-                .get("software_adapter_wall_clock_budget_exempt")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("real_window_speed_adapter_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("measured_adapter_name")
-                .and_then(serde_json::Value::as_str),
-            Some("discrete-gpu")
-        );
-        assert_eq!(
-            report
-                .get("measured_present_mode")
-                .and_then(serde_json::Value::as_str),
-            Some("Mailbox")
-        );
-        assert_eq!(
-            report
-                .get("wall_clock_frame_budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("required_real_window_speed_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn removed_dev_editor_scroll_surface_selector_fails_closed() {
-        let args = vec![
-            "verify-native-gpu-scroll-speed".to_owned(),
-            "--surface".to_owned(),
-            "dev-code-editor".to_owned(),
-        ];
-        let selector = native_gpu_scroll_selector(&args);
-
-        assert_eq!(selector.label, "dev-code-editor");
-        assert!(
-            selector
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("manifest examples only")),
-            "blockers={:?}",
-            selector.blockers
-        );
-    }
-
-    #[test]
-    fn removed_dev_editor_scroll_surface_report_is_not_handoff_child() {
-        let required_reports = native_gpu_handoff_required_reports();
-        assert!(
-            required_reports
-                .iter()
-                .all(|requirement| requirement.label != "scroll-speed-dev-code-editor"),
-            "removed dev-editor scroll surface report must stay out of the handoff manifest"
-        );
-        assert!(
-            required_reports.iter().all(|requirement| {
-                requirement.path
-                    != Path::new("target/reports/native-gpu/scroll-speed-dev-code-editor.json")
-            }),
-            "handoff manifest must not refresh the removed dev-editor scroll surface report"
-        );
-    }
-
-    #[test]
-    fn axis_specific_real_window_input_overrides_planned_operator_wheel_input() {
-        let mut report = json!({
-            "preview_frame_ms_p95": 24.0,
-            "operator_host_wheel_input": true,
-            "operator_host_input_evidence": {
-                "host_events": [{"kind": "wheel"}, {"kind": "wheel"}],
-                "deltas": {"vertical_px": 720.0, "horizontal_px": 480.0}
-            },
-            "app_owned_window_input": true,
-            "real_window_input": true,
-            "native_input_adapter": {
-                "mouse_scroll_event_count": 0,
-                "scroll_delta_x": 0.0,
-                "scroll_delta_y": 0.0
-            },
-            "preview_surface_proof": {
-                "adapter_is_software": false
-            },
-            "axis_specific_real_window_scroll_observation": {
-                "status": "pass",
-                "combined_input_adapter": {
-                    "mouse_scroll_event_count": 4,
-                    "scroll_delta_x": 480.0,
-                    "scroll_delta_y": 720.0
-                },
-                "vertical_observation": {
-                    "surface_post_input_frame_timing": {
-                        "measured_frame_count": 59,
-                        "presented_frame_ms_p95": 11.0,
-                        "sample_frame_count": 60,
-                        "warmup_frame_count": 3
-                    }
-                },
-                "horizontal_observation": {
-                    "surface_post_input_frame_timing": {
-                        "measured_frame_count": 59,
-                        "presented_frame_ms_p95": 12.0,
-                        "sample_frame_count": 60,
-                        "warmup_frame_count": 3
-                    }
-                }
-            }
-        });
-
-        assert!(promote_axis_specific_scroll_timing(&mut report));
-        add_native_scroll_model_evidence(&mut report, "cells", false);
-
-        assert_eq!(
-            report
-                .get("wheel_input_evidence_source")
-                .and_then(serde_json::Value::as_str),
-            Some("axis-specific-real-window-adapter")
-        );
-        assert_eq!(
-            report
-                .get("selected_wheel_input_observed")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("real_window_timing_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("required_real_window_speed_proven")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .get("operator_vertical_wheel_input")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            report
-                .get("real_vertical_wheel_input")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            report
-                .pointer("/materialized_range_before_after/status")
-                .and_then(serde_json::Value::as_str),
-            Some("real-window-wheel-input")
-        );
-        assert_eq!(
-            report
-                .get("budget_pass")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-    }
-}
+mod tests;

@@ -1856,6 +1856,14 @@ pub fn assert_scenario_checkpoint(
     }
     for (path, expected) in &input.expect_root_text {
         let actual = root_textlike_for_assertion(root_state, path, path)?;
+        if path.starts_with("bridge_") && expected != &actual {
+            return Err(format!(
+                "{}: {path} expected {expected:?}, got {actual:?}; probes: {}",
+                input.step_id,
+                root_bridge_probe_report(root_state)
+            )
+            .into());
+        }
         assert_executor_eq_report(&input.step_id, path, expected, &actual)?;
         checked.push("expect_root_text");
     }
@@ -1869,6 +1877,34 @@ pub fn assert_scenario_checkpoint(
             "passed": true,
         }),
     })
+}
+
+fn root_bridge_probe_report(root_state: &JsonMap<String, JsonValue>) -> String {
+    [
+        "bridge_request_descriptor_label",
+        "bridge_response_descriptor_label",
+        "bridge_request_fingerprint",
+        "bridge_response_fingerprint",
+        "bridge_request_input_digest",
+        "bridge_response_input_digest",
+        "bridge_request_structural_key",
+        "bridge_response_structural_key",
+        "bridge_request_window_label",
+        "bridge_response_window_label",
+        "bridge_response_status",
+        "bridge_response_status_compact_label",
+    ]
+    .iter()
+    .map(|probe| {
+        let value = root_state
+            .get(*probe)
+            .or_else(|| root_state.get(&format!("store.{probe}")))
+            .and_then(json_scalar_textlike)
+            .unwrap_or_else(|| "<missing>".to_owned());
+        format!("{probe}={value}")
+    })
+    .collect::<Vec<_>>()
+    .join("; ")
 }
 
 fn list_rows_with_field<'a>(
@@ -1965,7 +2001,73 @@ fn root_textlike_for_assertion(
             return Ok(text);
         }
     }
-    Err(format!("PlanExecutor root text assertion path `{path}` not found").into())
+    let probes = [
+        path,
+        &format!("store.{fallback_path}"),
+        fallback_path,
+        "bridge_request_window_label",
+        "store.bridge_request_window_label",
+        "keyboard_viewport_label",
+        "store.keyboard_viewport_label",
+        "viewport_label",
+        "store.viewport_label",
+        "viewport_label_start",
+        "store.viewport_label_start",
+        "viewport_label_end",
+        "store.viewport_label_end",
+        "active_metadata_file",
+        "store.active_metadata_file",
+        "selected_timeline_metadata_file",
+        "store.selected_timeline_metadata_file",
+        "selected_timeline_range_start",
+        "store.selected_timeline_range_start",
+        "selected_timeline_range_end",
+        "store.selected_timeline_range_end",
+        "zoom_level",
+        "store.zoom_level",
+        "viewport_initial_span_value",
+        "store.viewport_initial_span_value",
+        "viewport_range_span_value",
+        "store.viewport_range_span_value",
+        "viewport_close_unit_value",
+        "store.viewport_close_unit_value",
+        "viewport_closer_unit_value",
+        "store.viewport_closer_unit_value",
+        "viewport_duration_value",
+        "store.viewport_duration_value",
+        "viewport_anchor_center_value",
+        "store.viewport_anchor_center_value",
+        "viewport_desired_start_value",
+        "store.viewport_desired_start_value",
+    ];
+    let probe_report = probes
+        .iter()
+        .map(|probe| {
+            let value = root_state
+                .get(*probe)
+                .and_then(json_scalar_textlike)
+                .unwrap_or_else(|| "<missing>".to_owned());
+            format!("{probe}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut nearby = root_state
+        .keys()
+        .filter(|key| {
+            key.contains(path)
+                || key.contains(fallback_path)
+                || key.contains("bridge_")
+                || key.contains("viewport_label")
+        })
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>();
+    nearby.sort();
+    Err(format!(
+        "PlanExecutor root text assertion path `{path}` not found; probes: {probe_report}; nearby root keys: {}",
+        nearby.join(", ")
+    )
+    .into())
 }
 
 fn assert_executor_eq_report<T>(
@@ -3444,6 +3546,9 @@ fn eval_plan_row_expression_with_stack(
     stack: &[PlanRowEvalKey],
 ) -> PlanExecutorResult<JsonValue> {
     match expression {
+        PlanRowExpression::Field {
+            input: ValueRef::List(list_id),
+        } => eval_plan_row_list_ref(list_state, *list_id),
         PlanRowExpression::Field { input } => eval_plan_row_field_ref(plan, row, input, stack),
         PlanRowExpression::Constant { constant_id } => {
             let constant = plan
@@ -3751,27 +3856,40 @@ fn eval_plan_row_expression_with_stack(
                     row_value_to_text(&right_value)?
                 )));
             }
+            if matches!(op.as_str(), "==" | "!=") {
+                let left = row_value_to_text(&left_value)?;
+                let right = row_value_to_text(&right_value)?;
+                return Ok(JsonValue::Bool(match op.as_str() {
+                    "==" => left == right,
+                    "!=" => left != right,
+                    _ => unreachable!(),
+                }));
+            }
             let left = row_value_to_number(&left_value)?;
             let right = row_value_to_number(&right_value)?;
             let value = match op.as_str() {
-                "+" => left + right,
-                "-" => left - right,
-                "*" => left * right,
+                "+" => json!(left + right),
+                "-" => json!(left - right),
+                "*" => json!(left * right),
                 "/" => {
                     if right == 0 {
                         return Ok(row_error_json("div_by_zero"));
                     }
-                    left / right
+                    json!(left / right)
                 }
                 "%" => {
                     if right == 0 {
                         return Ok(row_error_json("mod_by_zero"));
                     }
-                    left % right
+                    json!(left % right)
                 }
+                ">" => JsonValue::Bool(left > right),
+                ">=" => JsonValue::Bool(left >= right),
+                "<" => JsonValue::Bool(left < right),
+                "<=" => JsonValue::Bool(left <= right),
                 _ => return Err(format!("unsupported row numeric op `{op}`").into()),
             };
-            Ok(json!(value))
+            Ok(value)
         }
         PlanRowExpression::TextConcat { parts } => {
             let mut text = String::new();
@@ -3807,7 +3925,7 @@ fn eval_plan_row_expression_with_stack(
             fallback,
         } => {
             let value = eval_plan_row_expression_with_stack(plan, list_state, row, value, stack)?;
-            let field_name = plan_row_field_local_name(plan, *field);
+            let field_name = plan_list_row_field_local_name(plan, *list_id, *field);
             let rows = list_state
                 .get(&list_id.0)
                 .ok_or_else(|| format!("row expression list {} is not materialized", list_id.0))?;
@@ -3980,6 +4098,20 @@ fn row_value_to_text(value: &JsonValue) -> PlanExecutorResult<String> {
     Err(format!("row expression value `{value}` is not text-convertible").into())
 }
 
+fn row_value_to_bool(value: &JsonValue) -> PlanExecutorResult<bool> {
+    if let Some(value) = value.as_bool() {
+        return Ok(value);
+    }
+    if let Some(text) = value.as_str() {
+        return match text {
+            "True" | "true" => Ok(true),
+            "False" | "false" => Ok(false),
+            _ => Err(format!("row expression value `{text}` is not bool").into()),
+        };
+    }
+    Err(format!("row expression value `{value}` is not bool").into())
+}
+
 fn row_error_code(value: &JsonValue) -> Option<&str> {
     value
         .get("$boon_type")
@@ -3993,6 +4125,25 @@ fn plan_row_field_local_name(plan: &MachinePlan, field_id: boon_plan::FieldId) -
     local_field_name(&semantic_field_label(plan, field_id.0))
 }
 
+fn plan_list_row_field_local_name(
+    plan: &MachinePlan,
+    list_id: boon_plan::ListId,
+    field_id: boon_plan::FieldId,
+) -> String {
+    plan.storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id == list_id)
+        .and_then(|slot| {
+            slot.initial_rows
+                .iter()
+                .flat_map(|row| &row.fields)
+                .find(|field| field.field_id == Some(field_id))
+                .map(|field| field.name.clone())
+        })
+        .unwrap_or_else(|| plan_row_field_local_name(plan, field_id))
+}
+
 fn eval_plan_row_lookup_field(
     plan: &MachinePlan,
     list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
@@ -4001,7 +4152,7 @@ fn eval_plan_row_lookup_field(
     field: boon_plan::FieldId,
     stack: &[PlanRowEvalKey],
 ) -> PlanExecutorResult<JsonValue> {
-    let target_name = plan_row_field_local_name(plan, field);
+    let target_name = plan_list_row_field_local_name(plan, list_id, field);
     let key = PlanRowEvalKey {
         list_id: list_id.0,
         row_key: row.key,
@@ -4155,8 +4306,191 @@ fn eval_plan_row_builtin_call(
                     .to_owned(),
             ))
         }
+        "Number/min" | "Number/max" => {
+            let left = match input {
+                Some(input) => {
+                    eval_plan_row_expression_with_stack(plan, list_state, row, input, stack)?
+                }
+                None => eval_plan_row_named_arg(plan, list_state, row, args, "left", stack)?
+                    .ok_or("row Number/min requires left")?,
+            };
+            let right = eval_plan_row_named_arg(plan, list_state, row, args, "right", stack)?
+                .ok_or("row Number/min requires right")?;
+            let left = row_value_to_number(&left)?;
+            let right = row_value_to_number(&right)?;
+            let value = if function == "Number/min" {
+                left.min(right)
+            } else {
+                left.max(right)
+            };
+            Ok(json!(value))
+        }
+        "List/count" | "List/length" => {
+            let input = input.ok_or("row List/count requires an input list")?;
+            let items = eval_plan_row_list_with_stack(plan, list_state, row, input, stack)?;
+            Ok(json!(items.len() as i64))
+        }
+        "List/retain" => {
+            let input = input.ok_or("row List/retain requires an input list")?;
+            let items = eval_plan_row_list_with_stack(plan, list_state, row, input, stack)?;
+            let binding =
+                eval_plan_row_named_text_arg(plan, list_state, row, args, "binding", stack)?
+                    .ok_or("row List/retain requires binding")?;
+            let predicate = args
+                .iter()
+                .find(|arg| arg.name.as_deref() == Some("if"))
+                .ok_or("row List/retain requires if predicate")?;
+            let binding_key = row_map_binding_key(&binding);
+            let mut retained = Vec::with_capacity(items.len());
+            for item in items {
+                let mut bound_row = row.clone();
+                bound_row.fields.insert(binding_key.clone(), item.clone());
+                let predicate_value = eval_plan_row_expression_with_stack(
+                    plan,
+                    list_state,
+                    &bound_row,
+                    &predicate.value,
+                    stack,
+                )?;
+                if row_value_to_bool(&predicate_value)? {
+                    retained.push(item);
+                }
+            }
+            Ok(JsonValue::Array(retained))
+        }
+        "List/filter_field_equal" | "List/filter_field_not_equal" => {
+            let input = input.ok_or("row List/filter_field_equal requires an input list")?;
+            let items = eval_plan_row_list_with_stack(plan, list_state, row, input, stack)?;
+            let field = eval_plan_row_named_text_arg(plan, list_state, row, args, "field", stack)?
+                .ok_or("row List/filter_field_equal requires field")?;
+            let expected = eval_plan_row_named_arg(plan, list_state, row, args, "value", stack)?
+                .ok_or("row List/filter_field_equal requires value")?;
+            let retain_equal = function == "List/filter_field_equal";
+            let filtered = items
+                .into_iter()
+                .filter(|item| {
+                    let actual = item.as_object().and_then(|object| object.get(&field));
+                    row_json_values_equal(actual, &expected) == retain_equal
+                })
+                .collect::<Vec<_>>();
+            Ok(JsonValue::Array(filtered))
+        }
+        "List/filter_text_contains" => {
+            let input = input.ok_or("row List/filter_text_contains requires an input list")?;
+            let items = eval_plan_row_list_with_stack(plan, list_state, row, input, stack)?;
+            let field = eval_plan_row_named_text_arg(plan, list_state, row, args, "field", stack)?
+                .ok_or("row List/filter_text_contains requires field")?;
+            let needle =
+                eval_plan_row_named_text_arg(plan, list_state, row, args, "needle", stack)?
+                    .unwrap_or_default();
+            let prefer_field =
+                eval_plan_row_named_text_arg(plan, list_state, row, args, "prefer_field", stack)?;
+            let empty_field =
+                eval_plan_row_named_text_arg(plan, list_state, row, args, "empty_field", stack)?;
+            let empty_value =
+                eval_plan_row_named_text_arg(plan, list_state, row, args, "empty_value", stack)?;
+            let filtered = filter_row_json_text_contains(
+                items,
+                &field,
+                prefer_field.as_deref(),
+                &needle,
+                empty_field.as_deref(),
+                empty_value.as_deref(),
+            );
+            Ok(JsonValue::Array(filtered))
+        }
+        "List/join_field" => {
+            let input = input.ok_or("row List/join_field requires an input list")?;
+            let items = eval_plan_row_list_with_stack(plan, list_state, row, input, stack)?;
+            let field = eval_plan_row_named_text_arg(plan, list_state, row, args, "field", stack)?
+                .ok_or("row List/join_field requires field")?;
+            let separator =
+                eval_plan_row_named_text_arg(plan, list_state, row, args, "separator", stack)?
+                    .unwrap_or_default();
+            let empty = eval_plan_row_named_text_arg(plan, list_state, row, args, "empty", stack)?
+                .unwrap_or_default();
+            if items.is_empty() {
+                return Ok(JsonValue::String(empty));
+            }
+            let joined = items
+                .iter()
+                .filter_map(|item| {
+                    item.as_object()
+                        .and_then(|object| object.get(&field))
+                        .map(row_value_to_text)
+                })
+                .collect::<PlanExecutorResult<Vec<_>>>()?
+                .join(&separator);
+            Ok(JsonValue::String(joined))
+        }
         _ => Err(format!("unsupported row builtin `{function}`").into()),
     }
+}
+
+fn eval_plan_row_named_arg(
+    plan: &MachinePlan,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    row: &PlanExecutorListRowState,
+    args: &[boon_plan::PlanRowCallArg],
+    name: &str,
+    stack: &[PlanRowEvalKey],
+) -> PlanExecutorResult<Option<JsonValue>> {
+    args.iter()
+        .find(|arg| arg.name.as_deref() == Some(name))
+        .map(|arg| eval_plan_row_expression_with_stack(plan, list_state, row, &arg.value, stack))
+        .transpose()
+}
+
+fn eval_plan_row_named_text_arg(
+    plan: &MachinePlan,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    row: &PlanExecutorListRowState,
+    args: &[boon_plan::PlanRowCallArg],
+    name: &str,
+    stack: &[PlanRowEvalKey],
+) -> PlanExecutorResult<Option<String>> {
+    eval_plan_row_named_arg(plan, list_state, row, args, name, stack)?
+        .map(|value| row_value_to_text(&value))
+        .transpose()
+}
+
+fn filter_row_json_text_contains(
+    items: Vec<JsonValue>,
+    field: &str,
+    prefer_field: Option<&str>,
+    needle: &str,
+    empty_field: Option<&str>,
+    empty_value: Option<&str>,
+) -> Vec<JsonValue> {
+    let needle = needle.trim().to_ascii_lowercase();
+    items
+        .into_iter()
+        .filter(|item| {
+            let Some(object) = item.as_object() else {
+                return false;
+            };
+            if needle.is_empty() {
+                return match (empty_field, empty_value) {
+                    (Some(empty_field), Some(empty_value)) => object
+                        .get(empty_field)
+                        .and_then(json_scalar_textlike)
+                        .is_some_and(|value| value == empty_value),
+                    _ => true,
+                };
+            }
+            let primary_match = object
+                .get(field)
+                .and_then(json_scalar_textlike)
+                .is_some_and(|value| value.to_ascii_lowercase().contains(&needle));
+            let prefer_match = prefer_field.is_some_and(|prefer_field| {
+                object
+                    .get(prefer_field)
+                    .and_then(json_scalar_textlike)
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+            });
+            primary_match || prefer_match
+        })
+        .collect()
 }
 
 fn row_text_to_bytes(text: &str, encoding: &str) -> PlanExecutorResult<Vec<u8>> {
@@ -5144,13 +5478,19 @@ pub fn evaluate_root_row_expression_derived_values(
                 return None;
             };
             let PlanOpKind::DerivedValue {
-                derived_kind: boon_plan::PlanDerivedKind::Pure,
+                derived_kind,
                 expression: Some(PlanDerivedExpression::RowExpression { expression }),
                 ..
             } = &op.kind
             else {
                 return None;
             };
+            if !matches!(
+                derived_kind,
+                boon_plan::PlanDerivedKind::Pure | boon_plan::PlanDerivedKind::ListView
+            ) {
+                return None;
+            }
             Some((op, output_id, expression))
         })
         .collect::<Vec<_>>();
@@ -5178,6 +5518,159 @@ pub fn evaluate_root_row_expression_derived_values(
         }
     }
     Ok(values)
+}
+
+pub fn evaluate_root_row_expression_derived_values_with_list_state(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+) -> PlanExecutorResult<BTreeMap<FieldId, JsonValue>> {
+    let mut evaluation_state = root_state.clone();
+    evaluation_state
+        .entry("Router/route".to_owned())
+        .or_insert_with(|| json!("/"));
+    let derived_ops = plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .filter_map(|op| {
+            if op.indexed {
+                return None;
+            }
+            let Some(ValueRef::Field(output_id)) = op.output else {
+                return None;
+            };
+            let PlanOpKind::DerivedValue {
+                derived_kind,
+                expression: Some(expression),
+                ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            match (derived_kind, expression) {
+                (
+                    boon_plan::PlanDerivedKind::Pure | boon_plan::PlanDerivedKind::ListView,
+                    PlanDerivedExpression::RowExpression { expression },
+                ) => Some((op, output_id, RootDerivedExpressionRef::Row(expression))),
+                (
+                    boon_plan::PlanDerivedKind::Pure,
+                    PlanDerivedExpression::NumberCompareConst {
+                        left,
+                        op: number_op,
+                        right,
+                    },
+                ) => Some((
+                    op,
+                    output_id,
+                    RootDerivedExpressionRef::NumberCompareConst {
+                        left,
+                        op: number_op,
+                        right,
+                    },
+                )),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut values = BTreeMap::new();
+    let mut resolved = BTreeSet::new();
+    while resolved.len() < derived_ops.len() {
+        let mut progressed = false;
+        for (op, output_id, expression) in &derived_ops {
+            if resolved.contains(&op.id) {
+                continue;
+            }
+            let root_row = root_state_plan_row(&evaluation_state);
+            let Ok(value) =
+                eval_root_derived_expression_ref(plan, list_state, &root_row, expression)
+            else {
+                continue;
+            };
+            let label = derived_field_label(plan, output_id.0);
+            evaluation_state.insert(label.clone(), value.clone());
+            evaluation_state.insert(local_field_name(&label), value.clone());
+            values.insert(*output_id, value);
+            resolved.insert(op.id);
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    Ok(values)
+}
+
+enum RootDerivedExpressionRef<'a> {
+    Row(&'a PlanRowExpression),
+    NumberCompareConst {
+        left: &'a ValueRef,
+        op: &'a str,
+        right: &'a i64,
+    },
+}
+
+fn eval_root_derived_expression_ref(
+    plan: &MachinePlan,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRowState>>,
+    root_row: &PlanExecutorListRowState,
+    expression: &RootDerivedExpressionRef<'_>,
+) -> PlanExecutorResult<JsonValue> {
+    match expression {
+        RootDerivedExpressionRef::Row(expression) => {
+            eval_plan_row_expression_with_stack(plan, list_state, root_row, expression, &[])
+        }
+        RootDerivedExpressionRef::NumberCompareConst { left, op, right } => {
+            let left = eval_plan_row_field_ref(plan, root_row, left, &[])?;
+            let left = row_value_to_number(&left)?;
+            Ok(match *op {
+                "+" => json!(left + **right),
+                "-" => json!(left - **right),
+                "*" => json!(left * **right),
+                "/" => {
+                    if **right == 0 {
+                        return Ok(row_error_json("div_by_zero"));
+                    }
+                    json!(left / **right)
+                }
+                "%" => {
+                    if **right == 0 {
+                        return Ok(row_error_json("mod_by_zero"));
+                    }
+                    json!(left % **right)
+                }
+                ">" => JsonValue::Bool(left > **right),
+                ">=" => JsonValue::Bool(left >= **right),
+                "<" => JsonValue::Bool(left < **right),
+                "<=" => JsonValue::Bool(left <= **right),
+                "==" => JsonValue::Bool(left == **right),
+                "!=" => JsonValue::Bool(left != **right),
+                other => {
+                    return Err(format!(
+                        "root NumberCompareConst has unsupported operator `{other}`"
+                    )
+                    .into());
+                }
+            })
+        }
+    }
+}
+
+fn root_state_plan_row(root_state: &JsonMap<String, JsonValue>) -> PlanExecutorListRowState {
+    let mut fields = BTreeMap::new();
+    for (name, value) in root_state {
+        fields.insert(name.clone(), value.clone());
+        fields.insert(local_field_name(name), value.clone());
+    }
+    PlanExecutorListRowState {
+        key: 0,
+        generation: 0,
+        fields,
+        private_bytes: BTreeMap::new(),
+        fixed_bytes_banks: BTreeMap::new(),
+    }
 }
 
 pub fn commit_source_derived_values_to_root_state(
@@ -5299,29 +5792,43 @@ fn eval_root_source_transform_row_expression(
                     .ok_or("source-transform + right input is not textlike")?;
                 return Ok(JsonValue::String(format!("{left_text}{right_text}")));
             }
+            if matches!(op.as_str(), "==" | "!=") {
+                let left_text = json_scalar_textlike(&left_value)
+                    .ok_or("source-transform == left input is not textlike")?;
+                let right_text = json_scalar_textlike(&right_value)
+                    .ok_or("source-transform == right input is not textlike")?;
+                return Ok(JsonValue::Bool(match op.as_str() {
+                    "==" => left_text == right_text,
+                    "!=" => left_text != right_text,
+                    _ => unreachable!(),
+                }));
+            }
             let left = root_source_transform_number_value(&left_value)
                 .ok_or("source-transform numeric left input is not a number")?;
             let right = root_source_transform_number_value(&right_value)
                 .ok_or("source-transform numeric right input is not a number")?;
-            let value = match op.as_str() {
-                "+" => left + right,
-                "-" => left - right,
-                "*" => left * right,
+            match op.as_str() {
+                "+" => Ok(json!(left + right)),
+                "-" => Ok(json!(left - right)),
+                "*" => Ok(json!(left * right)),
                 "/" => {
                     if right == 0 {
                         return Err("source-transform division by zero".into());
                     }
-                    left / right
+                    Ok(json!(left / right))
                 }
                 "%" => {
                     if right == 0 {
                         return Err("source-transform modulo by zero".into());
                     }
-                    left % right
+                    Ok(json!(left % right))
                 }
-                _ => return Err(format!("unsupported source-transform numeric op `{op}`").into()),
-            };
-            Ok(json!(value))
+                ">" => Ok(JsonValue::Bool(left > right)),
+                ">=" => Ok(JsonValue::Bool(left >= right)),
+                "<" => Ok(JsonValue::Bool(left < right)),
+                "<=" => Ok(JsonValue::Bool(left <= right)),
+                _ => Err(format!("unsupported source-transform numeric op `{op}`").into()),
+            }
         }
         PlanRowExpression::ListFindValue {
             list_id,
@@ -5365,6 +5872,37 @@ fn eval_root_source_transform_row_expression(
             .get("Router/route")
             .cloned()
             .unwrap_or_else(|| json!("/"))),
+        PlanRowExpression::BuiltinCall {
+            function,
+            input,
+            args,
+        } if matches!(function.as_str(), "Number/min" | "Number/max") => {
+            let left = match input {
+                Some(input) => eval_root_source_transform_row_expression(plan, root_state, input)?,
+                None => {
+                    let arg = args
+                        .iter()
+                        .find(|arg| arg.name.as_deref() == Some("left"))
+                        .ok_or("source-transform Number/min requires left")?;
+                    eval_root_source_transform_row_expression(plan, root_state, &arg.value)?
+                }
+            };
+            let right_arg = args
+                .iter()
+                .find(|arg| arg.name.as_deref() == Some("right"))
+                .ok_or("source-transform Number/min requires right")?;
+            let right =
+                eval_root_source_transform_row_expression(plan, root_state, &right_arg.value)?;
+            let left = root_source_transform_number_value(&left)
+                .ok_or("source-transform Number/min left is not a number")?;
+            let right = root_source_transform_number_value(&right)
+                .ok_or("source-transform Number/min right is not a number")?;
+            Ok(json!(if function == "Number/min" {
+                left.min(right)
+            } else {
+                left.max(right)
+            }))
+        }
         PlanRowExpression::Select { input, arms } => {
             let input = eval_root_source_transform_row_expression(plan, root_state, input)?;
             for arm in arms {
@@ -5519,12 +6057,7 @@ fn eval_root_bool_derived_expression(
                 "<=" => *left_value <= *right,
                 "==" => *left_value == *right,
                 "!=" => *left_value != *right,
-                other => {
-                    return Err(format!(
-                        "number-compare derived op {op_id} has unsupported operator `{other}`"
-                    )
-                    .into());
-                }
+                _ => return Ok(None),
             };
             Ok(Some(value))
         }
@@ -6226,12 +6759,6 @@ pub fn execute_initial_state(plan: &MachinePlan) -> PlanExecutorResult<InitialSt
         )
         .into());
     }
-    if !plan.capability_summary.cpu_plan_executor_complete {
-        return Err(
-            "CPU PlanExecutor initial-state slice requires cpu_plan_executor_complete=true".into(),
-        );
-    }
-
     let mut state_summary = JsonMap::new();
     let mut initialized_state_count = 0usize;
     let mut source_route_metadata_count = 0usize;
@@ -6553,12 +7080,196 @@ pub fn materialize_list_projections(
                 execution.chunk_count += 1;
                 execution.projected_row_count += chunks.len();
             }
+            PlanListProjection::ChunkValue {
+                source,
+                size,
+                item_field,
+                label_field,
+            } => {
+                let Some(rows) = optional_projection_rows_for_source_value(
+                    plan,
+                    root_state,
+                    list_state,
+                    &execution.summary,
+                    source,
+                    op.id,
+                )?
+                else {
+                    execution.reports.push(json!({
+                        "executor": "cpu-plan-list-projection-materializer-v1",
+                        "op_id": op.id.0,
+                        "kind": "chunk_value",
+                        "target": target_label,
+                        "source": value_ref_label(plan, source),
+                        "skipped": true,
+                        "skip_reason": "source_field_not_materialized",
+                    }));
+                    continue;
+                };
+                let mut chunks = Vec::new();
+                for (index, chunk) in rows.chunks(*size).enumerate() {
+                    let mut chunk_object = JsonMap::new();
+                    chunk_object.insert(label_field.clone(), JsonValue::String(index.to_string()));
+                    chunk_object.insert(
+                        item_field.clone(),
+                        JsonValue::Array(
+                            chunk
+                                .iter()
+                                .map(|row| {
+                                    JsonValue::Object(row.fields.clone().into_iter().collect())
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                    );
+                    chunks.push(JsonValue::Object(chunk_object));
+                }
+                execution
+                    .summary
+                    .insert(target_label.clone(), JsonValue::Array(chunks.clone()));
+                execution.reports.push(json!({
+                    "executor": "cpu-plan-list-projection-materializer-v1",
+                    "op_id": op.id.0,
+                    "kind": "chunk_value",
+                    "target": target_label,
+                    "source": value_ref_label(plan, source),
+                    "size": size,
+                    "item_field": item_field,
+                    "label_field": label_field,
+                    "projected_row_count": chunks.len(),
+                }));
+                execution.executed_count += 1;
+                execution.chunk_count += 1;
+                execution.projected_row_count += chunks.len();
+            }
             PlanListProjection::Unknown { summary } => {
                 return Err(format!("list projection op {} is unknown: {summary}", op.id.0).into());
             }
         }
     }
     Ok(execution)
+}
+
+fn optional_projection_rows_for_source_value(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRow>>,
+    projection_summary: &JsonMap<String, JsonValue>,
+    source: &ValueRef,
+    op_id: PlanOpId,
+) -> PlanExecutorResult<Option<Vec<PlanExecutorListRow>>> {
+    match source {
+        ValueRef::Field(field_id) => {
+            let label = semantic_field_label(plan, field_id.0);
+            let local = local_field_name(&label);
+            let Some(value) = projection_summary
+                .get(&label)
+                .or_else(|| root_state.get(&label))
+                .or_else(|| root_state.get(&local))
+            else {
+                return Ok(None);
+            };
+            projection_rows_from_json_value(value, op_id, &label).map(Some)
+        }
+        _ => projection_rows_for_source_value(
+            plan,
+            root_state,
+            list_state,
+            projection_summary,
+            source,
+            op_id,
+        )
+        .map(Some),
+    }
+}
+
+fn projection_rows_for_source_value(
+    plan: &MachinePlan,
+    root_state: &JsonMap<String, JsonValue>,
+    list_state: &BTreeMap<usize, Vec<PlanExecutorListRow>>,
+    projection_summary: &JsonMap<String, JsonValue>,
+    source: &ValueRef,
+    op_id: PlanOpId,
+) -> PlanExecutorResult<Vec<PlanExecutorListRow>> {
+    match source {
+        ValueRef::List(list_id) => list_state.get(&list_id.0).cloned().ok_or_else(|| {
+            format!(
+                "list projection op {} source list {} is not materialized",
+                op_id.0, list_id.0
+            )
+            .into()
+        }),
+        ValueRef::Field(field_id) => {
+            let label = semantic_field_label(plan, field_id.0);
+            let local = local_field_name(&label);
+            let value = projection_summary
+                .get(&label)
+                .or_else(|| root_state.get(&label))
+                .or_else(|| root_state.get(&local))
+                .ok_or_else(|| {
+                    format!(
+                        "list projection op {} source field `{label}` is not materialized",
+                        op_id.0
+                    )
+                })?;
+            projection_rows_from_json_value(value, op_id, &label)
+        }
+        other => Err(format!(
+            "list projection op {} source `{}` is not a list-valued source",
+            op_id.0,
+            value_ref_label(plan, other)
+        )
+        .into()),
+    }
+}
+
+fn projection_rows_from_json_value(
+    value: &JsonValue,
+    op_id: PlanOpId,
+    label: &str,
+) -> PlanExecutorResult<Vec<PlanExecutorListRow>> {
+    let rows = value.as_array().ok_or_else(|| {
+        format!(
+            "list projection op {} source field `{label}` is not a JSON array",
+            op_id.0
+        )
+    })?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let fields = row.as_object().ok_or_else(|| {
+                format!(
+                    "list projection op {} source field `{label}` row {index} is not an object",
+                    op_id.0
+                )
+            })?;
+            Ok(PlanExecutorListRow {
+                key: u64::try_from(index).unwrap_or(u64::MAX),
+                generation: 0,
+                fields: fields.clone().into_iter().collect(),
+            })
+        })
+        .collect()
+}
+
+fn value_ref_label(plan: &MachinePlan, value_ref: &ValueRef) -> String {
+    match value_ref {
+        ValueRef::State(state_id) => state_label(plan, *state_id),
+        ValueRef::Field(field_id) => semantic_field_label(plan, field_id.0),
+        ValueRef::List(list_id) => list_label(plan, list_id.0),
+        ValueRef::Source(source_id) => source_label(plan, source_id.0),
+        ValueRef::SourcePayload { source_id, field } => {
+            format!("{}.payload.{field:?}", source_label(plan, source_id.0))
+        }
+        ValueRef::Constant(constant_id) => format!("constant:{}", constant_id.0),
+    }
+}
+
+fn source_label(plan: &MachinePlan, source_id: usize) -> String {
+    plan.source_routes
+        .iter()
+        .find(|route| route.source_id.0 == source_id)
+        .map(|route| route.path.clone())
+        .unwrap_or_else(|| format!("source:{source_id}"))
 }
 
 pub fn materialize_list_retains(
@@ -10400,6 +11111,7 @@ pub fn evaluate_indexed_json_update_branch(
     source_route_slot: &SourceRoute,
     event: &RootJsonSourceEvent,
     row: &PlanExecutorListRowState,
+    root_state: &JsonMap<String, JsonValue>,
     root_derived_values: &BTreeMap<usize, JsonValue>,
 ) -> PlanExecutorResult<IndexedJsonUpdateEvaluation> {
     let Some(ValueRef::State(output_state_id)) = op.output else {
@@ -10430,29 +11142,38 @@ pub fn evaluate_indexed_json_update_branch(
             }
             validate_route_payload_field(source_route_slot, source_payload_field, op.id)?;
             validate_typed_payload_input(op, source_id, source_payload_field)?;
-            if output_slot.value_type != PlanValueType::Text {
-                return Err(format!(
-                    "indexed source-payload update branch {} reads text payload but output state `{}` is not TEXT",
-                    op.id.0,
-                    state_label(plan, output_state_id)
-                )
-                .into());
-            }
-            let Some(value) = source_payload_json_value_if_present(event, source_payload_field)?
-            else {
-                return Ok(indexed_json_update_outcome(
-                    op.id,
-                    true,
-                    None,
-                    output_state_id,
-                    None,
-                    Some((
-                        "source_payload",
-                        serde_json::to_value(source_payload_field)?,
-                        JsonValue::Null,
-                        JsonValue::Null,
-                    )),
-                ));
+            let value = match source_payload_field {
+                SourcePayloadField::Named(_) if output_slot.value_type == PlanValueType::Bool => {
+                    source_payload_bool_value(event, source_payload_field)?
+                }
+                _ => {
+                    if output_slot.value_type != PlanValueType::Text {
+                        return Err(format!(
+                            "indexed source-payload update branch {} reads text payload but output state `{}` is not TEXT",
+                            op.id.0,
+                            state_label(plan, output_state_id)
+                        )
+                        .into());
+                    }
+                    let Some(value) =
+                        source_payload_json_value_if_present(event, source_payload_field)?
+                    else {
+                        return Ok(indexed_json_update_outcome(
+                            op.id,
+                            true,
+                            None,
+                            output_state_id,
+                            None,
+                            Some((
+                                "source_payload",
+                                serde_json::to_value(source_payload_field)?,
+                                JsonValue::Null,
+                                JsonValue::Null,
+                            )),
+                        ));
+                    };
+                    value
+                }
             };
             Ok(indexed_json_update_outcome(
                 op.id,
@@ -10550,6 +11271,76 @@ pub fn evaluate_indexed_json_update_branch(
                 Some(JsonValue::Bool(!input_value)),
                 Some((
                     "bool_not",
+                    JsonValue::Null,
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            ))
+        }
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::NumberInfix,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let [left_ref, op_ref, right_ref] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "indexed NumberInfix update branch {} expected left, op, and right operands",
+                    op.id.0
+                )
+                .into());
+            };
+            let left = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                left_ref,
+                op.id,
+                "number left",
+            )?;
+            let op_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                op_ref,
+                op.id,
+                "number operator",
+            )?;
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "indexed NumberInfix update branch {} operator is not text",
+                    op.id.0
+                )
+            })?;
+            let right = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                right_ref,
+                op.id,
+                "number right",
+            )?;
+            let value = json_number_infix_value(&left, op_label, &right).ok_or_else(|| {
+                format!(
+                    "indexed NumberInfix update branch {} cannot evaluate {:?} {} {:?}",
+                    op.id.0, left, op_label, right
+                )
+            })?;
+            Ok(indexed_json_update_outcome(
+                op.id,
+                true,
+                None,
+                output_state_id,
+                Some(value),
+                Some((
+                    "number_infix",
                     JsonValue::Null,
                     JsonValue::Null,
                     JsonValue::Null,
@@ -10806,6 +11597,7 @@ pub fn evaluate_indexed_json_update_branch(
                 plan,
                 event,
                 row,
+                root_state,
                 root_derived_values,
                 prefix_ref,
                 op.id,
@@ -10821,6 +11613,7 @@ pub fn evaluate_indexed_json_update_branch(
                 plan,
                 event,
                 row,
+                root_state,
                 root_derived_values,
                 separator_ref,
                 op.id,
@@ -10858,6 +11651,7 @@ pub fn evaluate_indexed_json_update_branch(
                 plan,
                 event,
                 row,
+                root_state,
                 root_derived_values,
                 prefix_ref,
                 op.id,
@@ -10867,6 +11661,7 @@ pub fn evaluate_indexed_json_update_branch(
                 plan,
                 event,
                 row,
+                root_state,
                 root_derived_values,
                 input_ref,
                 op.id,
@@ -10876,6 +11671,7 @@ pub fn evaluate_indexed_json_update_branch(
                 plan,
                 event,
                 row,
+                root_state,
                 root_derived_values,
                 separator_ref,
                 op.id,
@@ -10912,6 +11708,7 @@ pub fn evaluate_indexed_json_update_branch(
                 plan,
                 event,
                 row,
+                root_state,
                 root_derived_values,
                 input_ref,
                 op.id,
@@ -10947,6 +11744,7 @@ pub fn evaluate_indexed_json_update_branch(
                 plan,
                 event,
                 row,
+                root_state,
                 root_derived_values,
                 selected_ref,
                 op.id,
@@ -10992,6 +11790,161 @@ pub fn evaluate_indexed_json_update_branch(
                     json!({
                         "input_empty": input_text.is_empty(),
                         "selected_operand_index": selected_operand_index,
+                        "skip": false,
+                    }),
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            ))
+        }
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::MatchNumberInfixConst,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let [left_ref, op_ref, right_ref, arm_refs @ ..] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "indexed MatchNumberInfixConst update branch {} expected left, op, right, and arm operands",
+                    op.id.0
+                )
+                .into());
+            };
+            let left = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                left_ref,
+                op.id,
+                "match left",
+            )?;
+            let op_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                op_ref,
+                op.id,
+                "match operator",
+            )?;
+            let right = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                right_ref,
+                op.id,
+                "match right",
+            )?;
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "indexed MatchNumberInfixConst update branch {} operator is not text",
+                    op.id.0
+                )
+            })?;
+            let current = json_match_number_infix_label(&left, op_label, &right).ok_or_else(|| {
+                format!(
+                    "indexed MatchNumberInfixConst update branch {} cannot evaluate {:?} {} {:?}",
+                    op.id.0, left, op_label, right
+                )
+            })?;
+            let mut selected = None;
+            let mut cursor = 0usize;
+            let mut arm_index = 0usize;
+            while cursor < arm_refs.len() {
+                let pattern_ref = arm_refs.get(cursor).ok_or_else(|| {
+                    format!(
+                        "indexed MatchNumberInfixConst update branch {} has malformed arm operands",
+                        op.id.0
+                    )
+                })?;
+                cursor += 1;
+                let pattern = indexed_match_pattern(plan, pattern_ref, op.id, arm_index)?;
+                let output_expr =
+                    parse_encoded_update_value_expr(plan, arm_refs, &mut cursor, op.id, arm_index)?;
+                if pattern == current || (pattern == "__" && selected.is_none()) {
+                    selected = Some((arm_index, output_expr, pattern == "__"));
+                    if pattern == current {
+                        break;
+                    }
+                }
+                arm_index += 1;
+            }
+            let Some((arm_index, selected_expr, wildcard)) = selected else {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    true,
+                    None,
+                    output_state_id,
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({
+                            "current": current,
+                            "selected_arm_missing": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let value = evaluate_indexed_encoded_update_value_expr(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                &selected_expr,
+                op.id,
+                "match selected arm",
+            )?;
+            if value.as_str() == Some("SKIP") {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    true,
+                    None,
+                    output_state_id,
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({
+                            "current": current,
+                            "selected_arm_index": arm_index,
+                            "wildcard": wildcard,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            }
+            if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                return Ok(indexed_json_update_outcome(
+                    op.id,
+                    false,
+                    Some("BYTES match arm values require runtime byte storage".to_owned()),
+                    output_state_id,
+                    None,
+                    None,
+                ));
+            }
+            Ok(indexed_json_update_outcome(
+                op.id,
+                true,
+                None,
+                output_state_id,
+                Some(value),
+                Some((
+                    "match_number_infix_const",
+                    json!({
+                        "current": current,
+                        "selected_arm_index": arm_index,
+                        "wildcard": wildcard,
                         "skip": false,
                     }),
                     JsonValue::Null,
@@ -11067,6 +12020,634 @@ fn indexed_row_read_path_value(
         )
         .into()
     })
+}
+
+fn indexed_match_pattern(
+    plan: &MachinePlan,
+    value_ref: &ValueRef,
+    op_id: PlanOpId,
+    arm_index: usize,
+) -> PlanExecutorResult<String> {
+    let ValueRef::Constant(constant_id) = value_ref else {
+        return Err(format!(
+            "indexed MatchNumberInfixConst update branch {} arm {arm_index} pattern is not a constant",
+            op_id.0
+        )
+        .into());
+    };
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *constant_id)
+        .ok_or_else(|| {
+            format!(
+                "indexed MatchNumberInfixConst update branch {} arm {arm_index} references missing pattern constant {}",
+                op_id.0, constant_id.0
+            )
+        })?;
+    match &constant.value {
+        PlanConstantValue::Text { value } | PlanConstantValue::Enum { value } => Ok(value.clone()),
+        _ => Err(format!(
+            "indexed MatchNumberInfixConst update branch {} arm {arm_index} pattern constant {} is not text-like",
+            op_id.0, constant_id.0
+        )
+        .into()),
+    }
+}
+
+fn json_number_infix_value(left: &JsonValue, op: &str, right: &JsonValue) -> Option<JsonValue> {
+    if matches!(op, "==" | "!=") {
+        let left = json_scalar_textlike(left)?;
+        let right = json_scalar_textlike(right)?;
+        return Some(JsonValue::Bool(match op {
+            "==" => left == right,
+            "!=" => left != right,
+            _ => unreachable!(),
+        }));
+    }
+    let left = json_number_value(left)?;
+    let right = json_number_value(right)?;
+    Some(match op {
+        "+" => json!(left + right),
+        "-" => json!(left - right),
+        ">" => JsonValue::Bool(left > right),
+        ">=" => JsonValue::Bool(left >= right),
+        "<" => JsonValue::Bool(left < right),
+        "<=" => JsonValue::Bool(left <= right),
+        _ => return None,
+    })
+}
+
+fn json_match_number_infix_label(left: &JsonValue, op: &str, right: &JsonValue) -> Option<String> {
+    json_scalar_textlike(&json_number_infix_value(left, op, right)?)
+}
+
+#[derive(Clone, Debug)]
+enum EncodedUpdateValueExpr<'a> {
+    Ref(&'a ValueRef),
+    NumberInfix {
+        left: &'a ValueRef,
+        op: &'a ValueRef,
+        right: &'a ValueRef,
+    },
+    MatchConst {
+        input: &'a ValueRef,
+        arms: Vec<(String, EncodedUpdateValueExpr<'a>)>,
+    },
+    MatchNumberInfixConst {
+        left: &'a ValueRef,
+        op: &'a ValueRef,
+        right: &'a ValueRef,
+        arms: Vec<(String, EncodedUpdateValueExpr<'a>)>,
+    },
+}
+
+fn parse_encoded_update_value_expr<'a>(
+    plan: &MachinePlan,
+    refs: &'a [ValueRef],
+    cursor: &mut usize,
+    op_id: PlanOpId,
+    arm_index: usize,
+) -> PlanExecutorResult<EncodedUpdateValueExpr<'a>> {
+    let Some(first_ref) = refs.get(*cursor) else {
+        return Err(format!(
+            "update branch {} arm {arm_index} is missing encoded output expression",
+            op_id.0
+        )
+        .into());
+    };
+    match constant_text_for_ref(plan, first_ref)? {
+        Some(tag) if tag == "ref" => {
+            *cursor += 1;
+            let value_ref = refs.get(*cursor).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} ref output is missing value operand",
+                    op_id.0
+                )
+            })?;
+            *cursor += 1;
+            Ok(EncodedUpdateValueExpr::Ref(value_ref))
+        }
+        Some(tag) if tag == "number_infix" => {
+            *cursor += 1;
+            let left = refs.get(*cursor).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} number_infix output is missing left operand",
+                    op_id.0
+                )
+            })?;
+            let op = refs.get(*cursor + 1).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} number_infix output is missing operator operand",
+                    op_id.0
+                )
+            })?;
+            let right = refs.get(*cursor + 2).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} number_infix output is missing right operand",
+                    op_id.0
+                )
+            })?;
+            *cursor += 3;
+            Ok(EncodedUpdateValueExpr::NumberInfix { left, op, right })
+        }
+        Some(tag) if tag == "match_const" => {
+            *cursor += 1;
+            let input = refs.get(*cursor).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_const output is missing input operand",
+                    op_id.0
+                )
+            })?;
+            let arm_count_ref = refs.get(*cursor + 1).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_const output is missing arm count",
+                    op_id.0
+                )
+            })?;
+            let arm_count = constant_usize_for_ref(plan, arm_count_ref)?.ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_const arm count is not a number constant",
+                    op_id.0
+                )
+            })?;
+            *cursor += 2;
+            let arms = parse_encoded_update_value_match_arms(
+                plan, refs, cursor, op_id, arm_index, arm_count,
+            )?;
+            Ok(EncodedUpdateValueExpr::MatchConst { input, arms })
+        }
+        Some(tag) if tag == "match_number_infix_const" => {
+            *cursor += 1;
+            let left = refs.get(*cursor).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_number_infix_const output is missing left operand",
+                    op_id.0
+                )
+            })?;
+            let op = refs.get(*cursor + 1).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_number_infix_const output is missing operator operand",
+                    op_id.0
+                )
+            })?;
+            let right = refs.get(*cursor + 2).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_number_infix_const output is missing right operand",
+                    op_id.0
+                )
+            })?;
+            let arm_count_ref = refs.get(*cursor + 3).ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_number_infix_const output is missing arm count",
+                    op_id.0
+                )
+            })?;
+            let arm_count = constant_usize_for_ref(plan, arm_count_ref)?.ok_or_else(|| {
+                format!(
+                    "update branch {} arm {arm_index} match_number_infix_const arm count is not a number constant",
+                    op_id.0
+                )
+            })?;
+            *cursor += 4;
+            let arms = parse_encoded_update_value_match_arms(
+                plan, refs, cursor, op_id, arm_index, arm_count,
+            )?;
+            Ok(EncodedUpdateValueExpr::MatchNumberInfixConst {
+                left,
+                op,
+                right,
+                arms,
+            })
+        }
+        _ => {
+            *cursor += 1;
+            Ok(EncodedUpdateValueExpr::Ref(first_ref))
+        }
+    }
+}
+
+fn parse_encoded_update_value_match_arms<'a>(
+    plan: &MachinePlan,
+    refs: &'a [ValueRef],
+    cursor: &mut usize,
+    op_id: PlanOpId,
+    parent_arm_index: usize,
+    arm_count: usize,
+) -> PlanExecutorResult<Vec<(String, EncodedUpdateValueExpr<'a>)>> {
+    let mut arms = Vec::with_capacity(arm_count);
+    for nested_arm_index in 0..arm_count {
+        let pattern_ref = refs.get(*cursor).ok_or_else(|| {
+            format!(
+                "update branch {} arm {parent_arm_index} nested arm {nested_arm_index} is missing pattern",
+                op_id.0
+            )
+        })?;
+        *cursor += 1;
+        let pattern = encoded_match_pattern(plan, pattern_ref, op_id, nested_arm_index)?;
+        let output = parse_encoded_update_value_expr(plan, refs, cursor, op_id, nested_arm_index)?;
+        arms.push((pattern, output));
+    }
+    Ok(arms)
+}
+
+fn constant_text_for_ref(
+    plan: &MachinePlan,
+    value_ref: &ValueRef,
+) -> PlanExecutorResult<Option<String>> {
+    let ValueRef::Constant(constant_id) = value_ref else {
+        return Ok(None);
+    };
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *constant_id)
+        .ok_or_else(|| format!("missing update constant {}", constant_id.0))?;
+    Ok(match &constant.value {
+        PlanConstantValue::Text { value } | PlanConstantValue::Enum { value } => {
+            Some(value.clone())
+        }
+        _ => None,
+    })
+}
+
+fn constant_usize_for_ref(
+    plan: &MachinePlan,
+    value_ref: &ValueRef,
+) -> PlanExecutorResult<Option<usize>> {
+    let ValueRef::Constant(constant_id) = value_ref else {
+        return Ok(None);
+    };
+    let constant = plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *constant_id)
+        .ok_or_else(|| format!("missing update constant {}", constant_id.0))?;
+    Ok(match &constant.value {
+        PlanConstantValue::Number { value } => usize::try_from(*value).ok(),
+        PlanConstantValue::Text { value } => value.parse::<usize>().ok(),
+        _ => None,
+    })
+}
+
+fn encoded_match_pattern(
+    plan: &MachinePlan,
+    value_ref: &ValueRef,
+    op_id: PlanOpId,
+    arm_index: usize,
+) -> PlanExecutorResult<String> {
+    constant_text_for_ref(plan, value_ref)?.ok_or_else(|| {
+        format!(
+            "update branch {} arm {arm_index} pattern is not a text constant",
+            op_id.0
+        )
+        .into()
+    })
+}
+
+fn evaluate_indexed_encoded_update_value_expr(
+    plan: &MachinePlan,
+    event: &RootJsonSourceEvent,
+    row: &PlanExecutorListRowState,
+    root_state: &JsonMap<String, JsonValue>,
+    root_derived_values: &BTreeMap<usize, JsonValue>,
+    expression: &EncodedUpdateValueExpr<'_>,
+    op_id: PlanOpId,
+    context: &str,
+) -> PlanExecutorResult<JsonValue> {
+    match expression {
+        EncodedUpdateValueExpr::Ref(value_ref) => indexed_update_json_value_for_ref(
+            plan,
+            event,
+            row,
+            root_state,
+            root_derived_values,
+            value_ref,
+            op_id,
+            context,
+        ),
+        EncodedUpdateValueExpr::NumberInfix { left, op, right } => {
+            let left_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                left,
+                op_id,
+                &format!("{context} number left"),
+            )?;
+            let op_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                op,
+                op_id,
+                &format!("{context} number operator"),
+            )?;
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "indexed update branch {} {context} number operator is not text",
+                    op_id.0
+                )
+            })?;
+            let right_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                right,
+                op_id,
+                &format!("{context} number right"),
+            )?;
+            json_number_infix_value(&left_value, op_label, &right_value).ok_or_else(|| {
+                format!(
+                    "indexed update branch {} {context} cannot evaluate {:?} {} {:?}",
+                    op_id.0, left_value, op_label, right_value
+                )
+                .into()
+            })
+        }
+        EncodedUpdateValueExpr::MatchConst { input, arms } => {
+            let input_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                input,
+                op_id,
+                &format!("{context} match input"),
+            )?;
+            let current = json_scalar_textlike(&input_value).ok_or_else(|| {
+                format!(
+                    "indexed update branch {} {context} match input is not scalar",
+                    op_id.0
+                )
+            })?;
+            let Some((_, selected)) = selected_encoded_match_arm(arms, &current) else {
+                return Err(format!(
+                    "indexed update branch {} {context} match selected no arm for `{current}`",
+                    op_id.0
+                )
+                .into());
+            };
+            evaluate_indexed_encoded_update_value_expr(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                selected,
+                op_id,
+                context,
+            )
+        }
+        EncodedUpdateValueExpr::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } => {
+            let left_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                left,
+                op_id,
+                &format!("{context} match number left"),
+            )?;
+            let op_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                op,
+                op_id,
+                &format!("{context} match number operator"),
+            )?;
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "indexed update branch {} {context} match number operator is not text",
+                    op_id.0
+                )
+            })?;
+            let right_value = indexed_update_json_value_for_ref(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                right,
+                op_id,
+                &format!("{context} match number right"),
+            )?;
+            let current =
+                json_match_number_infix_label(&left_value, op_label, &right_value).ok_or_else(
+                    || {
+                        format!(
+                            "indexed update branch {} {context} cannot evaluate match number {:?} {} {:?}",
+                            op_id.0, left_value, op_label, right_value
+                        )
+                    },
+                )?;
+            let Some((_, selected)) = selected_encoded_match_arm(arms, &current) else {
+                return Err(format!(
+                    "indexed update branch {} {context} match number selected no arm for `{current}`",
+                    op_id.0
+                )
+                .into());
+            };
+            evaluate_indexed_encoded_update_value_expr(
+                plan,
+                event,
+                row,
+                root_state,
+                root_derived_values,
+                selected,
+                op_id,
+                context,
+            )
+        }
+    }
+}
+
+fn evaluate_root_encoded_update_value_expr(
+    plan: &MachinePlan,
+    event: &RootJsonSourceEvent,
+    root_state: &JsonMap<String, JsonValue>,
+    source_id: SourceId,
+    expression: &EncodedUpdateValueExpr<'_>,
+    op_id: PlanOpId,
+    context: &str,
+) -> PlanExecutorResult<Option<JsonValue>> {
+    match expression {
+        EncodedUpdateValueExpr::Ref(value_ref) => root_update_json_value_for_ref(
+            plan, event, root_state, value_ref, source_id, op_id, context,
+        ),
+        EncodedUpdateValueExpr::NumberInfix { left, op, right } => {
+            let Some(left_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                left,
+                source_id,
+                op_id,
+                &format!("{context} number left"),
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(op_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                op,
+                source_id,
+                op_id,
+                &format!("{context} number operator"),
+            )?
+            else {
+                return Ok(None);
+            };
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "root update branch {} {context} number operator is not text",
+                    op_id.0
+                )
+            })?;
+            let Some(right_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                right,
+                source_id,
+                op_id,
+                &format!("{context} number right"),
+            )?
+            else {
+                return Ok(None);
+            };
+            json_number_infix_value(&left_value, op_label, &right_value)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "root update branch {} {context} cannot evaluate {:?} {} {:?}",
+                        op_id.0, left_value, op_label, right_value
+                    )
+                    .into()
+                })
+        }
+        EncodedUpdateValueExpr::MatchConst { input, arms } => {
+            let Some(input_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                input,
+                source_id,
+                op_id,
+                &format!("{context} match input"),
+            )?
+            else {
+                return Ok(None);
+            };
+            let current = json_scalar_textlike(&input_value).ok_or_else(|| {
+                format!(
+                    "root update branch {} {context} match input is not scalar",
+                    op_id.0
+                )
+            })?;
+            let Some((_, selected)) = selected_encoded_match_arm(arms, &current) else {
+                return Ok(None);
+            };
+            evaluate_root_encoded_update_value_expr(
+                plan, event, root_state, source_id, selected, op_id, context,
+            )
+        }
+        EncodedUpdateValueExpr::MatchNumberInfixConst {
+            left,
+            op,
+            right,
+            arms,
+        } => {
+            let Some(left_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                left,
+                source_id,
+                op_id,
+                &format!("{context} match number left"),
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(op_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                op,
+                source_id,
+                op_id,
+                &format!("{context} match number operator"),
+            )?
+            else {
+                return Ok(None);
+            };
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "root update branch {} {context} match number operator is not text",
+                    op_id.0
+                )
+            })?;
+            let Some(right_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                right,
+                source_id,
+                op_id,
+                &format!("{context} match number right"),
+            )?
+            else {
+                return Ok(None);
+            };
+            let current = json_match_number_infix_label(&left_value, op_label, &right_value)
+                .ok_or_else(|| {
+                    format!(
+                        "root update branch {} {context} cannot evaluate match number {:?} {} {:?}",
+                        op_id.0, left_value, op_label, right_value
+                    )
+                })?;
+            let Some((_, selected)) = selected_encoded_match_arm(arms, &current) else {
+                return Ok(None);
+            };
+            evaluate_root_encoded_update_value_expr(
+                plan, event, root_state, source_id, selected, op_id, context,
+            )
+        }
+    }
+}
+
+fn selected_encoded_match_arm<'a>(
+    arms: &'a [(String, EncodedUpdateValueExpr<'a>)],
+    current: &str,
+) -> Option<(usize, &'a EncodedUpdateValueExpr<'a>)> {
+    arms.iter()
+        .enumerate()
+        .find(|(_, (pattern, _))| pattern == current)
+        .or_else(|| {
+            arms.iter()
+                .enumerate()
+                .find(|(_, (pattern, _))| pattern == "__")
+        })
+        .map(|(index, (_, expression))| (index, expression))
 }
 
 fn root_update_json_value_for_ref(
@@ -11150,10 +12731,41 @@ fn root_match_const_pattern(
     }
 }
 
+fn root_update_i64_for_ref(
+    plan: &MachinePlan,
+    event: &RootJsonSourceEvent,
+    root_state: &JsonMap<String, JsonValue>,
+    value_ref: &ValueRef,
+    active_source_id: SourceId,
+    op_id: PlanOpId,
+    context: &str,
+) -> PlanExecutorResult<Option<i64>> {
+    let Some(value) = root_update_json_value_for_ref(
+        plan,
+        event,
+        root_state,
+        value_ref,
+        active_source_id,
+        op_id,
+        context,
+    )?
+    else {
+        return Ok(None);
+    };
+    json_number_value(&value).map(Some).ok_or_else(|| {
+        format!(
+            "root update branch {} {context} value {:?} is not numeric",
+            op_id.0, value
+        )
+        .into()
+    })
+}
+
 fn indexed_update_json_value_for_ref(
     plan: &MachinePlan,
     event: &RootJsonSourceEvent,
     row: &PlanExecutorListRowState,
+    root_state: &JsonMap<String, JsonValue>,
     root_derived_values: &BTreeMap<usize, JsonValue>,
     value_ref: &ValueRef,
     op_id: PlanOpId,
@@ -11162,15 +12774,24 @@ fn indexed_update_json_value_for_ref(
     match value_ref {
         ValueRef::State(state_id) => {
             let input_name = local_field_name(&state_label(plan, *state_id));
-            row.fields.get(&input_name).cloned().ok_or_else(|| {
-                format!(
-                    "indexed update branch {} {context} state field `{input_name}` is missing",
-                    op_id.0
-                )
-                .into()
-            })
+            if let Some(value) = row.fields.get(&input_name).cloned() {
+                return Ok(value);
+            }
+            root_state_value(plan, root_state, *state_id, op_id.0)
+                .cloned()
+                .map_err(|error| {
+                    format!(
+                        "indexed update branch {} {context} cannot read row or root state `{input_name}`: {error}",
+                        op_id.0
+                    )
+                    .into()
+                })
         }
         ValueRef::Field(field_id) => {
+            let row_field_name = local_field_name(&semantic_field_label(plan, field_id.0));
+            if let Some(value) = row.fields.get(&row_field_name).cloned() {
+                return Ok(value);
+            }
             let input_label = derived_field_label(plan, field_id.0);
             root_derived_values
                 .get(&field_id.0)
@@ -11217,6 +12838,7 @@ fn indexed_text_operand_value(
     plan: &MachinePlan,
     event: &RootJsonSourceEvent,
     row: &PlanExecutorListRowState,
+    root_state: &JsonMap<String, JsonValue>,
     root_derived_values: &BTreeMap<usize, JsonValue>,
     value_ref: &ValueRef,
     op_id: PlanOpId,
@@ -11226,6 +12848,7 @@ fn indexed_text_operand_value(
         plan,
         event,
         row,
+        root_state,
         root_derived_values,
         value_ref,
         op_id,
@@ -13105,14 +14728,6 @@ pub fn select_root_source_event_work(
     plan: &MachinePlan,
     source_route: &str,
 ) -> PlanExecutorResult<RootSourceEventWork> {
-    let verification = verify_plan(plan)?;
-    if verification.status != "pass" {
-        return Err(format!(
-            "MachinePlan verification failed with {} error(s)",
-            verification.error_count
-        )
-        .into());
-    }
     let source_id = source_id_for_label(plan, source_route)
         .ok_or_else(|| format!("MachinePlan has no source route `{source_route}`"))?;
     let source_route_slot = plan
@@ -13165,11 +14780,11 @@ pub fn select_root_source_event_work(
         .into());
     }
 
-    let plan_hash = plan_sha256(plan)?;
     let executor_report = plan_executor_no_fallback_counters(json!({
         "executor": "cpu-plan-root-source-event-work-selection-v1",
         "source": source_route,
         "source_id": source_id.0,
+        "plan_integrity": "verified_at_plan_load_not_recomputed_per_source_event",
         "source_route_scoped": source_route_slot.scoped,
         "global_typed_lowering_executable": plan.capability_summary.typed_lowering_executable,
         "global_cpu_plan_executor_unsupported_op_count": plan.capability_summary.cpu_plan_executor_unsupported_op_count,
@@ -13182,7 +14797,7 @@ pub fn select_root_source_event_work(
     }));
 
     Ok(RootSourceEventWork {
-        plan_hash,
+        plan_hash: "elided_from_source_event_hot_path".to_owned(),
         source_label: source_route.to_owned(),
         source_id,
         source_route_scoped: source_route_slot.scoped,
@@ -13726,6 +15341,281 @@ pub fn evaluate_root_json_update_branch(
             )
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::NumberInfix,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let [left_ref, op_ref, right_ref] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "root NumberInfix update branch {} expected left, op, and right operands",
+                    op.id.0
+                )
+                .into());
+            };
+            let Some(left) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                left_ref,
+                source_id,
+                op.id,
+                "number left",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "number_infix",
+                        json!({ "left_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(op_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                op_ref,
+                source_id,
+                op.id,
+                "number operator",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "number_infix",
+                        json!({ "operator_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "root NumberInfix update branch {} operator is not text",
+                    op.id.0
+                )
+            })?;
+            let Some(right) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                right_ref,
+                source_id,
+                op.id,
+                "number right",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "number_infix",
+                        json!({ "right_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let value = json_number_infix_value(&left, op_label, &right).ok_or_else(|| {
+                format!(
+                    "root NumberInfix update branch {} cannot evaluate {:?} {} {:?}",
+                    op.id.0, left, op_label, right
+                )
+            })?;
+            root_json_update_outcome(
+                op.id,
+                true,
+                false,
+                None,
+                Some(output_state_id),
+                Some(value),
+                Some((
+                    "number_infix",
+                    JsonValue::Null,
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            )
+        }
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::ProjectTime,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let [
+                pointer_x_ref,
+                pointer_width_ref,
+                viewport_start_ref,
+                viewport_end_ref,
+                fallback_ref,
+            ] = ordered_inputs.as_slice()
+            else {
+                return Err(format!(
+                    "root ProjectTime update branch {} expected pointer_x, pointer_width, viewport_start, viewport_end, and fallback operands",
+                    op.id.0
+                )
+                .into());
+            };
+            let Some(pointer_x) = root_update_i64_for_ref(
+                plan,
+                event,
+                root_state,
+                pointer_x_ref,
+                source_id,
+                op.id,
+                "project_time pointer_x",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "project_time",
+                        json!({ "pointer_x_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(pointer_width) = root_update_i64_for_ref(
+                plan,
+                event,
+                root_state,
+                pointer_width_ref,
+                source_id,
+                op.id,
+                "project_time pointer_width",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "project_time",
+                        json!({ "pointer_width_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(viewport_start) = root_update_i64_for_ref(
+                plan,
+                event,
+                root_state,
+                viewport_start_ref,
+                source_id,
+                op.id,
+                "project_time viewport_start",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "project_time",
+                        json!({ "viewport_start_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(viewport_end) = root_update_i64_for_ref(
+                plan,
+                event,
+                root_state,
+                viewport_end_ref,
+                source_id,
+                op.id,
+                "project_time viewport_end",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "project_time",
+                        json!({ "viewport_end_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let fallback = root_update_i64_for_ref(
+                plan,
+                event,
+                root_state,
+                fallback_ref,
+                source_id,
+                op.id,
+                "project_time fallback",
+            )?
+            .unwrap_or(viewport_start);
+            let viewport_span = viewport_end - viewport_start;
+            let projected = if pointer_width <= 0 || viewport_span <= 0 {
+                fallback
+            } else {
+                let clamped_x = pointer_x.clamp(0, pointer_width);
+                viewport_start + (viewport_span * clamped_x) / pointer_width
+            };
+            root_json_update_outcome(
+                op.id,
+                true,
+                false,
+                None,
+                Some(output_state_id),
+                Some(json!(projected)),
+                Some((
+                    "project_time",
+                    json!({
+                        "pointer_x": pointer_x,
+                        "pointer_width": pointer_width,
+                        "viewport_start": viewport_start,
+                        "viewport_end": viewport_end,
+                        "fallback": fallback,
+                    }),
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            )
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind: PlanExpressionKind::ReadPath,
             source_payload_field: None,
             update_constant_id: None,
@@ -13759,7 +15649,18 @@ pub fn evaluate_root_json_update_branch(
                     )),
                 )
             } else {
-                let input = root_single_state_or_field_input(op, output_state_id)?;
+                let input = match root_single_state_or_field_input(op, output_state_id) {
+                    Ok(input) => input,
+                    Err(_error)
+                        if op
+                            .inputs
+                            .iter()
+                            .any(|input| matches!(input, ValueRef::State(state_id) if *state_id == output_state_id)) =>
+                    {
+                        ValueRef::State(output_state_id)
+                    }
+                    Err(error) => return Err(error),
+                };
                 let Some(value) = root_update_json_value_for_ref(
                     plan,
                     event,
@@ -14204,6 +16105,233 @@ pub fn evaluate_root_json_update_branch(
             )
         }
         PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::MatchNumberInfixConst,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            ..
+        } => {
+            let [left_ref, op_ref, right_ref, arm_refs @ ..] = ordered_inputs.as_slice() else {
+                return Err(format!(
+                    "root MatchNumberInfixConst update branch {} expected left, op, right, and arm operands",
+                    op.id.0
+                )
+                .into());
+            };
+            let Some(left) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                left_ref,
+                source_id,
+                op.id,
+                "match left",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({ "left_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(op_value) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                op_ref,
+                source_id,
+                op.id,
+                "match operator",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({ "operator_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let op_label = op_value.as_str().ok_or_else(|| {
+                format!(
+                    "root MatchNumberInfixConst update branch {} operator is not text",
+                    op.id.0
+                )
+            })?;
+            let Some(right) = root_update_json_value_for_ref(
+                plan,
+                event,
+                root_state,
+                right_ref,
+                source_id,
+                op.id,
+                "match right",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({ "right_missing": true, "skip": true }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let current =
+                json_match_number_infix_label(&left, op_label, &right).ok_or_else(|| {
+                    format!(
+                        "root MatchNumberInfixConst update branch {} cannot evaluate {:?} {} {:?}",
+                        op.id.0, left, op_label, right
+                    )
+                })?;
+            let mut selected = None;
+            let mut cursor = 0usize;
+            let mut arm_index = 0usize;
+            while cursor < arm_refs.len() {
+                let pattern_ref = arm_refs.get(cursor).ok_or_else(|| {
+                    format!(
+                        "root MatchNumberInfixConst update branch {} has malformed arm operands",
+                        op.id.0
+                    )
+                })?;
+                cursor += 1;
+                let pattern = root_match_const_pattern(plan, pattern_ref, op.id, arm_index)?;
+                let output_expr =
+                    parse_encoded_update_value_expr(plan, arm_refs, &mut cursor, op.id, arm_index)?;
+                if pattern == current || (pattern == "__" && selected.is_none()) {
+                    selected = Some((arm_index, output_expr, pattern == "__"));
+                    if pattern == current {
+                        break;
+                    }
+                }
+                arm_index += 1;
+            }
+            let Some((selected_arm_index, selected_expr, wildcard)) = selected else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({
+                            "current": current,
+                            "selected_arm_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            let Some(value) = evaluate_root_encoded_update_value_expr(
+                plan,
+                event,
+                root_state,
+                source_id,
+                &selected_expr,
+                op.id,
+                "match selected arm",
+            )?
+            else {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({
+                            "current": current,
+                            "selected_arm_index": selected_arm_index,
+                            "wildcard": wildcard,
+                            "selected_value_missing": true,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            };
+            if value.as_str() == Some("SKIP") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    true,
+                    true,
+                    None,
+                    Some(output_state_id),
+                    None,
+                    Some((
+                        "match_number_infix_const",
+                        json!({
+                            "current": current,
+                            "selected_arm_index": selected_arm_index,
+                            "wildcard": wildcard,
+                            "skip": true,
+                        }),
+                        JsonValue::Null,
+                        JsonValue::Null,
+                    )),
+                ));
+            }
+            if value.get("$boon_type").and_then(JsonValue::as_str) == Some("BYTES") {
+                return Ok(root_json_update_outcome(
+                    op.id,
+                    false,
+                    false,
+                    Some("BYTES match arm values require runtime byte storage".to_owned()),
+                    Some(output_state_id),
+                    None,
+                    None,
+                ));
+            }
+            root_json_update_outcome(
+                op.id,
+                true,
+                false,
+                None,
+                Some(output_state_id),
+                Some(value),
+                Some((
+                    "match_number_infix_const",
+                    json!({
+                        "current": current,
+                        "selected_arm_index": selected_arm_index,
+                        "wildcard": wildcard,
+                        "skip": false,
+                    }),
+                    JsonValue::Null,
+                    JsonValue::Null,
+                )),
+            )
+        }
+        PlanOpKind::UpdateBranch {
             expression_kind: PlanExpressionKind::TextTrimOrPrevious,
             source_payload_field,
             update_constant_id: None,
@@ -14458,7 +16586,9 @@ fn validate_list_projection(
     op_id: usize,
 ) -> PlanExecutorResult<()> {
     match projection {
-        PlanListProjection::Find { .. } | PlanListProjection::Chunk { .. } => Ok(()),
+        PlanListProjection::Find { .. }
+        | PlanListProjection::Chunk { .. }
+        | PlanListProjection::ChunkValue { .. } => Ok(()),
         PlanListProjection::Unknown { summary } => {
             Err(format!("list projection op {op_id} is unknown: {summary}").into())
         }
@@ -14684,6 +16814,10 @@ pub fn semantic_field_label(plan: &MachinePlan, field_id: usize) -> String {
 
 pub fn derived_field_label(plan: &MachinePlan, field_id: usize) -> String {
     let expected = format!("field:{field_id}");
+    let semantic = field_label(plan, field_id);
+    if semantic != expected {
+        return semantic;
+    }
     plan.debug_map
         .derived_values
         .iter()
@@ -18542,6327 +20676,4 @@ fn root_state_has_fixed_byte_bank(plan: &MachinePlan, state_id: StateId) -> bool
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn simple_text_source_payload_plan() -> (MachinePlan, SourceId, StateId, PlanOpId) {
-        let source_id = SourceId(2);
-        let state_id = StateId(3);
-        let update_op_id = PlanOpId(4);
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: vec![boon_plan::PlanConstant {
-                id: PlanConstantId(0),
-                value: PlanConstantValue::Text {
-                    value: "".to_owned(),
-                },
-            }],
-            source_routes: vec![SourceRoute {
-                id: boon_plan::PlanSourceRouteId(0),
-                source_id,
-                path: "store.input.change".to_owned(),
-                scoped: false,
-                scope_id: None,
-                payload_schema: boon_plan::SourcePayloadSchema {
-                    fields: vec![SourcePayloadField::Text],
-                    typed_fields: vec![boon_plan::SourcePayloadDescriptor {
-                        field: SourcePayloadField::Text,
-                        value_type: boon_plan::SourcePayloadValueType::Text,
-                    }],
-                    row_lookup_field: None,
-                },
-            }],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(1),
-                    state_id,
-                    value_type: PlanValueType::Text,
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: InitialValueKind::Text,
-                    initial_constant_id: Some(PlanConstantId(0)),
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(1),
-                    kind: RegionKind::SourceRouting,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(1),
-                        kind: PlanOpKind::SourceRoute,
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::Source(source_id)),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(2),
-                    kind: RegionKind::StateInitialization,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(2),
-                        kind: PlanOpKind::StateInitialize {
-                            initial_value_kind: InitialValueKind::Text,
-                            initial_constant_id: Some(PlanConstantId(0)),
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::State(state_id)),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(3),
-                    kind: RegionKind::UpdateBranches,
-                    ops: vec![PlanOp {
-                        id: update_op_id,
-                        kind: PlanOpKind::UpdateBranch {
-                            expression_kind: PlanExpressionKind::SourcePayload,
-                            ordered_inputs: Vec::new(),
-                            source_payload_field: Some(SourcePayloadField::Text),
-                            update_constant_id: None,
-                            source_guard: None,
-                        },
-                        inputs: vec![
-                            ValueRef::Source(source_id),
-                            ValueRef::SourcePayload {
-                                source_id,
-                                field: SourcePayloadField::Text,
-                            },
-                        ],
-                        output: Some(ValueRef::State(state_id)),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-            ],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 1,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 1,
-                source_route_count: 1,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 3,
-                typed_value_ref_count: 5,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: vec![boon_plan::DebugEntry {
-                    id: "source:2".to_owned(),
-                    label: "store.input.change".to_owned(),
-                }],
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:3".to_owned(),
-                    label: "store.input".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        (plan, source_id, state_id, update_op_id)
-    }
-
-    #[test]
-    fn source_route_command_argv_prefers_artifact_paths_and_preserves_live_invocation() {
-        let current = vec![
-            "target/debug/boon_cli".to_owned(),
-            "run-plan-route".to_owned(),
-            "examples/bytes.bn".to_owned(),
-        ];
-        let preserved = build_source_route_command_argv(SourceRouteCommandArgvInput {
-            current_args: current.clone(),
-            source_path: "examples/ignored.bn".to_owned(),
-            target_profile: "software-default".to_owned(),
-            source_route: "store.input.change".to_owned(),
-            target_state: "store.input".to_owned(),
-            text: None,
-            key: None,
-            address: None,
-            payload: BTreeMap::new(),
-            payload_bytes: BTreeMap::new(),
-            payload_byte_artifact_paths: BTreeMap::new(),
-            report_path: None,
-        });
-        assert_eq!(preserved, current);
-
-        let argv = build_source_route_command_argv(SourceRouteCommandArgvInput {
-            current_args: vec!["xtask".to_owned(), "verify".to_owned()],
-            source_path: "examples/bytes.bn".to_owned(),
-            target_profile: "software-default".to_owned(),
-            source_route: "store.input.change".to_owned(),
-            target_state: "store.input".to_owned(),
-            text: Some("Typed".to_owned()),
-            key: Some("Enter".to_owned()),
-            address: Some("A1".to_owned()),
-            payload: BTreeMap::from([("mode".to_owned(), "replace".to_owned())]),
-            payload_bytes: BTreeMap::from([("bytes".to_owned(), vec![0xde, 0xad, 0xbe, 0xef])]),
-            payload_byte_artifact_paths: BTreeMap::from([(
-                "bytes".to_owned(),
-                "target/reports/event-bytes.bin".to_owned(),
-            )]),
-            report_path: Some("target/reports/route.json".to_owned()),
-        });
-        assert_eq!(
-            argv,
-            vec![
-                "target/debug/boon_cli",
-                "run-plan-route",
-                "examples/bytes.bn",
-                "--source",
-                "store.input.change",
-                "--target-state",
-                "store.input",
-                "--text",
-                "Typed",
-                "--key",
-                "Enter",
-                "--address",
-                "A1",
-                "--payload",
-                "mode=replace",
-                "--payload-bytes-file",
-                "bytes=target/reports/event-bytes.bin",
-                "--report",
-                "target/reports/route.json",
-            ]
-        );
-    }
-
-    #[test]
-    fn source_route_source_event_report_preserves_event_shape() {
-        let report = build_source_route_source_event_report(SourceRouteSourceEventReportInput {
-            source: "store.input.change".to_owned(),
-            source_id: 7,
-            text: Some("Typed".to_owned()),
-            key: Some("Enter".to_owned()),
-            list_id: Some("todos".to_owned()),
-            address: Some("A1".to_owned()),
-            target_text: Some("target".to_owned()),
-            target_occurrence: Some(2),
-            target_key: Some(42),
-            target_generation: Some(3),
-            bind_epoch: Some(4),
-            source_epoch: Some(5),
-            payload: BTreeMap::from([("mode".to_owned(), "replace".to_owned())]),
-            payload_bytes_report: json!({
-                "bytes": {
-                    "$boon_type": "BYTES",
-                    "storage": "artifact",
-                    "artifact_path": "target/reports/event-bytes.bin"
-                }
-            }),
-            pointer_x: Some("10".to_owned()),
-            pointer_y: Some("11".to_owned()),
-            pointer_width: Some("12".to_owned()),
-            pointer_height: Some("13".to_owned()),
-        });
-
-        assert_eq!(report["source"], "store.input.change");
-        assert_eq!(report["source_id"], 7);
-        assert_eq!(report["text"], "Typed");
-        assert_eq!(report["payload"]["mode"], "replace");
-        assert_eq!(
-            report["payload_bytes"]["bytes"]["artifact_path"],
-            "target/reports/event-bytes.bin"
-        );
-        assert_eq!(report["pointer_height"], "13");
-    }
-
-    #[test]
-    fn source_event_payload_bytes_report_writes_artifacts_and_inlines_small_payloads() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "boon-plan-executor-source-event-bytes-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-        let report_path = temp_dir.join("route-report.json");
-
-        let small = vec![1, 2];
-        let large = vec![0, 1, 2, 3];
-        let report = build_source_event_payload_bytes_report(
-            &BTreeMap::from([
-                ("small".to_owned(), small.clone()),
-                ("weird/name".to_owned(), large.clone()),
-            ]),
-            Some(&report_path),
-            3,
-        )
-        .unwrap();
-
-        let small_digest = sha256_bytes(&small);
-        assert_eq!(report.payload_bytes["small"]["storage"], "inline");
-        assert_eq!(report.payload_bytes["small"]["digest"], small_digest);
-        assert_eq!(report.payload_bytes["small"]["byte_len"], 2);
-        assert_eq!(report.payload_bytes["small"]["inline_bytes"], json!([1, 2]));
-        assert_eq!(report.payload_bytes["small"]["inline_byte_limit"], 3);
-
-        let large_digest = sha256_bytes(&large);
-        let artifact_path = report.payload_bytes["weird/name"]["artifact_path"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_eq!(report.payload_bytes["weird/name"]["storage"], "artifact");
-        assert_eq!(report.payload_bytes["weird/name"]["digest"], large_digest);
-        assert_eq!(
-            report.payload_bytes["weird/name"]["artifact_sha256"],
-            large_digest
-        );
-        assert_eq!(report.payload_bytes["weird/name"]["inline_byte_limit"], 3);
-        assert!(
-            artifact_path.ends_with(&format!(
-                "route-report-artifacts/source-event-weird_name-{large_digest}.bytes"
-            )),
-            "unexpected artifact path: {artifact_path}"
-        );
-        assert_eq!(fs::read(&artifact_path).unwrap(), large);
-        assert_eq!(report.artifacts.len(), 1);
-        assert_eq!(report.artifacts[0]["path"], artifact_path);
-        assert_eq!(report.artifacts[0]["sha256"], large_digest);
-        assert_eq!(
-            report.executor_report["executor"],
-            "cpu-plan-source-event-payload-bytes-report-v1"
-        );
-        assert_eq!(report.executor_report["payload_field_count"], 2);
-        assert_eq!(report.executor_report["inline_payload_count"], 1);
-        assert_eq!(report.executor_report["artifact_payload_count"], 1);
-        assert_eq!(report.executor_report["runtime_ast_eval_count"], 0);
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn source_route_command_output_assembles_event_argv_report_and_artifacts() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "boon-plan-executor-source-route-output-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-        let report_path = temp_dir.join("route-report.json");
-        let payload = vec![9, 8, 7, 6];
-
-        let output = assemble_source_route_command_output(SourceRouteCommandOutputInput {
-            current_args: vec!["xtask".to_owned()],
-            generated_at_utc: "2026-06-28T00:00:00Z".to_owned(),
-            git_commit: "abc123".to_owned(),
-            worktree_fingerprint: "worktreehash".to_owned(),
-            binary_hash: "binhash".to_owned(),
-            binary_path: "target/debug/boon_cli".to_owned(),
-            source_path: "examples/bytes.bn".to_owned(),
-            source_hash: "sourcehash".to_owned(),
-            source_files: vec!["examples/bytes.bn".to_owned()],
-            program_hash: "programhash".to_owned(),
-            program_kind: "single-file".to_owned(),
-            program_file_count: 1,
-            graph_node_count: 2,
-            load_pipeline_profile: json!({"total_ms": 1.0}),
-            target_profile: "software-default".to_owned(),
-            source_route: "store.receive".to_owned(),
-            target_state: "store.blob".to_owned(),
-            event: SourceRouteSourceEventReportInput {
-                source: "store.receive".to_owned(),
-                source_id: 3,
-                text: Some("ignored".to_owned()),
-                key: Some("Enter".to_owned()),
-                list_id: None,
-                address: Some("A1".to_owned()),
-                target_text: None,
-                target_occurrence: None,
-                target_key: None,
-                target_generation: None,
-                bind_epoch: Some(4),
-                source_epoch: Some(5),
-                payload: BTreeMap::from([("mode".to_owned(), "replace".to_owned())]),
-                payload_bytes_report: JsonValue::Null,
-                pointer_x: Some("10".to_owned()),
-                pointer_y: Some("11".to_owned()),
-                pointer_width: None,
-                pointer_height: None,
-            },
-            payload_bytes: BTreeMap::from([("bytes".to_owned(), payload.clone())]),
-            report_path: Some(report_path),
-            plan_hash: "planhash".to_owned(),
-            plan_version: json!({"major": 1}),
-            capability_summary: json!({"executable": true}),
-            route_surface: json!({"expression_kind": "SourcePayload"}),
-            state_summary: json!({"store": {"blob": "ok"}}),
-            semantic_delta_signatures: vec!["FieldSet:store.blob".to_owned()],
-            semantic_deltas: json!([{"kind": "FieldSet"}]),
-            plan_executor: json!({"executor": "cpu-plan-source-route-v1"}),
-            inline_byte_limit: 3,
-        })
-        .unwrap();
-
-        let digest = sha256_bytes(&payload);
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["plan_executor_status"], "pass");
-        assert!(output.report.get("accepted_for_product_status").is_none());
-        assert!(output.report.get("comparison_status").is_none());
-        assert_eq!(
-            output.report["plan_executor"]["command_output_core"]["executor"],
-            "cpu-plan-source-route-command-output-v1"
-        );
-        assert_eq!(
-            output.source_event["payload_bytes"]["bytes"]["storage"],
-            "artifact"
-        );
-        assert_eq!(
-            output.source_event["payload_bytes"]["bytes"]["artifact_sha256"],
-            digest
-        );
-        assert_eq!(output.artifact_sha256s.len(), 1);
-        let artifact_path = output.artifact_sha256s[0]["path"].as_str().unwrap();
-        assert_eq!(fs::read(artifact_path).unwrap(), payload);
-        assert!(
-            output
-                .command_argv
-                .windows(2)
-                .any(|window| window == ["--payload-bytes-file", &format!("bytes={artifact_path}")])
-        );
-        assert_eq!(output.report["source_event"], output.source_event);
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn root_scenario_command_output_assembles_report_and_executor_core() {
-        let output = assemble_root_scenario_command_output(RootScenarioCommandOutputInput {
-            command_argv: vec![
-                "target/debug/boon_cli".to_owned(),
-                "run-plan-root-scalar-scenario".to_owned(),
-                "examples/counter.bn".to_owned(),
-            ],
-            generated_at_utc: "2026-06-29T00:00:00Z".to_owned(),
-            git_commit: "abc123".to_owned(),
-            worktree_fingerprint: "worktreehash".to_owned(),
-            binary_hash: "binhash".to_owned(),
-            binary_path: "target/debug/boon_cli".to_owned(),
-            source_path: "examples/counter.bn".to_owned(),
-            source_hash: "sourcehash".to_owned(),
-            source_files: vec!["examples/counter.bn".to_owned()],
-            scenario_path: "examples/counter.scn".to_owned(),
-            scenario_hash: "scenariohash".to_owned(),
-            program_hash: "programhash".to_owned(),
-            program_kind: "single-file".to_owned(),
-            program_file_count: 1,
-            graph_node_count: 3,
-            load_pipeline_profile: json!({"total_ms": 1.0}),
-            target_profile: "software-default".to_owned(),
-            plan_hash: "planhash".to_owned(),
-            plan_version: json!({"major": 1}),
-            capability_summary: json!({"executable": true}),
-            selected_step_ids: vec!["increment".to_owned(), "inspect".to_owned()],
-            state_summary: json!({"store": {"count": 1}}),
-            semantic_delta_signatures: vec!["FieldSet:store.count".to_owned()],
-            semantic_deltas: json!([{"kind": "FieldSet"}]),
-            plan_executor: json!({"executor": "cpu-plan-root-scenario-v1"}),
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["plan_executor_status"], "pass");
-        assert!(output.report.get("accepted_for_product_status").is_none());
-        assert!(output.report.get("comparison_status").is_none());
-        assert_eq!(output.report["command"], "run-plan-root-scalar-scenario");
-        assert_eq!(
-            output.report["selected_step_ids"],
-            json!(["increment", "inspect"])
-        );
-        assert_eq!(json!(output.command_argv), output.report["command_argv"]);
-        assert_eq!(
-            output.report["plan_executor"]["command_output_core"]["executor"],
-            "cpu-plan-root-scenario-command-output-v1"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["command_output_core"]["selected_step_count"],
-            2
-        );
-        assert_eq!(
-            output.executor_report["executor"],
-            "cpu-plan-root-scenario-command-output-v1"
-        );
-    }
-
-    #[test]
-    fn scenario_events_command_output_assembles_report_and_executor_core() {
-        let output = assemble_scenario_events_command_output(ScenarioEventsCommandOutputInput {
-            command_argv: vec![
-                "target/debug/boon_cli".to_owned(),
-                "run-plan-scenario-events".to_owned(),
-                "examples/counter.bn".to_owned(),
-            ],
-            generated_at_utc: "2026-06-29T00:00:00Z".to_owned(),
-            git_commit: "abc123".to_owned(),
-            worktree_fingerprint: "worktreehash".to_owned(),
-            binary_hash: "binhash".to_owned(),
-            binary_path: "target/debug/boon_cli".to_owned(),
-            source_path: "examples/counter.bn".to_owned(),
-            source_hash: "sourcehash".to_owned(),
-            source_files: vec!["examples/counter.bn".to_owned()],
-            scenario_path: "examples/counter.scn".to_owned(),
-            scenario_hash: "scenariohash".to_owned(),
-            program_hash: "programhash".to_owned(),
-            program_kind: "single-file".to_owned(),
-            program_file_count: 1,
-            graph_node_count: 3,
-            load_pipeline_profile: json!({"total_ms": 1.0}),
-            target_profile: "software-default".to_owned(),
-            plan_hash: "planhash".to_owned(),
-            plan_version: json!({"major": 1}),
-            capability_summary: json!({"executable": true}),
-            state_summary: json!({"store": {"count": 1}}),
-            semantic_delta_signatures: vec!["FieldSet:store.count".to_owned()],
-            semantic_deltas: json!([{"kind": "FieldSet"}]),
-            plan_executor_coverage: json!({
-                "selected_step_ids": ["increment", "inspect"],
-                "covers_assertion_only_steps": true
-            }),
-            assertion_only_covered: true,
-            plan_executor: json!({"executor": "cpu-plan-scenario-events-v1"}),
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert_eq!(output.report["plan_executor_status"], "pass");
-        assert!(output.report.get("accepted_for_product_status").is_none());
-        assert!(output.report.get("comparison_status").is_none());
-        assert_eq!(output.report["command"], "run-plan-scenario-events");
-        assert_eq!(
-            output.report["selected_step_ids"],
-            json!(["increment", "inspect"])
-        );
-        assert_eq!(json!(output.command_argv), output.report["command_argv"]);
-        assert_eq!(
-            output.report["plan_executor"]["command_output_core"]["executor"],
-            "cpu-plan-scenario-events-command-output-v1"
-        );
-        assert_eq!(
-            output.report["plan_executor"]["command_output_core"]["selected_step_count"],
-            2
-        );
-        assert_eq!(
-            output.executor_report["executor"],
-            "cpu-plan-scenario-events-command-output-v1"
-        );
-    }
-
-    #[test]
-    fn scenario_events_report_without_compare_is_product_status() {
-        let output = assemble_scenario_events_command_output(ScenarioEventsCommandOutputInput {
-            command_argv: vec![
-                "target/debug/boon_cli".to_owned(),
-                "run-plan-scenario-events".to_owned(),
-                "examples/counter.bn".to_owned(),
-            ],
-            generated_at_utc: "2026-06-29T00:00:00Z".to_owned(),
-            git_commit: "abc123".to_owned(),
-            worktree_fingerprint: "worktreehash".to_owned(),
-            binary_hash: "binhash".to_owned(),
-            binary_path: "target/debug/boon_cli".to_owned(),
-            source_path: "examples/counter.bn".to_owned(),
-            source_hash: "sourcehash".to_owned(),
-            source_files: vec!["examples/counter.bn".to_owned()],
-            scenario_path: "examples/counter.scn".to_owned(),
-            scenario_hash: "scenariohash".to_owned(),
-            program_hash: "programhash".to_owned(),
-            program_kind: "single-file".to_owned(),
-            program_file_count: 1,
-            graph_node_count: 3,
-            load_pipeline_profile: json!({"total_ms": 1.0}),
-            target_profile: "software-default".to_owned(),
-            plan_hash: "planhash".to_owned(),
-            plan_version: json!({"major": 1}),
-            capability_summary: json!({"executable": true}),
-            state_summary: json!({"store": {"count": 1}}),
-            semantic_delta_signatures: vec!["FieldSet:store.count".to_owned()],
-            semantic_deltas: json!([{"kind": "FieldSet"}]),
-            plan_executor_coverage: json!({
-                "selected_step_ids": ["increment"],
-                "covers_assertion_only_steps": true
-            }),
-            assertion_only_covered: true,
-            plan_executor: json!({"executor": "cpu-plan-scenario-events-v1"}),
-        });
-
-        assert_eq!(output.report["status"], "pass");
-        assert!(output.report.get("comparison_status").is_none());
-        assert_eq!(
-            output.report["report_status_basis"],
-            "plan-executor-product-plus-assertion-coverage"
-        );
-        assert!(
-            output
-                .report
-                .pointer("/command_report_assembly_core/compare_required_for_status")
-                .is_none()
-        );
-        assert_eq!(output.report["per_step_pass_fail"][2]["pass"], true);
-        assert_eq!(
-            output.report["per_step_pass_fail"][2]["id"],
-            "scenario-event-product-path-is-plan-executor-only"
-        );
-    }
-
-    #[test]
-    fn source_route_command_argv_encodes_inline_bytes_and_non_default_target() {
-        let argv = build_source_route_command_argv(SourceRouteCommandArgvInput {
-            current_args: vec!["xtask".to_owned()],
-            source_path: "examples/bytes.bn".to_owned(),
-            target_profile: "software-wasm".to_owned(),
-            source_route: "store.input.change".to_owned(),
-            target_state: "store.input".to_owned(),
-            text: None,
-            key: None,
-            address: None,
-            payload: BTreeMap::new(),
-            payload_bytes: BTreeMap::from([("bytes".to_owned(), vec![0, 1, 2, 255])]),
-            payload_byte_artifact_paths: BTreeMap::new(),
-            report_path: None,
-        });
-        assert_eq!(
-            argv,
-            vec![
-                "target/debug/boon_cli",
-                "run-plan-route",
-                "examples/bytes.bn",
-                "--source",
-                "store.input.change",
-                "--target-state",
-                "store.input",
-                "--payload-bytes-hex",
-                "bytes=000102ff",
-                "--target",
-                "software-wasm",
-            ]
-        );
-    }
-
-    #[test]
-    fn source_route_execution_surface_is_executor_owned() {
-        let mut execution = SourceRouteJsonExecution {
-            plan_hash: "plan".to_owned(),
-            source_label: "store.input.change".to_owned(),
-            source_id: SourceId(2),
-            target_state_label: "store.input".to_owned(),
-            target_state_id: StateId(3),
-            update_op_id: PlanOpId(4),
-            supported: true,
-            skipped_by_guard: false,
-            unsupported_reason: None,
-            value: Some(json!("hello")),
-            state_summary: json!({ "store.input": "hello" }),
-            semantic_delta_signatures: Vec::new(),
-            semantic_deltas: Vec::new(),
-            expression_kind: Some("source_payload_text"),
-            source_payload_field: json!("Text"),
-            update_constant_id: JsonValue::Null,
-            update_constant_value: JsonValue::Null,
-            executor_report: json!({}),
-        };
-
-        let scalar_surface = select_source_route_execution_surface(&execution)
-            .expect("scalar JSON execution should classify");
-        assert_eq!(
-            scalar_surface.kind,
-            SourceRouteExecutionSurfaceKind::PlanJson
-        );
-        assert_eq!(
-            scalar_surface.executor_report["execution_surface"],
-            "plan-json"
-        );
-
-        execution.value = Some(json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "abc",
-            "byte_len": 3
-        }));
-        let bytes_surface = select_source_route_execution_surface(&execution)
-            .expect("BYTES execution should classify");
-        assert_eq!(
-            bytes_surface.kind,
-            SourceRouteExecutionSurfaceKind::FullExecution
-        );
-        assert_eq!(
-            bytes_surface.executor_report["execution_surface"],
-            "full-execution"
-        );
-        assert_eq!(
-            bytes_surface.executor_report["route_core_value_is_bytes"],
-            true
-        );
-
-        execution.skipped_by_guard = true;
-        let error = select_source_route_execution_surface(&execution)
-            .expect_err("guard-skipped selected execution should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("source guard did not match the supplied event"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn root_match_const_update_executes_on_json_surface() {
-        let source_id = SourceId(2);
-        let state_id = StateId(3);
-        let update_op_id = PlanOpId(4);
-        let constants = vec![
-            boon_plan::PlanConstant {
-                id: PlanConstantId(0),
-                value: PlanConstantValue::Enum {
-                    value: "Light".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(1),
-                value: PlanConstantValue::Text {
-                    value: "Light".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(2),
-                value: PlanConstantValue::Enum {
-                    value: "Dark".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(3),
-                value: PlanConstantValue::Text {
-                    value: "Dark".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(4),
-                value: PlanConstantValue::Enum {
-                    value: "Light".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(5),
-                value: PlanConstantValue::Text {
-                    value: "__".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(6),
-                value: PlanConstantValue::Text {
-                    value: "SKIP".to_owned(),
-                },
-            },
-        ];
-        let source_route = SourceRoute {
-            id: boon_plan::PlanSourceRouteId(0),
-            source_id,
-            path: "store.mode_toggle".to_owned(),
-            scoped: false,
-            scope_id: None,
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        };
-        let update_op = PlanOp {
-            id: update_op_id,
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::MatchConst,
-                ordered_inputs: vec![
-                    ValueRef::State(state_id),
-                    ValueRef::Constant(PlanConstantId(1)),
-                    ValueRef::Constant(PlanConstantId(2)),
-                    ValueRef::Constant(PlanConstantId(3)),
-                    ValueRef::Constant(PlanConstantId(4)),
-                    ValueRef::Constant(PlanConstantId(5)),
-                    ValueRef::Constant(PlanConstantId(6)),
-                ],
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: vec![ValueRef::Source(source_id), ValueRef::State(state_id)],
-            output: Some(ValueRef::State(state_id)),
-            indexed: false,
-            unresolved_executable_ref_count: 0,
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants,
-            source_routes: vec![source_route.clone()],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(1),
-                    state_id,
-                    value_type: PlanValueType::Enum,
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: InitialValueKind::Enum,
-                    initial_constant_id: Some(PlanConstantId(0)),
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(3),
-                kind: RegionKind::UpdateBranches,
-                ops: vec![update_op.clone()],
-            }],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 1,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 7,
-                source_route_count: 1,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 1,
-                typed_value_ref_count: 9,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: vec![boon_plan::DebugEntry {
-                    id: "source:2".to_owned(),
-                    label: "store.mode_toggle".to_owned(),
-                }],
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:3".to_owned(),
-                    label: "store.mode".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let root_state = JsonMap::from_iter([("store.mode".to_owned(), json!("Light"))]);
-        let evaluation = evaluate_root_json_update_branch(
-            &plan,
-            &update_op,
-            source_id,
-            &source_route,
-            &RootJsonSourceEvent::default(),
-            &root_state,
-        )
-        .expect("root MatchConst should evaluate");
-        assert!(evaluation.supported);
-        assert!(!evaluation.skipped_by_guard);
-        assert_eq!(evaluation.expression_kind, Some("match_const"));
-        assert_eq!(evaluation.value, Some(json!("Dark")));
-
-        let execution = execute_root_json_update_branch(
-            &plan,
-            &update_op,
-            source_id,
-            &source_route,
-            &RootJsonSourceEvent::default(),
-            &root_state,
-        )
-        .expect("root MatchConst should execute on JSON surface");
-        assert_eq!(
-            execution.surface_kind,
-            RootUpdateExecutionSurfaceKind::PlanJson
-        );
-        assert_eq!(execution.executed.unwrap().value, json!("Dark"));
-
-        let skipped_root_state = JsonMap::from_iter([("store.mode".to_owned(), json!("System"))]);
-        let skipped = evaluate_root_json_update_branch(
-            &plan,
-            &update_op,
-            source_id,
-            &source_route,
-            &RootJsonSourceEvent::default(),
-            &skipped_root_state,
-        )
-        .expect("fallback SKIP should evaluate as a no-op");
-        assert!(skipped.supported);
-        assert!(skipped.skipped_by_guard);
-        assert_eq!(skipped.value, None);
-
-        let field_id = FieldId(9);
-        let mut field_update_op = update_op.clone();
-        if let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &mut field_update_op.kind {
-            ordered_inputs[0] = ValueRef::Field(field_id);
-        }
-        field_update_op.inputs = vec![ValueRef::Source(source_id), ValueRef::Field(field_id)];
-        let mut field_plan = plan.clone();
-        field_plan.regions[0].ops = vec![field_update_op.clone()];
-        field_plan.debug_map.derived_values = vec![boon_plan::DebugEntry {
-            id: "field:9".to_owned(),
-            label: "store.selected_mode".to_owned(),
-        }];
-        let field_root_state = JsonMap::from_iter([
-            ("store.mode".to_owned(), json!("System")),
-            ("store.selected_mode".to_owned(), json!("Light")),
-        ]);
-        let field_evaluation = evaluate_root_json_update_branch(
-            &field_plan,
-            &field_update_op,
-            source_id,
-            &source_route,
-            &RootJsonSourceEvent::default(),
-            &field_root_state,
-        )
-        .expect("root MatchConst should read root derived fields");
-        assert!(field_evaluation.supported);
-        assert_eq!(field_evaluation.value, Some(json!("Dark")));
-    }
-
-    #[test]
-    fn root_match_value_const_update_executes_read_path_arms() {
-        let source_id = SourceId(7);
-        let selector_state_id = StateId(8);
-        let value_a_state_id = StateId(9);
-        let output_state_id = StateId(10);
-        let update_op_id = PlanOpId(11);
-        let constants = vec![
-            boon_plan::PlanConstant {
-                id: PlanConstantId(0),
-                value: PlanConstantValue::Text {
-                    value: "A".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(1),
-                value: PlanConstantValue::Text {
-                    value: "__".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(2),
-                value: PlanConstantValue::Text {
-                    value: "SKIP".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(3),
-                value: PlanConstantValue::Text {
-                    value: "old".to_owned(),
-                },
-            },
-            boon_plan::PlanConstant {
-                id: PlanConstantId(4),
-                value: PlanConstantValue::Text {
-                    value: "alpha".to_owned(),
-                },
-            },
-        ];
-        let source_route = SourceRoute {
-            id: boon_plan::PlanSourceRouteId(0),
-            source_id,
-            path: "store.trigger".to_owned(),
-            scoped: false,
-            scope_id: None,
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        };
-        let update_op = PlanOp {
-            id: update_op_id,
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::MatchValueConst,
-                ordered_inputs: vec![
-                    ValueRef::State(selector_state_id),
-                    ValueRef::Constant(PlanConstantId(0)),
-                    ValueRef::State(value_a_state_id),
-                    ValueRef::Constant(PlanConstantId(1)),
-                    ValueRef::Constant(PlanConstantId(2)),
-                ],
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: vec![
-                ValueRef::Source(source_id),
-                ValueRef::State(selector_state_id),
-                ValueRef::State(value_a_state_id),
-            ],
-            output: Some(ValueRef::State(output_state_id)),
-            indexed: false,
-            unresolved_executable_ref_count: 0,
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants,
-            source_routes: vec![source_route.clone()],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![
-                    boon_plan::ScalarStorageSlot {
-                        id: boon_plan::PlanStorageId(0),
-                        state_id: selector_state_id,
-                        value_type: PlanValueType::Text,
-                        scope_id: None,
-                        indexed: false,
-                        initial_value_kind: InitialValueKind::Text,
-                        initial_constant_id: Some(PlanConstantId(0)),
-                        initial_root_field_path: None,
-                        initial_row_field_path: None,
-                    },
-                    boon_plan::ScalarStorageSlot {
-                        id: boon_plan::PlanStorageId(1),
-                        state_id: value_a_state_id,
-                        value_type: PlanValueType::Text,
-                        scope_id: None,
-                        indexed: false,
-                        initial_value_kind: InitialValueKind::Text,
-                        initial_constant_id: Some(PlanConstantId(4)),
-                        initial_root_field_path: None,
-                        initial_row_field_path: None,
-                    },
-                    boon_plan::ScalarStorageSlot {
-                        id: boon_plan::PlanStorageId(2),
-                        state_id: output_state_id,
-                        value_type: PlanValueType::Text,
-                        scope_id: None,
-                        indexed: false,
-                        initial_value_kind: InitialValueKind::Text,
-                        initial_constant_id: Some(PlanConstantId(3)),
-                        initial_root_field_path: None,
-                        initial_row_field_path: None,
-                    },
-                ],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(3),
-                kind: RegionKind::UpdateBranches,
-                ops: vec![update_op.clone()],
-            }],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 1,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 5,
-                source_route_count: 1,
-                scalar_storage_count: 3,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 1,
-                typed_value_ref_count: 8,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: vec![boon_plan::DebugEntry {
-                    id: "source:7".to_owned(),
-                    label: "store.trigger".to_owned(),
-                }],
-                state_slots: vec![
-                    boon_plan::DebugEntry {
-                        id: "state:8".to_owned(),
-                        label: "store.selector".to_owned(),
-                    },
-                    boon_plan::DebugEntry {
-                        id: "state:9".to_owned(),
-                        label: "store.value_a".to_owned(),
-                    },
-                    boon_plan::DebugEntry {
-                        id: "state:10".to_owned(),
-                        label: "store.selected".to_owned(),
-                    },
-                ],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let root_state = JsonMap::from_iter([
-            ("store.selector".to_owned(), json!("A")),
-            ("store.value_a".to_owned(), json!("alpha")),
-            ("store.selected".to_owned(), json!("old")),
-        ]);
-        let evaluation = evaluate_root_json_update_branch(
-            &plan,
-            &update_op,
-            source_id,
-            &source_route,
-            &RootJsonSourceEvent::default(),
-            &root_state,
-        )
-        .expect("root MatchValueConst should evaluate");
-        assert!(evaluation.supported);
-        assert_eq!(evaluation.value, Some(json!("alpha")));
-        assert_eq!(evaluation.expression_kind, Some("match_value_const"));
-
-        let skipped_root_state = JsonMap::from_iter([
-            ("store.selector".to_owned(), json!("B")),
-            ("store.value_a".to_owned(), json!("alpha")),
-            ("store.selected".to_owned(), json!("old")),
-        ]);
-        let skipped = evaluate_root_json_update_branch(
-            &plan,
-            &update_op,
-            source_id,
-            &source_route,
-            &RootJsonSourceEvent::default(),
-            &skipped_root_state,
-        )
-        .expect("root MatchValueConst fallback SKIP should evaluate");
-        assert!(skipped.supported);
-        assert!(skipped.skipped_by_guard);
-        assert_eq!(skipped.value, None);
-    }
-
-    #[test]
-    fn root_read_path_update_reads_derived_field_value() {
-        let source_id = SourceId(12);
-        let output_state_id = StateId(13);
-        let field_id = FieldId(14);
-        let update_op = PlanOp {
-            id: PlanOpId(15),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::ReadPath,
-                ordered_inputs: Vec::new(),
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: vec![ValueRef::Source(source_id), ValueRef::Field(field_id)],
-            output: Some(ValueRef::State(output_state_id)),
-            indexed: false,
-            unresolved_executable_ref_count: 0,
-        };
-        let source_route = SourceRoute {
-            id: boon_plan::PlanSourceRouteId(0),
-            source_id,
-            path: "store.trigger".to_owned(),
-            scoped: false,
-            scope_id: None,
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: vec![source_route.clone()],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(0),
-                    state_id: output_state_id,
-                    value_type: PlanValueType::Text,
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: InitialValueKind::Text,
-                    initial_constant_id: None,
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(3),
-                kind: RegionKind::UpdateBranches,
-                ops: vec![update_op.clone()],
-            }],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 1,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 0,
-                source_route_count: 1,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 1,
-                typed_value_ref_count: 4,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: vec![boon_plan::DebugEntry {
-                    id: "source:12".to_owned(),
-                    label: "store.trigger".to_owned(),
-                }],
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:13".to_owned(),
-                    label: "store.selected".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: vec![boon_plan::DebugEntry {
-                    id: "field:14".to_owned(),
-                    label: "store.derived_selected".to_owned(),
-                }],
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let root_state = JsonMap::from_iter([
-            ("store.selected".to_owned(), json!("old")),
-            ("store.derived_selected".to_owned(), json!("new")),
-        ]);
-        let evaluation = evaluate_root_json_update_branch(
-            &plan,
-            &update_op,
-            source_id,
-            &source_route,
-            &RootJsonSourceEvent::default(),
-            &root_state,
-        )
-        .expect("root ReadPath should read root derived fields");
-
-        assert!(evaluation.supported);
-        assert_eq!(evaluation.value, Some(json!("new")));
-        assert_eq!(evaluation.expression_kind, Some("read_path"));
-    }
-
-    #[test]
-    fn source_route_orchestration_is_executor_owned() {
-        let source_id = SourceId(2);
-        let state_id = StateId(3);
-        let update_op_id = PlanOpId(4);
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: vec![boon_plan::PlanConstant {
-                id: PlanConstantId(0),
-                value: PlanConstantValue::Text {
-                    value: "".to_owned(),
-                },
-            }],
-            source_routes: vec![SourceRoute {
-                id: boon_plan::PlanSourceRouteId(0),
-                source_id,
-                path: "store.input.change".to_owned(),
-                scoped: false,
-                scope_id: None,
-                payload_schema: boon_plan::SourcePayloadSchema {
-                    fields: vec![SourcePayloadField::Text],
-                    typed_fields: vec![boon_plan::SourcePayloadDescriptor {
-                        field: SourcePayloadField::Text,
-                        value_type: boon_plan::SourcePayloadValueType::Text,
-                    }],
-                    row_lookup_field: None,
-                },
-            }],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(1),
-                    state_id,
-                    value_type: PlanValueType::Text,
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: InitialValueKind::Text,
-                    initial_constant_id: Some(PlanConstantId(0)),
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(1),
-                    kind: RegionKind::SourceRouting,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(1),
-                        kind: PlanOpKind::SourceRoute,
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::Source(source_id)),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(2),
-                    kind: RegionKind::StateInitialization,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(2),
-                        kind: PlanOpKind::StateInitialize {
-                            initial_value_kind: InitialValueKind::Text,
-                            initial_constant_id: Some(PlanConstantId(0)),
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::State(state_id)),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(3),
-                    kind: RegionKind::UpdateBranches,
-                    ops: vec![PlanOp {
-                        id: update_op_id,
-                        kind: PlanOpKind::UpdateBranch {
-                            expression_kind: PlanExpressionKind::SourcePayload,
-                            ordered_inputs: Vec::new(),
-                            source_payload_field: Some(SourcePayloadField::Text),
-                            update_constant_id: None,
-                            source_guard: None,
-                        },
-                        inputs: vec![
-                            ValueRef::Source(source_id),
-                            ValueRef::SourcePayload {
-                                source_id,
-                                field: SourcePayloadField::Text,
-                            },
-                        ],
-                        output: Some(ValueRef::State(state_id)),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-            ],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 1,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 1,
-                source_route_count: 1,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 3,
-                typed_value_ref_count: 5,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: vec![boon_plan::DebugEntry {
-                    id: "source:2".to_owned(),
-                    label: "store.input.change".to_owned(),
-                }],
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:3".to_owned(),
-                    label: "store.input".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let event = RootJsonSourceEvent {
-            text: Some("hello".to_owned()),
-            ..RootJsonSourceEvent::default()
-        };
-        let verification = verify_plan(&plan).expect("test plan should verify");
-        assert_eq!(
-            verification.status,
-            "pass",
-            "test plan verification failed: {:?}",
-            verification
-                .checks
-                .iter()
-                .filter(|check| !check.pass)
-                .collect::<Vec<_>>()
-        );
-        let output = execute_source_route_with_full_execution(
-            &plan,
-            "store.input.change",
-            "store.input",
-            &event,
-            || {
-                Ok(SourceRouteFullExecution {
-                    state_summary: json!({ "store.input": "hello" }),
-                    semantic_delta_signatures: vec!["FieldSet:store.input".to_owned()],
-                    semantic_deltas: json!([{
-                        "kind": "FieldSet",
-                        "field_path": "store.input",
-                        "value": "hello"
-                    }]),
-                    per_step: Vec::new(),
-                    executor_report: json!({ "executor": "test-full-execution" }),
-                })
-            },
-        )
-        .expect("source-route orchestration should execute through PlanExecutor");
-
-        assert_eq!(output.value, json!("hello"));
-        assert_eq!(output.state_summary, json!({ "store.input": "hello" }));
-        assert_eq!(output.route_surface["expression_kind"], "source_payload");
-        assert_eq!(
-            output.route_surface["route_execution_core"]["execution_surface_core"]["execution_surface"],
-            "plan-json"
-        );
-        assert_eq!(
-            output.executor_report["executor"],
-            "cpu-plan-source-route-v1"
-        );
-    }
-
-    #[test]
-    fn root_update_execution_surface_is_executor_owned() {
-        let mut evaluation = RootJsonUpdateEvaluation {
-            supported: true,
-            skipped_by_guard: false,
-            unsupported_reason: None,
-            target_state_id: Some(StateId(3)),
-            value: Some(json!("hello")),
-            expression_kind: Some("source_payload"),
-            source_payload_field: json!("Text"),
-            update_constant_id: JsonValue::Null,
-            update_constant_value: JsonValue::Null,
-            executor_report: json!({}),
-        };
-
-        let scalar_surface = select_root_update_execution_surface(PlanOpId(4), &evaluation);
-        assert_eq!(
-            scalar_surface.kind,
-            RootUpdateExecutionSurfaceKind::PlanJson
-        );
-        assert_eq!(
-            scalar_surface.executor_report["execution_surface"],
-            "plan-json"
-        );
-
-        evaluation.value = Some(json!({
-            "$boon_type": "BYTES",
-            "storage": "inline",
-            "digest": "abc",
-            "byte_len": 3
-        }));
-        let bytes_surface = select_root_update_execution_surface(PlanOpId(4), &evaluation);
-        assert_eq!(
-            bytes_surface.kind,
-            RootUpdateExecutionSurfaceKind::RuntimeBranch
-        );
-        assert_eq!(bytes_surface.executor_report["core_value_is_bytes"], true);
-
-        evaluation.skipped_by_guard = true;
-        let skipped_surface = select_root_update_execution_surface(PlanOpId(4), &evaluation);
-        assert_eq!(
-            skipped_surface.kind,
-            RootUpdateExecutionSurfaceKind::SkippedByGuard
-        );
-        assert_eq!(
-            skipped_surface.executor_report["execution_surface"],
-            "skipped-by-guard"
-        );
-    }
-
-    #[test]
-    fn root_json_update_execution_assembles_plan_json_executed_update() {
-        let (plan, source_id, state_id, update_op_id) = simple_text_source_payload_plan();
-        let verification = verify_plan(&plan).expect("test plan should verify");
-        assert_eq!(
-            verification.status,
-            "pass",
-            "test plan verification failed: {:?}",
-            verification
-                .checks
-                .iter()
-                .filter(|check| !check.pass)
-                .collect::<Vec<_>>()
-        );
-        let update_op = plan
-            .regions
-            .iter()
-            .flat_map(|region| region.ops.iter())
-            .find(|op| op.id == update_op_id)
-            .expect("test plan should include update op");
-        let event = RootJsonSourceEvent {
-            text: Some("hello".to_owned()),
-            ..RootJsonSourceEvent::default()
-        };
-        let execution = execute_root_json_update_branch(
-            &plan,
-            update_op,
-            source_id,
-            &plan.source_routes[0],
-            &event,
-            &JsonMap::new(),
-        )
-        .expect("source-payload text branch should execute in PlanExecutor JSON surface");
-
-        assert_eq!(
-            execution.surface_kind,
-            RootUpdateExecutionSurfaceKind::PlanJson
-        );
-        assert_eq!(
-            execution.executor_report["executor"],
-            "cpu-plan-root-json-update-execution-v1"
-        );
-        assert_eq!(execution.executor_report["surface"], "plan-json");
-        assert_eq!(
-            execution.evaluator_report["execution_surface_core"]["execution_surface"],
-            "plan-json"
-        );
-        let executed = execution
-            .executed
-            .expect("Plan JSON branch should assemble an executed root update");
-        assert_eq!(executed.value, json!("hello"));
-        assert_eq!(executed.expression_kind, "source_payload");
-        assert_eq!(executed.source_payload_field, json!("Text"));
-        assert_eq!(executed.update_constant_id, JsonValue::Null);
-        assert_eq!(executed.executor_core["expression_kind"], "source_payload");
-        assert_eq!(
-            executed.executor_core["execution_surface_core"]["execution_surface"],
-            "plan-json"
-        );
-        let mut root_state = JsonMap::new();
-        assert_eq!(
-            apply_root_json_state_value(
-                &plan,
-                &mut root_state,
-                state_id,
-                executed.value,
-                update_op_id
-            )
-            .expect("executed value should apply to root state")
-            .target_state_label,
-            "store.input"
-        );
-    }
-
-    #[test]
-    fn root_runtime_branch_update_execution_is_executor_owned() {
-        let inline = vec![1, 2, 3, 4];
-        let bytes = PlanExecutorBytes::from_inline(
-            sha256_bytes(&inline),
-            inline.len() as u64,
-            inline,
-            "root runtime branch update test",
-        )
-        .expect("test bytes should be valid");
-        let executed = assemble_root_runtime_branch_update(RootRuntimeBranchUpdateInput {
-            value: json!({
-                "$boon_type": "BYTES",
-                "storage": "inline",
-                "byte_len": 4,
-                "digest": bytes.digest()
-            }),
-            bytes_value: Some(bytes),
-            fixed_bytes_mutation: None,
-            bytes_access: json!({
-                "read_only": false,
-                "access_source": "private_bytes"
-            }),
-            runtime_branch_core: json!({
-                "executor": "cpu-plan-root-bytes-write-evaluator-v1"
-            }),
-            state_write_core: JsonValue::Null,
-            bytes_state_core: json!({
-                "executor": "cpu-plan-root-bytes-state-transition-v1"
-            }),
-            expression_kind: "bytes_concat".to_owned(),
-            source_payload_field: JsonValue::Null,
-            update_constant_id: JsonValue::Null,
-            update_constant_value: JsonValue::Null,
-            host_effect: JsonValue::Null,
-        });
-
-        assert_eq!(executed.expression_kind, "bytes_concat");
-        assert_eq!(
-            executed.executor_core["executor"],
-            "cpu-plan-root-bytes-write-evaluator-v1"
-        );
-        assert_eq!(
-            executed.executor_core["runtime_branch_execution_core"]["executor"],
-            "cpu-plan-root-runtime-branch-update-execution-v1"
-        );
-        assert_eq!(
-            executed.executor_core["runtime_branch_execution_core"]["runtime_branch_core"]["executor"],
-            "cpu-plan-root-bytes-write-evaluator-v1"
-        );
-        assert_eq!(
-            executed.bytes_state_core["executor"],
-            "cpu-plan-root-bytes-state-transition-v1"
-        );
-        assert_eq!(
-            executed.bytes_access["access_source"],
-            json!("private_bytes")
-        );
-    }
-
-    #[test]
-    fn root_bytes_update_dispatch_kind_is_executor_owned() {
-        fn update_op(expression_kind: PlanExpressionKind) -> PlanOp {
-            PlanOp {
-                id: PlanOpId(4),
-                kind: PlanOpKind::UpdateBranch {
-                    expression_kind,
-                    ordered_inputs: Vec::new(),
-                    source_payload_field: None,
-                    update_constant_id: None,
-                    source_guard: None,
-                },
-                inputs: Vec::new(),
-                output: Some(ValueRef::State(StateId(3))),
-                indexed: false,
-                unresolved_executable_ref_count: 0,
-            }
-        }
-
-        assert_eq!(
-            root_bytes_update_dispatch_kind(&update_op(PlanExpressionKind::BytesLength)),
-            Some(RootBytesUpdateDispatchKind::Read)
-        );
-        assert_eq!(
-            root_bytes_update_dispatch_kind(&update_op(PlanExpressionKind::FileReadBytes)),
-            Some(RootBytesUpdateDispatchKind::Read)
-        );
-        assert_eq!(
-            root_bytes_update_dispatch_kind(&update_op(PlanExpressionKind::BytesConcat)),
-            Some(RootBytesUpdateDispatchKind::Write)
-        );
-        assert_eq!(
-            root_bytes_update_dispatch_kind(&update_op(PlanExpressionKind::FileWriteBytes)),
-            Some(RootBytesUpdateDispatchKind::Write)
-        );
-        assert_eq!(
-            root_bytes_update_dispatch_kind(&update_op(PlanExpressionKind::BoolNot)),
-            None
-        );
-
-        let mut payload_op = update_op(PlanExpressionKind::BytesLength);
-        if let PlanOpKind::UpdateBranch {
-            source_payload_field,
-            ..
-        } = &mut payload_op.kind
-        {
-            *source_payload_field = Some(SourcePayloadField::Bytes);
-        }
-        assert_eq!(root_bytes_update_dispatch_kind(&payload_op), None);
-    }
-
-    #[test]
-    fn source_guard_matching_is_executor_owned() {
-        let guard = Some(PlanSourceGuard::SourcePayloadOneOf {
-            source_id: SourceId(4),
-            field: SourcePayloadField::Key,
-            values: vec!["Enter".to_owned(), "NumpadEnter".to_owned()],
-        });
-        let matching_event = RootJsonSourceEvent {
-            key: Some("Enter".to_owned()),
-            ..RootJsonSourceEvent::default()
-        };
-        assert!(
-            source_guard_matches(&guard, SourceId(4), &matching_event)
-                .expect("matching guard should evaluate")
-        );
-
-        let non_matching_event = RootJsonSourceEvent {
-            key: Some("Escape".to_owned()),
-            ..RootJsonSourceEvent::default()
-        };
-        assert!(
-            !source_guard_matches(&guard, SourceId(4), &non_matching_event)
-                .expect("non-matching guard should evaluate")
-        );
-
-        let wrong_source = source_guard_matches(&guard, SourceId(9), &matching_event)
-            .expect_err("guard source mismatch should be rejected");
-        assert!(
-            wrong_source
-                .to_string()
-                .contains("source guard targets source 4"),
-            "unexpected error: {wrong_source}"
-        );
-
-        let bytes_guard = Some(PlanSourceGuard::SourcePayloadOneOf {
-            source_id: SourceId(4),
-            field: SourcePayloadField::Bytes,
-            values: vec!["00".to_owned(), "de ad be ef".to_owned()],
-        });
-        let bytes_event = RootJsonSourceEvent {
-            payload_bytes: BTreeMap::from([("bytes".to_owned(), vec![0xde, 0xad, 0xbe, 0xef])]),
-            ..RootJsonSourceEvent::default()
-        };
-        assert!(
-            source_guard_matches(&bytes_guard, SourceId(4), &bytes_event)
-                .expect("matching BYTES guard should evaluate")
-        );
-        let non_matching_bytes_event = RootJsonSourceEvent {
-            payload_bytes: BTreeMap::from([("bytes".to_owned(), vec![0xca, 0xfe])]),
-            ..RootJsonSourceEvent::default()
-        };
-        assert!(
-            !source_guard_matches(&bytes_guard, SourceId(4), &non_matching_bytes_event)
-                .expect("non-matching BYTES guard should evaluate")
-        );
-        let invalid_bytes_guard = Some(PlanSourceGuard::SourcePayloadOneOf {
-            source_id: SourceId(4),
-            field: SourcePayloadField::Bytes,
-            values: vec!["not hex".to_owned()],
-        });
-        let invalid_bytes_error =
-            source_guard_matches(&invalid_bytes_guard, SourceId(4), &bytes_event)
-                .expect_err("invalid BYTES guard hex should be rejected");
-        assert!(
-            invalid_bytes_error.to_string().contains("invalid hex"),
-            "unexpected error: {invalid_bytes_error}"
-        );
-    }
-
-    #[test]
-    fn list_remove_predicate_evaluation_is_executor_owned() {
-        let state_id = StateId(5);
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:5".to_owned(),
-                    label: "row.done".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let row = PlanExecutorListRow {
-            key: 11,
-            generation: 2,
-            fields: BTreeMap::from([("done".to_owned(), json!(true))]),
-        };
-        let predicate = boon_plan::PlanListRemovePredicate::RowFieldBool {
-            input: ValueRef::State(state_id),
-        };
-        let evaluation = evaluate_list_remove_predicate(&plan, &predicate, &row)
-            .expect("row-field bool predicate should evaluate in executor");
-        assert!(evaluation.matches);
-        assert_eq!(
-            evaluation.executor_report["executor"],
-            "cpu-plan-list-remove-predicate-evaluator-v1"
-        );
-        assert_eq!(evaluation.executor_report["key"], 11);
-
-        let report = build_list_remove_predicate_row_resolution_report(&plan, &predicate, 3, &row)
-            .expect("predicate row-resolution report should be executor-owned");
-        assert_eq!(
-            report["executor"],
-            "cpu-plan-list-remove-predicate-row-resolution-v1"
-        );
-        assert_eq!(report["predicate"], "row_field_bool");
-        assert_eq!(report["predicate_field"], "done");
-        assert_eq!(report["row_index"], 3);
-
-        let not_predicate = boon_plan::PlanListRemovePredicate::RowFieldBoolNot {
-            input: ValueRef::State(state_id),
-        };
-        let not_evaluation = evaluate_list_remove_predicate(&plan, &not_predicate, &row)
-            .expect("row-field bool-not predicate should evaluate in executor");
-        assert!(!not_evaluation.matches);
-    }
-
-    #[test]
-    fn list_append_value_resolution_is_executor_owned() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:8".to_owned(),
-                    label: "todo.title".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let derived_values = BTreeMap::from([(FieldId(2), json!("derived title"))]);
-        let row_fields = BTreeMap::from([("title".to_owned(), json!("row title"))]);
-
-        assert_eq!(
-            resolve_plan_value_ref(
-                &plan,
-                &ValueRef::Field(FieldId(2)),
-                &derived_values,
-                Some(&row_fields),
-            )
-            .expect("field ref should resolve"),
-            Some(json!("derived title"))
-        );
-        assert_eq!(
-            resolve_plan_value_ref(
-                &plan,
-                &ValueRef::State(StateId(8)),
-                &derived_values,
-                Some(&row_fields),
-            )
-            .expect("state ref should resolve from row fields"),
-            Some(json!("row title"))
-        );
-
-        let bytes_constant = boon_plan::PlanConstant {
-            id: PlanConstantId(9),
-            value: PlanConstantValue::Bytes {
-                byte_len: 3,
-                sha256: sha256_bytes(&[1, 2, 3]),
-                inline_bytes: Some(vec![1, 2, 3]),
-            },
-        };
-        let bytes_json =
-            plan_constant_json_value(&bytes_constant).expect("BYTES constant should report JSON");
-        assert_eq!(bytes_json["$boon_type"], "BYTES");
-        assert_eq!(bytes_json["byte_len"], 3);
-    }
-
-    #[test]
-    fn initial_list_row_constant_value_conversion_is_executor_owned() {
-        let value = PlanConstantValue::Bytes {
-            byte_len: 3,
-            sha256: sha256_bytes(&[7, 8, 9]),
-            inline_bytes: Some(vec![7, 8, 9]),
-        };
-
-        let json_value = plan_constant_value_json_value(&value, "initial row field `payload`")
-            .expect("BYTES row value should report JSON");
-        assert_eq!(json_value["$boon_type"], "BYTES");
-        assert_eq!(json_value["byte_len"], 3);
-
-        let bytes = plan_constant_value_bytes(&value, "initial row field `payload`")
-            .expect("BYTES row value should validate")
-            .expect("BYTES row value should produce private bytes");
-        assert_eq!(bytes.inline_bytes(), &[7, 8, 9]);
-
-        let scalar = PlanConstantValue::Text {
-            value: "row title".to_owned(),
-        };
-        assert_eq!(
-            plan_constant_value_json_value(&scalar, "initial row field `title`")
-                .expect("TEXT row value should report JSON"),
-            json!("row title")
-        );
-        assert!(
-            plan_constant_value_bytes(&scalar, "initial row field `title`")
-                .expect("TEXT row value should not fail")
-                .is_none()
-        );
-
-        let tampered = PlanConstantValue::Bytes {
-            byte_len: 3,
-            sha256: sha256_bytes(&[7, 8, 9]),
-            inline_bytes: Some(vec![7, 8, 10]),
-        };
-        let error = plan_constant_value_bytes(&tampered, "initial row field `payload`")
-            .expect_err("digest mismatch should be rejected by executor conversion");
-        assert!(
-            error.to_string().contains("digest mismatch"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn list_row_report_fields_are_executor_owned() {
-        let row = PlanExecutorListRow {
-            key: 4,
-            generation: 2,
-            fields: BTreeMap::from([
-                ("title".to_owned(), json!("task")),
-                ("payload".to_owned(), json!("stale-public-value")),
-            ]),
-        };
-        let private_bytes = BTreeMap::from([(
-            "payload".to_owned(),
-            PlanExecutorBytes::from_inline(
-                sha256_bytes(&[4, 5, 6]),
-                3,
-                vec![4, 5, 6],
-                "row payload",
-            )
-            .expect("valid private row bytes"),
-        )]);
-
-        let fields = list_row_report_fields(&row, &private_bytes);
-        assert_eq!(fields["title"], json!("task"));
-        assert_eq!(fields["payload"]["$boon_type"], "BYTES");
-        assert_eq!(fields["payload"]["byte_len"], 3);
-        assert_eq!(fields["payload"]["digest"], sha256_bytes(&[4, 5, 6]));
-    }
-
-    #[test]
-    fn list_row_state_carrier_reports_private_bytes() {
-        let row = PlanExecutorListRowState {
-            key: 11,
-            generation: 3,
-            fields: BTreeMap::from([
-                ("title".to_owned(), json!("row")),
-                ("payload".to_owned(), json!("stale-public-value")),
-            ]),
-            private_bytes: BTreeMap::from([(
-                "payload".to_owned(),
-                PlanExecutorBytes::from_inline(
-                    sha256_bytes(&[9, 8, 7]),
-                    3,
-                    vec![9, 8, 7],
-                    "row state payload",
-                )
-                .expect("valid row state bytes"),
-            )]),
-            fixed_bytes_banks: BTreeMap::from([("payload".to_owned(), vec![9, 8, 7])]),
-        };
-        let public_rows =
-            list_row_state_public_rows(&BTreeMap::from([(5usize, vec![row.clone()])]));
-        assert_eq!(public_rows[&5][0].key, 11);
-        assert_eq!(public_rows[&5][0].fields["title"], json!("row"));
-
-        let fields = list_row_state_report_fields(&row);
-        assert_eq!(fields["title"], json!("row"));
-        assert_eq!(fields["payload"]["$boon_type"], "BYTES");
-        assert_eq!(fields["payload"]["byte_len"], 3);
-        assert_eq!(fields["payload"]["digest"], sha256_bytes(&[9, 8, 7]));
-    }
-
-    #[test]
-    fn list_row_initial_state_refresh_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(3);
-        let title_state_id = StateId(21);
-        let payload_state_id = StateId(22);
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(1),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let mut plan = empty_executor_test_plan();
-        plan.debug_map.state_slots = vec![
-            boon_plan::DebugEntry {
-                id: "state:21".to_owned(),
-                label: "todo.title_state".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "state:22".to_owned(),
-                label: "todo.payload_state".to_owned(),
-            },
-        ];
-        plan.storage_layout.list_slots = vec![list_slot.clone()];
-        plan.storage_layout.scalar_slots = vec![
-            boon_plan::ScalarStorageSlot {
-                id: boon_plan::PlanStorageId(2),
-                state_id: title_state_id,
-                value_type: PlanValueType::Text,
-                scope_id: Some(scope_id),
-                indexed: true,
-                initial_value_kind: InitialValueKind::Text,
-                initial_constant_id: None,
-                initial_root_field_path: None,
-                initial_row_field_path: Some("todo.title".to_owned()),
-            },
-            boon_plan::ScalarStorageSlot {
-                id: boon_plan::PlanStorageId(3),
-                state_id: payload_state_id,
-                value_type: PlanValueType::Bytes { fixed_len: Some(3) },
-                scope_id: Some(scope_id),
-                indexed: true,
-                initial_value_kind: InitialValueKind::Bytes,
-                initial_constant_id: None,
-                initial_root_field_path: None,
-                initial_row_field_path: Some("todo.payload".to_owned()),
-            },
-        ];
-        plan.storage_layout.byte_banks = vec![boon_plan::ByteStorageBank {
-            id: boon_plan::PlanStorageId(4),
-            state_storage_id: boon_plan::PlanStorageId(3),
-            state_id: payload_state_id,
-            scope_id: Some(scope_id),
-            indexed: true,
-            fixed_len: 3,
-            capacity: None,
-        }];
-        let payload = PlanExecutorBytes::from_inline(
-            sha256_bytes(&[1, 2, 3]),
-            3,
-            vec![1, 2, 3],
-            "row initial state refresh payload",
-        )
-        .expect("valid payload bytes");
-        let mut row = PlanExecutorListRowState {
-            key: 4,
-            generation: 1,
-            fields: BTreeMap::from([
-                ("title".to_owned(), json!("Buy milk")),
-                ("payload".to_owned(), payload.report_json()),
-            ]),
-            private_bytes: BTreeMap::from([("payload".to_owned(), payload)]),
-            fixed_bytes_banks: BTreeMap::new(),
-        };
-
-        refresh_list_row_initial_state_fields(&plan, &list_slot, &mut row);
-
-        assert_eq!(row.fields["title_state"], json!("Buy milk"));
-        assert_eq!(row.fields["payload_state"]["$boon_type"], "BYTES");
-        assert_eq!(
-            row.private_bytes["payload_state"].inline_bytes(),
-            &[1, 2, 3]
-        );
-        assert_eq!(row.fixed_bytes_banks["payload_state"], vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn list_row_bool_not_refresh_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(4);
-        let done_state_id = StateId(31);
-        let not_done_field_id = FieldId(41);
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(1),
-            list_id: boon_plan::ListId(9),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let mut plan = empty_executor_test_plan();
-        plan.debug_map.state_slots = vec![boon_plan::DebugEntry {
-            id: "state:31".to_owned(),
-            label: "todo.done".to_owned(),
-        }];
-        plan.debug_map.fields = vec![boon_plan::DebugEntry {
-            id: "field:41".to_owned(),
-            label: "todo.not_done".to_owned(),
-        }];
-        plan.storage_layout.list_slots = vec![list_slot.clone()];
-        plan.storage_layout.scalar_slots = vec![boon_plan::ScalarStorageSlot {
-            id: boon_plan::PlanStorageId(2),
-            state_id: done_state_id,
-            value_type: PlanValueType::Bool,
-            scope_id: Some(scope_id),
-            indexed: true,
-            initial_value_kind: InitialValueKind::Bool,
-            initial_constant_id: None,
-            initial_root_field_path: None,
-            initial_row_field_path: None,
-        }];
-        plan.regions = vec![boon_plan::OperationRegion {
-            id: boon_plan::PlanRegionId(1),
-            kind: RegionKind::DerivedEvaluation,
-            ops: vec![PlanOp {
-                id: PlanOpId(12),
-                kind: PlanOpKind::DerivedValue {
-                    derived_kind: boon_plan::PlanDerivedKind::Pure,
-                    startup_recompute: true,
-                    expression: Some(PlanDerivedExpression::BoolNot {
-                        input: ValueRef::State(done_state_id),
-                    }),
-                },
-                inputs: vec![ValueRef::State(done_state_id)],
-                output: Some(ValueRef::Field(not_done_field_id)),
-                indexed: true,
-                unresolved_executable_ref_count: 0,
-            }],
-        }];
-
-        let mut fields = BTreeMap::from([("done".to_owned(), json!(false))]);
-        let deltas =
-            refresh_list_row_bool_not_deltas(&plan, &list_slot, "todos", 7, 1, &mut fields)
-                .expect("strict Bool/not refresh should produce a delta");
-        assert_eq!(fields["not_done"], json!(true));
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0]["kind"], "FieldSet");
-        assert_eq!(deltas[0]["field_path"], "not_done");
-        assert_eq!(deltas[0]["value"], json!(true));
-
-        let unchanged =
-            refresh_list_row_bool_not_fields(&plan, &list_slot, "todos", 7, 1, &mut fields)
-                .expect("best-effort Bool/not refresh should succeed");
-        assert!(
-            unchanged.is_empty(),
-            "best-effort refresh should not emit a delta when the value is current"
-        );
-        fields.insert("done".to_owned(), json!(true));
-        let changed =
-            refresh_list_row_bool_not_fields(&plan, &list_slot, "todos", 7, 1, &mut fields)
-                .expect("best-effort Bool/not refresh should update changed values");
-        assert_eq!(fields["not_done"], json!(false));
-        assert_eq!(changed[0]["value"], json!(false));
-    }
-
-    #[test]
-    fn list_row_textlike_field_is_executor_owned() {
-        let row = PlanExecutorListRow {
-            key: 8,
-            generation: 1,
-            fields: BTreeMap::from([
-                ("title".to_owned(), json!("task")),
-                ("count".to_owned(), json!(3)),
-                ("done".to_owned(), json!(true)),
-                ("metadata".to_owned(), json!({"owner": "plan"})),
-            ]),
-        };
-
-        assert_eq!(
-            list_row_textlike_field(&row, "title").as_deref(),
-            Some("task")
-        );
-        assert_eq!(list_row_textlike_field(&row, "count").as_deref(), Some("3"));
-        assert_eq!(
-            list_row_textlike_field(&row, "done").as_deref(),
-            Some("True")
-        );
-        assert_eq!(list_row_textlike_field(&row, "metadata"), None);
-        assert_eq!(list_row_textlike_field(&row, "missing"), None);
-    }
-
-    #[test]
-    fn scenario_checkpoint_assertions_are_executor_owned() {
-        let plan = empty_executor_test_plan();
-        let root_state = JsonMap::from_iter([(
-            "store".to_owned(),
-            json!({
-                "selected_filter": "Active",
-                "new_todo_text": "Draft",
-            }),
-        )]);
-        let list_state = BTreeMap::from([
-            (
-                1,
-                vec![
-                    PlanExecutorListRow {
-                        key: 10,
-                        generation: 1,
-                        fields: BTreeMap::from([
-                            ("title".to_owned(), json!("Write tests")),
-                            ("completed".to_owned(), json!(false)),
-                            ("editing".to_owned(), json!(true)),
-                            ("edit_text".to_owned(), json!("Draft title")),
-                        ]),
-                    },
-                    PlanExecutorListRow {
-                        key: 11,
-                        generation: 1,
-                        fields: BTreeMap::from([
-                            ("title".to_owned(), json!("Compile")),
-                            ("completed".to_owned(), json!(true)),
-                            ("editing".to_owned(), json!(false)),
-                            ("edit_text".to_owned(), json!("Compile")),
-                        ]),
-                    },
-                ],
-            ),
-            (
-                2,
-                vec![
-                    PlanExecutorListRow {
-                        key: 20,
-                        generation: 1,
-                        fields: BTreeMap::from([
-                            ("address".to_owned(), json!("A0")),
-                            ("value".to_owned(), json!("5")),
-                            ("formula_text".to_owned(), json!("5")),
-                            ("editing_text".to_owned(), json!("5")),
-                            ("editing".to_owned(), json!(false)),
-                        ]),
-                    },
-                    PlanExecutorListRow {
-                        key: 21,
-                        generation: 1,
-                        fields: BTreeMap::from([
-                            ("address".to_owned(), json!("B0")),
-                            ("error".to_owned(), json!("Cycle")),
-                        ]),
-                    },
-                ],
-            ),
-        ]);
-
-        let report = assert_scenario_checkpoint(
-            &plan,
-            &root_state,
-            &list_state,
-            PlanExecutorScenarioCheckpointInput {
-                step_id: "checkpoint".to_owned(),
-                source_intent_exemption: Some("assertion-only".to_owned()),
-                expect_titles: Some(vec!["Write tests".to_owned(), "Compile".to_owned()]),
-                expect_completed_titles: Some(vec!["Compile".to_owned()]),
-                expect_active_count: Some(1),
-                expect_completed_count: Some(1),
-                expect_filter: Some("Active".to_owned()),
-                expect_new_text: Some("Draft".to_owned()),
-                expect_editing_title: Some("Write tests".to_owned()),
-                expect_edit_text: Some("Draft title".to_owned()),
-                expect_no_editing: Some(false),
-                expect_cell: Some(PlanExecutorScenarioCheckpointCellExpectation {
-                    address: "A0".to_owned(),
-                    value: Some("5".to_owned()),
-                    formula: Some("5".to_owned()),
-                    editing_text: Some("5".to_owned()),
-                    editing: Some(false),
-                }),
-                expect_error: Some(PlanExecutorScenarioCheckpointErrorExpectation {
-                    address: "B0".to_owned(),
-                    error: "Cycle".to_owned(),
-                }),
-                expect_root_text: BTreeMap::from([(
-                    "store.selected_filter".to_owned(),
-                    "Active".to_owned(),
-                )]),
-                ..PlanExecutorScenarioCheckpointInput::default()
-            },
-        )
-        .expect("PlanExecutor should own assertion-only checkpoint evaluation");
-
-        assert_eq!(report.report["passed"], true);
-        assert_eq!(report.report["source_intent_exemption"], "assertion-only");
-        assert_eq!(report.report["checked_expectation_count"], json!(15));
-        assert_eq!(
-            report.report["checked_expectations"]
-                .as_array()
-                .expect("checked expectations should be an array")
-                .iter()
-                .filter(|item| item.as_str() == Some("expect_cell.value"))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn root_update_candidate_tracker_is_executor_owned() {
-        let mut tracker = RootUpdateCandidateTracker::default();
-
-        let inserted = record_root_update_candidate(
-            &mut tracker,
-            "store.submit",
-            RootUpdateCandidate {
-                state_id: 7,
-                op_id: 40,
-                value: json!("value"),
-                bytes_value: None,
-                fixed_bytes_mutation: None,
-            },
-        )
-        .expect("first candidate should be inserted");
-        assert_eq!(inserted.kind, RootUpdateCandidateRecordKind::Inserted);
-
-        let duplicate = record_root_update_candidate(
-            &mut tracker,
-            "store.submit",
-            RootUpdateCandidate {
-                state_id: 7,
-                op_id: 41,
-                value: json!("value"),
-                bytes_value: None,
-                fixed_bytes_mutation: None,
-            },
-        )
-        .expect("same-value candidate should coalesce");
-        assert_eq!(duplicate.kind, RootUpdateCandidateRecordKind::Duplicate);
-        assert_eq!(duplicate.op_ids, vec![40, 41]);
-
-        let ordered = tracker.ordered_candidates();
-        assert_eq!(ordered.len(), 1);
-        assert_eq!(ordered[0].state_id, 7);
-        assert_eq!(ordered[0].op_ids, vec![40, 41]);
-        assert_eq!(ordered[0].value, json!("value"));
-
-        let conflict = record_root_update_candidate(
-            &mut tracker,
-            "store.submit",
-            RootUpdateCandidate {
-                state_id: 7,
-                op_id: 42,
-                value: json!("other"),
-                bytes_value: None,
-                fixed_bytes_mutation: None,
-            },
-        )
-        .expect_err("conflicting candidate should be rejected");
-        assert!(
-            conflict.to_string().contains("conflicting branches"),
-            "unexpected conflict error: {conflict}"
-        );
-    }
-
-    #[test]
-    fn root_update_candidate_tracker_rejects_byte_fingerprint_conflicts() {
-        let mut tracker = RootUpdateCandidateTracker::default();
-        let first_bytes = Some(json!({
-            "$boon_type": "BYTES",
-            "byte_len": 3,
-            "digest": "aaa",
-        }));
-        let other_bytes = Some(json!({
-            "$boon_type": "BYTES",
-            "byte_len": 3,
-            "digest": "bbb",
-        }));
-
-        record_root_update_candidate(
-            &mut tracker,
-            "store.bytes",
-            RootUpdateCandidate {
-                state_id: 9,
-                op_id: 50,
-                value: json!({"$boon_type": "BYTES", "byte_len": 3}),
-                bytes_value: first_bytes,
-                fixed_bytes_mutation: None,
-            },
-        )
-        .expect("first byte candidate should be inserted");
-
-        let conflict = record_root_update_candidate(
-            &mut tracker,
-            "store.bytes",
-            RootUpdateCandidate {
-                state_id: 9,
-                op_id: 51,
-                value: json!({"$boon_type": "BYTES", "byte_len": 3}),
-                bytes_value: other_bytes,
-                fixed_bytes_mutation: None,
-            },
-        )
-        .expect_err("same public value with different private bytes should conflict");
-        assert!(
-            conflict.to_string().contains("conflicting branches"),
-            "unexpected byte conflict error: {conflict}"
-        );
-    }
-
-    #[test]
-    fn root_update_commit_assembly_is_executor_owned() {
-        let commit = assemble_root_update_commit(RootUpdateCommitInput {
-            source_id: SourceId(3),
-            target_state: "store.title".to_owned(),
-            target_state_id: 7,
-            candidate_update_op_ids: vec![40, 41],
-            expression_kind: "source_payload_text".to_owned(),
-            source_payload_field: json!("Text"),
-            update_constant_id: JsonValue::Null,
-            update_constant_value: JsonValue::Null,
-            bytes_access: JsonValue::Null,
-            host_effect: JsonValue::Null,
-            executor_core: json!({"executor": "core"}),
-            state_write_core: json!({"changed": true}),
-            bytes_state_core: JsonValue::Null,
-            value: json!("New title"),
-            changed: true,
-            semantic_delta: None,
-        })
-        .expect("changed root update commit should assemble");
-
-        assert_eq!(
-            commit.touched_state,
-            Some(("store.title".to_owned(), json!("New title")))
-        );
-        assert_eq!(
-            commit.semantic_delta_signature.as_deref(),
-            Some("FieldSet:store.title")
-        );
-        assert_eq!(
-            commit
-                .semantic_delta
-                .as_ref()
-                .and_then(|delta| delta.get("field_path"))
-                .and_then(JsonValue::as_str),
-            Some("store.title")
-        );
-        assert_eq!(commit.update_report["update_op_id"], 40);
-        assert_eq!(
-            commit.update_report["candidate_update_op_ids"],
-            json!([40, 41])
-        );
-        assert_eq!(
-            commit.executor_report["executor"],
-            "cpu-plan-root-update-commit-assembly-v1"
-        );
-    }
-
-    #[test]
-    fn root_update_commit_assembly_suppresses_unchanged_delta() {
-        let commit = assemble_root_update_commit(RootUpdateCommitInput {
-            source_id: SourceId(3),
-            target_state: "store.title".to_owned(),
-            target_state_id: 7,
-            candidate_update_op_ids: vec![40],
-            expression_kind: "source_payload_text".to_owned(),
-            source_payload_field: json!("Text"),
-            update_constant_id: JsonValue::Null,
-            update_constant_value: JsonValue::Null,
-            bytes_access: JsonValue::Null,
-            host_effect: JsonValue::Null,
-            executor_core: json!({"executor": "core"}),
-            state_write_core: json!({"changed": false}),
-            bytes_state_core: JsonValue::Null,
-            value: json!("Same title"),
-            changed: false,
-            semantic_delta: Some(json!({"kind": "FieldSet"})),
-        })
-        .expect("unchanged root update commit should still report");
-
-        assert_eq!(commit.touched_state, None);
-        assert_eq!(commit.semantic_delta_signature, None);
-        assert_eq!(commit.semantic_delta, None);
-        assert_eq!(commit.update_report["changed"], false);
-        assert_eq!(commit.executor_report["emitted_semantic_delta"], false);
-    }
-
-    #[test]
-    fn root_update_commit_batch_applies_candidates_to_root_state() {
-        let (plan, source_id, state_id, update_op_id) = simple_text_source_payload_plan();
-        let mut root_state = initialize_root_state(&plan).expect("root state should initialize");
-        assert_eq!(root_state.root_state["store.input"], "");
-
-        let executed = RootExecutedUpdate {
-            value: json!("Typed text"),
-            bytes_value: None,
-            fixed_bytes_mutation: None,
-            bytes_access: JsonValue::Null,
-            executor_core: json!({"executor": "test-root-update"}),
-            state_write_core: JsonValue::Null,
-            bytes_state_core: JsonValue::Null,
-            expression_kind: "source_payload_text".to_owned(),
-            source_payload_field: json!("Text"),
-            update_constant_id: JsonValue::Null,
-            update_constant_value: JsonValue::Null,
-            host_effect: JsonValue::Null,
-        };
-        let mut tracker = RootUpdateCandidateTracker::default();
-        record_root_update_candidate(
-            &mut tracker,
-            "store.input.change",
-            root_update_candidate_from_executed(state_id.0, update_op_id.0, &executed),
-        )
-        .expect("candidate should be recorded");
-
-        let batch = commit_ordered_root_update_candidates(
-            &mut root_state,
-            &plan,
-            source_id,
-            &tracker,
-            BTreeMap::from([(state_id.0, executed)]),
-        )
-        .expect("PlanExecutor should commit ordered root update candidates");
-
-        assert_eq!(root_state.root_state["store.input"], "Typed text");
-        assert_eq!(batch.executed_update_branch_count, 1);
-        assert_eq!(batch.touched_states["store.input"], "Typed text");
-        assert_eq!(
-            batch.semantic_delta_signatures,
-            vec!["FieldSet:store.input".to_owned()]
-        );
-        assert_eq!(batch.semantic_deltas[0]["field_path"], "store.input");
-        assert_eq!(batch.update_reports[0]["update_op_id"], update_op_id.0);
-        assert_eq!(
-            batch.executor_report["executor"],
-            "cpu-plan-root-update-commit-batch-v1"
-        );
-        assert_eq!(batch.executor_report["committed_update_count"], 1);
-    }
-
-    #[test]
-    fn root_update_branch_collection_stages_plan_json_candidate() {
-        let (plan, source_id, state_id, update_op_id) = simple_text_source_payload_plan();
-        let source_route_slot = plan
-            .source_routes
-            .iter()
-            .find(|route| route.source_id == source_id)
-            .expect("test plan should include source route");
-        let op = plan
-            .regions
-            .iter()
-            .filter(|region| region.kind == RegionKind::UpdateBranches)
-            .flat_map(|region| region.ops.iter())
-            .find(|op| op.id == update_op_id)
-            .expect("test plan should include update op");
-        let mut staged_root_state =
-            initialize_root_state(&plan).expect("root state should initialize");
-        let root_json_event = RootJsonSourceEvent {
-            text: Some("Typed text".to_owned()),
-            ..RootJsonSourceEvent::default()
-        };
-        let mut tracker = RootUpdateCandidateTracker::default();
-        let mut touched_updates = BTreeMap::new();
-        let mut runtime_branch =
-            |_op: &PlanOp, _state: &PlanExecutorRootState| -> PlanExecutorResult<_> {
-                panic!("plan-json source payload update should not call runtime branch")
-            };
-
-        let collection = collect_root_update_candidate_for_step(
-            &plan,
-            op,
-            source_id,
-            "store.input.change",
-            source_route_slot,
-            &root_json_event,
-            &mut staged_root_state,
-            &mut tracker,
-            &mut touched_updates,
-            &mut runtime_branch,
-        )
-        .expect("PlanExecutor should collect root update candidate");
-
-        assert_eq!(collection.target_state_id, Some(state_id));
-        assert!(collection.inserted_update);
-        assert!(!collection.runtime_branch_used);
-        assert_eq!(staged_root_state.root_state["store.input"], "Typed text");
-        assert_eq!(touched_updates.len(), 1);
-        assert_eq!(touched_updates[&state_id.0].value, json!("Typed text"));
-        assert_eq!(tracker.ordered_candidates().len(), 1);
-        assert_eq!(
-            collection.executor_report["executor"],
-            "cpu-plan-root-update-branch-collection-v1"
-        );
-    }
-
-    #[test]
-    fn root_update_storage_transition_commits_bytes_and_public_state() {
-        let mut root_state = JsonMap::new();
-        let mut private_bytes = BTreeMap::new();
-        let mut fixed_byte_banks = BTreeMap::new();
-        let inline = vec![1, 2, 3];
-        let bytes = PlanExecutorBytes::from_inline(
-            sha256_bytes(&inline),
-            inline.len() as u64,
-            inline.clone(),
-            "root update storage transition test",
-        )
-        .expect("test bytes should be valid");
-
-        let mut state_owner =
-            RootUpdateStateMaps::new(&mut root_state, &mut private_bytes, &mut fixed_byte_banks);
-        let transition = apply_root_update_storage_transition(
-            &mut state_owner,
-            StateId(7),
-            "store.payload",
-            json!({"$boon_type": "BYTES", "byte_len": 3}),
-            Some(bytes),
-            None,
-            PlanOpId(55),
-        )
-        .expect("root update storage transition should commit bytes");
-        drop(state_owner);
-
-        assert_eq!(root_state["store.payload"]["byte_len"], 3);
-        assert_eq!(
-            private_bytes
-                .get(&7)
-                .expect("private BYTES state should be committed")
-                .inline_bytes,
-            inline
-        );
-        assert!(!fixed_byte_banks.contains_key(&7));
-        assert_eq!(transition.target_state_id, StateId(7));
-        assert_eq!(transition.target_state_label, "store.payload");
-        assert_eq!(transition.bytes_transition_mode, "bytes_commit");
-        assert_eq!(
-            transition.executor_report["executor"],
-            "cpu-plan-root-update-storage-transition-v1"
-        );
-        assert_eq!(
-            transition.executor_report["bytes_transition_core"]["executor"],
-            "cpu-plan-root-bytes-state-transition-v1"
-        );
-    }
-
-    #[test]
-    fn root_update_storage_transition_applies_fixed_patch() {
-        let mut root_state = JsonMap::new();
-        let mut private_bytes = BTreeMap::new();
-        let mut fixed_byte_banks = BTreeMap::new();
-        let inline = vec![4, 5, 6];
-        let bytes = PlanExecutorBytes::from_inline(
-            sha256_bytes(&inline),
-            inline.len() as u64,
-            inline,
-            "root update fixed patch transition seed",
-        )
-        .expect("test bytes should be valid");
-        private_bytes.insert(7, bytes);
-        fixed_byte_banks.insert(7, vec![4, 5, 6]);
-
-        let mut state_owner =
-            RootUpdateStateMaps::new(&mut root_state, &mut private_bytes, &mut fixed_byte_banks);
-        let transition = apply_root_update_storage_transition(
-            &mut state_owner,
-            StateId(7),
-            "store.payload",
-            json!({"$boon_type": "BYTES", "byte_len": 3}),
-            None,
-            Some(RootBytesFixedMutation {
-                input_state_id: StateId(7),
-                output_state_id: StateId(7),
-                patches: vec![(1, 9)],
-            }),
-            PlanOpId(56),
-        )
-        .expect("root update storage transition should apply fixed patch");
-        drop(state_owner);
-
-        assert_eq!(root_state["store.payload"]["byte_len"], 3);
-        assert!(!private_bytes.contains_key(&7));
-        assert_eq!(fixed_byte_banks.get(&7), Some(&vec![4, 9, 6]));
-        assert_eq!(transition.bytes_transition_mode, "fixed_byte_patch");
-        assert_eq!(
-            transition.executor_report["bytes_transition_mode"],
-            "fixed_byte_patch"
-        );
-    }
-
-    #[test]
-    fn root_executed_update_candidate_and_state_apply_are_executor_owned() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:7".to_owned(),
-                    label: "store.payload".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let inline = vec![7, 8, 9];
-        let bytes = PlanExecutorBytes::from_inline(
-            sha256_bytes(&inline),
-            inline.len() as u64,
-            inline.clone(),
-            "root executed update test",
-        )
-        .expect("test bytes should be valid");
-        let executed = RootExecutedUpdate {
-            value: json!({"$boon_type": "BYTES", "byte_len": 3}),
-            bytes_value: Some(bytes),
-            fixed_bytes_mutation: Some(RootBytesFixedMutation {
-                input_state_id: StateId(7),
-                output_state_id: StateId(7),
-                patches: vec![(1, 10)],
-            }),
-            bytes_access: JsonValue::Null,
-            executor_core: json!({"executor": "test"}),
-            state_write_core: JsonValue::Null,
-            bytes_state_core: JsonValue::Null,
-            expression_kind: "bytes_set".to_owned(),
-            source_payload_field: JsonValue::Null,
-            update_constant_id: JsonValue::Null,
-            update_constant_value: JsonValue::Null,
-            host_effect: JsonValue::Null,
-        };
-
-        let candidate = root_update_candidate_from_executed(7, 99, &executed);
-        assert_eq!(candidate.state_id, 7);
-        assert_eq!(candidate.op_id, 99);
-        assert_eq!(candidate.bytes_value.as_ref().unwrap()["byte_len"], 3);
-        assert_eq!(
-            candidate.fixed_bytes_mutation.as_ref().unwrap()["patches"],
-            json!([[1, 10]])
-        );
-
-        let mut bytes_executed = executed.clone();
-        bytes_executed.fixed_bytes_mutation = None;
-        let mut root_state = JsonMap::new();
-        let mut private_bytes = BTreeMap::new();
-        let mut fixed_byte_banks = BTreeMap::new();
-        let report = apply_executed_root_update_to_state(
-            &mut root_state,
-            &mut private_bytes,
-            &mut fixed_byte_banks,
-            &plan,
-            7,
-            &bytes_executed,
-            99,
-        )
-        .expect("executed root update should apply through PlanExecutor");
-        assert_eq!(root_state["store.payload"]["byte_len"], 3);
-        assert_eq!(
-            private_bytes.get(&7).unwrap().inline_bytes,
-            inline,
-            "bytes_value takes the direct bytes commit path"
-        );
-        assert_eq!(
-            report["executor"],
-            "cpu-plan-root-update-storage-transition-v1"
-        );
-    }
-
-    #[test]
-    fn root_state_initializer_owns_public_and_private_bytes_state() {
-        let bytes = vec![4, 5, 6];
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: vec![boon_plan::PlanConstant {
-                id: PlanConstantId(1),
-                value: PlanConstantValue::Bytes {
-                    byte_len: bytes.len() as u64,
-                    sha256: sha256_bytes(&bytes),
-                    inline_bytes: Some(bytes.clone()),
-                },
-            }],
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(10),
-                    state_id: StateId(7),
-                    value_type: PlanValueType::Bytes { fixed_len: Some(3) },
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: InitialValueKind::Bytes,
-                    initial_constant_id: Some(PlanConstantId(1)),
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: vec![boon_plan::ByteStorageBank {
-                    id: boon_plan::PlanStorageId(11),
-                    state_storage_id: boon_plan::PlanStorageId(10),
-                    state_id: StateId(7),
-                    scope_id: None,
-                    indexed: false,
-                    fixed_len: 3,
-                    capacity: None,
-                }],
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 1,
-                source_route_count: 0,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 1,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:7".to_owned(),
-                    label: "store.payload".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let root = initialize_root_state(&plan).expect("root state should initialize");
-
-        assert_eq!(root.initialized_state_count, 1);
-        assert_eq!(root.root_state["store.payload"]["$boon_type"], "BYTES");
-        assert_eq!(
-            root.private_bytes
-                .get(&7)
-                .expect("private bytes should be initialized")
-                .inline_bytes(),
-            bytes.as_slice()
-        );
-        assert_eq!(root.fixed_byte_banks.get(&7), Some(&bytes));
-        assert_eq!(
-            root.executor_report["executor"],
-            "cpu-plan-root-state-initializer-v1"
-        );
-        assert_eq!(
-            root.executor_report["bytes_initialization_core"]["executor"],
-            "cpu-plan-root-bytes-storage-initializer-v1"
-        );
-    }
-
-    #[test]
-    fn root_row_expression_finds_initial_list_value_and_converts_number() {
-        let mut plan = empty_executor_test_plan();
-        plan.constants = vec![boon_plan::PlanConstant {
-            id: PlanConstantId(0),
-            value: PlanConstantValue::Text {
-                value: "A".to_owned(),
-            },
-        }];
-        plan.storage_layout.list_slots = vec![boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(0),
-            scope_id: None,
-            row_field_ids: vec![FieldId(1), FieldId(2)],
-            capacity: None,
-            hidden_key_type: "none".to_owned(),
-            has_generation: false,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: vec![boon_plan::PlanInitialListRow {
-                fields: vec![
-                    boon_plan::PlanInitialListField {
-                        name: "key".to_owned(),
-                        field_id: Some(FieldId(1)),
-                        value: PlanConstantValue::Text {
-                            value: "A".to_owned(),
-                        },
-                    },
-                    boon_plan::PlanInitialListField {
-                        name: "width".to_owned(),
-                        field_id: Some(FieldId(2)),
-                        value: PlanConstantValue::Text {
-                            value: "120".to_owned(),
-                        },
-                    },
-                ],
-            }],
-        }];
-
-        let expression = PlanRowExpression::TextToNumber {
-            input: Box::new(PlanRowExpression::ListFindValue {
-                list_id: boon_plan::ListId(0),
-                field: FieldId(1),
-                value: Box::new(PlanRowExpression::Constant {
-                    constant_id: PlanConstantId(0),
-                }),
-                target: FieldId(2),
-                fallback: None,
-            }),
-        };
-
-        let value = eval_root_source_transform_row_expression(&plan, &JsonMap::new(), &expression)
-            .expect("root evaluator should read initial list rows");
-        assert_eq!(value, json!(120));
-    }
-
-    #[test]
-    fn root_row_expression_list_find_uses_fallback_derived_field() {
-        let mut plan = empty_executor_test_plan();
-        plan.constants = vec![boon_plan::PlanConstant {
-            id: PlanConstantId(0),
-            value: PlanConstantValue::Text {
-                value: "missing".to_owned(),
-            },
-        }];
-        plan.storage_layout.list_slots = vec![boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(0),
-            scope_id: None,
-            row_field_ids: vec![FieldId(1), FieldId(2)],
-            capacity: None,
-            hidden_key_type: "none".to_owned(),
-            has_generation: false,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: vec![boon_plan::PlanInitialListRow {
-                fields: vec![
-                    boon_plan::PlanInitialListField {
-                        name: "key".to_owned(),
-                        field_id: Some(FieldId(1)),
-                        value: PlanConstantValue::Text {
-                            value: "present".to_owned(),
-                        },
-                    },
-                    boon_plan::PlanInitialListField {
-                        name: "width".to_owned(),
-                        field_id: Some(FieldId(2)),
-                        value: PlanConstantValue::Text {
-                            value: "120".to_owned(),
-                        },
-                    },
-                ],
-            }],
-        }];
-        plan.debug_map.derived_values = vec![boon_plan::DebugEntry {
-            id: "field:4".to_owned(),
-            label: "store.default_width".to_owned(),
-        }];
-        let root_state = JsonMap::from_iter([(
-            "store.default_width".to_owned(),
-            JsonValue::String("88".to_owned()),
-        )]);
-
-        let expression = PlanRowExpression::ListFindValue {
-            list_id: boon_plan::ListId(0),
-            field: FieldId(1),
-            value: Box::new(PlanRowExpression::Constant {
-                constant_id: PlanConstantId(0),
-            }),
-            target: FieldId(2),
-            fallback: Some(Box::new(PlanRowExpression::Field {
-                input: ValueRef::Field(FieldId(4)),
-            })),
-        };
-
-        let value = eval_root_source_transform_row_expression(&plan, &root_state, &expression)
-            .expect("root evaluator should use fallback when no initial row matches");
-        assert_eq!(value, json!("88"));
-    }
-
-    #[test]
-    fn source_payload_press_updates_bool_state_as_event_pulse() {
-        let slot = boon_plan::ScalarStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            state_id: StateId(1),
-            value_type: PlanValueType::Bool,
-            scope_id: None,
-            indexed: false,
-            initial_value_kind: InitialValueKind::Bool,
-            initial_constant_id: None,
-            initial_root_field_path: None,
-            initial_row_field_path: None,
-        };
-        let event = RootJsonSourceEvent {
-            payload: BTreeMap::new(),
-            ..RootJsonSourceEvent::default()
-        };
-
-        let value = source_payload_value_for_slot(
-            &event,
-            &SourcePayloadField::Named("press".to_owned()),
-            &slot,
-            PlanOpId(7),
-        )
-        .expect("press source payload should be a bool event pulse");
-        assert_eq!(value, json!(true));
-
-        let false_event = RootJsonSourceEvent {
-            payload: BTreeMap::from([("press".to_owned(), "False".to_owned())]),
-            ..RootJsonSourceEvent::default()
-        };
-        let value = source_payload_value_for_slot(
-            &false_event,
-            &SourcePayloadField::Named("press".to_owned()),
-            &slot,
-            PlanOpId(8),
-        )
-        .expect("explicit false press source payload should decode");
-        assert_eq!(value, json!(false));
-    }
-
-    #[test]
-    fn root_state_initializer_copies_root_initial_fields_without_constants() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: vec![boon_plan::PlanConstant {
-                id: PlanConstantId(0),
-                value: PlanConstantValue::Text {
-                    value: "draft.txt".to_owned(),
-                },
-            }],
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![
-                    boon_plan::ScalarStorageSlot {
-                        id: boon_plan::PlanStorageId(0),
-                        state_id: StateId(1),
-                        value_type: PlanValueType::Text,
-                        scope_id: None,
-                        indexed: false,
-                        initial_value_kind: InitialValueKind::Text,
-                        initial_constant_id: Some(PlanConstantId(0)),
-                        initial_root_field_path: None,
-                        initial_row_field_path: None,
-                    },
-                    boon_plan::ScalarStorageSlot {
-                        id: boon_plan::PlanStorageId(1),
-                        state_id: StateId(2),
-                        value_type: PlanValueType::RootInitialField,
-                        scope_id: None,
-                        indexed: false,
-                        initial_value_kind: InitialValueKind::RootInitialField,
-                        initial_constant_id: None,
-                        initial_root_field_path: Some("active_file".to_owned()),
-                        initial_row_field_path: None,
-                    },
-                ],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(0),
-                kind: RegionKind::StateInitialization,
-                ops: vec![
-                    PlanOp {
-                        id: PlanOpId(0),
-                        kind: PlanOpKind::StateInitialize {
-                            initial_value_kind: InitialValueKind::Text,
-                            initial_constant_id: Some(PlanConstantId(0)),
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::State(StateId(1))),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    },
-                    PlanOp {
-                        id: PlanOpId(1),
-                        kind: PlanOpKind::StateInitialize {
-                            initial_value_kind: InitialValueKind::RootInitialField,
-                            initial_constant_id: None,
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::State(StateId(2))),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    },
-                ],
-            }],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 1,
-                source_route_count: 0,
-                scalar_storage_count: 2,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 2,
-                typed_value_ref_count: 2,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![
-                    boon_plan::DebugEntry {
-                        id: "state:1".to_owned(),
-                        label: "store.active_file".to_owned(),
-                    },
-                    boon_plan::DebugEntry {
-                        id: "state:2".to_owned(),
-                        label: "store.selected_file".to_owned(),
-                    },
-                ],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let root = initialize_root_state(&plan).expect("root state should initialize");
-        assert_eq!(root.root_state["store.active_file"], "draft.txt");
-        assert_eq!(root.root_state["store.selected_file"], "draft.txt");
-        assert_eq!(root.initialized_state_count, 2);
-        assert_eq!(root.executor_report["root_initial_field_copy_count"], 1);
-
-        let executed =
-            execute_initial_state(&plan).expect("initial-state execution should initialize copies");
-        assert_eq!(
-            executed.executor_report["state_summary"]["store.selected_file"],
-            "draft.txt"
-        );
-        assert_eq!(executed.executor_report["root_initial_field_copy_count"], 1);
-    }
-
-    fn empty_executor_test_plan() -> MachinePlan {
-        MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: Vec::new(),
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        }
-    }
-
-    #[test]
-    fn indexed_fixed_byte_bank_lookup_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(17);
-        let state_id = StateId(42);
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(1),
-                    state_id,
-                    value_type: PlanValueType::Bytes { fixed_len: Some(3) },
-                    scope_id: Some(scope_id),
-                    indexed: true,
-                    initial_value_kind: InitialValueKind::Bytes,
-                    initial_constant_id: None,
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: vec![boon_plan::ListStorageSlot {
-                    id: boon_plan::PlanStorageId(2),
-                    list_id: boon_plan::ListId(3),
-                    scope_id: Some(scope_id),
-                    row_field_ids: Vec::new(),
-                    capacity: None,
-                    hidden_key_type: "RowKey".to_owned(),
-                    has_generation: true,
-                    initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-                    range: None,
-                    initial_rows: Vec::new(),
-                }],
-                byte_banks: vec![boon_plan::ByteStorageBank {
-                    id: boon_plan::PlanStorageId(4),
-                    state_storage_id: boon_plan::PlanStorageId(1),
-                    state_id,
-                    scope_id: Some(scope_id),
-                    indexed: true,
-                    fixed_len: 3,
-                    capacity: None,
-                }],
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 1,
-                list_storage_count: 1,
-                byte_bank_storage_count: 1,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:42".to_owned(),
-                    label: "row.payload".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        assert!(indexed_state_has_fixed_byte_bank(&plan, state_id));
-        assert_eq!(
-            indexed_fixed_byte_bank_len(&plan, state_id)
-                .expect("fixed bank length should validate"),
-            Some(3)
-        );
-        assert!(indexed_field_has_fixed_byte_bank(
-            &plan,
-            Some(scope_id),
-            "payload"
-        ));
-        assert!(!indexed_field_has_fixed_byte_bank(
-            &plan,
-            Some(scope_id),
-            "other"
-        ));
-        assert!(!indexed_field_has_fixed_byte_bank(&plan, None, "payload"));
-    }
-
-    #[test]
-    fn list_row_default_fields_are_executor_owned() {
-        let scope_id = boon_plan::ScopeId(23);
-        let text_state_id = StateId(11);
-        let bytes_state_id = StateId(12);
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(1),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "RowKey".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: vec![
-                boon_plan::PlanConstant {
-                    id: PlanConstantId(1),
-                    value: PlanConstantValue::Text {
-                        value: "hello".to_owned(),
-                    },
-                },
-                boon_plan::PlanConstant {
-                    id: PlanConstantId(2),
-                    value: PlanConstantValue::Bytes {
-                        byte_len: 3,
-                        sha256: sha256_bytes(&[1, 2, 3]),
-                        inline_bytes: Some(vec![1, 2, 3]),
-                    },
-                },
-            ],
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![
-                    boon_plan::ScalarStorageSlot {
-                        id: boon_plan::PlanStorageId(2),
-                        state_id: text_state_id,
-                        value_type: PlanValueType::Text,
-                        scope_id: Some(scope_id),
-                        indexed: true,
-                        initial_value_kind: InitialValueKind::Text,
-                        initial_constant_id: Some(PlanConstantId(1)),
-                        initial_root_field_path: None,
-                        initial_row_field_path: None,
-                    },
-                    boon_plan::ScalarStorageSlot {
-                        id: boon_plan::PlanStorageId(3),
-                        state_id: bytes_state_id,
-                        value_type: PlanValueType::Bytes { fixed_len: Some(3) },
-                        scope_id: Some(scope_id),
-                        indexed: true,
-                        initial_value_kind: InitialValueKind::Bytes,
-                        initial_constant_id: Some(PlanConstantId(2)),
-                        initial_root_field_path: None,
-                        initial_row_field_path: None,
-                    },
-                ],
-                list_slots: vec![list_slot.clone()],
-                byte_banks: vec![boon_plan::ByteStorageBank {
-                    id: boon_plan::PlanStorageId(4),
-                    state_storage_id: boon_plan::PlanStorageId(3),
-                    state_id: bytes_state_id,
-                    scope_id: Some(scope_id),
-                    indexed: true,
-                    fixed_len: 3,
-                    capacity: None,
-                }],
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 2,
-                source_route_count: 0,
-                scalar_storage_count: 2,
-                list_storage_count: 1,
-                byte_bank_storage_count: 1,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![
-                    boon_plan::DebugEntry {
-                        id: "state:11".to_owned(),
-                        label: "row.title".to_owned(),
-                    },
-                    boon_plan::DebugEntry {
-                        id: "state:12".to_owned(),
-                        label: "row.payload".to_owned(),
-                    },
-                ],
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let defaults = list_row_default_fields(&plan, &list_slot)
-            .expect("row default fields should be assembled by executor");
-        assert_eq!(defaults.fields["title"], json!("hello"));
-        assert_eq!(defaults.fields["payload"]["$boon_type"], "BYTES");
-        assert_eq!(defaults.private_bytes["payload"].inline_bytes(), &[1, 2, 3]);
-        assert_eq!(defaults.fixed_byte_banks["payload"], vec![1, 2, 3]);
-        assert_eq!(
-            defaults.executor_report["executor"],
-            "cpu-plan-list-row-default-fields-v1"
-        );
-        assert_eq!(defaults.executor_report["default_field_count"], 2);
-        assert_eq!(defaults.executor_report["fixed_byte_bank_count"], 1);
-    }
-
-    #[test]
-    fn root_scenario_materialized_work_validation_is_executor_owned() {
-        let update_work =
-            validate_root_scenario_materialized_work("store.input.change", 1, 0, false)
-                .expect("update op work should be executable");
-        assert_eq!(
-            update_work.executor_report["executor"],
-            "cpu-plan-root-scenario-materialized-work-v1"
-        );
-        assert_eq!(update_work.executor_report["update_op_count"], 1);
-        assert_eq!(update_work.executor_report["executable_work"], true);
-
-        let derived_work =
-            validate_root_scenario_materialized_work("store.input.change", 0, 1, false)
-                .expect("derived value work should be executable");
-        assert_eq!(derived_work.executor_report["derived_value_count"], 1);
-
-        let remove_work = validate_root_scenario_materialized_work("todo.remove.click", 0, 0, true)
-            .expect("list remove work should be executable");
-        assert_eq!(remove_work.executor_report["has_list_remove_work"], true);
-
-        let error = validate_root_scenario_materialized_work("store.input.change", 0, 0, false)
-            .expect_err("empty materialized work should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("found no executable selected-surface work"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn list_next_key_allocation_is_executor_owned() {
-        let list_state = BTreeMap::from([
-            (
-                4,
-                vec![
-                    PlanExecutorListRow {
-                        key: 1,
-                        generation: 1,
-                        fields: BTreeMap::new(),
-                    },
-                    PlanExecutorListRow {
-                        key: 7,
-                        generation: 1,
-                        fields: BTreeMap::new(),
-                    },
-                ],
-            ),
-            (9, Vec::new()),
-        ]);
-        let mut next_keys = initial_list_next_keys(&list_state);
-        assert_eq!(next_keys.get(&4), Some(&8));
-        assert_eq!(next_keys.get(&9), Some(&1));
-
-        assert_eq!(
-            reserve_list_row_key(&mut next_keys, &list_state, 4)
-                .expect("first reservation should use current next key"),
-            8
-        );
-        assert_eq!(
-            reserve_list_row_key(&mut next_keys, &list_state, 4)
-                .expect("second reservation should increment"),
-            9
-        );
-        assert_eq!(next_keys.get(&4), Some(&10));
-
-        let error = reserve_list_row_key(&mut next_keys, &list_state, 99)
-            .expect_err("unknown list should be rejected");
-        assert!(
-            error.to_string().contains("list state missing list 99"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn row_source_binding_ids_and_deltas_are_executor_owned() {
-        let route_source_ids = vec![SourceId(2), SourceId(5), SourceId(9)];
-        assert_eq!(
-            row_source_binding_id(4, &route_source_ids, SourceId(2)),
-            Some(10)
-        );
-        assert_eq!(
-            row_source_binding_id(4, &route_source_ids, SourceId(5)),
-            Some(11)
-        );
-        assert_eq!(
-            row_source_binding_id(4, &route_source_ids, SourceId(9)),
-            Some(12)
-        );
-        assert_eq!(
-            row_source_binding_id(4, &route_source_ids, SourceId(99)),
-            None
-        );
-
-        let deltas = build_source_bind_deltas(
-            "todos",
-            4,
-            1,
-            &[
-                "todo.sources.remove.click".to_owned(),
-                "todo.sources.title.change".to_owned(),
-            ],
-        );
-        assert_eq!(deltas.len(), 2);
-        assert_eq!(deltas[0]["kind"], "SourceBind");
-        assert_eq!(deltas[0]["source_id"], 7);
-        assert_eq!(deltas[0]["bind_epoch"], 7);
-        assert_eq!(deltas[0]["field_path"], "todo.sources.remove.click");
-        assert_eq!(deltas[1]["source_id"], 8);
-        assert_eq!(deltas[1]["value"], "todo.sources.title.change");
-
-        let unbinds = build_source_unbind_deltas(
-            "todos",
-            4,
-            2,
-            &[
-                "todo.sources.remove.click".to_owned(),
-                "todo.sources.title.change".to_owned(),
-            ],
-        );
-        assert_eq!(unbinds.len(), 2);
-        assert_eq!(unbinds[0]["kind"], "SourceUnbind");
-        assert_eq!(unbinds[0]["source_id"], 7);
-        assert_eq!(unbinds[0]["bind_epoch"], 7);
-        assert!(unbinds[0]["value"].is_null());
-
-        let remove = build_list_remove_delta("todos", 4, 2);
-        assert_eq!(remove["kind"], "ListRemove");
-        assert_eq!(remove["list_id"], "todos");
-        assert_eq!(remove["key"], 4);
-        assert_eq!(remove["generation"], 2);
-        assert!(remove["source_id"].is_null());
-    }
-
-    #[test]
-    fn list_mutation_records_are_executor_owned() {
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(boon_plan::ScopeId(3)),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let plan = empty_executor_test_plan();
-        let append = record_list_append_mutation(
-            &plan,
-            &list_slot,
-            ListAppendMutationInput {
-                list_id: 7,
-                list_label: "todos".to_owned(),
-                append_op_id: 10,
-                key: 4,
-                generation: 1,
-                trigger_value: json!("Buy milk"),
-                fields_before_refresh: BTreeMap::from([("title".to_owned(), json!("Buy milk"))]),
-                fields_after_refresh: BTreeMap::from([
-                    ("title".to_owned(), json!("Buy milk")),
-                    ("completed".to_owned(), json!(false)),
-                ]),
-                source_paths: vec![
-                    "todo.remove.click".to_owned(),
-                    "todo.title.change".to_owned(),
-                ],
-                row_bool_deltas: vec![json!({
-                    "kind": "FieldSet",
-                    "list_id": "todos",
-                    "key": 4,
-                    "generation": 1,
-                    "source_id": null,
-                    "bind_epoch": null,
-                    "field_path": "active",
-                    "value": true,
-                })],
-            },
-        );
-        assert_eq!(append.source_bind_count, 2);
-        assert_eq!(append.semantic_deltas[0]["kind"], "ListInsert");
-        assert_eq!(append.semantic_deltas[1]["kind"], "SourceBind");
-        assert_eq!(append.report_row["append_op_id"], 10);
-        assert_eq!(
-            append.executor_report["executor"],
-            "cpu-plan-list-append-mutation-record-v1"
-        );
-
-        let remove = record_list_remove_mutation(ListRemoveMutationInput {
-            list_id: 7,
-            list_label: "todos".to_owned(),
-            remove_op_id: 11,
-            source_id: 2,
-            source_label: "todo.remove.click".to_owned(),
-            row_index: 3,
-            key: 4,
-            generation: 1,
-            source_binding_id: Some(7),
-            bind_epoch: Some(7),
-            row_resolution: json!({"method": "source_binding"}),
-            source_paths: vec![
-                "todo.remove.click".to_owned(),
-                "todo.title.change".to_owned(),
-            ],
-            row_fields: BTreeMap::from([("title".to_owned(), json!("Buy milk"))]),
-        });
-        assert_eq!(remove.source_unbind_count, 2);
-        assert_eq!(remove.semantic_deltas[0]["kind"], "SourceUnbind");
-        assert_eq!(remove.semantic_deltas[2]["kind"], "ListRemove");
-        assert_eq!(remove.report_row["remove_op_id"], 11);
-        assert_eq!(
-            remove.executor_report["executor"],
-            "cpu-plan-list-remove-mutation-record-v1"
-        );
-    }
-
-    #[test]
-    fn list_append_insert_and_row_refresh_deltas_are_executor_owned() {
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(boon_plan::ScopeId(3)),
-            row_field_ids: vec![FieldId(8), FieldId(9)],
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: vec![SourceRoute {
-                id: boon_plan::PlanSourceRouteId(1),
-                source_id: SourceId(1),
-                path: "store.submit".to_owned(),
-                scoped: false,
-                scope_id: None,
-                payload_schema: boon_plan::SourcePayloadSchema {
-                    fields: vec![SourcePayloadField::Text, SourcePayloadField::Key],
-                    typed_fields: Vec::new(),
-                    row_lookup_field: None,
-                },
-            }],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(1),
-                    state_id: StateId(30),
-                    value_type: boon_plan::PlanValueType::Text,
-                    scope_id: Some(boon_plan::ScopeId(3)),
-                    indexed: true,
-                    initial_value_kind: boon_plan::InitialValueKind::Text,
-                    initial_constant_id: None,
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: vec![list_slot.clone()],
-                byte_banks: Vec::new(),
-            },
-            regions: vec![
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(1),
-                    kind: RegionKind::ListOperations,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(10),
-                        kind: PlanOpKind::ListOperation {
-                            operation_kind: PlanListOperationKind::Append,
-                            append: Some(boon_plan::PlanListAppend {
-                                trigger: ValueRef::Field(FieldId(40)),
-                                fields: vec![boon_plan::PlanListAppendField {
-                                    name: "title".to_owned(),
-                                    field_id: Some(FieldId(8)),
-                                    value_ref: Some(ValueRef::Field(FieldId(40))),
-                                    constant_id: None,
-                                }],
-                            }),
-                            remove: None,
-                            retain: None,
-                            count: None,
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::List(boon_plan::ListId(7))),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(2),
-                    kind: RegionKind::DerivedEvaluation,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(11),
-                        kind: PlanOpKind::DerivedValue {
-                            derived_kind: boon_plan::PlanDerivedKind::Pure,
-                            startup_recompute: true,
-                            expression: Some(PlanDerivedExpression::RowExpression {
-                                expression: boon_plan::PlanRowExpression::Field {
-                                    input: ValueRef::State(StateId(30)),
-                                },
-                            }),
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::Field(FieldId(9))),
-                        indexed: true,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-            ],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 1,
-                list_storage_count: 1,
-                byte_bank_storage_count: 0,
-                operation_count: 2,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:30".to_owned(),
-                    label: "todo.title".to_owned(),
-                }],
-                list_slots: vec![boon_plan::DebugEntry {
-                    id: "list:7".to_owned(),
-                    label: "todos".to_owned(),
-                }],
-                derived_values: Vec::new(),
-                fields: vec![
-                    boon_plan::DebugEntry {
-                        id: "field:8".to_owned(),
-                        label: "todo.title".to_owned(),
-                    },
-                    boon_plan::DebugEntry {
-                        id: "field:9".to_owned(),
-                        label: "todo.normalized_title".to_owned(),
-                    },
-                ],
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let insert = build_list_insert_delta("todos", 4, 1, json!("Write tests"));
-        assert_eq!(insert["kind"], "ListInsert");
-        assert_eq!(insert["list_id"], "todos");
-        assert_eq!(insert["key"], 4);
-        assert_eq!(insert["value"], "Write tests");
-
-        let fields = row_expression_output_field_names(&plan, &list_slot);
-        assert!(fields.contains("normalized_title"));
-        assert!(!fields.contains("title"));
-
-        let before = BTreeMap::from([
-            ("title".to_owned(), json!("Write tests")),
-            ("normalized_title".to_owned(), json!("old")),
-        ]);
-        let after = BTreeMap::from([
-            ("title".to_owned(), json!("Changed but not row expression")),
-            ("normalized_title".to_owned(), json!("Write tests")),
-        ]);
-        let deltas =
-            build_row_refresh_field_deltas(&plan, &list_slot, "todos", 4, 1, &before, &after);
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0]["kind"], "FieldSet");
-        assert_eq!(deltas[0]["list_id"], "todos");
-        assert_eq!(deltas[0]["field_path"], "normalized_title");
-        assert_eq!(deltas[0]["value"], "Write tests");
-    }
-
-    #[test]
-    fn list_row_expression_refresh_loop_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(3);
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let mut plan = empty_executor_test_plan();
-        plan.source_routes = vec![SourceRoute {
-            id: boon_plan::PlanSourceRouteId(1),
-            source_id: SourceId(1),
-            path: "todo.title.change".to_owned(),
-            scoped: true,
-            scope_id: Some(scope_id),
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        }];
-        plan.storage_layout.list_slots = vec![list_slot.clone()];
-        plan.storage_layout.scalar_slots = vec![boon_plan::ScalarStorageSlot {
-            id: boon_plan::PlanStorageId(1),
-            state_id: StateId(30),
-            value_type: PlanValueType::Text,
-            scope_id: Some(scope_id),
-            indexed: true,
-            initial_value_kind: InitialValueKind::Text,
-            initial_constant_id: None,
-            initial_root_field_path: None,
-            initial_row_field_path: None,
-        }];
-        plan.debug_map.state_slots = vec![boon_plan::DebugEntry {
-            id: "state:30".to_owned(),
-            label: "todo.title".to_owned(),
-        }];
-        plan.debug_map.fields = vec![boon_plan::DebugEntry {
-            id: "field:9".to_owned(),
-            label: "todo.normalized_title".to_owned(),
-        }];
-        plan.regions = vec![boon_plan::OperationRegion {
-            id: boon_plan::PlanRegionId(2),
-            kind: RegionKind::DerivedEvaluation,
-            ops: vec![PlanOp {
-                id: PlanOpId(11),
-                kind: PlanOpKind::DerivedValue {
-                    derived_kind: boon_plan::PlanDerivedKind::Pure,
-                    startup_recompute: true,
-                    expression: Some(PlanDerivedExpression::RowExpression {
-                        expression: PlanRowExpression::Field {
-                            input: ValueRef::State(StateId(30)),
-                        },
-                    }),
-                },
-                inputs: Vec::new(),
-                output: Some(ValueRef::Field(FieldId(9))),
-                indexed: true,
-                unresolved_executable_ref_count: 0,
-            }],
-        }];
-        let mut row = PlanExecutorListRowState {
-            key: 4,
-            generation: 1,
-            fields: BTreeMap::from([("title".to_owned(), json!("Write tests"))]),
-            private_bytes: BTreeMap::new(),
-            fixed_bytes_banks: BTreeMap::new(),
-        };
-        let list_state = BTreeMap::from([(7usize, vec![row.clone()])]);
-
-        refresh_list_row_expression_fields_with(
-            &plan,
-            &list_slot,
-            &list_state,
-            &mut row,
-            |plan, _list_state, row, expression| {
-                let PlanRowExpression::Field {
-                    input: ValueRef::State(state_id),
-                } = expression
-                else {
-                    return Err("unexpected row expression".into());
-                };
-                let field_name = local_field_name(&state_label(plan, *state_id));
-                row.fields
-                    .get(&field_name)
-                    .cloned()
-                    .ok_or_else(|| "missing row field".into())
-            },
-        )
-        .expect("strict row-expression refresh should evaluate");
-        assert_eq!(row.fields["normalized_title"], json!("Write tests"));
-
-        row.fields.remove("normalized_title");
-        refresh_list_row_expression_fields_best_effort_with(
-            &plan,
-            &list_slot,
-            &list_state,
-            &mut row,
-            |_plan, _list_state, _row, _expression| Err("deferred expression".into()),
-        );
-        assert!(!row.fields.contains_key("normalized_title"));
-    }
-
-    #[test]
-    fn list_append_row_construction_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(3);
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let append = boon_plan::PlanListAppend {
-            trigger: ValueRef::Field(FieldId(40)),
-            fields: vec![boon_plan::PlanListAppendField {
-                name: "title".to_owned(),
-                field_id: Some(FieldId(8)),
-                value_ref: Some(ValueRef::Field(FieldId(40))),
-                constant_id: None,
-            }],
-        };
-        let mut plan = empty_executor_test_plan();
-        plan.source_routes = vec![SourceRoute {
-            id: boon_plan::PlanSourceRouteId(1),
-            source_id: SourceId(1),
-            path: "todo.title.change".to_owned(),
-            scoped: true,
-            scope_id: Some(scope_id),
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        }];
-        plan.storage_layout.list_slots = vec![list_slot.clone()];
-        plan.storage_layout.scalar_slots = vec![boon_plan::ScalarStorageSlot {
-            id: boon_plan::PlanStorageId(1),
-            state_id: StateId(30),
-            value_type: PlanValueType::Text,
-            scope_id: Some(scope_id),
-            indexed: true,
-            initial_value_kind: InitialValueKind::Text,
-            initial_constant_id: None,
-            initial_root_field_path: None,
-            initial_row_field_path: None,
-        }];
-        plan.debug_map.state_slots = vec![boon_plan::DebugEntry {
-            id: "state:30".to_owned(),
-            label: "todo.title".to_owned(),
-        }];
-        plan.debug_map.fields = vec![
-            boon_plan::DebugEntry {
-                id: "field:8".to_owned(),
-                label: "todo.title".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "field:9".to_owned(),
-                label: "todo.normalized_title".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "field:40".to_owned(),
-                label: "store.title_to_add".to_owned(),
-            },
-        ];
-        plan.regions = vec![boon_plan::OperationRegion {
-            id: boon_plan::PlanRegionId(2),
-            kind: RegionKind::DerivedEvaluation,
-            ops: vec![PlanOp {
-                id: PlanOpId(11),
-                kind: PlanOpKind::DerivedValue {
-                    derived_kind: boon_plan::PlanDerivedKind::Pure,
-                    startup_recompute: true,
-                    expression: Some(PlanDerivedExpression::RowExpression {
-                        expression: PlanRowExpression::Field {
-                            input: ValueRef::State(StateId(30)),
-                        },
-                    }),
-                },
-                inputs: Vec::new(),
-                output: Some(ValueRef::Field(FieldId(9))),
-                indexed: true,
-                unresolved_executable_ref_count: 0,
-            }],
-        }];
-        let list_state = BTreeMap::from([(7usize, Vec::new())]);
-        let derived_values = BTreeMap::from([(FieldId(40), json!("Write tests"))]);
-
-        let constructed = construct_list_append_row_with(
-            &plan,
-            &list_slot,
-            10,
-            &append,
-            7,
-            "todos",
-            &list_state,
-            4,
-            1,
-            &derived_values,
-            true,
-            |plan, _list_state, row, expression| {
-                let PlanRowExpression::Field {
-                    input: ValueRef::State(state_id),
-                } = expression
-                else {
-                    return Err("unexpected row expression".into());
-                };
-                let field_name = local_field_name(&state_label(plan, *state_id));
-                row.fields
-                    .get(&field_name)
-                    .cloned()
-                    .ok_or_else(|| "missing row field".into())
-            },
-        )
-        .expect("append row construction should succeed");
-
-        assert_eq!(constructed.row.key, 4);
-        assert_eq!(constructed.row.fields["title"], json!("Write tests"));
-        assert_eq!(
-            constructed.row.fields["normalized_title"],
-            json!("Write tests")
-        );
-        assert_eq!(constructed.source_paths, vec!["todo.title.change"]);
-        assert_eq!(
-            constructed.executor_report["executor"],
-            "cpu-plan-list-append-row-construction-v1"
-        );
-    }
-
-    #[test]
-    fn list_append_execution_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(3);
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let append = boon_plan::PlanListAppend {
-            trigger: ValueRef::Field(FieldId(40)),
-            fields: vec![boon_plan::PlanListAppendField {
-                name: "title".to_owned(),
-                field_id: Some(FieldId(8)),
-                value_ref: Some(ValueRef::Field(FieldId(40))),
-                constant_id: None,
-            }],
-        };
-        let mut plan = empty_executor_test_plan();
-        plan.source_routes = vec![SourceRoute {
-            id: boon_plan::PlanSourceRouteId(1),
-            source_id: SourceId(1),
-            path: "todo.title.change".to_owned(),
-            scoped: true,
-            scope_id: Some(scope_id),
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        }];
-        plan.storage_layout.list_slots = vec![list_slot];
-        plan.storage_layout.scalar_slots = vec![boon_plan::ScalarStorageSlot {
-            id: boon_plan::PlanStorageId(1),
-            state_id: StateId(30),
-            value_type: PlanValueType::Text,
-            scope_id: Some(scope_id),
-            indexed: true,
-            initial_value_kind: InitialValueKind::Text,
-            initial_constant_id: None,
-            initial_root_field_path: None,
-            initial_row_field_path: None,
-        }];
-        plan.debug_map.list_slots = vec![boon_plan::DebugEntry {
-            id: "list:7".to_owned(),
-            label: "todos".to_owned(),
-        }];
-        plan.debug_map.state_slots = vec![boon_plan::DebugEntry {
-            id: "state:30".to_owned(),
-            label: "todo.title".to_owned(),
-        }];
-        plan.debug_map.fields = vec![
-            boon_plan::DebugEntry {
-                id: "field:8".to_owned(),
-                label: "todo.title".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "field:9".to_owned(),
-                label: "todo.normalized_title".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "field:40".to_owned(),
-                label: "store.title_to_add".to_owned(),
-            },
-        ];
-        plan.regions = vec![
-            boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(1),
-                kind: RegionKind::ListOperations,
-                ops: vec![PlanOp {
-                    id: PlanOpId(10),
-                    kind: PlanOpKind::ListOperation {
-                        operation_kind: boon_plan::PlanListOperationKind::Append,
-                        append: Some(append),
-                        remove: None,
-                        retain: None,
-                        count: None,
-                    },
-                    inputs: vec![ValueRef::Field(FieldId(40))],
-                    output: Some(ValueRef::List(boon_plan::ListId(7))),
-                    indexed: false,
-                    unresolved_executable_ref_count: 0,
-                }],
-            },
-            boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(2),
-                kind: RegionKind::DerivedEvaluation,
-                ops: vec![PlanOp {
-                    id: PlanOpId(11),
-                    kind: PlanOpKind::DerivedValue {
-                        derived_kind: boon_plan::PlanDerivedKind::Pure,
-                        startup_recompute: true,
-                        expression: Some(PlanDerivedExpression::RowExpression {
-                            expression: PlanRowExpression::Field {
-                                input: ValueRef::State(StateId(30)),
-                            },
-                        }),
-                    },
-                    inputs: Vec::new(),
-                    output: Some(ValueRef::Field(FieldId(9))),
-                    indexed: true,
-                    unresolved_executable_ref_count: 0,
-                }],
-            },
-        ];
-        let mut list_state = BTreeMap::from([(7usize, Vec::new())]);
-        let mut list_next_keys = BTreeMap::new();
-        let mut bool_delta_lists = BTreeSet::new();
-        let derived_values = BTreeMap::from([(FieldId(40), json!("Write tests"))]);
-
-        let execution = append_list_rows_for_derived_values_with(
-            &plan,
-            &mut list_state,
-            &mut list_next_keys,
-            &mut bool_delta_lists,
-            &derived_values,
-            |plan, _list_state, row, expression| {
-                let PlanRowExpression::Field {
-                    input: ValueRef::State(state_id),
-                } = expression
-                else {
-                    return Err("unexpected row expression".into());
-                };
-                let field_name = local_field_name(&state_label(plan, *state_id));
-                row.fields
-                    .get(&field_name)
-                    .cloned()
-                    .ok_or_else(|| "missing row field".into())
-            },
-        )
-        .expect("append execution should succeed");
-
-        assert_eq!(execution.appended_row_count, 1);
-        assert_eq!(execution.source_bind_count, 1);
-        assert_eq!(
-            execution.executor_report["executor"],
-            "cpu-plan-list-append-execution-v1"
-        );
-        let rows = list_state.get(&7).expect("list should exist");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].key, 1);
-        assert_eq!(rows[0].fields["title"], json!("Write tests"));
-        assert_eq!(rows[0].fields["normalized_title"], json!("Write tests"));
-        assert_eq!(execution.report_rows[0]["list"], "todos");
-        assert!(
-            execution
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta["kind"] == "ListInsert")
-        );
-        assert!(
-            execution
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta["kind"] == "SourceBind")
-        );
-        assert!(
-            execution
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta["kind"] == "FieldSet"
-                    && delta["field_path"] == "normalized_title")
-        );
-    }
-
-    #[test]
-    fn list_remove_execution_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(3);
-        let list_slot = boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        };
-        let mut plan = empty_executor_test_plan();
-        plan.source_routes = vec![SourceRoute {
-            id: boon_plan::PlanSourceRouteId(1),
-            source_id: SourceId(1),
-            path: "todo.remove".to_owned(),
-            scoped: true,
-            scope_id: Some(scope_id),
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        }];
-        plan.storage_layout.list_slots = vec![list_slot];
-        plan.debug_map.list_slots = vec![boon_plan::DebugEntry {
-            id: "list:7".to_owned(),
-            label: "todos".to_owned(),
-        }];
-        plan.regions = vec![boon_plan::OperationRegion {
-            id: boon_plan::PlanRegionId(1),
-            kind: RegionKind::ListOperations,
-            ops: vec![PlanOp {
-                id: PlanOpId(10),
-                kind: PlanOpKind::ListOperation {
-                    operation_kind: boon_plan::PlanListOperationKind::Remove,
-                    append: None,
-                    remove: Some(boon_plan::PlanListRemove {
-                        source: ValueRef::Source(SourceId(1)),
-                        predicate: boon_plan::PlanListRemovePredicate::AlwaysTrue,
-                    }),
-                    retain: None,
-                    count: None,
-                },
-                inputs: vec![ValueRef::Source(SourceId(1))],
-                output: Some(ValueRef::List(boon_plan::ListId(7))),
-                indexed: false,
-                unresolved_executable_ref_count: 0,
-            }],
-        }];
-        let mut list_state = BTreeMap::from([(
-            7usize,
-            vec![PlanExecutorListRowState {
-                key: 1,
-                generation: 1,
-                fields: BTreeMap::from([("title".to_owned(), json!("Write tests"))]),
-                private_bytes: BTreeMap::new(),
-                fixed_bytes_banks: BTreeMap::new(),
-            }],
-        )]);
-        let event = PlanExecutorLiveSourceEvent {
-            source: "todo.remove",
-            text: None,
-            key: None,
-            list_id: Some("todos"),
-            address: None,
-            target_text: None,
-            target_occurrence: None,
-            target_key: Some(1),
-            target_generation: Some(1),
-            bind_epoch: Some(1),
-            source_epoch: None,
-            source_id: None,
-        };
-
-        let execution = remove_list_rows_for_source_event(
-            &plan,
-            SourceId(1),
-            &plan.source_routes[0],
-            &event,
-            &mut list_state,
-        )
-        .expect("remove execution should succeed");
-
-        assert_eq!(execution.removed_row_count, 1);
-        assert_eq!(execution.source_unbind_count, 1);
-        assert_eq!(
-            execution.executor_report["executor"],
-            "cpu-plan-list-remove-execution-v1"
-        );
-        assert!(list_state.get(&7).unwrap().is_empty());
-        assert_eq!(execution.report_rows[0]["list"], "todos");
-        assert_eq!(
-            execution.report_rows[0]["row_resolution"]["method"],
-            "key_generation"
-        );
-        assert!(
-            execution
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta["kind"] == "SourceUnbind")
-        );
-        assert!(
-            execution
-                .semantic_deltas
-                .iter()
-                .any(|delta| delta["kind"] == "ListRemove")
-        );
-    }
-
-    #[test]
-    fn indexed_update_batch_execution_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(3);
-        let mut plan = empty_executor_test_plan();
-        plan.source_routes = vec![SourceRoute {
-            id: boon_plan::PlanSourceRouteId(1),
-            source_id: SourceId(1),
-            path: "store.toggle_all".to_owned(),
-            scoped: false,
-            scope_id: None,
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: Vec::new(),
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        }];
-        plan.storage_layout.list_slots = vec![boon_plan::ListStorageSlot {
-            id: boon_plan::PlanStorageId(0),
-            list_id: boon_plan::ListId(7),
-            scope_id: Some(scope_id),
-            row_field_ids: Vec::new(),
-            capacity: None,
-            hidden_key_type: "u64".to_owned(),
-            has_generation: true,
-            initializer_kind: boon_plan::ListInitializerKind::RecordLiteral,
-            range: None,
-            initial_rows: Vec::new(),
-        }];
-        plan.storage_layout.scalar_slots = vec![boon_plan::ScalarStorageSlot {
-            id: boon_plan::PlanStorageId(1),
-            state_id: StateId(30),
-            value_type: PlanValueType::Bool,
-            scope_id: Some(scope_id),
-            indexed: true,
-            initial_value_kind: InitialValueKind::Bool,
-            initial_constant_id: None,
-            initial_root_field_path: None,
-            initial_row_field_path: None,
-        }];
-        plan.debug_map.list_slots = vec![boon_plan::DebugEntry {
-            id: "list:7".to_owned(),
-            label: "todos".to_owned(),
-        }];
-        let op = PlanOp {
-            id: PlanOpId(12),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::Const,
-                ordered_inputs: Vec::new(),
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: Vec::new(),
-            output: Some(ValueRef::State(StateId(30))),
-            indexed: true,
-            unresolved_executable_ref_count: 0,
-        };
-        let list_rows = BTreeMap::from([(
-            7usize,
-            vec![
-                PlanExecutorListRow {
-                    key: 1,
-                    generation: 1,
-                    fields: BTreeMap::new(),
-                },
-                PlanExecutorListRow {
-                    key: 2,
-                    generation: 1,
-                    fields: BTreeMap::new(),
-                },
-            ],
-        )]);
-        let event = IndexedUpdateTargetEvent {
-            source: "store.toggle_all".to_owned(),
-            target_text: Some("visible toggle label".to_owned()),
-            ..IndexedUpdateTargetEvent::default()
-        };
-        let mut callback_targets = Vec::new();
-
-        let execution = execute_indexed_update_batch_with(
-            &plan,
-            &op,
-            &plan.source_routes[0],
-            &event,
-            &list_rows,
-            |target| {
-                let target = target.expect("unscoped source should bulk-target rows");
-                callback_targets.push((target.list_label.clone(), target.key, target.generation));
-                let primary_value = format!("primary-{}", target.key);
-                let derived_value = format!("derived-{}", target.key);
-                Ok(IndexedUpdateBranchExecution {
-                    semantic_deltas: vec![
-                        json!({
-                            "kind": "FieldSet",
-                            "field_path": "completed",
-                            "key": target.key,
-                            "generation": target.generation,
-                            "value": primary_value,
-                        }),
-                        json!({
-                            "kind": "FieldSet",
-                            "field_path": "visible",
-                            "key": target.key,
-                            "generation": target.generation,
-                            "value": derived_value,
-                        }),
-                    ],
-                    report_rows: vec![json!({
-                        "update_op_id": 12,
-                        "list": target.list_label,
-                        "key": target.key,
-                        "generation": target.generation,
-                        "field_path": "completed",
-                        "value": primary_value,
-                    })],
-                    updated_row_count: 1,
-                })
-            },
-        )
-        .expect("batch execution should succeed");
-
-        assert_eq!(
-            callback_targets,
-            vec![("todos".to_owned(), 1, 1), ("todos".to_owned(), 2, 1)]
-        );
-        assert_eq!(execution.updated_row_count, 2);
-        assert!(execution.bulk_indexed_update);
-        assert_eq!(execution.report_rows.len(), 2);
-        assert_eq!(
-            execution.executor_report["executor"],
-            "cpu-plan-indexed-update-batch-execution-v1"
-        );
-        let ordered = execution
-            .semantic_deltas
-            .iter()
-            .map(|delta| {
-                (
-                    delta["field_path"].as_str().unwrap().to_owned(),
-                    delta["key"].as_u64().unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ordered,
-            vec![
-                ("completed".to_owned(), 1),
-                ("completed".to_owned(), 2),
-                ("visible".to_owned(), 1),
-                ("visible".to_owned(), 2),
-            ]
-        );
-    }
-
-    #[test]
-    fn indexed_json_update_evaluator_handles_bool_not_and_text_trim() {
-        let scope_id = boon_plan::ScopeId(3);
-        let mut plan = empty_executor_test_plan();
-        plan.source_routes = vec![SourceRoute {
-            id: boon_plan::PlanSourceRouteId(1),
-            source_id: SourceId(1),
-            path: "todo.title.change".to_owned(),
-            scoped: true,
-            scope_id: Some(scope_id),
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: vec![SourcePayloadField::Named("title".to_owned())],
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        }];
-        plan.storage_layout.scalar_slots = vec![
-            boon_plan::ScalarStorageSlot {
-                id: boon_plan::PlanStorageId(1),
-                state_id: StateId(30),
-                value_type: PlanValueType::Text,
-                scope_id: Some(scope_id),
-                indexed: true,
-                initial_value_kind: InitialValueKind::Text,
-                initial_constant_id: None,
-                initial_root_field_path: None,
-                initial_row_field_path: None,
-            },
-            boon_plan::ScalarStorageSlot {
-                id: boon_plan::PlanStorageId(2),
-                state_id: StateId(31),
-                value_type: PlanValueType::Bool,
-                scope_id: Some(scope_id),
-                indexed: true,
-                initial_value_kind: InitialValueKind::Bool,
-                initial_constant_id: None,
-                initial_root_field_path: None,
-                initial_row_field_path: None,
-            },
-            boon_plan::ScalarStorageSlot {
-                id: boon_plan::PlanStorageId(3),
-                state_id: StateId(32),
-                value_type: PlanValueType::Text,
-                scope_id: Some(scope_id),
-                indexed: true,
-                initial_value_kind: InitialValueKind::Text,
-                initial_constant_id: None,
-                initial_root_field_path: None,
-                initial_row_field_path: None,
-            },
-            boon_plan::ScalarStorageSlot {
-                id: boon_plan::PlanStorageId(4),
-                state_id: StateId(33),
-                value_type: PlanValueType::Text,
-                scope_id: Some(scope_id),
-                indexed: true,
-                initial_value_kind: InitialValueKind::Text,
-                initial_constant_id: None,
-                initial_root_field_path: None,
-                initial_row_field_path: None,
-            },
-        ];
-        plan.constants = vec![boon_plan::PlanConstant {
-            id: PlanConstantId(0),
-            value: PlanConstantValue::Text {
-                value: "SKIP".to_owned(),
-            },
-        }];
-        plan.debug_map.state_slots = vec![
-            boon_plan::DebugEntry {
-                id: "state:30".to_owned(),
-                label: "todo.title".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "state:31".to_owned(),
-                label: "todo.completed".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "state:32".to_owned(),
-                label: "todo.edited_title".to_owned(),
-            },
-            boon_plan::DebugEntry {
-                id: "state:33".to_owned(),
-                label: "todo.edited_title.draft_title".to_owned(),
-            },
-        ];
-        plan.debug_map.derived_values = vec![boon_plan::DebugEntry {
-            id: "field:80".to_owned(),
-            label: "store.all_completed".to_owned(),
-        }];
-        let row = PlanExecutorListRowState {
-            key: 1,
-            generation: 1,
-            fields: BTreeMap::from([
-                ("title".to_owned(), json!("Old")),
-                ("completed".to_owned(), json!(false)),
-                ("edited_title".to_owned(), json!("")),
-                ("draft_title".to_owned(), json!("")),
-            ]),
-            private_bytes: BTreeMap::new(),
-            fixed_bytes_banks: BTreeMap::new(),
-        };
-        let bool_op = PlanOp {
-            id: PlanOpId(10),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::BoolNot,
-                ordered_inputs: Vec::new(),
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: vec![ValueRef::Field(FieldId(80))],
-            output: Some(ValueRef::State(StateId(31))),
-            indexed: true,
-            unresolved_executable_ref_count: 0,
-        };
-        let root_derived_values = BTreeMap::from([(80usize, json!(true))]);
-        let event = RootJsonSourceEvent::default();
-        let bool_eval = evaluate_indexed_json_update_branch(
-            &plan,
-            &bool_op,
-            SourceId(1),
-            &plan.source_routes[0],
-            &event,
-            &row,
-            &root_derived_values,
-        )
-        .expect("Bool/not evaluation should succeed");
-        assert!(bool_eval.supported);
-        assert_eq!(bool_eval.expression_kind, Some("bool_not"));
-        assert_eq!(bool_eval.value, Some(json!(false)));
-        assert_eq!(
-            bool_eval.executor_report["executor"],
-            "cpu-plan-indexed-json-update-evaluator-v1"
-        );
-
-        let text_op = PlanOp {
-            id: PlanOpId(11),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::TextTrimOrPrevious,
-                ordered_inputs: Vec::new(),
-                source_payload_field: Some(SourcePayloadField::Named("title".to_owned())),
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: vec![ValueRef::SourcePayload {
-                source_id: SourceId(1),
-                field: SourcePayloadField::Named("title".to_owned()),
-            }],
-            output: Some(ValueRef::State(StateId(30))),
-            indexed: true,
-            unresolved_executable_ref_count: 0,
-        };
-        let event = RootJsonSourceEvent {
-            payload: BTreeMap::from([("title".to_owned(), "  New title  ".to_owned())]),
-            ..RootJsonSourceEvent::default()
-        };
-        let text_eval = evaluate_indexed_json_update_branch(
-            &plan,
-            &text_op,
-            SourceId(1),
-            &plan.source_routes[0],
-            &event,
-            &row,
-            &BTreeMap::new(),
-        )
-        .expect("TextTrimOrPrevious evaluation should succeed");
-        assert!(text_eval.supported);
-        assert_eq!(text_eval.expression_kind, Some("text_trim_or_previous"));
-        assert_eq!(text_eval.value, Some(json!("New title")));
-        assert_eq!(
-            text_eval.source_payload_field,
-            serde_json::to_value(SourcePayloadField::Named("title".to_owned())).unwrap()
-        );
-
-        plan.storage_layout.scalar_slots[0].initial_row_field_path = Some("title".to_owned());
-        let read_path_op = PlanOp {
-            id: PlanOpId(13),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::ReadPath,
-                ordered_inputs: Vec::new(),
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: Vec::new(),
-            output: Some(ValueRef::State(StateId(30))),
-            indexed: true,
-            unresolved_executable_ref_count: 0,
-        };
-        let read_path_eval = evaluate_indexed_json_update_branch(
-            &plan,
-            &read_path_op,
-            SourceId(1),
-            &plan.source_routes[0],
-            &RootJsonSourceEvent::default(),
-            &row,
-            &BTreeMap::new(),
-        )
-        .expect("indexed ReadPath should read the output row initializer field");
-        assert!(read_path_eval.supported);
-        assert_eq!(read_path_eval.expression_kind, Some("read_path"));
-        assert_eq!(read_path_eval.value, Some(json!("Old")));
-
-        let match_op = PlanOp {
-            id: PlanOpId(12),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::MatchTextIsEmptyConst,
-                ordered_inputs: vec![
-                    ValueRef::State(StateId(33)),
-                    ValueRef::State(StateId(30)),
-                    ValueRef::Constant(PlanConstantId(0)),
-                ],
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: vec![
-                ValueRef::State(StateId(33)),
-                ValueRef::State(StateId(30)),
-                ValueRef::Constant(PlanConstantId(0)),
-            ],
-            output: Some(ValueRef::State(StateId(32))),
-            indexed: true,
-            unresolved_executable_ref_count: 0,
-        };
-        let match_eval = evaluate_indexed_json_update_branch(
-            &plan,
-            &match_op,
-            SourceId(1),
-            &plan.source_routes[0],
-            &RootJsonSourceEvent::default(),
-            &row,
-            &BTreeMap::new(),
-        )
-        .expect("MatchTextIsEmptyConst evaluation should succeed");
-        assert!(match_eval.supported);
-        assert_eq!(
-            match_eval.expression_kind,
-            Some("match_text_is_empty_const")
-        );
-        assert_eq!(match_eval.value, Some(json!("Old")));
-
-        let mut non_empty_row = row.clone();
-        non_empty_row
-            .fields
-            .insert("draft_title".to_owned(), json!("Draft"));
-        let skip_eval = evaluate_indexed_json_update_branch(
-            &plan,
-            &match_op,
-            SourceId(1),
-            &plan.source_routes[0],
-            &RootJsonSourceEvent::default(),
-            &non_empty_row,
-            &BTreeMap::new(),
-        )
-        .expect("MatchTextIsEmptyConst SKIP evaluation should succeed");
-        assert!(skip_eval.supported);
-        assert_eq!(skip_eval.expression_kind, Some("match_text_is_empty_const"));
-        assert_eq!(skip_eval.value, None);
-    }
-
-    #[test]
-    fn ordered_root_update_ops_are_resolved_by_executor_dispatch() {
-        let update_op = |id: usize| PlanOp {
-            id: PlanOpId(id),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::Const,
-                ordered_inputs: Vec::new(),
-                source_payload_field: None,
-                update_constant_id: Some(PlanConstantId(id + 100)),
-                source_guard: None,
-            },
-            inputs: Vec::new(),
-            output: Some(ValueRef::State(StateId(id + 200))),
-            indexed: false,
-            unresolved_executable_ref_count: 0,
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: vec![SourceRoute {
-                id: boon_plan::PlanSourceRouteId(1),
-                source_id: SourceId(1),
-                path: "store.submit".to_owned(),
-                scoped: false,
-                scope_id: None,
-                payload_schema: boon_plan::SourcePayloadSchema {
-                    fields: vec![SourcePayloadField::Text, SourcePayloadField::Key],
-                    typed_fields: Vec::new(),
-                    row_lookup_field: None,
-                },
-            }],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(1),
-                kind: RegionKind::UpdateBranches,
-                ops: vec![update_op(10), update_op(20)],
-            }],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 2,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 1,
-                scalar_storage_count: 0,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 2,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: Vec::new(),
-                list_slots: Vec::new(),
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let dispatch = RootScenarioStepDispatch {
-            plan_hash: "test".to_owned(),
-            source_label: "store.submit".to_owned(),
-            source_id: SourceId(1),
-            source_route_scoped: false,
-            ordered_update_op_ids: vec![PlanOpId(20), PlanOpId(10)],
-            derived_op_count: 0,
-            has_list_remove_work: false,
-            root_update_key_gate: None,
-            root_update_key_matches: true,
-            executable_work: true,
-            executor_report: JsonValue::Null,
-        };
-
-        let ops = ordered_root_update_ops_for_dispatch(&plan, &dispatch)
-            .expect("dispatch-selected update ops should resolve through PlanExecutor");
-        assert_eq!(
-            ops.iter().map(|op| op.id.0).collect::<Vec<_>>(),
-            vec![20, 10]
-        );
-        let route = source_route_slot_for_dispatch(&plan, &dispatch)
-            .expect("dispatch-selected source route should resolve through PlanExecutor");
-        assert_eq!(route.path, "store.submit");
-        assert_eq!(
-            route.payload_schema.fields,
-            vec![SourcePayloadField::Text, SourcePayloadField::Key]
-        );
-
-        let stale_dispatch = RootScenarioStepDispatch {
-            ordered_update_op_ids: vec![PlanOpId(99)],
-            ..dispatch.clone()
-        };
-        let error = ordered_root_update_ops_for_dispatch(&plan, &stale_dispatch)
-            .expect_err("stale dispatch op ids must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("root source-event selector chose missing update op 99"),
-            "unexpected error: {error}"
-        );
-        let stale_route_dispatch = RootScenarioStepDispatch {
-            source_id: SourceId(99),
-            ..dispatch
-        };
-        let error = source_route_slot_for_dispatch(&plan, &stale_route_dispatch)
-            .expect_err("stale dispatch source ids must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("MachinePlan source route `store.submit` has no route slot"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn root_scenario_step_preparation_is_executor_owned() {
-        let update_op = PlanOp {
-            id: PlanOpId(10),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::SourcePayload,
-                ordered_inputs: Vec::new(),
-                source_payload_field: Some(SourcePayloadField::Text),
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: vec![
-                ValueRef::Source(SourceId(1)),
-                ValueRef::SourcePayload {
-                    source_id: SourceId(1),
-                    field: SourcePayloadField::Text,
-                },
-            ],
-            output: Some(ValueRef::State(StateId(4))),
-            indexed: false,
-            unresolved_executable_ref_count: 0,
-        };
-        let derived_op = PlanOp {
-            id: PlanOpId(20),
-            kind: PlanOpKind::DerivedValue {
-                derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
-                startup_recompute: true,
-                expression: Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-                    source_id: SourceId(1),
-                    key_field: SourcePayloadField::Key,
-                    required_key: "Enter".to_owned(),
-                    state: ValueRef::SourcePayload {
-                        source_id: SourceId(1),
-                        field: SourcePayloadField::Text,
-                    },
-                    skip_empty: true,
-                }),
-            },
-            inputs: vec![
-                ValueRef::Source(SourceId(1)),
-                ValueRef::SourcePayload {
-                    source_id: SourceId(1),
-                    field: SourcePayloadField::Text,
-                },
-                ValueRef::SourcePayload {
-                    source_id: SourceId(1),
-                    field: SourcePayloadField::Key,
-                },
-            ],
-            output: Some(ValueRef::Field(FieldId(9))),
-            indexed: false,
-            unresolved_executable_ref_count: 0,
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: vec![SourceRoute {
-                id: boon_plan::PlanSourceRouteId(0),
-                source_id: SourceId(1),
-                path: "store.submit".to_owned(),
-                scoped: false,
-                scope_id: None,
-                payload_schema: boon_plan::SourcePayloadSchema {
-                    fields: vec![SourcePayloadField::Text, SourcePayloadField::Key],
-                    typed_fields: vec![
-                        boon_plan::SourcePayloadDescriptor {
-                            field: SourcePayloadField::Text,
-                            value_type: boon_plan::SourcePayloadValueType::Text,
-                        },
-                        boon_plan::SourcePayloadDescriptor {
-                            field: SourcePayloadField::Key,
-                            value_type: boon_plan::SourcePayloadValueType::Text,
-                        },
-                    ],
-                    row_lookup_field: None,
-                },
-            }],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(0),
-                    state_id: StateId(4),
-                    value_type: boon_plan::PlanValueType::Text,
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: boon_plan::InitialValueKind::Text,
-                    initial_constant_id: None,
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(1),
-                    kind: RegionKind::UpdateBranches,
-                    ops: vec![update_op],
-                },
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(2),
-                    kind: RegionKind::DerivedEvaluation,
-                    ops: vec![derived_op],
-                },
-            ],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 1,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: true,
-                constant_count: 0,
-                source_route_count: 1,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 2,
-                typed_value_ref_count: 7,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: vec![boon_plan::DebugEntry {
-                    id: "source:1".to_owned(),
-                    label: "store.submit".to_owned(),
-                }],
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:4".to_owned(),
-                    label: "store.input".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: vec![boon_plan::DebugEntry {
-                    id: "field:9".to_owned(),
-                    label: "store.trimmed_submit".to_owned(),
-                }],
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let preparation = prepare_root_scenario_step(
-            &plan,
-            "store.submit",
-            &RootJsonSourceEvent {
-                text: Some("  Write tests  ".to_owned()),
-                key: Some("Enter".to_owned()),
-                ..RootJsonSourceEvent::default()
-            },
-            &JsonMap::new(),
-        )
-        .expect("PlanExecutor should prepare root scenario step work");
-
-        assert_eq!(preparation.source_id, SourceId(1));
-        assert_eq!(preparation.source_route_slot.path, "store.submit");
-        assert_eq!(preparation.route_ops.len(), 1);
-        assert_eq!(preparation.route_ops[0].id, PlanOpId(10));
-        assert_eq!(
-            preparation.derived_values.get(&FieldId(9)),
-            Some(&json!("Write tests"))
-        );
-        assert!(preparation.root_update_key_matches);
-        assert_eq!(
-            preparation.executor_report["executor"],
-            "cpu-plan-root-scenario-step-preparation-v1"
-        );
-        assert_eq!(
-            preparation.root_dispatch_report["materialized_work_core"]["executor"],
-            "cpu-plan-root-scenario-materialized-work-v1"
-        );
-    }
-
-    #[test]
-    fn source_derived_values_are_evaluated_by_executor() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(0),
-                    state_id: StateId(4),
-                    value_type: boon_plan::PlanValueType::Text,
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: boon_plan::InitialValueKind::Text,
-                    initial_constant_id: None,
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![boon_plan::OperationRegion {
-                id: boon_plan::PlanRegionId(1),
-                kind: RegionKind::DerivedEvaluation,
-                ops: vec![PlanOp {
-                    id: PlanOpId(10),
-                    kind: PlanOpKind::DerivedValue {
-                        derived_kind: boon_plan::PlanDerivedKind::SourceEventTransform,
-                        startup_recompute: true,
-                        expression: Some(PlanDerivedExpression::SourceKeyTextTrimNonEmpty {
-                            source_id: SourceId(2),
-                            key_field: SourcePayloadField::Key,
-                            required_key: "Enter".to_owned(),
-                            state: ValueRef::SourcePayload {
-                                source_id: SourceId(2),
-                                field: SourcePayloadField::Text,
-                            },
-                            skip_empty: true,
-                        }),
-                    },
-                    inputs: vec![
-                        ValueRef::Source(SourceId(2)),
-                        ValueRef::SourcePayload {
-                            source_id: SourceId(2),
-                            field: SourcePayloadField::Key,
-                        },
-                        ValueRef::SourcePayload {
-                            source_id: SourceId(2),
-                            field: SourcePayloadField::Text,
-                        },
-                    ],
-                    output: Some(ValueRef::Field(FieldId(9))),
-                    indexed: false,
-                    unresolved_executable_ref_count: 0,
-                }],
-            }],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 1,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 1,
-                typed_value_ref_count: 3,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:4".to_owned(),
-                    label: "store.input".to_owned(),
-                }],
-                list_slots: Vec::new(),
-                derived_values: vec![boon_plan::DebugEntry {
-                    id: "field:9".to_owned(),
-                    label: "store.title_to_add".to_owned(),
-                }],
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let root_state = JsonMap::new();
-
-        let values = evaluate_source_derived_values_for_event(
-            &plan,
-            SourceId(2),
-            &RootJsonSourceEvent {
-                text: Some("  Write tests  ".to_owned()),
-                key: Some("Enter".to_owned()),
-                ..RootJsonSourceEvent::default()
-            },
-            &root_state,
-        )
-        .expect("source-derived evaluation should stay executor-owned");
-        assert_eq!(values.get(&FieldId(9)), Some(&json!("Write tests")));
-        let delta_reports = build_source_derived_value_deltas(&plan, &values);
-        assert_eq!(delta_reports.len(), 1);
-        assert_eq!(delta_reports[0].0, "FieldSet:store.title_to_add");
-        assert_eq!(delta_reports[0].1["kind"], "FieldSet");
-        assert_eq!(delta_reports[0].1["field_path"], "store.title_to_add");
-        assert_eq!(delta_reports[0].1["value"], "Write tests");
-        assert_eq!(delta_reports[0].2["field_id"], 9);
-        assert_eq!(delta_reports[0].2["field_path"], "store.title_to_add");
-        let step_deltas = assemble_source_derived_step_deltas(&plan, &values);
-        assert_eq!(
-            step_deltas.semantic_delta_signatures,
-            vec!["FieldSet:store.title_to_add"]
-        );
-        assert_eq!(step_deltas.semantic_deltas.len(), 1);
-        assert_eq!(step_deltas.semantic_deltas[0], delta_reports[0].1.clone());
-        assert_eq!(step_deltas.reports, vec![delta_reports[0].2.clone()]);
-        assert_eq!(
-            step_deltas.executor_report["executor"],
-            "cpu-plan-source-derived-step-deltas-v1"
-        );
-        assert_eq!(step_deltas.executor_report["semantic_delta_count"], 1);
-
-        let skipped = evaluate_source_derived_values_for_event(
-            &plan,
-            SourceId(2),
-            &RootJsonSourceEvent {
-                text: Some("  Write tests  ".to_owned()),
-                key: Some("Escape".to_owned()),
-                ..RootJsonSourceEvent::default()
-            },
-            &root_state,
-        )
-        .expect("non-matching key should skip the source-derived value");
-        assert!(skipped.is_empty());
-
-        let skipped_empty = evaluate_source_derived_values_for_event(
-            &plan,
-            SourceId(2),
-            &RootJsonSourceEvent {
-                text: Some("   ".to_owned()),
-                key: Some("Enter".to_owned()),
-                ..RootJsonSourceEvent::default()
-            },
-            &root_state,
-        )
-        .expect("empty trimmed text should be skipped when skip_empty=true");
-        assert!(skipped_empty.is_empty());
-    }
-
-    #[test]
-    fn decode_expected_source_event_extracts_payload_and_reserved_fields() {
-        let expected = BTreeMap::from([
-            (
-                "source".to_owned(),
-                toml::Value::String("store.input.change".to_owned()),
-            ),
-            ("text".to_owned(), toml::Value::String("Typed".to_owned())),
-            ("key".to_owned(), toml::Value::String("Enter".to_owned())),
-            ("address".to_owned(), toml::Value::String("B2".to_owned())),
-            ("target_occurrence".to_owned(), toml::Value::Integer(3)),
-            ("target_key".to_owned(), toml::Value::Integer(42)),
-            ("target_generation".to_owned(), toml::Value::Integer(7)),
-            ("bind_epoch".to_owned(), toml::Value::Integer(9)),
-            ("source_epoch".to_owned(), toml::Value::Integer(11)),
-            (
-                "payload_name".to_owned(),
-                toml::Value::String("custom".to_owned()),
-            ),
-            (
-                "bytes_hex".to_owned(),
-                toml::Value::String("41 42 43".to_owned()),
-            ),
-            ("pointer_x".to_owned(), toml::Value::String("12".to_owned())),
-        ]);
-
-        let event = decode_expected_source_event("type-input", &expected)
-            .expect("expected_source_event should decode in executor");
-        assert_eq!(event.source, "store.input.change");
-        assert_eq!(event.text, Some("Typed"));
-        assert_eq!(event.key, Some("Enter"));
-        assert_eq!(event.address, Some("B2"));
-        assert_eq!(event.target_occurrence, Some(3));
-        assert_eq!(event.target_key, Some(42));
-        assert_eq!(event.target_generation, Some(7));
-        assert_eq!(event.bind_epoch, Some(9));
-        assert_eq!(event.source_epoch, Some(11));
-        assert_eq!(event.payload.get("payload_name"), Some(&"custom"));
-        assert_eq!(event.payload.get("pointer_x"), Some(&"12"));
-        assert_eq!(event.pointer_x, Some("12"));
-        assert_eq!(event.payload_bytes.get("bytes"), Some(&b"ABC".to_vec()));
-    }
-
-    #[test]
-    fn decode_expected_source_event_rejects_named_bytes_payloads() {
-        let expected = BTreeMap::from([
-            (
-                "source".to_owned(),
-                toml::Value::String("store.input.change".to_owned()),
-            ),
-            (
-                "image_bytes_hex".to_owned(),
-                toml::Value::String("4142".to_owned()),
-            ),
-        ]);
-
-        let error = decode_expected_source_event("named-bytes", &expected)
-            .expect_err("v1 executor should reject named BYTES source payload keys");
-        assert!(
-            error.to_string().contains("named BYTES source payload key"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn source_payload_bytes_key_policy_is_executor_owned() {
-        assert_eq!(source_payload_bytes_toml_key("bytes"), "bytes_hex");
-        assert_eq!(source_payload_bytes_toml_key("image"), "image_bytes_hex");
-        validate_source_payload_bytes_field_name("bytes")
-            .expect("reserved bytes field should be accepted");
-        let error = validate_source_payload_bytes_field_name("image")
-            .expect_err("named BYTES payload fields should be rejected in v1");
-        assert!(
-            error.to_string().contains("named BYTES source payload key"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn live_source_event_expectation_matcher_is_executor_owned() {
-        let expected = BTreeMap::from([
-            (
-                "source".to_owned(),
-                toml::Value::String("store.input.change".to_owned()),
-            ),
-            ("text".to_owned(), toml::Value::String("Typed".to_owned())),
-            ("target_occurrence".to_owned(), toml::Value::Integer(2)),
-            ("source_id".to_owned(), toml::Value::Integer(8)),
-        ]);
-        let event = PlanExecutorLiveSourceEvent {
-            source: "store.input.change",
-            text: Some("Typed"),
-            key: None,
-            list_id: None,
-            address: None,
-            target_text: None,
-            target_occurrence: Some(2),
-            target_key: None,
-            target_generation: None,
-            bind_epoch: None,
-            source_epoch: None,
-            source_id: Some(8),
-        };
-
-        assert_live_source_event_matches_expected("type-input", Some(&expected), event)
-            .expect("matching live source event should be accepted");
-
-        let error = assert_live_source_event_matches_expected(
-            "type-input",
-            Some(&expected),
-            PlanExecutorLiveSourceEvent {
-                text: Some("Wrong"),
-                ..event
-            },
-        )
-        .expect_err("field mismatch should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("observed live source field `text`"),
-            "unexpected error: {error}"
-        );
-
-        let error = assert_live_source_event_matches_expected("missing", None, event)
-            .expect_err("missing expected_source_event should be rejected");
-        assert!(
-            error.to_string().contains("without expected_source_event"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn live_source_event_expected_toml_builder_is_executor_owned() {
-        let payload = BTreeMap::from([
-            (
-                "source".to_owned(),
-                "payload-should-not-override".to_owned(),
-            ),
-            ("custom".to_owned(), "value".to_owned()),
-        ]);
-        let payload_bytes = BTreeMap::from([("bytes".to_owned(), vec![0x01, 0xfe, 0x04])]);
-
-        let expected =
-            build_live_source_event_expected_toml(PlanExecutorLiveSourceEventExpectedToml {
-                source: "store.receive",
-                text: Some("Typed"),
-                key: Some("Enter"),
-                list_id: Some("todos"),
-                address: Some("A1"),
-                payload: &payload,
-                payload_bytes: &payload_bytes,
-                pointer_x: Some("10"),
-                pointer_y: Some("20"),
-                pointer_width: Some("30"),
-                pointer_height: Some("40"),
-                target_text: Some("target"),
-                target_occurrence: Some(2),
-                target_key: Some(3),
-                target_generation: Some(4),
-                bind_epoch: Some(5),
-                source_epoch: Some(6),
-                source_id: Some(7),
-            });
-
-        assert_eq!(
-            expected.get("source").and_then(toml::Value::as_str),
-            Some("store.receive")
-        );
-        assert_eq!(
-            expected.get("custom").and_then(toml::Value::as_str),
-            Some("value")
-        );
-        assert_eq!(
-            expected.get("bytes_hex").and_then(toml::Value::as_str),
-            Some("01fe04")
-        );
-        assert_eq!(
-            expected
-                .get("target_occurrence")
-                .and_then(toml::Value::as_integer),
-            Some(2)
-        );
-        assert_eq!(
-            expected.get("source_id").and_then(toml::Value::as_integer),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn select_explicit_root_scenario_steps_requires_source_events() {
-        let steps = vec![
-            PlanExecutorScenarioStepMeta {
-                id: "initial".to_owned(),
-                has_expected_source_event: false,
-            },
-            PlanExecutorScenarioStepMeta {
-                id: "type".to_owned(),
-                has_expected_source_event: true,
-            },
-        ];
-
-        let selection =
-            select_explicit_root_scenario_steps("counter", &steps, &["type".to_owned()])
-                .expect("explicit selected source-event step should be accepted");
-        assert_eq!(selection.selected_indices, vec![1]);
-        assert_eq!(selection.selected_step_ids, vec!["type"]);
-        assert_eq!(
-            selection.executor_report["executor"],
-            "cpu-plan-explicit-root-scenario-step-selection-v1"
-        );
-
-        let error = select_explicit_root_scenario_steps("counter", &steps, &["initial".to_owned()])
-            .expect_err("assertion-only selected step should be rejected");
-        assert!(
-            error.to_string().contains("has no expected_source_event"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn select_scenario_event_steps_reports_replay_and_assertion_steps() {
-        let steps = vec![
-            PlanExecutorScenarioStepMeta {
-                id: "initial".to_owned(),
-                has_expected_source_event: false,
-            },
-            PlanExecutorScenarioStepMeta {
-                id: "type".to_owned(),
-                has_expected_source_event: true,
-            },
-            PlanExecutorScenarioStepMeta {
-                id: "assert".to_owned(),
-                has_expected_source_event: false,
-            },
-        ];
-
-        let selection = select_scenario_event_steps("counter", &steps)
-            .expect("scenario with source-event steps should be accepted");
-        assert_eq!(selection.all_indices, vec![0, 1, 2]);
-        assert_eq!(selection.selected_indices, vec![1]);
-        assert_eq!(selection.selected_step_ids, vec!["type"]);
-        assert_eq!(selection.assertion_only_step_ids, vec!["initial", "assert"]);
-        assert_eq!(
-            selection.executor_report["executor"],
-            "cpu-plan-scenario-events-step-selection-v1"
-        );
-
-        let error = select_scenario_event_steps(
-            "empty",
-            &[PlanExecutorScenarioStepMeta {
-                id: "only-assert".to_owned(),
-                has_expected_source_event: false,
-            }],
-        )
-        .expect_err("scenario without source events should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("has no expected_source_event steps"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn machine_plan_debug_label_helpers_are_executor_owned() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(0),
-                    state_id: StateId(4),
-                    value_type: boon_plan::PlanValueType::Text,
-                    scope_id: None,
-                    indexed: false,
-                    initial_value_kind: boon_plan::InitialValueKind::Text,
-                    initial_constant_id: None,
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 1,
-                list_storage_count: 0,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:4".to_owned(),
-                    label: "store.input".to_owned(),
-                }],
-                list_slots: vec![boon_plan::DebugEntry {
-                    id: "list:2".to_owned(),
-                    label: "todos".to_owned(),
-                }],
-                derived_values: vec![boon_plan::DebugEntry {
-                    id: "field:9".to_owned(),
-                    label: "store.has_todos".to_owned(),
-                }],
-                fields: vec![boon_plan::DebugEntry {
-                    id: "field:8".to_owned(),
-                    label: "todo.title".to_owned(),
-                }],
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        assert_eq!(state_label(&plan, StateId(4)), "store.input");
-        assert_eq!(state_label_by_id(&plan, 4), "store.input");
-        assert_eq!(list_label(&plan, 2), "todos");
-        assert_eq!(field_label(&plan, 8), "todo.title");
-        assert_eq!(semantic_field_label(&plan, 8), "todo.title");
-        assert_eq!(derived_field_label(&plan, 9), "store.has_todos");
-        assert_eq!(local_field_name("todo.title"), "title");
-        assert!(root_state_is_scalar(&plan, StateId(4)));
-        assert_eq!(state_label_by_id(&plan, 99), "state:99");
-    }
-
-    #[test]
-    fn semantic_delta_signature_uses_kind_and_field_path() {
-        assert_eq!(
-            semantic_delta_signature(&json!({
-                "kind": "FieldSet",
-                "field_path": "store.flag"
-            }))
-            .unwrap(),
-            "FieldSet:store.flag"
-        );
-        assert_eq!(
-            semantic_delta_signature(&json!({
-                "kind": "ListInsert",
-                "field_path": null
-            }))
-            .unwrap(),
-            "ListInsert"
-        );
-    }
-
-    #[test]
-    fn coalesce_field_set_deltas_keeps_last_write_per_target() {
-        let deltas = vec![
-            json!({
-                "kind": "FieldSet",
-                "list_id": "cells",
-                "key": 2,
-                "generation": 1,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": "value",
-                "value": "old"
-            }),
-            json!({
-                "kind": "ListInsert",
-                "list_id": "cells",
-                "key": 3,
-                "generation": 1
-            }),
-            json!({
-                "kind": "FieldSet",
-                "list_id": "cells",
-                "key": 2,
-                "generation": 1,
-                "source_id": null,
-                "bind_epoch": null,
-                "field_path": "value",
-                "value": "new"
-            }),
-        ];
-
-        let coalesced = coalesce_field_set_deltas(deltas).unwrap();
-        assert_eq!(coalesced.len(), 2);
-        assert_eq!(coalesced[0]["kind"], "ListInsert");
-        assert_eq!(coalesced[1]["value"], "new");
-    }
-
-    #[test]
-    fn indexed_update_delta_ordering_is_executor_owned() {
-        let primary_a = json!({
-            "kind": "FieldSet",
-            "field_path": "value",
-            "value": "A"
-        });
-        let derived_a = json!({
-            "kind": "FieldSet",
-            "field_path": "display_text",
-            "value": "A"
-        });
-        let primary_b = json!({
-            "kind": "FieldSet",
-            "field_path": "value",
-            "value": "B"
-        });
-        let batches = vec![
-            IndexedUpdateDeltaBatch {
-                semantic_deltas: vec![derived_a.clone(), primary_a.clone()],
-                report_rows: vec![json!({ "field_path": "value" })],
-            },
-            IndexedUpdateDeltaBatch {
-                semantic_deltas: vec![primary_b.clone()],
-                report_rows: vec![json!({ "field_path": "value" })],
-            },
-        ];
-
-        let bulk = order_indexed_update_semantic_deltas(true, &batches);
-        assert_eq!(
-            bulk.semantic_deltas,
-            vec![primary_a.clone(), primary_b.clone(), derived_a.clone()]
-        );
-        assert_eq!(
-            bulk.executor_report["executor"],
-            "cpu-plan-indexed-update-delta-ordering-v1"
-        );
-        assert_eq!(bulk.executor_report["bulk_indexed_update"], true);
-
-        let non_bulk = order_indexed_update_semantic_deltas(false, &batches);
-        assert_eq!(
-            non_bulk.semantic_deltas,
-            vec![derived_a, primary_a, primary_b]
-        );
-        assert_eq!(non_bulk.executor_report["bulk_indexed_update"], false);
-    }
-
-    #[test]
-    fn indexed_update_target_selection_is_executor_owned() {
-        let scope_id = boon_plan::ScopeId(7);
-        let output_state_id = StateId(12);
-        let source_route = SourceRoute {
-            id: boon_plan::PlanSourceRouteId(1),
-            source_id: SourceId(3),
-            path: "rows.toggle".to_owned(),
-            scoped: false,
-            scope_id: None,
-            payload_schema: boon_plan::SourcePayloadSchema {
-                fields: vec![SourcePayloadField::Text],
-                typed_fields: Vec::new(),
-                row_lookup_field: None,
-            },
-        };
-        let op = PlanOp {
-            id: PlanOpId(9),
-            kind: PlanOpKind::UpdateBranch {
-                expression_kind: PlanExpressionKind::BoolNot,
-                ordered_inputs: Vec::new(),
-                source_payload_field: None,
-                update_constant_id: None,
-                source_guard: None,
-            },
-            inputs: Vec::new(),
-            output: Some(ValueRef::State(output_state_id)),
-            indexed: true,
-            unresolved_executable_ref_count: 0,
-        };
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: vec![source_route.clone()],
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: vec![boon_plan::ScalarStorageSlot {
-                    id: boon_plan::PlanStorageId(1),
-                    state_id: output_state_id,
-                    value_type: PlanValueType::Bool,
-                    scope_id: Some(scope_id),
-                    indexed: true,
-                    initial_value_kind: InitialValueKind::Bool,
-                    initial_constant_id: None,
-                    initial_root_field_path: None,
-                    initial_row_field_path: None,
-                }],
-                list_slots: vec![boon_plan::ListStorageSlot {
-                    id: boon_plan::PlanStorageId(2),
-                    list_id: boon_plan::ListId(5),
-                    scope_id: Some(scope_id),
-                    row_field_ids: Vec::new(),
-                    capacity: None,
-                    hidden_key_type: "u64".to_owned(),
-                    has_generation: true,
-                    initializer_kind: boon_plan::ListInitializerKind::Empty,
-                    range: None,
-                    initial_rows: Vec::new(),
-                }],
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 1,
-                scalar_storage_count: 1,
-                list_storage_count: 1,
-                byte_bank_storage_count: 0,
-                operation_count: 1,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: Vec::new(),
-                list_slots: vec![boon_plan::DebugEntry {
-                    id: "list:5".to_owned(),
-                    label: "rows".to_owned(),
-                }],
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let list_rows = BTreeMap::from([(
-            5,
-            vec![
-                PlanExecutorListRow {
-                    key: 4,
-                    generation: 1,
-                    fields: BTreeMap::new(),
-                },
-                PlanExecutorListRow {
-                    key: 9,
-                    generation: 2,
-                    fields: BTreeMap::new(),
-                },
-            ],
-        )]);
-
-        let selection = select_unscoped_indexed_update_targets(
-            &plan,
-            &op,
-            &source_route,
-            &IndexedUpdateTargetEvent {
-                source: "rows.toggle".to_owned(),
-                ..IndexedUpdateTargetEvent::default()
-            },
-            &list_rows,
-        )
-        .expect("unscoped indexed update should fan out through executor-owned target selection");
-        assert!(selection.bulk_indexed_update);
-        assert_eq!(selection.list_id, Some(5));
-        assert_eq!(selection.list_label.as_deref(), Some("rows"));
-        assert_eq!(
-            selection.targets,
-            vec![
-                IndexedUpdateTargetRow {
-                    key: 4,
-                    generation: 1,
-                },
-                IndexedUpdateTargetRow {
-                    key: 9,
-                    generation: 2,
-                },
-            ]
-        );
-        assert_eq!(
-            selection.executor_report["executor"],
-            "cpu-plan-indexed-update-target-selection-v1"
-        );
-        assert_eq!(selection.executor_report["target_count"], 2);
-
-        let targeted = select_unscoped_indexed_update_targets(
-            &plan,
-            &op,
-            &source_route,
-            &IndexedUpdateTargetEvent {
-                source: "rows.toggle".to_owned(),
-                target_key: Some(4),
-                ..IndexedUpdateTargetEvent::default()
-            },
-            &list_rows,
-        )
-        .expect("already targeted events should skip bulk fanout");
-        assert!(!targeted.bulk_indexed_update);
-        assert_eq!(targeted.executor_report["skip_reason"], "event-target-key");
-
-        let wrong_list = select_unscoped_indexed_update_targets(
-            &plan,
-            &op,
-            &source_route,
-            &IndexedUpdateTargetEvent {
-                source: "rows.toggle".to_owned(),
-                list_id: Some("other_rows".to_owned()),
-                ..IndexedUpdateTargetEvent::default()
-            },
-            &list_rows,
-        )
-        .expect_err("wrong event list should be rejected by executor target selection");
-        assert!(
-            wrong_list.to_string().contains("expected `rows`"),
-            "unexpected error: {wrong_list}"
-        );
-    }
-
-    #[test]
-    fn indexed_update_conflict_guard_rejects_real_same_target_writes() {
-        let report_row = |op_id: u64, key: u64, field: &str, value: JsonValue| {
-            json!({
-                "list_id": 7,
-                "list": "items",
-                "key": key,
-                "generation": 1,
-                "field_path": field,
-                "update_op_id": op_id,
-                "value": value,
-            })
-        };
-
-        let mut touched = BTreeMap::new();
-        track_indexed_update_write_conflicts(
-            &mut touched,
-            &[
-                report_row(10, 4, "value", json!("old")),
-                report_row(11, 5, "value", json!("separate row")),
-                report_row(12, 4, "error", json!("separate field")),
-            ],
-        )
-        .expect("different indexed targets should be accepted");
-
-        let error = track_indexed_update_write_conflicts(
-            &mut touched,
-            &[report_row(14, 4, "value", json!("new"))],
-        )
-        .expect_err("different values for the same indexed target must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("conflicting indexed update branches"),
-            "unexpected error: {error}"
-        );
-
-        let mut touched = BTreeMap::new();
-        track_indexed_update_write_conflicts(
-            &mut touched,
-            &[report_row(20, 4, "value", json!("same"))],
-        )
-        .expect("first indexed write should be accepted");
-        let error = track_indexed_update_write_conflicts(
-            &mut touched,
-            &[report_row(21, 4, "value", json!("same"))],
-        )
-        .expect_err("same-value duplicate indexed target ownership must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate indexed update branches"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn indexed_update_conflict_guard_ignores_derived_semantic_deltas() {
-        let mut touched = BTreeMap::new();
-        track_indexed_update_write_conflicts(
-            &mut touched,
-            &[json!({
-                "list_id": 7,
-                "list": "cells",
-                "key": 4,
-                "generation": 1,
-                "field_path": "formula_text",
-                "update_op_id": 30,
-                "value": "=A1+A2",
-            })],
-        )
-        .expect("derived semantic-delta churn must not count as duplicate real writes");
-    }
-
-    #[test]
-    fn root_bytes_state_transition_applies_fixed_mutation_in_executor() {
-        let mut private_bytes = BTreeMap::from([(
-            2,
-            PlanExecutorBytes::from_inline(
-                sha256_bytes(&[10, 20, 30]),
-                3,
-                vec![10, 20, 30],
-                "input",
-            )
-            .expect("input bytes should be valid"),
-        )]);
-        let mut fixed_banks = BTreeMap::from([(4, vec![0, 0, 0])]);
-        let mut bytes_owner = RootBytesStateMaps::new(&mut private_bytes, &mut fixed_banks);
-        let transition = apply_root_bytes_state_transition(
-            &mut bytes_owner,
-            StateId(4),
-            None,
-            Some(RootBytesFixedMutation {
-                input_state_id: StateId(2),
-                output_state_id: StateId(4),
-                patches: vec![(1, 99)],
-            }),
-            PlanOpId(40),
-        )
-        .expect("fixed-byte mutation should be applied by PlanExecutor");
-        drop(bytes_owner);
-
-        assert_eq!(fixed_banks[&4], vec![10, 99, 30]);
-        assert!(!private_bytes.contains_key(&4));
-        assert_eq!(transition.mode, "fixed_byte_patch");
-        assert_eq!(
-            transition.executor_report["executor"],
-            "cpu-plan-root-bytes-state-transition-v1"
-        );
-        assert_eq!(transition.executor_report["mode"], "fixed_byte_patch");
-    }
-
-    #[test]
-    fn summarize_plan_lists_reports_counts_titles_and_rows() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: Vec::new(),
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 1,
-                byte_bank_storage_count: 0,
-                operation_count: 0,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: Vec::new(),
-                list_slots: vec![boon_plan::DebugEntry {
-                    id: "list:7".to_owned(),
-                    label: "todos".to_owned(),
-                }],
-                derived_values: Vec::new(),
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-        let mut active_fields = BTreeMap::new();
-        active_fields.insert("title".to_owned(), json!("Write tests"));
-        active_fields.insert("completed".to_owned(), json!(false));
-        let mut completed_fields = BTreeMap::new();
-        completed_fields.insert("title".to_owned(), json!("Compile"));
-        completed_fields.insert("completed".to_owned(), json!(true));
-        let list_state = BTreeMap::from([(
-            7,
-            vec![
-                PlanExecutorListRow {
-                    key: 1,
-                    generation: 1,
-                    fields: active_fields,
-                },
-                PlanExecutorListRow {
-                    key: 2,
-                    generation: 1,
-                    fields: completed_fields,
-                },
-            ],
-        )]);
-
-        let summary = summarize_plan_lists(&plan, &list_state);
-        assert_eq!(summary["todos"]["row_count"], 2);
-        assert_eq!(summary["todos"]["active_count"], 1);
-        assert_eq!(summary["todos"]["completed_count"], 1);
-        assert_eq!(
-            summary["todos"]["titles"],
-            json!(["Write tests", "Compile"])
-        );
-        assert_eq!(summary["todos"]["rows"][0]["key"], 1);
-    }
-
-    #[test]
-    fn root_aggregate_evaluator_counts_rows_and_reports_changed_deltas() {
-        let plan = MachinePlan {
-            version: boon_plan::PlanVersion::default(),
-            target_profile: boon_plan::TargetProfile::SoftwareDefault,
-            constants: Vec::new(),
-            source_routes: Vec::new(),
-            storage_layout: boon_plan::StorageLayout {
-                scalar_slots: Vec::new(),
-                list_slots: Vec::new(),
-                byte_banks: Vec::new(),
-            },
-            regions: vec![
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(1),
-                    kind: RegionKind::ListOperations,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(10),
-                        kind: PlanOpKind::ListOperation {
-                            operation_kind: PlanListOperationKind::Count,
-                            append: None,
-                            remove: None,
-                            retain: None,
-                            count: Some(boon_plan::PlanListCount {
-                                target: ValueRef::Field(FieldId(20)),
-                                predicate: boon_plan::PlanListRemovePredicate::RowFieldBoolNot {
-                                    input: ValueRef::State(StateId(30)),
-                                },
-                            }),
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::List(boon_plan::ListId(7))),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-                boon_plan::OperationRegion {
-                    id: boon_plan::PlanRegionId(2),
-                    kind: RegionKind::DerivedEvaluation,
-                    ops: vec![PlanOp {
-                        id: PlanOpId(11),
-                        kind: PlanOpKind::DerivedValue {
-                            derived_kind: boon_plan::PlanDerivedKind::Pure,
-                            startup_recompute: true,
-                            expression: Some(PlanDerivedExpression::NumberCompareConst {
-                                left: ValueRef::Field(FieldId(20)),
-                                op: ">".to_owned(),
-                                right: 0,
-                            }),
-                        },
-                        inputs: Vec::new(),
-                        output: Some(ValueRef::Field(FieldId(21))),
-                        indexed: false,
-                        unresolved_executable_ref_count: 0,
-                    }],
-                },
-            ],
-            dirty_plan: boon_plan::DirtyPlan {
-                dependency_edges: 0,
-                unresolved_dependency_edges: 0,
-            },
-            commit_plan: boon_plan::CommitPlan {
-                update_branch_count: 0,
-                unresolved_update_branch_count: 0,
-            },
-            delta_plan: boon_plan::DeltaPlan { deltas: Vec::new() },
-            capability_summary: boon_plan::CapabilitySummary {
-                executable: true,
-                typed_lowering_executable: true,
-                cpu_plan_executor_complete: false,
-                constant_count: 0,
-                source_route_count: 0,
-                scalar_storage_count: 0,
-                list_storage_count: 1,
-                byte_bank_storage_count: 0,
-                operation_count: 2,
-                typed_value_ref_count: 0,
-                executable_string_path_count: 0,
-                unresolved_executable_ref_count: 0,
-                unknown_plan_op_count: 0,
-                cpu_plan_executor_unsupported_op_count: 0,
-                runtime_ast_dependency_count: 0,
-                graph_rebuild_count: 0,
-                graph_clones_per_item: 0,
-            },
-            debug_map: boon_plan::DebugMap {
-                source_units: Vec::new(),
-                source_routes: Vec::new(),
-                state_slots: vec![boon_plan::DebugEntry {
-                    id: "state:30".to_owned(),
-                    label: "todo.completed".to_owned(),
-                }],
-                list_slots: vec![boon_plan::DebugEntry {
-                    id: "list:7".to_owned(),
-                    label: "todos".to_owned(),
-                }],
-                derived_values: vec![boon_plan::DebugEntry {
-                    id: "field:21".to_owned(),
-                    label: "store.has_active".to_owned(),
-                }],
-                fields: Vec::new(),
-                unresolved_executable_refs: Vec::new(),
-            },
-        };
-
-        let mut active_fields = BTreeMap::new();
-        active_fields.insert("completed".to_owned(), json!(false));
-        let mut completed_fields = BTreeMap::new();
-        completed_fields.insert("completed".to_owned(), json!(true));
-        let list_state = BTreeMap::from([(
-            7,
-            vec![
-                PlanExecutorListRow {
-                    key: 1,
-                    generation: 1,
-                    fields: active_fields,
-                },
-                PlanExecutorListRow {
-                    key: 2,
-                    generation: 1,
-                    fields: completed_fields,
-                },
-            ],
-        )]);
-
-        let values = evaluate_root_pure_number_compare_values(&plan, &list_state)
-            .expect("root aggregate evaluation should stay executor-owned");
-        assert_eq!(values.get(&21), Some(&json!(true)));
-
-        let changes = changed_root_derived_deltas(&plan, &BTreeMap::new(), &values);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0["field_path"], "store.has_active");
-        assert_eq!(changes[0].1["expression_kind"], "number_compare_const");
-    }
-}
+mod tests;

@@ -2300,7 +2300,7 @@ fn verify_runtime_production_hardening(args: &[String]) -> Result<(), Box<dyn st
         checks,
         blockers,
         json!({
-            "plan": "docs/plans/RUNTIME_PRODUCTION_AND_NATIVE_TODOMVC_PARITY_PLAN.md",
+            "plan": "docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md",
             "runtime_source": runtime_path,
             "static_scan_contract": "leak-free-owned-symbols-dense-id-action-table-columnar-storage",
             "hot_path_static_identity_forbidden": true
@@ -7442,7 +7442,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         "crates/boon_report_schema/src/lib.rs",
         "crates/xtask/Cargo.toml",
         "crates/xtask/src/main.rs",
-        "docs/plans/speedup/22-post-speedup-compiler-codegen-wasm-plan.md",
     ];
     let artifact_sha256s = artifact_paths
         .iter()
@@ -71323,7 +71322,6 @@ mod tests {
         assert!(paths.contains(&"docs/architecture/NATIVE_GPU_PIPELINE.md"));
         assert!(paths.contains(&"docs/architecture/native_gpu_handoff_manifest.json"));
         assert!(!paths.contains(&"docs/plans/GOAL_PROMPT.md"));
-        assert!(!paths.contains(&"docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md"));
     }
 
     #[test]

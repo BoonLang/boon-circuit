@@ -3,7 +3,6 @@
 **Status:** Active architecture summary
 **Updated:** 2026-07-06
 **Native GPU contract:** `docs/architecture/NATIVE_GPU_PIPELINE.md`
-**Execution ledger:** `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
 **Goal prompt:** `docs/plans/GOAL_PROMPT.md`
 
 This file is intentionally compact. Older versions mixed current architecture,
@@ -27,9 +26,7 @@ Boon source
   -> retained product surfaces
 ```
 
-There must be one semantic execution path. Verification may compare or inspect
-old concepts only as negative evidence that they are absent from the product
-path.
+There must be one semantic execution path.
 
 ## Current Authority
 
@@ -42,13 +39,12 @@ When documents conflict, use this order:
 1. Current user instruction and `AGENTS.md`.
 2. `docs/architecture/NATIVE_GPU_PIPELINE.md` for native GPU behavior.
 3. This summary for unified runtime/rendering/manufacturing direction.
-4. Focused progress ledgers and verifier schemas.
-5. Historical docs only as context, never as implementation authority.
+4. Verifier schemas.
 
 ## Non-Negotiables
 
 - Normal execution is `MachinePlan` plus `PlanExecutor`.
-- Do not recreate pre-PlanExecutor runtime shells, engine selection flags,
+- Do not recreate pre-PlanExecutor runtime shells or engine selection flags.
 - No TodoMVC-, Cells-, file-name-, example-name-, or source-text-specific
   runtime/compiler/renderer branches.
 - LIST rows are keyed memories with generations, not cloned runtime graphs.
@@ -56,7 +52,7 @@ When documents conflict, use this order:
   structures when typed IDs are available.
 - Native/browser rendering should share one retained WGPU renderer model.
 - Browser DOM is an accessibility/input bridge, not a second visual renderer.
-- App-owned WGPU readback is proof. Whole-desktop screenshots, Xvfb, browser
+- App-owned WGPU readback is proof.
 - Product latency excludes proof/readback/report writing, but proof artifacts
   must be linked to the presented frame by explicit frame evidence identity.
 - Delete obsolete paths. Do not quarantine, alias, or preserve compatibility
@@ -76,10 +72,7 @@ Required properties:
 - list lookup uses typed/indexed routes where the plan provides them;
 - demand-current fields do not run whole-grid startup work;
 - formula/list dependencies are generic runtime features, not Cells hacks;
-  comparison payloads.
-
-negative guards only after the guard has served its purpose. Product code should
-not contain fallback runtime execution.
+Product code should not contain fallback runtime execution.
 
 ## Active Rendering Shape
 

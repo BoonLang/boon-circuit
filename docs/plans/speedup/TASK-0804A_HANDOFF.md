@@ -304,7 +304,6 @@ Do not mark TASK-0804A complete until all of these are true on fresh reports:
 
 - `docs/plans/speedup/12-speedup-goal-execution-checklist.md`
   around the 2026-06-25 TASK-0804A entries.
-- `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
   around `TASK-0804A`, `TASK-0804B/C`, and the Cells layout-proof root-cause
   measurement.
 - `docs/architecture/LIST_MODEL.md`.

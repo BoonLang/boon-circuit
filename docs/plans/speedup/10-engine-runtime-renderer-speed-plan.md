@@ -9,10 +9,9 @@ roadmap. It covers Rust code in the compiler, runtime, document/layout,
 renderer, host/window, bridge/effects, driver, report, and verifier layers.
 
 This file deliberately does not propose Boon syntax changes, NovyWave Boon
-source rewrites, or user-facing API redesign. Those belong in
-`09-novywave-boon-api-and-design-speed-plan.md`. This file says how the Rust
-engine should become correct, reliable, measurable, and fast enough to support
-that source shape later.
+source rewrites, or user-facing API redesign. It says how the Rust engine
+should become correct, reliable, measurable, and fast enough to support that
+source shape later.
 
 ## Boundaries
 
@@ -51,11 +50,8 @@ Read these before changing code:
 - `docs/plans/speedup/01-inspiration.md`
 - `docs/plans/speedup/02-novel-research-ideas.md`
 - `docs/plans/speedup/03-rust-speed-libraries.md`
-- `docs/plans/speedup/04-rust-and-shader-slow-patterns.md`
 - `docs/plans/speedup/05-rust-wgpu-performance-measurement.md`
 - `docs/plans/speedup/06-human-like-scenario-testing.md`
-- `docs/plans/speedup/08-repo-code-smell-risk-inventory.md`
-- `docs/plans/speedup/09-novywave-boon-api-and-design-speed-plan.md`
 - `docs/architecture/NATIVE_GPU_PIPELINE.md`
 - `docs/architecture/BOON_RUST_BRIDGE.md`
 - `docs/architecture/BOON_DRIVER.md`

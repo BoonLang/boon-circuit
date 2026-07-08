@@ -374,4 +374,3 @@ Local docs:
 - `docs/plans/speedup/01-inspiration.md`
 - `docs/plans/speedup/02-novel-research-ideas.md`
 - `docs/plans/speedup/03-rust-speed-libraries.md`
-- `docs/plans/speedup/04-rust-and-shader-slow-patterns.md`

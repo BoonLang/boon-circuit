@@ -20,7 +20,6 @@ kept generic and fast on TodoMVC and 7GUIs Cells.
 
 ## Documents
 
-- [Architecture decisions](docs/architecture/DECISIONS.md)
 - [Runtime model](docs/architecture/RUNTIME_MODEL.md)
 - [Language semantics](docs/architecture/LANGUAGE_SEMANTICS.md)
 - [LIST and indexed memory model](docs/architecture/LIST_MODEL.md)

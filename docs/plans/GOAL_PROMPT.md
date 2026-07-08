@@ -11,8 +11,6 @@ source of truth.
   `docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md`
 - Native performance/render-graph plan:
   `docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md`
-- Compact live status:
-  `docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md`
 - Native handoff manifest:
   `docs/architecture/native_gpu_handoff_manifest.json`
 
@@ -43,7 +41,6 @@ First inspect:
 - git status and recent commits;
 - AGENTS.md;
 - docs/architecture/NATIVE_GPU_PIPELINE.md;
-- docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md;
 - docs/plans/GOAL_PROMPT.md;
 - current native/BYTES aggregate reports, using compact summaries only.
 
@@ -97,8 +94,7 @@ Clear stop condition before marking complete:
   is a fresh true blocker with code-level root cause and no hidden fallback;
 - Cells product interaction is measured with fresh native evidence and product
   UX latency is separate from proof/readback latency;
-- docs/plans/UNIFIED_RUNTIME_RENDERING_3D_PROGRESS.md and this prompt match
-  current evidence;
+- docs/plans/GOAL_PROMPT.md and current architecture docs match current evidence;
 - subagents have reviewed the completion claim before marking the goal done.
 ```
 

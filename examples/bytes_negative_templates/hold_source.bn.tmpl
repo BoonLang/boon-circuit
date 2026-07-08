@@ -1,0 +1,14 @@
+@PAYLOAD_NAME@:
+    @PAYLOAD_INITIAL@ |> HOLD @PAYLOAD_NAME@ { LATEST {} }
+
+store: [
+    trigger: SOURCE
+    @TARGET_NAME@:
+        @TARGET_INITIAL@ |> HOLD @TARGET_NAME@ {
+            LATEST {
+                store.trigger |> THEN { @UPDATE_EXPR@ }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

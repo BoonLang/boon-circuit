@@ -1,0 +1,16 @@
+payload:
+    BYTES[4] { 16uDE, 16uAD, 16uBE, 16uEF } |> HOLD payload { LATEST {} }
+
+store: [
+    write: SOURCE
+    path_state:
+        @PATH_INITIAL@ |> HOLD path_state { LATEST {} }
+    write_status:
+        TEXT { pending } |> HOLD write_status {
+            LATEST {
+                store.write |> THEN { payload |> File/write_bytes(path: store.path_state) }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { File write bytes }))

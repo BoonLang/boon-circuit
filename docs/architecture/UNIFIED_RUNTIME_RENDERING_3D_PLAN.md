@@ -48,8 +48,7 @@ When documents conflict, use this order:
 ## Non-Negotiables
 
 - Normal execution is `MachinePlan` plus `PlanExecutor`.
-- Do not recreate `LoadedRuntime`, `GenericScheduledRuntime`, engine selection
-  flags, compare-legacy product reports, or hidden fallback execution.
+- Do not recreate pre-PlanExecutor runtime shells, engine selection flags,
 - No TodoMVC-, Cells-, file-name-, example-name-, or source-text-specific
   runtime/compiler/renderer branches.
 - LIST rows are keyed memories with generations, not cloned runtime graphs.
@@ -58,7 +57,6 @@ When documents conflict, use this order:
 - Native/browser rendering should share one retained WGPU renderer model.
 - Browser DOM is an accessibility/input bridge, not a second visual renderer.
 - App-owned WGPU readback is proof. Whole-desktop screenshots, Xvfb, browser
-  screenshots, legacy Ply, and COSMIC scraping are not native GPU evidence.
 - Product latency excludes proof/readback/report writing, but proof artifacts
   must be linked to the presented frame by explicit frame evidence identity.
 - Delete obsolete paths. Do not quarantine, alias, or preserve compatibility
@@ -78,10 +76,8 @@ Required properties:
 - list lookup uses typed/indexed routes where the plan provides them;
 - demand-current fields do not run whole-grid startup work;
 - formula/list dependencies are generic runtime features, not Cells hacks;
-- scenario and preview reports prove PlanExecutor provenance without legacy
   comparison payloads.
 
-Remaining cleanup should remove ambiguity around test-only legacy names and
 negative guards only after the guard has served its purpose. Product code should
 not contain fallback runtime execution.
 
@@ -151,7 +147,6 @@ Rules:
 
 Prefer large simplifying cuts over endless local tuning:
 
-1. Remove product code and tests that keep legacy runtime concepts alive after
    PlanExecutor coverage exists.
 2. Replace fallback report fields with explicit product/recovery/proof names, or
    delete them if they only served migration.

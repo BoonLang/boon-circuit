@@ -1,0 +1,23 @@
+store: [
+    trigger: SOURCE
+    rows:
+        LIST {
+            [flag: False]
+            [flag: True]
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        edit: SOURCE
+        flag:
+            row.flag |> HOLD flag {
+                LATEST {
+                    edit.text |> THEN { edit.text }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Row initial }))

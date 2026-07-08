@@ -1,0 +1,11 @@
+store: [
+    receive: SOURCE
+    received:
+        @TARGET_INITIAL@ |> HOLD received {
+            LATEST {
+                store.receive.bytes |> THEN { store.receive.bytes }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes source payload }))

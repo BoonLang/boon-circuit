@@ -2266,7 +2266,7 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
                     path,
                     document.line,
                     document.indent + 1,
-                    "example documents must use `Document/new(root: Element/...)`, not legacy `document.children.element.kind` records",
+                    "example documents must use `Document/new(root: Element/...)`",
                 ));
             }
         }
@@ -4943,13 +4943,6 @@ FUNCTION new_waveform_segment(segment) {
         assert!(program.functions.contains(&"new_cell".to_owned()));
         assert!(program.functions.contains(&"new_sheet_column".to_owned()));
         assert!(program.functions.contains(&"cells_app".to_owned()));
-        let legacy_reader = ["For", "mula", "/reader"].concat();
-        assert!(
-            !program
-                .operators
-                .iter()
-                .any(|operator| operator == &legacy_reader)
-        );
         assert!(
             program
                 .source_ports
@@ -5239,76 +5232,6 @@ trailing_comment: BYTES[1] { 16u2A } -- comment after inline constructor
     }
 
     #[test]
-    fn widget_prefixed_symbols_do_not_create_list_memories() {
-        let source = r#"
-items:
-    LIST {}
-    |> List/map(item, new: row(item: item))
-legacy:
-    Widget/table(columns: 1, rows: 1)
-store:
-    sources:
-        noop: SOURCE
-    noop:
-        TEXT {} |> HOLD noop {
-            LATEST {}
-        }
-FUNCTION row(item) {
-    [value: item.value]
-}
-"#;
-        let program = parse_source("unknown-widget-prefix.bn", source).unwrap();
-        assert!(
-            program
-                .list_memories
-                .iter()
-                .any(|list| list.name == "items")
-        );
-        assert!(
-            !program
-                .list_memories
-                .iter()
-                .any(|list| list.name == "legacy"),
-            "Widget/table must not be a source-facing list constructor"
-        );
-    }
-
-    #[test]
-    fn list_unknown_alias_does_not_create_list_memories() {
-        let source = r#"
-items:
-    LIST {}
-    |> List/map(item, new: row(item: item))
-legacy:
-    List/spreadsheet_rows(columns: 1, rows: 1)
-store:
-    sources:
-        noop: SOURCE
-    noop:
-        TEXT {} |> HOLD noop {
-            LATEST {}
-        }
-FUNCTION row(item) {
-    [value: item.value]
-}
-"#;
-        let program = parse_source("unknown-list-table-alias.bn", source).unwrap();
-        assert!(
-            program
-                .list_memories
-                .iter()
-                .any(|list| list.name == "items")
-        );
-        assert!(
-            !program
-                .list_memories
-                .iter()
-                .any(|list| list.name == "legacy"),
-            "List/spreadsheet_rows must not be a source-facing table constructor"
-        );
-    }
-
-    #[test]
     fn unsupported_example_keyword_rejected_but_comments_strings_are_ignored() {
         let err = parse_source(
             "examples/cells.bn",
@@ -5347,23 +5270,6 @@ LIST {}
         )
         .unwrap_err();
         assert!(err.message.contains("use `--` comments"));
-    }
-
-    #[test]
-    fn rejects_legacy_link_and_accepts_piped_source_wiring() {
-        let legacy_link = "LIST {}\nbutton: LINK\nSOURCE\nHOLD\nLATEST\nList/map";
-        let err = parse_source("examples/todomvc.bn", legacy_link).unwrap_err();
-        assert!(err.message.contains("`LINK` is not supported"));
-
-        let piped_source =
-            "LIST {}\nclick: SOURCE\nvalue: TEXT { x } |> SOURCE\nHOLD\nLATEST\nList/map";
-        let program = parse_source("examples/todomvc.bn", piped_source).unwrap();
-        assert!(
-            program
-                .sources
-                .iter()
-                .any(|source| source.contains("|> SOURCE"))
-        );
     }
 
     #[test]
@@ -5657,25 +5563,6 @@ style: [
         assert!(program.expressions.iter().any(|expr| {
             matches!(&expr.kind, AstExprKind::Call { function, .. } if function == "Theme/color")
         }));
-    }
-
-    #[test]
-    fn rejects_legacy_example_document_shape() {
-        let source = r#"
-store:
-    sources: [click: SOURCE]
-value: Text/empty() |> HOLD value { LATEST {} }
-items: LIST {}
-items |> List/map(item, new: row(item: item))
-FUNCTION row(item) { [title: item.title] }
-document:
-    children:
-        element:
-            kind: Text
-            text: TEXT { bad }
-"#;
-        let err = parse_source("examples/todomvc.bn", source).unwrap_err();
-        assert!(err.message.contains("Document/new"));
     }
 
     #[test]

@@ -2028,6 +2028,7 @@ pub fn summarize_plan_lists(
     plan: &MachinePlan,
     list_state: &BTreeMap<usize, Vec<PlanExecutorListRow>>,
 ) -> JsonValue {
+    const ROW_SAMPLE_LIMIT: usize = 256;
     let mut lists = JsonMap::new();
     for (list_id, rows) in list_state {
         let list_label = list_label(plan, *list_id);
@@ -2061,7 +2062,10 @@ pub fn summarize_plan_lists(
                 "titles": titles,
                 "active_count": active_count,
                 "completed_count": completed_count,
-                "rows": rows.iter().map(|row| {
+                "row_sample_limit": ROW_SAMPLE_LIMIT,
+                "row_sample_count": rows.len().min(ROW_SAMPLE_LIMIT),
+                "rows_truncated": rows.len() > ROW_SAMPLE_LIMIT,
+                "rows": rows.iter().take(ROW_SAMPLE_LIMIT).map(|row| {
                     json!({
                         "key": row.key,
                         "generation": row.generation,
@@ -12792,9 +12796,9 @@ pub fn assemble_scenario_events_command_report(
                 "detail": "CPU PlanExecutor replayed all scenario steps carrying expected_source_event"
             },
             {
-                "id": "scenario-event-product-path-has-no-legacy-compare",
+                "id": "scenario-event-product-path-is-plan-executor-only",
                 "pass": true,
-                "detail": "Scenario-event product proof is PlanExecutor-only and does not carry legacy runtime comparison"
+                "detail": "Scenario-event product proof is PlanExecutor-only"
             },
             {
                 "id": "assertion-only-coverage-recorded",
@@ -19011,8 +19015,6 @@ mod tests {
             output.executor_report["executor"],
             "cpu-plan-root-scenario-command-output-v1"
         );
-        assert!(output.report.get("legacy_comparison").is_none());
-        assert!(output.report.get("legacy_comparison_acceptance").is_none());
     }
 
     #[test]
@@ -19075,18 +19077,10 @@ mod tests {
             output.executor_report["executor"],
             "cpu-plan-scenario-events-command-output-v1"
         );
-        assert!(output.report.get("legacy_comparison").is_none());
-        assert!(output.report.get("legacy_comparison_acceptance").is_none());
-        assert!(
-            output
-                .report
-                .pointer("/plan_executor/command_output_core/compare_legacy")
-                .is_none()
-        );
     }
 
     #[test]
-    fn scenario_events_report_without_legacy_compare_is_product_status() {
+    fn scenario_events_report_without_compare_is_product_status() {
         let output = assemble_scenario_events_command_output(ScenarioEventsCommandOutputInput {
             command_argv: vec![
                 "target/debug/boon_cli".to_owned(),
@@ -19132,16 +19126,14 @@ mod tests {
         assert!(
             output
                 .report
-                .pointer("/command_report_assembly_core/legacy_required_for_status")
+                .pointer("/command_report_assembly_core/compare_required_for_status")
                 .is_none()
         );
         assert_eq!(output.report["per_step_pass_fail"][2]["pass"], true);
         assert_eq!(
             output.report["per_step_pass_fail"][2]["id"],
-            "scenario-event-product-path-has-no-legacy-compare"
+            "scenario-event-product-path-is-plan-executor-only"
         );
-        assert!(output.report.get("legacy_comparison").is_none());
-        assert!(output.report.get("legacy_comparison_acceptance").is_none());
     }
 
     #[test]

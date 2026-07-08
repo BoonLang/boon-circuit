@@ -157,7 +157,6 @@ Each entry must define:
 Future examples fail readiness until they add a manifest entry and pass all
 generic native gates for that entry.
 
-## Retired Generic Commands
 
 The old broad example-readiness command surfaces have been deleted. Native
 readiness now flows through the manifest-backed native GPU gates in

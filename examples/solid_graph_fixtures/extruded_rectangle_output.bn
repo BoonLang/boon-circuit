@@ -1,0 +1,17 @@
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { extruded_rectangle_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { extruded_rectangle_part }
+            geometry: Solid/extrude(size: [x: 36, y: 18, z: 0], height: 12)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)

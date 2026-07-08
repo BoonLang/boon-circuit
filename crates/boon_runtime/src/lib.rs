@@ -46,10 +46,8 @@ use boon_compiler::{
     compiler_generic_derived_plan_from_ir, compiler_list_projections_from_ir,
     compiler_runtime_program_from_ir, compiler_source_route_root_text_transform_targets_from_ir,
     compiler_source_route_router_targets_from_ir, compiler_source_route_sources_from_ir,
-    compiler_storage_indexed_derived_fields_from_ir,
-    compiler_storage_indexed_row_initial_resets_from_ir, compiler_storage_initial_rows_from_ir,
-    compiler_storage_list_slots_from_ir, compiler_storage_root_slots_from_ir,
-    compiler_storage_row_templates_from_ir, compiler_typed_program_inventory_counts_from_ir,
+    compiler_storage_initial_rows_from_ir, compiler_storage_list_slots_from_ir,
+    compiler_typed_program_inventory_counts_from_ir,
     compiler_typed_program_report_metadata_from_ir, parse_project, parse_source,
 };
 #[cfg(test)]
@@ -3618,9 +3616,9 @@ pub fn run_plan_initial_state(
                 "detail": "CPU PlanExecutor initialized scalar storage from typed plan constants"
             },
             {
-                "id": "legacy-runtime-not-used",
+                "id": "plan-executor-only-runtime",
                 "pass": true,
-                "detail": "initial-state PlanExecutor path did not call legacy scenario execution"
+                "detail": "initial-state execution used the CPU PlanExecutor path"
             }
         ],
         "artifact_sha256s": [],
@@ -5554,8 +5552,19 @@ fn assert_plan_executor_scenario_checkpoint(
     step: &ScenarioStep,
 ) -> RuntimeResult<JsonValue> {
     let mut checkpoint_list_state = list_state.clone();
-    if step.expect_cell.is_some() || step.expect_error.is_some() {
-        let _ = refresh_all_indexed_derived_fields(plan, &mut checkpoint_list_state)?;
+    let mut checkpoint_address_rows = BTreeSet::new();
+    if let Some(expect) = &step.expect_cell {
+        checkpoint_address_rows.insert(expect.address.clone());
+    }
+    if let Some(expect) = &step.expect_error {
+        checkpoint_address_rows.insert(expect.address.clone());
+    }
+    if !checkpoint_address_rows.is_empty() {
+        let _ = refresh_indexed_derived_fields_for_address_rows(
+            plan,
+            &mut checkpoint_list_state,
+            &checkpoint_address_rows,
+        )?;
     }
     let list_state = plan_executor_list_state_for_materialization(&checkpoint_list_state);
     let report = assert_plan_scenario_checkpoint(
@@ -6792,6 +6801,7 @@ fn execute_indexed_update_branch(
                 &plan_list_label(plan, list_slot.list_id.0),
                 list_state,
                 row_index,
+                &output_name,
             )?
         } else {
             refresh_indexed_derived_fields_for_row_with_options(
@@ -8774,6 +8784,7 @@ fn refresh_indexed_derived_fields_after_state_change(
     changed_list_label: &str,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
     changed_row_index: usize,
+    changed_field_name: &str,
 ) -> RuntimeResult<Vec<JsonValue>> {
     let mut deltas = refresh_indexed_derived_fields_for_row_with_options(
         plan,
@@ -8796,12 +8807,22 @@ fn refresh_indexed_derived_fields_after_state_change(
     {
         return Ok(deltas);
     }
-    deltas.extend(refresh_other_indexed_derived_fields(
-        plan,
-        list_state,
-        changed_list_slot.list_id.0,
-        changed_row_index,
-    )?);
+    let refresh_other_rows =
+        indexed_field_feeds_cross_row_derived_expression(plan, changed_field_name)
+            || deltas.iter().any(|delta| {
+                delta
+                    .get("field_path")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|field| indexed_field_feeds_cross_row_derived_expression(plan, field))
+            });
+    if refresh_other_rows {
+        deltas.extend(refresh_other_indexed_derived_fields(
+            plan,
+            list_state,
+            changed_list_slot.list_id.0,
+            changed_row_index,
+        )?);
+    }
     Ok(deltas)
 }
 
@@ -9184,6 +9205,47 @@ fn refresh_all_indexed_derived_fields(
     refresh_all_indexed_derived_fields_with_options(plan, list_state, true, true)
 }
 
+fn refresh_indexed_derived_fields_for_address_rows(
+    plan: &MachinePlan,
+    list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
+    addresses: &BTreeSet<String>,
+) -> RuntimeResult<Vec<JsonValue>> {
+    let mut deltas = Vec::new();
+    for list_slot in &plan.storage_layout.list_slots {
+        let row_indices = list_state
+            .get(&list_slot.list_id.0)
+            .map(|rows| {
+                rows.iter()
+                    .enumerate()
+                    .filter_map(|(row_index, row)| {
+                        row.fields
+                            .get("address")
+                            .and_then(json_scalar_text)
+                            .filter(|address| addresses.contains(address))
+                            .map(|_| row_index)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if row_indices.is_empty() {
+            continue;
+        }
+        let list_label = plan_list_label(plan, list_slot.list_id.0);
+        for row_index in row_indices {
+            deltas.extend(refresh_indexed_derived_fields_for_row(
+                plan,
+                list_slot,
+                &list_label,
+                list_state,
+                row_index,
+                true,
+                true,
+            )?);
+        }
+    }
+    Ok(deltas)
+}
+
 fn refresh_all_indexed_derived_fields_with_options(
     plan: &MachinePlan,
     list_state: &mut BTreeMap<usize, Vec<PlanListRowState>>,
@@ -9304,6 +9366,216 @@ fn indexed_state_feeds_indexed_derived_expression(plan: &MachinePlan, state_id: 
             };
             plan_derived_expression_contains_state(expression, state_id)
         })
+}
+
+fn indexed_field_feeds_cross_row_derived_expression(plan: &MachinePlan, field_name: &str) -> bool {
+    plan.regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| region.ops.iter())
+        .any(|op| {
+            if !op.indexed {
+                return false;
+            }
+            let PlanOpKind::DerivedValue {
+                expression: Some(expression),
+                ..
+            } = &op.kind
+            else {
+                return false;
+            };
+            plan_derived_expression_cross_row_read_targets_field(plan, expression, field_name)
+        })
+}
+
+fn plan_derived_expression_cross_row_read_targets_field(
+    plan: &MachinePlan,
+    expression: &PlanDerivedExpression,
+    field_name: &str,
+) -> bool {
+    match expression {
+        PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
+            plan_row_expression_cross_row_read_targets_field(plan, default, field_name)
+                || arms.iter().any(|arm| {
+                    plan_row_expression_cross_row_read_targets_field(plan, &arm.value, field_name)
+                })
+        }
+        PlanDerivedExpression::BoolAnd { left, right } => {
+            plan_derived_expression_cross_row_read_targets_field(plan, left, field_name)
+                || plan_derived_expression_cross_row_read_targets_field(plan, right, field_name)
+        }
+        PlanDerivedExpression::BoolNotExpression { input } => {
+            plan_derived_expression_cross_row_read_targets_field(plan, input, field_name)
+        }
+        PlanDerivedExpression::RowExpression { expression } => {
+            plan_row_expression_cross_row_read_targets_field(plan, expression, field_name)
+        }
+        PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+        | PlanDerivedExpression::BoolNot { .. }
+        | PlanDerivedExpression::NumberCompareConst { .. } => false,
+    }
+}
+
+fn plan_row_expression_cross_row_read_targets_field(
+    plan: &MachinePlan,
+    expression: &PlanRowExpression,
+    field_name: &str,
+) -> bool {
+    match expression {
+        PlanRowExpression::ListGetField { field, index, .. } => {
+            local_field_name(&plan_semantic_field_label(plan, field.0)) == field_name
+                || plan_row_expression_cross_row_read_targets_field(plan, index, field_name)
+        }
+        PlanRowExpression::ListFindValue {
+            target,
+            value,
+            fallback,
+            ..
+        } => {
+            local_field_name(&plan_semantic_field_label(plan, target.0)) == field_name
+                || plan_row_expression_cross_row_read_targets_field(plan, value, field_name)
+                || fallback.as_ref().is_some_and(|fallback| {
+                    plan_row_expression_cross_row_read_targets_field(plan, fallback, field_name)
+                })
+        }
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextIsEmpty { input }
+        | PlanRowExpression::TextLength { input }
+        | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::TextToBytes { input, .. }
+        | PlanRowExpression::BytesToText { input, .. }
+        | PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input }
+        | PlanRowExpression::BytesIsEmpty { input }
+        | PlanRowExpression::BytesLength { input }
+        | PlanRowExpression::BytesZeros { byte_count: input }
+        | PlanRowExpression::ListSum { input }
+        | PlanRowExpression::ObjectField { object: input, .. } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+        }
+        PlanRowExpression::TextStartsWith { input, prefix }
+        | PlanRowExpression::BytesStartsWith { input, prefix } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, prefix, field_name)
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, suffix, field_name)
+        }
+        PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        }
+        | PlanRowExpression::BytesSlice {
+            input,
+            offset: start,
+            byte_count: length,
+        } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, start, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, length, field_name)
+        }
+        PlanRowExpression::BytesGet { input, index }
+        | PlanRowExpression::BytesFind {
+            input,
+            needle: index,
+        } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, index, field_name)
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, index, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, value, field_name)
+        }
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, byte_count, field_name)
+        }
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, offset, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, byte_count, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, endian, field_name)
+        }
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, offset, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, byte_count, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, endian, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, value, field_name)
+        }
+        PlanRowExpression::BytesConcat { left, right }
+        | PlanRowExpression::BytesEqual { left, right }
+        | PlanRowExpression::NumberInfix { left, right, .. } => {
+            plan_row_expression_cross_row_read_targets_field(plan, left, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, right, field_name)
+        }
+        PlanRowExpression::TextConcat { parts }
+        | PlanRowExpression::ListLiteral { items: parts } => parts
+            .iter()
+            .any(|part| plan_row_expression_cross_row_read_targets_field(plan, part, field_name)),
+        PlanRowExpression::ListRange { from, to } => {
+            plan_row_expression_cross_row_read_targets_field(plan, from, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, to, field_name)
+        }
+        PlanRowExpression::ListMap { input, value, .. } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || plan_row_expression_cross_row_read_targets_field(plan, value, field_name)
+        }
+        PlanRowExpression::Object { fields } => fields.iter().any(|field| {
+            plan_row_expression_cross_row_read_targets_field(plan, &field.value, field_name)
+        }),
+        PlanRowExpression::BuiltinCall { input, args, .. } => {
+            input.as_ref().is_some_and(|input| {
+                plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+            }) || args.iter().any(|arg| {
+                plan_row_expression_cross_row_read_targets_field(plan, &arg.value, field_name)
+            })
+        }
+        PlanRowExpression::Select { input, arms } => {
+            plan_row_expression_cross_row_read_targets_field(plan, input, field_name)
+                || arms.iter().any(|arm| {
+                    plan_row_expression_cross_row_read_targets_field(plan, &arm.value, field_name)
+                })
+        }
+        PlanRowExpression::Field { .. }
+        | PlanRowExpression::Constant { .. }
+        | PlanRowExpression::ListRef { .. }
+        | PlanRowExpression::ListMapItem { .. } => false,
+    }
 }
 
 fn plan_derived_expression_contains_state(
@@ -12907,7 +13179,6 @@ impl RuntimeStorageInitializationPlan {
             let row_scope = compiler_slot.row_scope.clone();
             let row_template_plan =
                 RuntimeStorageRowTemplate::from_compiler(compiler_template.clone())?;
-            let row_template = row_template_plan.to_runtime_template();
             let derived_fields = indexed_derived_fields_by_list
                 .get(compiler_slot.name.as_str())
                 .ok_or_else(|| {
@@ -12942,7 +13213,7 @@ impl RuntimeStorageInitializationPlan {
                         .iter()
                         .map(|row| {
                             let initial_fields = list_initial_fields_from_compiler(row)?;
-                            let mut row = row_template.materialize(initial_fields)?;
+                            let mut row = row_template_plan.materialize(initial_fields)?;
                             initialize_indexed_derived_base_fields_from_compiler(
                                 derived_fields,
                                 &mut row,
@@ -12970,8 +13241,8 @@ impl RuntimeStorageInitializationPlan {
                         initial_fields
                             .insert_value("index".to_owned(), FieldValue::Text(text.clone()));
                         initial_fields.insert_value("value".to_owned(), FieldValue::Text(text));
-                        row_template.fill_missing_row_initial_fields(&mut initial_fields);
-                        let mut row = row_template.materialize(initial_fields)?;
+                        row_template_plan.fill_missing_row_initial_fields(&mut initial_fields);
+                        let mut row = row_template_plan.materialize(initial_fields)?;
                         initialize_indexed_derived_base_fields_from_compiler(
                             derived_fields,
                             &mut row,
@@ -13043,24 +13314,6 @@ impl RuntimeStorageInitializationPlan {
         })
     }
 
-    fn instantiate_storage(&self) -> RuntimeResult<GenericCircuitRuntime> {
-        let mut runtime = GenericCircuitRuntime::default();
-        for slot in &self.root_slots {
-            runtime
-                .root
-                .insert_value(slot.path.clone(), slot.initial_value.clone());
-        }
-        for slot in &self.list_slots {
-            runtime.lists.insert(
-                slot.id,
-                slot.name.clone(),
-                ListMemory::from_values(slot.initial_rows.clone()),
-                slot.capacity,
-                slot.row_template.to_runtime_template(),
-            );
-        }
-        Ok(runtime)
-    }
 }
 
 impl RuntimeStorageRootSlot {
@@ -13144,34 +13397,71 @@ impl RuntimeStorageRowTemplate {
         })
     }
 
-    fn from_runtime_template(template: &RuntimeRowSnapshotTemplate) -> RuntimeResult<Self> {
-        Ok(Self {
-            fields: template
-                .fields
-                .iter()
-                .map(|field| {
-                    Ok(RuntimeStorageRowFieldTemplate {
-                        field_name: field.field_name.to_string(),
-                        initial_value: field.initial_value.clone(),
-                        missing_row_initial_value: field.missing_row_initial_value.clone(),
-                    })
-                })
-                .collect::<RuntimeResult<Vec<_>>>()?,
+    fn materialize(&self, mut initial_fields: ValueColumns) -> RuntimeResult<RuntimeRowSnapshot> {
+        for field in &self.fields {
+            let field_id = FieldSlotId::from_path(&field.field_name);
+            if initial_fields.contains_key_id(field_id) {
+                if let Some(value) = initial_fields.owned_value(&field.field_name) {
+                    initial_fields.insert_value(base_row_field_name(&field.field_name), value);
+                }
+                continue;
+            }
+            let value = field
+                .initial_value
+                .to_field_value(&initial_fields)
+                .or_else(|error| field.missing_row_initial_value.clone().ok_or(error))?;
+            initial_fields.insert_value(field.field_name.clone(), value);
+        }
+        self.restore_row_initial_fields_from_base(&mut initial_fields)?;
+        Ok(RuntimeRowSnapshot {
+            columns: initial_fields,
         })
     }
 
-    fn to_runtime_template(&self) -> RuntimeRowSnapshotTemplate {
-        RuntimeRowSnapshotTemplate {
-            fields: self
-                .fields
-                .iter()
-                .map(|field| RuntimeRowSnapshotFieldTemplate {
-                    field_name: field.field_name.clone().into_boxed_str(),
-                    field_id: FieldSlotId::from_path(&field.field_name),
-                    initial_value: field.initial_value.clone(),
-                    missing_row_initial_value: field.missing_row_initial_value.clone(),
-                })
-                .collect(),
+    fn restore_row_initial_fields_from_base(
+        &self,
+        fields: &mut ValueColumns,
+    ) -> RuntimeResult<()> {
+        for field in &self.fields {
+            let RuntimeInitialValue::RowInitialField { path } = &field.initial_value else {
+                continue;
+            };
+            let current = fields.owned_value(&field.field_name);
+            if current
+                .as_ref()
+                .is_some_and(|value| !field_value_is_empty_text(value))
+            {
+                continue;
+            }
+            let Some(value) = row_initial_field_value(fields, path, &field.field_name) else {
+                continue;
+            };
+            if field_value_is_empty_text(&value) {
+                continue;
+            }
+            let field_id = FieldSlotId::from_path(&field.field_name);
+            if fields.contains_key_id(field_id) {
+                fields.set_value(&field.field_name, value)?;
+            } else {
+                fields.insert_value(field.field_name.clone(), value);
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_missing_row_initial_fields(&self, initial_fields: &mut ValueColumns) {
+        for field in &self.fields {
+            let RuntimeInitialValue::RowInitialField { path } = &field.initial_value else {
+                continue;
+            };
+            let field_id = FieldSlotId::from_path(path);
+            if !initial_fields.contains_key_id(field_id) {
+                let value = field
+                    .missing_row_initial_value
+                    .clone()
+                    .unwrap_or_else(|| FieldValue::Text(String::new()));
+                initial_fields.insert_value(path.clone(), value);
+            }
         }
     }
 }
@@ -16954,7 +17244,7 @@ impl RuntimeListAppendFieldValue {
                 value: artifact_string_field(object, "value", context)?,
             }),
             "typed_const" => Err(format!(
-                "{context}.kind `typed_const` cannot be replayed from legacy runtime artifacts yet"
+                "{context}.kind `typed_const` cannot be replayed from storage artifacts yet"
             )
             .into()),
             other => Err(format!("{context}.kind has unsupported value `{other}`").into()),
@@ -22988,221 +23278,6 @@ fn field_slot_collision_diagnostics_from_names(
         .collect()
 }
 
-#[derive(Clone, Debug, Default)]
-struct RuntimeRowSnapshotTemplate {
-    fields: Vec<RuntimeRowSnapshotFieldTemplate>,
-}
-
-#[derive(Clone, Debug)]
-struct RuntimeRowSnapshotFieldTemplate {
-    field_name: Box<str>,
-    field_id: FieldSlotId,
-    initial_value: RuntimeInitialValue,
-    missing_row_initial_value: Option<FieldValue>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct GenericCircuitRuntime {
-    root: ValueColumns,
-    lists: RuntimeListStore,
-    sources: SourceStore,
-}
-
-#[derive(Clone, Debug, Default)]
-struct RuntimeListStore {
-    list_slots: Vec<RuntimeListSlot>,
-}
-
-#[derive(Clone, Debug)]
-struct RuntimeListSlot {
-    list_id: ListSlotId,
-    name: String,
-    memory: ListMemory,
-    capacity: Option<usize>,
-    row_template: RuntimeRowSnapshotTemplate,
-    root_identity_epoch: u64,
-    root_source_identities: Vec<Option<RootListViewFieldSourceIdentity>>,
-    spare_rows: Vec<RuntimeRowSnapshot>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ListSlotId(ListId);
-
-impl ListSlotId {
-    fn from_ir(id: ListId) -> Self {
-        Self(id)
-    }
-}
-
-impl RuntimeListStore {
-    fn insert(
-        &mut self,
-        id: ListId,
-        name: String,
-        memory: ListMemory,
-        capacity: Option<usize>,
-        row_template: RuntimeRowSnapshotTemplate,
-    ) {
-        if let Some(slot) = self.slot_mut(&name) {
-            slot.memory = memory;
-            slot.capacity = capacity;
-            slot.row_template = row_template;
-            slot.root_identity_epoch = slot.root_identity_epoch.wrapping_add(1);
-            slot.root_source_identities.clear();
-            slot.spare_rows.clear();
-            return;
-        }
-        let list_id = ListSlotId::from_ir(id);
-        let index = self.list_slot_index(list_id).unwrap_or_else(|index| index);
-        self.list_slots.insert(
-            index,
-            RuntimeListSlot {
-                list_id,
-                name,
-                memory,
-                capacity,
-                row_template,
-                root_identity_epoch: 0,
-                root_source_identities: Vec::new(),
-                spare_rows: Vec::new(),
-            },
-        );
-    }
-
-    fn memory(&self, name: &str) -> Option<&ListMemory> {
-        Some(&self.slot(name)?.memory)
-    }
-
-    fn memory_mut(&mut self, name: &str) -> Option<&mut ListMemory> {
-        Some(&mut self.slot_mut(name)?.memory)
-    }
-
-    fn replace_memory(&mut self, name: &str, memory: ListMemory) -> RuntimeResult<()> {
-        let slot = self.slot_mut_required(name)?;
-        slot.memory = memory;
-        slot.root_identity_epoch = slot.root_identity_epoch.wrapping_add(1);
-        slot.root_source_identities.clear();
-        slot.spare_rows.clear();
-        Ok(())
-    }
-
-    fn replace_or_patch_memory_with_root_source_identities(
-        &mut self,
-        name: &str,
-        rows: Vec<RuntimeRowSnapshot>,
-        source_identities: Vec<Option<RootListViewFieldSourceIdentity>>,
-    ) -> RuntimeResult<bool> {
-        let slot = self.slot_mut_required(name)?;
-        let can_patch = !source_identities.is_empty()
-            && source_identities.iter().all(Option::is_some)
-            && source_identities.len() == rows.len()
-            && slot.root_source_identities == source_identities;
-        if !can_patch {
-            slot.memory = ListMemory::from_values(rows);
-            slot.root_identity_epoch = slot.root_identity_epoch.wrapping_add(1);
-            slot.root_source_identities = source_identities;
-            slot.spare_rows.clear();
-            return Ok(false);
-        }
-        slot.memory.replace_visible_rows_in_place(rows)?;
-        Ok(true)
-    }
-
-    fn root_source_identities_match(
-        &self,
-        name: &str,
-        source_identities: &[Option<RootListViewFieldSourceIdentity>],
-    ) -> RuntimeResult<bool> {
-        let slot = self.slot_required(name)?;
-        Ok(!source_identities.is_empty()
-            && source_identities.iter().all(Option::is_some)
-            && source_identities.len() == slot.memory.len()
-            && slot.root_source_identities == source_identities)
-    }
-
-    fn root_source_identities_changed(
-        &self,
-        name: &str,
-        source_identities: &[Option<RootListViewFieldSourceIdentity>],
-    ) -> RuntimeResult<bool> {
-        let slot = self.slot_required(name)?;
-        Ok(slot.root_source_identities != source_identities)
-    }
-
-    fn root_source_identity(
-        &self,
-        name: &str,
-        index: usize,
-    ) -> RuntimeResult<Option<&RootListViewFieldSourceIdentity>> {
-        let slot = self.slot_required(name)?;
-        Ok(slot
-            .root_source_identities
-            .get(index)
-            .and_then(Option::as_ref))
-    }
-
-    fn root_identity_epoch(&self, name: &str) -> RuntimeResult<u64> {
-        Ok(self.slot_required(name)?.root_identity_epoch)
-    }
-
-    fn capacity(&self, name: &str) -> Option<usize> {
-        self.slot(name).and_then(|slot| slot.capacity)
-    }
-
-    fn row_template(&self, name: &str) -> Option<&RuntimeRowSnapshotTemplate> {
-        Some(&self.slot(name)?.row_template)
-    }
-
-    fn spare_len(&self, name: &str) -> usize {
-        self.slot(name)
-            .map(|slot| slot.spare_rows.len())
-            .unwrap_or_default()
-    }
-
-    fn spare_rows_mut(&mut self, name: &str) -> Option<&mut Vec<RuntimeRowSnapshot>> {
-        Some(&mut self.slot_mut(name)?.spare_rows)
-    }
-
-    fn push_spare(&mut self, name: &str, row: RuntimeRowSnapshot) -> RuntimeResult<()> {
-        self.spare_rows_mut_required(name)?.push(row);
-        Ok(())
-    }
-
-    fn pop_spare(&mut self, name: &str) -> Option<RuntimeRowSnapshot> {
-        self.slot_mut(name)?.spare_rows.pop()
-    }
-
-    fn slot(&self, name: &str) -> Option<&RuntimeListSlot> {
-        self.list_slots.iter().find(|slot| slot.name == name)
-    }
-
-    fn slot_mut(&mut self, name: &str) -> Option<&mut RuntimeListSlot> {
-        self.list_slots.iter_mut().find(|slot| slot.name == name)
-    }
-
-    fn slot_required(&self, name: &str) -> RuntimeResult<&RuntimeListSlot> {
-        self.slot(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`").into())
-    }
-
-    fn slot_mut_required(&mut self, name: &str) -> RuntimeResult<&mut RuntimeListSlot> {
-        self.slot_mut(name)
-            .ok_or_else(|| format!("generic runtime has no list `{name}`").into())
-    }
-
-    fn spare_rows_mut_required(
-        &mut self,
-        name: &str,
-    ) -> RuntimeResult<&mut Vec<RuntimeRowSnapshot>> {
-        Ok(&mut self.slot_mut_required(name)?.spare_rows)
-    }
-
-    fn list_slot_index(&self, list_id: ListSlotId) -> Result<usize, usize> {
-        self.list_slots
-            .binary_search_by(|slot| slot.list_id.cmp(&list_id))
-    }
-}
-
 #[derive(Clone, Debug)]
 struct SourceRouteExecutionStats {
     route_id: usize,
@@ -24010,2253 +24085,6 @@ fn text_pattern_pathlike_token(token: &str) -> bool {
     token
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '~')
-}
-
-impl GenericCircuitRuntime {
-    #[cfg(test)]
-    fn new(ir: &TypedProgram) -> RuntimeResult<Self> {
-        RuntimeStorageInitializationPlan::from_ir(
-            compiler_storage_root_slots_from_ir(ir),
-            compiler_storage_indexed_row_initial_resets_from_ir(ir),
-            compiler_storage_list_slots_from_ir(ir),
-            compiler_storage_row_templates_from_ir(ir),
-            compiler_storage_initial_rows_from_ir(ir),
-            compiler_storage_indexed_derived_fields_from_ir(ir),
-        )?
-        .instantiate_storage()
-    }
-
-    fn list_memory(&self, list: &str) -> RuntimeResult<&ListMemory> {
-        self.lists
-            .memory(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
-    }
-
-    fn list_memory_mut(&mut self, list: &str) -> RuntimeResult<&mut ListMemory> {
-        self.lists
-            .memory_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`").into())
-    }
-
-    fn root_textlike(&self, path: &str) -> RuntimeResult<String> {
-        self.root
-            .textlike(path)
-            .map(str::to_owned)
-            .or_else(|| {
-                self.root
-                    .owned_value(path)
-                    .and_then(|value| json_scalar_text(&field_value_json(value)))
-            })
-            .ok_or_else(|| {
-                format!("generic runtime root value `{path}` is missing or non-text").into()
-            })
-    }
-
-    fn root_textlike_ref(&self, path: &str) -> RuntimeResult<&str> {
-        self.root.textlike(path).ok_or_else(|| {
-            format!("generic runtime root value `{path}` is missing or non-text").into()
-        })
-    }
-
-    fn root_bytes(&self, path: &str) -> RuntimeResult<RuntimeBytes> {
-        match self.root.owned_value(path) {
-            Some(FieldValue::Bytes(value)) => Ok(value),
-            Some(_) => Err(format!("generic runtime root value `{path}` is not BYTES").into()),
-            None => Err(format!("generic runtime root value `{path}` is missing").into()),
-        }
-    }
-
-    fn set_root_textlike(&mut self, path: &str, value: &str) -> RuntimeResult<()> {
-        self.root.set_textlike(path, value)
-    }
-
-    fn set_root_number(&mut self, path: &str, value: i64) {
-        self.root
-            .insert_value(path.to_owned(), FieldValue::Json(json!(value)));
-    }
-
-    fn set_root_null(&mut self, path: &str) {
-        self.root
-            .insert_value(path.to_owned(), FieldValue::Json(JsonValue::Null));
-    }
-
-    fn set_root_bytes(&mut self, path: &str, value: RuntimeBytes) {
-        self.root
-            .insert_value(path.to_owned(), FieldValue::Bytes(value));
-    }
-
-    fn root_bool_opt(&self, path: &str) -> Option<bool> {
-        self.root.bool_value(path)
-    }
-
-    fn root_bool(&self, path: &str) -> RuntimeResult<bool> {
-        self.root.bool_value(path).ok_or_else(|| {
-            format!("generic runtime root value `{path}` is missing or non-bool").into()
-        })
-    }
-
-    fn set_root_bool(&mut self, path: &str, value: bool) -> RuntimeResult<()> {
-        self.root.set_bool(path, value)
-    }
-
-    fn apply_root_text_source<'a>(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        target: &str,
-        source: &str,
-        payload_key: Option<&'a str>,
-        payload_text: Option<&'a str>,
-        payload_address: Option<&'a str>,
-        payload_pointer_x: Option<&'a str>,
-        payload_pointer_y: Option<&'a str>,
-        payload_pointer_width: Option<&'a str>,
-        payload_pointer_height: Option<&'a str>,
-        seq: TickSeq,
-    ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        let empty_payload = BTreeMap::new();
-        let read_textlike = |path: &str| self.root_textlike(path).ok();
-        let value = if let Some(value) = equations.eval_list_find_text(
-            target,
-            source,
-            read_textlike,
-            |list, field, expected, value_field, fallback| {
-                self.list_find_value_text(list, field, expected, value_field, fallback)
-            },
-        )? {
-            Some(value)
-        } else {
-            equations.eval_text(
-                target,
-                source,
-                payload_key,
-                payload_text,
-                payload_address,
-                &empty_payload,
-                payload_pointer_x,
-                payload_pointer_y,
-                payload_pointer_width,
-                payload_pointer_height,
-                read_textlike,
-                |path| self.root_bytes(path).ok(),
-            )?
-        };
-        let Some(value) = value else {
-            if equations.has_root_text_branch(target, source) {
-                return Ok(None);
-            }
-            return Err(format!(
-                "no supported scalar update branch for `{target}` from `{source}`"
-            )
-            .into());
-        };
-        let Some(candidate) = then_value(EventPulse::present(seq), value) else {
-            return Ok(None);
-        };
-        self.commit_root_text_candidate(target, candidate)
-    }
-
-    fn apply_root_bool_source(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        target: &str,
-        source: &str,
-        seq: TickSeq,
-    ) -> RuntimeResult<Option<GenericRootBoolCommit>> {
-        let Some(value) = equations.eval_bool_with_context(
-            target,
-            source,
-            None,
-            None,
-            None,
-            |path| self.root_bool(path).ok(),
-            |path| self.root_textlike(path).ok(),
-            |path| self.root_bytes(path).ok(),
-        )?
-        else {
-            return Err(format!(
-                "no supported bool scalar update branch for `{target}` from `{source}`"
-            )
-            .into());
-        };
-        let Some(candidate) = then_value(EventPulse::present(seq), value) else {
-            return Ok(None);
-        };
-        let Some(value) = latest_value(target, &[candidate])? else {
-            return Ok(None);
-        };
-        if self.root_bool_opt(target) == Some(value) {
-            return Ok(None);
-        }
-        self.set_root_bool(target, value)?;
-        Ok(Some(GenericRootBoolCommit {
-            target: target.to_owned(),
-            value,
-        }))
-    }
-
-    fn apply_root_bytes_source(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        target: &str,
-        source: &str,
-        payload_bytes: &BTreeMap<String, Vec<u8>>,
-        seq: TickSeq,
-    ) -> RuntimeResult<Option<GenericRootBytesCommit>> {
-        let Some(value) = equations.eval_bytes(
-            target,
-            source,
-            payload_bytes,
-            |path| self.root_textlike(path).ok(),
-            |path| self.root_bytes(path).ok(),
-        )?
-        else {
-            return Ok(None);
-        };
-        let Some(candidate) = then_value(EventPulse::present(seq), value) else {
-            return Ok(None);
-        };
-        let Some(value) = latest_value(target, &[candidate])? else {
-            return Ok(None);
-        };
-        if self.root.owned_value(target) == Some(FieldValue::Bytes(value.clone())) {
-            return Ok(None);
-        }
-        self.set_root_bytes(target, value.clone());
-        Ok(Some(GenericRootBytesCommit {
-            target: target.to_owned(),
-            value,
-        }))
-    }
-
-    fn apply_root_text_action_source<'a>(
-        &mut self,
-        routes: &SourceRoutePlan,
-        equations: &ScalarEquationPlan,
-        source: &str,
-        source_id: SourceId,
-        payload_key: Option<&'a str>,
-        payload_text: Option<&'a str>,
-        payload_address: Option<&'a str>,
-        payload_pointer_x: Option<&'a str>,
-        payload_pointer_y: Option<&'a str>,
-        payload_pointer_width: Option<&'a str>,
-        payload_pointer_height: Option<&'a str>,
-        seq: TickSeq,
-    ) -> RuntimeResult<Option<GenericRootTextCommit<'a>>> {
-        let Some(target) = routes.single_root_scalar_target_for_source_id(source_id)? else {
-            return Ok(None);
-        };
-        let Some(value) = self.apply_root_text_source(
-            equations,
-            target,
-            source,
-            payload_key,
-            payload_text,
-            payload_address,
-            payload_pointer_x,
-            payload_pointer_y,
-            payload_pointer_width,
-            payload_pointer_height,
-            seq,
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(GenericRootTextCommit {
-            target: target.to_owned(),
-            value,
-        }))
-    }
-
-    fn eval_derived_text_transform<'a>(
-        &self,
-        equations: &DerivedEquationPlan,
-        target: &str,
-        source: &str,
-        key: Option<&'a str>,
-        text: Option<&'a str>,
-        address: Option<&'a str>,
-    ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        equations.eval_text_transform(
-            target,
-            source,
-            key,
-            text,
-            address,
-            &BTreeMap::new(),
-            |path| self.root_textlike(path).ok(),
-            |list, field, expected, value_field, fallback| {
-                self.list_find_value_text(list, field, expected, value_field, fallback)
-            },
-        )
-    }
-
-    fn commit_root_text_candidate<'a>(
-        &mut self,
-        target: &str,
-        candidate: LatestCandidate<Cow<'a, str>>,
-    ) -> RuntimeResult<Option<Cow<'a, str>>> {
-        let Some(value) = latest_value(target, &[candidate])? else {
-            return Ok(None);
-        };
-        if self.root.textlike(target) == Some(value.as_ref()) {
-            return Ok(None);
-        }
-        self.set_root_textlike(target, &value)?;
-        Ok(Some(value))
-    }
-
-    fn reserve_root_textlike(&mut self, path: &str, additional: usize) -> RuntimeResult<()> {
-        self.root.reserve_textlike(path, additional)
-    }
-
-    fn reserve_list(&mut self, list: &str, additional: usize) -> RuntimeResult<()> {
-        self.list_memory_mut(list)?.reserve(additional);
-        Ok(())
-    }
-
-    fn reserve_source_bindings(&mut self, additional: usize) {
-        self.sources.reserve(additional);
-    }
-
-    fn reserve_source_rows(&mut self, row_count: usize) {
-        self.sources.reserve_rows(row_count);
-    }
-
-    fn bind_row_sources(
-        &mut self,
-        list: &str,
-        key: u64,
-        generation: u64,
-        source_paths: &[String],
-    ) -> RuntimeResult<()> {
-        self.sources.bind_row(list, key, generation, source_paths)
-    }
-
-    fn unbind_row_sources(&mut self, list: &str, key: u64, generation: u64) {
-        self.sources.unbind_row(list, key, generation);
-    }
-
-    fn is_row_source_bound(
-        &self,
-        list: &str,
-        key: u64,
-        generation: u64,
-        source_path: &str,
-        source_id: Option<u64>,
-        bind_epoch: Option<u64>,
-    ) -> bool {
-        self.sources
-            .is_bound(list, key, generation, source_path, source_id, bind_epoch)
-    }
-
-    fn row_source_binding_resolution_report(
-        &self,
-        list: &str,
-        key: u64,
-        generation: u64,
-        source_path: &str,
-        source_id: Option<u64>,
-        bind_epoch: Option<u64>,
-    ) -> JsonValue {
-        self.sources.binding_resolution_report(
-            list,
-            key,
-            generation,
-            source_path,
-            source_id,
-            bind_epoch,
-        )
-    }
-
-    fn row_source_bindings(
-        &self,
-        list: &str,
-        key: u64,
-        generation: u64,
-    ) -> impl Iterator<Item = &SourceBinding> {
-        self.sources.row_bindings(list, key, generation)
-    }
-
-    #[cfg(test)]
-    fn row_source_binding_count(&self, list: &str, key: u64, generation: u64) -> usize {
-        self.sources.row_binding_count(list, key, generation)
-    }
-
-    fn source_binding_count(&self) -> usize {
-        self.sources.len()
-    }
-
-    fn list_rows_json(
-        &self,
-        list: &str,
-        fields: &[&str],
-    ) -> RuntimeResult<Vec<serde_json::Map<String, JsonValue>>> {
-        let rows = self.list_memory(list)?;
-        let mut values = Vec::with_capacity(rows.len());
-        for index in 0..rows.len() {
-            let mut row = serde_json::Map::new();
-            for field in fields {
-                let value = self.list_row_field(list, index, field)?;
-                row.insert((*field).to_owned(), value.as_json());
-            }
-            values.push(row);
-        }
-        Ok(values)
-    }
-
-    #[cfg(test)]
-    fn list_row_fields_json(
-        &self,
-        list: &str,
-        index: usize,
-        fields: &[&str],
-    ) -> RuntimeResult<serde_json::Map<String, JsonValue>> {
-        let mut row = serde_json::Map::new();
-        for field in fields {
-            let value = self.list_row_field(list, index, field)?;
-            row.insert((*field).to_owned(), value.as_json());
-        }
-        Ok(row)
-    }
-
-    fn semantic_source_delta<'a>(
-        kind: &'static str,
-        binding: &SourceBinding,
-        value: ProtocolValue<'a>,
-    ) -> SemanticDelta<'a> {
-        SemanticDelta {
-            kind,
-            list_id: Some(Cow::Owned(binding.list_id.clone())),
-            key: Some(binding.key),
-            generation: Some(binding.generation),
-            source_id: Some(binding.source_id),
-            bind_epoch: Some(binding.bind_epoch),
-            field_path: Some(Cow::Owned(binding.source_path.clone())),
-            value,
-        }
-    }
-
-    fn reserve_list_row_textlike_fields(
-        &mut self,
-        list: &str,
-        field: &str,
-        additional_by_row: impl Fn(usize, &str) -> usize,
-    ) -> RuntimeResult<()> {
-        let rows = self.list_memory_mut(list)?;
-        for index in 0..rows.len() {
-            let current = rows
-                .textlike(index, field)
-                .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like"))?;
-            let additional = additional_by_row(index, current);
-            rows.reserve_textlike(index, field, additional)?;
-        }
-        Ok(())
-    }
-
-    fn copy_list_row_textlike_field(
-        &mut self,
-        list: &str,
-        index: usize,
-        source_field: &str,
-        target_field: &str,
-    ) -> RuntimeResult<()> {
-        if source_field == target_field {
-            return Ok(());
-        }
-        self.list_memory_mut(list)?
-            .copy_textlike(index, source_field, target_field)
-            .map_err(|_| {
-                format!("generic list `{list}` field `{target_field}` is not text-like").into()
-            })
-    }
-
-    fn list_row_textlike(&self, list: &str, index: usize, field: &str) -> RuntimeResult<&str> {
-        self.list_memory(list)?
-            .textlike(index, field)
-            .ok_or_else(|| format!("generic list `{list}` field `{field}` is not text-like").into())
-    }
-
-    fn list_find_value_text(
-        &self,
-        list_path: &str,
-        field: &str,
-        expected: &str,
-        target: &str,
-        fallback: Option<String>,
-    ) -> RuntimeResult<Option<String>> {
-        let list = self.list_name_for_path(list_path).ok_or_else(|| {
-            format!("generic runtime has no list `{list_path}` for List/find_value")
-        })?;
-        let index = match self.find_list_index_by_textlike_existing_index(list, field, expected)? {
-            Some(index) => Some(index),
-            None => self.find_list_index_by_textlike(list, field, expected)?,
-        };
-        let Some(index) = index else {
-            return Ok(fallback);
-        };
-        self.list_row_field_textlike(list, index, target).map(Some)
-    }
-
-    fn list_name_for_path<'a>(&'a self, path: &'a str) -> Option<&'a str> {
-        if self.lists.memory(path).is_some() {
-            return Some(path);
-        }
-        if let Some(stripped) = path.strip_prefix("store.")
-            && self.lists.memory(stripped).is_some()
-        {
-            return Some(stripped);
-        }
-        let local = path
-            .rsplit_once('.')
-            .map(|(_, local)| local)
-            .unwrap_or(path);
-        self.lists.memory(local).is_some().then_some(local)
-    }
-
-    fn list_row_field_textlike(
-        &self,
-        list: &str,
-        index: usize,
-        field: &str,
-    ) -> RuntimeResult<String> {
-        let value = self.list_row_field(list, index, field)?;
-        match value {
-            FieldValueRef::Text(value) | FieldValueRef::Enum(value) => Ok(value.to_owned()),
-            FieldValueRef::Bool(true) => Ok("True".to_owned()),
-            FieldValueRef::Bool(false) => Ok("False".to_owned()),
-            FieldValueRef::Bytes(_) | FieldValueRef::Json(_) => {
-                Err(format!("generic list `{list}` field `{field}` is not text-like").into())
-            }
-        }
-    }
-
-    fn find_list_index_by_textlike(
-        &self,
-        list: &str,
-        field: &str,
-        expected: &str,
-    ) -> RuntimeResult<Option<usize>> {
-        let rows = self.list_memory(list)?;
-        for index in 0..rows.len() {
-            if self.list_row_textlike(list, index, field)? == expected {
-                return Ok(Some(index));
-            }
-        }
-        Ok(None)
-    }
-
-    fn find_list_index_by_textlike_existing_index(
-        &self,
-        list: &str,
-        field: &str,
-        expected: &str,
-    ) -> RuntimeResult<Option<usize>> {
-        let rows = self.list_memory(list)?;
-        Ok(rows.find_textlike_existing_index(field, expected))
-    }
-
-    fn find_list_index_by_textlike_indexed(
-        &mut self,
-        list: &str,
-        field: &str,
-        expected: &str,
-    ) -> RuntimeResult<(Option<usize>, TextLookupProbe)> {
-        let rows = self.list_memory_mut(list)?;
-        Ok(rows.find_textlike_indexed(field, expected))
-    }
-
-    fn find_list_indices_by_textlike_indexed(
-        &mut self,
-        list: &str,
-        field: &str,
-        expected: &str,
-    ) -> RuntimeResult<(Option<Vec<usize>>, TextLookupProbe)> {
-        let rows = self.list_memory_mut(list)?;
-        Ok(rows.find_textlike_indices_indexed(field, expected))
-    }
-
-    fn find_list_indices_in_selection_by_textlike_indexed(
-        &mut self,
-        list: &str,
-        field: &str,
-        expected: &str,
-        selection: &[usize],
-        equal: bool,
-    ) -> RuntimeResult<(Option<Vec<usize>>, TextLookupProbe)> {
-        let rows = self.list_memory_mut(list)?;
-        Ok(rows.find_textlike_indices_in_selection_indexed(field, expected, selection, equal))
-    }
-
-    fn list_textlike_index_candidate_count(
-        &mut self,
-        list: &str,
-        field: &str,
-        expected: &str,
-    ) -> RuntimeResult<Option<usize>> {
-        let rows = self.list_memory_mut(list)?;
-        Ok(rows.textlike_index_candidate_count(field, expected))
-    }
-
-    fn find_list_indices_by_numeric_indexed(
-        &mut self,
-        list: &str,
-        field: &str,
-        scalar: i64,
-        op: &str,
-        row_on_left: bool,
-    ) -> RuntimeResult<(Option<Vec<usize>>, NumericLookupProbe)> {
-        let rows = self.list_memory_mut(list)?;
-        Ok(rows.find_numeric_indices_indexed(field, scalar, op, row_on_left))
-    }
-
-    fn find_list_indices_in_selection_by_numeric_indexed(
-        &mut self,
-        list: &str,
-        field: &str,
-        scalar: i64,
-        op: &str,
-        row_on_left: bool,
-        selection: &[usize],
-    ) -> RuntimeResult<(Option<Vec<usize>>, NumericLookupProbe)> {
-        let rows = self.list_memory_mut(list)?;
-        Ok(rows.find_numeric_indices_in_selection_indexed(
-            field,
-            scalar,
-            op,
-            row_on_left,
-            selection,
-        ))
-    }
-
-    fn take_order_slots_refreshed(&mut self) -> usize {
-        self.lists
-            .list_slots
-            .iter_mut()
-            .map(|slot| slot.memory.take_order_slots_refreshed())
-            .sum()
-    }
-
-    fn list_row_textlike_opt(&self, list: &str, index: usize, field: &str) -> Option<&str> {
-        self.lists.memory(list)?.textlike(index, field)
-    }
-
-    fn list_row_textlike_path_opt(&self, list: &str, index: usize, path: &str) -> Option<&str> {
-        if let Some(value) = self.list_row_textlike_opt(list, index, path) {
-            return Some(value);
-        }
-        if let Some((_, row_local)) = path.split_once('.')
-            && let Some(value) = self.list_row_textlike_opt(list, index, row_local)
-        {
-            return Some(value);
-        }
-        let leaf = row_field_name(path);
-        (leaf != path)
-            .then(|| self.list_row_textlike_opt(list, index, leaf))
-            .flatten()
-    }
-
-    fn list_row_value_opt(&self, list: &str, index: usize, field: &str) -> Option<FieldValue> {
-        self.lists.memory(list)?.owned_value(index, field)
-    }
-
-    fn list_row_value_path_opt(&self, list: &str, index: usize, path: &str) -> Option<FieldValue> {
-        if let Some(value) = self.list_row_value_opt(list, index, path) {
-            return Some(value);
-        }
-        if let Some((_, row_local)) = path.split_once('.')
-            && let Some(value) = self.list_row_value_opt(list, index, row_local)
-        {
-            return Some(value);
-        }
-        let leaf = row_field_name(path);
-        (leaf != path)
-            .then(|| self.list_row_value_opt(list, index, leaf))
-            .flatten()
-    }
-
-    fn list_row_bytes_path_opt(
-        &self,
-        list: &str,
-        index: usize,
-        path: &str,
-    ) -> Option<RuntimeBytes> {
-        match self.list_row_value_path_opt(list, index, path) {
-            Some(FieldValue::Bytes(value)) => Some(value),
-            _ => None,
-        }
-    }
-
-    fn list_row_initial_value_opt(
-        &self,
-        list: &str,
-        index: usize,
-        source_field: &str,
-        target_field: &str,
-    ) -> Option<FieldValue> {
-        let row = self.lists.memory(list)?.snapshot_index(index).ok()?;
-        row_initial_field_value(&row.columns, source_field, target_field)
-    }
-
-    fn list_row_bool(&self, list: &str, index: usize, field: &str) -> RuntimeResult<bool> {
-        self.list_row_field(list, index, field)?
-            .as_bool()
-            .ok_or_else(|| format!("generic list `{list}` field `{field}` is not bool").into())
-    }
-
-    fn list_row_bool_opt(&self, list: &str, index: usize, field: &str) -> Option<bool> {
-        self.lists.memory(list)?.bool_value(index, field)
-    }
-
-    fn list_row_bool_path_opt(&self, list: &str, index: usize, path: &str) -> Option<bool> {
-        if let Some(value) = self.list_row_bool_opt(list, index, path) {
-            return Some(value);
-        }
-        if let Some((_, row_local)) = path.split_once('.')
-            && let Some(value) = self.list_row_bool_opt(list, index, row_local)
-        {
-            return Some(value);
-        }
-        let leaf = row_field_name(path);
-        (leaf != path)
-            .then(|| self.list_row_bool_opt(list, index, leaf))
-            .flatten()
-    }
-
-    fn text_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.list_memory(list)?
-            .textlike_field_names(index)
-            .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
-    }
-
-    fn bool_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.list_memory(list)?
-            .bool_field_names(index)
-            .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
-    }
-
-    fn json_fields_for_row(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.list_memory(list)?
-            .json_field_names(index)
-            .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
-    }
-
-    fn list_row_field_names(&self, list: &str, index: usize) -> RuntimeResult<Vec<String>> {
-        self.list_memory(list)?
-            .field_names(index)
-            .ok_or_else(|| format!("generic list `{list}` has no row {index}").into())
-    }
-
-    fn set_list_row_textlike(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-        value: &str,
-    ) -> RuntimeResult<()> {
-        self.list_memory_mut(list)?
-            .set_textlike(index, field, value)
-            .map_err(|error| {
-                format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
-                    .into()
-            })
-    }
-
-    fn set_or_insert_list_row_textlike(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-        value: &str,
-    ) -> RuntimeResult<()> {
-        self.list_memory_mut(list)?
-            .set_or_insert_text(index, field, value)
-            .map_err(|error| {
-                format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
-                    .into()
-            })
-    }
-
-    fn set_list_row_bool(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-        value: bool,
-    ) -> RuntimeResult<()> {
-        self.list_memory_mut(list)?
-            .set_bool(index, field, value)
-            .map_err(|error| {
-                format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
-                    .into()
-            })
-    }
-
-    fn set_list_row_value(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-        value: FieldValue,
-    ) -> RuntimeResult<()> {
-        self.list_memory_mut(list)?
-            .set_value(index, field, value)
-            .map_err(|error| {
-                format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
-                    .into()
-            })
-    }
-
-    fn replace_list_rows(
-        &mut self,
-        list: &str,
-        rows: Vec<RuntimeRowSnapshot>,
-    ) -> RuntimeResult<()> {
-        self.lists
-            .replace_memory(list, ListMemory::from_values(rows))
-    }
-
-    fn replace_or_patch_list_rows_with_root_source_identities(
-        &mut self,
-        list: &str,
-        rows: Vec<RuntimeRowSnapshot>,
-        source_identities: Vec<Option<RootListViewFieldSourceIdentity>>,
-    ) -> RuntimeResult<bool> {
-        self.lists
-            .replace_or_patch_memory_with_root_source_identities(list, rows, source_identities)
-    }
-
-    fn root_source_identities_match(
-        &self,
-        list: &str,
-        source_identities: &[Option<RootListViewFieldSourceIdentity>],
-    ) -> RuntimeResult<bool> {
-        self.lists
-            .root_source_identities_match(list, source_identities)
-    }
-
-    fn root_source_identities_changed(
-        &self,
-        list: &str,
-        source_identities: &[Option<RootListViewFieldSourceIdentity>],
-    ) -> RuntimeResult<bool> {
-        self.lists
-            .root_source_identities_changed(list, source_identities)
-    }
-
-    fn root_source_identity(
-        &self,
-        list: &str,
-        index: usize,
-    ) -> RuntimeResult<Option<&RootListViewFieldSourceIdentity>> {
-        self.lists.root_source_identity(list, index)
-    }
-
-    fn list_visible_snapshots(&self, list: &str) -> RuntimeResult<Vec<RuntimeRowSnapshot>> {
-        Ok(self.list_memory(list)?.visible_snapshots())
-    }
-
-    fn list_row_snapshot(&self, list: &str, index: usize) -> RuntimeResult<RuntimeRowSnapshot> {
-        self.list_memory(list)?.snapshot_index(index)
-    }
-
-    fn set_or_replace_list_row_value(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-        value: FieldValue,
-    ) -> RuntimeResult<()> {
-        self.list_memory_mut(list)?
-            .set_or_replace_value(index, field, value)
-            .map_err(|error| {
-                format!("generic list `{list}` set `{field}` at index {index} failed: {error}")
-                    .into()
-            })
-    }
-
-    fn set_or_replace_list_text_values(
-        &mut self,
-        list: &str,
-        field: &str,
-        values: Vec<String>,
-    ) -> RuntimeResult<Vec<usize>> {
-        self.list_memory_mut(list)?
-            .set_or_replace_text_values(field, values)
-            .map_err(|error| {
-                format!("generic list `{list}` set `{field}` batch failed: {error}").into()
-            })
-    }
-
-    fn commit_indexed_text_field(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-        value: &str,
-    ) -> RuntimeResult<(u64, u64)> {
-        self.set_list_row_textlike(list, index, field, value)?;
-        self.row_identity(list, index)
-    }
-
-    fn commit_indexed_bool_field(
-        &mut self,
-        list: &str,
-        index: usize,
-        field: &str,
-        value: bool,
-    ) -> RuntimeResult<(u64, u64)> {
-        self.set_list_row_bool(list, index, field, value)?;
-        self.row_identity(list, index)
-    }
-
-    fn commit_indexed_text_source<'a>(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_key: Option<&str>,
-        payload_text: Option<&'a str>,
-        payload_address: Option<&str>,
-        payload: &BTreeMap<String, &'a str>,
-    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
-        let value = match self.eval_indexed_text_source(
-            equations,
-            list,
-            index,
-            target,
-            source,
-            payload_key,
-            payload_text,
-            payload_address,
-            payload,
-        )? {
-            IndexedTextCandidate::SourceText(value) | IndexedTextCandidate::PreviousText(value) => {
-                value
-            }
-            IndexedTextCandidate::TrimmedOrSkip(Some(value)) => value,
-            IndexedTextCandidate::TrimmedOrSkip(None) => return Ok(None),
-            IndexedTextCandidate::PreviousField(path) => {
-                return Err(format!(
-                    "text update `{target}` from `{source}` needs previous field `{path}` without payload"
-                )
-                .into());
-            }
-        };
-        let field = row_local_field_name(target);
-        let (key, generation) =
-            self.commit_indexed_text_field(list, index, field, value.as_ref())?;
-        Ok(Some(GenericTextFieldCommit {
-            list: list.to_owned(),
-            key,
-            generation,
-            field: field.to_owned(),
-            value,
-        }))
-    }
-
-    fn indexed_bytes_source_payload_target(
-        &self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-    ) -> bool {
-        matches!(
-            self.list_row_value_path_opt(list, index, target),
-            Some(FieldValue::Bytes(_))
-        ) && equations.branches.iter().any(|branch| {
-            branch.target == target
-                && branch.source == source
-                && matches!(
-                    &branch.expression,
-                    ScalarUpdateExpression::SourcePayload(field) if field == "bytes"
-                )
-        })
-    }
-
-    fn commit_indexed_bytes_source<'a>(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_bytes: &BTreeMap<String, Vec<u8>>,
-        seq: TickSeq,
-    ) -> RuntimeResult<Option<GenericValueFieldCommit<'a>>> {
-        let value = equations.eval_bytes(
-            target,
-            source,
-            payload_bytes,
-            |path| {
-                self.root_textlike(path).ok().or_else(|| {
-                    self.list_row_textlike_path_opt(list, index, path)
-                        .map(str::to_owned)
-                })
-            },
-            |path| {
-                self.root_bytes(path).ok().or_else(|| {
-                    match self.list_row_value_path_opt(list, index, path) {
-                        Some(FieldValue::Bytes(value)) => Some(value),
-                        _ => None,
-                    }
-                })
-            },
-        )?;
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        let Some(candidate) = then_value(EventPulse::present(seq), value) else {
-            return Ok(None);
-        };
-        let Some(value) = latest_value(target, &[candidate])? else {
-            return Ok(None);
-        };
-        let field = row_local_field_name(target);
-        if self.list_row_value_opt(list, index, field) == Some(FieldValue::Bytes(value.clone())) {
-            return Ok(None);
-        }
-        self.set_list_row_value(list, index, field, FieldValue::Bytes(value.clone()))?;
-        let (key, generation) = self.row_identity(list, index)?;
-        Ok(Some(GenericValueFieldCommit {
-            list: list.to_owned(),
-            key,
-            generation,
-            field: field.to_owned(),
-            value: ProtocolValue::Bytes(value.report_json()),
-        }))
-    }
-
-    fn commit_indexed_value_source<'a>(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_bytes: &BTreeMap<String, Vec<u8>>,
-        seq: TickSeq,
-    ) -> RuntimeResult<Option<GenericValueFieldCommit<'a>>> {
-        let read_textlike = |path: &str| {
-            self.root_textlike(path).ok().or_else(|| {
-                self.list_row_textlike_path_opt(list, index, path)
-                    .map(str::to_owned)
-            })
-        };
-        let read_bytes = |path: &str| {
-            self.root_bytes(path).ok().or_else(|| {
-                match self.list_row_value_path_opt(list, index, path) {
-                    Some(FieldValue::Bytes(value)) => Some(value),
-                    _ => None,
-                }
-            })
-        };
-
-        let field = row_local_field_name(target);
-        if let Some(value) =
-            equations.eval_bytes(target, source, payload_bytes, read_textlike, read_bytes)?
-        {
-            let Some(candidate) = then_value(EventPulse::present(seq), value) else {
-                return Ok(None);
-            };
-            let Some(value) = latest_value(target, &[candidate])? else {
-                return Ok(None);
-            };
-            let field_value = FieldValue::Bytes(value.clone());
-            if self.list_row_value_opt(list, index, field) == Some(field_value.clone()) {
-                return Ok(None);
-            }
-            self.set_list_row_value(list, index, field, field_value)?;
-            let (key, generation) = self.row_identity(list, index)?;
-            return Ok(Some(GenericValueFieldCommit {
-                list: list.to_owned(),
-                key,
-                generation,
-                field: field.to_owned(),
-                value: ProtocolValue::Bytes(value.report_json()),
-            }));
-        }
-
-        let Some(number) =
-            equations.eval_number_value(target, source, read_textlike, read_bytes)?
-        else {
-            return Ok(None);
-        };
-        let (field_value, protocol_value) = match number {
-            GenericRootNumberValue::Number(value) => (
-                FieldValue::Json(json!(value)),
-                ProtocolValue::NumberText(value),
-            ),
-            GenericRootNumberValue::Null => {
-                (FieldValue::Json(JsonValue::Null), ProtocolValue::Null)
-            }
-        };
-        if self.list_row_value_opt(list, index, field) == Some(field_value.clone()) {
-            return Ok(None);
-        }
-        self.set_list_row_value(list, index, field, field_value)?;
-        let (key, generation) = self.row_identity(list, index)?;
-        Ok(Some(GenericValueFieldCommit {
-            list: list.to_owned(),
-            key,
-            generation,
-            field: field.to_owned(),
-            value: protocol_value,
-        }))
-    }
-
-    fn commit_edit_draft_title_for_index<'a>(
-        &mut self,
-        list: &str,
-        index: usize,
-    ) -> RuntimeResult<Option<GenericTextFieldCommit<'a>>> {
-        let Some(value) = self
-            .list_row_textlike_opt(list, index, "edit_text")
-            .or_else(|| self.list_row_textlike_opt(list, index, "edited_title"))
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-        else {
-            return Ok(None);
-        };
-        let (key, generation) = self.commit_indexed_text_field(list, index, "title", &value)?;
-        Ok(Some(GenericTextFieldCommit {
-            list: list.to_owned(),
-            key,
-            generation,
-            field: "title".to_owned(),
-            value: Cow::Owned(value),
-        }))
-    }
-
-    fn needs_edit_draft_title_commit(
-        &self,
-        list: &str,
-        index: usize,
-        source_actions_emitted_title: bool,
-    ) -> RuntimeResult<bool> {
-        if !source_actions_emitted_title {
-            return Ok(true);
-        }
-        let Some(draft) = self
-            .list_row_textlike_opt(list, index, "edit_text")
-            .or_else(|| self.list_row_textlike_opt(list, index, "edited_title"))
-            .filter(|value| !value.is_empty())
-        else {
-            return Ok(false);
-        };
-        let current_title = self.list_row_textlike(list, index, "title")?;
-        Ok(draft != current_title)
-    }
-
-    fn commit_indexed_bool_source(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_key: Option<&str>,
-        payload_text: Option<&str>,
-        payload_address: Option<&str>,
-        read_extra_bool: impl Fn(&str) -> Option<bool>,
-        read_extra_textlike: impl Fn(&str) -> Option<String>,
-    ) -> RuntimeResult<GenericBoolFieldCommit> {
-        let value = self.eval_indexed_bool_source(
-            equations,
-            list,
-            index,
-            target,
-            source,
-            payload_key,
-            payload_text,
-            payload_address,
-            read_extra_bool,
-            read_extra_textlike,
-        )?;
-        let field = row_local_field_name(target);
-        let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
-        Ok(GenericBoolFieldCommit {
-            list: list.to_owned(),
-            key,
-            generation,
-            field: field.to_owned(),
-            value,
-        })
-    }
-
-    fn commit_indexed_previous_text_target_source(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-    ) -> RuntimeResult<GenericTextFieldIdentity> {
-        let previous = match self.eval_indexed_text_source(
-            equations,
-            list,
-            index,
-            target,
-            source,
-            None,
-            None,
-            None,
-            &BTreeMap::new(),
-        )? {
-            IndexedTextCandidate::PreviousField(path) => path,
-            IndexedTextCandidate::SourceText(_) | IndexedTextCandidate::PreviousText(_) => {
-                return Err(format!(
-                    "text update `{target}` from `{source}` is not a previous-field update"
-                )
-                .into());
-            }
-            IndexedTextCandidate::TrimmedOrSkip(_) => {
-                return Err(format!(
-                    "text update `{target}` from `{source}` unexpectedly used trim-or-previous"
-                )
-                .into());
-            }
-        };
-        let field = row_local_field_name(target);
-        self.copy_list_row_textlike_field(list, index, &previous, field)?;
-        let value = self.list_row_textlike(list, index, field)?.to_owned();
-        let (key, generation) = self.row_identity(list, index)?;
-        Ok(GenericTextFieldIdentity {
-            list: list.to_owned(),
-            key,
-            generation,
-            field: field.to_owned(),
-            value,
-        })
-    }
-
-    fn commit_each_indexed_bool_source(
-        &mut self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        target: &str,
-        source: &str,
-        payload_key: Option<&str>,
-        payload_text: Option<&str>,
-        payload_address: Option<&str>,
-        read_extra_bool: impl Fn(&str) -> Option<bool> + Copy,
-        read_extra_textlike: impl Fn(&str) -> Option<String> + Copy,
-        mut observe: impl FnMut(GenericBoolFieldCommit) -> RuntimeResult<()>,
-    ) -> RuntimeResult<usize> {
-        let len = self.list_len(list)?;
-        for index in 0..len {
-            let value = self.eval_indexed_bool_source(
-                equations,
-                list,
-                index,
-                target,
-                source,
-                payload_key,
-                payload_text,
-                payload_address,
-                read_extra_bool,
-                read_extra_textlike,
-            )?;
-            let field = row_local_field_name(target);
-            let (key, generation) = self.commit_indexed_bool_field(list, index, field, value)?;
-            observe(GenericBoolFieldCommit {
-                list: list.to_owned(),
-                key,
-                generation,
-                field: field.to_owned(),
-                value,
-            })?;
-        }
-        Ok(len)
-    }
-
-    fn eval_indexed_text_source<'a>(
-        &self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_key: Option<&str>,
-        payload_text: Option<&'a str>,
-        payload_address: Option<&str>,
-        payload: &BTreeMap<String, &'a str>,
-    ) -> RuntimeResult<IndexedTextCandidate<'a>> {
-        let Some(branch) = equations
-            .branches
-            .iter()
-            .find(|branch| branch.target == target && branch.source == source)
-        else {
-            return Err(format!("no text branch for `{target}` from `{source}`").into());
-        };
-        match &branch.expression {
-            ScalarUpdateExpression::SourceText => {
-                let Some(value) = payload_text else {
-                    return Ok(IndexedTextCandidate::TrimmedOrSkip(None));
-                };
-                Ok(IndexedTextCandidate::SourceText(Cow::Borrowed(value)))
-            }
-            ScalarUpdateExpression::SourceKey => Err(format!(
-                "indexed text update `{target}` from `{source}` cannot use key payload directly"
-            )
-            .into()),
-            ScalarUpdateExpression::SourceAddress => Err(format!(
-                "indexed text update `{target}` from `{source}` cannot use address payload directly"
-            )
-            .into()),
-            ScalarUpdateExpression::SourcePayload(field) => Err(format!(
-                "indexed text update `{target}` from `{source}` cannot use payload `{field}` directly"
-            )
-            .into()),
-            ScalarUpdateExpression::Const(value) => {
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(value.clone())))
-            }
-            ScalarUpdateExpression::PreviousValue(path) => {
-                let Some(value) = payload_text else {
-                    return Ok(IndexedTextCandidate::PreviousField(path.clone()));
-                };
-                let current = self.list_row_textlike_path_opt(list, index, path).ok_or_else(
-                    || {
-                        format!(
-                            "indexed text update `{target}` from `{source}` cannot read previous row path `{path}`"
-                        )
-                    },
-                )?;
-                if value != current {
-                    return Err(format!(
-                        "text update `{target}` from `{source}` expected `{path}` value `{current}`, got `{value}`"
-                    )
-                    .into());
-                }
-                Ok(IndexedTextCandidate::PreviousText(Cow::Borrowed(value)))
-            }
-            ScalarUpdateExpression::ReadPath(path) => {
-                let current = self.list_row_textlike_path_opt(list, index, path).ok_or_else(
-                    || {
-                        format!(
-                            "indexed text update `{target}` from `{source}` cannot read row path `{path}`"
-                        )
-                    },
-                )?;
-                Ok(IndexedTextCandidate::PreviousText(Cow::Owned(
-                    current.to_owned(),
-                )))
-            }
-            ScalarUpdateExpression::TextTrimOrPrevious { path, previous } => {
-                let raw = match path.as_str() {
-                    "text" => {
-                        let Some(text) = payload_text else {
-                            return Ok(IndexedTextCandidate::TrimmedOrSkip(None));
-                        };
-                        Cow::Borrowed(text)
-                    }
-                    field => {
-                        let current =
-                            self.list_row_textlike_path_opt(list, index, field).ok_or_else(
-                                || {
-                                    format!(
-                                        "indexed text update `{target}` from `{source}` cannot read row path `{field}`"
-                                    )
-                                },
-                            )?;
-                        if let Some(value) = payload_text {
-                            if value != current {
-                                return Err(format!(
-                                    "text update `{target}` from `{source}` expected `{field}` value `{current}`, got `{value}`"
-                                )
-                                .into());
-                            }
-                        }
-                        Cow::Owned(current.to_owned())
-                    }
-                };
-                let current = self
-                    .list_row_textlike_path_opt(list, index, previous)
-                    .ok_or_else(|| {
-                        format!(
-                            "indexed text update `{target}` from `{source}` cannot read previous row path `{previous}`"
-                        )
-                    })?;
-                let value = match raw {
-                    Cow::Borrowed(value) => {
-                        let trimmed = value.trim();
-                        (!trimmed.is_empty() && trimmed != current).then_some(Cow::Borrowed(trimmed))
-                    }
-                    Cow::Owned(value) => {
-                        let trimmed = value.trim();
-                        (!trimmed.is_empty() && trimmed != current)
-                            .then(|| Cow::Owned(trimmed.to_owned()))
-                    }
-                };
-                Ok(IndexedTextCandidate::TrimmedOrSkip(value))
-            }
-            ScalarUpdateExpression::PrefixPayloadConcat {
-                prefix,
-                payload_path,
-                separator,
-            } => {
-                let Some(payload) = source_payload_match_input(
-                    payload_path,
-                    source,
-                    payload_key,
-                    payload_text,
-                    payload_address,
-                    payload,
-                )
-                else {
-                    return Err(format!(
-                        "indexed text update `{target}` from `{source}` requires text payload `{payload_path}`"
-                    )
-                    .into());
-                };
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(format!(
-                    "{prefix}{separator}{payload}"
-                ))))
-            }
-            ScalarUpdateExpression::PrefixRootConcat {
-                prefix,
-                path,
-                separator,
-            } => {
-                let value = self.root_textlike(path).ok().or_else(|| {
-                    self.list_row_textlike_path_opt(list, index, path)
-                        .map(str::to_owned)
-                });
-                let Some(value) = value else {
-                    return Err(format!(
-                        "indexed text update `{target}` from `{source}` requires path `{path}`"
-                    )
-                    .into());
-                };
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(format!(
-                    "{prefix}{separator}{value}"
-                ))))
-            }
-            ScalarUpdateExpression::MatchConst { .. }
-            | ScalarUpdateExpression::MatchValueConst { .. }
-            | ScalarUpdateExpression::MatchTextIsEmptyConst { .. }
-            | ScalarUpdateExpression::MatchNumberInfixConst { .. } => {
-                let Some(value) = equations.eval_text(
-                    target,
-                    source,
-                    payload_key,
-                    payload_text,
-                    payload_address,
-                    payload,
-                    None,
-                    None,
-                    None,
-                    None,
-                    |path| {
-                        self.root_textlike(path).ok().or_else(|| {
-                            self.list_row_textlike_path_opt(list, index, path)
-                                .map(str::to_owned)
-                        })
-                    },
-                    |path| self.root_bytes(path).ok(),
-                )?
-                else {
-                    return Ok(IndexedTextCandidate::TrimmedOrSkip(None));
-                };
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(
-                    value.into_owned(),
-                )))
-            }
-            ScalarUpdateExpression::ListFindValue { .. } => {
-                let read_textlike = |path: &str| {
-                    self.root_textlike(path).ok().or_else(|| {
-                        self.list_row_textlike_path_opt(list, index, path)
-                            .map(str::to_owned)
-                    })
-                };
-                let Some(value) = equations.eval_list_find_text(
-                    target,
-                    source,
-                    read_textlike,
-                    |list, field, expected, value_field, fallback| {
-                        self.list_find_value_text(list, field, expected, value_field, fallback)
-                    },
-                )?
-                else {
-                    return Ok(IndexedTextCandidate::TrimmedOrSkip(None));
-                };
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(
-                    value.into_owned(),
-                )))
-            }
-            ScalarUpdateExpression::BytesToHex { path } => {
-                let bytes = self
-                    .root_bytes(path)
-                    .ok()
-                    .or_else(|| self.list_row_bytes_path_opt(list, index, path))
-                    .ok_or_else(|| {
-                        format!(
-                            "indexed text update `{target}` from `{source}` cannot read bytes path `{path}`"
-                        )
-                    })?;
-                let data = bytes.inline_bytes().map_err(|error| {
-                    format!(
-                        "indexed text update `{target}` from `{source}` cannot read inline bytes path `{path}`: {error}"
-                    )
-                })?;
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(
-                    bytes_encode_hex(data),
-                )))
-            }
-            ScalarUpdateExpression::BytesToBase64 { path } => {
-                let bytes = self
-                    .root_bytes(path)
-                    .ok()
-                    .or_else(|| self.list_row_bytes_path_opt(list, index, path))
-                    .ok_or_else(|| {
-                        format!(
-                            "indexed text update `{target}` from `{source}` cannot read bytes path `{path}`"
-                        )
-                    })?;
-                let data = bytes.inline_bytes().map_err(|error| {
-                    format!(
-                        "indexed text update `{target}` from `{source}` cannot read inline bytes path `{path}`: {error}"
-                    )
-                })?;
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(
-                    bytes_encode_base64(data),
-                )))
-            }
-            ScalarUpdateExpression::BytesToText { path, encoding } => {
-                let bytes = self
-                    .root_bytes(path)
-                    .ok()
-                    .or_else(|| self.list_row_bytes_path_opt(list, index, path))
-                    .ok_or_else(|| {
-                        format!(
-                            "indexed text update `{target}` from `{source}` cannot read bytes path `{path}`"
-                        )
-                    })?;
-                let data = bytes.inline_bytes().map_err(|error| {
-                    format!(
-                        "indexed text update `{target}` from `{source}` cannot read inline bytes path `{path}`: {error}"
-                    )
-                })?;
-                let text = runtime_bytes_to_text(data, encoding).map_err(|error| {
-                    format!(
-                        "indexed text update `{target}` from `{source}` bytes path `{path}` {error}"
-                    )
-                })?;
-                Ok(IndexedTextCandidate::SourceText(Cow::Owned(text)))
-            }
-            ScalarUpdateExpression::NumberInfix { .. }
-            | ScalarUpdateExpression::ProjectTime { .. }
-            | ScalarUpdateExpression::BoolNot(_)
-            | ScalarUpdateExpression::BytesLength(_)
-            | ScalarUpdateExpression::BytesIsEmpty(_)
-            | ScalarUpdateExpression::BytesGet { .. }
-            | ScalarUpdateExpression::BytesSet { .. }
-            | ScalarUpdateExpression::BytesSlice { .. }
-            | ScalarUpdateExpression::BytesTake { .. }
-            | ScalarUpdateExpression::BytesDrop { .. }
-            | ScalarUpdateExpression::BytesZeros { .. }
-            | ScalarUpdateExpression::BytesFromHex { .. }
-            | ScalarUpdateExpression::BytesFromBase64 { .. }
-            | ScalarUpdateExpression::BytesReadUnsigned { .. }
-            | ScalarUpdateExpression::BytesReadSigned { .. }
-            | ScalarUpdateExpression::BytesWriteUnsigned { .. }
-            | ScalarUpdateExpression::BytesWriteSigned { .. }
-            | ScalarUpdateExpression::FileReadBytes { .. }
-            | ScalarUpdateExpression::TextToBytes { .. }
-            | ScalarUpdateExpression::BytesConcat { .. }
-            | ScalarUpdateExpression::BytesEqual { .. }
-            | ScalarUpdateExpression::BytesFind { .. }
-            | ScalarUpdateExpression::BytesStartsWith { .. }
-            | ScalarUpdateExpression::BytesEndsWith { .. }
-            | ScalarUpdateExpression::Unsupported => Err(format!(
-                "text branch for `{target}` from `{source}` is not a supported indexed text expression"
-            )
-            .into()),
-        }
-    }
-
-    fn eval_indexed_bool_source(
-        &self,
-        equations: &ScalarEquationPlan,
-        list: &str,
-        index: usize,
-        target: &str,
-        source: &str,
-        payload_key: Option<&str>,
-        payload_text: Option<&str>,
-        payload_address: Option<&str>,
-        read_extra_bool: impl Fn(&str) -> Option<bool>,
-        read_extra_textlike: impl Fn(&str) -> Option<String>,
-    ) -> RuntimeResult<bool> {
-        equations
-            .eval_bool_with_context(
-                target,
-                source,
-                payload_key,
-                payload_text,
-                payload_address,
-                |path| {
-                    self.list_row_bool_path_opt(list, index, path)
-                        .or_else(|| read_extra_bool(path))
-                },
-                |path| {
-                    let empty_payload = BTreeMap::new();
-                    source_payload_match_input(
-                        path,
-                        source,
-                        payload_key,
-                        payload_text,
-                        payload_address,
-                        &empty_payload,
-                    )
-                    .map(str::to_owned)
-                    .or_else(|| read_extra_textlike(path))
-                    .or_else(|| {
-                        let source_scope = source.split_once('.')?.0;
-                        let (path_scope, field) = path.split_once('.')?;
-                        (path_scope == source_scope
-                            && matches!(row_field_name(field), "id" | "key" | "address"))
-                        .then(|| payload_address.map(str::to_owned))
-                        .flatten()
-                    })
-                    .or_else(|| {
-                        self.list_row_textlike_path_opt(list, index, path)
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| self.root_textlike(path).ok())
-                },
-                |path| match self.list_row_value_path_opt(list, index, path) {
-                    Some(FieldValue::Bytes(value)) => Some(value),
-                    _ => self.root_bytes(path).ok(),
-                },
-            )?
-            .ok_or_else(|| {
-                format!("no supported bool branch for `{target}` from `{source}`").into()
-            })
-    }
-
-    fn append_row_for_trigger(
-        &mut self,
-        equations: &ListEquationPlan,
-        list: &str,
-        trigger: &str,
-        append_ordinal: usize,
-        row: RuntimeRowSnapshot,
-    ) -> RuntimeResult<(u64, u64)> {
-        let expected = equations.append_trigger_at(append_ordinal, list)?;
-        if expected != trigger {
-            return Err(format!(
-                "list `{list}` append trigger `{trigger}` does not match IR trigger `{expected}`"
-            )
-            .into());
-        }
-        self.append_row(list, row)
-    }
-
-    fn append_row_for_trigger_text(
-        &mut self,
-        equations: &ListEquationPlan,
-        list: &str,
-        trigger: &str,
-        append_ordinal: usize,
-        _trigger_value: &str,
-        append_source_values: &BTreeMap<String, String>,
-    ) -> RuntimeResult<(u64, u64)> {
-        let append_fields = equations.append_fields_at(append_ordinal, list, trigger)?;
-        let template = self
-            .lists
-            .row_template(list)
-            .cloned()
-            .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
-        let mut row = self.lists.pop_spare(list).map(Ok).unwrap_or_else(|| {
-            let initial_fields = equations.append_initial_fields_at(
-                append_ordinal,
-                list,
-                trigger,
-                append_source_values,
-            )?;
-            template.materialize(initial_fields)
-        })?;
-        template.reset_from_initial_value(&mut row, |initial_name| {
-            append_fields
-                .iter()
-                .find(|field| field.name == row_field_name(initial_name))
-                .and_then(|field| match &field.value {
-                    RuntimeListAppendFieldValue::Source { path } => append_source_values
-                        .get(path)
-                        .map(|value| FieldValue::Text(value.clone())),
-                    RuntimeListAppendFieldValue::Const { value } => {
-                        Some(FieldValue::Text(value.clone()))
-                    }
-                    RuntimeListAppendFieldValue::TypedConst { value } => {
-                        value.to_field_value(&ValueColumns::default()).ok()
-                    }
-                })
-        })?;
-        for field in append_fields {
-            match &field.value {
-                RuntimeListAppendFieldValue::Source { path } => {
-                    if let Some(value) = append_source_values.get(path) {
-                        row.columns.set_textlike(&field.name, value)?;
-                    }
-                }
-                RuntimeListAppendFieldValue::Const { value } => {
-                    row.columns.set_textlike(&field.name, value)?;
-                }
-                RuntimeListAppendFieldValue::TypedConst { value } => {
-                    row.columns.insert_value(
-                        field.name.clone(),
-                        value.to_field_value(&ValueColumns::default())?,
-                    );
-                }
-            }
-        }
-        self.append_row_for_trigger(equations, list, trigger, append_ordinal, row)
-    }
-
-    fn reserve_spare_rows_for_trigger_text(
-        &mut self,
-        equations: &ListEquationPlan,
-        list: &str,
-        trigger: &str,
-        append_ordinal: usize,
-        count: usize,
-        text_capacity: usize,
-    ) -> RuntimeResult<()> {
-        let spare_len = self.lists.spare_len(list);
-        if spare_len >= count {
-            return Ok(());
-        }
-        let template = self
-            .lists
-            .row_template(list)
-            .cloned()
-            .ok_or_else(|| format!("generic runtime has no row template for list `{list}`"))?;
-        let additional = count - spare_len;
-        let spare_rows = self
-            .lists
-            .spare_rows_mut(list)
-            .ok_or_else(|| format!("generic runtime has no list `{list}`"))?;
-        spare_rows.reserve(additional + count);
-        let mut append_source_values = BTreeMap::new();
-        append_source_values.insert(trigger.to_owned(), String::new());
-        for _ in 0..additional {
-            let initial_fields = equations.append_initial_fields_at(
-                append_ordinal,
-                list,
-                trigger,
-                &append_source_values,
-            )?;
-            let mut row = template.materialize(initial_fields)?;
-            row.reserve_textlike_fields(text_capacity)?;
-            spare_rows.push(row);
-        }
-        Ok(())
-    }
-
-    fn append_row_for_trigger_text_and_bind_sources(
-        &mut self,
-        equations: &ListEquationPlan,
-        list: &str,
-        trigger: &str,
-        append_ordinal: usize,
-        trigger_value: &str,
-        append_source_values: &BTreeMap<String, String>,
-        source_paths: &[String],
-    ) -> RuntimeResult<GenericListRowCommit> {
-        let (key, generation) = self.append_row_for_trigger_text(
-            equations,
-            list,
-            trigger,
-            append_ordinal,
-            trigger_value,
-            append_source_values,
-        )?;
-        self.bind_row_sources(list, key, generation, source_paths)?;
-        Ok(GenericListRowCommit {
-            list: list.to_owned(),
-            key,
-            generation,
-        })
-    }
-
-    #[cfg(test)]
-    fn append_text_row_source_action_and_bind_sources<'a>(
-        &mut self,
-        routes: &SourceRoutePlan,
-        derived: &DerivedEquationPlan,
-        lists: &ListEquationPlan,
-        list: &str,
-        source: &str,
-        key: Option<&'a str>,
-        text: Option<&'a str>,
-        source_paths: &[String],
-    ) -> RuntimeResult<Option<GenericTextListAppendCommit<'a>>> {
-        let (trigger, append_ordinal) = routes.list_append_target(source, list)?;
-        let Some(value) =
-            self.eval_derived_text_transform(derived, trigger, source, key, text, None)?
-        else {
-            return Ok(None);
-        };
-        let mut append_source_values = BTreeMap::new();
-        append_source_values.insert(trigger.to_owned(), value.to_string());
-        let insert = self.append_row_for_trigger_text_and_bind_sources(
-            lists,
-            list,
-            trigger,
-            append_ordinal,
-            value.as_ref(),
-            &append_source_values,
-            source_paths,
-        )?;
-        Ok(Some(GenericTextListAppendCommit {
-            list: list.to_owned(),
-            key: insert.key,
-            generation: insert.generation,
-            value,
-        }))
-    }
-
-    fn spare_row(&mut self, list: &str, row: RuntimeRowSnapshot) -> RuntimeResult<()> {
-        self.lists.push_spare(list, row)
-    }
-
-    fn remove_row_for_predicate(
-        &mut self,
-        list: &str,
-        predicate: RuntimeListPredicate,
-        index: usize,
-    ) -> RuntimeResult<Option<KeyedRow<RuntimeRowSnapshot>>> {
-        if predicate == RuntimeListPredicate::Unsupported {
-            return Err(
-                format!("remove over list `{list}` has unsupported predicate in IR").into(),
-            );
-        }
-        if !self.list_row_matches_predicate(list, index, &predicate)? {
-            return Ok(None);
-        }
-        self.remove_row(list, index).map(Some)
-    }
-
-    fn remove_row_for_predicate_and_unbind_sources(
-        &mut self,
-        list: &str,
-        predicate: &RuntimeListPredicate,
-        index: usize,
-        mut observe_binding: impl FnMut(&SourceBinding) -> RuntimeResult<()>,
-    ) -> RuntimeResult<Option<KeyedRow<RuntimeRowSnapshot>>> {
-        let Some(row) = self.remove_row_for_predicate(list, predicate.clone(), index)? else {
-            return Ok(None);
-        };
-        for binding in self.row_source_bindings(list, row.key, row.generation) {
-            observe_binding(binding)?;
-        }
-        self.unbind_row_sources(list, row.key, row.generation);
-        Ok(Some(row))
-    }
-
-    fn remove_where_source_action_and_unbind_sources(
-        &mut self,
-        routes: &SourceRoutePlan,
-        list: &str,
-        source_id: SourceId,
-        mut observe: impl FnMut(GenericListRemoveObservation<'_>) -> RuntimeResult<()>,
-    ) -> RuntimeResult<()> {
-        let predicate = routes.list_remove_predicate_for_source_id(source_id, list)?;
-        let mut index = 0;
-        while index < self.list_len(list)? {
-            let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
-                list,
-                &predicate,
-                index,
-                |binding| observe(GenericListRemoveObservation::SourceUnbind(binding)),
-            )?
-            else {
-                index += 1;
-                continue;
-            };
-            let (key, generation) = (row.key, row.generation);
-            observe(GenericListRemoveObservation::RowRemoved { key, generation })?;
-            self.spare_row(list, row.value)?;
-        }
-        Ok(())
-    }
-
-    fn remove_index_source_action_and_unbind_sources(
-        &mut self,
-        routes: &SourceRoutePlan,
-        list: &str,
-        source_id: SourceId,
-        index: usize,
-        observe_binding: impl FnMut(&SourceBinding) -> RuntimeResult<()>,
-    ) -> RuntimeResult<Option<(u64, u64)>> {
-        let predicate = routes.list_remove_predicate_for_source_id(source_id, list)?;
-        let Some(row) = self.remove_row_for_predicate_and_unbind_sources(
-            list,
-            &predicate,
-            index,
-            observe_binding,
-        )?
-        else {
-            return Ok(None);
-        };
-        let identity = (row.key, row.generation);
-        self.spare_row(list, row.value)?;
-        Ok(Some(identity))
-    }
-
-    #[cfg(test)]
-    fn remove_row_and_unbind_sources(
-        &mut self,
-        list: &str,
-        index: usize,
-        mut observe_binding: impl FnMut(&SourceBinding),
-    ) -> RuntimeResult<KeyedRow<RuntimeRowSnapshot>> {
-        let row = self.remove_row(list, index)?;
-        for binding in self.row_source_bindings(list, row.key, row.generation) {
-            observe_binding(binding);
-        }
-        self.unbind_row_sources(list, row.key, row.generation);
-        Ok(row)
-    }
-
-    fn append_row(&mut self, list: &str, row: RuntimeRowSnapshot) -> RuntimeResult<(u64, u64)> {
-        if let Some(capacity) = self.lists.capacity(list) {
-            let len = self.list_len(list)?;
-            if len >= capacity {
-                return Err(format!(
-                    "generic list `{list}` capacity {capacity} exceeded by append"
-                )
-                .into());
-            }
-        }
-        Ok(self.list_memory_mut(list)?.append(row))
-    }
-
-    fn remove_row(
-        &mut self,
-        list: &str,
-        index: usize,
-    ) -> RuntimeResult<KeyedRow<RuntimeRowSnapshot>> {
-        let rows = self.list_memory_mut(list)?;
-        if index >= rows.len() {
-            return Err(format!("generic list `{list}` has no index {index}").into());
-        }
-        Ok(rows.remove_index(index))
-    }
-
-    fn move_row(
-        &mut self,
-        list: &str,
-        from: usize,
-        to: usize,
-    ) -> RuntimeResult<GenericListRowCommit> {
-        let (key, generation) = self.list_memory_mut(list)?.move_index(from, to)?;
-        Ok(GenericListRowCommit {
-            list: list.to_owned(),
-            key,
-            generation,
-        })
-    }
-
-    fn row_identity(&self, list: &str, index: usize) -> RuntimeResult<(u64, u64)> {
-        self.list_memory(list)?
-            .row_identity(index)
-            .ok_or_else(|| format!("generic list `{list}` has no index {index}").into())
-    }
-
-    fn list_root_identity_epoch(&self, list: &str) -> RuntimeResult<u64> {
-        self.lists.root_identity_epoch(list)
-    }
-
-    fn bound_index(&self, list: &str, key: u64, generation: u64) -> RuntimeResult<Option<usize>> {
-        Ok(self.list_memory(list)?.bound_index(key, generation))
-    }
-
-    fn list_len(&self, list: &str) -> RuntimeResult<usize> {
-        Ok(self.list_memory(list)?.len())
-    }
-
-    fn list_row_matches_predicate(
-        &self,
-        list: &str,
-        index: usize,
-        predicate: &RuntimeListPredicate,
-    ) -> RuntimeResult<bool> {
-        match predicate {
-            RuntimeListPredicate::AlwaysTrue => Ok(true),
-            RuntimeListPredicate::FieldBool { path } => {
-                self.list_row_bool(list, index, row_field_name(path))
-            }
-            RuntimeListPredicate::FieldBoolNot { path } => {
-                Ok(!self.list_row_bool(list, index, row_field_name(path))?)
-            }
-            RuntimeListPredicate::SelectorVisibility {
-                selector,
-                row_field,
-            } => {
-                let row_value = self.list_row_bool(list, index, row_field_name(row_field))?;
-                Ok(match self.root_textlike_ref(selector)? {
-                    "Active" => !row_value,
-                    "Completed" => row_value,
-                    _ => true,
-                })
-            }
-            RuntimeListPredicate::Unsupported => Err("unsupported list predicate".into()),
-        }
-    }
-
-    fn count_list_rows_for_target(
-        &self,
-        equations: &ListEquationPlan,
-        list: &str,
-        target: &str,
-    ) -> RuntimeResult<usize> {
-        let predicate = equations.count_predicate(list, target)?;
-        self.count_list_rows_matching(list, predicate)
-    }
-
-    fn count_list_rows_matching(
-        &self,
-        list: &str,
-        predicate: RuntimeListPredicate,
-    ) -> RuntimeResult<usize> {
-        if predicate == RuntimeListPredicate::Unsupported {
-            return Err(format!("count over list `{list}` has unsupported predicate in IR").into());
-        }
-        let rows = self.list_memory(list)?;
-        let mut count = 0usize;
-        for index in 0..rows.len() {
-            if self.list_row_matches_predicate(list, index, &predicate)? {
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    fn collect_list_textlike_for_retain(
-        &self,
-        equations: &ListEquationPlan,
-        list: &str,
-        target: &str,
-        field: &str,
-    ) -> RuntimeResult<Vec<String>> {
-        let predicate = equations.retain_predicate(list, target)?;
-        self.collect_list_textlike_matching(list, field, predicate)
-    }
-
-    fn collect_list_textlike_matching(
-        &self,
-        list: &str,
-        field: &str,
-        predicate: RuntimeListPredicate,
-    ) -> RuntimeResult<Vec<String>> {
-        if predicate == RuntimeListPredicate::Unsupported {
-            return Err(format!(
-                "text projection over list `{list}` has unsupported predicate in IR"
-            )
-            .into());
-        }
-        let rows = self.list_memory(list)?;
-        let mut values = Vec::new();
-        for index in 0..rows.len() {
-            let visible = self.list_row_matches_predicate(list, index, &predicate)?;
-            if let Some(value) = while_value(visible, self.list_row_textlike(list, index, field)?) {
-                values.push(value.to_owned());
-            }
-        }
-        Ok(values)
-    }
-
-    fn collect_list_textlike_where_bool(
-        &self,
-        list: &str,
-        text_field: &str,
-        bool_field: &str,
-        expected: bool,
-    ) -> RuntimeResult<Vec<String>> {
-        let rows = self.list_memory(list)?;
-        let mut values = Vec::new();
-        for index in 0..rows.len() {
-            if self.list_row_bool(list, index, bool_field)? == expected {
-                values.push(self.list_row_textlike(list, index, text_field)?.to_owned());
-            }
-        }
-        Ok(values)
-    }
-
-    fn first_list_textlike_where_bool(
-        &self,
-        list: &str,
-        text_field: &str,
-        bool_field: &str,
-        expected: bool,
-    ) -> RuntimeResult<Option<String>> {
-        let rows = self.list_memory(list)?;
-        for index in 0..rows.len() {
-            if self.list_row_bool(list, index, bool_field)? == expected {
-                return Ok(Some(
-                    self.list_row_textlike(list, index, text_field)?.to_owned(),
-                ));
-            }
-        }
-        Ok(None)
-    }
-
-    fn assert_root_textlike(
-        &self,
-        step_id: &str,
-        label: &str,
-        path: &str,
-        expected: &str,
-    ) -> RuntimeResult<()> {
-        let actual = self.root_textlike(path)?;
-        assert_eq_report(step_id, label, &expected, &actual.as_str())
-    }
-
-    fn assert_list_textlike_projection(
-        &self,
-        step_id: &str,
-        label: &str,
-        list: &str,
-        field: &str,
-        predicate: RuntimeListPredicate,
-        expected: &[String],
-    ) -> RuntimeResult<()> {
-        let actual = self.collect_list_textlike_matching(list, field, predicate)?;
-        assert_eq_report(step_id, label, &expected.to_vec(), &actual)
-    }
-
-    fn assert_list_textlike_retain_projection(
-        &self,
-        equations: &ListEquationPlan,
-        step_id: &str,
-        label: &str,
-        list: &str,
-        target: &str,
-        field: &str,
-        expected: &[String],
-    ) -> RuntimeResult<()> {
-        let actual = self.collect_list_textlike_for_retain(equations, list, target, field)?;
-        assert_eq_report(step_id, label, &expected.to_vec(), &actual)
-    }
-
-    fn assert_list_textlike_where_bool(
-        &self,
-        step_id: &str,
-        label: &str,
-        list: &str,
-        text_field: &str,
-        bool_field: &str,
-        expected_bool: bool,
-        expected: &[String],
-    ) -> RuntimeResult<()> {
-        let actual =
-            self.collect_list_textlike_where_bool(list, text_field, bool_field, expected_bool)?;
-        assert_eq_report(step_id, label, &expected.to_vec(), &actual)
-    }
-
-    fn assert_list_count_for_target(
-        &self,
-        equations: &ListEquationPlan,
-        step_id: &str,
-        label: &str,
-        list: &str,
-        target: &str,
-        expected: usize,
-    ) -> RuntimeResult<()> {
-        let actual = self.count_list_rows_for_target(equations, list, target)?;
-        assert_num(step_id, label, expected, actual)
-    }
-
-    fn assert_first_list_textlike_where_bool(
-        &self,
-        step_id: &str,
-        label: &str,
-        list: &str,
-        text_field: &str,
-        bool_field: &str,
-        expected_bool: bool,
-        expected: &str,
-    ) -> RuntimeResult<()> {
-        let actual =
-            self.first_list_textlike_where_bool(list, text_field, bool_field, expected_bool)?;
-        assert_eq_report(step_id, label, &Some(expected.to_owned()), &actual)
-    }
-
-    fn assert_no_list_bool(
-        &self,
-        step_id: &str,
-        list: &str,
-        bool_field: &str,
-        expected_bool: bool,
-    ) -> RuntimeResult<()> {
-        if self.any_list_bool(list, bool_field, expected_bool)? {
-            return Err(
-                format!("{step_id} expected no `{list}.{bool_field}` = {expected_bool}").into(),
-            );
-        }
-        Ok(())
-    }
-
-    fn assert_list_row_textlike(
-        &self,
-        step_id: &str,
-        label: &str,
-        list: &str,
-        index: usize,
-        field: &str,
-        expected: &str,
-    ) -> RuntimeResult<()> {
-        let actual = self.list_row_textlike(list, index, field)?;
-        assert_eq_report(step_id, label, &expected, &actual)
-    }
-
-    fn assert_list_row_bool(
-        &self,
-        step_id: &str,
-        label: &str,
-        list: &str,
-        index: usize,
-        field: &str,
-        expected: bool,
-    ) -> RuntimeResult<()> {
-        let actual = self.list_row_bool(list, index, field)?;
-        assert_eq_report(step_id, label, &expected, &actual)
-    }
-
-    fn any_list_bool(&self, list: &str, field: &str, expected: bool) -> RuntimeResult<bool> {
-        let rows = self.list_memory(list)?;
-        for index in 0..rows.len() {
-            if self.list_row_bool(list, index, field)? == expected {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    fn list_row_field(
-        &self,
-        list: &str,
-        index: usize,
-        field: &str,
-    ) -> RuntimeResult<FieldValueRef<'_>> {
-        let memory = self.list_memory(list)?;
-        memory.value(index, field).ok_or_else(|| {
-            let available = memory
-                .field_names(index)
-                .map(|fields| fields.join(", "))
-                .unwrap_or_else(|| "row index is not visible".to_owned());
-            format!(
-                "generic list `{list}` row missing field `{field}`; available fields: {available}"
-            )
-            .into()
-        })
-    }
 }
 
 impl FieldValueRef<'_> {
@@ -27373,169 +25201,6 @@ fn boon_record_initial_fields(value: BoonValue) -> RuntimeResult<ValueColumns> {
     Ok(columns)
 }
 
-impl RuntimeRowSnapshotTemplate {
-    fn materialize(&self, mut initial_fields: ValueColumns) -> RuntimeResult<RuntimeRowSnapshot> {
-        for field in &self.fields {
-            if initial_fields.contains_key_id(field.field_id.clone()) {
-                if let Some(value) = initial_fields.owned_value(&field.field_name) {
-                    initial_fields.insert_value(base_row_field_name(&field.field_name), value);
-                }
-                continue;
-            }
-            let value = field
-                .initial_value
-                .to_field_value(&initial_fields)
-                .or_else(|error| field.missing_row_initial_value.clone().ok_or(error))?;
-            initial_fields.insert_value(field.field_name.to_string(), value);
-        }
-        self.restore_row_initial_fields_from_base(&mut initial_fields)?;
-        Ok(RuntimeRowSnapshot {
-            columns: initial_fields,
-        })
-    }
-
-    fn restore_row_initial_fields_from_base(&self, fields: &mut ValueColumns) -> RuntimeResult<()> {
-        for field in &self.fields {
-            let RuntimeInitialValue::RowInitialField { path } = &field.initial_value else {
-                continue;
-            };
-            let current = fields.owned_value(&field.field_name);
-            if current
-                .as_ref()
-                .is_some_and(|value| !field_value_is_empty_text(value))
-            {
-                continue;
-            }
-            let Some(value) = row_initial_field_value(fields, path, &field.field_name) else {
-                continue;
-            };
-            if field_value_is_empty_text(&value) {
-                continue;
-            }
-            if fields.contains_key_id(field.field_id.clone()) {
-                fields.set_value(&field.field_name, value)?;
-            } else {
-                fields.insert_value(field.field_name.to_string(), value);
-            }
-        }
-        Ok(())
-    }
-
-    fn fill_missing_row_initial_fields(&self, initial_fields: &mut ValueColumns) {
-        for field in &self.fields {
-            let RuntimeInitialValue::RowInitialField { path } = &field.initial_value else {
-                continue;
-            };
-            let field_id = FieldSlotId::from_path(path);
-            if !initial_fields.contains_key_id(field_id) {
-                let value = field
-                    .missing_row_initial_value
-                    .clone()
-                    .unwrap_or_else(|| FieldValue::Text(String::new()));
-                initial_fields.insert_value(path.clone(), value);
-            }
-        }
-    }
-
-    fn reset_from_initial_value(
-        &self,
-        row: &mut RuntimeRowSnapshot,
-        initial_value: impl Fn(&str) -> Option<FieldValue>,
-    ) -> RuntimeResult<()> {
-        for field in &self.fields {
-            if !row.columns.contains_key_id(field.field_id.clone()) {
-                return Err(format!("generic row missing field `{}`", field.field_name).into());
-            }
-            match &field.initial_value {
-                RuntimeInitialValue::Text(value) => {
-                    row.columns.set_textlike(&field.field_name, value)?
-                }
-                RuntimeInitialValue::Number(value) => row.columns.insert_value(
-                    field.field_name.to_string(),
-                    FieldValue::Json(json!(*value)),
-                ),
-                RuntimeInitialValue::Byte(value) => row.columns.insert_value(
-                    field.field_name.to_string(),
-                    FieldValue::Json(json!(*value)),
-                ),
-                RuntimeInitialValue::Bool(value) => {
-                    row.columns.set_bool(&field.field_name, *value)?
-                }
-                RuntimeInitialValue::Bytes(bytes) => row.columns.set_value(
-                    &field.field_name,
-                    FieldValue::Bytes(RuntimeBytes::inline(Bytes::copy_from_slice(bytes))),
-                )?,
-                RuntimeInitialValue::Enum(value) => {
-                    row.columns.set_textlike(&field.field_name, value)?
-                }
-                RuntimeInitialValue::RootInitialField { path } => {
-                    if let Some(value) = initial_value(path) {
-                        row.columns.set_value(&field.field_name, value)?;
-                    } else if let Some(value) = field.missing_row_initial_value.clone() {
-                        row.columns.set_value(&field.field_name, value)?;
-                    } else {
-                        return Err(format!("root initial field `{path}` is missing").into());
-                    }
-                }
-                RuntimeInitialValue::RowInitialField { path } => {
-                    if let Some(value) =
-                        row_initial_field_value(&row.columns, path, &field.field_name)
-                            .or_else(|| initial_value(path))
-                    {
-                        row.columns.set_value(&field.field_name, value)?;
-                    } else if let Some(value) = field.missing_row_initial_value.clone() {
-                        row.columns.set_value(&field.field_name, value)?;
-                    } else {
-                        return Err(format!("row initial field `{path}` is missing").into());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-impl RuntimeRowSnapshot {
-    fn reserve_textlike_fields(&mut self, additional: usize) -> RuntimeResult<()> {
-        self.columns.reserve_all_textlike(additional);
-        Ok(())
-    }
-}
-
-fn runtime_row_changed_field_names(
-    previous: &RuntimeRowSnapshot,
-    current: &RuntimeRowSnapshot,
-) -> BTreeSet<String> {
-    let previous_fields = previous.columns.field_id_labels();
-    let current_fields = current.columns.field_id_labels();
-    let mut changed = BTreeSet::new();
-    let mut field_ids = previous_fields.keys().cloned().collect::<BTreeSet<_>>();
-    field_ids.extend(current_fields.keys().cloned());
-    for field_id in field_ids {
-        if previous.columns.value_ref_id(&field_id) != current.columns.value_ref_id(&field_id) {
-            let field = previous_fields
-                .get(&field_id)
-                .or_else(|| current_fields.get(&field_id))
-                .cloned()
-                .unwrap_or_else(|| field_id.as_str().to_owned());
-            changed.insert(field);
-        }
-    }
-    changed
-}
-
-fn initialize_indexed_derived_base_fields_from_compiler(
-    fields: &CompilerStorageIndexedDerivedFields,
-    row: &mut RuntimeRowSnapshot,
-) {
-    for field in &fields.fields {
-        if let Some(base_value) = row.columns.owned_value(field) {
-            row.columns
-                .insert_value(base_row_field_name(field), base_value);
-        }
-    }
-}
-
 fn row_initial_field_value(
     initial_fields: &ValueColumns,
     source_field: &str,
@@ -27572,6 +25237,18 @@ fn row_initial_field_value(
 
 fn field_value_is_empty_text(value: &FieldValue) -> bool {
     matches!(value, FieldValue::Text(text) if text.is_empty())
+}
+
+fn initialize_indexed_derived_base_fields_from_compiler(
+    fields: &CompilerStorageIndexedDerivedFields,
+    row: &mut RuntimeRowSnapshot,
+) {
+    for field in &fields.fields {
+        if let Some(base_value) = row.columns.owned_value(field) {
+            row.columns
+                .insert_value(base_row_field_name(field), base_value);
+        }
+    }
 }
 
 fn initialize_indexed_derived_text_fields_from_compiler(
@@ -29922,17 +27599,34 @@ impl<'a> GenericSourceMutation<'a> {
                 field_path: None,
                 value: ProtocolValue::Null,
             }),
-            Self::SourceBind(binding) => Some(GenericCircuitRuntime::semantic_source_delta(
+            Self::SourceBind(binding) => Some(semantic_source_delta(
                 "SourceBind",
                 binding,
                 ProtocolValue::Text(Cow::Owned(binding.source_path.clone())),
             )),
-            Self::SourceUnbind(binding) => Some(GenericCircuitRuntime::semantic_source_delta(
+            Self::SourceUnbind(binding) => Some(semantic_source_delta(
                 "SourceUnbind",
                 binding,
                 ProtocolValue::Null,
             )),
         }
+    }
+}
+
+fn semantic_source_delta<'a>(
+    kind: &'static str,
+    binding: &SourceBinding,
+    value: ProtocolValue<'a>,
+) -> SemanticDelta<'a> {
+    SemanticDelta {
+        kind,
+        list_id: Some(Cow::Owned(binding.list_id.clone())),
+        key: Some(binding.key),
+        generation: Some(binding.generation),
+        source_id: Some(binding.source_id),
+        bind_epoch: Some(binding.bind_epoch),
+        field_path: Some(Cow::Owned(binding.source_path.clone())),
+        value,
     }
 }
 
@@ -32483,8 +30177,7 @@ fn push_bytes_constructor_value(target: &mut Vec<u8>, value: BoonValue) -> Runti
                 Ok(())
             }
             RuntimeBytesPayload::BlobRef { .. } | RuntimeBytesPayload::PageRef { .. } => Err(
-                "BYTES constructor cannot inline blob/page-backed BYTES in the legacy evaluator"
-                    .into(),
+                "BYTES constructor cannot inline blob/page-backed BYTES in this evaluator".into(),
             ),
         },
         other => Err(format!(
@@ -36629,29 +34322,6 @@ impl GenericDerivedPlan {
         }
     }
 
-    fn keys_for_runtime(
-        &self,
-        runtime: &GenericCircuitRuntime,
-    ) -> RuntimeResult<Vec<GenericDerivedKey>> {
-        let mut keys = Vec::new();
-        for field in &self.indexed_fields {
-            if !field.startup_recompute {
-                continue;
-            }
-            if self.list_has_root_list_view(&field.list) {
-                continue;
-            }
-            let row_count = runtime.list_len(&field.list)?;
-            for index in 0..row_count {
-                keys.push(GenericDerivedKey {
-                    list: field.list.clone(),
-                    index,
-                    field: field.field.clone(),
-                });
-            }
-        }
-        Ok(keys)
-    }
 }
 
 fn root_derived_source_read_path_matches(root_path: &str, read_path: &str) -> bool {
@@ -41707,22 +39377,6 @@ mod tests {
             plan_executor_source_replay_identity_for_report(&report).as_ref()
         );
 
-        let mut retired_engine_report = report.clone();
-        retired_engine_report["command_argv"] = json!([
-            "target/debug/boon_cli",
-            "run",
-            "examples/cells.bn",
-            "--scenario",
-            "examples/cells.scn",
-            "--engine",
-            "plan",
-            "--report",
-            "target/reports/bytes-plan/cells-scenario-events-full.json"
-        ]);
-        assert!(
-            plan_executor_source_replay_identity_for_report(&retired_engine_report).is_none(),
-            "retired --engine source replay argv must not mint scoped freshness identity"
-        );
     }
 
     #[test]
@@ -41839,26 +39493,6 @@ FUNCTION app() {
     }
 
     #[test]
-    fn cells_sources_do_not_use_legacy_formula_operators() {
-        let legacy_operator_prefix = ["For", "mula", "/"].concat();
-        for (path, source) in [
-            (
-                "examples/cells/formula.bn",
-                include_str!("../../../examples/cells/formula.bn"),
-            ),
-            (
-                "examples/cells/cell.bn",
-                include_str!("../../../examples/cells/cell.bn"),
-            ),
-        ] {
-            assert!(
-                !source.contains(&legacy_operator_prefix),
-                "{path} must express cell calculation in ordinary Boon source"
-            );
-        }
-    }
-
-    #[test]
     fn cells_formula_scans_with_ascii_bytes_after_text_boundary() {
         let source = include_str!("../../../examples/cells/formula.bn");
 
@@ -41913,35 +39547,6 @@ FUNCTION app() {
             }),
             "Cells should not lower through spreadsheet-specific operators"
         );
-    }
-
-    #[test]
-    fn production_runtime_sources_do_not_contain_legacy_formula_runtime_symbols() {
-        let forbidden = [
-            ["For", "mula", "Ast"].concat(),
-            ["For", "mula", "Term"].concat(),
-            ["For", "mula", "Operator", "Plan"].concat(),
-            ["Addressed", "For", "mula", "Runtime"].concat(),
-            ["parse", "_formula", "_ast"].concat(),
-            ["formula", "_ast", "_dependencies"].concat(),
-        ];
-        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        for relative in [
-            "../boon_parser/src/lib.rs",
-            "../boon_ir/src/lib.rs",
-            "src/lib.rs",
-        ] {
-            let path = crate_root.join(relative);
-            let text = std::fs::read_to_string(&path).unwrap();
-            for needle in &forbidden {
-                assert!(
-                    !text.contains(needle),
-                    "{} still contains legacy formula runtime symbol `{}`",
-                    path.display(),
-                    needle
-                );
-            }
-        }
     }
 
     fn physical_todomvc_project_for_test() -> ParsedProgram {
@@ -42029,10 +39634,6 @@ FUNCTION app() {
         assert!(
             build_source.contains("Bytes/to_text(encoding: Utf8)"),
             "BUILD.bn should decode icon payloads through an explicit BYTES/TEXT boundary"
-        );
-        assert!(
-            !build_source.contains("File/read_text()"),
-            "BUILD.bn should not keep the legacy text-only file read path"
         );
         for relative in [
             "Theme/Glassmorphism.bn",
@@ -42454,26 +40055,30 @@ FUNCTION icon_code(item) {
                 fixture.compiled.storage_initialization.list_slots.len(),
                 "decoded list slot count differs for {example}"
             );
-            let decoded_storage = decoded.instantiate_storage().unwrap();
-            let planned_storage = fixture
-                .compiled
-                .storage_initialization
-                .instantiate_storage()
-                .unwrap();
+            for (decoded_slot, planned_slot) in decoded
+                .root_slots
+                .iter()
+                .zip(fixture.compiled.storage_initialization.root_slots.iter())
+            {
+                assert_eq!(
+                    decoded_slot.path, planned_slot.path,
+                    "decoded root path differs for {example}"
+                );
+                assert_eq!(
+                    decoded_slot.initial_value, planned_slot.initial_value,
+                    "decoded root initial value differs for {} in {example}",
+                    decoded_slot.path
+                );
+            }
             assert_eq!(
-                decoded_storage.root, planned_storage.root,
-                "decoded root storage differs for {example}"
-            );
-            assert_eq!(
-                decoded_storage.lists.list_slots.len(),
-                planned_storage.lists.list_slots.len(),
+                decoded.list_slots.len(),
+                fixture.compiled.storage_initialization.list_slots.len(),
                 "decoded list slot count differs for {example}"
             );
-            for (decoded_slot, planned_slot) in decoded_storage
-                .lists
+            for (decoded_slot, planned_slot) in decoded
                 .list_slots
                 .iter()
-                .zip(planned_storage.lists.list_slots.iter())
+                .zip(fixture.compiled.storage_initialization.list_slots.iter())
             {
                 assert_eq!(
                     decoded_slot.name, planned_slot.name,
@@ -42485,8 +40090,13 @@ FUNCTION icon_code(item) {
                     decoded_slot.name
                 );
                 assert_eq!(
-                    decoded_slot.memory.visible_snapshots(),
-                    planned_slot.memory.visible_snapshots(),
+                    decoded_slot.row_template.fields.len(),
+                    planned_slot.row_template.fields.len(),
+                    "decoded row-template field count differs for {} in {example}",
+                    decoded_slot.name
+                );
+                assert_eq!(
+                    decoded_slot.initial_rows, planned_slot.initial_rows,
                     "decoded initial rows differ for {} in {example}",
                     decoded_slot.name
                 );
@@ -43003,7 +40613,7 @@ FUNCTION icon_code(item) {
         assert_eq!(
             artifact_output.render_patches.len(),
             0,
-            "{label} PlanExecutor artifact scenario should not claim legacy render-patch output"
+            "{label} PlanExecutor artifact scenario should not claim obsolete render-patch output"
         );
         assert_eq!(
             source_output.state_summary, artifact_output.state_summary,
@@ -43435,54 +41045,6 @@ FUNCTION decorate(value) {
             loaded["compiled_artifact"]["sha256"].as_str(),
             Some(sha256_file(&artifact).unwrap().as_str())
         );
-    }
-
-    #[test]
-    fn runtime_storage_initialization_plan_matches_ir_storage() {
-        for_core_compiled_programs(|example, ir, compiled| {
-            let legacy = GenericCircuitRuntime::new(&ir).unwrap();
-            let planned = compiled
-                .storage_initialization
-                .instantiate_storage()
-                .unwrap();
-            assert_eq!(
-                planned.root, legacy.root,
-                "root storage differs for {example}"
-            );
-            assert_eq!(
-                planned.lists.list_slots.len(),
-                legacy.lists.list_slots.len(),
-                "list slot count differs for {example}"
-            );
-            for (planned_slot, legacy_slot) in planned
-                .lists
-                .list_slots
-                .iter()
-                .zip(legacy.lists.list_slots.iter())
-            {
-                assert_eq!(
-                    planned_slot.name, legacy_slot.name,
-                    "list name differs for {example}"
-                );
-                assert_eq!(
-                    planned_slot.capacity, legacy_slot.capacity,
-                    "list capacity differs for {} in {example}",
-                    planned_slot.name
-                );
-                assert_eq!(
-                    planned_slot.row_template.fields.len(),
-                    legacy_slot.row_template.fields.len(),
-                    "row template length differs for {} in {example}",
-                    planned_slot.name
-                );
-                assert_eq!(
-                    planned_slot.memory.visible_snapshots(),
-                    legacy_slot.memory.visible_snapshots(),
-                    "initial rows differ for {} in {example}",
-                    planned_slot.name
-                );
-            }
-        });
     }
 
     #[test]
@@ -45140,55 +42702,6 @@ FUNCTION new_marker(marker) {
             .collect::<BTreeSet<_>>();
         assert!(removed_lists.contains("groups"));
         assert!(removed_lists.contains("markers"));
-    }
-
-    #[test]
-    fn generic_runtime_owns_todo_list_structural_checks() {
-        let parsed = parse_source(
-            "examples/todomvc.bn",
-            include_str!("../../../examples/todomvc.bn"),
-        )
-        .unwrap();
-        let ir = lower(&parsed).unwrap();
-        let compiled = CompiledProgram::from_ir(&ir).unwrap();
-        let mut generic = GenericCircuitRuntime::new(&ir).unwrap();
-
-        let bad_append = generic
-            .append_row_for_trigger(
-                &compiled.list_equations,
-                "todos",
-                "store.sources.new_todo_input.key_down",
-                0,
-                todo_generic_row("Wrong trigger"),
-            )
-            .unwrap_err()
-            .to_string();
-        assert!(bad_append.contains("does not match IR trigger"));
-        assert_eq!(generic.list_len("todos").unwrap(), 4);
-
-        let clear_source = "store.sources.clear_completed_button.press";
-        let clear_predicate = compiled
-            .source_routes
-            .for_source(clear_source)
-            .unwrap()
-            .list_remove_predicate("todos")
-            .unwrap();
-        assert!(
-            generic
-                .remove_row_for_predicate("todos", clear_predicate.clone(), 0)
-                .unwrap()
-                .is_none(),
-            "clear completed must not remove an active row"
-        );
-        generic
-            .commit_indexed_bool_field("todos", 0, "completed", true)
-            .unwrap();
-        let removed = generic
-            .remove_row_for_predicate("todos", clear_predicate, 0)
-            .unwrap()
-            .expect("completed row should match the IR-derived remove predicate");
-        assert_eq!(removed.key, 1);
-        assert_eq!(generic.list_len("todos").unwrap(), 3);
     }
 
     #[test]
@@ -48047,8 +45560,6 @@ payload:
         assert_eq!(output.state_summary["store.selected_filter"], "All");
         assert_eq!(output.state_summary["store.new_todo_focused"], true);
         assert!(output.report.get("comparison_status").is_none());
-        assert!(output.report.get("legacy_comparison").is_none());
-        assert!(output.report.get("legacy_comparison_acceptance").is_none());
         assert_eq!(
             output.report["command_report_assembly_core"]["executor"],
             "cpu-plan-root-scenario-command-report-assembly-v1"
@@ -48078,8 +45589,6 @@ payload:
 
     fn assert_root_scenario_product_only(report: &JsonValue) {
         assert!(report.get("comparison_status").is_none());
-        assert!(report.get("legacy_comparison").is_none());
-        assert!(report.get("legacy_comparison_acceptance").is_none());
     }
 
     #[test]
@@ -48320,7 +45829,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
         assert_eq!(output.report["status"], "pass");
         assert_eq!(output.state_summary["store.flag"], true);
         assert!(output.report.get("comparison_status").is_none());
-        assert!(output.report.get("legacy_comparison").is_none());
         assert_eq!(
             output.report["command_report_assembly_core"]["executor"],
             "cpu-plan-source-route-command-report-assembly-v1"
@@ -48384,16 +45892,8 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Root }))
                 .expect("Cells expected-source-event scenario should run through PlanExecutor");
 
                 assert!(
-                    output.report.get("legacy_comparison").is_none(),
-                    "Cells product scenario events must not emit legacy comparison"
-                );
-                assert!(
-                    output.report.get("legacy_comparison_acceptance").is_none(),
-                    "Cells product scenario events must not emit legacy acceptance policy"
-                );
-                assert!(
                     output.report.get("comparison_status").is_none(),
-                    "Cells product scenario events must not emit legacy comparison status"
+                    "Cells product scenario events must not emit comparison status"
                 );
                 assert_eq!(
                     output.report["status"], "pass",
@@ -51224,7 +48724,7 @@ expected_source_event = {{ source = "store.decode" }}
         );
         assert!(
             output.render_patches.is_empty(),
-            "{label} PlanExecutor live batch must not synthesize legacy render patches"
+            "{label} PlanExecutor live batch must not synthesize obsolete render patches"
         );
         assert_eq!(
             runtime.engine_provenance_report()["generic_fallback_enabled"],
@@ -51637,7 +49137,7 @@ expected_source_event = {{ source = "store.decode" }}
         );
         assert!(
             output.render_patches.is_empty(),
-            "PlanExecutor live turn must not synthesize legacy render patches during this slice"
+            "PlanExecutor live turn must not synthesize obsolete render patches during this slice"
         );
     }
 
@@ -52156,7 +49656,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
                 live_source_event_from_generic(&generic_event),
                 &["store.new_todo_text".to_owned()],
             )
-            .expect("PlanExecutor sparse step helper should not mutate legacy runtime");
+            .expect("PlanExecutor sparse step helper should stay PlanExecutor-only");
         assert_eq!(
             sparse.value_summaries["store.new_todo_text"]["kind"],
             "string"
@@ -52169,7 +49669,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     }
 
     #[test]
-    fn live_runtime_plan_executor_rejects_legacy_only_outputs_without_fallback() {
+    fn live_runtime_plan_executor_rejects_missing_outputs_without_fallback() {
         let source = r#"
 prelude: [
     noop: SOURCE
@@ -52184,7 +49684,7 @@ store: [
 
 document: Document/new(root: Element/label(element: [], label: store.value))
 "#;
-        let mut runtime = LiveRuntime::from_source("plan-executor-legacy-output-guard", source)
+        let mut runtime = LiveRuntime::from_source("plan-executor-output-guard", source)
             .expect("source should initialize in PlanExecutor mode");
         let world_error = runtime
             .world_scene_output()
@@ -52895,47 +50395,6 @@ document: Document/new(root: Element/label(element: [], label: store.value))
                 "field_collision_1469".to_owned(),
                 "field_collision_2806".to_owned()
             ]
-        );
-    }
-
-    #[test]
-    fn runtime_list_store_keeps_hidden_list_slots_sorted_for_dense_lookup() {
-        let mut store = RuntimeListStore::default();
-        store.insert(
-            ListId(0),
-            "todos".to_owned(),
-            ListMemory::from_values([todo_generic_row("A")]),
-            Some(4),
-            RuntimeRowSnapshotTemplate::default(),
-        );
-        let mut address_row = ValueColumns::default();
-        address_row.insert_value("address".to_owned(), FieldValue::Text("A0".to_owned()));
-        store.insert(
-            ListId(1),
-            "cells".to_owned(),
-            ListMemory::from_values([RuntimeRowSnapshot {
-                columns: address_row,
-            }]),
-            Some(26),
-            RuntimeRowSnapshotTemplate::default(),
-        );
-        store.insert(
-            ListId(0),
-            "todos".to_owned(),
-            ListMemory::from_values([todo_generic_row("B")]),
-            Some(8),
-            RuntimeRowSnapshotTemplate::default(),
-        );
-
-        assert_eq!(store.capacity("todos"), Some(8));
-        assert_eq!(store.capacity("cells"), Some(26));
-        assert_eq!(store.memory("todos").unwrap().len(), 1);
-        assert_eq!(store.memory("cells").unwrap().len(), 1);
-        assert!(
-            store
-                .list_slots
-                .windows(2)
-                .all(|window| window[0].list_id < window[1].list_id)
         );
     }
 

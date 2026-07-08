@@ -1,0 +1,6 @@
+name = "named bytes payload rejected"
+source = "examples/bytes_source_payload_plan_ops.bn"
+
+[[step]]
+id = "receive-bytes"
+expected_source_event = { source = "store.receive", blob_bytes_hex = "01fe04" }

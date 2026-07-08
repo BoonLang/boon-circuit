@@ -73,7 +73,7 @@ toplevel scraping, compositor activation, or whole-desktop screenshots as
 verification evidence; the native proof must come from app-owned reports,
 process IDs, host events, and WGPU readback.
 
-Do not use legacy Ply, Xvfb, whole-desktop screenshots, `xdotool`, `ydotool`,
+Do not use Ply, Xvfb, whole-desktop screenshots, `xdotool`, `ydotool`,
 direct COSMIC toplevel probing, or browser windows as evidence for the native
 GPU path. Use app-owned WGPU readback screenshots, native GPU reports, and the
 host-event verifier route described in `docs/architecture/NATIVE_GPU_PIPELINE.md`.

@@ -1,0 +1,13 @@
+store: [
+    load: SOURCE
+    path:
+        @PATH_INITIAL@ |> HOLD path { LATEST {} }
+    file_bytes:
+        BYTES {} |> HOLD file_bytes {
+            LATEST {
+                store.load |> THEN { store.path |> File/read_bytes() }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { File bytes }))

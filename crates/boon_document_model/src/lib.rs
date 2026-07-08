@@ -146,16 +146,6 @@ impl<'de> Deserialize<'de> for StyleValue {
     }
 }
 
-impl StyleValue {
-    pub fn from_legacy_rich_text_spans_json(payload: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str::<Vec<StyleRichTextSpan>>(payload).map(Self::RichTextSpans)
-    }
-
-    pub fn from_legacy_editor_type_hints_json(payload: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str::<Vec<StyleEditorTypeHint>>(payload).map(Self::EditorTypeHints)
-    }
-}
-
 pub type StyleMap = BTreeMap<String, StyleValue>;
 pub type StylePatch = BTreeMap<String, Option<StyleValue>>;
 
@@ -537,39 +527,6 @@ mod tests {
                 serde_json::from_value(encoded).expect("typed style value should deserialize");
             assert_eq!(decoded, value);
         }
-    }
-
-    #[test]
-    fn legacy_typed_style_payload_strings_decode_only_through_explicit_helpers() {
-        let rich_text_payload = serde_json::to_string(&vec![StyleRichTextSpan {
-            text: "SOURCE".to_owned(),
-            source_text: Some("SOURCE".to_owned()),
-            color: Some("#ff0000".to_owned()),
-            font_style: Some("italic".to_owned()),
-            font_weight: Some("bold".to_owned()),
-        }])
-        .unwrap();
-        let decoded_scalar: StyleValue =
-            serde_json::from_value(serde_json::Value::String(rich_text_payload.clone()))
-                .expect("legacy scalar string should remain a text style");
-        assert!(matches!(decoded_scalar, StyleValue::Text(_)));
-
-        let decoded_rich_text =
-            StyleValue::from_legacy_rich_text_spans_json(&rich_text_payload).unwrap();
-        assert!(matches!(decoded_rich_text, StyleValue::RichTextSpans(_)));
-
-        let hint_payload = serde_json::to_string(&vec![StyleEditorTypeHint {
-            line: 2,
-            start: 4,
-            end: 8,
-            anchor_column: 12,
-            category: "return".to_owned(),
-            compact_label: "TEXT".to_owned(),
-            detail_label: "TEXT value".to_owned(),
-        }])
-        .unwrap();
-        let decoded_hints = StyleValue::from_legacy_editor_type_hints_json(&hint_payload).unwrap();
-        assert!(matches!(decoded_hints, StyleValue::EditorTypeHints(_)));
     }
 
     #[test]

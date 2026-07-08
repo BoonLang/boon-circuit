@@ -1,0 +1,29 @@
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { curved_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { cone_part }
+            geometry: Solid/cone(radius0: 8, radius1: 3, height: 20)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { torus_part }
+            geometry: Solid/torus(major_radius: 12, minor_radius: 2)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+        Part/new(
+            id: TEXT { sphere_part }
+            geometry: Solid/sphere(radius: 6)
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)

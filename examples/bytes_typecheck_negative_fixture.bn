@@ -1,0 +1,47 @@
+SOURCE
+HOLD
+LATEST
+LIST {}
+bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
+too_short: BYTES[2] { 16u01 }
+implicit_text: BYTES[__] { TEXT { hi } }
+bad_count: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 3, endian: Little)
+bad_endian: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Middle)
+bad_length_input: Bytes/length(input: TEXT { bad })
+missing_get_input: Bytes/get(index: 0)
+missing_set_index: bytes |> Bytes/set(value: 16u01)
+bad_decode_encoding: bytes |> Bytes/to_text(encoding: Middle)
+missing_decode_encoding: bytes |> Bytes/to_text
+bad_encode_encoding: TEXT { hi } |> Text/to_bytes(encoding: Middle)
+missing_encode_encoding: TEXT { hi } |> Text/to_bytes
+bad_ascii_static_text: TEXT { č } |> Text/to_bytes(encoding: Ascii)
+bad_static_hex_odd: TEXT { 123 } |> Bytes/from_hex
+bad_static_hex_digit: TEXT { 12XX } |> Bytes/from_hex
+bad_static_base64_length: TEXT { AQI } |> Bytes/from_base64
+bad_static_base64_digit: TEXT { AQ*D } |> Bytes/from_base64
+unknown_extra_arg: bytes |> Bytes/find(needle: BYTES[1] { 16u02 }, surprise: 1)
+bad_zeros_input: Bytes/zeros(input: bytes, byte_count: 4)
+bad_zeros_pipe: bytes |> Bytes/zeros(byte_count: 4)
+missing_zeros_count: Bytes/zeros()
+bad_positional_slice: Bytes/slice(TEXT { bad }, offset: 0, byte_count: 2)
+bad_positional_bytes_slice: Bytes/slice(BYTES[4] { 16u01, 16u02, 16u03, 16u04 }, offset: 1, byte_count: 4)
+bad_get_bounds: bytes |> Bytes/get(index: 4)
+bad_get_negative_bounds: bytes |> Bytes/get(index: -1)
+bad_set_bounds: bytes |> Bytes/set(index: 4, value: 16u01)
+bad_slice_bounds: bytes |> Bytes/slice(offset: 3, byte_count: 2)
+bad_slice_negative_bounds: bytes |> Bytes/slice(offset: -1, byte_count: 2)
+bad_take_bounds: bytes |> Bytes/take(byte_count: 5)
+bad_drop_bounds: bytes |> Bytes/drop(byte_count: 5)
+bad_read_bounds: bytes |> Bytes/read_unsigned(offset: 2, byte_count: 4, endian: Little)
+bad_write_bounds: bytes |> Bytes/write_unsigned(offset: 2, byte_count: 4, endian: Little, value: 1)
+bad_read_signed_bounds: bytes |> Bytes/read_signed(offset: 2, byte_count: 4, endian: Little)
+bad_write_signed_bounds: bytes |> Bytes/write_signed(offset: 2, byte_count: 4, endian: Little, value: 1)
+bad_folded_static_integer_overflow: bytes |> Bytes/get(index: 170141183460469231731687303715884105727 + 1)
+bad_folded_static_integer_plan_range: bytes |> Bytes/get(index: 9223372036854775807 + 1)
+bad_folded_slice_offset_overflow: bytes |> Bytes/slice(offset: 170141183460469231731687303715884105727 + 1, byte_count: 2)
+bad_folded_zeros_count_overflow: Bytes/zeros(byte_count: 170141183460469231731687303715884105727 + 1)
+bad_folded_zeros_count_plan_range: Bytes/zeros(byte_count: 9223372036854775807 + 1)
+bad_folded_write_unsigned_value_negative_plan_range: bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Little, value: 0 - 1)
+bad_folded_write_signed_value_plan_range: bytes |> Bytes/write_signed(offset: 0, byte_count: 4, endian: Little, value: 0 - 9223372036854775808 * 2)
+bad_unsupported_static_integer_division: bytes |> Bytes/get(index: 4 / 2)
+document: []

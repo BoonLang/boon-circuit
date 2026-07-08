@@ -316,7 +316,6 @@ A terminal backend can implement the same driver concepts:
 - Rename current `host-synthetic` reports to `boon-driver` where they satisfy
   the stricter path.
 - Keep compatibility fields temporarily:
-  - `legacy_evidence_tier: host-synthetic`;
   - `evidence_tier: boon-driver`.
 - Fail if the action bypasses the app input adapter or document hit testing.
 - Update TodoMVC and Cells reports to include BoonDriver action proofs.

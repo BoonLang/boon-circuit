@@ -1,0 +1,21 @@
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { lofted_rectangle_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { lofted_rectangle_part }
+            geometry: Solid/loft(
+                bottom_size: [x: 36, y: 20, z: 0]
+                top_size: [x: 18, y: 10, z: 0]
+                height: 12
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)

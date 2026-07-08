@@ -1,0 +1,20 @@
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { shell_box_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { shell_box_part }
+            geometry: Solid/shell(
+                child: Solid/box(size: [x: 40, y: 24, z: 16])
+                thickness: 2
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)

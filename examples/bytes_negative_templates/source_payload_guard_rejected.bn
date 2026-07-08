@@ -1,0 +1,14 @@
+store: [
+    trigger: SOURCE
+    receive: SOURCE
+    matched:
+        False |> HOLD matched {
+            LATEST {
+                store.receive.bytes |> WHEN {
+                    __ => True
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))

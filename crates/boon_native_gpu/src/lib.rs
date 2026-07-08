@@ -11023,7 +11023,7 @@ mod tests {
             );
             assert!(
                 first.queue_write_count < first.dirty_upload_range_count.saturating_mul(3),
-                "interleaved POD uploads should use one queue write per dirty batch instead of the legacy split-buffer three writes"
+                "interleaved POD uploads should use one queue write per dirty batch"
             );
             assert!(first.allocated_gpu_bytes >= first.upload_bytes);
             assert_eq!(first.upload_bytes % NATIVE_GPU_QUAD_VERTEX_STRIDE, 0);

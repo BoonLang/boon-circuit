@@ -1,0 +1,20 @@
+prelude: [
+    noop: SOURCE
+    hold_marker: TEXT { HOLD }
+    latest_marker: TEXT { LATEST }
+]
+
+manufacturing: Assembly/new(
+    id: TEXT { translated_rounded_box_assembly }
+    parts: LIST {
+        Part/new(
+            id: TEXT { translated_rounded_box_part }
+            geometry: Solid/translate(
+                child: Solid/rounded_box(size: [x: 28, y: 16, z: 8], radius: 3)
+                by: [x: 4, y: 5, z: 6]
+            )
+            physical_material: TEXT { PLA }
+            manufacturing_role: PrintableSolid
+        )
+    }
+)

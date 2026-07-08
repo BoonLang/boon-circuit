@@ -47,8 +47,8 @@ The main performance target is:
   compatibility paths.
 - `SourceStore::unbind_row` currently takes a row slot before validating the
   row identity, making stale unbinds dangerous for future cache correctness.
-- `GenericCircuitRuntime::classify_source_event` still classifies events with
-  ordered route-kind heuristics.
+- PlanExecutor source-event routing still needs periodic audits for ordered
+  route-kind heuristics and fallback classification.
 - `apply_source_actions` clones the action vector for every source application.
 - `FieldSlotId::from_path` still uses hash-derived field IDs with a small masked
   ID space, which is a long-term collision and diagnostics risk.

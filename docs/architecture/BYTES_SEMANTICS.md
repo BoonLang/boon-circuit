@@ -3,8 +3,8 @@
 This document records the v1 language/runtime contract for Boon `BYTES`.
 
 Status: partial implementation. The parser, typechecker signatures, IR
-expression coverage, and legacy runtime literal carrier have initial support.
-PlanExecutor storage, full builtin runtime bodies, example refactors, and final
+expression coverage, PlanExecutor byte storage, and runtime byte carriers have
+initial support. Full builtin runtime bodies, example refactors, and final
 verification gates are still part of the active BYTES/MachinePlan roadmap.
 
 ## Values
@@ -133,15 +133,15 @@ memory, or depend on the host machine endian.
 
 ## Current Implementation Notes
 
-The legacy runtime can currently carry inline, shared, blob-ref, and page-ref
-runtime bytes from bridge paths and source/runtime execution paths.
-Source-language BYTES literals currently lower through the legacy evaluator as
-inline runtime bytes. Runtime-owned dynamic payloads larger than the
+PlanExecutor/runtime byte paths can currently carry inline, shared, blob-ref,
+and page-ref runtime bytes from bridge paths and source/runtime execution paths.
+Source-language BYTES literals currently lower to inline runtime bytes.
+Runtime-owned dynamic payloads larger than the
 source-event inline limit use shared executable storage: public summaries still
 expose only storage kind, digest, and byte length, while byte operations borrow
 the shared payload through the private runtime representation. Blob/page-backed
-concatenation in constructors is intentionally rejected in the legacy evaluator
-until a resolver exists for descriptor-only external byte references.
+concatenation in constructors is intentionally rejected until a resolver exists
+for descriptor-only external byte references.
 
 The final PlanExecutor path must not execute parser AST or string paths for
 BYTES. It must use typed IDs, typed storage layout, typed operation regions,

@@ -1,0 +1,26 @@
+store: [
+    rows:
+        LIST {
+@ROWS@
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        write: SOURCE
+        name: row.name
+@PATH_BINDING@        payload:
+            row.payload |> HOLD payload {
+                LATEST {}
+            }
+        write_status:
+            row.write_status |> HOLD write_status {
+                LATEST {
+                    write |> THEN { @WRITE_EXPR@ }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { @LABEL@ }))

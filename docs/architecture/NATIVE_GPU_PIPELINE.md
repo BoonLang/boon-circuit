@@ -1026,7 +1026,6 @@ blockers.
 
 The aggregate control plane must classify stale identity before data-plane
 validation. If a child report was generated for a stale git commit, stale
-worktree fingerprint, stale scoped verifier identity, or stale legacy binary
 hash, the aggregate records refresh debt with the manifest-canonical command and
 skips schema, native-contract, semantic, and artifact validation for that child
 until it is regenerated. Fresh child reports still receive full validation.
@@ -1040,7 +1039,6 @@ artifact, the aggregate must classify that child as refresh debt rather than a
 true product blocker. Fresh true blockers are reserved for failures that remain
 after the consumed evidence is current.
 
-Native reports carry both the legacy full `worktree_fingerprint` and scoped
 fingerprints in `worktree_fingerprints`. The handoff aggregate may use the
 `native-gpu-handoff` scoped fingerprint for native child freshness. The scoped
 fingerprint includes product/verifier inputs such as `crates/`, `examples/`,
@@ -1051,30 +1049,24 @@ otherwise current product reports. Scoped fingerprint material must include the
 scoped committed `HEAD` tree/blob identity plus scoped dirty status and diff;
 status/diff-only scoped fingerprints are not sufficient freshness evidence
 after commits. Older reports without the scoped field are refresh debt for the
-handoff aggregate; the full worktree fingerprint is preserved only as legacy
 diagnostic context and must not make a missing scoped fingerprint fresh.
 
 Native `xtask` reports also carry `verifier_identity`, a scoped verifier
 contract identity containing the identity kind, scheme version, command,
 measurement mode, contract version, canonical verifier arguments, and identity
 hash. When present, `verifier_identity` is authoritative for verifier freshness:
-a matching scoped identity may supersede a stale legacy `binary_hash`, while a
-mismatched scoped identity is refresh debt even if the legacy binary hash
-matches. Reports without `verifier_identity` fall back to the legacy
 `binary_hash` check. This keeps harmless aggregate/schema binary churn from
 forcing product verifier reruns without weakening stale-report detection for
 reports that have no scoped identity.
 
 PlanExecutor source replay reports must describe product execution directly in
 the BYTES/MachinePlan verifier. Top-level `status` is product acceptance, and
-`plan_executor_status` proves the PlanExecutor lane. Legacy oracle parity and
 old product-acceptance side channels are not part of product source-replay
 reports; any future comparison gate must use an explicit diagnostic report.
 Native preview E2E does not consume those reports.
 
 PlanExecutor source replay reports carry source-replay freshness evidence
 separate from native verifier identity. `run-plan-scenario-events` reports keep
-the legacy full `worktree_fingerprint`, but also include
 `worktree_fingerprint_scope=plan-executor-source-replay`, scoped entries in
 `worktree_fingerprints`, and `source_replay_identity`. The scope is limited to
 Cargo metadata plus the compiler/runtime/PlanExecutor/CLI crates needed to
@@ -1125,13 +1117,11 @@ with bounded report and sidecar budgets:
 cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
 ```
 
-Do not run the legacy readiness audits as part of this architecture gate. The
 old `verify-report-schema`, `audit-machine-readiness`, `audit-goal-readiness`,
 Ply headed/headless, COSMIC split-launch, Xvfb, and browser/playground-smoke
 paths belong to the historical verification system and must not be used to prove
 the native two-window GPU playground. If broader repo readiness is rebuilt later,
 it must consume `target/reports/native-gpu-all.json` without launching or
-requiring legacy Ply/COSMIC/browser surfaces.
 
 `verify-platform-contract` must fail if core crates expose `app_window`, `wgpu`,
 `glyphon`, Wayland/X11, native process/window IDs, DOM types, terminal escape
@@ -1295,7 +1285,6 @@ Implementation may be staged, but final acceptance for this architecture is the
 two-process preview/dev desktop path with all gates passing. A preview-only probe
 is an intermediate milestone, not handoff readiness.
 
-1. Keep the native GPU path isolated from legacy browser, Ply, Xvfb, and
    compositor-probing verifiers.
 2. Keep human observation as follow-up evidence only; do not weaken native GPU
    report requirements to make a manual path look complete.
@@ -1314,7 +1303,6 @@ is an intermediate milestone, not handoff readiness.
 8. Add virtualized Cells grid rendering and code editor scrolling.
 9. Add the platform, dependency, architecture, layout, shader, multi-window,
    IPC, observability, E2E, negative-fixture, and scroll-speed gates.
-10. Keep removed legacy verifier paths out of `xtask`; old command names may
     only fail fast with a native-GPU replacement message.
 
 At no point should implementation make an example smaller, hardcode an example

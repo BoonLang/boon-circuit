@@ -59,7 +59,7 @@ The first implementation is only convincing if these are true:
 6. Browser/server runtime sync can exchange semantic deltas, not full state.
 7. Every stateful value has a visible next-state equation.
 8. TodoMVC is accepted through app-owned native GPU host-event evidence, not
-   legacy Ply, browser, Xvfb, COSMIC screenshots, or fabricated manual proof.
+   Ply, browser, Xvfb, COSMIC screenshots, or fabricated manual proof.
 9. Cells and future examples use the same generic native/document/runtime
    verification contract without example-specific runtime or renderer hacks.
 10. Normal interactions complete in a couple of milliseconds in release mode

@@ -3574,9 +3574,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
 
     let compiler_lib = fs::read_to_string("crates/boon_compiler/src/lib.rs").unwrap_or_default();
     let runtime_source = fs::read_to_string("crates/boon_runtime/src/lib.rs").unwrap_or_default();
-    let cli_source = fs::read_to_string("crates/boon_cli/src/main.rs").unwrap_or_default();
-    let native_app_window_source =
-        fs::read_to_string("crates/boon_native_app_window/src/lib.rs").unwrap_or_default();
     let native_playground_source =
         fs::read_to_string("crates/boon_native_playground/src/main.rs").unwrap_or_default();
     let xtask_source = fs::read_to_string("crates/xtask/src/main.rs").unwrap_or_default();
@@ -3874,16 +3871,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         toml_has_optional_dependency(&plan_cargo, "boon_parser");
     let plan_optionally_depends_on_typecheck =
         toml_has_optional_dependency(&plan_cargo, "boon_typecheck");
-    let plan_old_ir_adapter_feature_present =
-        toml_feature_includes(&plan_cargo, "legacy-ir-adapter", "dep:boon_ir");
-    let plan_old_backend_feature_present =
-        toml_feature_includes(&plan_cargo, "legacy-compiler-backend", "dep:boon_ir")
-            || toml_feature_includes(&plan_cargo, "legacy-compiler-backend", "dep:boon_parser")
-            || toml_feature_includes(&plan_cargo, "legacy-compiler-backend", "dep:boon_typecheck");
-    let compiler_enables_old_backend_feature =
-        toml_dependency_feature_enabled(&compiler_cargo, "boon_plan", "legacy-compiler-backend");
-    let compiler_enables_old_ir_adapter_feature =
-        toml_dependency_feature_enabled(&compiler_cargo, "boon_plan", "legacy-ir-adapter");
     let plan_schema_owns_ids = [
         "pub struct SourceId",
         "pub struct StateId",
@@ -3936,8 +3923,7 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         && !toml_has_required_dependency(&plan_cargo, "boon_typecheck")
         && !plan_optionally_depends_on_ir
         && !plan_optionally_depends_on_parser
-        && !plan_optionally_depends_on_typecheck
-        && !plan_old_ir_adapter_feature_present;
+        && !plan_optionally_depends_on_typecheck;
     let plan_default_build_schema_only = plan_frontend_dependencies_optional_only
         && plan_schema_owns_ids
         && plan_schema_owns_source_payload_schema;
@@ -3970,9 +3956,7 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         }),
     );
 
-    let machine_plan_backend_owned_by_compiler = !plan_old_backend_feature_present
-        && !compiler_enables_old_backend_feature
-        && !facade_delegates_to_plan_backend
+    let machine_plan_backend_owned_by_compiler = !facade_delegates_to_plan_backend
         && !plan_imports_parser_ast
         && compiler_owns_machine_plan_backend_source;
     push_audit_check(
@@ -3981,10 +3965,10 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         "compiler-boundaries:machine-plan-backend-owned-by-compiler",
         machine_plan_backend_owned_by_compiler,
         format!(
-            "plan_old_backend_feature_present={plan_old_backend_feature_present}, compiler_enables_old_backend_feature={compiler_enables_old_backend_feature}, compiler_owns_machine_plan_backend_source={compiler_owns_machine_plan_backend_source}, facade_delegates_to_plan_backend={facade_delegates_to_plan_backend}, plan_imports_parser_ast={plan_imports_parser_ast}"
+            "compiler_owns_machine_plan_backend_source={compiler_owns_machine_plan_backend_source}, facade_delegates_to_plan_backend={facade_delegates_to_plan_backend}, plan_imports_parser_ast={plan_imports_parser_ast}"
         ),
         (!machine_plan_backend_owned_by_compiler).then(|| {
-            "TypedProgram-to-MachinePlan lowering still lives in boon_plan behind the old compatibility feature"
+            "TypedProgram-to-MachinePlan lowering is not fully owned by boon_compiler"
                 .to_owned()
         }),
     );
@@ -4373,15 +4357,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         .contains("pub fn validate_source_route_full_execution")
         && plan_executor_source.contains("SourceRouteFullExecutionValidation")
         && plan_executor_source.contains("cpu-plan-source-route-full-execution-validation-v1");
-    let plan_executor_source_route_retired_comparison_absent = !plan_executor_source
-        .contains("assemble_source_route_legacy_comparison")
-        && !plan_executor_source.contains("SourceRouteLegacyComparisonAssembly")
-        && !plan_executor_source.contains("cpu-plan-source-route-legacy-comparison-assembly-v1")
-        && !plan_executor_source.contains("\"legacy_comparison\": legacy_comparison")
-        && !plan_executor_source.contains("\"legacy-route-parity\"")
-        && !runtime_source.contains("assemble_plan_source_route_legacy_comparison")
-        && !runtime_source
-            .contains("\"legacy_semantic_delta_count\": legacy_output.semantic_deltas.len()");
     let plan_executor_source_route_report_assembly_extracted = plan_executor_source
         .contains("pub fn assemble_source_route_report")
         && plan_executor_source.contains("SourceRouteReportAssembly")
@@ -4578,14 +4553,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         && plan_executor_source.contains("RootScenarioStepReportAssembly")
         && plan_executor_source.contains("cpu-plan-root-scenario-step-report-assembly-v1")
         && runtime_source.contains("assemble_plan_root_scenario_step_report");
-    let plan_executor_root_scenario_retired_comparison_absent = !plan_executor_source
-        .contains("pub fn assemble_root_scenario_legacy_comparison")
-        && !plan_executor_source.contains("RootScenarioLegacyComparisonAssembly")
-        && !plan_executor_source.contains("RootScenarioLegacyStepComparisonInput")
-        && !plan_executor_source.contains("cpu-plan-root-scenario-legacy-comparison-assembly-v1")
-        && !runtime_source.contains("assemble_plan_root_scenario_legacy_comparison")
-        && !runtime_source.contains("RootScenarioLegacyStepComparisonInput")
-        && !runtime_source.contains("\"step_comparisons\": step_comparisons");
     let plan_executor_root_scenario_command_report_assembly_extracted = plan_executor_source
         .contains("pub fn assemble_root_scenario_command_report")
         && plan_executor_source.contains("RootScenarioCommandReportAssembly")
@@ -4614,49 +4581,9 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         && runtime_source.contains("assemble_plan_scenario_events_command_output")
         && runtime_source.contains("ScenarioEventsCommandOutputInput")
         && !runtime_source.contains("ScenarioEventsCommandReportInput");
-    let plan_executor_scenario_events_product_retired_compare_absent = plan_executor_source
-        .contains("pub struct ScenarioEventsCommandOutputInput")
-        && !plan_executor_source
-            .contains("legacy-scenario-event-parity-or-demand-current-coalescing")
-        && !plan_executor_source.contains("\"legacy_comparison\": input.legacy_comparison")
-        && !plan_executor_source
-            .contains("\"legacy_comparison_acceptance\": input.legacy_comparison_acceptance")
-        && !plan_executor_source.contains("\"compare_legacy\": input.compare_legacy")
-        && !runtime_source
-            .contains("legacy comparison was removed from the product scenario-event path");
     let live_runtime_product_output_roots_plan_executor_only = runtime_source
         .contains("self.plan_session_mut().world_scene_output()")
         && runtime_source.contains("self.plan_session_mut().solid_model_output()");
-    let cli_retired_compare_aliases_absent = !cli_source.contains("diagnostic-compare-legacy")
-        && !cli_source.contains("compare-legacy")
-        && !cli_source.contains("\"legacy\" | \"semantic\"")
-        && !cli_source.contains("\"compare\" =>");
-    let native_control_plane_retired_schema_names_absent = [
-        "currently_legacy_pre_present",
-        "legacy_proof_json_built_pre_present",
-        "legacy_render_hook_proof_built_pre_present",
-        "legacy_pre_present_proof_request_count",
-        "legacy_product_proof_built_pre_present",
-        "legacy_render_frame_metrics",
-        "structured_proof_legacy",
-        "readback_requested_by_legacy_flags",
-        "legacy_selection_fallback_count",
-        "legacy_selection_fallback_reason",
-        "legacy_selection_fallback_used",
-        "unknown_legacy",
-        "legacy_runtime_fallback_hidden",
-        "DocumentSourceIntentBindingSelector::legacy",
-        "fn legacy(",
-        "legacy_index_tuple",
-        "LEGACY_ROW_LOOKUP_SOURCE_INTENT",
-    ]
-    .iter()
-    .all(|old_name| {
-        !native_app_window_source.contains(old_name) && !native_playground_source.contains(old_name)
-    });
-    let native_todomvc_input_parity_deleted = !xtask_source
-        .contains("fn verify_native_todomvc_input_parity")
-        && !xtask_source.contains("\"verify-native-todomvc-input-parity\"");
     let physical_todomvc_content_body = xtask_source
         .rsplit_once("fn physical_todomvc_preview_content_evidence")
         .and_then(|(_, tail)| tail.split_once("fn novywave_preview_content_evidence"))
@@ -4664,8 +4591,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         .unwrap_or_default();
     let physical_todomvc_content_native_only = [
         "native_runtime_assertion_evidence/assertions",
-        "legacy_add_runtime_pass",
-        "legacy_matched",
         "add_runtime_pass",
         "theme_runtime_sources",
         "runtime_assertion_scalar",
@@ -4733,10 +4658,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         .contains("pub fn assemble_root_scenario_report")
         && plan_executor_source.contains("RootScenarioReportAssembly")
         && plan_executor_source.contains("cpu-plan-root-scenario-report-assembly-v1");
-    let plan_executor_root_scenario_acceptance_policy_removed = !plan_executor_source
-        .contains("pub fn demand_current_semantic_delta_acceptance_policy")
-        && !plan_executor_source.contains("cpu-plan-root-scenario-demand-current-acceptance-v1")
-        && !runtime_source.contains("fn demand_current_semantic_delta_acceptance_policy");
     let plan_executor_root_scenario_coverage_report_extracted = plan_executor_source
         .contains("pub fn assemble_root_scenario_coverage_report")
         && plan_executor_source.contains("RootScenarioCoverageReport")
@@ -5424,19 +5345,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "compiler-boundaries:planexecutor-source-route-retired-comparison-absent",
-        plan_executor_source_route_retired_comparison_absent,
-        format!(
-            "source_route_retired_comparison_absent={plan_executor_source_route_retired_comparison_absent}"
-        ),
-        (!plan_executor_source_route_retired_comparison_absent).then(|| {
-            "Source-route retired comparison report plumbing still exists in product code"
-                .to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
         "compiler-boundaries:planexecutor-source-route-report-assembly-extracted",
         plan_executor_source_route_report_assembly_extracted,
         format!(
@@ -5728,19 +5636,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "compiler-boundaries:planexecutor-root-scenario-retired-comparison-absent",
-        plan_executor_root_scenario_retired_comparison_absent,
-        format!(
-            "root_scenario_retired_comparison_absent={plan_executor_root_scenario_retired_comparison_absent}"
-        ),
-        (!plan_executor_root_scenario_retired_comparison_absent).then(|| {
-            "Root scenario retired comparison assembly still exists in the product architecture"
-                .to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
         "compiler-boundaries:planexecutor-root-scenario-command-report-assembly-extracted",
         plan_executor_root_scenario_command_report_assembly_extracted,
         format!(
@@ -5789,28 +5684,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "compiler-boundaries:planexecutor-scenario-events-product-retired-compare-absent",
-        plan_executor_scenario_events_product_retired_compare_absent,
-        format!(
-            "scenario_events_product_retired_compare_absent={plan_executor_scenario_events_product_retired_compare_absent}"
-        ),
-        (!plan_executor_scenario_events_product_retired_compare_absent).then(|| {
-            "Scenario-events product reports still carry retired comparison plumbing".to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "compiler-boundaries:cli-retired-compare-aliases-absent",
-        cli_retired_compare_aliases_absent,
-        format!("cli_retired_compare_aliases_absent={cli_retired_compare_aliases_absent}"),
-        (!cli_retired_compare_aliases_absent).then(|| {
-            "boon_cli still contains retired legacy/compare control-plane aliases".to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
         "compiler-boundaries:live-runtime-product-output-roots-planexecutor-only",
         live_runtime_product_output_roots_plan_executor_only,
         format!(
@@ -5824,37 +5697,13 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "compiler-boundaries:native-control-plane-retired-schema-names-absent",
-        native_control_plane_retired_schema_names_absent,
-        format!(
-            "native_control_plane_retired_schema_names_absent={native_control_plane_retired_schema_names_absent}"
-        ),
-        (!native_control_plane_retired_schema_names_absent).then(|| {
-            "Native proof/selection control-plane code still exposes retired schema names"
-                .to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "compiler-boundaries:native-todomvc-input-parity-deleted",
-        native_todomvc_input_parity_deleted,
-        format!("native_todomvc_input_parity_deleted={native_todomvc_input_parity_deleted}"),
-        (!native_todomvc_input_parity_deleted).then(|| {
-            "retired Native TodoMVC input parity wrapper still exists outside the manifest"
-                .to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
         "compiler-boundaries:physical-todomvc-content-native-only",
         physical_todomvc_content_native_only,
         format!(
             "physical_todomvc_content_native_only={physical_todomvc_content_native_only}"
         ),
         (!physical_todomvc_content_native_only).then(|| {
-            "Physical TodoMVC content evidence still accepts source replay or legacy runtime assertions instead of native post-input layout/readback evidence"
+            "Physical TodoMVC content evidence still accepts source replay assertions instead of native post-input layout/readback evidence"
                 .to_owned()
         }),
     );
@@ -5943,18 +5792,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         ),
         (!plan_executor_root_scenario_report_assembly_extracted)
             .then(|| "PlanExecutor core does not yet own root scenario report assembly".to_owned()),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
-        "compiler-boundaries:planexecutor-root-scenario-acceptance-policy-removed",
-        plan_executor_root_scenario_acceptance_policy_removed,
-        format!(
-            "root_scenario_acceptance_policy_removed={plan_executor_root_scenario_acceptance_policy_removed}"
-        ),
-        (!plan_executor_root_scenario_acceptance_policy_removed).then(|| {
-            "Root scenario legacy acceptance policy still exists in product code".to_owned()
-        }),
     );
     push_audit_check(
         &mut checks,
@@ -6353,7 +6190,7 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         && runtime_source.contains("compiler_row_templates: Vec<CompilerStorageRowTemplate>")
         && runtime_source.contains("RuntimeStorageRowTemplate::from_compiler")
         && runtime_source.contains("row_templates_by_list")
-        && runtime_source.contains("let row_template = row_template_plan.to_runtime_template()")
+        && runtime_source.contains("row_template_plan.materialize(initial_fields)")
         && !runtime_source.contains(
             "RuntimeRowSnapshotTemplate::from_cells(&row_scope, &indexed_cells, ir)?;\n            let row_template_plan",
         );
@@ -6393,18 +6230,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
         && runtime_source.contains("RuntimeStorageInitializationPlan::from_ir(\n            storage_root_slots,")
         && !runtime_source.contains("fn from_ir(\n        ir: &TypedProgram,\n        compiler_root_slots: Vec<CompilerStorageRootSlot>")
         && !runtime_source.contains("lists_by_name");
-    let runtime_legacy_storage_constructor_uses_compiler_plan = runtime_compiler_runtime_program_aggregate || runtime_storage_initialization_ir_free
-        && runtime_source.contains("impl GenericCircuitRuntime {\n    fn new(ir: &TypedProgram) -> RuntimeResult<Self> {\n        RuntimeStorageInitializationPlan::from_ir(")
-        && runtime_source.contains("compiler_storage_root_slots_from_ir(ir),")
-        && runtime_source.contains("compiler_storage_indexed_derived_fields_from_ir(ir),")
-        && runtime_source.contains(".instantiate_storage()")
-        && !runtime_source.contains("for list in &ir.lists")
-        && !runtime_source.contains("fn list_initial_fields(")
-        && !runtime_source.contains("fn runtime_value_from_initial(")
-        && !runtime_source.contains("fn initialize_indexed_derived_base_fields(\n    ir: &TypedProgram")
-        && !runtime_source.contains("fn initialize_indexed_derived_text_fields(\n    ir: &TypedProgram")
-        && !runtime_source.contains("fn row_scope_name_for_ir_list(")
-        && !runtime_source.contains("fn missing_row_initial_value(");
     let runtime_typed_storage_layout_counts_extracted = runtime_compiler_runtime_program_aggregate || compiler_lib
         .contains("pub struct CompilerTypedStorageLayoutCounts")
         && compiler_lib.contains("pub fn compiler_typed_storage_layout_counts_from_ir")
@@ -7203,18 +7028,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
     push_audit_check(
         &mut checks,
         &mut blockers,
-        "compiler-boundaries:runtime-legacy-storage-constructor-uses-compiler-plan",
-        runtime_legacy_storage_constructor_uses_compiler_plan,
-        format!(
-            "runtime_legacy_storage_constructor_uses_compiler_plan={runtime_legacy_storage_constructor_uses_compiler_plan}"
-        ),
-        (!runtime_legacy_storage_constructor_uses_compiler_plan).then(|| {
-            "legacy GenericCircuitRuntime::new still walks raw IR storage tables instead of delegating to compiler storage DTOs".to_owned()
-        }),
-    );
-    push_audit_check(
-        &mut checks,
-        &mut blockers,
         "compiler-boundaries:runtime-typed-storage-layout-counts-extracted",
         runtime_typed_storage_layout_counts_extracted,
         format!(
@@ -7371,7 +7184,7 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "runtime_raw_ir_value_enum_imports_qualified={runtime_raw_ir_value_enum_imports_qualified}"
         ),
         (!runtime_raw_ir_value_enum_imports_qualified).then(|| {
-            "runtime still imports raw IR initial/list value enums into its namespace instead of qualifying legacy IR inspections".to_owned()
+            "runtime still imports raw IR initial/list value enums into its namespace instead of qualifying IR inspections".to_owned()
         }),
     );
     push_audit_check(
@@ -7710,7 +7523,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "source_route_json_execution_extracted": plan_executor_source_route_json_execution_extracted,
             "source_route_execution_surface_extracted": plan_executor_source_route_execution_surface_extracted,
             "source_route_full_execution_validation_extracted": plan_executor_source_route_full_execution_validation_extracted,
-            "source_route_retired_comparison_absent": plan_executor_source_route_retired_comparison_absent,
             "source_route_report_assembly_extracted": plan_executor_source_route_report_assembly_extracted,
             "source_route_command_report_assembly_extracted": plan_executor_source_route_command_report_assembly_extracted,
             "source_route_command_argv_extracted": plan_executor_source_route_command_argv_extracted,
@@ -7735,15 +7547,10 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "scenario_step_selection_extracted": plan_executor_scenario_step_selection_extracted,
             "debug_label_helpers_extracted": plan_executor_debug_label_helpers_extracted,
             "root_scenario_step_report_assembly_extracted": plan_executor_root_scenario_step_report_assembly_extracted,
-            "root_scenario_retired_comparison_absent": plan_executor_root_scenario_retired_comparison_absent,
             "root_scenario_command_report_assembly_extracted": plan_executor_root_scenario_command_report_assembly_extracted,
             "root_scenario_command_output_extracted": plan_executor_root_scenario_command_output_extracted,
             "scenario_events_command_report_assembly_extracted": plan_executor_scenario_events_command_report_assembly_extracted,
             "scenario_events_command_output_extracted": plan_executor_scenario_events_command_output_extracted,
-            "scenario_events_product_retired_compare_absent": plan_executor_scenario_events_product_retired_compare_absent,
-            "cli_retired_compare_aliases_absent": cli_retired_compare_aliases_absent,
-            "native_control_plane_retired_schema_names_absent": native_control_plane_retired_schema_names_absent,
-            "native_todomvc_input_parity_deleted": native_todomvc_input_parity_deleted,
             "physical_todomvc_content_native_only": physical_todomvc_content_native_only,
             "semantic_delta_normalization_extracted": plan_executor_semantic_delta_normalization_extracted,
             "indexed_update_conflict_guard_extracted": plan_executor_indexed_update_conflict_guard_extracted,
@@ -7752,7 +7559,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "indexed_update_batch_execution_extracted": plan_executor_indexed_update_batch_execution_extracted,
             "indexed_json_update_evaluator_extracted": plan_executor_indexed_json_update_evaluator_extracted,
             "root_scenario_report_assembly_extracted": plan_executor_root_scenario_report_assembly_extracted,
-            "root_scenario_acceptance_policy_removed": plan_executor_root_scenario_acceptance_policy_removed,
             "root_scenario_coverage_report_extracted": plan_executor_root_scenario_coverage_report_extracted,
             "root_json_update_evaluator_extracted": plan_executor_root_json_update_evaluator_extracted,
             "root_update_execution_surface_extracted": plan_executor_root_update_execution_surface_extracted,
@@ -7782,10 +7588,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "plan_schema_still_uses_ir_ids": plan_schema_still_uses_ir_ids,
             "plan_schema_still_uses_ir_source_schema": plan_schema_still_uses_ir_source_schema,
             "boon_plan_frontend_dependencies_optional_only": plan_frontend_dependencies_optional_only,
-            "boon_plan_old_ir_adapter_feature_present": plan_old_ir_adapter_feature_present,
-            "boon_plan_old_backend_feature_present": plan_old_backend_feature_present,
-            "boon_compiler_enables_old_backend_feature": compiler_enables_old_backend_feature,
-            "boon_compiler_enables_old_ir_adapter_feature": compiler_enables_old_ir_adapter_feature,
             "boon_plan_default_build_schema_only": plan_default_build_schema_only,
             "parser_ast_still_in_plan_lowering": parser_ast_still_in_plan_lowering,
             "plan_executor_core_still_frontend_coupled": plan_executor_core_still_frontend_coupled,
@@ -7813,7 +7615,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "runtime_storage_initial_rows_extracted": runtime_storage_initial_rows_extracted,
             "runtime_storage_indexed_derived_fields_extracted": runtime_storage_indexed_derived_fields_extracted,
             "runtime_storage_initialization_ir_free": runtime_storage_initialization_ir_free,
-            "runtime_legacy_storage_constructor_uses_compiler_plan": runtime_legacy_storage_constructor_uses_compiler_plan,
             "runtime_parser_dependency_removed": runtime_parser_dependency_removed,
             "runtime_static_analysis_dtos_extracted": runtime_static_analysis_dtos_extracted,
             "runtime_source_payload_counts_extracted": runtime_source_payload_counts_extracted,
@@ -7868,7 +7669,6 @@ fn verify_compiler_boundaries(args: &[String]) -> Result<(), Box<dyn std::error:
             "boon_plan_depends_on_boon_parser": plan_depends_on_parser,
             "boon_plan_optionally_depends_on_boon_parser": plan_optionally_depends_on_parser,
             "boon_plan_optionally_depends_on_boon_typecheck": plan_optionally_depends_on_typecheck,
-            "boon_plan_old_ir_adapter_feature_present": plan_old_ir_adapter_feature_present,
             "boon_plan_imports_parser_ast": plan_imports_parser_ast,
             "boon_plan_executor_frontend_dependencies": plan_executor_frontend_dependencies,
             "boon_runtime_frontend_dependencies": runtime_depends_on_frontend,
@@ -7958,37 +7758,6 @@ fn toml_dependency_is_optional(entry: &toml::Value) -> bool {
         .get("optional")
         .and_then(toml::Value::as_bool)
         .unwrap_or(false)
-}
-
-fn toml_feature_includes(value: &toml::Value, feature: &str, item: &str) -> bool {
-    value
-        .get("features")
-        .and_then(|features| features.get(feature))
-        .and_then(toml::Value::as_array)
-        .is_some_and(|items| items.iter().any(|entry| entry.as_str() == Some(item)))
-}
-
-fn toml_dependency_feature_enabled(value: &toml::Value, dependency: &str, feature: &str) -> bool {
-    toml_dependency_features(value, dependency)
-        .iter()
-        .any(|enabled| enabled == feature)
-}
-
-fn toml_dependency_features(value: &toml::Value, dependency: &str) -> Vec<String> {
-    ["dependencies", "dev-dependencies", "build-dependencies"]
-        .into_iter()
-        .filter_map(|section| toml_dependency_entry(value, section, dependency))
-        .flat_map(|entry| {
-            entry
-                .get("features")
-                .and_then(toml::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .collect()
 }
 
 fn rust_source_matches(
@@ -8948,49 +8717,7 @@ fn verify_world_scene(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
             }),
     );
 
-    let world_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-world: World/new(
-    camera: World/perspective_camera(
-        transform: World/transform(translation: [x: 0, y: 0, z: 6])
-    )
-    lights: LIST {
-        World/light(
-            id: TEXT { key }
-            transform: World/transform(translation: [x: 2, y: 4, z: 3])
-        )
-    }
-    materials: LIST {
-        World/material(
-            id: TEXT { blue }
-            base_color: [r: 0, g: 1, b: 1, a: 1]
-        )
-    }
-    geometries: LIST {
-        World/primitive(
-            id: TEXT { cube }
-            kind: Cube
-            size: [x: 1, y: 1, z: 1]
-        )
-    }
-    instances: LIST {
-        World/model(
-            id: TEXT { cube_instance }
-            geometry: TEXT { cube }
-            transform: World/transform(rotation_z_degrees: 45)
-            material: TEXT { blue }
-            part_id: TEXT { body }
-            feature_id: TEXT { cube_feature }
-            pick_id: 1
-        )
-    }
-)
-"#;
+    let world_source = include_str!("../../../examples/world_scene_output_root.bn");
     let parsed = boon_parser::parse_source("verify-world-scene-output-root.bn", world_source)?;
     let typecheck = boon_typecheck::check(&parsed);
     let typed = boon_ir::lower(&parsed)
@@ -13471,7 +13198,7 @@ fn verify_runtime_change_sets(args: &[String]) -> Result<(), Box<dyn std::error:
                 "runtime-change-sets:plan-scenario-events-product-deltas",
                 "boon_runtime",
                 "run_plan_route_reports_full_source_event_delta_batch",
-                "PlanExecutor route execution must emit product semantic deltas without retired comparison fields",
+                "PlanExecutor route execution must emit product semantic deltas directly",
             ),
             FocusedCargoTestSpec::lib(
                 "runtime-change-sets:plan-field-set-delta-coalescing",
@@ -15672,35 +15399,8 @@ fn verify_solid_graph(args: &[String]) -> Result<(), Box<dyn std::error::Error>>
         }),
     );
 
-    let boon_manufacturing_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { bracket_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { bracket }
-            geometry: Solid/difference(
-                base: Solid/rounded_box(size: [x: 70, y: 34, z: 6], radius: 2)
-                tools: LIST {
-                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: -23, y: 0, z: 0])
-                    Solid/translate(child: Solid/cylinder(radius: 3, height: 8), by: [x: 23, y: 0, z: 0])
-                }
-            )
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-    instances: LIST {
-        Part/instance(id: TEXT { bracket_a }, part: TEXT { bracket }, label: TEXT { Bracket A })
-        Part/instance(id: TEXT { bracket_b }, part: TEXT { bracket }, label: TEXT { Bracket B })
-    }
-)
-"#;
+    let boon_manufacturing_source =
+        include_str!("../../../examples/solid_graph_fixtures/manufacturing_output.bn");
     let parsed = boon_parser::parse_source(
         "verify-solid-graph-manufacturing-output.bn",
         boon_manufacturing_source,
@@ -15760,37 +15460,8 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let boon_curved_solid_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { curved_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { cone_part }
-            geometry: Solid/cone(radius0: 8, radius1: 3, height: 20)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-        Part/new(
-            id: TEXT { torus_part }
-            geometry: Solid/torus(major_radius: 12, minor_radius: 2)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-        Part/new(
-            id: TEXT { sphere_part }
-            geometry: Solid/sphere(radius: 6)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
+    let boon_curved_solid_source =
+        include_str!("../../../examples/solid_graph_fixtures/curved_solid_output.bn");
     let curved_parsed = boon_parser::parse_source(
         "verify-solid-graph-curved-solid-output.bn",
         boon_curved_solid_source,
@@ -15929,28 +15600,8 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let boon_shell_box_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { shell_box_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { shell_box_part }
-            geometry: Solid/shell(
-                child: Solid/box(size: [x: 40, y: 24, z: 16])
-                thickness: 2
-            )
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
+    let boon_shell_box_source =
+        include_str!("../../../examples/solid_graph_fixtures/shell_box_output.bn");
     let shell_box_parsed = boon_parser::parse_source(
         "verify-solid-graph-shell-box-output.bn",
         boon_shell_box_source,
@@ -16028,25 +15679,8 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let boon_extruded_rectangle_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { extruded_rectangle_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { extruded_rectangle_part }
-            geometry: Solid/extrude(size: [x: 36, y: 18, z: 0], height: 12)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
+    let boon_extruded_rectangle_source =
+        include_str!("../../../examples/solid_graph_fixtures/extruded_rectangle_output.bn");
     let extruded_rectangle_parsed = boon_parser::parse_source(
         "verify-solid-graph-extruded-rectangle-output.bn",
         boon_extruded_rectangle_source,
@@ -16182,25 +15816,8 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let boon_rounded_box_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { rounded_box_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { rounded_box_part }
-            geometry: Solid/rounded_box(size: [x: 28, y: 16, z: 8], radius: 3)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
+    let boon_rounded_box_source =
+        include_str!("../../../examples/solid_graph_fixtures/rounded_box_output.bn");
     let mut rounded_box_runtime = LiveRuntime::from_source(
         "verify-solid-graph-rounded-box-output",
         boon_rounded_box_source,
@@ -16245,28 +15862,8 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let boon_translated_rounded_box_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { translated_rounded_box_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { translated_rounded_box_part }
-            geometry: Solid/translate(
-                child: Solid/rounded_box(size: [x: 28, y: 16, z: 8], radius: 3)
-                by: [x: 4, y: 5, z: 6]
-            )
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
+    let boon_translated_rounded_box_source =
+        include_str!("../../../examples/solid_graph_fixtures/translated_rounded_box_output.bn");
     let mut translated_rounded_box_runtime = LiveRuntime::from_source(
         "verify-solid-graph-translated-rounded-box-output",
         boon_translated_rounded_box_source,
@@ -16332,25 +15929,8 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let boon_revolved_ring_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { revolved_ring_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { revolved_ring_part }
-            geometry: Solid/revolve(inner_radius: 4, outer_radius: 9, height: 12)
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
+    let boon_revolved_ring_source =
+        include_str!("../../../examples/solid_graph_fixtures/revolved_ring_output.bn");
     let revolved_ring_parsed = boon_parser::parse_source(
         "verify-solid-graph-revolved-ring-output.bn",
         boon_revolved_ring_source,
@@ -16444,29 +16024,8 @@ manufacturing: Assembly/new(
         }),
     );
 
-    let boon_lofted_rectangle_source = r#"
-prelude: [
-    noop: SOURCE
-    hold_marker: TEXT { HOLD }
-    latest_marker: TEXT { LATEST }
-]
-
-manufacturing: Assembly/new(
-    id: TEXT { lofted_rectangle_assembly }
-    parts: LIST {
-        Part/new(
-            id: TEXT { lofted_rectangle_part }
-            geometry: Solid/loft(
-                bottom_size: [x: 36, y: 20, z: 0]
-                top_size: [x: 18, y: 10, z: 0]
-                height: 12
-            )
-            physical_material: TEXT { PLA }
-            manufacturing_role: PrintableSolid
-        )
-    }
-)
-"#;
+    let boon_lofted_rectangle_source =
+        include_str!("../../../examples/solid_graph_fixtures/lofted_rectangle_output.bn");
     let lofted_rectangle_parsed = boon_parser::parse_source(
         "verify-solid-graph-lofted-rectangle-output.bn",
         boon_lofted_rectangle_source,
@@ -23416,7 +22975,7 @@ fn native_renderer_counter_inventory() -> serde_json::Value {
             ],
             "field_semantics": {
                 "surface_acquire_ms": "time to acquire the visible surface texture",
-                "present_submit_ms": "legacy combined visible-frame timing from command recording through queue submit, frame.present, and post-present bookkeeping",
+                "present_submit_ms": "combined visible-frame timing from command recording through queue submit, frame.present, and post-present bookkeeping",
                 "command_record_ms": "CPU wall time from surface-view creation through command recording, render hook execution, and readback command enqueue",
                 "encoder_finish_ms": "CPU wall time spent finishing the WGPU command encoder into a command buffer",
                 "queue_submit_ms": "CPU wall time spent in queue.submit for the visible-surface command buffer",
@@ -27920,7 +27479,7 @@ fn verify_native_gpu_novywave_visual(args: &[String]) -> Result<(), Box<dyn std:
         "native-gpu-novywave-visual:runtime-timeline-projection-source",
         source_policy_pass,
         format!(
-            "segment_width_fields={}, runtime_projection={:?}, dynamic_ticks={:?}, legacy_width_hack={:?}, marker_strip={:?}",
+            "segment_width_fields={}, runtime_projection={:?}, dynamic_ticks={:?}, marker_strip={:?}",
             source_policy
                 .get("segment_width_fields")
                 .and_then(serde_json::Value::as_array)
@@ -27930,9 +27489,6 @@ fn verify_native_gpu_novywave_visual(args: &[String]) -> Result<(), Box<dyn std:
                 .and_then(serde_json::Value::as_bool),
             source_policy
                 .get("dynamic_tick_projection")
-                .and_then(serde_json::Value::as_bool),
-            source_policy
-                .get("legacy_width_hack_present")
                 .and_then(serde_json::Value::as_bool),
             source_policy
                 .get("marker_strip_present")
@@ -28471,9 +28027,6 @@ fn novywave_source_projection_policy_evidence() -> serde_json::Value {
         .cloned()
         .map(serde_json::Value::String)
         .collect::<Vec<_>>();
-    let legacy_width_hack_present = source.contains("simple_vcd_long_segment_width")
-        || source.contains("simple_vcd_segment_width")
-        || source.contains("width_source:");
     let hardcoded_tick_fields_present = source.lines().any(|line| {
         [
             ", tick_0:",
@@ -28555,7 +28108,6 @@ fn novywave_source_projection_policy_evidence() -> serde_json::Value {
         .contains("PASSED.store.selected_waveform_segments")
         || waveform_segment_lane_body.contains("store.selected_waveform_segments");
     let pass = segment_width_fields.is_empty()
-        && !legacy_width_hack_present
         && !hardcoded_tick_fields_present
         && runtime_projection
         && dynamic_tick_projection
@@ -28571,7 +28123,6 @@ fn novywave_source_projection_policy_evidence() -> serde_json::Value {
         "view_path": view_path,
         "waveform_segment_record_line_count": segment_record_lines.len(),
         "segment_width_fields": segment_width_fields,
-        "legacy_width_hack_present": legacy_width_hack_present,
         "hardcoded_tick_fields_present": hardcoded_tick_fields_present,
         "runtime_projection": runtime_projection,
         "dynamic_tick_projection": dynamic_tick_projection,
@@ -48208,7 +47759,7 @@ fn verify_native_gpu_report_bundle(
         } else if verifier_identity_present {
             "stale-verifier-identity"
         } else if binary_hash_matches {
-            "whole-binary-legacy"
+            "whole-binary"
         } else {
             "stale-binary"
         };
@@ -50439,7 +49990,7 @@ fn native_gpu_label_contract_blockers(label: &str, report: &serde_json::Value) -
                 != Some(0)
             {
                 blockers.push(
-                    "cells-visible-click release must not use legacy address selection fallback"
+                    "cells-visible-click release must not use address selection fallback"
                         .to_owned(),
                 );
             }
@@ -54812,7 +54363,6 @@ fn native_gpu_ux_forbidden_capture_method(method: &str) -> bool {
         || lower.contains("xvfb")
         || lower.contains("cosmic")
         || lower.contains("human")
-        || lower.contains("legacy-ply")
         || lower.contains("ply-")
         || lower.contains("xdotool")
         || lower.contains("ydotool")
@@ -64011,53 +63561,25 @@ fn bytes_file_write_live_negative_cases() -> Vec<BytesFileWriteLiveNegativeCase>
     cases
 }
 
+fn leak_template(template: &str, replacements: &[(&str, &str)]) -> &'static str {
+    let mut output = template.to_owned();
+    for (placeholder, value) in replacements {
+        output = output.replace(placeholder, value);
+    }
+    Box::leak(output.into_boxed_str())
+}
+
 fn bytes_file_write_negative_source(initial: &'static str, update: &'static str) -> &'static str {
-    Box::leak(
-        format!(
-            r#"
-payload:
-    {initial} |> HOLD payload {{ LATEST {{}} }}
-
-store: [
-    write: SOURCE
-    write_status:
-        TEXT {{ pending }} |> HOLD write_status {{
-            LATEST {{
-                store.write |> THEN {{ {update} }}
-            }}
-        }}
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ File write bytes }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!("../../../examples/bytes_negative_templates/file_write.bn.tmpl"),
+        &[("@INITIAL@", initial), ("@UPDATE@", update)],
     )
 }
 
 fn bytes_file_write_dynamic_path_negative_source(path_initial: &'static str) -> &'static str {
-    Box::leak(
-        format!(
-            r#"
-payload:
-    BYTES[4] {{ 16uDE, 16uAD, 16uBE, 16uEF }} |> HOLD payload {{ LATEST {{}} }}
-
-store: [
-    write: SOURCE
-    path_state:
-        {path_initial} |> HOLD path_state {{ LATEST {{}} }}
-    write_status:
-        TEXT {{ pending }} |> HOLD write_status {{
-            LATEST {{
-                store.write |> THEN {{ payload |> File/write_bytes(path: store.path_state) }}
-            }}
-        }}
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ File write bytes }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!("../../../examples/bytes_negative_templates/file_write_dynamic_path.bn.tmpl"),
+        &[("@PATH_INITIAL@", path_initial)],
     )
 }
 
@@ -64072,38 +63594,16 @@ fn bytes_file_write_indexed_row_field_negative_source(
     } else {
         format!("        {path_binding}\n")
     };
-    Box::leak(
-        format!(
-            r#"
-store: [
-    rows:
-        LIST {{
-{rows}
-        }}
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {{
-    [
-        write: SOURCE
-        name: row.name
-{path_binding}        payload:
-            row.payload |> HOLD payload {{
-                LATEST {{}}
-            }}
-        write_status:
-            row.write_status |> HOLD write_status {{
-                LATEST {{
-                    write |> THEN {{ {write_expr} }}
-                }}
-            }}
-    ]
-}}
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ {label} }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!(
+            "../../../examples/bytes_negative_templates/file_write_indexed_row_field.bn.tmpl"
+        ),
+        &[
+            ("@ROWS@", rows),
+            ("@PATH_BINDING@", path_binding.as_str()),
+            ("@WRITE_EXPR@", write_expr),
+            ("@LABEL@", label),
+        ],
     )
 }
 
@@ -65127,46 +64627,16 @@ fn bytes_file_read_live_negative_cases() -> Vec<BytesFileReadLiveNegativeCase> {
 }
 
 fn bytes_file_read_negative_source(initial: &'static str, update: &'static str) -> &'static str {
-    Box::leak(
-        format!(
-            r#"
-store: [
-    load: SOURCE
-    file_bytes:
-        {initial} |> HOLD file_bytes {{
-            LATEST {{
-                store.load |> THEN {{ {update} }}
-            }}
-        }}
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ File bytes }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!("../../../examples/bytes_negative_templates/file_read.bn.tmpl"),
+        &[("@INITIAL@", initial), ("@UPDATE@", update)],
     )
 }
 
 fn bytes_file_read_dynamic_path_negative_source(path_initial: &'static str) -> &'static str {
-    Box::leak(
-        format!(
-            r#"
-store: [
-    load: SOURCE
-    path:
-        {path_initial} |> HOLD path {{ LATEST {{}} }}
-    file_bytes:
-        BYTES {{}} |> HOLD file_bytes {{
-            LATEST {{
-                store.load |> THEN {{ store.path |> File/read_bytes() }}
-            }}
-        }}
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ File bytes }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!("../../../examples/bytes_negative_templates/file_read_dynamic_path.bn.tmpl"),
+        &[("@PATH_INITIAL@", path_initial)],
     )
 }
 
@@ -65181,34 +64651,16 @@ fn bytes_file_read_indexed_row_field_negative_source(
     } else {
         format!("        {path_binding}\n")
     };
-    Box::leak(
-        format!(
-            r#"
-store: [
-    rows:
-        LIST {{
-{rows}
-        }}
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {{
-    [
-        load: SOURCE
-        name: row.name
-{path_binding}        file_bytes:
-            row.file_bytes |> HOLD file_bytes {{
-                LATEST {{
-                    load |> THEN {{ {read_expr} }}
-                }}
-            }}
-    ]
-}}
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ {label} }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!(
+            "../../../examples/bytes_negative_templates/file_read_indexed_row_field.bn.tmpl"
+        ),
+        &[
+            ("@ROWS@", rows),
+            ("@PATH_BINDING@", path_binding.as_str()),
+            ("@READ_EXPR@", read_expr),
+            ("@LABEL@", label),
+        ],
     )
 }
 
@@ -65650,7 +65102,6 @@ fn verify_bytes_default_engine_readiness(
     }
 
     let cli_source = fs::read_to_string("crates/boon_cli/src/main.rs")?;
-    let default_is_legacy = cli_source.contains("let mut engine = \"legacy\".to_owned()");
     let default_is_plan = cli_source.contains("run_plan_scenario_events(")
         && !cli_source.contains("let mut engine")
         && !cli_source.contains("match engine.as_str()");
@@ -65661,8 +65112,8 @@ fn verify_bytes_default_engine_readiness(
         &mut checks,
         &mut blockers,
         "bytes-default-engine:source-default-plan",
-        default_is_plan && !default_is_legacy,
-        format!("default_is_legacy={default_is_legacy} default_is_plan={default_is_plan}"),
+        default_is_plan,
+        format!("default_is_plan={default_is_plan}"),
         Some("boon_cli run default engine must be PlanExecutor-backed `plan`".to_owned()),
     );
 
@@ -65736,7 +65187,7 @@ fn verify_bytes_default_engine_readiness(
         &mut checks,
         &mut blockers,
         "bytes-default-engine:phase10-switch-ready",
-        default_is_plan && !default_is_legacy,
+        default_is_plan,
         "Phase 10 default switch is active and default plan execution has been proven by this report",
         Some("Phase 10 default switch regressed away from PlanExecutor".to_owned()),
     );
@@ -65769,7 +65220,7 @@ fn verify_bytes_default_engine_readiness(
         "required_check_ids": required_check_ids,
         "readiness_mode": "post-switch-plan-default",
         "readiness_scope": "default-engine-control-plane-only",
-        "default_engine": if default_is_legacy { "legacy" } else if default_is_plan { "plan" } else { "unknown" },
+        "default_engine": if default_is_plan { "plan" } else { "unknown" },
         "default_switch_allowed": default_switch_allowed,
         "default_switch_blocker": default_switch_blocker,
         "diagnostic_comparison_mode": diagnostic_comparison_mode,
@@ -65915,6 +65366,127 @@ fn bytes_default_engine_argv_has_arg(command_argv: &[serde_json::Value], expecte
         .any(|arg| arg.as_str() == Some(expected))
 }
 
+struct BytesParserNegativeCase {
+    fixture_name: &'static str,
+    result_id: &'static str,
+    source: &'static str,
+    accepted_detail: &'static str,
+    expected_message: &'static str,
+}
+
+fn record_bytes_parser_negative_case(
+    fixture_dir: &Path,
+    case: &BytesParserNegativeCase,
+    artifact_paths: &mut Vec<PathBuf>,
+    checks: &mut Vec<serde_json::Value>,
+    case_results: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = write_bytes_negative_fixture(fixture_dir, case.fixture_name, "bn", case.source)?;
+    artifact_paths.push(path.clone());
+    let result = boon_parser::parse_source(path.display().to_string(), case.source);
+    let detail = result
+        .as_ref()
+        .err()
+        .map(|error| error.message.clone())
+        .unwrap_or_else(|| case.accepted_detail.to_owned());
+    record_bytes_negative_case(
+        checks,
+        case_results,
+        blockers,
+        case.result_id,
+        "parser",
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.message.contains(case.expected_message)),
+        detail,
+    );
+    Ok(())
+}
+
+fn bytes_independent_typecheck_source(source_line: &str, include_fixed_bytes: bool) -> String {
+    let bytes_binding = if include_fixed_bytes {
+        "bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"
+SOURCE
+HOLD
+LATEST
+LIST {{}}
+{bytes_binding}{source_line}
+document: []
+"#
+    )
+}
+
+fn record_bytes_independent_typecheck_case(
+    fixture_dir: &Path,
+    id: &str,
+    source_line: &str,
+    include_fixed_bytes: bool,
+    needle: &str,
+    artifact_paths: &mut Vec<PathBuf>,
+    checks: &mut Vec<serde_json::Value>,
+    case_results: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = bytes_independent_typecheck_source(source_line, include_fixed_bytes);
+    let path = write_bytes_negative_fixture(fixture_dir, id, "bn", &source)?;
+    artifact_paths.push(path.clone());
+    let parsed = boon_parser::parse_source(path.display().to_string(), &source)?;
+    let report = boon_typecheck::check(&parsed);
+    let messages = report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    record_bytes_negative_case(
+        checks,
+        case_results,
+        blockers,
+        id,
+        "typecheck",
+        messages.contains(needle),
+        format!("independent typecheck diagnostic search for `{needle}` in `{id}`"),
+    );
+    Ok(())
+}
+
+fn record_bytes_schema_negative_cases(
+    path_prefix: &str,
+    cases: Vec<BytesReportNegativeCase>,
+    checks: &mut Vec<serde_json::Value>,
+    case_results: &mut Vec<serde_json::Value>,
+    blockers: &mut Vec<String>,
+    rejected_detail: &'static str,
+    accepted_detail: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for report_case in cases {
+        let negative_path = PathBuf::from(format!("{path_prefix}{}.json", report_case.id));
+        write_json(&negative_path, &report_case.report)?;
+        let rejected = schema_rejects(&negative_path)?;
+        record_bytes_negative_case(
+            checks,
+            case_results,
+            blockers,
+            report_case.id,
+            "report-schema",
+            rejected,
+            if rejected {
+                rejected_detail.to_owned()
+            } else {
+                accepted_detail.to_owned()
+            },
+        );
+    }
+    Ok(())
+}
+
 fn verify_bytes_negative(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let report = report_arg(args)
         .unwrap_or_else(|| PathBuf::from("target/reports/bytes-plan/bytes-negative.json"));
@@ -65926,318 +65498,82 @@ fn verify_bytes_negative(args: &[String]) -> Result<(), Box<dyn std::error::Erro
     let mut case_results = Vec::new();
     let mut artifact_paths = Vec::new();
 
-    let invalid_hex_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16uGG }\n";
-    let invalid_hex_path =
-        write_bytes_negative_fixture(&fixture_dir, "parser-invalid-hex", "bn", invalid_hex_source)?;
-    artifact_paths.push(invalid_hex_path.clone());
-    let invalid_hex_result =
-        boon_parser::parse_source(invalid_hex_path.display().to_string(), invalid_hex_source);
-    let invalid_hex_detail = invalid_hex_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted invalid hex byte literal".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-invalid-hex-byte",
-        "parser",
-        invalid_hex_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.message.contains("outside base 16")),
-        invalid_hex_detail,
-    );
+    for case in [
+        BytesParserNegativeCase {
+            fixture_name: "parser-invalid-hex",
+            result_id: "parser-invalid-hex-byte",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16uGG }\n",
+            accepted_detail: "parser accepted invalid hex byte literal",
+            expected_message: "outside base 16",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-multiline-invalid-hex",
+            result_id: "parser-multiline-invalid-hex-byte",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16uGG\n}\n",
+            accepted_detail: "parser accepted multiline invalid hex byte literal",
+            expected_message: "outside base 16",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-byte-overflow",
+            result_id: "parser-byte-overflow",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u100 }\n",
+            accepted_detail: "parser accepted byte literal >255",
+            expected_message: "bytes must be 0..255",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-unsupported-byte-base",
+            result_id: "parser-unsupported-byte-base",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 3u12 }\n",
+            accepted_detail: "parser accepted unsupported byte literal base",
+            expected_message: "byte literal base must be one of",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-byte-missing-digits",
+            result_id: "parser-byte-missing-digits",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u }\n",
+            accepted_detail: "parser accepted byte literal without digits",
+            expected_message: "byte literal must include digits after `u`",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-bad-size-expression",
+            result_id: "parser-bad-size-expression",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[foo] {}\n",
+            accepted_detail: "parser accepted unsupported BYTES size expression",
+            expected_message: "BYTES size must be `__`",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-missing-body",
+            result_id: "parser-missing-body",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[4]\n",
+            accepted_detail: "parser accepted BYTES constructor without body",
+            expected_message: "BYTES constructor requires a `{ ... }` body",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-missing-closing-body",
+            result_id: "parser-missing-closing-body",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u00\n",
+            accepted_detail: "parser accepted unterminated BYTES constructor body",
+            expected_message: "BYTES constructor is missing closing `}`",
+        },
+        BytesParserNegativeCase {
+            fixture_name: "parser-multiline-trailing-token",
+            result_id: "parser-multiline-trailing-token",
+            source: "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16u00\n} trailing\n",
+            accepted_detail: "parser accepted multiline BYTES trailing token",
+            expected_message: "BYTES constructor has unexpected trailing token `trailing`",
+        },
+    ] {
+        record_bytes_parser_negative_case(
+            &fixture_dir,
+            &case,
+            &mut artifact_paths,
+            &mut checks,
+            &mut case_results,
+            &mut blockers,
+        )?;
+    }
 
-    let multiline_invalid_hex_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16uGG\n}\n";
-    let multiline_invalid_hex_path = write_bytes_negative_fixture(
-        &fixture_dir,
-        "parser-multiline-invalid-hex",
-        "bn",
-        multiline_invalid_hex_source,
-    )?;
-    artifact_paths.push(multiline_invalid_hex_path.clone());
-    let multiline_invalid_hex_result = boon_parser::parse_source(
-        multiline_invalid_hex_path.display().to_string(),
-        multiline_invalid_hex_source,
-    );
-    let multiline_invalid_hex_detail = multiline_invalid_hex_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted multiline invalid hex byte literal".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-multiline-invalid-hex-byte",
-        "parser",
-        multiline_invalid_hex_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.message.contains("outside base 16")),
-        multiline_invalid_hex_detail,
-    );
-
-    let overflow_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u100 }\n";
-    let overflow_path =
-        write_bytes_negative_fixture(&fixture_dir, "parser-byte-overflow", "bn", overflow_source)?;
-    artifact_paths.push(overflow_path.clone());
-    let overflow_result =
-        boon_parser::parse_source(overflow_path.display().to_string(), overflow_source);
-    let overflow_detail = overflow_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted byte literal >255".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-byte-overflow",
-        "parser",
-        overflow_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.message.contains("bytes must be 0..255")),
-        overflow_detail,
-    );
-
-    let bad_base_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 3u12 }\n";
-    let bad_base_path = write_bytes_negative_fixture(
-        &fixture_dir,
-        "parser-unsupported-byte-base",
-        "bn",
-        bad_base_source,
-    )?;
-    artifact_paths.push(bad_base_path.clone());
-    let bad_base_result =
-        boon_parser::parse_source(bad_base_path.display().to_string(), bad_base_source);
-    let bad_base_detail = bad_base_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted unsupported byte literal base".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-unsupported-byte-base",
-        "parser",
-        bad_base_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.message.contains("byte literal base must be one of")),
-        bad_base_detail,
-    );
-
-    let missing_digits_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u }\n";
-    let missing_digits_path = write_bytes_negative_fixture(
-        &fixture_dir,
-        "parser-byte-missing-digits",
-        "bn",
-        missing_digits_source,
-    )?;
-    artifact_paths.push(missing_digits_path.clone());
-    let missing_digits_result = boon_parser::parse_source(
-        missing_digits_path.display().to_string(),
-        missing_digits_source,
-    );
-    let missing_digits_detail = missing_digits_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted byte literal without digits".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-byte-missing-digits",
-        "parser",
-        missing_digits_result.as_ref().err().is_some_and(|error| {
-            error
-                .message
-                .contains("byte literal must include digits after `u`")
-        }),
-        missing_digits_detail,
-    );
-
-    let bad_size_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[foo] {}\n";
-    let bad_size_path = write_bytes_negative_fixture(
-        &fixture_dir,
-        "parser-bad-size-expression",
-        "bn",
-        bad_size_source,
-    )?;
-    artifact_paths.push(bad_size_path.clone());
-    let bad_size_result =
-        boon_parser::parse_source(bad_size_path.display().to_string(), bad_size_source);
-    let bad_size_detail = bad_size_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted unsupported BYTES size expression".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-bad-size-expression",
-        "parser",
-        bad_size_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.message.contains("BYTES size must be `__`")),
-        bad_size_detail,
-    );
-
-    let missing_body_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[4]\n";
-    let missing_body_path = write_bytes_negative_fixture(
-        &fixture_dir,
-        "parser-missing-body",
-        "bn",
-        missing_body_source,
-    )?;
-    artifact_paths.push(missing_body_path.clone());
-    let missing_body_result =
-        boon_parser::parse_source(missing_body_path.display().to_string(), missing_body_source);
-    let missing_body_detail = missing_body_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted BYTES constructor without body".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-missing-body",
-        "parser",
-        missing_body_result.as_ref().err().is_some_and(|error| {
-            error
-                .message
-                .contains("BYTES constructor requires a `{ ... }` body")
-        }),
-        missing_body_detail,
-    );
-
-    let missing_closing_body_source = "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] { 16u00\n";
-    let missing_closing_body_path = write_bytes_negative_fixture(
-        &fixture_dir,
-        "parser-missing-closing-body",
-        "bn",
-        missing_closing_body_source,
-    )?;
-    artifact_paths.push(missing_closing_body_path.clone());
-    let missing_closing_body_result = boon_parser::parse_source(
-        missing_closing_body_path.display().to_string(),
-        missing_closing_body_source,
-    );
-    let missing_closing_body_detail = missing_closing_body_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted unterminated BYTES constructor body".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-missing-closing-body",
-        "parser",
-        missing_closing_body_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| {
-                error
-                    .message
-                    .contains("BYTES constructor is missing closing `}`")
-            }),
-        missing_closing_body_detail,
-    );
-
-    let multiline_trailing_source =
-        "SOURCE\nHOLD\nLATEST\nbad: BYTES[1] {\n    16u00\n} trailing\n";
-    let multiline_trailing_path = write_bytes_negative_fixture(
-        &fixture_dir,
-        "parser-multiline-trailing-token",
-        "bn",
-        multiline_trailing_source,
-    )?;
-    artifact_paths.push(multiline_trailing_path.clone());
-    let multiline_trailing_result = boon_parser::parse_source(
-        multiline_trailing_path.display().to_string(),
-        multiline_trailing_source,
-    );
-    let multiline_trailing_detail = multiline_trailing_result
-        .as_ref()
-        .err()
-        .map(|error| error.message.clone())
-        .unwrap_or_else(|| "parser accepted multiline BYTES trailing token".to_owned());
-    record_bytes_negative_case(
-        &mut checks,
-        &mut case_results,
-        &mut blockers,
-        "parser-multiline-trailing-token",
-        "parser",
-        multiline_trailing_result
-            .as_ref()
-            .err()
-            .is_some_and(|error| {
-                error
-                    .message
-                    .contains("BYTES constructor has unexpected trailing token `trailing`")
-            }),
-        multiline_trailing_detail,
-    );
-
-    let typecheck_source = r#"
-SOURCE
-HOLD
-LATEST
-LIST {}
-bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
-too_short: BYTES[2] { 16u01 }
-implicit_text: BYTES[__] { TEXT { hi } }
-bad_count: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 3, endian: Little)
-bad_endian: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Middle)
-bad_length_input: Bytes/length(input: TEXT { bad })
-missing_get_input: Bytes/get(index: 0)
-missing_set_index: bytes |> Bytes/set(value: 16u01)
-bad_decode_encoding: bytes |> Bytes/to_text(encoding: Middle)
-missing_decode_encoding: bytes |> Bytes/to_text
-bad_encode_encoding: TEXT { hi } |> Text/to_bytes(encoding: Middle)
-missing_encode_encoding: TEXT { hi } |> Text/to_bytes
-bad_ascii_static_text: TEXT { č } |> Text/to_bytes(encoding: Ascii)
-bad_static_hex_odd: TEXT { 123 } |> Bytes/from_hex
-bad_static_hex_digit: TEXT { 12XX } |> Bytes/from_hex
-bad_static_base64_length: TEXT { AQI } |> Bytes/from_base64
-bad_static_base64_digit: TEXT { AQ*D } |> Bytes/from_base64
-unknown_extra_arg: bytes |> Bytes/find(needle: BYTES[1] { 16u02 }, surprise: 1)
-bad_zeros_input: Bytes/zeros(input: bytes, byte_count: 4)
-bad_zeros_pipe: bytes |> Bytes/zeros(byte_count: 4)
-missing_zeros_count: Bytes/zeros()
-bad_positional_slice: Bytes/slice(TEXT { bad }, offset: 0, byte_count: 2)
-bad_positional_bytes_slice: Bytes/slice(BYTES[4] { 16u01, 16u02, 16u03, 16u04 }, offset: 1, byte_count: 4)
-bad_get_bounds: bytes |> Bytes/get(index: 4)
-bad_get_negative_bounds: bytes |> Bytes/get(index: -1)
-bad_set_bounds: bytes |> Bytes/set(index: 4, value: 16u01)
-bad_slice_bounds: bytes |> Bytes/slice(offset: 3, byte_count: 2)
-bad_slice_negative_bounds: bytes |> Bytes/slice(offset: -1, byte_count: 2)
-bad_take_bounds: bytes |> Bytes/take(byte_count: 5)
-bad_drop_bounds: bytes |> Bytes/drop(byte_count: 5)
-bad_read_bounds: bytes |> Bytes/read_unsigned(offset: 2, byte_count: 4, endian: Little)
-bad_write_bounds: bytes |> Bytes/write_unsigned(offset: 2, byte_count: 4, endian: Little, value: 1)
-bad_read_signed_bounds: bytes |> Bytes/read_signed(offset: 2, byte_count: 4, endian: Little)
-bad_write_signed_bounds: bytes |> Bytes/write_signed(offset: 2, byte_count: 4, endian: Little, value: 1)
-bad_folded_static_integer_overflow: bytes |> Bytes/get(index: 170141183460469231731687303715884105727 + 1)
-bad_folded_static_integer_plan_range: bytes |> Bytes/get(index: 9223372036854775807 + 1)
-bad_folded_slice_offset_overflow: bytes |> Bytes/slice(offset: 170141183460469231731687303715884105727 + 1, byte_count: 2)
-bad_folded_zeros_count_overflow: Bytes/zeros(byte_count: 170141183460469231731687303715884105727 + 1)
-bad_folded_zeros_count_plan_range: Bytes/zeros(byte_count: 9223372036854775807 + 1)
-bad_folded_write_unsigned_value_negative_plan_range: bytes |> Bytes/write_unsigned(offset: 0, byte_count: 4, endian: Little, value: 0 - 1)
-bad_folded_write_signed_value_plan_range: bytes |> Bytes/write_signed(offset: 0, byte_count: 4, endian: Little, value: 0 - 9223372036854775808 * 2)
-bad_unsupported_static_integer_division: bytes |> Bytes/get(index: 4 / 2)
-document: []
-"#;
+    let typecheck_source = include_str!("../../../examples/bytes_typecheck_negative_fixture.bn");
     let typecheck_path = write_bytes_negative_fixture(
         &fixture_dir,
         "typecheck-bytes-errors",
@@ -66424,37 +65760,20 @@ document: []
             "`Bytes/from_base64` requires valid static base64 text",
         ),
     ] {
-        let source = format!(
-            r#"
-SOURCE
-HOLD
-LATEST
-LIST {{}}
-{source_line}
-document: []
-"#
-        );
-        let path = write_bytes_negative_fixture(&fixture_dir, id, "bn", &source)?;
-        artifact_paths.push(path.clone());
-        let parsed = boon_parser::parse_source(path.display().to_string(), &source)?;
-        let report = boon_typecheck::check(&parsed);
-        let messages = report
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        record_bytes_negative_case(
+        record_bytes_independent_typecheck_case(
+            &fixture_dir,
+            id,
+            source_line,
+            false,
+            needle,
+            &mut artifact_paths,
             &mut checks,
             &mut case_results,
             &mut blockers,
-            id,
-            "typecheck",
-            messages.contains(needle),
-            format!("independent typecheck diagnostic search for `{needle}` in `{id}`"),
-        );
+        )?;
     }
 
+    let zeros_input_needle = "`Bytes/zeros` creates BYTES and does not accept an input BYTES value";
     for (id, source_line) in [
         (
             "typecheck-bytes-zeros-rejects-input",
@@ -66465,37 +65784,17 @@ document: []
             "bad_zeros_pipe: bytes |> Bytes/zeros(byte_count: 4)",
         ),
     ] {
-        let source = format!(
-            r#"
-SOURCE
-HOLD
-LATEST
-LIST {{}}
-bytes: BYTES[4] {{ 16u01, 16u02, 16u03, 16u04 }}
-{source_line}
-document: []
-"#
-        );
-        let path = write_bytes_negative_fixture(&fixture_dir, id, "bn", &source)?;
-        artifact_paths.push(path.clone());
-        let parsed = boon_parser::parse_source(path.display().to_string(), &source)?;
-        let report = boon_typecheck::check(&parsed);
-        let messages = report
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let needle = "`Bytes/zeros` creates BYTES and does not accept an input BYTES value";
-        record_bytes_negative_case(
+        record_bytes_independent_typecheck_case(
+            &fixture_dir,
+            id,
+            source_line,
+            true,
+            zeros_input_needle,
+            &mut artifact_paths,
             &mut checks,
             &mut case_results,
             &mut blockers,
-            id,
-            "typecheck",
-            messages.contains(needle),
-            format!("independent typecheck diagnostic search for `{needle}` in `{id}`"),
-        );
+        )?;
     }
 
     let lower_result = boon_ir::lower(&parsed);
@@ -66566,14 +65865,7 @@ document: []
         duplicate_indexed_error,
     );
 
-    let named_bytes_scenario = r#"
-name = "named bytes payload rejected"
-source = "examples/bytes_source_payload_plan_ops.bn"
-
-[[step]]
-id = "receive-bytes"
-expected_source_event = { source = "store.receive", blob_bytes_hex = "01fe04" }
-"#;
+    let named_bytes_scenario = include_str!("../../../examples/bytes_named_payload_rejected.scn");
     let named_bytes_scenario_path = write_bytes_negative_fixture(
         &fixture_dir,
         "source-payload-named-bytes-scenario-key",
@@ -66669,27 +65961,15 @@ expected_source_event = { source = "store.receive", blob_bytes_hex = "01fe04" }
         ),
     );
     let positive_report = read_json(&positive_report_path)?;
-    for report_case in bytes_report_negative_cases(&positive_report) {
-        let negative_path = PathBuf::from(format!(
-            "target/reports/bytes-plan/_negative-bytes-{}.json",
-            report_case.id
-        ));
-        write_json(&negative_path, &report_case.report)?;
-        let rejected = schema_rejects(&negative_path)?;
-        record_bytes_negative_case(
-            &mut checks,
-            &mut case_results,
-            &mut blockers,
-            report_case.id,
-            "report-schema",
-            rejected,
-            if rejected {
-                "schema rejected mutated BYTES report".to_owned()
-            } else {
-                "schema accepted mutated BYTES report".to_owned()
-            },
-        );
-    }
+    record_bytes_schema_negative_cases(
+        "target/reports/bytes-plan/_negative-bytes-",
+        bytes_report_negative_cases(&positive_report),
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "schema rejected mutated BYTES report",
+        "schema accepted mutated BYTES report",
+    )?;
 
     let source_payload_report_path =
         PathBuf::from("target/reports/bytes-plan/bytes-negative-source-payload-route-base.json");
@@ -66722,27 +66002,15 @@ expected_source_event = { source = "store.receive", blob_bytes_hex = "01fe04" }
         ),
     );
     let source_payload_report = read_json(&source_payload_report_path)?;
-    for report_case in bytes_source_payload_report_negative_cases(&source_payload_report) {
-        let negative_path = PathBuf::from(format!(
-            "target/reports/bytes-plan/_negative-bytes-source-payload-{}.json",
-            report_case.id
-        ));
-        write_json(&negative_path, &report_case.report)?;
-        let rejected = schema_rejects(&negative_path)?;
-        record_bytes_negative_case(
-            &mut checks,
-            &mut case_results,
-            &mut blockers,
-            report_case.id,
-            "report-schema",
-            rejected,
-            if rejected {
-                "schema rejected mutated BYTES source-payload report".to_owned()
-            } else {
-                "schema accepted mutated BYTES source-payload report".to_owned()
-            },
-        );
-    }
+    record_bytes_schema_negative_cases(
+        "target/reports/bytes-plan/_negative-bytes-source-payload-",
+        bytes_source_payload_report_negative_cases(&source_payload_report),
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "schema rejected mutated BYTES source-payload report",
+        "schema accepted mutated BYTES source-payload report",
+    )?;
 
     let large_source_payload_report_path =
         PathBuf::from("target/reports/bytes-plan/bytes-source-payload-large-route-run-plan.json");
@@ -66775,29 +66043,15 @@ expected_source_event = { source = "store.receive", blob_bytes_hex = "01fe04" }
         ),
     );
     let large_source_payload_report = read_json(&large_source_payload_report_path)?;
-    for report_case in
-        bytes_large_source_payload_report_negative_cases(&large_source_payload_report)
-    {
-        let negative_path = PathBuf::from(format!(
-            "target/reports/bytes-plan/_negative-bytes-source-payload-{}.json",
-            report_case.id
-        ));
-        write_json(&negative_path, &report_case.report)?;
-        let rejected = schema_rejects(&negative_path)?;
-        record_bytes_negative_case(
-            &mut checks,
-            &mut case_results,
-            &mut blockers,
-            report_case.id,
-            "report-schema",
-            rejected,
-            if rejected {
-                "schema rejected mutated large BYTES source-payload report".to_owned()
-            } else {
-                "schema accepted mutated large BYTES source-payload report".to_owned()
-            },
-        );
-    }
+    record_bytes_schema_negative_cases(
+        "target/reports/bytes-plan/_negative-bytes-source-payload-",
+        bytes_large_source_payload_report_negative_cases(&large_source_payload_report),
+        &mut checks,
+        &mut case_results,
+        &mut blockers,
+        "schema rejected mutated large BYTES source-payload report",
+        "schema accepted mutated large BYTES source-payload report",
+    )?;
 
     for aggregate_case in bytes_machine_plan_aggregate_tamper_cases() {
         let (rejected, detail) = run_bytes_machine_plan_aggregate_tamper_case(&aggregate_case)?;
@@ -67398,47 +66652,22 @@ fn bytes_negative_hold_source(
     target_initial: &'static str,
     update_expr: &'static str,
 ) -> &'static str {
-    Box::leak(
-        format!(
-            r#"
-{payload_name}:
-    {payload_initial} |> HOLD {payload_name} {{ LATEST {{}} }}
-
-store: [
-    trigger: SOURCE
-    {target_name}:
-        {target_initial} |> HOLD {target_name} {{
-            LATEST {{
-                store.trigger |> THEN {{ {update_expr} }}
-            }}
-        }}
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ Bytes }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!("../../../examples/bytes_negative_templates/hold_source.bn.tmpl"),
+        &[
+            ("@PAYLOAD_NAME@", payload_name),
+            ("@PAYLOAD_INITIAL@", payload_initial),
+            ("@TARGET_NAME@", target_name),
+            ("@TARGET_INITIAL@", target_initial),
+            ("@UPDATE_EXPR@", update_expr),
+        ],
     )
 }
 
 fn bytes_source_payload_route_negative_source(target_initial: &'static str) -> &'static str {
-    Box::leak(
-        format!(
-            r#"
-store: [
-    receive: SOURCE
-    received:
-        {target_initial} |> HOLD received {{
-            LATEST {{
-                store.receive.bytes |> THEN {{ store.receive.bytes }}
-            }}
-        }}
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT {{ Bytes source payload }}))
-"#
-        )
-        .into_boxed_str(),
+    leak_template(
+        include_str!("../../../examples/bytes_negative_templates/source_payload_route.bn.tmpl"),
+        &[("@TARGET_INITIAL@", target_initial)],
     )
 }
 
@@ -67513,51 +66742,16 @@ fn bytes_negative_plan_cases() -> Vec<BytesNegativePlanCase> {
         BytesNegativePlanCase {
             id: "plan-bytes-source-payload-guard-rejected",
             expected_error: "BYTES source payload guards are not supported in v1",
-            source: r#"
-store: [
-    trigger: SOURCE
-    receive: SOURCE
-    matched:
-        False |> HOLD matched {
-            LATEST {
-                store.receive.bytes |> WHEN {
-                    __ => True
-                }
-            }
-        }
-]
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
-"#,
+            source: include_str!(
+                "../../../examples/bytes_negative_templates/source_payload_guard_rejected.bn"
+            ),
         },
         BytesNegativePlanCase {
             id: "plan-row-initial-bool-rejects-source-payload-text",
             expected_error: "expected: BOOL\nfound: TEXT",
-            source: r#"
-store: [
-    trigger: SOURCE
-    rows:
-        LIST {
-            [flag: False]
-            [flag: True]
-        }
-        |> List/map(row, new: row_widget(row: row))
-]
-
-FUNCTION row_widget(row) {
-    [
-        edit: SOURCE
-        flag:
-            row.flag |> HOLD flag {
-                LATEST {
-                    edit.text |> THEN { edit.text }
-                }
-            }
-    ]
-}
-
-document: Document/new(root: Element/label(element: [], label: TEXT { Row initial }))
-"#,
+            source: include_str!(
+                "../../../examples/bytes_negative_templates/row_initial_bool_rejects_source_payload_text.bn"
+            ),
         },
     ]
 }
@@ -68653,10 +67847,6 @@ fn verify_reports_schema(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             stale_historical_reports += 1;
             continue;
         }
-        if schema_summary_legacy_pre_contract_report(&path, &report, &native_handoff_report_paths) {
-            stale_historical_reports += 1;
-            continue;
-        }
         if schema_summary_should_hash_report(&path, &report, &summary_path) {
             artifact_hashes.push(artifact_hash(&path)?);
         }
@@ -68823,30 +68013,6 @@ fn schema_summary_native_gpu_large_non_handoff_report(
         && path.starts_with(Path::new("target/reports/native-gpu"))
         && !path.starts_with(Path::new("target/reports/native-gpu/roles"))
         && !native_handoff_report_paths.contains(path)
-}
-
-fn schema_summary_legacy_pre_contract_report(
-    path: &Path,
-    report: &serde_json::Value,
-    native_handoff_report_paths: &BTreeSet<PathBuf>,
-) -> bool {
-    if native_handoff_report_paths.contains(path)
-        || report.get("report_version").is_some()
-        || report.get("command").is_some()
-    {
-        return false;
-    }
-    let status_known = matches!(
-        report.get("status").and_then(serde_json::Value::as_str),
-        Some("pass" | "fail")
-    );
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    status_known
-        && ((path.starts_with(Path::new("target/reports/native-gpu"))
-            && name.starts_with("headed-scenario-"))
-            || name.ends_with("-ir-debug.json"))
 }
 
 fn json_string_field_from_prefix(prefix: &str, field: &str) -> Option<String> {
@@ -71443,34 +70609,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_summary_legacy_pre_contract_skip_is_narrow() {
-        let handoff_paths = BTreeSet::from([PathBuf::from(
-            "target/reports/native-gpu/preview-e2e-cells.json",
-        )]);
-        let legacy = json!({"status": "pass"});
-        assert!(schema_summary_legacy_pre_contract_report(
-            Path::new("target/reports/native-gpu/headed-scenario-cells-basic-headed.json"),
-            &legacy,
-            &handoff_paths
-        ));
-        assert!(schema_summary_legacy_pre_contract_report(
-            Path::new("target/reports/novywave-ir-debug.json"),
-            &legacy,
-            &handoff_paths
-        ));
-        assert!(!schema_summary_legacy_pre_contract_report(
-            Path::new("target/reports/native-gpu/preview-e2e-cells.json"),
-            &legacy,
-            &handoff_paths
-        ));
-        assert!(!schema_summary_legacy_pre_contract_report(
-            Path::new("target/reports/native-gpu/headed-scenario-cells-basic-headed.json"),
-            &json!({"status": "pass", "report_version": 1, "command": "verify-native-gpu-preview-e2e"}),
-            &handoff_paths
-        ));
-    }
-
-    #[test]
     fn product_render_graph_cells_sample_count_reads_json_sidecar_ref() {
         let dir = std::env::temp_dir().join(format!(
             "boon-xtask-product-graph-sidecar-{}-{}",
@@ -71722,11 +70860,11 @@ mod tests {
                     "label": "bad-source-replay",
                     "path": child.display().to_string(),
                     "reason": "identity-freshness",
-                    "command": "boon_cli run --compare-legacy --report child.json",
+                    "command": "boon_cli run examples/cells.bn --report child.json",
                     "argv": [
                         "boon_cli",
                         "run",
-                        "--compare-legacy",
+                        "examples/cells.bn",
                         "--report",
                         child.display().to_string()
                     ]
@@ -72226,11 +71364,11 @@ mod tests {
             Some(current_scoped.as_str())
         );
 
-        let legacy_report = json!({
+        let missing_scoped_report = json!({
             "worktree_fingerprint": "stale-full-worktree"
         });
         let missing_scoped =
-            report_worktree_freshness(&legacy_report, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
+            report_worktree_freshness(&missing_scoped_report, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
         assert!(!missing_scoped.fresh);
         assert_eq!(missing_scoped.basis, "missing-scoped");
         assert_eq!(missing_scoped.scope, NATIVE_GPU_WORKTREE_FINGERPRINT_SCOPE);
@@ -72794,9 +71932,9 @@ mod tests {
             assert!(
                 !replay.iter().any(|arg| matches!(
                     arg.as_str(),
-                    "--compare-legacy" | "--diagnostic-compare-legacy" | "--engine"
+                    "--engine"
                 )),
-                "{} canonical refresh argv contains retired control args: {replay:?}",
+                "{} canonical refresh argv contains engine-selection args: {replay:?}",
                 required.label
             );
         }
@@ -73068,7 +72206,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_path_ledger_rejects_product_forbidden_legacy_proof() {
+    fn stale_path_ledger_rejects_product_forbidden_proof() {
         let dir = PathBuf::from(format!(
             "target/tmp/xtask-stale-path-ledger-{}",
             std::process::id()
@@ -73097,7 +72235,7 @@ mod tests {
             &json!({
                 "schema_version": 1,
                 "rows": [{
-                    "id": "reject-legacy-proof",
+                    "id": "reject-product-forbidden-proof",
                     "mode": "product-forbidden",
                     "current_owner": "test",
                     "typed_replacement": "post-present proof queue",
@@ -73164,7 +72302,7 @@ mod tests {
             &json!({
                 "schema_version": 1,
                 "rows": [{
-                    "id": "removed-legacy-proof",
+                    "id": "removed-product-forbidden-proof",
                     "mode": "product-forbidden",
                     "current_owner": "test",
                     "typed_replacement": "post-present proof queue",
@@ -73573,8 +72711,8 @@ mod tests {
         assert!(
             blockers
                 .iter()
-                .any(|blocker| blocker.contains("legacy address selection fallback")),
-            "label contract must reject legacy selection fallback: {blockers:?}"
+                .any(|blocker| blocker.contains("address selection fallback")),
+            "label contract must reject selection fallback: {blockers:?}"
         );
     }
 
@@ -73682,7 +72820,7 @@ mod tests {
             bad_reasons
                 .iter()
                 .any(|reason| reason == "operator host input cannot claim real_os_input=true"),
-            "legacy operator-host token should still be rejected: {bad_reasons:?}"
+            "operator-host token should still be rejected: {bad_reasons:?}"
         );
     }
 

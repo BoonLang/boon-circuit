@@ -1,0 +1,11 @@
+store: [
+    load: SOURCE
+    file_bytes:
+        @INITIAL@ |> HOLD file_bytes {
+            LATEST {
+                store.load |> THEN { @UPDATE@ }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { File bytes }))

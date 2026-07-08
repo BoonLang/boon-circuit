@@ -1,0 +1,14 @@
+payload:
+    @INITIAL@ |> HOLD payload { LATEST {} }
+
+store: [
+    write: SOURCE
+    write_status:
+        TEXT { pending } |> HOLD write_status {
+            LATEST {
+                store.write |> THEN { @UPDATE@ }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { File write bytes }))

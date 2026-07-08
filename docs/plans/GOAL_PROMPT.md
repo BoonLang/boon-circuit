@@ -19,10 +19,8 @@ source of truth.
 ## Current Checkpoint
 
 - Normal runtime/product execution is PlanExecutor-backed.
-- Current source inspection shows no `LoadedRuntime`, `LoadedRuntimeHarness`, or
-  `GenericScheduledRuntime` implementation references in
-  `crates/boon_runtime`.
-- `boon_cli run` no longer exposes `--engine`, `--compare-legacy`, or
+- Current source inspection shows no pre-PlanExecutor runtime implementation
+  references in `crates/boon_runtime`.
   diagnostic compare aliases.
 - Native preview E2E and scroll evidence no longer accept the top-level
   `preview_native_gpu_render_proof` alias. Surface-scoped proof under
@@ -57,14 +55,12 @@ Use subagents before deep cuts:
 - one for native GPU/report freshness and verifier debt;
 - one for PlanExecutor/LiveRuntime/default runtime authority;
 - one for ProductFrameGraph/retained renderer architecture;
-- optionally one for negative legacy-path audit.
 
 Implementation priorities:
 
-1. Keep normal execution PlanExecutor-backed. Do not recreate LoadedRuntime,
-   GenericScheduledRuntime, LoadedRuntimeHarness, run --engine, compare-legacy,
-   disabled legacy report fields, or hidden fallback paths. If old tests need
-   them, delete or replace the tests with PlanExecutor/product coverage.
+1. Keep normal execution PlanExecutor-backed. Do not recreate pre-PlanExecutor
+   or hidden fallback paths. If old tests need them, delete or replace the tests
+   with PlanExecutor/product coverage.
 
 2. Cut verifier/control-plane ambiguity before product tuning when it blocks
    reliable evidence. Every verifier-consumed side report must be manifest-owned

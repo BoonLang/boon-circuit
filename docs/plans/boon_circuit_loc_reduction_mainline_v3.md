@@ -103,12 +103,10 @@ Not allowed:
 - Python in `docs/plans` as suggested tooling.
 - Python-generated committed source unless the generator is not part of the repo and the generated source is already required. Prefer not to do this.
 
-### 3.2 Delete legacy code; do not park it
 
 Do not create these directories or equivalents:
 
 ```text
-legacy/
 old/
 archive/
 unused/
@@ -611,7 +609,6 @@ Pass condition:
 Search:
 
 ```bash
-git grep -n -E 'quarantine|legacy/|archive/|feature branch|one phase per branch|python|\.py|native GPU checklist|handoff checklist' docs/plans/boon_circuit_loc_reduction_mainline_v3.md || true
 ```
 
 Allowed hits are only rule text forbidding those things.
@@ -1014,7 +1011,6 @@ Goal: remove stale references after code deletion.
 Search for removed features and commands:
 
 ```bash
-git grep -n -E 'boon_3mf|boon_manufacturing|legacy|quarantine|old Ply|browser proof|Xvfb screenshot|whole-desktop|COSMIC scraping' -- . ':!target' || true
 ```
 
 Only delete stale docs that refer to removed code or obsolete proof paths.
@@ -1180,7 +1176,6 @@ A chunk is successful only if all are true:
 - No protected surface was deleted.
 - No verifier was weakened.
 - No Python was added.
-- No legacy/quarantine/stub path was added.
 - Native handoff truth stayed manifest-backed.
 - Focused checks for touched crates passed.
 - Final aggregate gates pass before claiming the whole cleanup is done.

@@ -1,0 +1,22 @@
+store: [
+    rows:
+        LIST {
+@ROWS@
+        }
+        |> List/map(row, new: row_widget(row: row))
+]
+
+FUNCTION row_widget(row) {
+    [
+        load: SOURCE
+        name: row.name
+@PATH_BINDING@        file_bytes:
+            row.file_bytes |> HOLD file_bytes {
+                LATEST {
+                    load |> THEN { @READ_EXPR@ }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], label: TEXT { @LABEL@ }))

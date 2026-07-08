@@ -18,9 +18,7 @@ app-owned host events, WGPU/readback evidence, frame identity, bounded report
 payloads, and the product/proof latency split described in
 `docs/architecture/NATIVE_GPU_PIPELINE.md`.
 
-Do not use deleted or retired evidence paths:
 
-- no legacy Ply playground;
 - no Xvfb/browser/COSMIC screenshot proof;
 - no `headed-ply`, `ply-headless`, focus-free headed, operator-e2e, or manual
   JSON report substitutes;

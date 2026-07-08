@@ -20003,10 +20003,7 @@ fn style_rich_text_spans_for_test(
 ) -> Vec<boon_document_model::StyleRichTextSpan> {
     match value {
         boon_document_model::StyleValue::RichTextSpans(spans) => spans.clone(),
-        boon_document_model::StyleValue::Text(spans_json) => {
-            serde_json::from_str(spans_json).expect("syntax spans should be valid JSON")
-        }
-        _ => panic!("rich syntax spans should be typed or legacy JSON text"),
+        _ => panic!("rich syntax spans should be typed"),
     }
 }
 
@@ -20016,10 +20013,7 @@ fn style_editor_type_hints_for_test(
 ) -> Vec<boon_document_model::StyleEditorTypeHint> {
     match value {
         boon_document_model::StyleValue::EditorTypeHints(hints) => hints.clone(),
-        boon_document_model::StyleValue::Text(hints_json) => {
-            serde_json::from_str(hints_json).expect("type hints should be valid JSON")
-        }
-        _ => panic!("editor type hints should be typed or legacy JSON text"),
+        _ => panic!("editor type hints should be typed"),
     }
 }
 
@@ -65313,7 +65307,7 @@ mod tests {
         };
         let state_summary = json!({
             "store": {
-                "selected_address": "legacy-address-should-not-win",
+                "selected_address": "state-address-should-not-win",
                 "formula_bar": {
                     "text": "=generic-node-binding"
                 }
@@ -66678,7 +66672,7 @@ mod tests {
             &mut document_frame,
             root.clone(),
             dev_node(
-                "legacy-alpha",
+                "alpha-node",
                 boon_document_model::DocumentNodeKind::TextInput,
                 Some("Alpha".to_owned()),
                 &[("width", "96"), ("height", "24"), ("selected", "false")],
@@ -66688,7 +66682,7 @@ mod tests {
             &mut document_frame,
             root,
             dev_node(
-                "legacy-beta",
+                "beta-node",
                 boon_document_model::DocumentNodeKind::TextInput,
                 Some("Beta".to_owned()),
                 &[("width", "96"), ("height", "24"), ("selected", "true")],
@@ -66699,13 +66693,13 @@ mod tests {
         let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
             layout_proof: json!({
                 "source_intent_assertions": [
-                    {"node": "legacy-alpha", "intent": "address", "source_path": "alpha"},
-                    {"node": "legacy-beta", "intent": "address", "source_path": "beta"}
+                    {"node": "alpha-node", "intent": "address", "source_path": "alpha"},
+                    {"node": "beta-node", "intent": "address", "source_path": "beta"}
                 ],
                 "source_intent_value_index": {
                     "address": {
-                        "alpha": ["legacy-alpha"],
-                        "beta": ["legacy-beta"]
+                        "alpha": ["alpha-node"],
+                        "beta": ["beta-node"]
                     }
                 }
             }),
@@ -80616,7 +80610,7 @@ label:
         .unwrap();
         assert!(
             scratch_payload.is_none(),
-            "non-manifest buffers should keep the legacy single-file fallback"
+            "non-manifest buffers should not be upgraded to manifest payloads"
         );
     }
 
@@ -82088,74 +82082,6 @@ label:
     }
 
     #[test]
-    fn legacy_replace_code_probe_uses_current_preview_fast_path() {
-        let source_path = repo_path("examples/todo_mvc_physical/RUN.bn");
-        let source = boon_runtime::source_text_for_path(&source_path).unwrap();
-        let units = project_units_for_source_text(&source_path, &source);
-        let project_hash = boon_runtime::source_units_hash(&units);
-        let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
-            layout_proof: json!({"status": "pass", "source": "current-preview-layout"}),
-            layout_frame_override: None,
-            update_count: 6,
-            scroll_x_px: 0.0,
-            scroll_y_px: 0.0,
-            last_error: None,
-            last_error_count: 0,
-            status_overlay: None,
-            last_dirty_reason: None,
-        }));
-        let state = Arc::new(Mutex::new(PreviewIpcState {
-            source_path: source_path.clone(),
-            source_text: source.clone(),
-            runtime_units: units,
-            source_bytes: source.len() as u64,
-            source_sha256: project_hash,
-            runtime_summary: json!({"status": "pass", "source": "current-preview-runtime"}),
-            preview_perf_stats: None,
-            shared_render_state: Arc::clone(&shared_render_state),
-            live_runtime: None,
-            world_scene: None,
-            world_editor_session: None,
-            latest_accepted_command_id: 0,
-            latest_accepted_source_revision: 0,
-            replace_status_cache: json!({"kind": "replace-source-status", "status": "ready"}),
-            prewarmed_project_hashes: BTreeSet::new(),
-            prewarmed_project_results: BTreeMap::new(),
-            prewarm_worker: PreviewPrewarmWorkerQueue::default(),
-            replace_worker: PreviewReplaceWorkerQueue::default(),
-            ipc_counters: PreviewIpcCounterState::default(),
-            verifier_frame_requests: PreviewVerifierFrameRequestState::default(),
-            verifier_host_input: PreviewVerifierHostInputQueue::default(),
-            shutdown: PreviewShutdownState::default(),
-        }));
-
-        let response = preview_replace_code_already_current_response(
-            &state,
-            &json!({
-                "kind": "replace-code",
-                "source_path": source_path.display().to_string(),
-                "code": source,
-                "expected_hash": boon_runtime::sha256_bytes(
-                    boon_runtime::source_text_for_path(&source_path).unwrap().as_bytes()
-                )
-            }),
-        )
-        .unwrap()
-        .expect("same physical source should use replace-code no-op");
-
-        assert_eq!(response["status"], "pass", "{response}");
-        assert_eq!(response["preview_command"], "ReplaceCode");
-        assert_eq!(response["hash_matches"], true);
-        assert_eq!(response["accepted_for_preview_mutation"], false);
-        assert_eq!(response["source_project_already_current"], true);
-        assert_eq!(response["document_layout_proof"]["status"], "pass");
-        assert_eq!(response["preview_runtime_summary"]["status"], "pass");
-        let shared = shared_render_state.lock().unwrap();
-        assert_eq!(shared.update_count, 6);
-        assert!(shared.status_overlay.is_none());
-    }
-
-    #[test]
     fn prewarm_source_project_ack_is_deferred_and_background_marks_hash() {
         let source_path = repo_path("examples/counter.bn");
         let source = boon_runtime::source_text_for_path(&source_path).unwrap();
@@ -82357,7 +82283,7 @@ label:
     }
 
     #[test]
-    fn source_project_payload_rejects_scenario_fields_and_legacy_identity_is_opaque() {
+    fn source_project_payload_rejects_scenario_fields() {
         let source = std::fs::read_to_string(repo_path("examples/counter.bn")).unwrap();
         let payload = SourceProjectPayload::single_unit(
             11,
@@ -82379,20 +82305,6 @@ label:
             rejected.contains(&format!("unknown field `{forbidden_payload}`")),
             "unexpected rejection: {rejected}"
         );
-
-        let legacy = source_project_payload_from_request(&json!({
-            "kind": "replace-code",
-            "source_path": "memory://unscoped-counter.bn",
-            "code": source.clone(),
-            "expected_hash": boon_runtime::sha256_bytes(source.as_bytes()),
-            "source_revision": 5
-        }))
-        .unwrap();
-        assert!(
-            legacy.source_identity.starts_with("source:"),
-            "unscoped replace-code must be normalized to an opaque source identity"
-        );
-        assert_ne!(legacy.source_identity, "unscoped-replace-code");
     }
 
     #[test]
@@ -83575,7 +83487,7 @@ label:
         assert_eq!(
             binary_format_summary.pointer("/store/format_dropdown_state"),
             Some(&json!("Closed")),
-            "NovyWave legacy formatter dropdown state should remain closed after footer selection"
+            "NovyWave formatter dropdown state should remain closed after footer selection"
         );
         let (_, binary_format_layout) = native_document_layout_proof_with_project_state_embedded(
             &source_path,
@@ -87201,7 +87113,7 @@ document:
     }
 
     #[test]
-    fn layout_row_identity_enriches_live_event_with_legacy_address_payload() {
+    fn layout_row_identity_preserves_existing_address_payload() {
         let layout_proof = json!({
             "source_intent_assertions": [{
                 "node": "doc-node-test-row",
@@ -87216,7 +87128,7 @@ document:
         });
         let mut event = boon_runtime::LiveSourceEvent {
             source: "row.sources.select".to_owned(),
-            address: Some("legacy-address-payload".to_owned()),
+            address: Some("existing-address-payload".to_owned()),
             ..boon_runtime::LiveSourceEvent::default()
         };
 
@@ -87227,11 +87139,11 @@ document:
         assert_eq!(event.target_generation, Some(7));
         assert_eq!(event.source_id, Some(11));
         assert_eq!(event.bind_epoch, Some(12));
-        assert_eq!(event.address.as_deref(), Some("legacy-address-payload"));
+        assert_eq!(event.address.as_deref(), Some("existing-address-payload"));
     }
 
     #[test]
-    fn hit_route_table_enriches_live_event_with_legacy_address_payload() {
+    fn hit_route_table_preserves_existing_address_payload() {
         let source_intent = PreviewSourceIntentRecord {
             node: "doc-node-test-row".to_owned(),
             intent: "select".to_owned(),
@@ -87264,7 +87176,7 @@ document:
         };
         let mut event = boon_runtime::LiveSourceEvent {
             source: "row.sources.select".to_owned(),
-            address: Some("legacy-address-payload".to_owned()),
+            address: Some("existing-address-payload".to_owned()),
             ..boon_runtime::LiveSourceEvent::default()
         };
 
@@ -87275,7 +87187,7 @@ document:
         assert_eq!(event.target_generation, Some(7));
         assert_eq!(event.source_id, Some(11));
         assert_eq!(event.bind_epoch, Some(12));
-        assert_eq!(event.address.as_deref(), Some("legacy-address-payload"));
+        assert_eq!(event.address.as_deref(), Some("existing-address-payload"));
     }
 
     #[test]

@@ -133,8 +133,7 @@ proof-lane backpressure, or verifier measurement bugs.
    stale top-level preview proof dependencies.
 2. Split semantic scenario coverage from native input proof coverage so native
    gates do not fail on unrelated full-manifest expectations.
-3. Remove remaining legacy runtime fallback routes where `PlanExecutor` is the
-   intended product authority.
+   `PlanExecutor` is the intended product authority.
 4. Turn `ProductFrameGraph` from a linear/report projection into renderer-owned
    dirty-resource scheduling with retained GPU resources.
 5. Refresh focused native reports only after the harness is lean enough that
@@ -164,7 +163,6 @@ Stop and reassess architecture instead of continuing micro-optimizations when:
 - the same fresh blocker class repeats across two focused attempts;
 - verifier proof latency dominates while product latency is within budget;
 - stale report identity causes product-looking failures;
-- a code path exists only to preserve old report shape or legacy runtime
   comparison behavior.
 
 When stopping, document the blocker in the compact unified status file and cut

@@ -2948,7 +2948,6 @@ fn verify_compiler_boundaries_report(report: &JsonValue, report_path: &Path) -> 
         "runtime_static_analysis_dtos_extracted",
         "runtime_storage_indexed_derived_fields_extracted",
         "runtime_storage_initialization_ir_free",
-        "runtime_legacy_storage_constructor_uses_compiler_plan",
         "runtime_storage_initial_rows_extracted",
         "runtime_storage_indexed_row_initial_resets_extracted",
         "runtime_storage_list_slots_metadata_extracted",
@@ -3452,7 +3451,7 @@ fn verify_machine_plan_report(report: &JsonValue, report_path: &Path) -> Runtime
         })?;
     if executable != cpu_plan_executor_complete {
         return Err(format!(
-            "{} capability_summary.executable must match cpu_plan_executor_complete until the legacy field is removed",
+            "{} capability_summary.executable must match cpu_plan_executor_complete",
             report_path.display()
         )
         .into());
@@ -3925,13 +3924,6 @@ fn verify_run_plan_route_report(report: &JsonValue, report_path: &Path) -> Runti
             .into());
         }
     }
-    if report.get("legacy_comparison").is_some() {
-        return Err(format!(
-            "{} run-plan-route product report must not emit legacy_comparison",
-            report_path.display()
-        )
-        .into());
-    }
     let source_plan = compile_report_machine_plan(report, report_path)?;
     let actual_plan_hash = boon_plan::plan_sha256(&source_plan).map_err(|error| {
         format!(
@@ -4271,15 +4263,6 @@ fn verify_run_plan_root_scalar_scenario_report(
         if report.get(key).is_none() {
             return Err(format!(
                 "{} run-plan-root-scalar-scenario report missing `{key}`",
-                report_path.display()
-            )
-            .into());
-        }
-    }
-    for key in ["legacy_comparison", "legacy_comparison_acceptance"] {
-        if report.get(key).is_some() {
-            return Err(format!(
-                "{} run-plan-root-scalar-scenario product report must not emit `{key}`",
                 report_path.display()
             )
             .into());
@@ -4637,15 +4620,6 @@ fn verify_run_plan_scenario_events_report(
             .into());
         }
     }
-    for key in ["legacy_comparison", "legacy_comparison_acceptance"] {
-        if report.get(key).is_some() {
-            return Err(format!(
-                "{} run-plan-scenario-events product report must not emit `{key}`",
-                report_path.display()
-            )
-            .into());
-        }
-    }
     if report
         .get("plan_executor_status")
         .and_then(JsonValue::as_str)
@@ -4677,7 +4651,7 @@ fn verify_run_plan_scenario_events_report(
         .is_some_and(|argv| command_argv_value_after(argv, "--engine").is_some())
     {
         return Err(format!(
-            "{} run-plan-scenario-events command_argv must use default PlanExecutor `boon_cli run` without retired --engine",
+            "{} run-plan-scenario-events command_argv must use default PlanExecutor `boon_cli run` without --engine",
             report_path.display()
         )
         .into());
@@ -9222,14 +9196,9 @@ fn verify_native_gpu_all_refresh_commands(
             )
             .into());
         }
-        if argv_strings.iter().any(|arg| {
-            matches!(
-                *arg,
-                "--compare-legacy" | "--diagnostic-compare-legacy" | "--engine"
-            )
-        }) {
+        if argv_strings.iter().any(|arg| *arg == "--engine") {
             return Err(format!(
-                "{} refresh_commands[{index}] for `{label}` contains retired legacy comparison or engine flags",
+                "{} refresh_commands[{index}] for `{label}` contains an engine-selection flag",
                 report_path.display()
             )
             .into());
@@ -10529,13 +10498,6 @@ fn verify_bytes_file_write_plan_report_inner(
     if json_contains_key(report, "inline_bytes") {
         return Err(format!(
             "{} verify-bytes-file-write-plan must not expose inline byte payloads",
-            report_path.display()
-        )
-        .into());
-    }
-    if report.get("legacy_comparison").is_some() {
-        return Err(format!(
-            "{} verify-bytes-file-write-plan must not emit legacy_comparison",
             report_path.display()
         )
         .into());
@@ -13106,14 +13068,6 @@ fn verify_bytes_file_read_plan_report(report: &JsonValue, report_path: &Path) ->
         )
         .into());
     }
-    if report.get("legacy_comparison").is_some() {
-        return Err(format!(
-            "{} verify-bytes-file-read-plan must not emit legacy_comparison",
-            report_path.display()
-        )
-        .into());
-    }
-
     let executor = report
         .get("plan_executor")
         .and_then(JsonValue::as_object)
@@ -27535,7 +27489,6 @@ fn native_ux_forbidden_capture_method(method: &str) -> bool {
         || lower.contains("xvfb")
         || lower.contains("cosmic")
         || lower.contains("human")
-        || lower.contains("legacy-ply")
         || lower.contains("ply-")
         || lower.contains("xdotool")
         || lower.contains("ydotool")
@@ -30694,8 +30647,7 @@ fn verify_report_source_files_hash(
         return Ok(false);
     }
     let actual = sha256_combined_source_files(&paths)?;
-    let legacy_actual = sha256_combined_source_file_digests(&paths)?;
-    if actual != expected && legacy_actual != expected {
+    if actual != expected {
         return Err(format!(
             "{} has stale `source_hash` for manifest {files_key}",
             report_path.display()
@@ -30717,20 +30669,6 @@ fn sha256_combined_source_files(paths: &[&str]) -> RuntimeResult<String> {
         canonical.push(0xff);
     }
     Ok(sha256_bytes(&canonical))
-}
-
-fn sha256_combined_source_file_digests(paths: &[&str]) -> RuntimeResult<String> {
-    if paths.len() == 1 {
-        return Ok(sha256_bytes(&fs::read(paths[0])?));
-    }
-    let mut canonical = String::new();
-    for path in paths {
-        canonical.push_str(path);
-        canonical.push('\0');
-        canonical.push_str(&sha256_bytes(&fs::read(path)?));
-        canonical.push('\0');
-    }
-    Ok(sha256_bytes(canonical.as_bytes()))
 }
 
 fn verify_artifact_hashes(report: &JsonValue, report_path: &Path) -> RuntimeResult<()> {
@@ -31414,22 +31352,6 @@ mod tests {
             source_replay_argv,
             "dump-plan"
         ));
-        let retired_engine_argv = json!([
-            "target/debug/boon_cli",
-            "run",
-            "examples/todomvc.bn",
-            "--scenario",
-            "examples/todomvc.scn",
-            "--engine",
-            "plan",
-            "--report",
-            "target/reports/bytes-plan/todomvc-scenario-events-full.json"
-        ]);
-        assert!(!child_command_argv_proves_expected_command(
-            retired_engine_argv.as_array().unwrap(),
-            "run-plan-scenario-events"
-        ));
-
         let semantic_argv = json!([
             "target/debug/boon_cli",
             "run",
@@ -32009,11 +31931,11 @@ mod tests {
             "label": "preview-e2e-cells",
             "path": "target/reports/native-gpu/preview-e2e-cells.json",
             "reason": "identity-freshness",
-            "command": "boon_cli run --compare-legacy --report target/reports/native-gpu/preview-e2e-cells.json",
+            "command": "boon_cli run examples/cells.bn --report target/reports/native-gpu/preview-e2e-cells.json",
             "argv": [
                 "boon_cli",
                 "run",
-                "--compare-legacy",
+                "examples/cells.bn",
                 "--report",
                 "target/reports/native-gpu/preview-e2e-cells.json"
             ]
@@ -32031,12 +31953,12 @@ mod tests {
             "label": "preview-e2e-cells",
             "path": "target/reports/native-gpu/preview-e2e-cells.json",
             "reason": "identity-freshness",
-            "command": "xtask verify-native-gpu-preview-e2e --engine legacy --report target/reports/native-gpu/preview-e2e-cells.json",
+            "command": "xtask verify-native-gpu-preview-e2e --engine plan --report target/reports/native-gpu/preview-e2e-cells.json",
             "argv": [
                 "xtask",
                 "verify-native-gpu-preview-e2e",
                 "--engine",
-                "legacy",
+                "plan",
                 "--report",
                 "target/reports/native-gpu/preview-e2e-cells.json"
             ]
@@ -32717,23 +32639,6 @@ mod tests {
         report["source_replay_identity"] = identity;
         assert!(report_source_replay_identity_matches_report(&report));
 
-        let mut retired_engine_report = source_replay_identity_report_fixture();
-        retired_engine_report["command_argv"] = json!([
-            "target/debug/boon_cli",
-            "run",
-            "examples/cells.bn",
-            "--scenario",
-            "examples/cells.scn",
-            "--engine",
-            "plan",
-            "--report",
-            "target/reports/bytes-plan/cells-scenario-events-full.json"
-        ]);
-        assert!(
-            source_replay_identity_for_report(&retired_engine_report).is_none(),
-            "retired --engine source replay argv must not mint a current identity"
-        );
-
         report["plan_hash"] = json!("different-planhash");
         assert!(
             !report_source_replay_identity_matches_report(&report),
@@ -33050,7 +32955,7 @@ mod tests {
             "per_step_pass_fail": [
                 {"id": "machine-plan-verified", "pass": true},
                 {"id": "cpu-plan-executor-initial-state", "pass": true},
-                {"id": "legacy-runtime-not-used", "pass": true}
+                {"id": "plan-executor-only-runtime", "pass": true}
             ],
             "artifact_sha256s": [],
             "plan_executor": plan_executor

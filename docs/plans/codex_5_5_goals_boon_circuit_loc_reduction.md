@@ -13,7 +13,6 @@ Core execution rules:
 - Work on `main`. Do not create branches.
 - Do not commit or push unless the user explicitly asks.
 - Do not use Python in the repository.
-- Delete legacy code; do not move it into `legacy`, `archive`, `quarantine`, or disabled stubs.
 - Do not leave removed-command stubs in final code.
 - Do not weaken verification, native GPU schemas, report schemas, negative checks, budgets, or runtime finality checks.
 - Do not replace strict validators with permissive skeletons.
@@ -70,7 +69,6 @@ Recommended target for the known `428,824`-line checkout:
 ## /goal 0 — high — verify active plan files and remove weaker copies if they return
 
 ```text
-/goal You are working in the Boon Circuit repository on main. Do not create branches. Do not commit or push. Do not use Python. Do not move removed code into legacy/archive/quarantine directories.
 
 Task: make the LOC-reduction plan files unambiguous before any code cleanup.
 
@@ -247,7 +245,6 @@ Task: finish the LOC-reduction cleanup and produce an honest final line-count re
 
 Steps:
 1. Search stale references:
-   git grep -n -E 'boon_3mf|boon_manufacturing|legacy|quarantine|old Ply|browser proof|Xvfb screenshot|whole-desktop|COSMIC scraping|one phase per branch|feature branch|Python tooling|\.py|second native.*handoff|native GPU checklist' -- . ':!target' || true
 2. Delete stale docs only when they point to removed code or obsolete proof paths. Do not delete active native GPU docs.
 3. Ensure only v3 LOC plan remains in docs/plans if any LOC plan is committed.
 4. Run formatting/checking appropriate to the repo. If cargo fmt would explode intentionally compressed physical line counts, report that and ask whether formatting is desired; do not use minification as a LOC-reduction tactic.

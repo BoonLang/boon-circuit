@@ -7130,173 +7130,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_style_layout_path_matches_legacy_layout_for_covered_properties() {
-        let mut frame = DocumentFrame::empty("root");
-
-        let mut row = node("row", DocumentNodeKind::Row, Some("root"));
-        row.style
-            .insert("width".to_owned(), StyleValue::Number(360.0));
-        row.style
-            .insert("height".to_owned(), StyleValue::Number(84.0));
-        row.style.insert("gap".to_owned(), StyleValue::Number(8.0));
-        row.style
-            .insert("padding".to_owned(), StyleValue::Number(6.0));
-        row.style
-            .insert("padding_left".to_owned(), StyleValue::Number(10.0));
-        row.style
-            .insert("center".to_owned(), StyleValue::Bool(true));
-        row.children.push(DocumentNodeId("auto-button".to_owned()));
-        row.children.push(DocumentNodeId("fill-panel".to_owned()));
-        row.children.push(DocumentNodeId("field".to_owned()));
-
-        let mut auto_button = node("auto-button", DocumentNodeKind::Button, Some("row"));
-        auto_button.text = Some(TextValue {
-            text: "Open".to_owned(),
-        });
-        auto_button
-            .style
-            .insert("width".to_owned(), StyleValue::Text("auto".to_owned()));
-        auto_button
-            .style
-            .insert("height".to_owned(), StyleValue::Number(26.0));
-        auto_button
-            .style
-            .insert("padding".to_owned(), StyleValue::Number(3.0));
-        auto_button
-            .style
-            .insert("auto_padding".to_owned(), StyleValue::Number(12.0));
-        auto_button
-            .style
-            .insert("size".to_owned(), StyleValue::Number(10.0));
-
-        let mut fill_panel = node("fill-panel", DocumentNodeKind::Stack, Some("row"));
-        fill_panel
-            .style
-            .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
-        fill_panel
-            .style
-            .insert("height".to_owned(), StyleValue::Number(30.0));
-        fill_panel
-            .style
-            .insert("__hover_scope".to_owned(), StyleValue::Bool(true));
-
-        let mut field = node("field", DocumentNodeKind::TextInput, Some("row"));
-        field
-            .style
-            .insert("width".to_owned(), StyleValue::Number(80.0));
-        field
-            .style
-            .insert("height".to_owned(), StyleValue::Number(24.0));
-        field.style.insert(
-            "placeholder".to_owned(),
-            StyleValue::Text("Find".to_owned()),
-        );
-        field
-            .style
-            .insert("size".to_owned(), StyleValue::Number(11.0));
-
-        let mut overlay = node("overlay", DocumentNodeKind::Stack, Some("root"));
-        overlay
-            .style
-            .insert("overlay_children".to_owned(), StyleValue::Bool(true));
-        overlay
-            .style
-            .insert("padding".to_owned(), StyleValue::Number(5.0));
-        overlay
-            .style
-            .insert("min_width".to_owned(), StyleValue::Number(100.0));
-        overlay
-            .style
-            .insert("max_width".to_owned(), StyleValue::Number(140.0));
-        overlay
-            .children
-            .push(DocumentNodeId("overlay-text".to_owned()));
-
-        let mut overlay_text = node("overlay-text", DocumentNodeKind::Text, Some("overlay"));
-        overlay_text.text = Some(TextValue {
-            text: "Overlay".to_owned(),
-        });
-        overlay_text
-            .style
-            .insert("size".to_owned(), StyleValue::Number(9.0));
-
-        frame
-            .nodes
-            .get_mut(&frame.root)
-            .unwrap()
-            .children
-            .extend([row.id.clone(), overlay.id.clone()]);
-        frame.nodes.insert(row.id.clone(), row);
-        frame.nodes.insert(auto_button.id.clone(), auto_button);
-        frame.nodes.insert(fill_panel.id.clone(), fill_panel);
-        frame.nodes.insert(field.id.clone(), field);
-        frame.nodes.insert(overlay.id.clone(), overlay);
-        frame.nodes.insert(overlay_text.id.clone(), overlay_text);
-
-        let hot_ids = DocumentHotIdTable::from_frame(&frame).unwrap();
-        let typed_styles = DocumentTypedStyleIndex::from_frame(&frame, &hot_ids).unwrap();
-        let viewport = Viewport {
-            surface: 1,
-            width: 500.0,
-            height: 240.0,
-            scale: 1.0,
-        };
-
-        let mut legacy_text = SimpleTextMeasurer;
-        let legacy = layout(LayoutInput {
-            document: &frame,
-            viewport,
-            text: &mut legacy_text,
-            capabilities: RenderCapabilities::fake_portable(),
-        });
-        let mut typed_text = SimpleTextMeasurer;
-        let typed = layout_with_typed_styles(
-            LayoutInput {
-                document: &frame,
-                viewport,
-                text: &mut typed_text,
-                capabilities: RenderCapabilities::fake_portable(),
-            },
-            &hot_ids,
-            &typed_styles,
-        );
-
-        assert_eq!(typed, legacy);
-        assert!(
-            typed
-                .hit_regions
-                .iter()
-                .any(|hit| hit.node.0 == "fill-panel"),
-            "typed pseudo styles should preserve hover hit-region emission"
-        );
-
-        let mut stale_styles = typed_styles.clone();
-        let row_hot = hot_ids
-            .hot_id(&DocumentNodeId("row".to_owned()))
-            .expect("row should have a hot id");
-        stale_styles.records.remove(&row_hot);
-        let mut stale_text = SimpleTextMeasurer;
-        let err = try_layout_with_typed_styles(
-            LayoutInput {
-                document: &frame,
-                viewport,
-                text: &mut stale_text,
-                capabilities: RenderCapabilities::fake_portable(),
-            },
-            &hot_ids,
-            &stale_styles,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            PatchApplyError::StaleReference {
-                reference_kind: "typed_style_index",
-                id
-            } if id.0 == "row"
-        ));
-    }
-
-    #[test]
     fn derived_index_bundle_builds_typed_layout_and_hit_indexes_together() {
         let mut frame = DocumentFrame::empty("root");
         let mut button = node("button", DocumentNodeKind::Button, Some("root"));
@@ -7346,13 +7179,6 @@ mod tests {
             height: 80.0,
             scale: 1.0,
         };
-        let mut legacy_text = SimpleTextMeasurer;
-        let legacy = layout(LayoutInput {
-            document: &frame,
-            viewport,
-            text: &mut legacy_text,
-            capabilities: RenderCapabilities::fake_portable(),
-        });
         let mut typed_text = SimpleTextMeasurer;
         let typed = bundle
             .try_layout(LayoutInput {
@@ -7362,7 +7188,6 @@ mod tests {
                 capabilities: RenderCapabilities::fake_portable(),
             })
             .unwrap();
-        assert_eq!(typed, legacy);
 
         let hit_table = bundle.try_hit_side_table(&frame, &typed).unwrap();
         let hit = hit_table

@@ -16,20 +16,24 @@ fn demand_driven_scheduler_renders_first_dirty_revision_once() {
 
 
 #[test]
-fn demand_driven_idle_wait_uses_frame_class_passive_input_poll() {
+fn demand_driven_idle_wait_uses_passive_poll_only_without_scheduled_wake() {
     let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
     let now = Instant::now();
     state.mark_presented(state.dirty_revision);
 
+    assert!(
+        PASSIVE_INPUT_POLL_INTERVAL >= Duration::from_millis(30),
+        "manual idle windows must not spin at frame-rate/probe cadence when no wake is scheduled"
+    );
     assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
 
     state.schedule_wake_after(now, Duration::from_millis(30));
-    assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
+    assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(30));
 
     let mut state = NativeRenderLoopState::new(NativeRenderLoopMode::DemandDriven);
     state.mark_presented(state.dirty_revision);
     state.schedule_wake_after(now, Duration::from_millis(4));
-    assert_eq!(state.idle_wait_timeout(now), PASSIVE_INPUT_POLL_INTERVAL);
+    assert_eq!(state.idle_wait_timeout(now), Duration::from_millis(4));
 }
 
 

@@ -77,6 +77,7 @@ const DEV_FILE_TAB_HEIGHT: u32 = 24;
 const DEV_TOOLBAR_PADDING: u32 = 8;
 const DEV_TOOLBAR_GAP: u32 = 10;
 const DEV_TOOLBAR_ROW_HEIGHT: u32 = 32;
+const DEV_COMMAND_SPECS: [&str; 5] = ["run", "test", "format", "reset", "remove_custom"];
 const DEV_FOOTER_LINE_HEIGHT: u32 = 22;
 const DEV_FOOTER_VALUE_WRAP_CHARS: usize = 92;
 const DEV_FOOTER_SCROLL_PADDING: u32 = 6;
@@ -99,7 +100,7 @@ const DEV_TYPE_INSPECTOR_LIST_LOAD_STEP: usize = 4;
 const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 64;
 const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
 const DEV_PREVIEW_INSPECTOR_REFRESH_MS: u64 = 250;
-const DEV_PREVIEW_PERF_REFRESH_MS: u64 = 250;
+const DEV_PREVIEW_PERF_REFRESH_MS: u64 = 1_000;
 const DEV_PREVIEW_PERF_SNAPSHOT_MAX_PAYLOAD_BYTES: u64 = 4096;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 const DEFAULT_PREVIEW_WIDTH: f32 = 920.0;
@@ -7275,7 +7276,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     dev_args.push("--selected-example".to_owned());
     dev_args.push(example.clone());
-    if !dev_editor_only {
+    if desktop_should_send_startup_replace_code(probe, dev_editor_only) {
         dev_args.push("--replace-code-file".to_owned());
         dev_args.push(
             source_path
@@ -7296,14 +7297,6 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .to_owned(),
         "--hold-ms".to_owned(),
         effective_dev_hold_ms.to_string(),
-        "--ipc-stress-messages".to_owned(),
-        "4096".to_owned(),
-        "--ipc-queue-capacity".to_owned(),
-        "256".to_owned(),
-        "--ipc-probe-timeout-ms".to_owned(),
-        dev_ipc_probe_timeout_ms.to_string(),
-        "--operator-host-input-source-event-limit".to_owned(),
-        OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST.to_string(),
         "--title-token".to_owned(),
         title_token.clone(),
         "--input-sample-delay-ms".to_owned(),
@@ -7317,12 +7310,24 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .to_str()
             .ok_or("dev loop report path is not UTF-8")?
             .to_owned(),
-        "--preview-loop-report".to_owned(),
-        preview_loop_report
-            .to_str()
-            .ok_or("preview loop report path is not UTF-8")?
-            .to_owned(),
     ]);
+    if probe {
+        dev_args.extend([
+            "--ipc-stress-messages".to_owned(),
+            "4096".to_owned(),
+            "--ipc-queue-capacity".to_owned(),
+            "256".to_owned(),
+            "--ipc-probe-timeout-ms".to_owned(),
+            dev_ipc_probe_timeout_ms.to_string(),
+            "--operator-host-input-source-event-limit".to_owned(),
+            OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST.to_string(),
+            "--preview-loop-report".to_owned(),
+            preview_loop_report
+                .to_str()
+                .ok_or("preview loop report path is not UTF-8")?
+                .to_owned(),
+        ]);
+    }
     if (probe && !real_window_input_probe) || dev_app_owned_input_probe {
         dev_args.push("--synthetic-input-probe".to_owned());
     }
@@ -7657,6 +7662,10 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         write_desktop_report(&report, &args[1..], details)?;
     }
     Ok(())
+}
+
+fn desktop_should_send_startup_replace_code(probe: bool, dev_editor_only: bool) -> bool {
+    probe && !dev_editor_only
 }
 
 fn native_document_layout_proof(
@@ -12711,6 +12720,8 @@ fn native_gpu_dev_visible_render_hook(
         )
     });
     let render_hook_started = Instant::now();
+    let build_dev_render_report =
+        context.frame_lane != boon_native_app_window::NativeFrameLane::DevTelemetry;
     let render_scene_cache_started = Instant::now();
     let render_scene_cache_hit = render_scene_cache.as_ref().is_some_and(|cache| {
         cache.content_revision == content_revision
@@ -12826,40 +12837,56 @@ fn native_gpu_dev_visible_render_hook(
             let render_target_kind = context.render_target_kind;
             let presentation_width = context.width;
             let presentation_height = context.height;
-            let report_json_started = Instant::now();
-            let mut report = dev_visible_render_report(
-                context,
-                shell,
-                layout_frame,
-                code_editor_model_report,
-                full_layout_refresh_count,
-                fast_frame_patch_count,
-                passive_scroll_full_layout_refresh_count,
-                passive_scroll_fast_frame_patch_count,
-                cache,
-                visible_metrics.clone(),
-                render_hook_phase_timings_ms.clone(),
-            );
-            report["dev_render_cache"]["fast_render_scene_patch"] = json!({
-                "status": "pass",
-                "kind": patch_request.kind,
-                "base_revision": patch_request.base_revision,
-                "target_revision": patch_request.target_revision,
-                "touched_node_count": patch_request.touched_nodes.len(),
-                "patch_hash": direct_patch_hash,
-                "patch_report": direct_patch_report,
-                "base_cache_hit": true,
-                "rejection": direct_patch_rejection
-            });
-            let report_json_ms = elapsed_ms(report_json_started);
-            if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
-                timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
-                timings.insert(
-                    "total_with_report_json_ms".to_owned(),
-                    json!(elapsed_ms(render_hook_started)),
+            let proof = if build_dev_render_report {
+                let report_json_started = Instant::now();
+                let mut report = dev_visible_render_report(
+                    context,
+                    shell,
+                    layout_frame,
+                    code_editor_model_report,
+                    full_layout_refresh_count,
+                    fast_frame_patch_count,
+                    passive_scroll_full_layout_refresh_count,
+                    passive_scroll_fast_frame_patch_count,
+                    cache,
+                    visible_metrics.clone(),
+                    render_hook_phase_timings_ms.clone(),
                 );
-            }
-            report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
+                report["dev_render_cache"]["fast_render_scene_patch"] = json!({
+                    "status": "pass",
+                    "kind": patch_request.kind,
+                    "base_revision": patch_request.base_revision,
+                    "target_revision": patch_request.target_revision,
+                    "touched_node_count": patch_request.touched_nodes.len(),
+                    "patch_hash": direct_patch_hash,
+                    "patch_report": direct_patch_report,
+                    "base_cache_hit": true,
+                    "rejection": direct_patch_rejection
+                });
+                let report_json_ms = elapsed_ms(report_json_started);
+                if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+                    timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
+                    timings.insert(
+                        "total_with_report_json_ms".to_owned(),
+                        json!(elapsed_ms(render_hook_started)),
+                    );
+                }
+                report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms.clone();
+                Some(report)
+            } else {
+                if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+                    timings.insert("report_json_ms".to_owned(), json!(0.0));
+                    timings.insert(
+                        "report_json_skipped".to_owned(),
+                        json!("dev_telemetry_frame"),
+                    );
+                    timings.insert(
+                        "total_with_report_json_ms".to_owned(),
+                        json!(elapsed_ms(render_hook_started)),
+                    );
+                }
+                None
+            };
             let mut render_frame_metrics =
                 preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
             let presentation_plan = preview_dev_presentation_plan(
@@ -12870,8 +12897,12 @@ fn native_gpu_dev_visible_render_hook(
                 presentation_height,
                 "dev_direct_render_scene_patch",
                 "dev_window_fast_render_scene_patch",
-                true,
-                dev_post_present_proof_request_summaries(),
+                proof.is_some(),
+                if proof.is_some() {
+                    dev_post_present_proof_request_summaries()
+                } else {
+                    Vec::new()
+                },
             );
             preview_attach_product_proof_boundary(
                 &mut render_frame_metrics,
@@ -12883,7 +12914,7 @@ fn native_gpu_dev_visible_render_hook(
                 Some(encode_scene_ms),
             );
             return Ok(PreviewNativeGpuRenderHookOutput {
-                proof: Some(report),
+                proof,
                 layout_identity: cache.layout_frame_hash.clone(),
                 render_scene_identity: cache.render_scene_identity.clone(),
                 render_frame_metrics: Some(render_frame_metrics),
@@ -12951,42 +12982,58 @@ fn native_gpu_dev_visible_render_hook(
     let render_target_kind = context.render_target_kind;
     let presentation_width = context.width;
     let presentation_height = context.height;
-    let report_json_started = Instant::now();
-    let mut report = dev_visible_render_report(
-        context,
-        shell,
-        layout_frame,
-        code_editor_model_report,
-        full_layout_refresh_count,
-        fast_frame_patch_count,
-        passive_scroll_full_layout_refresh_count,
-        passive_scroll_fast_frame_patch_count,
-        cache,
-        visible_metrics.clone(),
-        render_hook_phase_timings_ms.clone(),
-    );
-    report["dev_render_cache"]["fast_render_scene_patch"] = json!({
-        "status": if direct_patch_rejection.is_some() { "fallback" } else { "not-used" },
-        "kind": fast_render_scene_patch.map(|patch| patch.kind).unwrap_or("none"),
-        "base_revision": fast_render_scene_patch.map(|patch| patch.base_revision),
-        "target_revision": fast_render_scene_patch.map(|patch| patch.target_revision),
-        "touched_node_count": fast_render_scene_patch
-            .map(|patch| patch.touched_nodes.len())
-            .unwrap_or(0),
-        "patch_hash": direct_patch_hash,
-        "patch_report": direct_patch_report,
-        "base_cache_hit": direct_patch_base_cache_hit,
-        "rejection": direct_patch_rejection
-    });
-    let report_json_ms = elapsed_ms(report_json_started);
-    if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
-        timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
-        timings.insert(
-            "total_with_report_json_ms".to_owned(),
-            json!(elapsed_ms(render_hook_started)),
+    let proof = if build_dev_render_report {
+        let report_json_started = Instant::now();
+        let mut report = dev_visible_render_report(
+            context,
+            shell,
+            layout_frame,
+            code_editor_model_report,
+            full_layout_refresh_count,
+            fast_frame_patch_count,
+            passive_scroll_full_layout_refresh_count,
+            passive_scroll_fast_frame_patch_count,
+            cache,
+            visible_metrics.clone(),
+            render_hook_phase_timings_ms.clone(),
         );
-    }
-    report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms;
+        report["dev_render_cache"]["fast_render_scene_patch"] = json!({
+            "status": if direct_patch_rejection.is_some() { "fallback" } else { "not-used" },
+            "kind": fast_render_scene_patch.map(|patch| patch.kind).unwrap_or("none"),
+            "base_revision": fast_render_scene_patch.map(|patch| patch.base_revision),
+            "target_revision": fast_render_scene_patch.map(|patch| patch.target_revision),
+            "touched_node_count": fast_render_scene_patch
+                .map(|patch| patch.touched_nodes.len())
+                .unwrap_or(0),
+            "patch_hash": direct_patch_hash,
+            "patch_report": direct_patch_report,
+            "base_cache_hit": direct_patch_base_cache_hit,
+            "rejection": direct_patch_rejection
+        });
+        let report_json_ms = elapsed_ms(report_json_started);
+        if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+            timings.insert("report_json_ms".to_owned(), json!(report_json_ms));
+            timings.insert(
+                "total_with_report_json_ms".to_owned(),
+                json!(elapsed_ms(render_hook_started)),
+            );
+        }
+        report["render_hook_phase_timings_ms"] = render_hook_phase_timings_ms.clone();
+        Some(report)
+    } else {
+        if let Some(timings) = render_hook_phase_timings_ms.as_object_mut() {
+            timings.insert("report_json_ms".to_owned(), json!(0.0));
+            timings.insert(
+                "report_json_skipped".to_owned(),
+                json!("dev_telemetry_frame"),
+            );
+            timings.insert(
+                "total_with_report_json_ms".to_owned(),
+                json!(elapsed_ms(render_hook_started)),
+            );
+        }
+        None
+    };
     let mut render_frame_metrics =
         preview_native_render_frame_metrics(&visible_metrics, layout_frame, Some(0.0));
     let presentation_plan = preview_dev_presentation_plan(
@@ -13005,8 +13052,12 @@ fn native_gpu_dev_visible_render_hook(
         } else {
             "dev_window_cached_render_scene"
         },
-        false,
-        dev_post_present_proof_request_summaries(),
+        proof.is_some(),
+        if proof.is_some() {
+            dev_post_present_proof_request_summaries()
+        } else {
+            Vec::new()
+        },
     );
     preview_attach_product_proof_boundary(
         &mut render_frame_metrics,
@@ -13018,7 +13069,7 @@ fn native_gpu_dev_visible_render_hook(
         Some(encode_scene_ms),
     );
     Ok(PreviewNativeGpuRenderHookOutput {
-        proof: Some(report),
+        proof,
         layout_identity: cache.layout_frame_hash.clone(),
         render_scene_identity: cache.render_scene_identity.clone(),
         render_frame_metrics: Some(render_frame_metrics),
@@ -13066,7 +13117,7 @@ fn dev_visible_render_report(
         "example_catalog_entry_count": shell.catalog.entries.len(),
         "dev_window_tabs_visible": true,
         "dev_window_toolbar_visible": true,
-        "dev_window_controls": ["Run", "Format", "Reset"],
+        "dev_window_controls": ["Run", "Test", "Format", "Reset"],
         "code_editor_model": code_editor_model_report,
         "code_editor_visible_style": dev_code_editor_visible_style_report(layout_frame),
         "dev_hot_path_counters": {
@@ -17029,6 +17080,81 @@ impl ExampleWorkspace {
             "program_kind": "generic",
             "preview_transport": "ReplaceCode",
             "validation": validation,
+            "parser_bypassed": false,
+            "runtime_bypassed": false
+        })
+    }
+
+    fn test_selected(&self, catalog: &ExampleCatalog) -> serde_json::Value {
+        let runtime_units = match self.selected_runtime_units(catalog) {
+            Ok(units) => units,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
+                    "command": "Test",
+                    "selected_example_id": self.selected_example_id,
+                    "source_path": self.selected_buffer.file_name,
+                    "diagnostic": error.to_string(),
+                    "parser_bypassed": false,
+                    "runtime_bypassed": true
+                });
+            }
+        };
+        let validation =
+            BoonLanguageService::validate_project_units(&self.entry_file, &runtime_units);
+        let validation_pass =
+            validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+        let selected_entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == self.selected_example_id);
+        let scenario_report = selected_entry
+            .filter(|entry| !entry.custom)
+            .and_then(|entry| boon_runtime::example_manifest_entry(&entry.id).ok())
+            .map(|entry| {
+                let scenario_path = repo_relative_path(&entry.scenario);
+                match boon_runtime::parse_scenario(&scenario_path) {
+                    Ok(scenario) => json!({
+                        "status": "pass",
+                        "scenario_path": entry.scenario,
+                        "scenario_step_count": scenario.step.len(),
+                        "budget_path": entry.budget,
+                        "manifest_bound": true
+                    }),
+                    Err(error) => json!({
+                        "status": "fail",
+                        "scenario_path": entry.scenario,
+                        "budget_path": entry.budget,
+                        "manifest_bound": true,
+                        "diagnostic": error.to_string()
+                    }),
+                }
+            })
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "skipped",
+                    "manifest_bound": false,
+                    "reason": "selected example is custom or not manifest-backed"
+                })
+            });
+        let scenario_pass = matches!(
+            scenario_report
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("pass" | "skipped")
+        );
+        json!({
+            "status": if validation_pass && scenario_pass { "pass" } else { "fail" },
+            "command": "Test",
+            "selected_example_id": self.selected_example_id,
+            "source_path": self.selected_buffer.file_name,
+            "entry_file": self.entry_file,
+            "source_hash": BoonLanguageService::runtime_units_hash(&runtime_units),
+            "source_unit_count": runtime_units.len(),
+            "program_kind": "generic",
+            "preview_transport": "ReplaceCode",
+            "validation": validation,
+            "scenario": scenario_report,
             "parser_bypassed": false,
             "runtime_bypassed": false
         })
@@ -21024,6 +21150,7 @@ impl DevWindowShell {
 
         let mut value = match source_path {
             "dev.commands.run" => self.workspace.run_selected(&self.catalog),
+            "dev.commands.test" => self.workspace.test_selected(&self.catalog),
             "dev.commands.format" => {
                 self.hovered_editor_position = None;
                 self.workspace.format_selected(&self.catalog)
@@ -21737,6 +21864,9 @@ impl DevWindowShell {
             .attach_preview_transport_result_if_queued(&mut tab_switch_json, preview_probe_timeout);
         let mut run = shell.dispatch_host_synthetic_source_path("dev.commands.run", 1180.0, 820.0);
         shell.attach_preview_transport_result_if_queued(&mut run, preview_probe_timeout);
+        let mut test =
+            shell.dispatch_host_synthetic_source_path("dev.commands.test", 1180.0, 820.0);
+        shell.attach_preview_transport_result_if_queued(&mut test, preview_probe_timeout);
         let mut format =
             shell.dispatch_host_synthetic_source_path("dev.commands.format", 1180.0, 820.0);
         shell.attach_preview_transport_result_if_queued(&mut format, preview_probe_timeout);
@@ -21865,6 +21995,7 @@ impl DevWindowShell {
         let status_pass = [
             &tab_switch_json,
             &run,
+            &test,
             &format,
             &reset,
             &editor_text_input,
@@ -21897,6 +22028,7 @@ impl DevWindowShell {
         let source_dispatches = [
             &tab_switch_json,
             &run,
+            &test,
             &format,
             &reset,
             &editor_text_input,
@@ -21928,6 +22060,7 @@ impl DevWindowShell {
             "catalog_listing": catalog_listing,
             "tab_switch": tab_switch_json,
             "run": run,
+            "test": test,
             "format": format,
             "reset": reset,
             "editor_text_input": editor_text_input,
@@ -22119,6 +22252,7 @@ impl DevWindowShell {
         let required_sources = {
             let mut sources = vec![
                 "dev.commands.run".to_owned(),
+                "dev.commands.test".to_owned(),
                 "dev.commands.format".to_owned(),
                 "dev.commands.reset".to_owned(),
                 "dev.editor.insert_text".to_owned(),
@@ -22379,8 +22513,7 @@ fn dev_shell_document(
     } else {
         0
     };
-    let command_specs = ["run", "format", "reset", "remove_custom"];
-    let command_widths = command_specs
+    let command_widths = DEV_COMMAND_SPECS
         .iter()
         .map(|command| if *command == "remove_custom" { 116 } else { 96 })
         .collect::<Vec<_>>();
@@ -22697,7 +22830,7 @@ fn dev_shell_document(
         .entries
         .iter()
         .any(|entry| entry.id == shell.workspace.selected_example_id && entry.custom);
-    for (command_index, command) in command_specs.iter().copied().enumerate() {
+    for (command_index, command) in DEV_COMMAND_SPECS.iter().copied().enumerate() {
         let label = match command {
             "remove_custom" => "REMOVE".to_owned(),
             other => other.to_ascii_uppercase(),
@@ -23272,6 +23405,7 @@ fn friendly_dev_command(command: &str) -> &'static str {
     match command {
         "startup" => "Startup",
         "Run" => "Run",
+        "Test" => "Test",
         "Format" => "Format",
         "Reset" => "Reset",
         "RemoveCustomExample" => "Remove",
@@ -63557,4 +63691,82 @@ fn read_runtime_source_units(
     path: &Path,
 ) -> Result<Vec<boon_runtime::RuntimeSourceUnit>, Box<dyn std::error::Error>> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_toolbar_exposes_test_source_binding() {
+        let source_path = "examples/counter.bn";
+        let source = boon_runtime::source_text_for_path(Path::new(source_path)).unwrap();
+        let shell = DevWindowShell::new(
+            source_path,
+            &source,
+            Some("counter"),
+            PreviewTransport::new(None),
+        );
+        let source_paths = shell.document_source_paths();
+
+        for command in ["run", "test", "format", "reset"] {
+            let source_path = format!("dev.commands.{command}");
+            assert!(
+                source_paths.contains(&source_path),
+                "dev toolbar must expose `{source_path}`"
+            );
+        }
+    }
+
+    #[test]
+    fn default_catalog_hides_3d_examples_but_keeps_primary_examples_visible() {
+        let entries = boon_runtime::example_manifest_entries().unwrap();
+        let entry = |id: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .unwrap_or_else(|| panic!("missing manifest entry `{id}`"))
+        };
+
+        for id in [
+            "hello_3d",
+            "printable_bracket_3d",
+            "parametric_car_3d",
+            "parametric_car_rich_3d",
+        ] {
+            assert!(
+                !entry(id).shown_by_default,
+                "`{id}` must not appear as a default dev-window example tab"
+            );
+        }
+
+        for id in [
+            "cells",
+            "todomvc",
+            "todo_mvc_physical",
+            "novywave",
+            "counter",
+        ] {
+            assert!(
+                entry(id).shown_by_default,
+                "`{id}` must stay visible in the default dev-window catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_desktop_launch_does_not_send_startup_replace_code() {
+        assert!(!desktop_should_send_startup_replace_code(false, false));
+        assert!(!desktop_should_send_startup_replace_code(false, true));
+        assert!(!desktop_should_send_startup_replace_code(true, true));
+        assert!(desktop_should_send_startup_replace_code(true, false));
+    }
+
+    #[test]
+    fn dev_perf_hud_default_refresh_is_not_a_busy_repaint_loop() {
+        assert!(
+            DEV_PREVIEW_PERF_REFRESH_MS >= 1_000,
+            "manual dev-window perf HUD must not force multiple full text-scene repaints per second"
+        );
+    }
 }

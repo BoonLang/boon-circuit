@@ -16,14 +16,10 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wgpu::SurfaceTargetUnsafe;
 
-// The native loop currently owns both DemandDriven frame pacing and app-window
-// input discovery. Until `PreviewHotLoop` splits those responsibilities, this
-// timeout is the worst-case interval before mouse/keyboard state becomes
-// sampleable on paths where the app-window callback cannot interrupt our wait.
-// Keep it below a frame budget instead of treating it as an idle-only energy
-// knob; otherwise user-visible clicks can sit behind a 100ms sleep before the
-// product path even starts.
-const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(2);
+// Fallback poll for paths where the app-window callback cannot interrupt our
+// wait. Real input and scheduled animation wakes use NativeWakeHandle/next_wake
+// and should not be gated by this idle-only interval.
+const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const VISIBLE_SURFACE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;

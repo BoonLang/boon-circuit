@@ -4882,8 +4882,6 @@ fn compiler_runtime_generic_call_supported(
 ) -> Result<(), String> {
     if function.strip_prefix("Field/").is_some()
         || compiler_is_generic_render_constructor(function)
-        || compiler_is_generic_world_constructor(function)
-        || compiler_is_generic_solid_constructor(function)
         || compiler_is_light_constructor(function)
         || functions.contains(function)
         || function
@@ -4977,48 +4975,6 @@ fn compiler_is_generic_render_constructor(function: &str) -> bool {
             | "Scene/Element/button"
             | "Scene/Element/paragraph"
             | "Scene/Element/link"
-    )
-}
-
-fn compiler_is_generic_world_constructor(function: &str) -> bool {
-    matches!(
-        function,
-        "World/new"
-            | "World/camera"
-            | "World/perspective_camera"
-            | "World/light"
-            | "World/point_light"
-            | "World/material"
-            | "World/transform"
-            | "World/primitive"
-            | "World/indexed_mesh"
-            | "World/model"
-            | "World/group"
-            | "Camera/perspective"
-            | "Light/directional"
-            | "World/instance"
-    )
-}
-
-fn compiler_is_generic_solid_constructor(function: &str) -> bool {
-    matches!(
-        function,
-        "Assembly/new"
-            | "Part/new"
-            | "Part/instance"
-            | "Solid/box"
-            | "Solid/rounded_box"
-            | "Solid/sphere"
-            | "Solid/cylinder"
-            | "Solid/cone"
-            | "Solid/torus"
-            | "Solid/extrude"
-            | "Solid/revolve"
-            | "Solid/loft"
-            | "Solid/shell"
-            | "Solid/union"
-            | "Solid/difference"
-            | "Solid/translate"
     )
 }
 

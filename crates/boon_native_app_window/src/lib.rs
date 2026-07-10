@@ -117,15 +117,6 @@ pub struct NativeAccessibilityActionRequest {
     pub value: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct NativeWorldEditorSessionActionReport {
-    pub dispatch: boon_host::SemanticSourceDispatch,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_report: Option<boon_scene_model::WorldEditorSessionActionReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeAccessibilityAction {
@@ -368,35 +359,6 @@ pub fn native_accessibility_source_dispatches_from_requests(
             let semantic_id = native_to_semantic.get(&request.target_node_id)?.clone();
             let event = native_accessibility_semantic_input_event(semantic_id, request)?;
             scene.source_dispatch_for_event(event)
-        })
-        .collect()
-}
-
-pub fn native_accessibility_world_editor_session_reports_from_requests(
-    scene: &boon_host::SemanticScene,
-    requests: &[NativeAccessibilityActionRequest],
-    session: &mut boon_scene_model::WorldEditorSession,
-    bundle: &boon_solid_model::SolidModelBundle,
-) -> Vec<NativeWorldEditorSessionActionReport> {
-    native_accessibility_source_dispatches_from_requests(scene, requests)
-        .into_iter()
-        .map(|dispatch| {
-            let action = boon_scene_model::WorldEditorSourceAction {
-                source_path: dispatch.source_path.clone(),
-                source_intent: dispatch.source_intent.clone(),
-            };
-            match session.handle_source_action(bundle, &action) {
-                Ok(session_report) => NativeWorldEditorSessionActionReport {
-                    dispatch,
-                    session_report: Some(session_report),
-                    error: None,
-                },
-                Err(error) => NativeWorldEditorSessionActionReport {
-                    dispatch,
-                    session_report: None,
-                    error: Some(error),
-                },
-            }
         })
         .collect()
 }
@@ -3976,8 +3938,6 @@ pub struct NativeProductFrameCommit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_hook_outer_input_snapshot_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub render_hook_outer_world_snapshot_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_hook_outer_core_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_hook_outer_revision_ms: Option<f64>,
@@ -4025,8 +3985,6 @@ pub struct NativeRenderFrameMetrics {
     pub render_hook_outer_state_snapshot_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_hook_outer_input_snapshot_ms: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub render_hook_outer_world_snapshot_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_hook_outer_core_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -8255,8 +8213,6 @@ fn product_frame_commit_for_presented_frame(
             .and_then(|metrics| metrics.render_hook_outer_state_snapshot_ms),
         render_hook_outer_input_snapshot_ms: render_frame_metrics
             .and_then(|metrics| metrics.render_hook_outer_input_snapshot_ms),
-        render_hook_outer_world_snapshot_ms: render_frame_metrics
-            .and_then(|metrics| metrics.render_hook_outer_world_snapshot_ms),
         render_hook_outer_core_ms: render_frame_metrics
             .and_then(|metrics| metrics.render_hook_outer_core_ms),
         render_hook_outer_revision_ms: render_frame_metrics
@@ -8621,7 +8577,6 @@ fn compact_poll_diagnostics_for_recent_history(
         "scheduler_reason": diagnostics.get("scheduler_reason").cloned().unwrap_or(serde_json::Value::Null),
         "role_dirty_reason": diagnostics.get("role_dirty_reason").cloned().unwrap_or(serde_json::Value::Null),
         "text_input_caret_active": diagnostics.get("text_input_caret_active").cloned().unwrap_or(serde_json::Value::Null),
-        "preview_has_world_scene": diagnostics.get("preview_has_world_scene").cloned().unwrap_or(serde_json::Value::Null),
         "accessibility_snapshot_status": diagnostics.get("accessibility_snapshot_status").cloned().unwrap_or(serde_json::Value::Null),
         "phase_timings_ms": diagnostics.get("phase_timings_ms").cloned().unwrap_or(serde_json::Value::Null),
         "recent_native_input_timing_samples": diagnostics.get("recent_native_input_timing_samples").cloned().unwrap_or_else(|| serde_json::json!([])),

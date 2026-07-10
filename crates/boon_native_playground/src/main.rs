@@ -5642,7 +5642,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         boon_native_app_window::NativeSyntheticInputProbeKind::Full
     };
-    let world_scene_orbit_probe = args.iter().any(|arg| arg == "--world-scene-orbit-probe");
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
     let sample_frame_count = numeric_arg(args, "--sample-frame-count").unwrap_or(1) as u32;
     let render_loop_state_report = value_arg(args, "--render-loop-report");
@@ -5657,24 +5656,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let (initial_width, initial_height) = preview_viewport_for_source_path(Path::new(&code_file));
     let title = role_window_title("Boon Preview", value_arg(args, "--title-token").as_deref());
     let wake_handle = boon_native_app_window::NativeWakeHandle::new();
-    let world_scene = preview_world_scene_for_live_runtime(&code_hash, live_runtime.as_ref());
-    let world_editor_session =
-        preview_world_editor_session_for_live_runtime(&code_hash, live_runtime.as_ref());
-    let world_editor_layout_snapshot = world_editor_session.as_ref().and_then(|session| {
-        preview_world_editor_document_layout_snapshot(
-            session,
-            (initial_width as f32, initial_height as f32),
-        )
-        .ok()
-    });
     let shared_render_state = Arc::new(Mutex::new(PreviewSharedRenderState {
-        layout_proof: world_editor_layout_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.proof.clone())
-            .unwrap_or_else(|| document_layout_proof.clone()),
-        layout_frame_override: world_editor_layout_snapshot
-            .map(|snapshot| Arc::new(snapshot.layout_frame))
-            .or_else(|| document_layout_frame.map(Arc::new)),
+        layout_proof: document_layout_proof.clone(),
+        layout_frame_override: document_layout_frame.map(Arc::new),
         update_count: 0,
         scroll_x_px: 0.0,
         scroll_y_px: 0.0,
@@ -5693,8 +5677,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         preview_perf_stats: None,
         shared_render_state: Arc::clone(&shared_render_state),
         live_runtime: live_runtime.clone(),
-        world_scene: world_scene.clone(),
-        world_editor_session: world_editor_session.clone(),
         latest_accepted_command_id: 0,
         latest_accepted_source_revision: 0,
         replace_status_cache: json!({
@@ -5719,40 +5701,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|_| "preview IPC state mutex poisoned")?
         .shutdown
         .clone();
-    let world_scene_orbit_probe_report = if world_scene_orbit_probe {
-        match world_scene.as_ref() {
-            Some(world_scene) => {
-                match preview_apply_world_scene_orbit_probe(world_scene, &shared_render_state) {
-                    Ok(report) => report,
-                    Err(error) => {
-                        let diagnostic = format!("world scene orbit probe failed: {error}");
-                        preview_note_render_error(&shared_render_state, diagnostic.clone())?;
-                        json!({
-                            "status": "fail",
-                            "diagnostic": diagnostic,
-                            "input_method": "app_owned_native_input_adapter_world_scene_orbit_probe"
-                        })
-                    }
-                }
-            }
-            None => {
-                let diagnostic =
-                    "world scene orbit probe requested but source has no top-level `world:` output"
-                        .to_owned();
-                preview_note_render_error(&shared_render_state, diagnostic.clone())?;
-                json!({
-                    "status": "fail",
-                    "diagnostic": diagnostic,
-                    "input_method": "app_owned_native_input_adapter_world_scene_orbit_probe"
-                })
-            }
-        }
-    } else {
-        json!({
-            "status": "not-run",
-            "reason": "--world-scene-orbit-probe not requested"
-        })
-    };
     if let Some(path) = connect.as_deref() {
         start_preview_ipc_server(path, Arc::clone(&preview_ipc_state), wake_handle.clone())?;
     }
@@ -5767,7 +5715,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let preview_ipc_state = Arc::clone(&preview_ipc_state);
         let poll_shared_render_state = Arc::clone(&shared_render_state);
         let poll_preview_ipc_state = Arc::clone(&preview_ipc_state);
-        let render_preview_ipc_state = Arc::clone(&preview_ipc_state);
         let perf_preview_ipc_state = Arc::clone(&preview_ipc_state);
         let input_state = Arc::new(Mutex::new(PreviewNativeInputState::default()));
         let input_poll_shared_render_state = Arc::clone(&shared_render_state);
@@ -5826,24 +5773,31 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             input_state.accepted_host_input_event_hint = None;
             note_poll_phase!("input_state_lock_ms", phase_started);
             let phase_started = Instant::now();
-            let preview_world_scene = input_poll_preview_ipc_state
-                .lock()
-                .map_err(|_| "preview IPC state mutex poisoned".to_owned())?
-                .world_scene
-                .clone();
-            let preview_has_world_scene = preview_world_scene.is_some();
-            note_poll_phase!("world_scene_lock_ms", phase_started);
             let mut role_dirty_reason = None;
             let mut input_route = "none";
             let input_may_change_source =
                 preview_input_has_unhandled_source_events(&input_delta, &input_state)
                     || preview_input_has_pending_source_work(&input_state);
-            if let Some(world_scene) = preview_world_scene.as_ref() {
-                input_route = "world_scene";
+            if input_may_change_source {
+                input_route = "source";
+                let input_context = preview_input_runtime_context(&input_poll_preview_ipc_state)
+                    .map_err(|error| error.to_string())?;
+                note_poll_phase!("input_runtime_context_ms", phase_started);
                 let phase_started = Instant::now();
-                match preview_apply_world_scene_input(
+                let pending_live_events_before_current_input =
+                    if preview_input_has_unhandled_source_events(&input_delta, &input_state)
+                        && !input_state.pending_live_events.is_empty()
+                    {
+                        Some(std::mem::take(&mut input_state.pending_live_events))
+                    } else {
+                        None
+                    };
+                match preview_apply_real_window_input_with_units(
                     &input_delta,
-                    world_scene,
+                    &input_context.source_path,
+                    &input_context.source_text,
+                    &input_context.runtime_units,
+                    input_context.live_runtime.as_ref(),
                     &input_poll_shared_render_state,
                     &mut input_state,
                 ) {
@@ -5865,90 +5819,13 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                note_poll_phase!("world_scene_input_ms", phase_started);
-            } else if input_may_change_source {
-                input_route = "source";
-                let phase_started = Instant::now();
-                let input_context = preview_input_runtime_context(&input_poll_preview_ipc_state)
-                    .map_err(|error| error.to_string())?;
-                note_poll_phase!("input_runtime_context_ms", phase_started);
-                let phase_started = Instant::now();
-                let world_editor_input_result = if let Some(world_editor_session) =
-                    input_context.world_editor_session.as_ref()
-                {
-                    preview_try_apply_world_editor_input(
-                        &input_delta,
-                        world_editor_session,
-                        &input_poll_shared_render_state,
-                        &mut input_state,
-                    )
-                } else {
-                    Ok(false)
-                };
-                match world_editor_input_result {
-                    Ok(true) => {
-                        role_dirty_reason =
-                            Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
-                    }
-                    Ok(false) => {
-                        let pending_live_events_before_current_input =
-                            if preview_input_has_unhandled_source_events(&input_delta, &input_state)
-                                && !input_state.pending_live_events.is_empty()
-                            {
-                                Some(std::mem::take(&mut input_state.pending_live_events))
-                            } else {
-                                None
-                            };
-                        match preview_apply_real_window_input_with_units(
-                            &input_delta,
-                            &input_context.source_path,
-                            &input_context.source_text,
-                            &input_context.runtime_units,
-                            input_context.live_runtime.as_ref(),
-                            &input_poll_shared_render_state,
-                            &mut input_state,
-                        ) {
-                            Ok(true) => {
-                                role_dirty_reason = Some(
-                                    boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied,
-                                );
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                if preview_note_render_error(
-                                    &input_poll_shared_render_state,
-                                    error.to_string(),
-                                )
-                                .map_err(|error| error.to_string())?
-                                {
-                                    role_dirty_reason = Some(
-                                    boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
-                                );
-                                }
-                            }
-                        }
-                        if let Some(deferred_live_events) = pending_live_events_before_current_input
-                        {
-                            let mut current_live_events =
-                                std::mem::take(&mut input_state.pending_live_events);
-                            input_state.pending_live_events = deferred_live_events;
-                            input_state
-                                .pending_live_events
-                                .append(&mut current_live_events);
-                        }
-                    }
-                    Err(error) => {
-                        if preview_note_render_error(
-                            &input_poll_shared_render_state,
-                            error.to_string(),
-                        )
-                        .map_err(|error| error.to_string())?
-                        {
-                            role_dirty_reason = Some(
-                                boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
-                            );
-                        }
-                    }
+                if let Some(deferred_live_events) = pending_live_events_before_current_input {
+                    let mut current_live_events =
+                        std::mem::take(&mut input_state.pending_live_events);
+                    input_state.pending_live_events = deferred_live_events;
+                    input_state
+                        .pending_live_events
+                        .append(&mut current_live_events);
                 }
                 note_poll_phase!("source_input_ms", phase_started);
             }
@@ -5976,7 +5853,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "forced_frame": context.forced_frame,
                 "real_os_events_observed": context.input_delta.real_os_events_observed,
                 "input_route": input_route,
-                "preview_has_world_scene": preview_has_world_scene,
                 "input_may_change_source": input_may_change_source,
                 "role_dirty_reason": role_dirty_reason,
                 "before_update_count": before_update_count,
@@ -6048,14 +5924,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|error| error.to_string())?;
             note_poll_phase!("input_runtime_context_ms", phase_started);
             let phase_started = Instant::now();
-            let preview_world_scene = poll_preview_ipc_state
-                .lock()
-                .map_err(|_| "preview IPC state mutex poisoned".to_owned())?
-                .world_scene
-                .clone();
-            let preview_has_world_scene = preview_world_scene.is_some();
-            note_poll_phase!("world_scene_lock_ms", phase_started);
-            let phase_started = Instant::now();
             let input_delta = native_input_for_layout_surface(
                 &context.input_delta,
                 context.width,
@@ -6073,27 +5941,25 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let mut verifier_host_input_report = serde_json::Value::Null;
             let mut verifier_host_input_applied = false;
             let phase_started = Instant::now();
-            if !preview_has_world_scene {
-                match preview_try_apply_passive_hover_input(
-                    &input_delta,
-                    &poll_shared_render_state,
-                    &mut input_state,
-                ) {
-                    Ok(true) => {
-                        if role_dirty_reason.is_none() {
-                            role_dirty_reason =
-                                Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
-                        }
+            match preview_try_apply_passive_hover_input(
+                &input_delta,
+                &poll_shared_render_state,
+                &mut input_state,
+            ) {
+                Ok(true) => {
+                    if role_dirty_reason.is_none() {
+                        role_dirty_reason =
+                            Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
                     }
-                    Ok(false) => {}
-                    Err(error) => {
-                        if preview_note_render_error(&poll_shared_render_state, error.to_string())
-                            .map_err(|error| error.to_string())?
-                        {
-                            role_dirty_reason = Some(
-                                boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
-                            );
-                        }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if preview_note_render_error(&poll_shared_render_state, error.to_string())
+                        .map_err(|error| error.to_string())?
+                    {
+                        role_dirty_reason = Some(
+                            boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
+                        );
                     }
                 }
             }
@@ -6152,7 +6018,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     &input_context.source_text,
                     &input_context.runtime_units,
                     input_context.live_runtime.as_ref(),
-                    input_context.world_editor_session.as_ref(),
                     &poll_shared_render_state,
                     &mut input_state,
                 ) {
@@ -6176,10 +6041,17 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             note_poll_phase!("accessibility_actions_ms", phase_started);
             let phase_started = Instant::now();
-            if let Some(world_scene) = preview_world_scene.as_ref() {
-                match preview_apply_world_scene_input(
+            if !verifier_host_input_applied
+                && (preview_input_has_unhandled_source_events(&input_delta, &input_state)
+                    || preview_input_has_pending_source_work(&input_state))
+            {
+                let source_input_started = Instant::now();
+                match preview_apply_real_window_input_with_units(
                     &input_delta,
-                    world_scene,
+                    &input_context.source_path,
+                    &input_context.source_text,
+                    &input_context.runtime_units,
+                    input_context.live_runtime.as_ref(),
                     &poll_shared_render_state,
                     &mut input_state,
                 ) {
@@ -6198,146 +6070,79 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-            } else if !verifier_host_input_applied
-                && (preview_input_has_unhandled_source_events(&input_delta, &input_state)
-                    || preview_input_has_pending_source_work(&input_state))
-            {
-                let source_input_started = Instant::now();
-                let world_editor_input_result = if let Some(world_editor_session) =
-                    input_context.world_editor_session.as_ref()
-                {
-                    preview_try_apply_world_editor_input(
-                        &input_delta,
-                        world_editor_session,
-                        &poll_shared_render_state,
-                        &mut input_state,
-                    )
-                } else {
-                    Ok(false)
-                };
-                match world_editor_input_result {
-                    Ok(true) => {
-                        role_dirty_reason =
-                            Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
-                    }
-                    Ok(false) => {
-                        match preview_apply_real_window_input_with_units(
-                            &input_delta,
-                            &input_context.source_path,
-                            &input_context.source_text,
-                            &input_context.runtime_units,
-                            input_context.live_runtime.as_ref(),
-                            &poll_shared_render_state,
-                            &mut input_state,
-                        ) {
-                            Ok(true) => {
-                                role_dirty_reason = Some(
-                                    boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied,
-                                );
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                if preview_note_render_error(
-                                    &poll_shared_render_state,
-                                    error.to_string(),
-                                )
-                                .map_err(|error| error.to_string())?
-                                {
-                                    role_dirty_reason = Some(
-                                    boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
-                                );
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        if preview_note_render_error(&poll_shared_render_state, error.to_string())
-                            .map_err(|error| error.to_string())?
-                        {
-                            role_dirty_reason = Some(
-                                boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
-                            );
-                        }
-                    }
-                }
                 note_poll_phase!("source_input_ms", source_input_started);
             }
-            note_poll_phase!("world_or_source_input_ms", phase_started);
+            note_poll_phase!("source_input_route_ms", phase_started);
             let phase_started = Instant::now();
-            if !preview_has_world_scene {
-                match preview_apply_scroll_input_with_units(
-                    &input_delta,
-                    Some(&input_context.source_path),
-                    Some(&input_context.source_text),
-                    Some(&input_context.runtime_units),
-                    input_context.live_runtime.as_ref(),
-                    &poll_shared_render_state,
-                ) {
-                    Ok(true) => {
-                        if role_dirty_reason.is_none() {
-                            role_dirty_reason =
-                                Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
-                        }
+            match preview_apply_scroll_input_with_units(
+                &input_delta,
+                Some(&input_context.source_path),
+                Some(&input_context.source_text),
+                Some(&input_context.runtime_units),
+                input_context.live_runtime.as_ref(),
+                &poll_shared_render_state,
+            ) {
+                Ok(true) => {
+                    if role_dirty_reason.is_none() {
+                        role_dirty_reason =
+                            Some(boon_native_app_window::NativeRoleDirtyReason::ScrollChanged);
                     }
-                    Ok(false) => {}
-                    Err(error) => {
-                        if preview_note_render_error(&poll_shared_render_state, error.to_string())
-                            .map_err(|error| error.to_string())?
-                        {
-                            role_dirty_reason = Some(
-                                boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
-                            );
-                        }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if preview_note_render_error(&poll_shared_render_state, error.to_string())
+                        .map_err(|error| error.to_string())?
+                    {
+                        role_dirty_reason = Some(
+                            boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
+                        );
                     }
                 }
             }
             note_poll_phase!("scroll_input_ms", phase_started);
             let phase_started = Instant::now();
-            if !preview_has_world_scene {
-                match preview_relayout_for_viewport(
-                    &poll_preview_ipc_state,
-                    context.width,
-                    context.height,
-                ) {
-                    Ok(true) => {
-                        if role_dirty_reason.is_none() {
-                            role_dirty_reason =
-                                Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
-                        }
+            match preview_relayout_for_viewport(
+                &poll_preview_ipc_state,
+                context.width,
+                context.height,
+            ) {
+                Ok(true) => {
+                    if role_dirty_reason.is_none() {
+                        role_dirty_reason =
+                            Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged);
                     }
-                    Ok(false) => {}
-                    Err(error) => {
-                        if preview_note_render_error(&poll_shared_render_state, error.to_string())
-                            .map_err(|error| error.to_string())?
-                        {
-                            role_dirty_reason = Some(
-                                boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
-                            );
-                        }
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    if preview_note_render_error(&poll_shared_render_state, error.to_string())
+                        .map_err(|error| error.to_string())?
+                    {
+                        role_dirty_reason = Some(
+                            boon_native_app_window::NativeRoleDirtyReason::ErrorOverlayChanged,
+                        );
                     }
                 }
             }
             note_poll_phase!("viewport_relayout_ms", phase_started);
             let phase_started = Instant::now();
             let caret_visible = preview_caret_visible(&input_state, context.now);
-            let focus_changed =
-                if preview_has_world_scene || input_state.focus_overlay_applied_in_input {
-                    false
-                } else if input_state.focused_selection_proxy {
-                    preview_update_retained_focus_overlay_state(
-                        &poll_shared_render_state,
-                        &mut input_state,
-                        caret_visible,
-                    )
-                    .map_err(|error| error.to_string())?
-                } else {
-                    preview_apply_focus_overlay(
-                        &poll_shared_render_state,
-                        &mut input_state,
-                        caret_visible,
-                    )
-                    .map_err(|error| error.to_string())?
-                };
+            let focus_changed = if input_state.focus_overlay_applied_in_input {
+                false
+            } else if input_state.focused_selection_proxy {
+                preview_update_retained_focus_overlay_state(
+                    &poll_shared_render_state,
+                    &mut input_state,
+                    caret_visible,
+                )
+                .map_err(|error| error.to_string())?
+            } else {
+                preview_apply_focus_overlay(
+                    &poll_shared_render_state,
+                    &mut input_state,
+                    caret_visible,
+                )
+                .map_err(|error| error.to_string())?
+            };
             if focus_changed && role_dirty_reason.is_none() {
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged);
@@ -6424,8 +6229,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 accessibility_snapshot_status = "deferred_product_input";
                 None
             } else {
-                let input_context = preview_input_runtime_context(&poll_preview_ipc_state)
-                    .map_err(|error| error.to_string())?;
                 let focus_overlay = input_state.focus_render_overlay.clone();
                 let shared = poll_shared_render_state
                     .lock()
@@ -6433,7 +6236,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 let revision = preview_content_revision(shared.update_count);
                 let snapshot = preview_native_accessibility_snapshot_for_host_cached(
                     &shared,
-                    input_context.world_editor_session.as_ref(),
                     &mut accessibility_cache,
                     revision,
                     Some(&focus_overlay),
@@ -6482,7 +6284,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 "real_os_events_observed": context.input_delta.real_os_events_observed,
                 "input_delta_real_os_events_observed": input_delta.real_os_events_observed,
                 "frame_lane_hint": frame_lane_hint.map(|lane| format!("{lane:?}")),
-                "preview_has_world_scene": preview_has_world_scene,
                 "role_dirty_reason": role_dirty_reason,
                 "scheduler_reason": scheduler_reason,
                 "before_update_count": before_update_count,
@@ -6552,14 +6353,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .unwrap_or_default();
             let render_hook_outer_input_snapshot_ms = elapsed_ms(input_snapshot_started);
-            let world_snapshot_started = Instant::now();
-            let render_world_scene = render_preview_ipc_state
-                .lock()
-                .map_err(|_| "preview IPC state mutex poisoned".to_owned())?
-                .world_scene
-                .clone()
-                .and_then(|world_scene| world_scene.lock().ok().map(|state| state.clone()));
-            let render_hook_outer_world_snapshot_ms = elapsed_ms(world_snapshot_started);
             let core_started = Instant::now();
             let emit_deferred_post_present_proof = proof_mode
                 == boon_native_app_window::NativeProofMode::Readback
@@ -6570,7 +6363,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 );
             let render_output = native_gpu_app_owned_render_hook(
                 context,
-                render_world_scene.as_ref(),
                 &visible_render_state,
                 render_error.as_deref(),
                 render_status_overlay.as_ref(),
@@ -6611,8 +6403,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     Some(render_hook_outer_state_snapshot_ms);
                 metrics.render_hook_outer_input_snapshot_ms =
                     Some(render_hook_outer_input_snapshot_ms);
-                metrics.render_hook_outer_world_snapshot_ms =
-                    Some(render_hook_outer_world_snapshot_ms);
                 metrics.render_hook_outer_core_ms = Some(render_hook_outer_core_ms);
                 metrics.render_hook_outer_revision_ms = Some(render_hook_outer_revision_ms);
                 metrics.render_hook_outer_total_ms = Some(elapsed_ms(outer_render_hook_started));
@@ -6686,7 +6476,6 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 "preview_receives_example_name": false,
                                 "preview_document_layout_proof": document_layout_proof,
                                 "preview_runtime_summary": runtime_summary,
-                                "world_scene_orbit_probe": world_scene_orbit_probe_report,
                                 "bounded_ipc_server": connect.as_ref().map(|path| path.display().to_string()),
                                 "app_window_surface_proof": proof,
                                 "app_window_contract": boon_native_app_window::app_window_contract(),
@@ -8133,25 +7922,10 @@ fn native_preview_live_runtime_from_project_profiled(
     source_label: &str,
     units: &[boon_runtime::RuntimeSourceUnit],
 ) -> Result<(boon_runtime::LiveRuntime, Value), Box<dyn std::error::Error>> {
-    let has_world_or_manufacturing_output_root =
-        boon_runtime::project_has_world_or_manufacturing_output_root(source_label, units)?;
-    let (runtime, mut profile) =
-        boon_runtime::LiveRuntime::from_project_profiled(source_label, units)?;
-    if let Some(object) = profile.as_object_mut() {
-        object.insert(
-            "native_preview_runtime_selection".to_owned(),
-            json!(if has_world_or_manufacturing_output_root {
-                "plan_executor_output_root_runtime"
-            } else {
-                "plan_executor_document_runtime"
-            }),
-        );
-        object.insert(
-            "has_world_or_manufacturing_output_root".to_owned(),
-            json!(has_world_or_manufacturing_output_root),
-        );
-    }
-    Ok((runtime, profile))
+    Ok(boon_runtime::LiveRuntime::from_project_profiled(
+        source_label,
+        units,
+    )?)
 }
 
 fn live_runtime_from_source_text_with_scenario(
@@ -11264,7 +11038,6 @@ fn preview_dev_presentation_plan(
 
 fn native_gpu_app_owned_render_hook(
     context: boon_native_app_window::NativeRenderFrameContext<'_>,
-    world_scene: Option<&PreviewWorldSceneState>,
     visible_state: &PreviewVisibleRenderState,
     last_error: Option<&str>,
     status_overlay: Option<&PreviewStatusOverlay>,
@@ -11284,28 +11057,6 @@ fn native_gpu_app_owned_render_hook(
     >,
     emit_deferred_post_present_proof: bool,
 ) -> Result<PreviewNativeGpuRenderHookOutput, Box<dyn std::error::Error>> {
-    if let Some(world_scene) = world_scene {
-        let proof = native_gpu_world_scene_visible_render_hook(
-            context,
-            world_scene,
-            last_error,
-            status_overlay,
-        )?;
-        let layout_identity =
-            preview_proof_identity_value(&proof, &["layout_frame_hash"], "world-scene-layout");
-        let render_scene_identity = preview_proof_identity_value(
-            &proof,
-            &["render_scene_identity", "render_scene_hash"],
-            &layout_identity,
-        );
-        return Ok(PreviewNativeGpuRenderHookOutput {
-            proof: Some(proof),
-            layout_identity,
-            render_scene_identity,
-            render_frame_metrics: None,
-            post_present_proof_subscribers: Vec::new(),
-        });
-    }
     if visible_state.status.as_deref() != Some("pass") {
         return Err("layout proof did not pass".into());
     }
@@ -11894,7 +11645,6 @@ fn preview_native_render_frame_metrics(
         preview_blocked_on_ipc_count: Some(metrics.preview_blocked_on_ipc_count),
         render_hook_outer_state_snapshot_ms: None,
         render_hook_outer_input_snapshot_ms: None,
-        render_hook_outer_world_snapshot_ms: None,
         render_hook_outer_core_ms: None,
         render_hook_outer_revision_ms: None,
         render_hook_outer_total_ms: None,
@@ -13016,77 +12766,6 @@ fn single_line_preview_error(error: &str) -> String {
     } else {
         value
     }
-}
-
-fn native_gpu_world_scene_visible_render_hook(
-    context: boon_native_app_window::NativeRenderFrameContext<'_>,
-    world_scene: &PreviewWorldSceneState,
-    last_error: Option<&str>,
-    status_overlay: Option<&PreviewStatusOverlay>,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let surface_proof = boon_native_gpu::encode_world_scene_mesh_pipeline_to_surface(
-        boon_native_gpu::SurfaceWorldSceneRenderRequest {
-            device: context.device,
-            queue: context.queue,
-            encoder: context.encoder,
-            view: context.surface_view,
-            scene: &world_scene.scene,
-            format: context.surface_texture_format,
-            width: context.width,
-            height: context.height,
-        },
-    )?;
-    let status = if last_error.is_some() {
-        "fail"
-    } else if let Some(overlay) = status_overlay {
-        match overlay.kind {
-            PreviewStatusOverlayKind::Pending => "pending",
-            PreviewStatusOverlayKind::Error => "fail",
-        }
-    } else {
-        "pass"
-    };
-    Ok(json!({
-        "status": status,
-        "renderer": "boon_native_gpu",
-        "render_backend_trait": "boon_native_gpu::encode_world_scene_mesh_pipeline_to_surface",
-        "surface_id": context.surface_id,
-        "surface_epoch": context.surface_epoch,
-        "surface_format": context.surface_format,
-        "visible_style_mode": "world_scene_3d",
-        "debug_palette_used": false,
-        "visible_surface_rendered": true,
-        "visible_present_path": true,
-        "last_error": last_error.map(str::to_owned),
-        "status_overlay": status_overlay.map(|overlay| json!({
-            "kind": match overlay.kind {
-                PreviewStatusOverlayKind::Pending => "pending",
-                PreviewStatusOverlayKind::Error => "error",
-            },
-            "message": overlay.message.clone(),
-        })),
-        "world_scene_preview_output": {
-            "status": status,
-            "source_sha256": world_scene.source_sha256.clone(),
-            "output_root": world_scene.output_root.clone(),
-            "read_count": world_scene.read_count,
-            "source_contract": "top-level-world-output",
-            "preview_receives_example_name": false,
-            "metrics": world_scene.scene.metrics(),
-            "operator_host_pointer_orbit": {
-                "status": world_scene.orbit_last_status.clone(),
-                "input_method": "WorldHostPointerOrbitController",
-                "host_event_count": world_scene.orbit_host_event_count,
-                "patch_operation_count": world_scene.orbit_patch_operation_count,
-                "camera_transform_update_count": world_scene.orbit_camera_transform_update_count,
-                "instance_transform_update_count": world_scene.orbit_instance_transform_update_count,
-                "geometry_rebuild_count": world_scene.orbit_geometry_rebuild_count,
-                "controller_active": world_scene.orbit_controller.active_camera().is_some()
-            }
-        },
-        "world_scene_surface_proof": surface_proof,
-        "copy_to_present_limitation": serde_json::Value::Null
-    }))
 }
 
 fn native_gpu_dev_visible_render_hook(
@@ -49930,16 +49609,6 @@ struct PreviewAccessibilityFocusSignature {
 }
 
 impl PreviewAccessibilityHostCache {
-    fn should_publish_revision(&mut self, revision: u64) -> bool {
-        if self.last_published_revision == Some(revision) {
-            self.skipped_unchanged_count = self.skipped_unchanged_count.saturating_add(1);
-            return false;
-        }
-        self.last_published_revision = Some(revision);
-        self.publish_count = self.publish_count.saturating_add(1);
-        true
-    }
-
     fn note_full_publish(
         &mut self,
         revision: u64,
@@ -49975,61 +49644,6 @@ fn preview_should_defer_accessibility_snapshot_for_product_input(
         && !accessibility_actions_present
         && !forced_frame
         && !pending_accessibility_refresh
-}
-
-#[derive(Clone, Debug)]
-struct PreviewWorldEditorSessionState {
-    source_sha256: String,
-    bundle: boon_solid_model::SolidModelBundle,
-    session: boon_scene_model::WorldEditorSession,
-    last_action_report: Option<boon_native_app_window::NativeWorldEditorSessionActionReport>,
-    last_export_artifact: Option<PreviewWorldEditorExportArtifact>,
-}
-
-type PreviewWorldEditorSessionStore = Arc<Mutex<PreviewWorldEditorSessionState>>;
-
-#[derive(Clone, Debug)]
-struct PreviewWorldSceneState {
-    source_sha256: String,
-    output_root: String,
-    read_count: usize,
-    scene: boon_scene_model::WorldScene,
-    orbit_controller: boon_scene_model::WorldHostPointerOrbitController,
-    orbit_host_event_count: u64,
-    orbit_patch_operation_count: u64,
-    orbit_camera_transform_update_count: u64,
-    orbit_instance_transform_update_count: u64,
-    orbit_geometry_rebuild_count: u64,
-    orbit_last_status: String,
-}
-
-type PreviewWorldSceneStore = Arc<Mutex<PreviewWorldSceneState>>;
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct PreviewWorldEditorExportArtifact {
-    status: String,
-    scope: String,
-    print_status: String,
-    three_mf_status: String,
-    validation_status: String,
-    selected_instance_count: usize,
-    selected_part_exportable: bool,
-    printable_instance_count: usize,
-    excluded_visual_only_instance_count: usize,
-    print_artifact_hash: String,
-    three_mf_artifact_hash: String,
-    three_mf_opc_zip_hash: String,
-    three_mf_opc_zip_byte_count: usize,
-    three_mf_entry_count: usize,
-    three_mf_component_count: usize,
-    three_mf_slice_count: usize,
-    visual_mesh_used_for_manufacturing: bool,
-}
-
-struct PreviewWorldEditorLayoutSnapshot {
-    proof: serde_json::Value,
-    layout_frame: boon_document::LayoutFrame,
 }
 
 #[derive(Clone, Debug)]
@@ -50362,557 +49976,19 @@ fn preview_native_accessibility_snapshot_for_shared(
     )
 }
 
-fn preview_world_scene_for_live_runtime(
-    source_sha256: &str,
-    live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
-) -> Option<PreviewWorldSceneStore> {
-    let live_runtime = live_runtime?;
-    let mut runtime = live_runtime.lock().ok()?;
-    let output = match runtime.world_scene_output() {
-        Ok(output) => output,
-        Err(error)
-            if error
-                .to_string()
-                .contains("requires a top-level `world:` value") =>
-        {
-            return None;
-        }
-        Err(_) => return None,
-    };
-    Some(Arc::new(Mutex::new(PreviewWorldSceneState {
-        source_sha256: source_sha256.to_owned(),
-        output_root: output.output_root,
-        read_count: output.read_count,
-        scene: output.scene,
-        orbit_controller: boon_scene_model::WorldHostPointerOrbitController::around_origin(),
-        orbit_host_event_count: 0,
-        orbit_patch_operation_count: 0,
-        orbit_camera_transform_update_count: 0,
-        orbit_instance_transform_update_count: 0,
-        orbit_geometry_rebuild_count: 0,
-        orbit_last_status: "idle".to_owned(),
-    })))
-}
-
-fn preview_apply_world_scene_input(
-    input: &boon_native_app_window::NativeInputAdapterProof,
-    world_scene: &PreviewWorldSceneStore,
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-    input_state: &mut PreviewNativeInputState,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if input.synthetic_input_probe {
-        return Ok(false);
-    }
-    let Some(position) = input.mouse_window_pos else {
-        return Ok(false);
-    };
-    let viewport = [
-        position.window_width.max(1.0) as f32,
-        position.window_height.max(1.0) as f32,
-    ];
-    let position_pixels = [position.x as f32, position.y as f32];
-    let primary_down = input
-        .mouse_buttons_down
-        .iter()
-        .any(|button| button == "left");
-    let mut events = Vec::new();
-    let mut had_new_press = false;
-    for press in unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count) {
-        had_new_press = true;
-        input_state.last_mouse_press_event_count =
-            input_state.last_mouse_press_event_count.max(press.sequence);
-        events.push(boon_scene_model::WorldHostPointerOrbitEvent::press(
-            position_pixels,
-            viewport,
-        ));
-    }
-    let motion_changed = input.mouse_motion_event_count > input_state.last_mouse_motion_event_count
-        || preview_mouse_position_key(input.mouse_window_pos)
-            != input_state.last_hover_window_position;
-    if primary_down && motion_changed && !had_new_press {
-        events.push(boon_scene_model::WorldHostPointerOrbitEvent::drag(
-            position_pixels,
-            viewport,
-        ));
-    }
-    for release in
-        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count)
-    {
-        events.push(boon_scene_model::WorldHostPointerOrbitEvent::release(
-            position_pixels,
-            viewport,
-        ));
-        input_state.last_mouse_button_event_count = input_state
-            .last_mouse_button_event_count
-            .max(release.sequence);
-    }
-    input_state.last_mouse_button_event_count = input_state
-        .last_mouse_button_event_count
-        .max(input.mouse_button_event_count);
-    input_state.last_mouse_motion_event_count = input_state
-        .last_mouse_motion_event_count
-        .max(input.mouse_motion_event_count);
-    input_state.last_hover_window_position = preview_mouse_position_key(input.mouse_window_pos);
-    if events.is_empty() {
-        return Ok(false);
-    }
-
-    let mut proof_changed = false;
-    let mut state = world_scene
-        .lock()
-        .map_err(|_| "preview world scene mutex poisoned")?;
-    let Some(camera) = state.scene.cameras.keys().next().copied() else {
-        state.orbit_last_status = "missing-camera".to_owned();
-        drop(state);
-        let mut shared = shared_render_state
-            .lock()
-            .map_err(|_| "preview render state mutex poisoned")?;
-        shared.update_count = shared.update_count.saturating_add(1);
-        shared.last_dirty_reason =
-            Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
-        return Ok(true);
-    };
-    for event in events {
-        proof_changed = true;
-        state.orbit_host_event_count = state.orbit_host_event_count.saturating_add(1);
-        let scene_before_event = state.scene.clone();
-        let Some(patch) = state
-            .orbit_controller
-            .handle_event(&scene_before_event, camera, event)
-            .map_err(|error| format!("preview world scene orbit input failed: {error}"))?
-        else {
-            continue;
-        };
-        let operation_count = patch.operations.len() as u64;
-        let report = state
-            .scene
-            .apply_patch(&patch)
-            .map_err(|error| format!("preview world scene orbit patch failed: {error}"))?;
-        state.orbit_patch_operation_count = state
-            .orbit_patch_operation_count
-            .saturating_add(operation_count);
-        state.orbit_camera_transform_update_count = state
-            .orbit_camera_transform_update_count
-            .saturating_add(report.camera_transform_update_count as u64);
-        state.orbit_instance_transform_update_count = state
-            .orbit_instance_transform_update_count
-            .saturating_add(report.transform_update_count as u64);
-        state.orbit_geometry_rebuild_count = state
-            .orbit_geometry_rebuild_count
-            .saturating_add(report.geometry_rebuild_count as u64);
-        state.orbit_last_status = "operator-host-pointer-orbit-pass".to_owned();
-    }
-    drop(state);
-    if proof_changed {
-        let mut shared = shared_render_state
-            .lock()
-            .map_err(|_| "preview render state mutex poisoned")?;
-        shared.update_count = shared.update_count.saturating_add(1);
-        shared.last_dirty_reason =
-            Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied);
-    }
-    Ok(proof_changed)
-}
-
-fn preview_apply_world_scene_orbit_probe(
-    world_scene: &PreviewWorldSceneStore,
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let mut input_state = PreviewNativeInputState::default();
-
-    let mut press = deterministic_click_input(0, 96.0, 96.0);
-    press.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
-        sequence: 1,
-        button: "left".to_owned(),
-        pressed: true,
-        window_protocol_id: Some(1),
-        position: press.mouse_window_pos,
-        event_elapsed_ms: None,
-    }];
-    press.mouse_button_event_count = 1;
-    press.mouse_motion_event_count = 1;
-    press.mouse_total_event_count = 2;
-    press.mouse_buttons_down = vec!["left".to_owned()];
-    let press_dirty = preview_apply_world_scene_input(
-        &press,
-        world_scene,
-        shared_render_state,
-        &mut input_state,
-    )?;
-
-    let mut drag = deterministic_click_input(0, 128.0, 72.0);
-    drag.mouse_button_events.clear();
-    drag.mouse_button_event_count = 1;
-    drag.mouse_motion_event_count = 2;
-    drag.mouse_total_event_count = 3;
-    drag.mouse_buttons_down = vec!["left".to_owned()];
-    let drag_dirty =
-        preview_apply_world_scene_input(&drag, world_scene, shared_render_state, &mut input_state)?;
-
-    let mut release = deterministic_click_input(0, 128.0, 72.0);
-    release.mouse_button_events = vec![boon_native_app_window::NativeMouseButtonEventProof {
-        sequence: 2,
-        button: "left".to_owned(),
-        pressed: false,
-        window_protocol_id: Some(1),
-        position: release.mouse_window_pos,
-        event_elapsed_ms: None,
-    }];
-    release.mouse_button_event_count = 2;
-    release.mouse_motion_event_count = 3;
-    release.mouse_total_event_count = 4;
-    release.mouse_buttons_down.clear();
-    let release_dirty = preview_apply_world_scene_input(
-        &release,
-        world_scene,
-        shared_render_state,
-        &mut input_state,
-    )?;
-
-    let state = world_scene
-        .lock()
-        .map_err(|_| "preview world scene mutex poisoned")?;
-    let shared = shared_render_state
-        .lock()
-        .map_err(|_| "preview render state mutex poisoned")?;
-    let pass = press_dirty
-        && drag_dirty
-        && release_dirty
-        && state.orbit_host_event_count == 3
-        && state.orbit_patch_operation_count == 1
-        && state.orbit_camera_transform_update_count == 1
-        && state.orbit_instance_transform_update_count == 0
-        && state.orbit_geometry_rebuild_count == 0
-        && state.orbit_controller.active_camera().is_none();
-    Ok(json!({
-        "status": if pass { "pass" } else { "fail" },
-        "input_method": "app_owned_native_input_adapter_world_scene_orbit_probe",
-        "real_os_input_claimed": false,
-        "press_dirty": press_dirty,
-        "drag_dirty": drag_dirty,
-        "release_dirty": release_dirty,
-        "host_event_count": state.orbit_host_event_count,
-        "patch_operation_count": state.orbit_patch_operation_count,
-        "camera_transform_update_count": state.orbit_camera_transform_update_count,
-        "instance_transform_update_count": state.orbit_instance_transform_update_count,
-        "geometry_rebuild_count": state.orbit_geometry_rebuild_count,
-        "controller_active_after_release": state.orbit_controller.active_camera().is_some(),
-        "preview_update_count": shared.update_count,
-        "last_dirty_reason": shared.last_dirty_reason.as_ref().map(|reason| format!("{reason:?}")),
-    }))
-}
-
-fn preview_world_editor_session_for_live_runtime(
-    source_sha256: &str,
-    live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
-) -> Option<PreviewWorldEditorSessionStore> {
-    let live_runtime = live_runtime?;
-    let mut runtime = live_runtime.lock().ok()?;
-    let output = runtime.solid_model_output().ok()?;
-    let visual =
-        boon_scene_model::WorldScene::visual_proxy_with_chunks_from_solid_model(&output.bundle)
-            .ok()?;
-    Some(Arc::new(Mutex::new(PreviewWorldEditorSessionState {
-        source_sha256: source_sha256.to_owned(),
-        bundle: output.bundle,
-        session: boon_scene_model::WorldEditorSession::new(visual.scene),
-        last_action_report: None,
-        last_export_artifact: None,
-    })))
-}
-
-fn preview_world_editor_export_artifact_for_report(
-    bundle: &boon_solid_model::SolidModelBundle,
-    session_report: &boon_scene_model::WorldEditorSessionActionReport,
-) -> Option<PreviewWorldEditorExportArtifact> {
-    if session_report.outcome.action != boon_scene_model::WorldEditorActionKind::Export3Mf {
-        return None;
-    }
-    let preparation = session_report.outcome.export_preparation.as_ref()?;
-    if preparation.status
-        != boon_scene_model::WorldManufacturingExportStatus::ReadySelectedPrintable
-        || !preparation.selected_part_exportable
-    {
-        return None;
-    }
-    let selected_instance = preparation.selected_instance?;
-    let print_request = boon_manufacturing::PrintCompileRequest::for_selected_instances(
-        bundle,
-        [boon_solid_model::PartInstanceId(selected_instance.0)],
-    );
-    let print_output = boon_manufacturing::compile_print_job(bundle, print_request);
-    let three_mf = boon_3mf::export_3mf_entry_set(&print_output);
-    let validation = boon_3mf::validate_3mf_package(&three_mf);
-    let visual_mesh_used_for_manufacturing = print_output.visual_mesh_used_for_manufacturing
-        || three_mf.visual_mesh_used_for_manufacturing;
-    let status = if print_output.status == boon_manufacturing::ManufacturingCompileStatus::Pass
-        && three_mf.status == boon_3mf::ThreeMfExportStatus::Pass
-        && validation.status == boon_3mf::ThreeMfValidationStatus::Pass
-        && !visual_mesh_used_for_manufacturing
-        && three_mf.metrics.opc_zip_byte_count > 0
-    {
-        "pass"
-    } else {
-        "fail"
-    };
-    Some(PreviewWorldEditorExportArtifact {
-        status: status.to_owned(),
-        scope: "selected-printable-instance-from-export-action".to_owned(),
-        print_status: format!("{:?}", print_output.status),
-        three_mf_status: format!("{:?}", three_mf.status),
-        validation_status: format!("{:?}", validation.status),
-        selected_instance_count: session_report.selected_instance_count,
-        selected_part_exportable: preparation.selected_part_exportable,
-        printable_instance_count: print_output.metrics.printable_instance_count,
-        excluded_visual_only_instance_count: preparation.excluded_visual_only_instance_count,
-        print_artifact_hash: print_output.artifact_hash,
-        three_mf_artifact_hash: three_mf.artifact_hash,
-        three_mf_opc_zip_hash: three_mf.opc_zip_hash,
-        three_mf_opc_zip_byte_count: three_mf.metrics.opc_zip_byte_count,
-        three_mf_entry_count: three_mf.metrics.entry_count,
-        three_mf_component_count: three_mf.metrics.component_count,
-        three_mf_slice_count: three_mf.metrics.slice_count,
-        visual_mesh_used_for_manufacturing,
-    })
-}
-
-fn preview_semantic_scene_for_world_editor_session(
-    world_editor_session: &PreviewWorldEditorSessionStore,
-) -> Option<boon_document::SemanticScene> {
-    let state = world_editor_session.lock().ok()?;
-    let tree = state
-        .session
-        .semantic_editor_tree(&state.bundle, "3D editor")
-        .ok()?;
-    Some(boon_document::SemanticScene::from_world_editor_tree(&tree))
-}
-
-fn preview_world_editor_document_layout_snapshot(
-    world_editor_session: &PreviewWorldEditorSessionStore,
-    viewport: (f32, f32),
-) -> Result<PreviewWorldEditorLayoutSnapshot, Box<dyn std::error::Error>> {
-    let (source_sha256, tree) = {
-        let state = world_editor_session
-            .lock()
-            .map_err(|_| "preview world editor session mutex poisoned")?;
-        let tree = state
-            .session
-            .semantic_editor_tree(&state.bundle, "3D editor")?;
-        (state.source_sha256.clone(), tree)
-    };
-    let frame = boon_document::document_frame_from_world_editor_tree(&tree);
-    let derived_indexes = document_derived_indexes_for_frame(&frame)?;
-    let layout = layout_frame_for_document_frame_with_indexes(&frame, &derived_indexes, viewport)?;
-    let retained_layout_cache =
-        retained_layout_cache_for_document_layout(&frame, &derived_indexes, &layout)?;
-    let source_intents = source_intents_from_document_source_bindings(&frame);
-    let (source_intent_index, source_intent_value_index) = source_intent_indexes(&source_intents);
-    let hit_target_assertions = serde_json::to_value(&layout.hit_regions)?
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let hit_target_samples = hit_target_assertions
-        .iter()
-        .take(256)
-        .cloned()
-        .collect::<Vec<_>>();
-    let display_item_samples = serde_json::to_value(
-        layout
-            .display_list
-            .iter()
-            .take(256)
-            .cloned()
-            .collect::<Vec<_>>(),
-    )?;
-    let layout_frame_hash = boon_runtime::sha256_bytes(&serde_json::to_vec(&layout)?);
-    let artifact_sha256 = boon_runtime::sha256_bytes(&serde_json::to_vec(&frame)?);
-    let layout_metrics = serde_json::to_value(&layout.metrics)?;
-    let scroll_regions = serde_json::to_value(&layout.scroll_regions)?;
-    let proof = json!({
-        "status": "pass",
-        "lowering": "world_editor_session_to_boon_document_model",
-        "render_root_kind": "world-editor-document",
-        "source_path": "world-editor://preview",
-        "source_sha256": source_sha256,
-        "artifact_path": Value::Null,
-        "artifact_sha256": artifact_sha256,
-        "layout_frame_hash": layout_frame_hash,
-        "viewport": {
-            "width": viewport.0,
-            "height": viewport.1,
-            "scale": 1.0
-        },
-        "node_count": frame.nodes.len(),
-        "display_item_count": layout.display_list.len(),
-        "display_item_samples": display_item_samples,
-        "hit_target_count": hit_target_assertions.len(),
-        "hit_target_sample_count": hit_target_samples.len(),
-        "hit_target_sample_limit": 256,
-        "hit_target_assertions": hit_target_assertions,
-        "hit_target_samples": hit_target_samples,
-        "source_intent_count": source_intents.len(),
-        "source_intent_sample_count": source_intents.len().min(256),
-        "source_intent_sample_limit": 256,
-        "source_intent_assertions": source_intents,
-        "source_intent_samples": source_intents.iter().take(256).cloned().collect::<Vec<_>>(),
-        "source_intent_index": source_intent_index,
-        "source_intent_value_index": source_intent_value_index,
-        "source_binding_index_count": 0,
-        "data_binding_index_count": 0,
-        "data_binding_target_paths": 0,
-        "data_binding_target_sample_count": 0,
-        "data_binding_target_samples": [],
-        "layout_metrics": layout_metrics,
-        "scroll_regions": scroll_regions,
-        "runtime_document_state_used": false,
-        "runtime_document_state_hash": Value::Null,
-        "structural_data_read_count": 0,
-        "structural_data_read_samples": [],
-        "live_artifact_write_skipped": true,
-        "layout_cache_hit": false,
-        "layout_cache_key": "world-editor-session-document-layout",
-        "layout_profile": {
-            "world_editor_session_document_layout": true,
-            "layout_cache_hit": false,
-            "document_eval_lower_ms": 0.0,
-            "artifact_serialize_ms": 0.0,
-            "artifact_write_ms": 0.0
-        },
-        "retained_layout_cache": retained_layout_cache_report(&retained_layout_cache),
-        "world_editor_document_projection": true,
-        "world_editor_session_visual_panel_status": "visible-layout-frame"
-    });
-    cache_document_render_snapshot(
-        layout_frame_hash,
-        DocumentRenderSnapshot {
-            document_frame: frame,
-            runtime_document_state_values: BTreeMap::new(),
-            derived_indexes,
-            layout_frame: Arc::new(layout.clone()),
-            display_items_by_node: document_display_items_by_node(&layout),
-            retained_layout_cache,
-            data_binding_targets: Arc::new(DocumentDataBindingSnapshotIndex::from(BTreeMap::new())),
-            structural_data_reads: BTreeSet::new(),
-            structural_data_read_aliases: Vec::new(),
-            source_intents,
-            hit_route_static_cache_key: None,
-        },
-    );
-    Ok(PreviewWorldEditorLayoutSnapshot {
-        proof,
-        layout_frame: layout,
-    })
-}
-
-fn preview_world_editor_viewport_from_shared(shared: &PreviewSharedRenderState) -> (f32, f32) {
-    let width = shared
-        .layout_proof
-        .get("viewport")
-        .and_then(|viewport| viewport.get("width"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(920.0) as f32;
-    let height = shared
-        .layout_proof
-        .get("viewport")
-        .and_then(|viewport| viewport.get("height"))
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(720.0) as f32;
-    (width, height)
-}
-
-fn preview_install_world_editor_layout_snapshot(
-    world_editor_session: &PreviewWorldEditorSessionStore,
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-    dirty_reason: boon_native_app_window::NativeRoleDirtyReason,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let viewport = {
-        let shared = shared_render_state
-            .lock()
-            .map_err(|_| "preview render state mutex poisoned")?;
-        preview_world_editor_viewport_from_shared(&shared)
-    };
-    let snapshot = preview_world_editor_document_layout_snapshot(world_editor_session, viewport)?;
-    let mut shared = shared_render_state
-        .lock()
-        .map_err(|_| "preview render state mutex poisoned")?;
-    shared.layout_proof = snapshot.proof;
-    shared.layout_frame_override = Some(Arc::new(snapshot.layout_frame));
-    shared.scroll_x_px = 0.0;
-    shared.scroll_y_px = 0.0;
-    shared.last_error = None;
-    shared.status_overlay = None;
-    shared.update_count = shared.update_count.saturating_add(1);
-    shared.last_dirty_reason = Some(dirty_reason);
-    Ok(())
-}
-
-fn source_intents_from_document_source_bindings(
-    frame: &boon_document_model::DocumentFrame,
-) -> Vec<serde_json::Value> {
-    frame
-        .nodes
-        .values()
-        .flat_map(|node| {
-            node.source_bindings()
-                .enumerate()
-                .map(|(ordinal, binding)| {
-                    json!({
-                    "node": node.id.0,
-                    "intent": binding.intent,
-                    "source_path": binding.source_path,
-                    "binding_id": binding.id.0,
-                    "binding_ordinal": ordinal,
-                    "implicit": false
-                    })
-                })
-        })
-        .collect()
-}
-
-fn preview_native_accessibility_snapshot_for_world_editor_session(
-    world_editor_session: &PreviewWorldEditorSessionStore,
-) -> Option<boon_native_app_window::NativeAccessibilitySnapshot> {
-    let scene = preview_semantic_scene_for_world_editor_session(world_editor_session)?;
-    Some(
-        boon_native_app_window::accesskit_tree_update_from_semantic_scene(
-            &scene,
-            "boon-native-playground",
-            env!("CARGO_PKG_VERSION"),
-        ),
-    )
-}
-
 fn preview_native_accessibility_snapshot_for_host(
     shared: &PreviewSharedRenderState,
-    world_editor_session: Option<&PreviewWorldEditorSessionStore>,
     focus_overlay: Option<&PreviewFocusOverlayState>,
 ) -> Option<boon_native_app_window::NativeAccessibilitySnapshot> {
-    if let Some(snapshot) = world_editor_session
-        .and_then(preview_native_accessibility_snapshot_for_world_editor_session)
-    {
-        return Some(snapshot);
-    }
     preview_native_accessibility_snapshot_for_shared(shared, focus_overlay)
 }
 
 fn preview_native_accessibility_snapshot_for_host_cached(
     shared: &PreviewSharedRenderState,
-    world_editor_session: Option<&PreviewWorldEditorSessionStore>,
     cache: &mut PreviewAccessibilityHostCache,
     content_revision: u64,
     focus_overlay: Option<&PreviewFocusOverlayState>,
 ) -> Option<boon_native_app_window::NativeAccessibilitySnapshot> {
-    if world_editor_session.is_some() {
-        if !cache.should_publish_revision(content_revision) {
-            return None;
-        }
-        return preview_native_accessibility_snapshot_for_host(
-            shared,
-            world_editor_session,
-            focus_overlay,
-        );
-    }
-
     let layout_key = preview_accessibility_layout_key(shared)?;
     let focus_signature = focus_overlay.and_then(preview_accessibility_focus_signature);
     if cache.last_published_layout_key.as_deref() == Some(layout_key.as_str()) {
@@ -50930,7 +50006,7 @@ fn preview_native_accessibility_snapshot_for_host_cached(
         }
     }
 
-    let snapshot = preview_native_accessibility_snapshot_for_host(shared, None, focus_overlay);
+    let snapshot = preview_native_accessibility_snapshot_for_host(shared, focus_overlay);
     if snapshot.is_some() {
         cache.note_full_publish(content_revision, layout_key, focus_signature);
     } else {
@@ -51001,12 +50077,11 @@ struct PreviewAccessibilityApplyReport {
     unsupported_count: usize,
     focus_changed: bool,
     runtime_turn_applied: bool,
-    world_editor_session_applied: bool,
 }
 
 impl PreviewAccessibilityApplyReport {
     fn dirty_reason(self) -> Option<boon_native_app_window::NativeRoleDirtyReason> {
-        if self.runtime_turn_applied || self.world_editor_session_applied {
+        if self.runtime_turn_applied {
             Some(boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied)
         } else if self.focus_changed {
             Some(boon_native_app_window::NativeRoleDirtyReason::FocusChanged)
@@ -51022,64 +50097,11 @@ fn preview_apply_accessibility_actions_with_units(
     source_text: &str,
     runtime_units: &[boon_runtime::RuntimeSourceUnit],
     live_runtime: Option<&Arc<Mutex<boon_runtime::LiveRuntime>>>,
-    world_editor_session: Option<&PreviewWorldEditorSessionStore>,
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
 ) -> Result<PreviewAccessibilityApplyReport, Box<dyn std::error::Error>> {
     if actions.is_empty() {
         return Ok(PreviewAccessibilityApplyReport::default());
-    }
-    if let Some(world_editor_session) = world_editor_session
-        && let Some(scene) = preview_semantic_scene_for_world_editor_session(world_editor_session)
-    {
-        let action_reports = {
-            let mut state = world_editor_session
-                .lock()
-                .map_err(|_| "preview world editor session mutex poisoned")?;
-            let bundle = state.bundle.clone();
-            boon_native_app_window::native_accessibility_world_editor_session_reports_from_requests(
-                &scene,
-                actions,
-                &mut state.session,
-                &bundle,
-            )
-        };
-        if !action_reports.is_empty() {
-            let mut report = PreviewAccessibilityApplyReport::default();
-            let mut latest_report = None;
-            for action_report in action_reports {
-                if action_report.error.is_none() && action_report.session_report.is_some() {
-                    report.routed_count += 1;
-                    report.world_editor_session_applied = true;
-                } else {
-                    report.unsupported_count += 1;
-                }
-                latest_report = Some(action_report);
-            }
-            if let Some(latest_report) = latest_report {
-                if let Ok(mut state) = world_editor_session.lock() {
-                    state.last_export_artifact =
-                        latest_report
-                            .session_report
-                            .as_ref()
-                            .and_then(|session_report| {
-                                preview_world_editor_export_artifact_for_report(
-                                    &state.bundle,
-                                    session_report,
-                                )
-                            });
-                    state.last_action_report = Some(latest_report);
-                }
-            }
-            if report.world_editor_session_applied {
-                preview_install_world_editor_layout_snapshot(
-                    world_editor_session,
-                    shared_render_state,
-                    boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied,
-                )?;
-            }
-            return Ok(report);
-        }
     }
     let Some(live_runtime) = live_runtime else {
         return Ok(PreviewAccessibilityApplyReport {
@@ -51210,112 +50232,6 @@ fn preview_apply_accessibility_actions_with_units(
         }
     }
     Ok(report)
-}
-
-fn preview_try_apply_world_editor_input(
-    input: &boon_native_app_window::NativeInputAdapterProof,
-    world_editor_session: &PreviewWorldEditorSessionStore,
-    shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
-    input_state: &mut PreviewNativeInputState,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    if input.synthetic_input_probe
-        || input.scroll_delta_x.abs() > f64::EPSILON
-        || input.scroll_delta_y.abs() > f64::EPSILON
-        || !input.keyboard_events.is_empty()
-        || !input.pressed_keys.is_empty()
-        || input
-            .mouse_buttons_down
-            .iter()
-            .any(|button| button == "left")
-    {
-        return Ok(false);
-    }
-    let releases =
-        unhandled_primary_mouse_releases(input, input_state.last_mouse_button_event_count);
-    if releases.len() != 1 {
-        return Ok(false);
-    }
-    let Some(position) = input.mouse_window_pos else {
-        return Ok(false);
-    };
-    let (node, source_path, source_intent) = {
-        let shared = shared_render_state
-            .lock()
-            .map_err(|_| "preview render state mutex poisoned")?;
-        let Some(route_table) = PreviewHitRouteTable::from_shared(&shared) else {
-            return Ok(false);
-        };
-        let Some(hit) = route_table.hit_test(position.x, position.y) else {
-            return Ok(false);
-        };
-        let source_node = route_table
-            .source_node_for_hit(hit, &["select", "press", "click", "source"])
-            .unwrap_or_else(|| hit.node.0.clone());
-        let Some(intent) =
-            ["select", "press", "click", "source"]
-                .into_iter()
-                .find_map(|candidate| {
-                    route_table.source_intent_for_node_intent(&source_node, candidate)
-                })
-        else {
-            return Ok(false);
-        };
-        if !intent.source_path.starts_with("world.") {
-            return Ok(false);
-        }
-        (
-            source_node,
-            intent.source_path.clone(),
-            Some(intent.intent.clone()),
-        )
-    };
-    let action = boon_scene_model::WorldEditorSourceAction {
-        source_path: source_path.clone(),
-        source_intent: source_intent.clone(),
-    };
-    let session_report = {
-        let mut state = world_editor_session
-            .lock()
-            .map_err(|_| "preview world editor session mutex poisoned")?;
-        let bundle = state.bundle.clone();
-        let session_report = state.session.handle_source_action(&bundle, &action)?;
-        state.last_export_artifact =
-            preview_world_editor_export_artifact_for_report(&bundle, &session_report);
-        state.last_action_report = Some(
-            boon_native_app_window::NativeWorldEditorSessionActionReport {
-                dispatch: boon_document::SemanticSourceDispatch {
-                    semantic_id: boon_document::SemanticId(format!("semantic:{node}")),
-                    node: boon_document_model::DocumentNodeId(node.clone()),
-                    source_path,
-                    source_intent,
-                    text: None,
-                },
-                session_report: Some(session_report.clone()),
-                error: None,
-            },
-        );
-        session_report
-    };
-    let release = releases[0].sequence;
-    for press in unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count) {
-        input_state.last_mouse_press_event_count =
-            input_state.last_mouse_press_event_count.max(press.sequence);
-    }
-    input_state.last_mouse_button_event_count =
-        input_state.last_mouse_button_event_count.max(release);
-    input_state.last_click_node = Some(node);
-    input_state.last_click_sequence = release;
-    if session_report.patch_report.is_some()
-        || session_report.outcome.export_preparation.is_some()
-        || session_report.selected_instance_count > 0
-    {
-        preview_install_world_editor_layout_snapshot(
-            world_editor_session,
-            shared_render_state,
-            boon_native_app_window::NativeRoleDirtyReason::RuntimeTurnApplied,
-        )?;
-    }
-    Ok(true)
 }
 
 fn preview_focus_node_from_accessibility(
@@ -52742,18 +51658,6 @@ fn preview_content_revision(update_count: u64) -> u64 {
     update_count.saturating_add(1)
 }
 
-fn preview_proof_identity_value(proof: &Value, keys: &[&str], fallback: &str) -> String {
-    for key in keys {
-        if let Some(value) = proof.get(*key).and_then(Value::as_str)
-            && !value.is_empty()
-            && value != "missing"
-        {
-            return value.to_owned();
-        }
-    }
-    fallback.to_owned()
-}
-
 fn preview_monotonic_identity_revision(
     last_identity: &mut Option<String>,
     revision: &mut u64,
@@ -52777,8 +51681,6 @@ struct PreviewIpcState {
     preview_perf_stats: Option<boon_native_app_window::NativePreviewPerfStats>,
     shared_render_state: Arc<Mutex<PreviewSharedRenderState>>,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
-    world_scene: Option<PreviewWorldSceneStore>,
-    world_editor_session: Option<PreviewWorldEditorSessionStore>,
     latest_accepted_command_id: u64,
     latest_accepted_source_revision: u64,
     replace_status_cache: serde_json::Value,
@@ -53609,7 +52511,6 @@ struct PreviewInputRuntimeContext {
     source_text: String,
     runtime_units: Vec<boon_runtime::RuntimeSourceUnit>,
     live_runtime: Option<Arc<Mutex<boon_runtime::LiveRuntime>>>,
-    world_editor_session: Option<PreviewWorldEditorSessionStore>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -53935,7 +52836,6 @@ fn preview_input_runtime_context(
         source_text: state.source_text.clone(),
         runtime_units: state.runtime_units.clone(),
         live_runtime: state.live_runtime.clone(),
-        world_editor_session: state.world_editor_session.clone(),
     })
 }
 
@@ -60314,14 +59214,6 @@ where
                 );
                 summary["restored_ui_state"] = json!(restored_ui_state.is_some());
                 summary["live_runtime_provenance"] = runtime_provenance;
-                summary["native_preview_runtime_selection"] = profile
-                    .get("native_preview_runtime_selection")
-                    .cloned()
-                    .unwrap_or_else(|| json!("unknown"));
-                summary["has_world_or_manufacturing_output_root"] = profile
-                    .get("has_world_or_manufacturing_output_root")
-                    .cloned()
-                    .unwrap_or_else(|| json!(false));
                 (
                     summary,
                     Some(document_state_summary),
@@ -60522,38 +59414,13 @@ fn preview_commit_source_project_result(
         state.source_sha256 = result.source_sha256.clone();
         state.runtime_summary = result.runtime_summary.clone();
         state.live_runtime = result.live_runtime;
-        state.world_scene =
-            preview_world_scene_for_live_runtime(&state.source_sha256, state.live_runtime.as_ref());
-        state.world_editor_session = preview_world_editor_session_for_live_runtime(
-            &state.source_sha256,
-            state.live_runtime.as_ref(),
-        );
-        let world_editor_layout_snapshot =
-            state.world_editor_session.as_ref().and_then(|session| {
-                let viewport = result
-                    .layout_proof
-                    .get("viewport")
-                    .and_then(|viewport| {
-                        Some((
-                            viewport.get("width")?.as_f64()? as f32,
-                            viewport.get("height")?.as_f64()? as f32,
-                        ))
-                    })
-                    .unwrap_or_else(|| preview_viewport_for_source_path(&state.source_path));
-                preview_world_editor_document_layout_snapshot(session, viewport).ok()
-            });
         let (frame_revision, visible_layout_frame_hash, visible_layout_text_evidence) = {
             let mut shared = state
                 .shared_render_state
                 .lock()
                 .map_err(|_| "preview render state mutex poisoned")?;
-            if let Some(snapshot) = world_editor_layout_snapshot {
-                shared.layout_proof = snapshot.proof;
-                shared.layout_frame_override = Some(Arc::new(snapshot.layout_frame));
-            } else {
-                shared.layout_proof = result.layout_proof.clone();
-                shared.layout_frame_override = result.layout_frame.map(Arc::new);
-            }
+            shared.layout_proof = result.layout_proof.clone();
+            shared.layout_frame_override = result.layout_frame.map(Arc::new);
             shared.scroll_x_px = 0.0;
             shared.scroll_y_px = 0.0;
             shared.last_error = None;
@@ -60719,37 +59586,13 @@ fn preview_apply_replace_code_to_state(
         }
         Err(_) => None,
     };
-    state.world_scene =
-        preview_world_scene_for_live_runtime(&state.source_sha256, state.live_runtime.as_ref());
-    state.world_editor_session = preview_world_editor_session_for_live_runtime(
-        &state.source_sha256,
-        state.live_runtime.as_ref(),
-    );
     if let Some(layout_proof) = response.get("document_layout_proof") {
-        let world_editor_layout_snapshot =
-            state.world_editor_session.as_ref().and_then(|session| {
-                let viewport = layout_proof
-                    .get("viewport")
-                    .and_then(|viewport| {
-                        Some((
-                            viewport.get("width")?.as_f64()? as f32,
-                            viewport.get("height")?.as_f64()? as f32,
-                        ))
-                    })
-                    .unwrap_or_else(|| preview_viewport_for_source_path(&state.source_path));
-                preview_world_editor_document_layout_snapshot(session, viewport).ok()
-            });
         let mut shared = state
             .shared_render_state
             .lock()
             .map_err(|_| "preview render state mutex poisoned")?;
-        if let Some(snapshot) = world_editor_layout_snapshot {
-            shared.layout_proof = snapshot.proof;
-            shared.layout_frame_override = Some(Arc::new(snapshot.layout_frame));
-        } else {
-            shared.layout_proof = layout_proof.clone();
-            shared.layout_frame_override = None;
-        }
+        shared.layout_proof = layout_proof.clone();
+        shared.layout_frame_override = None;
         shared.scroll_x_px = 0.0;
         shared.scroll_y_px = 0.0;
         shared.last_error = None;
@@ -64813,7 +63656,7 @@ mod tests {
     }
 
     #[test]
-    fn default_catalog_hides_3d_examples_but_keeps_primary_examples_visible() {
+    fn default_catalog_keeps_primary_examples_visible() {
         let entries = boon_runtime::example_manifest_entries().unwrap();
         let entry = |id: &str| {
             entries
@@ -64821,18 +63664,6 @@ mod tests {
                 .find(|entry| entry.id == id)
                 .unwrap_or_else(|| panic!("missing manifest entry `{id}`"))
         };
-
-        for id in [
-            "hello_3d",
-            "printable_bracket_3d",
-            "parametric_car_3d",
-            "parametric_car_rich_3d",
-        ] {
-            assert!(
-                !entry(id).shown_by_default,
-                "`{id}` must not appear as a default dev-window example tab"
-            );
-        }
 
         for id in [
             "cells",

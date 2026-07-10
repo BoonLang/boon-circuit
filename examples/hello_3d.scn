@@ -1,7 +1,0 @@
-name = "hello_3d"
-source = "examples/hello_3d/RUN.bn"
-
-[[step]]
-id = "initial-world-output"
-  [step.expect_root_text]
-  "world" = "World"

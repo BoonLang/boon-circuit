@@ -16,27 +16,26 @@ fn unaccounted_host_input_frame_is_not_pre_present_drop_eligible() {
 
 #[test]
 fn accessibility_action_requests_route_to_semantic_source_dispatch() {
-    let root_id = boon_host::SemanticId("semantic:world-editor:root".to_owned());
-    let export_id =
-        boon_host::SemanticId("semantic:world-editor:manufacturing:export-3mf".to_owned());
+    let root_id = boon_host::SemanticId("semantic:counter:root".to_owned());
+    let increment_id = boon_host::SemanticId("semantic:counter:increment".to_owned());
     let mut scene = boon_host::SemanticScene {
         root: Some(root_id.clone()),
-        focused: Some(export_id.clone()),
+        focused: Some(increment_id.clone()),
         ..boon_host::SemanticScene::default()
     };
     scene.nodes.insert(
         root_id.clone(),
         boon_host::SemanticNode {
             id: root_id.clone(),
-            node: boon_host::DocumentNodeId("world:world-editor:root".to_owned()),
+            node: boon_host::DocumentNodeId("counter:root".to_owned()),
             role: boon_host::SemanticRole::Application,
-            name: Some("Car editor".to_owned()),
+            name: Some("Counter".to_owned()),
             description: None,
             value: None,
             state: boon_host::SemanticState::default(),
             actions: boon_host::SemanticActions::default(),
             relations: boon_host::SemanticRelations {
-                children: vec![export_id.clone()],
+                children: vec![increment_id.clone()],
                 ..boon_host::SemanticRelations::default()
             },
             bounds: None,
@@ -49,14 +48,12 @@ fn accessibility_action_requests_route_to_semantic_source_dispatch() {
         },
     );
     scene.nodes.insert(
-        export_id.clone(),
+        increment_id.clone(),
         boon_host::SemanticNode {
-            id: export_id.clone(),
-            node: boon_host::DocumentNodeId(
-                "world:world-editor:manufacturing:export-3mf".to_owned(),
-            ),
+            id: increment_id.clone(),
+            node: boon_host::DocumentNodeId("counter:increment".to_owned()),
             role: boon_host::SemanticRole::Button,
-            name: Some("Export 3MF".to_owned()),
+            name: Some("Increment".to_owned()),
             description: None,
             value: None,
             state: boon_host::SemanticState {
@@ -79,32 +76,32 @@ fn accessibility_action_requests_route_to_semantic_source_dispatch() {
             heading_level: None,
             href: None,
             source_binding_id: Some(boon_host::SourceBindingId(
-                "source:world.manufacturing.export_3mf".to_owned(),
+                "source:store.increment".to_owned(),
             )),
-            source_path: Some("world.manufacturing.export_3mf".to_owned()),
+            source_path: Some("store.increment".to_owned()),
             source_intent: Some("press".to_owned()),
         },
     );
     let snapshot = accesskit_tree_update_from_semantic_scene(&scene, "boon-native", "test-version");
-    let export_node_id = snapshot
+    let increment_node_id = snapshot
         .semantic_node_ids
         .iter()
-        .find(|mapping| mapping.semantic_id == export_id.0)
-        .expect("export semantic node should map to AccessKit")
+        .find(|mapping| mapping.semantic_id == increment_id.0)
+        .expect("increment semantic node should map to AccessKit")
         .accesskit_node_id;
     let requests =
         native_accessibility_action_requests_from_accesskit(vec![accesskit::ActionRequest {
             action: accesskit::Action::Click,
             target_tree: accesskit::TreeId::ROOT,
-            target_node: accesskit::NodeId(export_node_id),
+            target_node: accesskit::NodeId(increment_node_id),
             data: None,
         }]);
 
     let dispatches = native_accessibility_source_dispatches_from_requests(&scene, &requests);
 
     assert_eq!(dispatches.len(), 1);
-    assert_eq!(dispatches[0].semantic_id, export_id);
-    assert_eq!(dispatches[0].source_path, "world.manufacturing.export_3mf");
+    assert_eq!(dispatches[0].semantic_id, increment_id);
+    assert_eq!(dispatches[0].source_path, "store.increment");
     assert_eq!(dispatches[0].source_intent.as_deref(), Some("press"));
     assert_eq!(dispatches[0].text, None);
 }

@@ -15,7 +15,6 @@ fn renderer_graph_plan_hash_ignores_workload_metrics() {
     );
 }
 
-
 #[test]
 fn product_frame_graph_executor_emits_typed_pass_and_resource_metrics() {
     let schedule = ProductFrameSchedule::product_surface(1);
@@ -361,58 +360,4 @@ fn product_frame_graph_executor_rejects_early_finish() {
             .contains("ProductFrameGraph schedule finished early"),
         "{error:?}"
     );
-}
-
-
-#[test]
-fn world_scene_depth_target_clear_pass_uses_app_owned_depth_texture() {
-    futures::executor::block_on(async {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = match instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                force_fallback_adapter: true,
-                compatible_surface: None,
-            })
-            .await
-        {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                eprintln!(
-                    "skipping app-owned world scene depth target test: request_adapter failed: {error}"
-                );
-                return;
-            }
-        };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("boon-native-gpu-world-scene-depth-target-test-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::default(),
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-            })
-            .await
-            .expect("test WGPU device should be available when adapter exists");
-        let scene = boon_scene_model::WorldScene::hello_cube_fixture();
-        let proof = render_app_owned_world_scene_depth_target(&device, &queue, &scene, 128, 96)
-            .expect("world scene should clear an app-owned depth target");
-
-        assert_eq!(
-            proof.capture_method,
-            "app-owned-world-scene-depth-target-clear-pass"
-        );
-        assert_eq!(
-            proof.render_identity_hash,
-            world_scene_identity_hash(&scene)
-        );
-        assert_eq!(proof.width, 128);
-        assert_eq!(proof.height, 96);
-        assert_eq!(proof.format, "Depth32Float");
-        assert_eq!(proof.sample_count, 1);
-        assert_eq!(proof.clear_depth, 1.0);
-        assert_eq!(proof.submitted_pass_count, 1);
-    });
 }

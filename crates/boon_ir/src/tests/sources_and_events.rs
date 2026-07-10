@@ -76,111 +76,6 @@ fn view_row_source_alias_resolves_to_unique_canonical_source_path() {
 
 
 #[test]
-fn world_root_records_generic_output_port_without_document_view_bindings() {
-    let source = r#"
-SOURCE
-HOLD
-LATEST
-
-world: World/new(
-camera: World/perspective_camera(
-    transform: World/transform(translation: [x: 0, y: 0, z: 6])
-)
-lights: LIST {
-    World/light(transform: World/transform(translation: [x: 2, y: 4, z: 3]))
-}
-materials: LIST {
-    World/material(base_color: [r: 0.2, g: 0.55, b: 0.95, a: 1])
-}
-geometries: LIST {
-    World/primitive(kind: Cube, size: [x: 1, y: 1, z: 1])
-}
-instances: LIST {
-    World/model(
-        geometry: TEXT { cube }
-        transform: World/transform(rotation_z_degrees: 45)
-        material: TEXT { blue }
-        part_id: TEXT { body }
-        feature_id: TEXT { cube_feature }
-        pick_id: 1
-    )
-}
-)
-"#;
-    let parsed = boon_parser::parse_source("world-output-root.bn", source).unwrap();
-    let ir = lower(&parsed).unwrap();
-
-    let world_root = ir
-        .semantic_index
-        .output_roots
-        .iter()
-        .find(|root| root.root == "world")
-        .expect("world root should be recorded as an output root");
-    assert_eq!(world_root.output_kind, "world");
-    assert!(world_root.typed_contract_known);
-    assert!(world_root.generic_output_port);
-    assert!(
-        ir.view_bindings.is_empty(),
-        "world output roots must not be lowered through document view bindings: {:?}",
-        ir.view_bindings
-    );
-    assert!(
-        ir.semantic_index
-            .symbols
-            .iter()
-            .any(|symbol| symbol.category == "operator_name" && symbol.text == "World/new")
-    );
-    assert!(
-        ir.semantic_index
-            .symbols
-            .iter()
-            .any(|symbol| symbol.category == "output_root" && symbol.text == "world")
-    );
-}
-
-
-#[test]
-fn manufacturing_root_records_generic_output_port() {
-    let source = r#"
-SOURCE
-HOLD
-LATEST
-
-manufacturing: Assembly/new(
-parts: LIST {
-    Part/new(
-        id: TEXT { bracket }
-        geometry: Solid/box(size: [x: 10, y: 10, z: 2])
-        physical_material: TEXT { PLA }
-        manufacturing_role: PrintableSolid
-    )
-}
-instances: LIST {
-    Part/instance(id: TEXT { bracket_a }, part: TEXT { bracket })
-}
-)
-"#;
-    let parsed = boon_parser::parse_source("manufacturing-output-root.bn", source).unwrap();
-    let ir = lower(&parsed).unwrap();
-
-    let manufacturing_root = ir
-        .semantic_index
-        .output_roots
-        .iter()
-        .find(|root| root.root == "manufacturing")
-        .expect("manufacturing root should be recorded as an output root");
-    assert_eq!(manufacturing_root.output_kind, "manufacturing");
-    assert!(manufacturing_root.typed_contract_known);
-    assert!(manufacturing_root.generic_output_port);
-    assert!(
-        ir.view_bindings.is_empty(),
-        "manufacturing output roots must not be lowered through document view bindings: {:?}",
-        ir.view_bindings
-    );
-}
-
-
-#[test]
 fn semantic_symbol_table_reuses_duplicate_category_text_pairs() {
     let mut table = SemanticSymbolTable::default();
 
@@ -311,5 +206,4 @@ fn event_press_pulse_is_not_payload_guard_field() {
         Some("key".to_owned())
     );
 }
-
 

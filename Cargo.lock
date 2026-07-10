@@ -464,18 +464,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "boon_3mf"
-version = "0.1.0"
-dependencies = [
- "boon_manufacturing",
- "boon_solid_model",
- "earcutr",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "boon_bridge"
 version = "0.1.0"
 dependencies = [
@@ -518,7 +506,6 @@ version = "0.1.0"
 dependencies = [
  "boon_document_model",
  "boon_host",
- "boon_scene_model",
  "serde",
  "serde_json",
  "sha2",
@@ -554,7 +541,6 @@ name = "boon_host"
 version = "0.1.0"
 dependencies = [
  "boon_document_model",
- "boon_scene_model",
  "serde",
 ]
 
@@ -569,24 +555,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "boon_manufacturing"
-version = "0.1.0"
-dependencies = [
- "boon_solid_model",
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
 name = "boon_native_app_window"
 version = "0.1.0"
 dependencies = [
  "accesskit",
  "app_window",
  "boon_host",
- "boon_scene_model",
- "boon_solid_model",
  "futures",
  "image 0.24.9",
  "serde",
@@ -601,8 +575,6 @@ version = "0.1.0"
 dependencies = [
  "boon_document",
  "boon_host",
- "boon_scene_model",
- "boon_solid_model",
  "bytemuck",
  "encase",
  "futures",
@@ -620,19 +592,15 @@ name = "boon_native_playground"
 version = "0.1.0"
 dependencies = [
  "arboard",
- "boon_3mf",
  "boon_document",
  "boon_document_model",
  "boon_editor",
  "boon_host",
  "boon_ir",
- "boon_manufacturing",
  "boon_native_app_window",
  "boon_native_gpu",
  "boon_parser",
  "boon_runtime",
- "boon_scene_model",
- "boon_solid_model",
  "boon_typecheck",
  "futures",
  "image 0.24.9",
@@ -695,30 +663,12 @@ dependencies = [
  "boon_plan",
  "boon_plan_executor",
  "boon_report_schema",
- "boon_scene_model",
- "boon_solid_model",
  "bytes",
  "serde",
  "serde_json",
  "sha2",
  "smallvec",
  "toml",
-]
-
-[[package]]
-name = "boon_scene_model"
-version = "0.1.0"
-dependencies = [
- "boon_solid_model",
- "earcutr",
- "serde",
-]
-
-[[package]]
-name = "boon_solid_model"
-version = "0.1.0"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -1151,16 +1101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
-name = "earcutr"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "afc28d89ac6cb489f679fcf51aaa62b4667bb0fb73a30f1d4d23949069707c07"
-dependencies = [
- "itertools",
- "num-traits",
-]
-
-[[package]]
 name = "educe"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1171,12 +1111,6 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "either"
-version = "1.16.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "ena"
@@ -1793,15 +1727,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
 ]
 
 [[package]]
@@ -4057,7 +3982,6 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "accesskit",
- "boon_3mf",
  "boon_bridge",
  "boon_compiler",
  "boon_document",
@@ -4065,14 +3989,11 @@ dependencies = [
  "boon_driver",
  "boon_host",
  "boon_ir",
- "boon_manufacturing",
  "boon_native_app_window",
  "boon_native_gpu",
  "boon_parser",
  "boon_plan",
  "boon_runtime",
- "boon_scene_model",
- "boon_solid_model",
  "boon_typecheck",
  "flate2",
  "futures",

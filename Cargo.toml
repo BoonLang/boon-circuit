@@ -15,10 +15,6 @@ members = [
     "crates/boon_driver",
     "crates/boon_host",
     "crates/boon_document",
-    "crates/boon_scene_model",
-    "crates/boon_solid_model",
-    "crates/boon_manufacturing",
-    "crates/boon_3mf",
     "crates/boon_native_gpu",
     "crates/boon_native_app_window",
     "crates/boon_native_playground",
@@ -47,10 +43,6 @@ boon_editor = { path = "crates/boon_editor" }
 boon_driver = { path = "crates/boon_driver" }
 boon_host = { path = "crates/boon_host" }
 boon_document = { path = "crates/boon_document" }
-boon_scene_model = { path = "crates/boon_scene_model" }
-boon_solid_model = { path = "crates/boon_solid_model" }
-boon_manufacturing = { path = "crates/boon_manufacturing" }
-boon_3mf = { path = "crates/boon_3mf" }
 boon_native_gpu = { path = "crates/boon_native_gpu" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
 accesskit = "0.24.0"

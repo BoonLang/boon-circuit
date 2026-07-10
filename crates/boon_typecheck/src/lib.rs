@@ -546,17 +546,12 @@ impl<'a> Checker<'a> {
         let flow_bindings = flow_bindings(program);
         let flow_bindings_ms = typecheck_elapsed_ms(flow_bindings_started);
         let render_contracts_started = Instant::now();
-        let render_contracts = RenderContractRegistry::default().with_active_root(
-            if manufacturing_root(program).is_some() {
-                "manufacturing"
-            } else if world_root(program).is_some() {
-                "world"
-            } else if scene_root(program).is_some() {
+        let render_contracts =
+            RenderContractRegistry::default().with_active_root(if scene_root(program).is_some() {
                 "scene"
             } else {
                 "document"
-            },
-        );
+            });
         let render_contracts_ms = typecheck_elapsed_ms(render_contracts_started);
         let mut checker = Self {
             program,
@@ -836,7 +831,6 @@ impl<'a> Checker<'a> {
         let next_in_document = in_document
             || statement_field(statement).as_deref() == Some("document")
             || statement_field(statement).as_deref() == Some("scene")
-            || statement_field(statement).as_deref() == Some("world")
             || self.statement_enters_render_context(statement);
         if let Some(expr_id) = statement.expr {
             let flow = self.ensure_expr(expr_id);
@@ -2946,7 +2940,7 @@ impl<'a> Checker<'a> {
                 continue;
             }
             if let Some(field) = statement_output_name(statement)
-                && !matches!(field.as_str(), "document" | "scene" | "world")
+                && !matches!(field.as_str(), "document" | "scene")
                 && let Some(ty) =
                     self.static_statement_type_with_bindings(statement, active_functions, bindings)
             {
@@ -3048,7 +3042,7 @@ impl<'a> Checker<'a> {
                 continue;
             }
             if let Some(field) = statement_output_name(statement)
-                && !matches!(field.as_str(), "document" | "scene" | "world")
+                && !matches!(field.as_str(), "document" | "scene")
                 && let Some(ty) = self.static_statement_type(statement, active_functions)
             {
                 insert_ordered_shape_field(fields, field_order, field, ty);
@@ -4933,24 +4927,6 @@ fn scene_root(program: &ParsedProgram) -> Option<&AstStatement> {
     })
 }
 
-fn world_root(program: &ParsedProgram) -> Option<&AstStatement> {
-    program.ast.statements.iter().find(|statement| {
-        matches!(
-            &statement.kind,
-            AstStatementKind::Field { name } if name == "world"
-        )
-    })
-}
-
-fn manufacturing_root(program: &ParsedProgram) -> Option<&AstStatement> {
-    program.ast.statements.iter().find(|statement| {
-        matches!(
-            &statement.kind,
-            AstStatementKind::Field { name } if name == "manufacturing"
-        )
-    })
-}
-
 #[derive(Clone, Debug)]
 pub struct BuiltinSignatureRegistry {
     text_functions: BTreeSet<&'static str>,
@@ -5143,8 +5119,6 @@ impl Default for RenderContractRegistry {
             roots: [
                 ("document", RuntimeRootContract::document()),
                 ("scene", RuntimeRootContract::scene()),
-                ("world", RuntimeRootContract::world()),
-                ("manufacturing", RuntimeRootContract::manufacturing()),
             ]
             .into_iter()
             .collect(),
@@ -5226,70 +5200,6 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Scene/Element/button", "Button")
         .with_fixed_constructor("Scene/Element/paragraph", "Paragraph")
         .with_fixed_constructor("Scene/Element/link", "Link")
-    }
-
-    fn world() -> Self {
-        Self::new([
-            "AppearanceMaterial",
-            "Camera",
-            "DirectionalLight",
-            "Group",
-            "IndexedMesh",
-            "ModelInstance",
-            "PerspectiveCamera",
-            "PointLight",
-            "PrimitiveGeometry",
-            "Transform3D",
-            "World",
-        ])
-        .with_fixed_constructor("World/new", "World")
-        .with_fixed_constructor("World/camera", "Camera")
-        .with_fixed_constructor("World/perspective_camera", "PerspectiveCamera")
-        .with_fixed_constructor("World/light", "DirectionalLight")
-        .with_fixed_constructor("World/point_light", "PointLight")
-        .with_fixed_constructor("World/material", "AppearanceMaterial")
-        .with_fixed_constructor("World/transform", "Transform3D")
-        .with_fixed_constructor("World/primitive", "PrimitiveGeometry")
-        .with_fixed_constructor("World/indexed_mesh", "IndexedMesh")
-        .with_fixed_constructor("World/model", "ModelInstance")
-        .with_fixed_constructor("World/group", "Group")
-    }
-
-    fn manufacturing() -> Self {
-        Self::new([
-            "Assembly",
-            "Part",
-            "PartInstance",
-            "SolidBox",
-            "SolidCone",
-            "SolidCylinder",
-            "SolidDifference",
-            "SolidExtrude",
-            "SolidLoft",
-            "SolidRevolve",
-            "SolidRoundedBox",
-            "SolidShell",
-            "SolidSphere",
-            "SolidTorus",
-            "SolidTransform",
-            "SolidUnion",
-        ])
-        .with_fixed_constructor("Assembly/new", "Assembly")
-        .with_fixed_constructor("Part/new", "Part")
-        .with_fixed_constructor("Part/instance", "PartInstance")
-        .with_fixed_constructor("Solid/box", "SolidBox")
-        .with_fixed_constructor("Solid/rounded_box", "SolidRoundedBox")
-        .with_fixed_constructor("Solid/sphere", "SolidSphere")
-        .with_fixed_constructor("Solid/cylinder", "SolidCylinder")
-        .with_fixed_constructor("Solid/cone", "SolidCone")
-        .with_fixed_constructor("Solid/torus", "SolidTorus")
-        .with_fixed_constructor("Solid/extrude", "SolidExtrude")
-        .with_fixed_constructor("Solid/revolve", "SolidRevolve")
-        .with_fixed_constructor("Solid/loft", "SolidLoft")
-        .with_fixed_constructor("Solid/shell", "SolidShell")
-        .with_fixed_constructor("Solid/union", "SolidUnion")
-        .with_fixed_constructor("Solid/difference", "SolidDifference")
-        .with_fixed_constructor("Solid/translate", "SolidTransform")
     }
 }
 
@@ -6640,7 +6550,7 @@ fn statement_contains_render_context_syntax(
     statement_field(statement).as_deref().is_some_and(|field| {
         matches!(
             field,
-            "document" | "scene" | "world" | "root" | "child" | "items" | "children"
+            "document" | "scene" | "root" | "child" | "items" | "children"
         )
     }) || statement
         .expr

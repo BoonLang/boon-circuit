@@ -1967,8 +1967,6 @@ fn semantic_output_roots(
             let output_kind = match name.as_str() {
                 "document" => "document",
                 "scene" => "scene",
-                "world" => "world",
-                "manufacturing" => "manufacturing",
                 _ => return None,
             };
             Some(SemanticOutputRootEntry {
@@ -1982,10 +1980,7 @@ fn semantic_output_roots(
                     program,
                     typecheck_report,
                 ),
-                generic_output_port: matches!(
-                    name.as_str(),
-                    "document" | "world" | "manufacturing"
-                ),
+                generic_output_port: name == "document",
             })
         })
         .collect()
@@ -2006,8 +2001,6 @@ fn output_root_values(
             let output_kind = match name.as_str() {
                 "document" => "document",
                 "scene" => "scene",
-                "world" => "world",
-                "manufacturing" => "manufacturing",
                 _ => return None,
             };
             Some(OutputRootValue {
@@ -2021,10 +2014,7 @@ fn output_root_values(
                     program,
                     typecheck_report,
                 ),
-                generic_output_port: matches!(
-                    name.as_str(),
-                    "document" | "world" | "manufacturing"
-                ),
+                generic_output_port: name == "document",
                 statement: statement.clone(),
             })
         })
@@ -2046,12 +2036,6 @@ fn output_root_typed_contract_known(
                 || statement_contains_constructor(statement, program, "Element/")
         }
         "scene" => statement_contains_constructor(statement, program, "Scene/"),
-        "world" => statement_contains_constructor(statement, program, "World/"),
-        "manufacturing" => {
-            statement_contains_constructor(statement, program, "Assembly/")
-                || statement_contains_constructor(statement, program, "Part/")
-                || statement_contains_constructor(statement, program, "Solid/")
-        }
         _ => false,
     }
 }
@@ -13906,7 +13890,7 @@ fn should_record_field_statement(
     };
     let top_level_data_scope = scope
         .first()
-        .is_some_and(|root| !matches!(root.as_str(), "store" | "document" | "scene" | "world"));
+        .is_some_and(|root| !matches!(root.as_str(), "store" | "document" | "scene"));
     local_name != "sources"
         && !scope.iter().any(|name| name == "sources")
         && (program

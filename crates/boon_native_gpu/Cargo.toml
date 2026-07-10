@@ -8,7 +8,6 @@ rust-version.workspace = true
 [dependencies]
 boon_document.workspace = true
 boon_host.workspace = true
-boon_scene_model.workspace = true
 bytemuck.workspace = true
 encase.workspace = true
 serde.workspace = true
@@ -20,5 +19,4 @@ resvg.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-boon_solid_model.workspace = true
 futures.workspace = true

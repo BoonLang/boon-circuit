@@ -199,7 +199,6 @@ fn preview_perf_stats_keep_proof_overhead_separate_from_ux_latency() {
         preview_blocked_on_ipc_count: Some(0),
         render_hook_outer_state_snapshot_ms: None,
         render_hook_outer_input_snapshot_ms: None,
-        render_hook_outer_world_snapshot_ms: None,
         render_hook_outer_core_ms: None,
         render_hook_outer_revision_ms: None,
         render_hook_outer_total_ms: None,
@@ -302,7 +301,6 @@ fn preview_perf_accumulator_keeps_bounded_rolling_summaries() {
             preview_blocked_on_ipc_count: None,
             render_hook_outer_state_snapshot_ms: None,
             render_hook_outer_input_snapshot_ms: None,
-            render_hook_outer_world_snapshot_ms: None,
             render_hook_outer_core_ms: None,
             render_hook_outer_revision_ms: None,
             render_hook_outer_total_ms: None,
@@ -380,4 +378,3 @@ fn native_frame_clock_proof_frame_allows_required_proof_without_background_guess
     assert!(policy.pre_submit_proof_poll_allowed);
     assert_eq!(policy.post_present_background_telemetry_allowed, Some(true));
 }
-

@@ -1,7 +1,0 @@
-name = "parametric_car_3d"
-source = "examples/parametric_car_3d/RUN.bn"
-
-[[step]]
-id = "initial-car-manufacturing-output"
-  [step.expect_root_text]
-  "manufacturing" = "Assembly"

@@ -30,7 +30,6 @@ kept generic and fast on TodoMVC and 7GUIs Cells.
 - [Cells target shape](docs/examples/CELLS_CIRCUIT_STYLE.md)
 - [Implementation plan](docs/plans/IMPLEMENTATION_PLAN.md)
 - [Native GPU pipeline contract](docs/architecture/NATIVE_GPU_PIPELINE.md)
-- [Unified runtime/rendering/3D plan](docs/architecture/UNIFIED_RUNTIME_RENDERING_3D_PLAN.md)
 - [Native realtime frame-loop and proof plan](docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md)
 - [Manual testing runbook](docs/plans/MANUAL_TESTING_RUNBOOK.md)
 - [`/goal` prompt](docs/plans/GOAL_PROMPT.md)

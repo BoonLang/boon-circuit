@@ -93,6 +93,9 @@ tempfile = "3.21.0"
 atspi = {version = "0.29.0", features=[]}
 ampsc = "0.2.0"
 
+[target.'cfg(target_os="linux")'.dev-dependencies]
+wayland-server = "=0.31.11"
+
 
 [[example]]
 name = "gpu"

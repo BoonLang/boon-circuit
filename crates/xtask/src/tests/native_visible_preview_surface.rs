@@ -267,6 +267,68 @@ fn native_preview_route_evidence_uses_embedded_prelaunch_layout_probe() {
     );
 }
 
+#[test]
+fn verifier_host_click_queue_proves_visible_runtime_change() {
+    let report = json!({
+        "operator_host_input": true,
+        "hit_target_assertions": [{
+            "id": "hit:counter-plus",
+            "node": "counter-plus",
+            "bounds": {"x": 10.0, "y": 20.0, "width": 80.0, "height": 24.0}
+        }],
+        "source_intent_assertions": [{
+            "node": "counter-plus",
+            "intent": "press",
+            "source_path": "store.sources.increment_button.press"
+        }],
+        "dev_ipc_probe": {
+            "verifier_host_input_status": {
+                "queue": {
+                    "recent_completed": [{
+                        "request_id": 1,
+                        "status": "pass",
+                        "source": "store.sources.increment_button.press",
+                        "target_text": "+",
+                        "bounded_state_summary_sample": {
+                            "scalars": [{"key": "count", "value": 1}]
+                        }
+                    }]
+                }
+            }
+        }
+    });
+
+    let route = native_preview_host_route_evidence("counter", &report);
+    assert_eq!(
+        route
+            .pointer("/status")
+            .and_then(serde_json::Value::as_str),
+        Some("pass")
+    );
+    assert_eq!(
+        route
+            .pointer("/changes_visible_frame")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    let mut report_with_route = report;
+    report_with_route["native_host_input_route_evidence"] = route;
+    let runtime = native_runtime_assertions_after_input(&report_with_route);
+    assert_eq!(
+        runtime
+            .pointer("/status")
+            .and_then(serde_json::Value::as_str),
+        Some("pass")
+    );
+    assert_eq!(
+        runtime
+            .pointer("/assertions/0/bounded_state_summary_sample/scalars/0/value")
+            .and_then(serde_json::Value::as_i64),
+        Some(1)
+    );
+}
+
 
 #[test]
 fn native_visible_reality_accepts_cosmic_portrait_dev_surface_with_area() {

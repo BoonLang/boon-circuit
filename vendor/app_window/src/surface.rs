@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::coordinates::Size;
+use crate::input::{keyboard::Keyboard, mouse::Mouse};
 use crate::sys;
 use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, WindowHandle};
 
@@ -66,6 +67,21 @@ pub struct Surface {
 }
 
 impl Surface {
+    /// Returns input state bound to this surface.
+    ///
+    /// On Wayland this is registered when the window is created, before the
+    /// compositor can send the first pointer or keyboard event.
+    pub async fn input(&self) -> (Mouse, Keyboard) {
+        #[cfg(target_os = "linux")]
+        {
+            self.sys.input()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (Mouse::coalesced().await, Keyboard::coalesced().await)
+        }
+    }
+
     /// Returns the size and scale factor of the surface.
     ///
     /// The size is returned in logical pixels, which may differ from physical pixels

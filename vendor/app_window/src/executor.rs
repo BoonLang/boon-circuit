@@ -286,8 +286,17 @@ fn main_executor_iter() {
                     RUNNING.replace(Some(running));
                 }
             }
-            //there MAY be more pollable tasks.  However, we want to yield here
-            submit_to_main_thread("main_executor_iter".to_string(), main_executor_iter);
+            // There may be more pollable tasks added while this task was being
+            // polled. Yield back to the platform loop between tasks, but do not
+            // reschedule ourselves when every task is simply pending. Long-lived
+            // input futures rely on their waker to schedule the next executor
+            // turn; unconditional resubmission turns them into a busy loop.
+            let pollable = POLLABLE.take();
+            let has_more_pollable = !pollable.is_empty();
+            POLLABLE.replace(pollable);
+            if has_more_pollable {
+                submit_to_main_thread("main_executor_iter".to_string(), main_executor_iter);
+            }
             if begin_iter.elapsed() > crate::application::time::Duration::from_millis(10) {
                 logwise::warn_sync!(
                     "main_executor_iter {task} took too long: {duration}",

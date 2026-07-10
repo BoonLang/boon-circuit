@@ -55,6 +55,23 @@ pub enum HostEvent {
     Resize(SurfaceResizeEvent),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostEventOrigin {
+    RealOs,
+    Operator,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostEventEnvelope {
+    pub sequence: u64,
+    pub origin: HostEventOrigin,
+    pub window: WindowId,
+    pub surface: SurfaceId,
+    pub surface_epoch: u64,
+    pub event: HostEvent,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeyEvent {
     pub surface: SurfaceId,
@@ -73,12 +90,33 @@ pub struct PointerEvent {
     pub surface: SurfaceId,
     pub x: f32,
     pub y: f32,
-    pub pressed: bool,
+    pub phase: PointerPhase,
+    pub button: Option<PointerButton>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerPhase {
+    Move,
+    Down,
+    Up,
+    Leave,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButton {
+    Primary,
+    Secondary,
+    Middle,
+    Other(u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WheelEvent {
     pub surface: SurfaceId,
+    pub x: f32,
+    pub y: f32,
     pub delta_x: f32,
     pub delta_y: f32,
 }

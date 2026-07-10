@@ -192,6 +192,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     use crate::some_executor::MainThreadExecutor;
+    some_executor::thread_executor::set_thread_executor(Box::new(MainThreadExecutor {}));
     some_executor::thread_executor::set_thread_local_executor_adapting_notifier(
         MainThreadExecutor {},
     );

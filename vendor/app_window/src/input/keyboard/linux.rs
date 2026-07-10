@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::input::InputEventOrigin;
 use crate::input::keyboard::Shared;
 use crate::input::keyboard::key::KeyboardKey;
 use crate::input::mouse::linux::motion_event;
@@ -25,22 +26,22 @@ use wayland_protocols::xdg::shell::client::xdg_toplevel;
 use wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel;
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{Event, XdgWmBase};
 
-pub(crate) mod ax;
-
 #[derive(Default)]
 struct KeyboardState {
     shareds: Vec<Weak<Shared>>,
 }
 impl KeyboardState {
-    fn apply_all<F: Fn(&Shared)>(&mut self, f: F) {
+    fn live_shareds(&mut self) -> Vec<Arc<Shared>> {
+        let mut live = Vec::with_capacity(self.shareds.len());
         self.shareds.retain(|shared| {
             if let Some(shared) = shared.upgrade() {
-                f(&shared);
+                live.push(shared);
                 true
             } else {
                 false
             }
-        })
+        });
+        live
     }
 }
 static KEYBOARD_STATE: OnceLock<Mutex<KeyboardState>> = OnceLock::new();
@@ -49,6 +50,10 @@ static KEYBOARD_STATE: OnceLock<Mutex<KeyboardState>> = OnceLock::new();
 pub(super) struct PlatformCoalescedKeyboard {}
 
 impl PlatformCoalescedKeyboard {
+    pub(crate) fn attached() -> Self {
+        Self {}
+    }
+
     pub async fn new(shared: &Arc<Shared>) -> Self {
         KEYBOARD_STATE
             .get_or_init(Mutex::default)
@@ -312,16 +317,37 @@ Call this from [WlKeyboard] dispatch for [wayland_client::protocol::wl_keyboard:
 pub fn wl_keyboard_event(_serial: u32, _time: u32, key: u32, state: u32, surface_id: ObjectId) {
     if let Some(key) = KeyboardKey::from_vk(key) {
         let down = state == 1;
-        KEYBOARD_STATE
+        let shareds = KEYBOARD_STATE
             .get_or_init(Mutex::default)
             .lock()
             .unwrap()
-            .apply_all(|shared| {
-                shared.set_key_state(key, down, surface_id.protocol_id() as *mut c_void)
-            });
-        ax::ax_press(key, down);
+            .live_shareds();
+        for shared in shareds {
+            shared.set_key_state(
+                key,
+                down,
+                surface_id.protocol_id() as *mut c_void,
+                InputEventOrigin::RealOs,
+            );
+        }
     } else {
         logwise::warn_sync!("Unknown key {key}", key = key);
+    }
+}
+
+pub(crate) fn wl_keyboard_event_for_shared(
+    shared: &Arc<Shared>,
+    key: u32,
+    state: u32,
+    surface_id: &ObjectId,
+) {
+    if let Some(key) = KeyboardKey::from_vk(key) {
+        shared.set_key_state(
+            key,
+            state == 1,
+            surface_id.protocol_id() as *mut c_void,
+            InputEventOrigin::RealOs,
+        );
     }
 }
 

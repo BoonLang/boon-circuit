@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::input::InputEventOrigin;
 use crate::input::Window;
 use crate::input::mouse::{MouseWindowLocation, Shared};
 use std::ffi::c_void;
@@ -40,7 +41,7 @@ extern "C" fn raw_input_mouse_move(
             window_height,
             window,
         );
-        shared.set_window_location(loc);
+        shared.set_window_location(loc, InputEventOrigin::RealOs);
     }
     std::mem::forget(weak);
 }
@@ -54,7 +55,7 @@ extern "C" fn raw_input_mouse_button(
 ) {
     let weak = unsafe { Weak::from_raw(ctx as *const Shared) };
     if let Some(shared) = weak.upgrade() {
-        shared.set_key_state(button, down, window);
+        shared.set_key_state(button, down, window, InputEventOrigin::RealOs);
     }
     std::mem::forget(weak);
 }
@@ -68,7 +69,7 @@ extern "C" fn raw_input_mouse_scroll(
 ) {
     let weak = unsafe { Weak::from_raw(ctx as *const Shared) };
     if let Some(shared) = weak.upgrade() {
-        shared.add_scroll_delta(delta_x, delta_y, window);
+        shared.add_scroll_delta(delta_x, delta_y, window, InputEventOrigin::RealOs);
     }
     std::mem::forget(weak);
 }

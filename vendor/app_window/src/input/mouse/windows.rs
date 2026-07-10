@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::input::InputEventOrigin;
 use crate::input::Window;
 use crate::input::mouse::{MouseWindowLocation, Shared};
 use std::mem::MaybeUninit;
@@ -96,43 +97,43 @@ pub(crate) fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM
             );
 
             apply_all(|shared| {
-                shared.set_window_location(rel_mouse);
+                shared.set_window_location(rel_mouse, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
         msg if msg == WM_LBUTTONDOWN => {
             apply_all(|shared| {
-                shared.set_key_state(0, true, hwnd.0);
+                shared.set_key_state(0, true, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
         msg if msg == WM_LBUTTONUP => {
             apply_all(|shared| {
-                shared.set_key_state(0, false, hwnd.0);
+                shared.set_key_state(0, false, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
         msg if msg == WM_RBUTTONDOWN => {
             apply_all(|shared| {
-                shared.set_key_state(1, true, hwnd.0);
+                shared.set_key_state(1, true, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
         msg if msg == WM_RBUTTONUP => {
             apply_all(|shared| {
-                shared.set_key_state(1, false, hwnd.0);
+                shared.set_key_state(1, false, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
         msg if msg == WM_MBUTTONDOWN => {
             apply_all(|shared| {
-                shared.set_key_state(2, true, hwnd.0);
+                shared.set_key_state(2, true, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
         msg if msg == WM_MBUTTONUP => {
             apply_all(|shared| {
-                shared.set_key_state(2, false, hwnd.0);
+                shared.set_key_state(2, false, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
@@ -146,7 +147,7 @@ pub(crate) fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM
                 }
             };
             apply_all(|shared| {
-                shared.set_key_state(key, true, hwnd.0);
+                shared.set_key_state(key, true, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
@@ -160,7 +161,7 @@ pub(crate) fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM
                 }
             };
             apply_all(|shared| {
-                shared.set_key_state(key, false, hwnd.0);
+                shared.set_key_state(key, false, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
@@ -168,7 +169,7 @@ pub(crate) fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM
             //todo: should this be scaled in some way?
             let delta = get_wheel_delta_wparam(w_param);
             apply_all(|shared| {
-                shared.add_scroll_delta(0.0, delta as f64, hwnd.0);
+                shared.add_scroll_delta(0.0, delta as f64, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }
@@ -176,7 +177,7 @@ pub(crate) fn window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM
             //todo: should this be scaled in some way?
             let delta = get_wheel_delta_wparam(w_param);
             apply_all(|shared| {
-                shared.add_scroll_delta(delta as f64, 0.0, hwnd.0);
+                shared.add_scroll_delta(delta as f64, 0.0, hwnd.0, InputEventOrigin::RealOs);
             });
             LRESULT(0)
         }

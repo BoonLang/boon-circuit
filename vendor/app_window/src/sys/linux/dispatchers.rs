@@ -7,7 +7,7 @@ use wayland_client::protocol::wl_keyboard::WlKeyboard;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_registry;
-use wayland_client::protocol::wl_seat::WlSeat;
+use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_shm::WlShm;
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
@@ -24,7 +24,27 @@ use super::buffer::AllocatedBuffer;
 use super::cursor::{CursorRequest, MouseRegion};
 use super::{App, BufferReleaseInfo, Configure, OutputInfo, SurfaceEvents};
 use crate::coordinates::Position;
+use crate::input::InputEventOrigin;
+use crate::input::mouse::MouseWindowLocation;
 use crate::sys::window::{ConfigureContentBufferAction, WindowInternal};
+
+enum PendingSurfaceMouseInput {
+    Motion {
+        time: u32,
+        location: MouseWindowLocation,
+    },
+    Leave,
+    Button {
+        time: u32,
+        button: u32,
+        state: u32,
+    },
+    Axis {
+        time: u32,
+        axis: u32,
+        value: f64,
+    },
+}
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for App {
     fn event(
@@ -162,6 +182,7 @@ impl Dispatch<XdgSurface, Arc<Mutex<WindowInternal>>> for App {
         _conn: &Connection,
         qh: &QueueHandle<Self>,
     ) {
+        let mut accessibility_update = None;
         let mut locked_data = data.as_ref().lock().unwrap();
         match event {
             xdg_surface::Event::Configure { serial } => {
@@ -193,9 +214,10 @@ impl Dispatch<XdgSurface, Arc<Mutex<WindowInternal>>> for App {
                         locked_data.applied_configure = Some(configure);
                         let title = locked_data.title.clone();
                         let applied_size = locked_data.applied_size();
-                        if let Some(a) = locked_data.adapter.as_mut() {
-                            a.update_if_active(|| ax::build_tree_update(title, applied_size))
-                        }
+                        accessibility_update = Some((
+                            Arc::clone(&locked_data.adapter),
+                            ax::build_tree_update(title, applied_size),
+                        ));
                         if let Some(f) = locked_data.size_update_notify.as_ref() {
                             f.0(locked_data.applied_size())
                         }
@@ -251,6 +273,12 @@ impl Dispatch<XdgSurface, Arc<Mutex<WindowInternal>>> for App {
                 );
             }
         }
+        drop(locked_data);
+        if let Some((adapter, update)) = accessibility_update
+            && let Some(adapter) = adapter.lock().unwrap().as_mut()
+        {
+            adapter.update_if_active(|| update);
+        }
     }
 }
 
@@ -273,10 +301,17 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<XdgToplevel, A> for App {
                 height,
                 states: _,
             } => {
-                crate::input::linux::xdg_toplevel_configure_event(width, height);
-
-                data.as_ref().lock().unwrap().proposed_configure =
-                    Some(Configure { width, height });
+                let mut window = data.as_ref().lock().unwrap();
+                if let Some(surface) = window.wl_surface.as_ref() {
+                    crate::input::linux::xdg_toplevel_configure_event_for_window(
+                        width,
+                        height,
+                        surface.id(),
+                    );
+                } else {
+                    crate::input::linux::xdg_toplevel_configure_event(width, height);
+                }
+                window.proposed_configure = Some(Configure { width, height });
             }
             _ => {
                 //?
@@ -343,19 +378,45 @@ impl Dispatch<WlBuffer, BufferReleaseInfo> for App {
     }
 }
 
-impl Dispatch<WlSeat, ()> for App {
+impl Dispatch<WlSeat, Arc<Mutex<WindowInternal>>> for App {
     fn event(
         _state: &mut Self,
-        _proxy: &WlSeat,
+        proxy: &WlSeat,
         event: <WlSeat as Proxy>::Event,
-        _data: &(),
+        data: &Arc<Mutex<WindowInternal>>,
         _conn: &Connection,
-        _qhandle: &QueueHandle<Self>,
+        qhandle: &QueueHandle<Self>,
     ) {
-        logwise::debuginternal_sync!(
-            "Got WlSeat event {event}",
-            event = logwise::privacy::LogIt(&event)
-        );
+        match event {
+            wl_seat::Event::Capabilities { capabilities } => {
+                let capabilities = wl_seat::Capability::from_bits_truncate(capabilities.into());
+                let mut window = data.lock().unwrap();
+                if capabilities.contains(wl_seat::Capability::Pointer) {
+                    if window.wl_pointer.is_none() {
+                        window.wl_pointer = Some(proxy.get_pointer(qhandle, Arc::clone(data)));
+                    }
+                } else if let Some(pointer) = window.wl_pointer.take()
+                    && pointer.version() >= 3
+                {
+                    pointer.release();
+                }
+                if capabilities.contains(wl_seat::Capability::Keyboard) {
+                    if window.wl_keyboard.is_none() {
+                        window.wl_keyboard = Some(proxy.get_keyboard(qhandle, Arc::clone(data)));
+                    }
+                } else if let Some(keyboard) = window.wl_keyboard.take()
+                    && keyboard.version() >= 3
+                {
+                    keyboard.release();
+                }
+            }
+            _ => {
+                logwise::debuginternal_sync!(
+                    "Got WlSeat event {event}",
+                    event = logwise::privacy::LogIt(&event)
+                );
+            }
+        }
     }
 }
 
@@ -434,6 +495,9 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
         _qhandle: &QueueHandle<Self>,
     ) {
         let mut data = data.as_ref().lock().unwrap();
+        let surface_mouse = Arc::clone(&data.surface_mouse);
+        let window_id = data.wl_surface.as_ref().expect("No surface").id();
+        let mut pending_input = None;
         match event {
             wayland_client::protocol::wl_pointer::Event::Enter {
                 serial,
@@ -445,12 +509,17 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                 data.wl_pointer_enter_surface = Some(surface);
                 let position = Position::new(surface_x, surface_y);
                 data.wl_pointer_pos.replace(position);
-                crate::input::linux::motion_event(
-                    0,
-                    surface_x,
-                    surface_y,
-                    data.wl_surface.as_ref().unwrap().id(),
-                );
+                let size = data.applied_size();
+                pending_input = Some(PendingSurfaceMouseInput::Motion {
+                    time: 0,
+                    location: MouseWindowLocation::for_window_protocol_id(
+                        surface_x,
+                        surface_y,
+                        size.width(),
+                        size.height(),
+                        u64::from(window_id.protocol_id()),
+                    ),
+                });
                 //set cursor?
                 let app = data.app_state.upgrade().expect("App state gone");
                 let cursor_request = app
@@ -478,6 +547,11 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                     cursor_request.hot_y,
                 );
             }
+            wayland_client::protocol::wl_pointer::Event::Leave { .. } => {
+                pending_input = Some(PendingSurfaceMouseInput::Leave);
+                data.wl_pointer_enter_surface = None;
+                data.wl_pointer_pos = None;
+            }
             wayland_client::protocol::wl_pointer::Event::Motion {
                 surface_x,
                 surface_y,
@@ -498,15 +572,18 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                     parent_surface_x = surface_x;
                     parent_surface_y = surface_y;
                 }
-                crate::input::linux::motion_event(
-                    _time,
-                    parent_surface_x,
-                    parent_surface_y,
-                    data.wl_surface.as_ref().unwrap().id(),
-                );
-
                 //get current size
                 let size = data.applied_size();
+                pending_input = Some(PendingSurfaceMouseInput::Motion {
+                    time: _time,
+                    location: MouseWindowLocation::for_window_protocol_id(
+                        parent_surface_x,
+                        parent_surface_y,
+                        size.width(),
+                        size.height(),
+                        u64::from(window_id.protocol_id()),
+                    ),
+                });
                 let position = Position::new(parent_surface_x, parent_surface_y);
                 data.wl_pointer_pos.replace(position);
                 let cursor_request = match MouseRegion::from_position(size, position) {
@@ -540,18 +617,17 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                 button,
                 state,
             } => {
-                crate::input::linux::button_event(
-                    _time,
+                let pressed: u32 = state.into();
+                pending_input = Some(PendingSurfaceMouseInput::Button {
+                    time: _time,
                     button,
-                    state.into(),
-                    data.wl_surface.as_ref().unwrap().id(),
-                );
+                    state: pressed,
+                });
 
                 //get current size
                 let size = data.applied_size();
                 let mouse_pos = data.wl_pointer_pos.expect("No pointer position");
                 let mouse_region = MouseRegion::from_position(size, mouse_pos);
-                let pressed: u32 = state.into();
                 if button == 0x110 {
                     //BUTTON_LEFT
                     if pressed == 1 {
@@ -609,16 +685,63 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlPointer, A> for App {
                 axis,
                 value,
             } => {
-                crate::input::linux::axis_event(
-                    _time,
-                    axis.into(),
+                pending_input = Some(PendingSurfaceMouseInput::Axis {
+                    time: _time,
+                    axis: axis.into(),
                     value,
-                    data.wl_surface.as_ref().unwrap().id(),
-                );
+                });
             }
             _ => {
                 //?
             }
+        }
+        drop(data);
+
+        let window_ptr = window_id.protocol_id() as usize as *mut std::ffi::c_void;
+        match pending_input {
+            Some(PendingSurfaceMouseInput::Motion { time, location }) => {
+                surface_mouse.set_window_location(location, InputEventOrigin::RealOs);
+                crate::input::linux::motion_event(
+                    time,
+                    location.pos_x(),
+                    location.pos_y(),
+                    window_id,
+                );
+            }
+            Some(PendingSurfaceMouseInput::Leave) => {
+                surface_mouse.clear_window_location(window_ptr, InputEventOrigin::RealOs);
+                crate::input::linux::pointer_leave_event(window_id);
+            }
+            Some(PendingSurfaceMouseInput::Button {
+                time,
+                button,
+                state,
+            }) => {
+                if let Some(button_code) = crate::input::mouse::linux::button_code(button) {
+                    surface_mouse.set_key_state(
+                        button_code,
+                        state != 0,
+                        window_ptr,
+                        InputEventOrigin::RealOs,
+                    );
+                }
+                crate::input::linux::button_event(time, button, state, window_id);
+            }
+            Some(PendingSurfaceMouseInput::Axis { time, axis, value }) => {
+                let (delta_x, delta_y) = if axis == 0 {
+                    (0.0, value)
+                } else {
+                    (value, 0.0)
+                };
+                surface_mouse.add_scroll_delta(
+                    delta_x,
+                    delta_y,
+                    window_ptr,
+                    InputEventOrigin::RealOs,
+                );
+                crate::input::linux::axis_event(time, axis, value, window_id);
+            }
+            None => {}
         }
     }
 }
@@ -636,13 +759,15 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlKeyboard, A> for App {
             "got WlKeyboard event {event}",
             event = logwise::privacy::LogIt(&event)
         );
+        let mut pending_key = None;
         match event {
             wayland_client::protocol::wl_keyboard::Event::Enter {
                 serial: _,
                 surface: _,
                 keys: _,
             } => {
-                if let Some(e) = data.as_ref().lock().unwrap().adapter.as_mut() {
+                let adapter = Arc::clone(&data.as_ref().lock().unwrap().adapter);
+                if let Some(e) = adapter.lock().unwrap().as_mut() {
                     e.update_window_focus_state(true)
                 }
             }
@@ -650,7 +775,8 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlKeyboard, A> for App {
                 serial: _,
                 surface: _,
             } => {
-                if let Some(e) = data.as_ref().lock().unwrap().adapter.as_mut() {
+                let adapter = Arc::clone(&data.as_ref().lock().unwrap().adapter);
+                if let Some(e) = adapter.lock().unwrap().as_mut() {
                     e.update_window_focus_state(false)
                 }
             }
@@ -660,21 +786,25 @@ impl<A: AsRef<Mutex<WindowInternal>>> Dispatch<WlKeyboard, A> for App {
                 key: _key,
                 state: _state,
             } => {
-                crate::input::linux::wl_keyboard_event(
-                    _serial,
-                    _time,
-                    _key,
-                    _state.into(),
-                    data.as_ref()
-                        .lock()
-                        .unwrap()
-                        .wl_surface
-                        .as_ref()
-                        .unwrap()
-                        .id(),
-                );
+                pending_key = Some((_serial, _time, _key, _state.into()));
             }
             _ => {}
+        }
+        if let Some((serial, time, key, state)) = pending_key {
+            let (surface_keyboard, surface_id) = {
+                let window = data.as_ref().lock().unwrap();
+                (
+                    Arc::clone(&window.surface_keyboard),
+                    window.wl_surface.as_ref().expect("No surface").id(),
+                )
+            };
+            crate::input::keyboard::linux::wl_keyboard_event_for_shared(
+                &surface_keyboard,
+                key,
+                state,
+                &surface_id,
+            );
+            crate::input::linux::wl_keyboard_event(serial, time, key, state, surface_id);
         }
     }
 }

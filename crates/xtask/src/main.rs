@@ -98,6 +98,7 @@ const XTASK_COMMANDS: &[XtaskCommandSpec] = &[
     ("verify-native-example-tabs", verify_native_example_tabs),
     ("verify-native-editor-format", verify_native_editor_format),
     ("verify-native-product-render-graph", verify_native_product_render_graph),
+    ("verify-native-counter-dev-test-e2e", verify_native_counter_dev_test_e2e),
     ("verify-native-counter-interaction-speed", verify_native_counter_interaction_speed),
     ("verify-native-cells-interaction-speed", verify_native_cells_interaction_speed),
     ("verify-native-cells-visible-click-e2e", verify_native_cells_visible_click_e2e),
@@ -23162,6 +23163,7 @@ fn verify_native_gpu_ipc_backpressure(args: &[String]) -> Result<(), Box<dyn std
         }
         for key in [
             "process_model",
+            "desktop_process_pid",
             "preview_child_pid",
             "dev_child_pid",
             "preview_child_cmdline",
@@ -24739,6 +24741,7 @@ fn verify_native_gpu_present_floor_inner(
             input_sample_delay_ms: 0,
             synthetic_input_probe: false,
             synthetic_input_probe_kind: boon_native_app_window::NativeSyntheticInputProbeKind::Full,
+            app_owned_pointer_script: None,
             sample_input_after_initial_frames: false,
             warmup_frame_count,
             sample_frame_count,
@@ -25568,8 +25571,17 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             } else {
                 String::new()
             };
+            let dev_coalesced_input_cli = if entry.id == "counter" {
+                format!(
+                    " --dev-coalesced-input-probe --dev-coalesced-input-source {} --dev-coalesced-input-label {}",
+                    shell_quote("dev.commands.test"),
+                    shell_quote("counter-test-button")
+                )
+            } else {
+                String::new()
+            };
             let script = format!(
-                "cd {} && {} --role desktop --example {} --probe --demand-driven-loop --skip-render-hook-app-owned-proof --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --warmup-frame-count 3 --sample-frame-count 30 --role-report-timeout-ms {} --live-state-report {} --report {}{} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
+                "cd {} && {} --role desktop --example {} --probe --demand-driven-loop --skip-render-hook-app-owned-proof --child-hold-ms 30000 --dev-hold-ms 10000 --title-token {} --input-sample-delay-ms {} --warmup-frame-count 3 --sample-frame-count 30 --role-report-timeout-ms {} --live-state-report {} --report {}{}{} >>/tmp/boon-native-gpu-preview-e2e-{}.log 2>&1",
                 shell_quote(&cwd.display().to_string()),
                 shell_quote(&format!("./{}", launched_binary_path.display())),
                 shell_quote(&entry.id),
@@ -25579,6 +25591,7 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
                 shell_quote(&live_state_report.display().to_string()),
                 shell_quote(&supervisor_report.display().to_string()),
                 adapter_policy_cli,
+                dev_coalesced_input_cli,
                 shell_quote(&example)
             );
             cosmic_launch_proof = run_cosmic_background_launch("boon-circuit", &script)?;
@@ -25775,7 +25788,9 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
             "preview_runtime_summary",
             "preview_surface_proof",
             "dev_surface_proof",
+            "dev_coalesced_input_probe_request",
             "dev_shell_interaction_probe",
+            "process_cpu_evidence",
         ] {
             if let Some(value) = supervisor.get(key) {
                 extra[key] = value.clone();
@@ -26119,16 +26134,47 @@ fn verify_native_gpu_preview_e2e(args: &[String]) -> Result<(), Box<dyn std::err
         .pointer("/dev_shell_interaction_probe/visible_route_proof/status")
         .and_then(serde_json::Value::as_str)
         == Some("pass");
-    let dev_probe_pass = dev_probe_status == Some("pass")
-        && (dev_probe_real_window_input
-            || (dev_probe_app_owned_window_input && dev_probe_route_pass));
+    let dev_loop_report_for_probe = extra
+        .get("dev_loop_report")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|path| read_optional_json(Path::new(path)).ok().flatten());
+    let counter_dev_coalesced_probe = dev_loop_report_for_probe
+        .as_ref()
+        .and_then(|report| report.pointer("/last_poll_diagnostics/dev_coalesced_input_probe"));
+    let counter_dev_coalesced_probe_pass = counter_dev_coalesced_probe
+        .and_then(|probe| probe.pointer("/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && counter_dev_coalesced_probe
+            .and_then(|probe| probe.pointer("/clicked_source_path"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev.commands.test")
+        && counter_dev_coalesced_probe
+            .and_then(|probe| probe.pointer("/command"))
+            .and_then(serde_json::Value::as_str)
+            == Some("Test")
+        && counter_dev_coalesced_probe
+            .and_then(|probe| probe.pointer("/synthetic_input_probe"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && counter_dev_coalesced_probe
+            .and_then(|probe| probe.pointer("/shell_clone_probe"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    let dev_probe_pass = if example == "counter" {
+        counter_dev_coalesced_probe_pass
+    } else {
+        dev_probe_status == Some("pass")
+            && (dev_probe_real_window_input
+                || (dev_probe_app_owned_window_input && dev_probe_route_pass))
+    };
     push_audit_check(
         &mut checks,
         &mut blockers,
         format!("native-gpu-preview-e2e-{example}:dev-window-real-input-probe"),
         dev_probe_pass,
         format!(
-            "dev_probe_status={dev_probe_status:?}, visible_window_input={dev_probe_real_window_input}, app_owned_window_input={dev_probe_app_owned_window_input}, route_pass={dev_probe_route_pass}"
+            "dev_probe_status={dev_probe_status:?}, visible_window_input={dev_probe_real_window_input}, app_owned_window_input={dev_probe_app_owned_window_input}, route_pass={dev_probe_route_pass}, counter_coalesced_probe_pass={counter_dev_coalesced_probe_pass}, counter_coalesced_probe={counter_dev_coalesced_probe:?}"
         ),
         (!dev_probe_pass).then(|| {
             "native preview E2E launched two windows but did not prove the dev window is visibly interactive through real or app-owned host input".to_owned()
@@ -26986,6 +27032,21 @@ fn native_preview_manifest_scenario_evidence(
         .and_then(serde_json::Value::as_str)
         == Some("pass");
     let physical_preview = example == "todo_mvc_physical";
+    let dev_coalesced_ready = report
+        .pointer("/dev_coalesced_input_probe/status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        || report
+            .get("dev_loop_report")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|path| read_optional_json(Path::new(path)).ok().flatten())
+            .and_then(|dev_loop| {
+                dev_loop
+                    .pointer("/last_poll_diagnostics/dev_coalesced_input_probe/status")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|status| status == "pass")
+            })
+            == Some(true);
     let dev_ready = if physical_preview {
         report
             .pointer("/dev_shell_interaction_probe/app_owned_window_input")
@@ -26996,10 +27057,16 @@ fn native_preview_manifest_scenario_evidence(
                 .and_then(serde_json::Value::as_str)
                 == Some("pass")
     } else {
-        report
-            .pointer("/dev_shell_interaction_probe/status")
-            .and_then(serde_json::Value::as_str)
-            == Some("pass")
+        dev_coalesced_ready
+            || report
+                .pointer("/dev_shell_interaction_probe/status")
+                .and_then(serde_json::Value::as_str)
+                == Some("pass")
+    };
+    let dev_ready_proof_source = if dev_coalesced_ready {
+        "dev_coalesced_input_probe"
+    } else {
+        "dev_shell_interaction_probe"
     };
     let scenario_source_event_labels = native_manifest_source_event_scenario_labels(&entry);
     let bridge_scenario_evidence = novywave_bridge_scenario_evidence_for_preview(
@@ -27158,7 +27225,7 @@ fn native_preview_manifest_scenario_evidence(
             pass,
             observed_tier,
             if label == "dev-window-editor-visible" {
-                "dev_shell_interaction_probe"
+                dev_ready_proof_source
             } else {
                 "visible_reality_harness+app_owned_readback"
             },
@@ -30735,7 +30802,19 @@ fn native_preview_host_route_evidence(
                         .unwrap_or_default()
                         > 0
             })
-        });
+        })
+        || report
+            .pointer("/dev_ipc_probe/verifier_host_input_status/queue/recent_completed")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|outputs| {
+                outputs.iter().any(|output| {
+                    output.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                        && output
+                            .get("bounded_state_summary_sample")
+                            .and_then(serde_json::Value::as_object)
+                            .is_some()
+                })
+            });
     let status = if input_ready && has_route {
         "pass"
     } else if !input_ready && has_route {
@@ -30835,6 +30914,56 @@ fn native_runtime_assertions_after_input(report: &serde_json::Value) -> serde_js
                 .get("outputs")
                 .cloned()
                 .unwrap_or_else(|| json!([]))
+        });
+    }
+
+    if let Some(outputs) = report
+        .pointer("/dev_ipc_probe/verifier_host_input_status/queue/recent_completed")
+        .and_then(serde_json::Value::as_array)
+        .filter(|outputs| {
+            !outputs.is_empty()
+                && outputs.iter().all(|output| {
+                    output.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+                        && output
+                            .get("source")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                })
+        })
+    {
+        let assertions = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                json!({
+                    "id": format!("preview-ipc-host-input-{index}"),
+                    "pass": true,
+                    "event": {
+                        "source": output.get("source").cloned().unwrap_or(serde_json::Value::Null),
+                        "target_text": output.get("target_text").cloned().unwrap_or(serde_json::Value::Null)
+                    },
+                    "bounded_state_summary_sample": output
+                        .get("bounded_state_summary_sample")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "proof": "queued native input adapter click reached preview hit testing, source binding, and the live runtime"
+                })
+            })
+            .collect::<Vec<_>>();
+        return json!({
+            "status": "pass",
+            "assertions": assertions,
+            "public_runtime_api": "boon_runtime::LiveRuntime through preview_apply_real_window_input_with_units",
+            "private_runtime_dispatch_used": false,
+            "operator_host_input_observed": true,
+            "real_os_input_observed": false,
+            "host_route_ready": report
+                .pointer("/native_host_input_route_evidence/status")
+                .and_then(serde_json::Value::as_str)
+                == Some("pass"),
+            "live_preview_process_route": true,
+            "route_contract": "NativeInputAdapterProof -> preview hit test -> source binding -> LiveRuntime",
+            "outputs": outputs
         });
     }
 
@@ -35419,6 +35548,54 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             "native dev window lacks persistent generic custom example/injected source/dirty-tab API evidence, or generic document examples are not executable through the generic live runtime".to_owned()
         }),
     );
+    let test_button_click_pass = dev_probe
+        .and_then(|probe| probe.pointer("/test/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/test/command"))
+            .and_then(serde_json::Value::as_str)
+            == Some("Test")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/test/input_pipeline"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev_apply_real_window_input_with_indexes")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/test/clicked_source_path"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev.commands.test")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/test/clicked_source_intent"))
+            .and_then(serde_json::Value::as_str)
+            == Some("press")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/test/triggered_by_clicking_test_button"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_probe
+            .and_then(|probe| {
+                probe.pointer("/test/host_synthetic_activation/target_hit_region/source_path")
+            })
+            .and_then(serde_json::Value::as_str)
+            == Some("dev.commands.test")
+        && dev_probe
+            .and_then(|probe| probe.pointer("/test/preview_transport/preview_mutation_allowed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && dev_probe
+            .and_then(|probe| probe.pointer("/test/direct_dispatch_without_hit_test"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        format!("native-dev-window-editor:{example}:test-button-click-route"),
+        test_button_click_pass,
+        format!("preview_report={}", preview_report_path.display()),
+        (!test_button_click_pass).then(|| {
+            "native dev TEST command is not proven through a targeted app-owned click on the rendered TEST button".to_owned()
+        }),
+    );
     let transport_commands = ["tab_switch", "run", "format", "reset"];
     let preview_transport_pass = transport_commands.iter().all(|command| {
         let local =
@@ -35572,7 +35749,7 @@ fn verify_native_dev_window_editor(args: &[String]) -> Result<(), Box<dyn std::e
             "Run/Format/Reset/tab evidence has not reached the required app-owned host-event or real-window tier".to_owned()
         }),
     );
-    for command in ["tab_switch", "run", "format", "reset"] {
+    for command in ["tab_switch", "run", "test", "format", "reset"] {
         let command_pass = dev_probe
             .and_then(|probe| probe.get(command))
             .and_then(|value| value.get("status"))
@@ -36970,6 +37147,615 @@ fn verify_native_counter_interaction_speed(
             "artifact_sha256s": role_artifact
         }),
     )
+}
+
+fn verify_native_counter_dev_test_e2e(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks = Vec::new();
+    let mut blockers = Vec::new();
+    let profile = value_arg(args, "--profile").unwrap_or_else(|| "release".to_owned());
+    let check_existing = args.iter().any(|arg| arg == "--check-existing");
+    let max_cpu_p95 = value_arg(args, "--max-cpu-p95-pct-one-core")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(80.0);
+    let max_cpu_max = value_arg(args, "--max-cpu-max-pct-one-core")
+        .map(|value| value.parse::<f64>())
+        .transpose()?
+        .unwrap_or(160.0);
+    let profile_ok = profile == "release";
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:release-profile",
+        profile_ok,
+        format!("profile={profile}"),
+        (!profile_ok).then(|| {
+            "Counter dev TEST E2E must run the native playground in release mode".to_owned()
+        }),
+    );
+
+    let preview_report_path = native_preview_e2e_report_path("counter");
+    let mut refresh_evidence = json!({
+        "status": "skipped",
+        "reason": "check-existing requested"
+    });
+    if !check_existing && profile_ok {
+        let report_arg = preview_report_path.display().to_string();
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "verify-native-gpu-preview-e2e",
+                "--example",
+                "counter",
+                "--profile",
+                "release",
+                "--report",
+                &report_arg,
+            ])
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        refresh_evidence = json!({
+            "status": if output.status.success() { "pass" } else { "fail" },
+            "exit_status": output.status.code(),
+            "preview_e2e_report": preview_report_path,
+            "stdout_tail": text_tail(&stdout, 4000),
+            "stderr_tail": text_tail(&stderr, 4000)
+        });
+    }
+    let refresh_ok = check_existing
+        || refresh_evidence
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:fresh-preview-e2e-run",
+        refresh_ok,
+        format!(
+            "check_existing={check_existing}, refresh_status={:?}, report={}",
+            refresh_evidence
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            preview_report_path.display()
+        ),
+        (!refresh_ok).then(|| {
+            "fresh release verify-native-gpu-preview-e2e counter run did not pass".to_owned()
+        }),
+    );
+
+    let preview_report = read_optional_json(&preview_report_path)?;
+    let report = preview_report.as_ref();
+    let preview_status_pass = report
+        .and_then(|report| report.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    let release_build = report
+        .and_then(|report| report.get("release_build"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:preview-e2e-status",
+        preview_status_pass && release_build,
+        format!("preview_status_pass={preview_status_pass}, release_build={release_build}"),
+        (!(preview_status_pass && release_build)).then(|| {
+            "Counter preview E2E report is missing, failed, or was not release-built".to_owned()
+        }),
+    );
+
+    let dev_probe = report.and_then(|report| report.get("dev_shell_interaction_probe"));
+    let dev_loop_report_path = report
+        .and_then(|report| report.get("dev_loop_report"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let preview_loop_report_path = report
+        .and_then(|report| report.get("preview_loop_report"))
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let dev_loop_report = dev_loop_report_path
+        .as_deref()
+        .and_then(|path| read_optional_json(path).ok().flatten());
+    let preview_loop_report = preview_loop_report_path
+        .as_deref()
+        .and_then(|path| read_optional_json(path).ok().flatten());
+    let dev_coalesced_test_probe = dev_loop_report
+        .as_ref()
+        .and_then(|report| report.pointer("/last_poll_diagnostics/dev_coalesced_input_probe"));
+    let test_route_pass = dev_coalesced_test_probe
+        .and_then(|probe| probe.pointer("/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/requested_source_path"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev.commands.test")
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/clicked_source_path"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev.commands.test")
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/clicked_source_intent"))
+            .and_then(serde_json::Value::as_str)
+            == Some("press")
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/command"))
+            .and_then(serde_json::Value::as_str)
+            == Some("Test")
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/input_injection_method"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|method| {
+                method.starts_with("app_window_app_owned_pointer_script:counter-test-button")
+            })
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/synthetic_input_probe"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/shell_clone_probe"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/direct_dispatch_without_hit_test"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/hovered_node"))
+            .and_then(serde_json::Value::as_str)
+            == Some("dev-command-test")
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/retained_hover_style_active"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && dev_coalesced_test_probe
+            .and_then(|probe| probe.pointer("/preview_mutation_allowed"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    let shell_synthetic_test_probe_still_present = dev_probe
+        .and_then(|probe| probe.pointer("/test/status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:test-button-coalesced-click-route",
+        test_route_pass,
+        format!(
+            "coalesced_probe={:?}, shell_synthetic_test_probe_present={shell_synthetic_test_probe_still_present}",
+            dev_coalesced_test_probe
+        ),
+        (!test_route_pass).then(|| {
+            "TEST was not proven through live app-window input, dev hit testing, and preview mutation"
+                .to_owned()
+        }),
+    );
+
+    let replay_motion_count = dev_loop_report
+        .as_ref()
+        .and_then(|report| report.pointer("/observed_input_adapter/mouse_motion_event_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let replay_button_edge_count = dev_loop_report
+        .as_ref()
+        .and_then(|report| report.pointer("/observed_input_adapter/mouse_button_event_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let replay_scroll_count = dev_loop_report
+        .as_ref()
+        .and_then(|report| report.pointer("/observed_input_adapter/mouse_scroll_event_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let replay_keyboard_count = dev_loop_report
+        .as_ref()
+        .and_then(|report| report.pointer("/observed_input_adapter/keyboard_key_event_count"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let repeated_pointer_replay_pass = replay_motion_count >= 18
+        && replay_button_edge_count >= 10
+        && replay_scroll_count >= 1
+        && replay_keyboard_count >= 2;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:repeated-motion-press-release",
+        repeated_pointer_replay_pass,
+        format!(
+            "motion_events={replay_motion_count}, button_edges={replay_button_edge_count}, scroll_events={replay_scroll_count}, keyboard_edges={replay_keyboard_count}, expected=18/10/1/2"
+        ),
+        (!repeated_pointer_replay_pass).then(|| {
+            "dev input replay did not survive repeated pointer, wheel, and keyboard steps"
+                .to_owned()
+        }),
+    );
+
+    let dev_readback_path = dev_loop_report
+        .as_ref()
+        .and_then(|report| report.pointer("/last_interactive_readback_artifact/path"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            dev_loop_report
+                .as_ref()
+                .and_then(|report| report.pointer("/recent_interactive_readback_artifacts/0/path"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            dev_probe
+                .and_then(|probe| probe.pointer("/visible_route_proof/app_owned_readback/path"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            dev_probe
+                .and_then(|probe| probe.pointer("/app_owned_framebuffer/path"))
+                .and_then(serde_json::Value::as_str)
+        });
+    let test_cursor = dev_coalesced_test_probe
+        .and_then(|probe| probe.pointer("/target_cursor"))
+        .or_else(|| {
+            dev_probe
+                .and_then(|probe| probe.pointer("/test/host_synthetic_activation/target_cursor"))
+        })
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let test_cursor_visible_artifact_pass = test_cursor
+        .get("x")
+        .and_then(serde_json::Value::as_f64)
+        .is_some()
+        && test_cursor
+            .get("y")
+            .and_then(serde_json::Value::as_f64)
+            .is_some()
+        && dev_readback_path.is_some();
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:test-cursor-readback-artifact",
+        test_cursor_visible_artifact_pass,
+        format!(
+            "test_cursor={test_cursor:?}, dev_readback_path={:?}",
+            dev_readback_path
+        ),
+        (!test_cursor_visible_artifact_pass).then(|| {
+            "TEST click proof lacks a target cursor and app-owned dev WGPU readback artifact"
+                .to_owned()
+        }),
+    );
+
+    let completed_test_outputs = report
+        .and_then(|report| {
+            report.pointer("/dev_ipc_probe/verifier_host_input_status/queue/recent_completed")
+        })
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let final_test_request_ids = dev_coalesced_test_probe
+        .and_then(|probe| probe.pointer("/last_dev_input_dispatch/preview_transport/request_ids"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_u64)
+        .collect::<BTreeSet<_>>();
+    let test_outputs = completed_test_outputs
+        .into_iter()
+        .filter(|output| {
+            output
+                .get("request_id")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|request_id| final_test_request_ids.contains(&request_id))
+        })
+        .collect::<Vec<_>>();
+    let counter_sequence = test_outputs
+        .iter()
+        .filter_map(counter_test_output_count)
+        .collect::<Vec<_>>();
+    let source_sequence = test_outputs
+        .iter()
+        .filter_map(|output| {
+            output
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let expected_counter_sequence = vec![1_i64, 2, 1, 0, -1, 0];
+    let expected_sources = vec![
+        "store.sources.increment_button.press".to_owned(),
+        "store.sources.increment_button.press".to_owned(),
+        "store.sources.decrement_button.press".to_owned(),
+        "store.sources.reset_button.press".to_owned(),
+        "store.sources.decrement_button.press".to_owned(),
+        "store.sources.increment_button.press".to_owned(),
+    ];
+    let counter_preview_pass =
+        counter_sequence == expected_counter_sequence && source_sequence == expected_sources;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:counter-preview-state-sequence",
+        counter_preview_pass,
+        format!("counter_sequence={counter_sequence:?}, source_sequence={source_sequence:?}"),
+        (!counter_preview_pass).then(|| {
+            "TEST did not produce the scenario's +,+,-,Reset,-,+ Counter state sequence".to_owned()
+        }),
+    );
+
+    let preview_readback_artifact_count = preview_loop_report
+        .as_ref()
+        .and_then(|report| report.get("recent_interactive_readback_artifacts"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let preview_visual_proof_pass = preview_readback_artifact_count > 0;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:counter-preview-wgpu-readback-artifacts",
+        preview_visual_proof_pass,
+        format!(
+            "preview_readback_artifact_count={preview_readback_artifact_count}, test_output_count={}",
+            test_outputs.len()
+        ),
+        (!preview_visual_proof_pass).then(|| {
+            "Counter TEST preview updates lack app-owned WGPU readback artifacts".to_owned()
+        }),
+    );
+
+    let process_cpu_evidence = report
+        .and_then(|report| report.get("process_cpu_evidence"))
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
+    let cpu_sample_count = process_cpu_evidence
+        .get("sample_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let preview_cpu_p95 = process_cpu_evidence
+        .pointer("/summary/preview_cpu_pct_one_core/p95")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let preview_cpu_max = process_cpu_evidence
+        .pointer("/summary/preview_cpu_pct_one_core/max")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let dev_cpu_p95 = process_cpu_evidence
+        .pointer("/summary/dev_cpu_pct_one_core/p95")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let dev_cpu_max = process_cpu_evidence
+        .pointer("/summary/dev_cpu_pct_one_core/max")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(f64::INFINITY);
+    let cpu_pass = process_cpu_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass")
+        && cpu_sample_count >= 4
+        && preview_cpu_p95 <= max_cpu_p95
+        && dev_cpu_p95 <= max_cpu_p95
+        && preview_cpu_max <= max_cpu_max
+        && dev_cpu_max <= max_cpu_max;
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:process-cpu-bounded",
+        cpu_pass,
+        format!(
+            "samples={cpu_sample_count}, preview_p95={preview_cpu_p95:.2}, preview_max={preview_cpu_max:.2}, dev_p95={dev_cpu_p95:.2}, dev_max={dev_cpu_max:.2}, max_p95={max_cpu_p95:.2}, max_max={max_cpu_max:.2}"
+        ),
+        (!cpu_pass).then(|| {
+            "release Counter dev/preview process CPU was missing, stale, or exceeded bounded thresholds"
+                .to_owned()
+        }),
+    );
+
+    let dev_loop_live = native_counter_loop_report_live(dev_loop_report.as_ref());
+    let preview_loop_live = native_counter_loop_report_live(preview_loop_report.as_ref());
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:loop-reports-advanced-after-input",
+        dev_loop_live && preview_loop_live,
+        format!(
+            "dev_loop_live={dev_loop_live}, preview_loop_live={preview_loop_live}, dev_loop_report={:?}, preview_loop_report={:?}",
+            dev_loop_report_path, preview_loop_report_path
+        ),
+        (!(dev_loop_live && preview_loop_live)).then(|| {
+            "dev/preview render-loop reports did not prove continued input/render progress"
+                .to_owned()
+        }),
+    );
+
+    let desktop_supervisor_pid = report
+        .and_then(|report| report.get("desktop_supervisor_pid"))
+        .and_then(serde_json::Value::as_u64);
+    let desktop_process_pid = report
+        .and_then(|report| report.get("desktop_process_pid"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            report
+                .and_then(|report| report.get("preview_loop_report"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(native_counter_desktop_pid_from_role_report_path)
+        });
+    let executor_log_evidence = native_counter_executor_log_evidence(desktop_process_pid);
+    let executor_logs_clean = executor_log_evidence
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("pass");
+    push_audit_check(
+        &mut checks,
+        &mut blockers,
+        "counter-dev-test-e2e:no-executor-warning-or-panic",
+        executor_logs_clean,
+        format!("executor_log_evidence={executor_log_evidence:?}"),
+        (!executor_logs_clean).then(|| {
+            "native playground logs contain LastResortExecutor, panic, poison, or stale Wayland warnings"
+                .to_owned()
+        }),
+    );
+
+    let simulated_cursor_path = json!({
+        "status": if test_cursor_visible_artifact_pass && preview_visual_proof_pass {
+            "pass"
+        } else {
+            "fail"
+        },
+        "dev_test": {
+            "source_path": "dev.commands.test",
+            "cursor": test_cursor,
+            "readback_artifact": dev_readback_path
+        },
+        "preview_counter_sources": source_sequence,
+        "preview_counter_values": counter_sequence,
+        "preview_readback_artifact_count": preview_readback_artifact_count
+    });
+
+    let entry = boon_runtime::example_manifest_entry("counter")?;
+    let source_text = boon_runtime::source_text_for_entry(&entry)?;
+    let source_files = manifest_source_files(&entry);
+    let source_hash = source_hash_for_report_source_files(&source_files, &source_text)?;
+    let preview_e2e_report_sha256 =
+        boon_runtime::sha256_file(&preview_report_path).unwrap_or_else(|_| "missing".to_owned());
+    write_native_gate_report(
+        args,
+        "verify-native-counter-dev-test-e2e",
+        checks,
+        blockers,
+        json!({
+            "example": "counter",
+            "profile": profile,
+            "release_build": release_build,
+            "source_path": "examples/counter.bn",
+            "source_hash": source_hash,
+            "source_files": source_files,
+            "preview_e2e_report": preview_report_path,
+            "preview_e2e_report_sha256": preview_e2e_report_sha256,
+            "refresh_evidence": refresh_evidence,
+            "preview_child_pid": report
+                .and_then(|report| report.get("preview_child_pid"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "dev_child_pid": report
+                .and_then(|report| report.get("dev_child_pid"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "desktop_supervisor_pid": desktop_supervisor_pid,
+            "desktop_process_pid": desktop_process_pid,
+            "dev_loop_report": dev_loop_report_path,
+            "preview_loop_report": preview_loop_report_path,
+            "dev_coalesced_input_probe_request": report
+                .and_then(|report| report.get("dev_coalesced_input_probe_request"))
+                .cloned()
+                .unwrap_or_else(|| json!({"status": "missing"})),
+            "dev_coalesced_input_probe": dev_coalesced_test_probe
+                .cloned()
+                .unwrap_or_else(|| json!({"status": "missing"})),
+            "test_button_route": dev_probe
+                .and_then(|probe| probe.get("test"))
+                .cloned()
+                .unwrap_or_else(|| json!({"status": "missing"})),
+            "counter_test_output_count": test_outputs.len(),
+            "counter_sequence": simulated_cursor_path
+                .get("preview_counter_values")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "counter_source_sequence": simulated_cursor_path
+                .get("preview_counter_sources")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "simulated_cursor_path": simulated_cursor_path,
+            "process_cpu_evidence": process_cpu_evidence,
+            "executor_log_evidence": executor_log_evidence,
+            "visual_capture_method": "app-owned-wgpu-readback",
+            "operator_host_input": true,
+            "real_os_input": false,
+            "human_observation": false,
+            "xvfb": false,
+            "ply": false
+        }),
+    )
+}
+
+fn counter_test_output_count(output: &serde_json::Value) -> Option<i64> {
+    output
+        .pointer("/bounded_state_summary_sample/scalars")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find_map(|scalar| {
+            (scalar.get("key").and_then(serde_json::Value::as_str) == Some("count"))
+                .then(|| scalar.get("value").and_then(serde_json::Value::as_i64))
+                .flatten()
+        })
+}
+
+fn native_counter_loop_report_live(report: Option<&serde_json::Value>) -> bool {
+    let Some(report) = report else {
+        return false;
+    };
+    report.get("status").and_then(serde_json::Value::as_str) == Some("pass")
+        && report
+            .get("rendered_frame_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && report
+            .get("input_event_wake_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        && report
+            .get("input_poll_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+}
+
+fn native_counter_desktop_pid_from_role_report_path(path: &str) -> Option<u64> {
+    let stem = Path::new(path).file_stem()?.to_string_lossy();
+    stem.rsplit('-').next()?.parse::<u64>().ok()
+}
+
+fn native_counter_executor_log_evidence(desktop_process_pid: Option<u64>) -> serde_json::Value {
+    let Some(desktop_process_pid) = desktop_process_pid else {
+        return json!({
+            "status": "fail",
+            "reason": "missing desktop process pid"
+        });
+    };
+    let log_dir = PathBuf::from("target/logs/native-playground");
+    let paths = ["preview", "dev"]
+        .into_iter()
+        .map(|role| log_dir.join(format!("{role}-{desktop_process_pid}-stderr.log")))
+        .collect::<Vec<_>>();
+    let forbidden = ["LastResortExecutor", "panicked at", "poison", "old 2"];
+    let mut hits = Vec::new();
+    let mut inspected = Vec::new();
+    for path in &paths {
+        inspected.push(path.display().to_string());
+        let Ok(text) = fs::read_to_string(path) else {
+            hits.push(json!({
+                "path": path,
+                "pattern": "missing-log"
+            }));
+            continue;
+        };
+        for pattern in forbidden {
+            if text.contains(pattern) {
+                hits.push(json!({
+                    "path": path,
+                    "pattern": pattern,
+                    "tail": text_tail(&text, 1200)
+                }));
+            }
+        }
+    }
+    json!({
+        "status": if hits.is_empty() { "pass" } else { "fail" },
+        "desktop_process_pid": desktop_process_pid,
+        "inspected_logs": inspected,
+        "forbidden_patterns": forbidden,
+        "hits": hits
+    })
 }
 
 fn verify_native_cells_interaction_speed(
@@ -53024,9 +53810,9 @@ fn require_active_pending_snapshot_backpressure(
     let currentness_policy = field("pending_snapshot_commit_currentness_policy")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if currentness_policy != "source-revision-plus-exact-frame-evidence" {
+    if currentness_policy != "source-revision-plus-surface-epoch" {
         blockers.push(format!(
-            "{label}.pending_snapshot_commit_currentness_policy must be source-revision-plus-exact-frame-evidence"
+            "{label}.pending_snapshot_commit_currentness_policy must be source-revision-plus-surface-epoch"
         ));
     }
     if frame_evidence_status == "stale-rejected"
@@ -54068,6 +54854,7 @@ fn native_default_report_path(command: &str, args: &[String]) -> PathBuf {
             Some("todomvc") => "product-render-graph-todomvc",
             _ => "product-render-graph",
         },
+        "verify-native-counter-dev-test-e2e" => "counter-dev-test-e2e",
         "verify-native-counter-interaction-speed" => "counter-interaction-speed",
         "verify-native-cells-interaction-speed" => match value_arg(args, "--profile").as_deref() {
             Some("release") => "cells-interaction-speed-release",
@@ -54961,6 +55748,7 @@ fn native_gpu_report_is_ux_gate(report: &serde_json::Value) -> bool {
     command.ends_with("-speed")
         || command.contains("interaction-speed")
         || command == "verify-native-gpu-preview-e2e"
+        || command == "verify-native-counter-dev-test-e2e"
         || command == "verify-native-gpu-scroll-speed"
         || command == "verify-native-gpu-present-floor"
         || command == "verify-native-counter-interaction-speed"
@@ -69724,6 +70512,7 @@ fn report_is_blocker_audit(report: &serde_json::Value) -> bool {
                 | "verify-native-example-tabs"
                 | "verify-native-editor-format"
                 | "verify-native-product-render-graph"
+                | "verify-native-counter-dev-test-e2e"
                 | "verify-native-counter-interaction-speed"
                 | "verify-native-cells-interaction-speed"
                 | "verify-boon-driver-schema"

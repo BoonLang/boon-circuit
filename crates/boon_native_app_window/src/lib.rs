@@ -19,7 +19,6 @@ use wgpu::SurfaceTargetUnsafe;
 // Fallback poll for paths where the app-window callback cannot interrupt our
 // wait. Real input and scheduled animation wakes use NativeWakeHandle/next_wake
 // and should not be gated by this idle-only interval.
-const PASSIVE_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const VISIBLE_SURFACE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const VISIBLE_SURFACE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const NATIVE_WINDOW_RENDER_THREAD_STACK_BYTES: usize = 32 * 1024 * 1024;
@@ -612,6 +611,7 @@ pub struct NativeWindowOptions {
     pub input_sample_delay_ms: u64,
     pub synthetic_input_probe: bool,
     pub synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
+    pub app_owned_pointer_script: Option<NativeAppOwnedPointerScript>,
     pub sample_input_after_initial_frames: bool,
     pub warmup_frame_count: u32,
     pub sample_frame_count: u32,
@@ -621,6 +621,32 @@ pub struct NativeWindowOptions {
     pub proof_mode: NativeProofMode,
     pub adapter_policy: NativeAdapterPolicy,
     pub skip_interactive_surface_readback_when_external_proof: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NativeAppOwnedPointerScript {
+    pub label: String,
+    pub x: f64,
+    pub y: f64,
+    pub base_width: f64,
+    pub base_height: f64,
+    pub delay_ms: u64,
+    pub press: bool,
+    pub release: bool,
+    #[serde(default)]
+    pub scroll_delta_x: f64,
+    #[serde(default)]
+    pub scroll_delta_y: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_pressed: Option<bool>,
+}
+
+impl NativeAppOwnedPointerScript {
+    fn input_injection_method(&self) -> String {
+        format!("app_window_app_owned_pointer_script:{}", self.label)
+    }
 }
 
 impl NativeWindowOptions {
@@ -2379,11 +2405,9 @@ impl NativeRenderLoopState {
         }
     }
 
-    pub fn idle_wait_timeout(&self, now: Instant) -> Duration {
+    fn scheduled_wait_timeout(&self, now: Instant) -> Option<Duration> {
         self.next_wake_at
             .and_then(|wake_at| wake_at.checked_duration_since(now))
-            .map(|timeout| timeout.min(PASSIVE_INPUT_POLL_INTERVAL))
-            .unwrap_or(PASSIVE_INPUT_POLL_INTERVAL)
     }
 
     pub fn apply_poll_result(&mut self, poll_result: &NativePollResult, real_os_input: bool) {
@@ -2579,7 +2603,12 @@ struct AsyncPostPresentProofSubscriberWorker {
 }
 
 impl AsyncPostPresentProofSubscriberWorker {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::new_with_wake(None)
+    }
+
+    fn new_with_wake(wake_handle: Option<NativeWakeHandle>) -> Self {
         let shared = Arc::new((
             Mutex::new(AsyncPostPresentProofSubscriberShared::default()),
             Condvar::new(),
@@ -2608,6 +2637,9 @@ impl AsyncPostPresentProofSubscriberWorker {
                         let result = subscriber(batch.context.clone());
                         if sender.send(result).is_err() {
                             break;
+                        }
+                        if let Some(wake_handle) = wake_handle.as_ref() {
+                            wake_handle.wake();
                         }
                     }
                 }
@@ -3035,6 +3067,53 @@ impl NativeWakeHandle {
         });
         self.generation()
     }
+
+    pub fn wait_for_wake_after_signal(&self, observed_generation: u64) -> u64 {
+        if self.generation() != observed_generation {
+            return self.generation();
+        }
+        let (lock, condvar) = &*self.signal;
+        let Ok(guard) = lock.lock() else {
+            return self.generation();
+        };
+        let _guard = condvar.wait_while(guard, |signaled_generation| {
+            *signaled_generation <= observed_generation && self.generation() == observed_generation
+        });
+        self.generation()
+    }
+}
+
+fn wait_for_native_wake(
+    wake_handle: &NativeWakeHandle,
+    observed_generation: u64,
+    timeout: Option<Duration>,
+) -> (u64, Duration) {
+    match timeout {
+        Some(timeout) => (
+            wake_handle.wait_for_wake_after(observed_generation, timeout),
+            timeout,
+        ),
+        None => (
+            wake_handle.wait_for_wake_after_signal(observed_generation),
+            Duration::ZERO,
+        ),
+    }
+}
+
+fn native_loop_wait_timeout(
+    state: &NativeRenderLoopState,
+    now: Instant,
+    hold_started: Instant,
+    hold_ms: u64,
+) -> Option<Duration> {
+    let scheduled = state.scheduled_wait_timeout(now);
+    let hold = (hold_ms > 0)
+        .then(|| Duration::from_millis(hold_ms).saturating_sub(hold_started.elapsed()));
+    match (scheduled, hold) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+        (None, None) => None,
+    }
 }
 
 impl Default for NativeWakeHandle {
@@ -3357,6 +3436,8 @@ pub struct NativeInputAdapterProof {
     pub real_os_events_observed: bool,
     pub input_injection_method: String,
     pub synthetic_input_probe: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_events: Vec<boon_host::HostEventEnvelope>,
     pub mouse_last_window_protocol_id: Option<u64>,
     pub keyboard_last_window_protocol_id: Option<u64>,
     pub mouse_motion_event_count: u64,
@@ -3375,6 +3456,8 @@ pub struct NativeInputAdapterProof {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct NativeInputCursor {
+    pub last_host_event_sequence: u64,
+    pub last_mouse_input_sequence: u64,
     pub last_mouse_button_sequence: u64,
     pub last_keyboard_sequence: u64,
     pub last_mouse_motion_event_count: u64,
@@ -3383,6 +3466,17 @@ pub struct NativeInputCursor {
 
 impl NativeInputCursor {
     pub fn accept(&mut self, input: &NativeInputAdapterProof) {
+        self.last_host_event_sequence = self.last_host_event_sequence.max(
+            input
+                .host_events
+                .iter()
+                .map(|event| event.sequence)
+                .max()
+                .unwrap_or(0),
+        );
+        self.last_mouse_input_sequence = self
+            .last_mouse_input_sequence
+            .max(input.mouse_total_event_count);
         self.last_mouse_button_sequence = self.last_mouse_button_sequence.max(
             input
                 .mouse_button_events
@@ -3422,6 +3516,8 @@ pub struct NativeMouseButtonEventProof {
     pub button: String,
     pub pressed: bool,
     pub window_protocol_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<NativeMouseWindowPosition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_elapsed_ms: Option<f64>,
 }
@@ -4377,10 +4473,13 @@ pub type NativeRenderHook = Box<
 
 pub type NativePollHook =
     Box<dyn FnMut(NativePollContext) -> Result<NativePollResult, String> + Send>;
+pub type NativePointerScriptHook =
+    Box<dyn FnMut(NativePointerScriptContext) -> Option<NativeAppOwnedPointerScript> + Send>;
 pub type NativeExitHook = Box<dyn FnMut() -> Option<String> + Send>;
 pub type NativePerfStatsHook = Box<dyn FnMut(NativePreviewPerfStats) + Send>;
 
 pub struct NativeWindowHooks {
+    pub app_owned_pointer_script: Option<NativePointerScriptHook>,
     pub input: Option<NativePollHook>,
     pub poll: Option<NativePollHook>,
     pub should_exit: Option<NativeExitHook>,
@@ -4391,6 +4490,7 @@ pub struct NativeWindowHooks {
 impl NativeWindowHooks {
     pub fn from_render_hook(render: NativeRenderHook) -> Self {
         Self {
+            app_owned_pointer_script: None,
             input: None,
             poll: None,
             should_exit: None,
@@ -4400,11 +4500,32 @@ impl NativeWindowHooks {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct NativePointerScriptContext {
+    pub window_id: WindowId,
+    pub surface_id: SurfaceId,
+    pub surface_epoch: u64,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+    pub now: Instant,
+}
+
 fn native_window_exit_reason(hooks: &mut Option<NativeWindowHooks>) -> Option<String> {
     hooks
         .as_mut()
         .and_then(|hooks| hooks.should_exit.as_mut())
         .and_then(|should_exit| should_exit())
+}
+
+fn native_window_app_owned_pointer_script(
+    hooks: &mut Option<NativeWindowHooks>,
+    context: NativePointerScriptContext,
+) -> Option<NativeAppOwnedPointerScript> {
+    hooks
+        .as_mut()
+        .and_then(|hooks| hooks.app_owned_pointer_script.as_mut())
+        .and_then(|script| script(context))
 }
 
 fn notify_native_perf_stats(hooks: &mut Option<NativeWindowHooks>, stats: NativePreviewPerfStats) {
@@ -4630,8 +4751,7 @@ async fn run_surface_probe_inner(
         options.role.as_str()
     ));
     let window_id = WindowId(format!("{}:{window_hash}", options.role.as_str()));
-    let mut mouse = Mouse::coalesced().await;
-    let keyboard = Keyboard::coalesced().await;
+    let (mut mouse, keyboard) = app_surface.input().await;
     let input_event_wake_count = Arc::new(AtomicU64::new(0));
     let input_event_last_wake_at = Arc::new(Mutex::new(None::<Instant>));
     let input_event_wake_timeline = Arc::new(Mutex::new(VecDeque::<(u64, Instant)>::new()));
@@ -4802,7 +4922,7 @@ async fn run_surface_probe_inner(
             &mut next_forced_sample_frame_start,
             frame_index > 0,
         );
-        let input = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
+        let input = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None);
         let accessibility_actions = native_accessibility_action_requests_from_accesskit(
             app_surface.take_accessibility_action_requests(),
         );
@@ -5165,13 +5285,21 @@ async fn run_surface_probe_inner(
         sample_input_adapter(
             &mut mouse,
             &keyboard,
+            &window_id,
+            &surface_id,
+            surface_lifecycle.epoch(),
+            width,
+            height,
+            cached_surface_scale,
             options.synthetic_input_probe,
             options.synthetic_input_probe_kind,
+            None,
         )
     } else {
         let mut input_adapter = empty_input_adapter_proof(
             options.synthetic_input_probe,
             options.synthetic_input_probe_kind,
+            None,
         );
         input_adapter.real_os_events_observed = input_event_wake_count.load(Ordering::Relaxed) > 0;
         input_adapter.sampled_after_visible_window = false;
@@ -5211,8 +5339,15 @@ async fn run_surface_probe_inner(
                 sample_input_adapter(
                     &mut mouse,
                     &keyboard,
+                    &window_id,
+                    &surface_id,
+                    surface_lifecycle.epoch(),
+                    width,
+                    height,
+                    cached_surface_scale,
                     false,
                     options.synthetic_input_probe_kind,
+                    None,
                 )
             };
             let accessibility_actions = native_accessibility_action_requests_from_accesskit(
@@ -5649,7 +5784,8 @@ async fn run_surface_probe_inner(
         .render_loop_state_report
         .as_ref()
         .map(|_| AsyncRenderLoopReportWriter::new());
-    let mut async_post_present_proof_worker = AsyncPostPresentProofSubscriberWorker::new();
+    let mut async_post_present_proof_worker =
+        AsyncPostPresentProofSubscriberWorker::new_with_wake(Some(wake_handle.clone()));
     let mut last_sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
     let mut last_presented_input_event_wake_count = last_sampled_input_event_wake_count;
     let mut consecutive_unsampled_input_resamples = 0_u8;
@@ -5661,6 +5797,7 @@ async fn run_surface_probe_inner(
         0
     };
     let mut synthetic_interactive_scroll_sent_count = 0_u32;
+    let mut static_app_owned_pointer_script_sent = false;
     loop {
         let pre_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
         let loop_start_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
@@ -5816,12 +5953,17 @@ async fn run_surface_probe_inner(
         if raw_width <= 0.0 || raw_height <= 0.0 {
             surface_lifecycle.note_zero_size_skip();
             render_loop_state.note_idle_poll();
-            let idle_timeout = render_loop_state.idle_wait_timeout(Instant::now());
+            let idle_timeout = native_loop_wait_timeout(
+                &render_loop_state,
+                Instant::now(),
+                hold_started,
+                options.hold_ms,
+            );
             let wait_started = Instant::now();
-            let completed_generation =
-                wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
+            let (completed_generation, reported_timeout) =
+                wait_for_native_wake(&wake_handle, last_wake_generation, idle_timeout);
             render_loop_state.note_idle_wait(
-                idle_timeout,
+                reported_timeout,
                 wait_started.elapsed(),
                 last_wake_generation,
                 completed_generation,
@@ -5861,6 +6003,70 @@ async fn run_surface_probe_inner(
             synthetic_interactive_scroll_sent_count =
                 synthetic_interactive_scroll_sent_count.saturating_add(1);
         }
+        let mut app_owned_pointer_input_method = None::<String>;
+        let (app_owned_pointer_script, static_pointer_script) =
+            if !static_app_owned_pointer_script_sent && options.app_owned_pointer_script.is_some() {
+                (options.app_owned_pointer_script.clone(), true)
+            } else {
+                (
+                    native_window_app_owned_pointer_script(
+                        &mut hooks,
+                        NativePointerScriptContext {
+                            window_id: window_id.clone(),
+                            surface_id: surface_id.clone(),
+                            surface_epoch: surface_lifecycle.epoch(),
+                            width,
+                            height,
+                            scale: current_scale as f32,
+                            now: Instant::now(),
+                        },
+                    ),
+                    false,
+                )
+            };
+        if let Some(script) = app_owned_pointer_script.as_ref()
+            && hold_started.elapsed() >= Duration::from_millis(script.delay_ms)
+        {
+            let protocol_id = synthetic_probe_protocol_id(&window_id);
+            let target_x = if script.base_width > f64::EPSILON {
+                script.x * f64::from(width) / script.base_width
+            } else {
+                script.x
+            };
+            let target_y = if script.base_height > f64::EPSILON {
+                script.y * f64::from(height) / script.base_height
+            } else {
+                script.y
+            };
+            let input_scale = current_scale.max(f64::EPSILON);
+            mouse.inject_test_motion(
+                target_x / input_scale,
+                target_y / input_scale,
+                f64::from(width) / input_scale,
+                f64::from(height) / input_scale,
+                protocol_id,
+            );
+            if script.press {
+                mouse.inject_test_button(MOUSE_BUTTON_LEFT, true, protocol_id);
+            }
+            if script.release {
+                mouse.inject_test_button(MOUSE_BUTTON_LEFT, false, protocol_id);
+            }
+            if script.scroll_delta_x.abs() > f64::EPSILON
+                || script.scroll_delta_y.abs() > f64::EPSILON
+            {
+                mouse.inject_test_scroll(script.scroll_delta_x, script.scroll_delta_y, protocol_id);
+            }
+            if let (Some(key), Some(pressed)) = (script.key.as_deref(), script.key_pressed)
+                && let Some(key) = native_app_owned_script_key(key)
+            {
+                keyboard.inject_test_key(key, pressed, protocol_id);
+            }
+            app_owned_pointer_input_method = Some(script.input_injection_method());
+            if static_pointer_script {
+                static_app_owned_pointer_script_sent = true;
+            }
+        }
         let poll_started_at = Instant::now();
         let poll_started_elapsed_ms = hold_started.elapsed().as_secs_f64() * 1000.0;
         render_loop_state.note_poll_started(poll_started_elapsed_ms);
@@ -5875,8 +6081,15 @@ async fn run_surface_probe_inner(
             &mut mouse,
             &keyboard,
             &input_cursor,
+            &window_id,
+            &surface_id,
+            surface_lifecycle.epoch(),
+            width,
+            height,
+            current_scale,
             options.synthetic_input_probe,
             options.synthetic_input_probe_kind,
+            app_owned_pointer_input_method.as_deref(),
             hold_started,
         );
         let mut sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
@@ -5892,8 +6105,15 @@ async fn run_surface_probe_inner(
                 &mut mouse,
                 &keyboard,
                 &input_cursor,
+                &window_id,
+                &surface_id,
+                surface_lifecycle.epoch(),
+                width,
+                height,
+                current_scale,
                 options.synthetic_input_probe,
                 options.synthetic_input_probe_kind,
+                app_owned_pointer_input_method.as_deref(),
                 hold_started,
             );
             sampled_input_event_wake_count = input_event_wake_count.load(Ordering::Relaxed);
@@ -6177,12 +6397,17 @@ async fn run_surface_probe_inner(
                 bookkeeping_elapsed,
             );
             render_loop_state.note_idle_poll();
-            let idle_timeout = render_loop_state.idle_wait_timeout(Instant::now());
+            let idle_timeout = native_loop_wait_timeout(
+                &render_loop_state,
+                Instant::now(),
+                hold_started,
+                options.hold_ms,
+            );
             let wait_started = Instant::now();
-            let completed_generation =
-                wake_handle.wait_for_wake_after(last_wake_generation, idle_timeout);
+            let (completed_generation, reported_timeout) =
+                wait_for_native_wake(&wake_handle, last_wake_generation, idle_timeout);
             render_loop_state.note_idle_wait(
-                idle_timeout,
+                reported_timeout,
                 wait_started.elapsed(),
                 last_wake_generation,
                 completed_generation,
@@ -6211,11 +6436,17 @@ async fn run_surface_probe_inner(
                 bookkeeping_elapsed,
             );
             render_loop_state.note_idle_poll();
+            let idle_timeout = native_loop_wait_timeout(
+                &render_loop_state,
+                Instant::now(),
+                hold_started,
+                options.hold_ms,
+            );
             let wait_started = Instant::now();
-            let completed_generation =
-                wake_handle.wait_for_wake_after(last_wake_generation, PASSIVE_INPUT_POLL_INTERVAL);
+            let (completed_generation, reported_timeout) =
+                wait_for_native_wake(&wake_handle, last_wake_generation, idle_timeout);
             render_loop_state.note_idle_wait(
-                PASSIVE_INPUT_POLL_INTERVAL,
+                reported_timeout,
                 wait_started.elapsed(),
                 last_wake_generation,
                 completed_generation,
@@ -9364,7 +9595,7 @@ fn write_render_loop_state_report(
         "renders_per_second": renders_per_second,
         "scheduled_wake_count": state.scheduled_wake_count,
         "active_timer_reason": active_timer_reason,
-        "passive_input_poll_interval_ms": PASSIVE_INPUT_POLL_INTERVAL.as_millis() as u64,
+        "passive_input_poll_interval_ms": 0,
         "resize_wake_count": extras.resize_wake_count,
         "input_event_wake_count": extras.input_event_wake_count,
         "sampled_input_event_wake_count": extras.sampled_input_event_wake_count,
@@ -10163,17 +10394,19 @@ fn inject_synthetic_scroll_probe(
 fn sample_input_adapter(
     mouse: &mut Mouse,
     keyboard: &Keyboard,
+    window_id: &WindowId,
+    surface_id: &SurfaceId,
+    surface_epoch: u64,
+    surface_width: u32,
+    surface_height: u32,
+    surface_scale: f64,
     synthetic_input_probe: bool,
     synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
+    app_owned_input_injection_method: Option<&str>,
 ) -> NativeInputAdapterProof {
-    let mouse_window_pos = mouse
-        .window_pos()
-        .map(|position| NativeMouseWindowPosition {
-            x: position.pos_x(),
-            y: position.pos_y(),
-            window_width: position.window_width(),
-            window_height: position.window_height(),
-        });
+    let mouse_window_pos = mouse.window_pos().map(|position| {
+        native_mouse_position_for_surface(position, surface_width, surface_height, surface_scale)
+    });
     let mouse_buttons_down = [
         (MOUSE_BUTTON_LEFT, "left"),
         (MOUSE_BUTTON_RIGHT, "right"),
@@ -10196,6 +10429,17 @@ fn sample_input_adapter(
             window_protocol_id: event.window_protocol_id,
         })
         .collect::<Vec<_>>();
+    let host_events = native_host_event_envelopes(
+        &mouse_provenance,
+        &keyboard_provenance,
+        &NativeInputCursor::default(),
+        window_id,
+        surface_id,
+        surface_epoch,
+        surface_width,
+        surface_height,
+        surface_scale,
+    );
     let mouse_button_events = mouse_provenance
         .recent_button_events
         .iter()
@@ -10204,31 +10448,38 @@ fn sample_input_adapter(
             button: mouse_button_label(event.button).to_owned(),
             pressed: event.pressed,
             window_protocol_id: event.window_protocol_id,
+            position: event.window_position.map(|position| {
+                native_mouse_position_for_surface(
+                    position,
+                    surface_width,
+                    surface_height,
+                    surface_scale,
+                )
+            }),
             event_elapsed_ms: None,
         })
         .collect::<Vec<_>>();
-    let real_os_events_observed = mouse_window_pos.is_some()
-        || !mouse_buttons_down.is_empty()
-        || !pressed_keys.is_empty()
-        || scroll_delta_x != 0.0
-        || scroll_delta_y != 0.0
-        || mouse_provenance.total_event_count > 0
-        || keyboard_provenance.key_event_count > 0;
+    let real_os_events_observed = host_events
+        .iter()
+        .any(|event| event.origin == boon_host::HostEventOrigin::RealOs);
 
     NativeInputAdapterProof {
         installed: true,
-        capture_scope: "app_window_coalesced_input_with_per_window_event_provenance".to_owned(),
-        keyboard_api: "app_window::input::keyboard::Keyboard::coalesced".to_owned(),
-        mouse_api: "app_window::input::mouse::Mouse::coalesced".to_owned(),
+        capture_scope: "app_window_surface_bound_input_with_per_window_event_provenance".to_owned(),
+        keyboard_api: "app_window::surface::Surface::input (surface-bound keyboard)".to_owned(),
+        mouse_api: "app_window::surface::Surface::input (surface-bound mouse)".to_owned(),
         wheel_api: "app_window::input::mouse::Mouse::load_clear_scroll_delta".to_owned(),
         per_window_event_provenance_api: "app_window::input::{mouse,keyboard}::event_provenance"
             .to_owned(),
         sampled_after_visible_window: true,
         real_os_events_observed,
-        input_injection_method: synthetic_input_probe_kind
-            .input_injection_method(synthetic_input_probe)
-            .to_owned(),
+        input_injection_method: native_input_injection_method(
+            synthetic_input_probe,
+            synthetic_input_probe_kind,
+            app_owned_input_injection_method,
+        ),
         synthetic_input_probe,
+        host_events,
         mouse_last_window_protocol_id: mouse_provenance.last_window_protocol_id,
         keyboard_last_window_protocol_id: keyboard_provenance.last_window_protocol_id,
         mouse_motion_event_count: mouse_provenance.motion_event_count,
@@ -10250,18 +10501,20 @@ fn sample_input_adapter_delta(
     mouse: &Mouse,
     keyboard: &Keyboard,
     cursor: &NativeInputCursor,
+    window_id: &WindowId,
+    surface_id: &SurfaceId,
+    surface_epoch: u64,
+    surface_width: u32,
+    surface_height: u32,
+    surface_scale: f64,
     synthetic_input_probe: bool,
     synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
+    app_owned_input_injection_method: Option<&str>,
     hold_started: Instant,
 ) -> NativeInputAdapterProof {
-    let mouse_window_pos = mouse
-        .window_pos()
-        .map(|position| NativeMouseWindowPosition {
-            x: position.pos_x(),
-            y: position.pos_y(),
-            window_width: position.window_width(),
-            window_height: position.window_height(),
-        });
+    let mouse_window_pos = mouse.window_pos().map(|position| {
+        native_mouse_position_for_surface(position, surface_width, surface_height, surface_scale)
+    });
     let mouse_buttons_down = [
         (MOUSE_BUTTON_LEFT, "left"),
         (MOUSE_BUTTON_RIGHT, "right"),
@@ -10285,6 +10538,17 @@ fn sample_input_adapter_delta(
             window_protocol_id: event.window_protocol_id,
         })
         .collect::<Vec<_>>();
+    let host_events = native_host_event_envelopes(
+        &mouse_provenance,
+        &keyboard_provenance,
+        cursor,
+        window_id,
+        surface_id,
+        surface_epoch,
+        surface_width,
+        surface_height,
+        surface_scale,
+    );
     let mouse_button_events = mouse_provenance
         .recent_button_events
         .iter()
@@ -10294,6 +10558,14 @@ fn sample_input_adapter_delta(
             button: mouse_button_label(event.button).to_owned(),
             pressed: event.pressed,
             window_protocol_id: event.window_protocol_id,
+            position: event.window_position.map(|position| {
+                native_mouse_position_for_surface(
+                    position,
+                    surface_width,
+                    surface_height,
+                    surface_scale,
+                )
+            }),
             event_elapsed_ms: event
                 .occurred_at
                 .checked_duration_since(hold_started)
@@ -10303,31 +10575,29 @@ fn sample_input_adapter_delta(
     let new_scroll_observed = mouse_provenance.scroll_event_count
         > cursor.last_mouse_scroll_event_count
         && (scroll_delta_x != 0.0 || scroll_delta_y != 0.0);
-    let new_motion_observed =
-        mouse_provenance.motion_event_count > cursor.last_mouse_motion_event_count;
-    let real_os_events_observed = !mouse_button_events.is_empty()
-        || !keyboard_events.is_empty()
-        || new_motion_observed
-        || new_scroll_observed
-        || !mouse_buttons_down.is_empty()
-        || !pressed_keys.is_empty();
+    let real_os_events_observed = host_events
+        .iter()
+        .any(|event| event.origin == boon_host::HostEventOrigin::RealOs);
 
     NativeInputAdapterProof {
         installed: true,
-        capture_scope: "app_window_coalesced_input_delta_with_per_window_event_provenance"
+        capture_scope: "app_window_surface_bound_input_delta_with_per_window_event_provenance"
             .to_owned(),
-        keyboard_api: "app_window::input::keyboard::Keyboard::coalesced".to_owned(),
-        mouse_api: "app_window::input::mouse::Mouse::coalesced".to_owned(),
+        keyboard_api: "app_window::surface::Surface::input (surface-bound keyboard)".to_owned(),
+        mouse_api: "app_window::surface::Surface::input (surface-bound mouse)".to_owned(),
         wheel_api: "app_window::input::mouse::Mouse::{scroll_delta,load_clear_scroll_delta}"
             .to_owned(),
         per_window_event_provenance_api: "app_window::input::{mouse,keyboard}::event_provenance"
             .to_owned(),
         sampled_after_visible_window: true,
         real_os_events_observed,
-        input_injection_method: synthetic_input_probe_kind
-            .input_injection_method(synthetic_input_probe)
-            .to_owned(),
+        input_injection_method: native_input_injection_method(
+            synthetic_input_probe,
+            synthetic_input_probe_kind,
+            app_owned_input_injection_method,
+        ),
         synthetic_input_probe,
+        host_events,
         mouse_last_window_protocol_id: mouse_provenance.last_window_protocol_id,
         keyboard_last_window_protocol_id: keyboard_provenance.last_window_protocol_id,
         mouse_motion_event_count: mouse_provenance.motion_event_count,
@@ -10350,6 +10620,166 @@ fn sample_input_adapter_delta(
         } else {
             0.0
         },
+    }
+}
+
+fn native_mouse_position_for_surface(
+    position: app_window::input::mouse::MouseWindowLocation,
+    surface_width: u32,
+    surface_height: u32,
+    surface_scale: f64,
+) -> NativeMouseWindowPosition {
+    let scale = surface_scale.max(f64::EPSILON);
+    NativeMouseWindowPosition {
+        x: position.pos_x() * scale,
+        y: position.pos_y() * scale,
+        window_width: f64::from(surface_width),
+        window_height: f64::from(surface_height),
+    }
+}
+
+struct PendingNativeHostEvent {
+    occurred_at: Instant,
+    origin: boon_host::HostEventOrigin,
+    event: boon_host::HostEvent,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn native_host_event_envelopes(
+    mouse: &app_window::input::mouse::MouseEventProvenance,
+    keyboard: &app_window::input::keyboard::KeyboardEventProvenance,
+    cursor: &NativeInputCursor,
+    window_id: &WindowId,
+    surface_id: &SurfaceId,
+    surface_epoch: u64,
+    surface_width: u32,
+    surface_height: u32,
+    surface_scale: f64,
+) -> Vec<boon_host::HostEventEnvelope> {
+    let mut pending = mouse
+        .recent_events
+        .iter()
+        .filter(|event| event.sequence > cursor.last_mouse_input_sequence)
+        .map(|event| {
+            let position = event.window_position.map(|position| {
+                native_mouse_position_for_surface(
+                    position,
+                    surface_width,
+                    surface_height,
+                    surface_scale,
+                )
+            });
+            let (x, y) = position
+                .map(|position| (position.x as f32, position.y as f32))
+                .unwrap_or((0.0, 0.0));
+            let host_event = match event.kind {
+                app_window::input::mouse::MouseInputEventKind::Motion => {
+                    boon_host::HostEvent::Pointer(boon_host::PointerEvent {
+                        surface: surface_id.clone(),
+                        x,
+                        y,
+                        phase: boon_host::PointerPhase::Move,
+                        button: None,
+                    })
+                }
+                app_window::input::mouse::MouseInputEventKind::Button { button, pressed } => {
+                    boon_host::HostEvent::Pointer(boon_host::PointerEvent {
+                        surface: surface_id.clone(),
+                        x,
+                        y,
+                        phase: if pressed {
+                            boon_host::PointerPhase::Down
+                        } else {
+                            boon_host::PointerPhase::Up
+                        },
+                        button: Some(native_pointer_button(button)),
+                    })
+                }
+                app_window::input::mouse::MouseInputEventKind::Scroll { delta_x, delta_y } => {
+                    boon_host::HostEvent::Wheel(boon_host::WheelEvent {
+                        surface: surface_id.clone(),
+                        x,
+                        y,
+                        delta_x: delta_x as f32,
+                        delta_y: delta_y as f32,
+                    })
+                }
+                app_window::input::mouse::MouseInputEventKind::Leave => {
+                    boon_host::HostEvent::Pointer(boon_host::PointerEvent {
+                        surface: surface_id.clone(),
+                        x,
+                        y,
+                        phase: boon_host::PointerPhase::Leave,
+                        button: None,
+                    })
+                }
+            };
+            PendingNativeHostEvent {
+                occurred_at: event.occurred_at,
+                origin: native_host_event_origin(event.origin),
+                event: host_event,
+            }
+        })
+        .collect::<Vec<_>>();
+    pending.extend(
+        keyboard
+            .recent_events
+            .iter()
+            .filter(|event| event.sequence > cursor.last_keyboard_sequence)
+            .map(|event| PendingNativeHostEvent {
+                occurred_at: event.occurred_at,
+                origin: native_host_event_origin(event.origin),
+                event: boon_host::HostEvent::Keyboard(boon_host::KeyEvent {
+                    surface: surface_id.clone(),
+                    key: format!("{:?}", event.key),
+                    pressed: event.pressed,
+                }),
+            }),
+    );
+    pending.sort_by_key(|event| event.occurred_at);
+    pending
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| boon_host::HostEventEnvelope {
+            sequence: cursor
+                .last_host_event_sequence
+                .saturating_add(index as u64)
+                .saturating_add(1),
+            origin: event.origin,
+            window: window_id.clone(),
+            surface: surface_id.clone(),
+            surface_epoch,
+            event: event.event,
+        })
+        .collect()
+}
+
+fn native_host_event_origin(
+    origin: app_window::input::InputEventOrigin,
+) -> boon_host::HostEventOrigin {
+    match origin {
+        app_window::input::InputEventOrigin::RealOs => boon_host::HostEventOrigin::RealOs,
+        app_window::input::InputEventOrigin::Operator => boon_host::HostEventOrigin::Operator,
+    }
+}
+
+fn native_pointer_button(button: u8) -> boon_host::PointerButton {
+    match button {
+        MOUSE_BUTTON_LEFT => boon_host::PointerButton::Primary,
+        MOUSE_BUTTON_RIGHT => boon_host::PointerButton::Secondary,
+        MOUSE_BUTTON_MIDDLE => boon_host::PointerButton::Middle,
+        other => boon_host::PointerButton::Other(other),
+    }
+}
+
+fn native_app_owned_script_key(key: &str) -> Option<KeyboardKey> {
+    match key {
+        "A" => Some(KeyboardKey::A),
+        "DownArrow" => Some(KeyboardKey::DownArrow),
+        "Enter" => Some(KeyboardKey::Return),
+        "Escape" => Some(KeyboardKey::Escape),
+        "Tab" => Some(KeyboardKey::Tab),
+        _ => None,
     }
 }
 
@@ -10478,6 +10908,15 @@ fn merge_input_adapter_proof(base: &mut NativeInputAdapterProof, sample: &Native
     base.scroll_delta_y += sample.scroll_delta_y;
     base.mouse_buttons_down = sample.mouse_buttons_down.clone();
     base.pressed_keys = sample.pressed_keys.clone();
+    for event in &sample.host_events {
+        if !base
+            .host_events
+            .iter()
+            .any(|existing| existing.sequence == event.sequence)
+        {
+            base.host_events.push(event.clone());
+        }
+    }
     for event in &sample.mouse_button_events {
         if !base
             .mouse_button_events
@@ -10504,7 +10943,7 @@ fn accept_input_cursor(
     input: &NativeInputAdapterProof,
 ) {
     if input.scroll_delta_x != 0.0 || input.scroll_delta_y != 0.0 {
-        let _ = mouse.load_clear_scroll_delta();
+        mouse.consume_scroll_delta(input.scroll_delta_x, input.scroll_delta_y);
     }
     cursor.accept(input);
 }
@@ -10761,24 +11200,42 @@ fn mouse_button_label(button: u8) -> &'static str {
     }
 }
 
+fn native_input_injection_method(
+    synthetic_input_probe: bool,
+    synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
+    app_owned_input_injection_method: Option<&str>,
+) -> String {
+    app_owned_input_injection_method
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            synthetic_input_probe_kind
+                .input_injection_method(synthetic_input_probe)
+                .to_owned()
+        })
+}
+
 fn empty_input_adapter_proof(
     synthetic_input_probe: bool,
     synthetic_input_probe_kind: NativeSyntheticInputProbeKind,
+    app_owned_input_injection_method: Option<&str>,
 ) -> NativeInputAdapterProof {
     NativeInputAdapterProof {
         installed: true,
-        capture_scope: "app_window_coalesced_input_with_per_window_event_provenance".to_owned(),
-        keyboard_api: "app_window::input::keyboard::Keyboard::coalesced".to_owned(),
-        mouse_api: "app_window::input::mouse::Mouse::coalesced".to_owned(),
+        capture_scope: "app_window_surface_bound_input_with_per_window_event_provenance".to_owned(),
+        keyboard_api: "app_window::surface::Surface::input (surface-bound keyboard)".to_owned(),
+        mouse_api: "app_window::surface::Surface::input (surface-bound mouse)".to_owned(),
         wheel_api: "app_window::input::mouse::Mouse::load_clear_scroll_delta".to_owned(),
         per_window_event_provenance_api: "app_window::input::{mouse,keyboard}::event_provenance"
             .to_owned(),
         sampled_after_visible_window: true,
         real_os_events_observed: false,
-        input_injection_method: synthetic_input_probe_kind
-            .input_injection_method(synthetic_input_probe)
-            .to_owned(),
+        input_injection_method: native_input_injection_method(
+            synthetic_input_probe,
+            synthetic_input_probe_kind,
+            app_owned_input_injection_method,
+        ),
         synthetic_input_probe,
+        host_events: Vec::new(),
         mouse_last_window_protocol_id: None,
         keyboard_last_window_protocol_id: None,
         mouse_motion_event_count: 0,

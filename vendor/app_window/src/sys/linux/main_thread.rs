@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
 use super::{App, AppState};
 use crate::application::IS_MAIN_THREAD_RUNNING;
-use libc::{EFD_SEMAPHORE, SYS_gettid, c_int, c_void, eventfd, getpid, pid_t, syscall};
+use libc::{
+    EFD_SEMAPHORE, POLLERR, POLLHUP, POLLIN, POLLOUT, SYS_gettid, c_int, c_void, eventfd, getpid,
+    pid_t, poll, pollfd, syscall,
+};
 use std::cell::RefCell;
 use std::os::fd::AsRawFd;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Sender, channel};
-use std::time::Duration;
+use std::sync::mpsc::{Sender, TryRecvError, channel};
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::{GlobalList, registry_queue_init};
 use wayland_client::protocol::wl_subcompositor::WlSubcompositor;
@@ -118,51 +120,37 @@ pub fn run_main_thread<F: FnOnce() + Send + 'static>(closure: F) {
     };
 
     MAIN_THREAD_INFO.replace(Some(main_thread_info));
-    let mut io_uring = io_uring::IoUring::new(2).expect("Failed to create io_uring");
-
     _ = std::thread::Builder::new()
         .name("app_window closure".to_string())
         .spawn(closure);
 
-    event_queue.flush().expect("Failed to flush event queue");
+    fn flush_or_defer(event_queue: &wayland_client::EventQueue<App>) -> bool {
+        match event_queue.flush() {
+            Ok(()) => false,
+            Err(WaylandError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(error) => panic!("Failed to flush event queue: {error}"),
+        }
+    }
 
-    let mut read_guard = Some(event_queue.prepare_read().expect("Failed to prepare read"));
-    const WAYLAND_DATA_AVAILABLE: u64 = 1;
-    const CHANNEL_DATA_AVAILABLE: u64 = 2;
-    let fd = read_guard.as_ref().unwrap().connection_fd();
-    let io_uring_fd = io_uring::types::Fd(fd.as_raw_fd());
-    let io_uring_fd_raw = io_uring_fd.0.as_raw_fd();
-    let mut wayland_entry =
-        io_uring::opcode::PollAdd::new(io_uring_fd, libc::POLLIN as u32).build();
-    wayland_entry = wayland_entry.user_data(WAYLAND_DATA_AVAILABLE);
-    let mut sqs = io_uring.submission();
-    unsafe { sqs.push(&wayland_entry) }.expect("Can't submit peek");
-    let mut eventfd_opcode = io_uring::opcode::PollAdd::new(
-        io_uring::types::Fd(channel_read_event),
-        libc::POLLIN as u32,
-    )
-    .build();
-    eventfd_opcode = eventfd_opcode.user_data(CHANNEL_DATA_AVAILABLE);
-    unsafe { sqs.push(&eventfd_opcode) }.expect("Can't submit peek");
-    drop(sqs);
+    let mut flush_pending = flush_or_defer(&event_queue);
+
     fn next_read_guard(
         event_queue: &mut wayland_client::EventQueue<App>,
         app: &mut App,
-        read_guard: &mut Option<wayland_client::backend::ReadEventsGuard>,
-    ) {
+        flush_pending: &mut bool,
+    ) -> wayland_client::backend::ReadEventsGuard {
         loop {
             let _read_guard = event_queue.prepare_read();
 
             match _read_guard {
                 Some(guard) => {
-                    *read_guard = Some(guard);
-                    break; //out of loop
+                    break guard;
                 }
                 None => {
                     event_queue
                         .dispatch_pending(app)
                         .expect("Can't dispatch events");
-                    event_queue.flush().expect("Failed to flush event queue");
+                    *flush_pending = flush_or_defer(event_queue);
                     //try again
                     logwise::debuginternal_sync!("Retrying");
                 }
@@ -172,46 +160,37 @@ pub fn run_main_thread<F: FnOnce() + Send + 'static>(closure: F) {
 
     //park
     loop {
-        next_read_guard(&mut event_queue, &mut app, &mut read_guard);
-        assert!(read_guard.as_ref().unwrap().connection_fd().as_raw_fd() == io_uring_fd_raw);
-        let r = io_uring.submit_and_wait(1);
-        //we also want to take once regardless of entry
-        let mut take_read_guard = read_guard.take();
-        match r {
-            Ok(_) => {}
-            Err(e) => {
-                logwise::error_sync!(
-                    "Can't submit and wait: {err}",
-                    err = logwise::privacy::LogIt(e)
-                );
-                continue;
+        let read_guard = next_read_guard(&mut event_queue, &mut app, &mut flush_pending);
+        let wayland_fd = read_guard.connection_fd().as_raw_fd();
+        let mut fds = [
+            pollfd {
+                fd: wayland_fd,
+                events: POLLIN | if flush_pending { POLLOUT } else { 0 },
+                revents: 0,
+            },
+            pollfd {
+                fd: channel_read_event,
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            let result = unsafe { poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if result >= 0 {
+                break;
+            }
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != libc::EINTR {
+                panic!("Error polling main thread fds: {errno}");
             }
         }
-        let mut wayland_data_available = false;
-        let mut channel_data_available = false;
-        for entry in io_uring.completion() {
-            let result = entry.result();
-            if result < 0 {
-                panic!("Error in completion queue: {err}", err = result);
-            }
-            match entry.user_data() {
-                WAYLAND_DATA_AVAILABLE => {
-                    wayland_data_available = true;
-                }
-                CHANNEL_DATA_AVAILABLE => {
-                    channel_data_available = true;
-                }
-                other => {
-                    unimplemented!("Unknown user data: {other}", other = other);
-                }
-            }
-        }
+        let wayland_events = fds[0].revents;
+        let channel_events = fds[1].revents;
+        let wayland_data_available = wayland_events & (POLLIN | POLLERR | POLLHUP) != 0;
+        let wayland_writable = wayland_events & POLLOUT != 0;
+        let channel_data_available = channel_events & (POLLIN | POLLERR | POLLHUP) != 0;
         if wayland_data_available {
-            match take_read_guard
-                .take()
-                .expect("Read guard not available")
-                .read()
-            {
+            match read_guard.read() {
                 Ok(_) => {}
                 Err(e) => {
                     match e {
@@ -236,39 +215,34 @@ pub fn run_main_thread<F: FnOnce() + Send + 'static>(closure: F) {
                 .expect("Can't dispatch events");
             //prepare next read
             //ensure writes queued during dispatch_pending go out (such as proxy replies, etc)
-            event_queue.flush().expect("Failed to flush event queue");
-
-            let mut sqs = io_uring.submission();
-            wayland_entry =
-                io_uring::opcode::PollAdd::new(io_uring_fd, libc::POLLIN as u32).build();
-            wayland_entry = wayland_entry.user_data(WAYLAND_DATA_AVAILABLE);
-            unsafe { sqs.push(&wayland_entry) }.expect("Can't submit peek");
-            //return to submit_and_wait
+            flush_pending = flush_or_defer(&event_queue);
+        } else {
+            drop(read_guard);
+            if wayland_writable {
+                flush_pending = flush_or_defer(&event_queue);
+            }
         }
         if channel_data_available {
-            drop(take_read_guard); //we don't need it anymore
             let mut buf = [0u8; 8];
             let r = unsafe { libc::read(channel_read_event, buf.as_mut_ptr() as *mut c_void, 8) };
             assert_eq!(r, 8, "Failed to read from eventfd");
-            let message = receiver
-                .recv_timeout(Duration::from_secs(0))
-                .expect("Failed to receive closure");
-            match message {
-                Message::Closure(closure) => closure(),
-                Message::Stop => {
+            match receiver.try_recv() {
+                Ok(Message::Closure(closure)) => closure(),
+                Ok(Message::Stop) => {
                     IS_MAIN_THREAD_RUNNING.store(false, Ordering::Relaxed);
-                    break;
+                    return;
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    IS_MAIN_THREAD_RUNNING.store(false, Ordering::Relaxed);
+                    return;
                 }
             }
             //let's ensure any writes went out to wayland
             event_queue
                 .dispatch_pending(&mut app)
                 .expect("can't dispatch events");
-            event_queue.flush().expect("Failed to flush event queue");
-            //submit new peek
-            let mut sqs = io_uring.submission();
-            unsafe { sqs.push(&eventfd_opcode) }.expect("Can't submit peek");
-            //return to submit_and_wait
+            flush_pending = flush_or_defer(&event_queue);
         }
     }
 }

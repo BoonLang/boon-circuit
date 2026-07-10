@@ -14,6 +14,7 @@ pub mod main_thread;
 pub mod window;
 
 use crate::coordinates::Size;
+use crate::input::{keyboard::Keyboard, mouse::Mouse};
 use crate::sys::window::WindowInternal;
 use accesskit::NodeId;
 use memmap2::MmapMut;
@@ -142,6 +143,14 @@ unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
 impl Surface {
+    pub fn input(&self) -> (Mouse, Keyboard) {
+        let window = self.window_internal.lock().unwrap();
+        (
+            Mouse::from_surface_shared(Arc::clone(&window.surface_mouse)),
+            Keyboard::from_surface_shared(Arc::clone(&window.surface_keyboard)),
+        )
+    }
+
     fn size_scale_impl(&self) -> (Size, f64) {
         let size = self.window_internal.lock().unwrap().applied_size();
 
@@ -256,9 +265,12 @@ impl Surface {
     }
 
     pub fn update_accessibility_if_active(&self, update: accesskit::TreeUpdate) {
-        let mut window_internal = self.window_internal.lock().unwrap();
-        window_internal.latest_accessibility_tree_update = Some(update.clone());
-        if let Some(adapter) = window_internal.adapter.as_mut() {
+        let adapter = {
+            let mut window_internal = self.window_internal.lock().unwrap();
+            window_internal.latest_accessibility_tree_update = Some(update.clone());
+            Arc::clone(&window_internal.adapter)
+        };
+        if let Some(adapter) = adapter.lock().unwrap().as_mut() {
             adapter.update_if_active(|| update);
         }
     }

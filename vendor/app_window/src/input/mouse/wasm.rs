@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::input::Window;
 use crate::input::keyboard::wasm::ARBITRARY_WINDOW_PTR;
 use crate::input::mouse::MouseWindowLocation;
+use crate::input::{InputEventOrigin, Window};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
@@ -49,13 +49,16 @@ impl PlatformCoalescedMouse {
                         .unwrap_or(0.0);
                     let window = Some(Window(NonNull::new(ARBITRARY_WINDOW_PTR).unwrap()));
 
-                    shared.set_window_location(MouseWindowLocation::new(
-                        event.offset_x() as f64,
-                        event.offset_y() as f64,
-                        width,
-                        height,
-                        window,
-                    ));
+                    shared.set_window_location(
+                        MouseWindowLocation::new(
+                            event.offset_x() as f64,
+                            event.offset_y() as f64,
+                            width,
+                            height,
+                            window,
+                        ),
+                        InputEventOrigin::RealOs,
+                    );
                 }
             }) as Box<dyn FnMut(MouseEvent)>);
 
@@ -73,6 +76,7 @@ impl PlatformCoalescedMouse {
                         js_button_to_rust(event.button()),
                         true,
                         ARBITRARY_WINDOW_PTR,
+                        InputEventOrigin::RealOs,
                     );
                 }
             }) as Box<dyn FnMut(MouseEvent)>);
@@ -90,6 +94,7 @@ impl PlatformCoalescedMouse {
                         js_button_to_rust(event.button()),
                         false,
                         ARBITRARY_WINDOW_PTR,
+                        InputEventOrigin::RealOs,
                     );
                 }
             }) as Box<dyn FnMut(MouseEvent)>);
@@ -112,7 +117,7 @@ impl PlatformCoalescedMouse {
                 };
 
                 if let Some(shared) = weak_wheel.upgrade() {
-                    shared.add_scroll_delta(x, y, ARBITRARY_WINDOW_PTR);
+                    shared.add_scroll_delta(x, y, ARBITRARY_WINDOW_PTR, InputEventOrigin::RealOs);
                 }
             }) as Box<dyn FnMut(WheelEvent)>);
             document

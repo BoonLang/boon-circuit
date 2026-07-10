@@ -94,6 +94,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
+use std::time::Instant;
 
 /// Keyboard key definitions and enumerations.
 pub mod key;
@@ -123,6 +124,7 @@ pub(crate) use windows as sys;
 pub(crate) use linux as sys;
 
 use crate::application::is_main_thread_running;
+use crate::input::InputEventOrigin;
 use crate::input::keyboard::key::KeyboardKey;
 use crate::input::keyboard::sys::PlatformCoalescedKeyboard;
 use std::fmt;
@@ -134,7 +136,7 @@ type InputWakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 /// This struct is shared between the public `Keyboard` API and the platform-specific
 /// implementations. It maintains the current state of all keyboard keys using atomic
 /// operations for thread safety.
-struct Shared {
+pub(crate) struct Shared {
     /// Array of atomic booleans tracking the pressed state of each key.
     /// Indexed by the numeric value of `KeyboardKey`.
     key_states: Vec<AtomicBool>,
@@ -178,13 +180,15 @@ pub struct KeyboardEventRecord {
     pub key: KeyboardKey,
     pub pressed: bool,
     pub window_protocol_id: Option<u64>,
+    pub origin: InputEventOrigin,
+    pub occurred_at: Instant,
 }
 
 impl Shared {
     /// Creates a new shared keyboard state with all keys initially unpressed.
     ///
     /// Allocates an array of atomic booleans, one for each possible key variant.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut vec = Vec::with_capacity(key::KeyboardKey::all_keys().len());
         for _ in 0..key::KeyboardKey::all_keys().len() {
             vec.push(AtomicBool::new(false));
@@ -219,7 +223,13 @@ impl Shared {
     /// This method uses relaxed atomic ordering for performance. The exact ordering
     /// of concurrent key state changes is not guaranteed, but each individual key's
     /// state will be eventually consistent.
-    fn set_key_state(&self, key: KeyboardKey, state: bool, window_ptr: *mut c_void) {
+    pub(crate) fn set_key_state(
+        &self,
+        key: KeyboardKey,
+        state: bool,
+        window_ptr: *mut c_void,
+        origin: InputEventOrigin,
+    ) {
         logwise::debuginternal_sync!(
             "Setting key {key} to {state}",
             key = logwise::privacy::LogIt(key),
@@ -242,6 +252,8 @@ impl Shared {
             pressed: state,
             window_protocol_id: (window_ptr as usize as u64 != 0)
                 .then_some(window_ptr as usize as u64),
+            origin,
+            occurred_at: Instant::now(),
         });
         while recent_events.len() > 256 {
             recent_events.pop_front();
@@ -329,6 +341,14 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_surface_shared(shared: Arc<Shared>) -> Self {
+        Self {
+            shared,
+            _platform_coalesced_keyboard: PlatformCoalescedKeyboard::attached(),
+        }
+    }
+
     /// Creates a keyboard instance representing all physical keyboards on the system.
     ///
     /// This constructor creates a single logical keyboard that coalesces input from all
@@ -461,8 +481,12 @@ impl Keyboard {
     /// boundary as normal platform events without typing into the user's
     /// desktop.
     pub fn inject_test_key(&self, key: KeyboardKey, down: bool, window_protocol_id: u64) {
-        self.shared
-            .set_key_state(key, down, window_protocol_id as usize as *mut c_void);
+        self.shared.set_key_state(
+            key,
+            down,
+            window_protocol_id as usize as *mut c_void,
+            InputEventOrigin::Operator,
+        );
     }
 }
 

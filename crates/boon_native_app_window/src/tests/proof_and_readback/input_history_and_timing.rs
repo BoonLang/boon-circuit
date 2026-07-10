@@ -3,9 +3,9 @@
 // test: merge_input_adapter_proof_keeps_current_button_and_key_state
 #[test]
 fn merge_input_adapter_proof_keeps_current_button_and_key_state() {
-    let mut base = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
+    let mut base = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None);
 
-    let mut pressed = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
+    let mut pressed = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None);
     pressed.real_os_events_observed = true;
     pressed.mouse_button_event_count = 2;
     pressed.keyboard_key_event_count = 3;
@@ -18,7 +18,7 @@ fn merge_input_adapter_proof_keeps_current_button_and_key_state() {
     assert_eq!(base.mouse_buttons_down, vec!["left".to_owned()]);
     assert_eq!(base.pressed_keys, vec!["KeyA".to_owned()]);
 
-    let mut released = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
+    let mut released = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None);
     released.mouse_button_event_count = 4;
     released.keyboard_key_event_count = 5;
     merge_input_adapter_proof(&mut base, &released);
@@ -808,7 +808,7 @@ fn interactive_surface_readback_is_coalesced_while_previous_proof_is_pending() {
 // test: accepted_host_input_summary_honors_semantic_press_hint_in_coalesced_batch
 #[test]
 fn accepted_host_input_summary_honors_semantic_press_hint_in_coalesced_batch() {
-    let mut input = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full);
+    let mut input = empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None);
     input.real_os_events_observed = true;
     input.mouse_button_event_count = 2;
     input.mouse_button_events = vec![
@@ -817,6 +817,7 @@ fn accepted_host_input_summary_honors_semantic_press_hint_in_coalesced_batch() {
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(9),
+            position: None,
             event_elapsed_ms: Some(10.0),
         },
         NativeMouseButtonEventProof {
@@ -824,6 +825,7 @@ fn accepted_host_input_summary_honors_semantic_press_hint_in_coalesced_batch() {
             button: "left".to_owned(),
             pressed: false,
             window_protocol_id: Some(9),
+            position: None,
             event_elapsed_ms: Some(18.0),
         },
     ];
@@ -1123,6 +1125,7 @@ fn input_cursor_accepts_events_only_after_role_update() {
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(42),
+            position: None,
             event_elapsed_ms: None,
         }],
         keyboard_events: vec![NativeKeyboardEventProof {
@@ -1134,7 +1137,7 @@ fn input_cursor_accepts_events_only_after_role_update() {
         mouse_scroll_event_count: 3,
         scroll_delta_x: 4.0,
         scroll_delta_y: 8.0,
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
 
     assert_eq!(cursor.last_mouse_button_sequence, 0);
@@ -1154,9 +1157,10 @@ fn button_press_only_input_delta_is_coalescible() {
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(42),
+            position: None,
             event_elapsed_ms: None,
         }],
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
     let click_pair = NativeInputAdapterProof {
         mouse_button_events: vec![
@@ -1165,6 +1169,7 @@ fn button_press_only_input_delta_is_coalescible() {
                 button: "left".to_owned(),
                 pressed: true,
                 window_protocol_id: Some(42),
+                position: None,
                 event_elapsed_ms: None,
             },
             NativeMouseButtonEventProof {
@@ -1172,10 +1177,11 @@ fn button_press_only_input_delta_is_coalescible() {
                 button: "left".to_owned(),
                 pressed: false,
                 window_protocol_id: Some(42),
+                position: None,
                 event_elapsed_ms: None,
             },
         ],
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
 
     assert!(native_input_delta_is_button_press_only(&press_only));
@@ -1192,9 +1198,10 @@ fn clean_press_only_poll_does_not_accept_input_cursor() {
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(42),
+            position: None,
             event_elapsed_ms: None,
         }],
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
     let clean_poll = NativePollResult::clean(0);
 
@@ -1214,9 +1221,10 @@ fn dirty_press_only_poll_accepts_input_cursor() {
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(42),
+            position: None,
             event_elapsed_ms: None,
         }],
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
     let dirty_poll = NativePollResult {
         dirty: true,
@@ -1235,7 +1243,7 @@ fn dirty_press_only_poll_accepts_input_cursor() {
 fn raw_wake_without_input_delta_is_not_reportable_host_input() {
     let raw_wake = NativeInputAdapterProof {
         real_os_events_observed: false,
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
     let press = NativeInputAdapterProof {
         real_os_events_observed: true,
@@ -1244,9 +1252,10 @@ fn raw_wake_without_input_delta_is_not_reportable_host_input() {
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(42),
+            position: None,
             event_elapsed_ms: None,
         }],
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
     let motion = NativeInputAdapterProof {
         real_os_events_observed: true,
@@ -1257,7 +1266,7 @@ fn raw_wake_without_input_delta_is_not_reportable_host_input() {
             window_width: 640.0,
             window_height: 480.0,
         }),
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
 
     assert!(!native_input_delta_has_reportable_host_event(&raw_wake));
@@ -1277,7 +1286,7 @@ fn pointer_motion_only_input_delta_can_yield_to_newer_input() {
             window_width: 640.0,
             window_height: 480.0,
         }),
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
     let button_delta = NativeInputAdapterProof {
         real_os_events_observed: true,
@@ -1286,20 +1295,20 @@ fn pointer_motion_only_input_delta_can_yield_to_newer_input() {
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(42),
+            position: motion_only.mouse_window_pos,
             event_elapsed_ms: None,
         }],
         mouse_window_pos: motion_only.mouse_window_pos.clone(),
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
     let scroll_delta = NativeInputAdapterProof {
         real_os_events_observed: true,
         mouse_window_pos: motion_only.mouse_window_pos.clone(),
         scroll_delta_y: 120.0,
-        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full)
+        ..empty_input_adapter_proof(false, NativeSyntheticInputProbeKind::Full, None)
     };
 
     assert!(native_input_delta_is_pointer_motion_only(&motion_only));
     assert!(!native_input_delta_is_pointer_motion_only(&button_delta));
     assert!(!native_input_delta_is_pointer_motion_only(&scroll_delta));
 }
-

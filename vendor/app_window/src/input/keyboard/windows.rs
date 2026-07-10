@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::input::InputEventOrigin;
 use crate::input::keyboard::Shared;
 use crate::input::keyboard::key::KeyboardKey;
 use std::ffi::c_void;
@@ -86,7 +87,7 @@ pub fn kbd_window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, _l_param: LPARAM) 
                     .lock()
                     .unwrap()
                     .apply_all(|shared| {
-                        shared.set_key_state(key, true, window_ptr);
+                        shared.set_key_state(key, true, window_ptr, InputEventOrigin::RealOs);
                     });
                 LRESULT(0)
             } else {
@@ -101,7 +102,7 @@ pub fn kbd_window_proc(hwnd: HWND, msg: u32, w_param: WPARAM, _l_param: LPARAM) 
                     .lock()
                     .unwrap()
                     .apply_all(|shared| {
-                        shared.set_key_state(key, false, window_ptr);
+                        shared.set_key_state(key, false, window_ptr, InputEventOrigin::RealOs);
                     });
                 LRESULT(0)
             } else {

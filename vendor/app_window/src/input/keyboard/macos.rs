@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::input::InputEventOrigin;
 use crate::input::keyboard::Shared;
 use crate::input::keyboard::key::KeyboardKey;
 use std::ffi::c_void;
@@ -20,7 +21,7 @@ unsafe extern "C" fn raw_input_key_notify_func(
     let shared = unsafe { Weak::from_raw(ctx as *const Shared) };
     if let Some(shared) = shared.upgrade() {
         let key_code = KeyboardKey::from_code(key_code).expect("Unknown key code {key_code}");
-        shared.set_key_state(key_code, down, window);
+        shared.set_key_state(key_code, down, window, InputEventOrigin::RealOs);
     }
     std::mem::forget(shared); //keep weak reference alive as it is still owned by the target function
 }

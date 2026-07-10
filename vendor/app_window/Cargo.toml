@@ -176,16 +176,6 @@ version = "0.24.0"
 [target.'cfg(target_os="linux")'.dependencies.accesskit_unix]
 version = "0.20.0"
 
-[target.'cfg(target_os="linux")'.dependencies.ampsc]
-version = "0.2.0"
-
-[target.'cfg(target_os="linux")'.dependencies.atspi]
-version = "0.29.0"
-features = []
-
-[target.'cfg(target_os="linux")'.dependencies.io-uring]
-version = "0.7.9"
-
 [target.'cfg(target_os="linux")'.dependencies.libc]
 version = "0.2.175"
 
@@ -211,6 +201,9 @@ features = ["client"]
 
 [target.'cfg(target_os="linux")'.dependencies.zune-png]
 version = "0.5.1"
+
+[target.'cfg(target_os="linux")'.dev-dependencies.wayland-server]
+version = "=0.31.11"
 
 [target.'cfg(target_os="windows")'.dependencies.windows]
 version = "0.62.2"

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
+use crate::input::InputEventOrigin;
 use crate::input::keyboard::Shared;
 use crate::input::keyboard::key::KeyboardKey;
 use std::ffi::c_void;
@@ -30,7 +31,12 @@ impl PlatformCoalescedKeyboard {
                         let key = KeyboardKey::from_js_code(&code)
                             .unwrap_or_else(|| panic!("Unknown key: {}", key));
 
-                        shared.set_key_state(key, true, ARBITRARY_WINDOW_PTR);
+                        shared.set_key_state(
+                            key,
+                            true,
+                            ARBITRARY_WINDOW_PTR,
+                            InputEventOrigin::RealOs,
+                        );
                     }
                 })
                     as Box<dyn FnMut(KeyboardEvent)>);
@@ -48,7 +54,12 @@ impl PlatformCoalescedKeyboard {
                     if let Some(shared) = weak_up.upgrade() {
                         let key = KeyboardKey::from_js_code(&code)
                             .unwrap_or_else(|| panic!("Unknown key: {}", key));
-                        shared.set_key_state(key, false, ARBITRARY_WINDOW_PTR);
+                        shared.set_key_state(
+                            key,
+                            false,
+                            ARBITRARY_WINDOW_PTR,
+                            InputEventOrigin::RealOs,
+                        );
                     }
                 })
                     as Box<dyn FnMut(KeyboardEvent)>);

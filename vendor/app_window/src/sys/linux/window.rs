@@ -18,6 +18,7 @@ use super::cursor::CursorRequest;
 use super::main_thread::MAIN_THREAD_INFO;
 use super::{App, AppState, Configure, FullscreenError, Surface, SurfaceEvents};
 use crate::coordinates::{Position, Size};
+use crate::input::{keyboard, mouse};
 use crate::surface::SurfaceContentReport;
 use accesskit::{ActionRequest, TreeUpdate};
 
@@ -43,12 +44,14 @@ pub(super) struct WindowInternal {
     pub wl_pointer_pos: Option<Position>,
     pub wl_pointer: Option<WlPointer>,
     pub wl_keyboard: Option<WlKeyboard>,
+    pub surface_mouse: Arc<mouse::Shared>,
+    pub surface_keyboard: Arc<keyboard::Shared>,
     pub xdg_toplevel: Option<XdgToplevel>,
     pub wl_surface: Option<WlSurface>,
     pub xdg_surface: Option<XdgSurface>,
     pub drawable_buffer: Option<AllocatedBuffer>,
     pub requested_maximize: bool,
-    pub adapter: Option<accesskit_unix::Adapter>,
+    pub adapter: Arc<Mutex<Option<accesskit_unix::Adapter>>>,
     pub latest_accessibility_tree_update: Option<TreeUpdate>,
     pub accessibility_action_requests: Vec<ActionRequest>,
     pub size_update_notify: Option<DebugWrapper>,
@@ -87,6 +90,7 @@ impl WindowInternal {
         queue_handle: &QueueHandle<App>,
         ax: bool,
     ) -> Arc<Mutex<Self>> {
+        let adapter = Arc::new(Mutex::new(None));
         let window_internal = Arc::new(Mutex::new(WindowInternal {
             title: title.clone(),
             app_state: Arc::downgrade(app_state),
@@ -101,11 +105,13 @@ impl WindowInternal {
             wl_pointer_pos: None,
             wl_pointer: None,
             wl_keyboard: None,
+            surface_mouse: Arc::new(mouse::Shared::new()),
+            surface_keyboard: Arc::new(keyboard::Shared::new()),
             xdg_toplevel: None,
             wl_surface: None,
             requested_maximize: false,
             drawable_buffer: None,
-            adapter: None,
+            adapter: Arc::clone(&adapter),
             latest_accessibility_tree_update: None,
             accessibility_action_requests: Vec::new(),
             size_update_notify: None,
@@ -121,11 +127,8 @@ impl WindowInternal {
         }));
         if ax {
             let _aximpl = AX::new(size, title.clone(), window_internal.clone());
-            let adapter = Some(accesskit_unix::Adapter::new(
-                _aximpl.clone(),
-                _aximpl.clone(),
-                _aximpl.clone(),
-            ));
+            let accesskit_adapter =
+                accesskit_unix::Adapter::new(_aximpl.clone(), _aximpl.clone(), _aximpl.clone());
             let buffer = AllocatedBuffer::new(
                 size.width() as i32,
                 size.height() as i32,
@@ -134,7 +137,7 @@ impl WindowInternal {
                 window_internal.clone(),
             );
             window_internal.lock().unwrap().drawable_buffer = Some(buffer);
-            window_internal.lock().unwrap().adapter = adapter;
+            adapter.lock().unwrap().replace(accesskit_adapter);
         }
         window_internal
     }
@@ -302,7 +305,8 @@ impl Window {
 
                 // Seat (input devices) may not be available in headless environments
                 let seat_result: Result<WlSeat, _> =
-                    info.globals.bind(&info.queue_handle, 1..=9, ());
+                    info.globals
+                        .bind(&info.queue_handle, 1..=9, window_internal.clone());
                 if let Ok(seat) = seat_result {
                     window_internal
                         .lock()
@@ -314,11 +318,6 @@ impl Window {
                         .lock()
                         .unwrap()
                         .replace(seat.clone());
-                    let pointer = seat.get_pointer(&info.queue_handle, window_internal.clone());
-                    let keyboard = seat.get_keyboard(&info.queue_handle, window_internal.clone());
-                    let mut window = window_internal.lock().unwrap();
-                    window.wl_pointer = Some(pointer);
-                    window.wl_keyboard = Some(keyboard);
                 }
 
                 MAIN_THREAD_INFO.replace(Some(info));
@@ -384,6 +383,8 @@ impl Drop for Window {
 #[cfg(test)]
 mod tests {
     use super::{ConfigureContentBufferAction, configure_content_buffer_action};
+
+    include!("window/per_surface_wayland_input.rs");
 
     #[test]
     fn configure_uses_shm_buffer_before_external_surface_exists() {

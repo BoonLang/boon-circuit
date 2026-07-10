@@ -98,9 +98,6 @@ const DEV_TYPE_INSPECTOR_VALUE_MAX_FIELDS: usize = 16;
 const DEV_TYPE_INSPECTOR_DEFAULT_LIST_ITEMS: usize = 1;
 const DEV_TYPE_INSPECTOR_LIST_LOAD_STEP: usize = 4;
 const DEV_TYPE_INSPECTOR_VALUE_MAX_LIST_ITEMS: usize = 64;
-const DEV_PREVIEW_SUMMARY_REFRESH_MS: u64 = 15_000;
-const DEV_PREVIEW_INSPECTOR_REFRESH_MS: u64 = 250;
-const DEV_PREVIEW_PERF_REFRESH_MS: u64 = 1_000;
 const DEV_PREVIEW_PERF_SNAPSHOT_MAX_PAYLOAD_BYTES: u64 = 4096;
 const DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS: u64 = 35;
 const DEFAULT_PREVIEW_WIDTH: f32 = 920.0;
@@ -1513,6 +1510,7 @@ fn deterministic_keyboard_input_from_keys(
         real_os_events_observed: false,
         input_injection_method: "deterministic_app_owned_keyboard_event_batch".to_owned(),
         synthetic_input_probe: false,
+        host_events: Vec::new(),
         mouse_last_window_protocol_id: None,
         keyboard_last_window_protocol_id: Some(1),
         mouse_motion_event_count: 0,
@@ -1528,6 +1526,97 @@ fn deterministic_keyboard_input_from_keys(
         scroll_delta_x: 0.0,
         scroll_delta_y: 0.0,
     }
+}
+
+fn canonical_native_input_from_host_events(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+) -> boon_native_app_window::NativeInputAdapterProof {
+    if input.host_events.is_empty() {
+        return input.clone();
+    }
+    let mut canonical = input.clone();
+    canonical.capture_scope = "boon_host_ordered_event_envelopes".to_owned();
+    canonical.mouse_button_events.clear();
+    canonical.keyboard_events.clear();
+    canonical.scroll_delta_x = 0.0;
+    canonical.scroll_delta_y = 0.0;
+    canonical.real_os_events_observed = input
+        .host_events
+        .iter()
+        .any(|event| event.origin == boon_host::HostEventOrigin::RealOs);
+    for envelope in &input.host_events {
+        match &envelope.event {
+            boon_host::HostEvent::Pointer(pointer) => {
+                let position = boon_native_app_window::NativeMouseWindowPosition {
+                    x: f64::from(pointer.x),
+                    y: f64::from(pointer.y),
+                    window_width: input
+                        .mouse_window_pos
+                        .map(|position| position.window_width)
+                        .unwrap_or_default(),
+                    window_height: input
+                        .mouse_window_pos
+                        .map(|position| position.window_height)
+                        .unwrap_or_default(),
+                };
+                match pointer.phase {
+                    boon_host::PointerPhase::Move => canonical.mouse_window_pos = Some(position),
+                    boon_host::PointerPhase::Leave => canonical.mouse_window_pos = None,
+                    boon_host::PointerPhase::Down | boon_host::PointerPhase::Up => {
+                        canonical.mouse_window_pos = Some(position);
+                        canonical.mouse_button_events.push(
+                            boon_native_app_window::NativeMouseButtonEventProof {
+                                sequence: envelope.sequence,
+                                button: match pointer.button {
+                                    Some(boon_host::PointerButton::Primary) => "left",
+                                    Some(boon_host::PointerButton::Secondary) => "right",
+                                    Some(boon_host::PointerButton::Middle) => "middle",
+                                    Some(boon_host::PointerButton::Other(_)) | None => "other",
+                                }
+                                .to_owned(),
+                                pressed: pointer.phase == boon_host::PointerPhase::Down,
+                                window_protocol_id: input.mouse_last_window_protocol_id,
+                                position: Some(position),
+                                event_elapsed_ms: None,
+                            },
+                        );
+                    }
+                }
+            }
+            boon_host::HostEvent::Wheel(wheel) => {
+                canonical.mouse_window_pos =
+                    Some(boon_native_app_window::NativeMouseWindowPosition {
+                        x: f64::from(wheel.x),
+                        y: f64::from(wheel.y),
+                        window_width: input
+                            .mouse_window_pos
+                            .map(|position| position.window_width)
+                            .unwrap_or_default(),
+                        window_height: input
+                            .mouse_window_pos
+                            .map(|position| position.window_height)
+                            .unwrap_or_default(),
+                    });
+                canonical.scroll_delta_x += f64::from(wheel.delta_x);
+                canonical.scroll_delta_y += f64::from(wheel.delta_y);
+            }
+            boon_host::HostEvent::Keyboard(key) => {
+                canonical
+                    .keyboard_events
+                    .push(boon_native_app_window::NativeKeyboardEventProof {
+                        sequence: envelope.sequence,
+                        key: key.key.clone(),
+                        pressed: key.pressed,
+                        window_protocol_id: input.keyboard_last_window_protocol_id,
+                    });
+            }
+            boon_host::HostEvent::TextInput(_)
+            | boon_host::HostEvent::Focus { .. }
+            | boon_host::HostEvent::CloseRequested { .. }
+            | boon_host::HostEvent::Resize(_) => {}
+        }
+    }
+    canonical
 }
 
 fn cells_interaction_workflow_checks(summary: &Value) -> Vec<Value> {
@@ -5404,6 +5493,12 @@ fn set_input_window_size(
         position.window_width = f64::from(viewport.0);
         position.window_height = f64::from(viewport.1);
     }
+    for event in &mut input.mouse_button_events {
+        if let Some(position) = event.position.as_mut() {
+            position.window_width = f64::from(viewport.0);
+            position.window_height = f64::from(viewport.1);
+        }
+    }
 }
 
 fn deterministic_motion_input_from_counts(
@@ -5697,12 +5792,17 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             .lock()
             .map(|state| preview_content_revision(state.update_count))
             .unwrap_or_default();
+        let detailed_input_poll_diagnostics =
+            proof_mode == boon_native_app_window::NativeProofMode::Readback;
+        let detailed_background_poll_diagnostics = detailed_input_poll_diagnostics;
         let input_poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
             let poll_total_started = Instant::now();
             let mut poll_phase_timings_ms = serde_json::Map::new();
             macro_rules! note_poll_phase {
                 ($name:literal, $started:expr) => {
-                    poll_phase_timings_ms.insert($name.to_owned(), json!(elapsed_ms($started)));
+                    if detailed_input_poll_diagnostics {
+                        poll_phase_timings_ms.insert($name.to_owned(), json!(elapsed_ms($started)));
+                    }
                 };
             }
             let phase_started = Instant::now();
@@ -5866,9 +5966,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             note_poll_phase!("state_snapshot_ms", phase_started);
             let dirty = after_update_count != before_update_count || role_dirty_reason.is_some();
             last_input_poll_revision = last_input_poll_revision.max(after_content_revision);
-            poll_phase_timings_ms
-                .insert("total_ms".to_owned(), json!(elapsed_ms(poll_total_started)));
-            let diagnostics = json!({
+            if detailed_input_poll_diagnostics {
+                poll_phase_timings_ms
+                    .insert("total_ms".to_owned(), json!(elapsed_ms(poll_total_started)));
+            }
+            let diagnostics = detailed_input_poll_diagnostics.then(|| json!({
                 "kind": "preview_input_first_poll",
                 "dirty": dirty,
                 "forced_frame": context.forced_frame,
@@ -5892,7 +5994,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .iter()
                     .map(preview_interaction_timing_sample_json)
                     .collect::<Vec<_>>()
-            });
+            }));
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: last_input_poll_revision,
@@ -5905,7 +6007,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 next_wake_after_ms: None,
                 wants_animation_frame: false,
                 cursor_icon,
-                diagnostics: Some(diagnostics),
+                diagnostics,
                 accessibility_update: None,
             })
         });
@@ -5914,7 +6016,9 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let mut poll_phase_timings_ms = serde_json::Map::new();
             macro_rules! note_poll_phase {
                 ($name:literal, $started:expr) => {
-                    poll_phase_timings_ms.insert($name.to_owned(), json!(elapsed_ms($started)));
+                    if detailed_background_poll_diagnostics {
+                        poll_phase_timings_ms.insert($name.to_owned(), json!(elapsed_ms($started)));
+                    }
                 };
             }
             let phase_started = Instant::now();
@@ -6349,8 +6453,10 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 snapshot.map(|snapshot| snapshot.tree_update)
             };
             note_poll_phase!("accessibility_snapshot_ms", phase_started);
-            poll_phase_timings_ms
-                .insert("total_ms".to_owned(), json!(elapsed_ms(poll_total_started)));
+            if detailed_background_poll_diagnostics {
+                poll_phase_timings_ms
+                    .insert("total_ms".to_owned(), json!(elapsed_ms(poll_total_started)));
+            }
             let frame_lane_hint = if verifier_frame_requested {
                 Some(boon_native_app_window::NativeFrameLane::ProofOrHarness)
             } else if verifier_host_input_applied {
@@ -6358,7 +6464,11 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 preview_frame_lane_hint_for_current_interaction_scope()
             };
-            let poll_diagnostics = json!({
+            let emit_poll_diagnostics = detailed_background_poll_diagnostics
+                || verifier_frame_requested
+                || verifier_host_click_request.is_some()
+                || context.forced_frame;
+            let poll_diagnostics = emit_poll_diagnostics.then(|| json!({
                 "kind": "preview_role_poll",
                 "dirty": dirty,
                 "forced_frame": context.forced_frame,
@@ -6401,7 +6511,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .map(preview_interaction_timing_sample_json)
                     .collect::<Vec<_>>(),
                 "phase_timings_ms": poll_phase_timings_ms
-            });
+            }));
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: last_poll_revision,
@@ -6412,7 +6522,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 next_wake_after_ms: preview_text_input_caret_active.then_some(500),
                 wants_animation_frame: verifier_host_input_applied,
                 cursor_icon,
-                diagnostics: Some(poll_diagnostics),
+                diagnostics: poll_diagnostics,
                 accessibility_update,
             })
         });
@@ -6523,6 +6633,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let should_exit: boon_native_app_window::NativeExitHook =
             Box::new(move || should_exit_shutdown.exit_reason());
         Some(boon_native_app_window::NativeWindowHooks {
+            app_owned_pointer_script: None,
             input: Some(input_poll),
             poll: Some(poll),
             should_exit: Some(should_exit),
@@ -6544,6 +6655,7 @@ fn run_preview(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             input_sample_delay_ms,
             synthetic_input_probe,
             synthetic_input_probe_kind,
+            app_owned_pointer_script: None,
             sample_input_after_initial_frames: true,
             warmup_frame_count,
             sample_frame_count,
@@ -6633,6 +6745,18 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .any(|arg| arg == "--skip-interactive-surface-readback-when-external-proof");
     let skip_ipc_probe = args.iter().any(|arg| arg == "--skip-ipc-probe");
     let skip_visible_input_probe = args.iter().any(|arg| arg == "--skip-visible-input-probe");
+    let dev_coalesced_input_probe = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--dev-coalesced-input-probe" | "--dev-app-owned-input-probe"
+        )
+    });
+    let dev_coalesced_input_source = value_arg(args, "--dev-coalesced-input-source")
+        .unwrap_or_else(|| "dev.commands.test".to_owned());
+    let dev_coalesced_input_label = value_arg(args, "--dev-coalesced-input-label")
+        .unwrap_or_else(|| "counter-test-button".to_owned());
+    let dev_coalesced_input_delay_ms =
+        numeric_arg(args, "--dev-coalesced-input-delay-ms").unwrap_or(0);
     let preview_loop_report = value_arg(args, "--preview-loop-report").map(PathBuf::from);
     let ipc_stress_messages = numeric_arg(args, "--ipc-stress-messages").unwrap_or(4_096);
     let ipc_queue_capacity = numeric_arg(args, "--ipc-queue-capacity").unwrap_or(256);
@@ -6641,9 +6765,10 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         numeric_arg(args, "--operator-host-input-source-event-limit")
             .map(|limit| limit as usize)
             .unwrap_or(DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT);
-    let skip_operator_host_input_probe = args
-        .iter()
-        .any(|arg| arg == "--skip-operator-host-input-probe");
+    let skip_operator_host_input_probe = dev_coalesced_input_probe
+        || args
+            .iter()
+            .any(|arg| arg == "--skip-operator-host-input-probe");
     let title = role_window_title("Boon Dev", value_arg(args, "--title-token").as_deref());
     let role_args = args[1..].to_vec();
     let warmup_frame_count = numeric_arg(args, "--warmup-frame-count").unwrap_or(0) as u32;
@@ -6658,12 +6783,47 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .map(boon_runtime::source_text_for_path)
         .transpose()?
         .unwrap_or_else(|| "document = []".to_owned());
-    let dev_shell = Arc::new(Mutex::new(DevWindowShell::new(
+    let verifier_host_input_expected_completed =
+        if dev_coalesced_input_probe && dev_coalesced_input_source == "dev.commands.test" {
+            editor_code_file
+                .as_deref()
+                .map(preview_test_host_clicks)
+                .map(|clicks| clicks.len() * DEV_COALESCED_POINTER_CLICK_REPETITIONS)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+    let dev_wake = boon_native_app_window::NativeWakeHandle::new();
+    let mut shell = DevWindowShell::new(
         &dev_source_path_label,
         &dev_source_text,
         selected_example_id.as_deref(),
         PreviewTransport::new(Some(connect.clone())),
-    )));
+    );
+    shell.native_wake = Some(dev_wake.clone());
+    let dev_shell = Arc::new(Mutex::new(shell));
+    let app_owned_pointer_script = None;
+    let dev_coalesced_input_probe_request = if dev_coalesced_input_probe {
+        json!({
+            "status": "configured",
+            "label": dev_coalesced_input_label.clone(),
+            "source_path": dev_coalesced_input_source.clone(),
+            "delay_ms": dev_coalesced_input_delay_ms,
+            "input_boundary": "app_window::Mouse coalesced pointer script -> dev poll hook",
+            "target_resolution": "typed_hit_side_table_for_current_surface_size",
+            "pointer_steps": ["motion", "press", "release"],
+            "pointer_repetitions": DEV_COALESCED_POINTER_CLICK_REPETITIONS,
+            "editor_steps": ["motion", "wheel", "press", "release", "key_down", "key_up"],
+            "shell_clone_probe": false,
+            "direct_dispatch_without_hit_test": false,
+            "app_owned_pointer_script": serde_json::Value::Null
+        })
+    } else {
+        json!({
+            "status": "not-run",
+            "reason": "dev coalesced input probe was not requested"
+        })
+    };
     let dev_render_state = Arc::new(Mutex::new(DevRenderState::default()));
     let hooks: Option<boon_native_app_window::NativeWindowHooks> = {
         let mut visible_renderer = None;
@@ -6679,6 +6839,10 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let poll_shell = Arc::clone(&dev_shell);
         let render_state = Arc::clone(&dev_render_state);
         let poll_render_state = Arc::clone(&dev_render_state);
+        let poll_dev_coalesced_input_probe = dev_coalesced_input_probe;
+        let poll_dev_coalesced_input_source = dev_coalesced_input_source.clone();
+        let poll_dev_coalesced_input_label = dev_coalesced_input_label.clone();
+        let mut last_dev_coalesced_input_probe_summary = None::<serde_json::Value>;
         let poll: boon_native_app_window::NativePollHook = Box::new(move |context| {
             let mut shell = poll_shell
                 .lock()
@@ -6686,10 +6850,16 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             let mut render_state = poll_render_state
                 .lock()
                 .map_err(|_| "dev render state mutex poisoned".to_owned())?;
+            let input_delta = canonical_native_input_from_host_events(&context.input_delta);
             let mut dirty = false;
             let mut role_dirty_reason = None;
             let mut layout_refreshed = false;
             let mut needs_layout_refresh = false;
+            let render_revision_before_input = render_state.revision;
+            let mut input_applied = false;
+            let mut layout_changed_from_input = false;
+            let mut input_dispatch_observation = DevInputDispatchObservation::default();
+            let mut source_hit_observation = serde_json::Value::Null;
             let caret_visible = dev_editor_caret_visible(&mut input_state, context.now);
             if shell.caret_visible != caret_visible {
                 shell.caret_visible = caret_visible;
@@ -6708,7 +6878,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
             let cache_stale =
                 cache_needs_dev_render_layout(&render_state, context.width, context.height);
-            let input_hot_path = dev_input_may_change(&context.input_delta, &input_state);
+            let input_hot_path = dev_input_may_change(&input_delta, &input_state);
             if cache_stale {
                 refresh_dev_render_layout(
                     &shell,
@@ -6729,17 +6899,62 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     render_state.layout_frame.clone(),
                 )
             {
-                let before_input = DevEditorSnapshot::from_shell(&shell);
-                let layout_changed = dev_apply_real_window_input_with_indexes(
-                    &context.input_delta,
+                if poll_dev_coalesced_input_probe
+                    && let Some(position) = input_layout_position(
+                        input_delta.mouse_window_pos,
+                        context.width,
+                        context.height,
+                    )
+                {
+                    source_hit_observation = dev_source_binding_at_with_indexes(
+                        &document,
+                        Some(&derived_indexes),
+                        &layout_frame,
+                        position.x as f32,
+                        position.y as f32,
+                    )
+                    .map(|(node_id, source_path, source_intent)| {
+                        json!({
+                            "node": node_id,
+                            "source_path": source_path,
+                            "source_intent": source_intent,
+                            "x": position.x,
+                            "y": position.y
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        json!({
+                            "status": "miss",
+                            "x": position.x,
+                            "y": position.y
+                        })
+                    });
+                }
+                update_dev_pointer_visual_state(
+                    &input_delta,
                     &document,
-                    &derived_indexes,
+                    Some(&derived_indexes),
+                    &layout_frame,
+                    context.width,
+                    context.height,
+                    &mut input_state,
+                );
+                let before_input = DevEditorSnapshot::from_shell(&shell);
+                let mut clipboard = NativeClipboardAdapter;
+                let layout_changed = dev_apply_real_window_input_with_clipboard_and_indexes(
+                    &input_delta,
+                    &document,
+                    Some(&derived_indexes),
                     &layout_frame,
                     context.width,
                     context.height,
                     &mut shell,
                     &mut input_state,
+                    &mut clipboard,
+                    Some(&mut input_dispatch_observation),
                 );
+                input_applied = true;
+                layout_changed_from_input = layout_changed;
                 if layout_changed {
                     dirty = true;
                     let after_input = DevEditorSnapshot::from_shell(&shell);
@@ -6793,41 +7008,22 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            let telemetry_refresh_allowed = !input_hot_path && !context.forced_frame;
-            if telemetry_refresh_allowed && shell.collect_preview_replace_result() {
+            let background_work_allowed = !input_hot_path && !context.forced_frame;
+            if background_work_allowed && shell.collect_preview_replace_result() {
                 dirty = true;
-                needs_layout_refresh = true;
                 role_dirty_reason =
                     Some(boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied);
-            }
-            if telemetry_refresh_allowed && shell.refresh_preview_summary_if_due(context.now) {
-                dirty = true;
-                needs_layout_refresh = true;
-                role_dirty_reason =
-                    Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
-            }
-            if telemetry_refresh_allowed && shell.refresh_preview_perf_snapshot_if_due(context.now)
-            {
-                dirty = true;
-                role_dirty_reason =
-                    Some(boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged);
-                if !needs_layout_refresh
-                    && !cache_needs_dev_render_layout(&render_state, context.width, context.height)
-                {
-                    let touched_nodes =
-                        patch_dev_render_footer_content_touched(&shell, &mut render_state);
-                    if !touched_nodes.is_empty() {
-                        mark_dev_render_fast_scene_patch(
-                            &mut render_state,
-                            "dev_footer_content",
-                            touched_nodes,
-                        );
-                        layout_refreshed = true;
-                    } else {
-                        needs_layout_refresh = true;
-                    }
-                } else {
+                let touched_nodes =
+                    patch_dev_render_footer_content_touched(&shell, &mut render_state);
+                if touched_nodes.is_empty() {
                     needs_layout_refresh = true;
+                } else {
+                    mark_dev_render_fast_scene_patch(
+                        &mut render_state,
+                        "dev_preview_replace_status",
+                        touched_nodes,
+                    );
+                    layout_refreshed = true;
                 }
             }
             if context.forced_frame && render_state.layout_frame.is_some() {
@@ -6847,25 +7043,26 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            if patch_dev_render_pointer_visual_state(&input_state, &mut render_state) {
+                dirty = true;
+                layout_refreshed = true;
+                role_dirty_reason = role_dirty_reason.or(Some(
+                    boon_native_app_window::NativeRoleDirtyReason::DocumentPatchApplied,
+                ));
+            }
             let caret_wake = input_state
                 .editor_focused
                 .then_some(BOON_EDITOR_CARET_BLINK_HALF_PERIOD_MS);
-            let telemetry_wake = telemetry_refresh_allowed.then(|| {
-                shell
-                    .preview_summary_wake_after_ms(context.now)
-                    .min(shell.preview_perf_wake_after_ms(context.now))
-            });
-            let next_wake_after_ms = [caret_wake, telemetry_wake].into_iter().flatten().min();
+            let next_wake_after_ms = caret_wake;
             let scheduler_reason = if context.forced_frame {
                 Some(boon_native_app_window::NativeSchedulerReason::VerifierFrame)
             } else if input_hot_path {
                 Some(boon_native_app_window::NativeSchedulerReason::HostInput)
             } else {
                 match role_dirty_reason {
-                    Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink)
-                    | Some(
-                        boon_native_app_window::NativeRoleDirtyReason::TelemetrySummaryChanged,
-                    ) => Some(boon_native_app_window::NativeSchedulerReason::Timer),
+                    Some(boon_native_app_window::NativeRoleDirtyReason::CaretBlink) => {
+                        Some(boon_native_app_window::NativeSchedulerReason::Timer)
+                    }
                     Some(boon_native_app_window::NativeRoleDirtyReason::LayoutChanged) => {
                         Some(boon_native_app_window::NativeSchedulerReason::SurfaceChanged)
                     }
@@ -6875,17 +7072,106 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     _ => None,
                 }
             };
+            let accepted_host_input_event_hint =
+                dev_accepted_host_input_hint(&input_delta, &input_dispatch_observation);
+            let diagnostics = poll_dev_coalesced_input_probe.then(|| {
+                let normalized_mouse_position = input_layout_position(
+                    input_delta.mouse_window_pos,
+                    context.width,
+                    context.height,
+                );
+                let input_injection_method = input_delta.input_injection_method.clone();
+                let last_dev_input_dispatch = shell.last_dev_input_dispatch.clone();
+                let observed_source_path = input_dispatch_observation.source_path.clone();
+                let coalesced_input_app_owned =
+                    input_injection_method.starts_with("app_window_app_owned_pointer_script:");
+                let coalesced_status = last_dev_input_dispatch
+                    .as_ref()
+                    .and_then(|dispatch| dispatch.get("status"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let coalesced_command = last_dev_input_dispatch
+                    .as_ref()
+                    .and_then(|dispatch| dispatch.get("command"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let coalesced_preview_mutation_allowed = last_dev_input_dispatch
+                    .as_ref()
+                    .and_then(|dispatch| {
+                        dispatch.pointer("/preview_transport/preview_mutation_allowed")
+                    })
+                    .and_then(serde_json::Value::as_bool);
+                let coalesced_probe_pass = coalesced_input_app_owned
+                    && !input_delta.synthetic_input_probe
+                    && observed_source_path.as_deref()
+                        == Some(poll_dev_coalesced_input_source.as_str())
+                    && coalesced_status.as_deref() == Some("pass");
+                let current_probe = json!({
+                    "status": if coalesced_probe_pass { "pass" } else { "pending-or-fail" },
+                    "label": poll_dev_coalesced_input_label.clone(),
+                    "requested_source_path": poll_dev_coalesced_input_source.clone(),
+                    "clicked_source_path": observed_source_path,
+                    "clicked_source_intent": input_dispatch_observation.source_intent.clone(),
+                    "clicked_node": input_dispatch_observation.node_id.clone(),
+                    "command": coalesced_command,
+                    "command_status": coalesced_status,
+                    "preview_mutation_allowed": coalesced_preview_mutation_allowed,
+                    "input_injection_method": input_injection_method,
+                    "app_owned_window_input": coalesced_input_app_owned,
+                    "real_os_input": false,
+                    "real_os_events_observed": input_delta.real_os_events_observed,
+                    "synthetic_input_probe": input_delta.synthetic_input_probe,
+                    "shell_clone_probe": false,
+                    "direct_dispatch_without_hit_test": false,
+                    "accepted_host_input_event_hint": accepted_host_input_event_hint.clone(),
+                    "target_cursor": normalized_mouse_position,
+                    "source_hit": source_hit_observation.clone(),
+                    "hovered_node": input_state.hovered_node.clone(),
+                    "pressed_node": input_state.pressed_node.clone(),
+                    "retained_hover_style_active": input_state
+                        .hovered_node
+                        .as_deref()
+                        .is_some_and(|hovered_node| render_state.layout_frame.as_ref().is_some_and(|frame| {
+                            frame.display_list.iter().any(|item| {
+                                item.node.0 == hovered_node
+                                    && item.style.get("__hover")
+                                        == Some(&boon_document_model::StyleValue::Bool(true))
+                            })
+                        })),
+                    "last_dev_input_dispatch": last_dev_input_dispatch
+                });
+                if coalesced_probe_pass || last_dev_coalesced_input_probe_summary.is_none() {
+                    last_dev_coalesced_input_probe_summary = Some(current_probe.clone());
+                }
+                json!({
+                    "input_route": "dev_live_poll_hook",
+                    "dev_coalesced_input_probe": last_dev_coalesced_input_probe_summary
+                        .clone()
+                        .unwrap_or(current_probe),
+                    "cache_stale": cache_stale,
+                    "input_hot_path": input_hot_path,
+                    "input_applied": input_applied,
+                    "layout_changed_from_input": layout_changed_from_input,
+                    "layout_refreshed": layout_refreshed,
+                    "needs_layout_refresh": needs_layout_refresh,
+                    "dirty": dirty,
+                    "render_revision_before_input": render_revision_before_input,
+                    "render_revision_after_poll": render_state.revision
+                })
+            });
+            let cursor_icon =
+                dev_pointer_cursor_icon(&shell, &input_state, render_state.layout_frame.as_ref());
             Ok(boon_native_app_window::NativePollResult {
                 dirty,
                 role_revision: render_state.revision,
                 scheduler_reason,
                 role_dirty_reason,
                 frame_lane: None,
-                accepted_host_input_event_hint: None,
+                accepted_host_input_event_hint,
                 next_wake_after_ms,
                 wants_animation_frame: false,
-                cursor_icon: shell.current_cursor_icon(),
-                diagnostics: None,
+                cursor_icon,
+                diagnostics,
                 accessibility_update: None,
             })
         });
@@ -6951,7 +7237,71 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 role_dirty_reason: None,
             })
         });
+        let pointer_script = if dev_coalesced_input_probe {
+            let target_shell = Arc::clone(&dev_shell);
+            let target_source = dev_coalesced_input_source.clone();
+            let target_label = dev_coalesced_input_label.clone();
+            let mut script_step = 0_u8;
+            Some(Box::new(
+                move |context: boon_native_app_window::NativePointerScriptContext| {
+                    const POINTER_STEPS_PER_CLICK: u8 = 3;
+                    const POINTER_CLICK_REPETITIONS: u8 =
+                        DEV_COALESCED_POINTER_CLICK_REPETITIONS as u8;
+                    const POINTER_CLICK_STEP_COUNT: u8 =
+                        POINTER_STEPS_PER_CLICK * POINTER_CLICK_REPETITIONS;
+                    const SCRIPT_STEP_COUNT: u8 = POINTER_CLICK_STEP_COUNT + 6;
+                    if script_step >= SCRIPT_STEP_COUNT {
+                        return None;
+                    }
+                    let shell = target_shell.lock().ok()?;
+                    let step_target = if script_step < POINTER_CLICK_STEP_COUNT {
+                        target_source.as_str()
+                    } else {
+                        "dev.editor.insert_text"
+                    };
+                    let mut script = dev_app_owned_pointer_script_for_source_path(
+                        &shell,
+                        step_target,
+                        &target_label,
+                        context.width as f32,
+                        context.height as f32,
+                        0,
+                    )
+                    .ok()?;
+                    script.press = false;
+                    script.release = false;
+                    if script_step < POINTER_CLICK_STEP_COUNT {
+                        match script_step % POINTER_STEPS_PER_CLICK {
+                            1 => script.press = true,
+                            2 => script.release = true,
+                            _ => {}
+                        }
+                    } else {
+                        match script_step - POINTER_CLICK_STEP_COUNT {
+                            1 => script.scroll_delta_y = 72.0,
+                            2 => script.press = true,
+                            3 => script.release = true,
+                            4 => {
+                                script.key = Some("DownArrow".to_owned());
+                                script.key_pressed = Some(true);
+                            }
+                            5 => {
+                                script.key = Some("DownArrow".to_owned());
+                                script.key_pressed = Some(false);
+                            }
+                            _ => {}
+                        }
+                    }
+                    script_step = script_step.saturating_add(1);
+                    Some(script)
+                },
+            )
+                as boon_native_app_window::NativePointerScriptHook)
+        } else {
+            None
+        };
         Some(boon_native_app_window::NativeWindowHooks {
+            app_owned_pointer_script: pointer_script,
             input: None,
             poll: Some(poll),
             should_exit: None,
@@ -6970,6 +7320,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             input_sample_delay_ms,
             synthetic_input_probe,
             synthetic_input_probe_kind,
+            app_owned_pointer_script,
             sample_input_after_initial_frames: true,
             warmup_frame_count,
             sample_frame_count,
@@ -6982,7 +7333,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             skip_interactive_surface_readback_when_external_proof,
         },
         hooks,
-        boon_native_app_window::NativeWakeHandle::new(),
+        dev_wake,
         move |proof| {
             let result = match proof {
                 Ok(proof) => report
@@ -6998,6 +7349,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 replace_code_expected_hash.as_deref(),
                                 skip_operator_host_input_probe,
                                 operator_host_input_source_event_limit,
+                                verifier_host_input_expected_completed,
                                 preview_loop_report.as_deref(),
                                 Duration::from_millis(ipc_probe_timeout_ms),
                             )
@@ -7051,6 +7403,7 @@ fn run_dev(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                                 "replace_code_expected_hash": replace_code_expected_hash,
                                 "ipc_probe": ipc_probe,
                                 "verification_probe_enabled": probe,
+                                "dev_coalesced_input_probe_request": dev_coalesced_input_probe_request,
                                 "dev_shell_interaction_probe": dev_shell_interaction_probe,
                                 "app_window_surface_proof": proof,
                                 "app_window_contract": boon_native_app_window::app_window_contract(),
@@ -7105,7 +7458,18 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let dev_editor_only = args.iter().any(|arg| arg == "--dev-editor-only");
     let probe = report.is_some() || args.iter().any(|arg| arg == "--probe");
     let real_window_input_probe = args.iter().any(|arg| arg == "--real-window-input-probe");
-    let dev_app_owned_input_probe = args.iter().any(|arg| arg == "--dev-app-owned-input-probe");
+    let dev_coalesced_input_probe = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--dev-coalesced-input-probe" | "--dev-app-owned-input-probe"
+        )
+    });
+    let dev_coalesced_input_source = value_arg(args, "--dev-coalesced-input-source")
+        .unwrap_or_else(|| "dev.commands.test".to_owned());
+    let dev_coalesced_input_label = value_arg(args, "--dev-coalesced-input-label")
+        .unwrap_or_else(|| "counter-test-button".to_owned());
+    let dev_coalesced_input_delay_ms =
+        numeric_arg(args, "--dev-coalesced-input-delay-ms").unwrap_or(0);
     let synthetic_scroll_probe = args.iter().any(|arg| arg == "--synthetic-scroll-probe");
     let demand_driven_loop = args.iter().any(|arg| arg == "--demand-driven-loop");
     let adapter_policy = native_adapter_policy_arg(args)?;
@@ -7328,8 +7692,19 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 .to_owned(),
         ]);
     }
-    if (probe && !real_window_input_probe) || dev_app_owned_input_probe {
+    if probe && !real_window_input_probe && !dev_coalesced_input_probe {
         dev_args.push("--synthetic-input-probe".to_owned());
+    }
+    if dev_coalesced_input_probe {
+        dev_args.extend([
+            "--dev-coalesced-input-probe".to_owned(),
+            "--dev-coalesced-input-source".to_owned(),
+            dev_coalesced_input_source,
+            "--dev-coalesced-input-label".to_owned(),
+            dev_coalesced_input_label,
+            "--dev-coalesced-input-delay-ms".to_owned(),
+            dev_coalesced_input_delay_ms.to_string(),
+        ]);
     }
     if demand_driven_loop {
         dev_args.push("--demand-driven-loop".to_owned());
@@ -7348,7 +7723,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if skip_dev_ipc_probe {
         dev_args.push("--skip-ipc-probe".to_owned());
     }
-    if skip_dev_visible_input_probe {
+    if skip_dev_visible_input_probe || dev_coalesced_input_probe {
         dev_args.push("--skip-visible-input-probe".to_owned());
     }
     if args
@@ -7366,6 +7741,16 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         json!({"preview_child_pid": preview_pid, "dev_child_pid": dev_pid}),
     );
     let dev_cmdline = wait_for_proc_cmdline(dev_pid, "--role", "dev");
+    let mut process_cpu_sampler = if probe {
+        Some(DesktopProcessCpuSampler::start(
+            preview_pid,
+            dev_pid,
+            Duration::from_millis(250),
+            256,
+        ))
+    } else {
+        None
+    };
     if let Some(path) = live_state_report.as_deref() {
         write_live_state_report(
             path,
@@ -7397,6 +7782,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) =
         wait_for_report_or_child_exit(&dev_report, &mut dev, "dev", role_report_timeout)
     {
+        let process_cpu_evidence = finish_desktop_process_cpu_sampler(&mut process_cpu_sampler);
         if let Some(report) = report.as_deref() {
             write_desktop_report(
                 report,
@@ -7410,6 +7796,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     "source_bytes": source.len(),
                     "source_sha256": source_sha256,
                     "process_model": "two-child-processes",
+                    "desktop_process_pid": std::process::id(),
                     "preview_role_status": "unknown",
                     "dev_role_status": "missing-report",
                     "preview_child_pid": preview_pid,
@@ -7430,6 +7817,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     "display_connection": display_connection(),
                     "role_report_timeout_ms": role_report_timeout_ms,
                     "dev_ipc_probe_timeout_ms": dev_ipc_probe_timeout_ms,
+                    "process_cpu_evidence": process_cpu_evidence,
                     "early_role_report_failure": error.to_string(),
                     "note": "desktop supervisor stopped because a child role exited before writing its app-owned role report"
                 }),
@@ -7443,6 +7831,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "preview",
         role_report_timeout,
     ) {
+        let process_cpu_evidence = finish_desktop_process_cpu_sampler(&mut process_cpu_sampler);
         if let Some(report) = report.as_deref() {
             write_desktop_report(
                 report,
@@ -7456,6 +7845,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     "source_bytes": source.len(),
                     "source_sha256": source_sha256,
                     "process_model": "two-child-processes",
+                    "desktop_process_pid": std::process::id(),
                     "preview_role_status": "missing-report",
                     "dev_role_status": "pass",
                     "preview_child_pid": preview_pid,
@@ -7476,6 +7866,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     "display_connection": display_connection(),
                     "role_report_timeout_ms": role_report_timeout_ms,
                     "dev_ipc_probe_timeout_ms": dev_ipc_probe_timeout_ms,
+                    "process_cpu_evidence": process_cpu_evidence,
                     "early_role_report_failure": error.to_string(),
                     "note": "desktop supervisor stopped because a child role exited before writing its app-owned role report"
                 }),
@@ -7499,6 +7890,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         json!({"preview_child_pid": preview_pid, "dev_child_pid": dev_pid}),
     );
     let dev_status = dev.wait()?;
+    let process_cpu_evidence = finish_desktop_process_cpu_sampler(&mut process_cpu_sampler);
     write_desktop_progress(
         supervisor_progress_report.as_deref(),
         "dev-exited",
@@ -7591,6 +7983,10 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .pointer("/details/dev_shell_interaction_probe")
         .cloned()
         .unwrap_or_else(|| json!({"status": "missing"}));
+    let dev_coalesced_input_probe_request = dev_json
+        .pointer("/details/dev_coalesced_input_probe_request")
+        .cloned()
+        .unwrap_or_else(|| json!({"status": "missing"}));
     let preview_runtime_summary = preview_json
         .pointer("/details/preview_runtime_summary")
         .cloned()
@@ -7605,6 +8001,7 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "source_bytes": source.len(),
             "source_sha256": source_sha256,
             "process_model": "two-child-processes",
+            "desktop_process_pid": std::process::id(),
             "preview_role_status": preview_role_status,
             "dev_role_status": dev_role_status,
             "preview_child_pid": preview_pid,
@@ -7657,8 +8054,10 @@ fn run_desktop(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         details["dev_surface_proof"] = dev_proof;
         details["preview_runtime_summary"] = preview_runtime_summary;
         details["dev_ipc_probe"] = dev_ipc_probe;
+        details["dev_coalesced_input_probe_request"] = dev_coalesced_input_probe_request;
         details["dev_shell_interaction_probe"] = dev_shell_interaction_probe;
         details["preview_shutdown_ack"] = preview_shutdown_ack;
+        details["process_cpu_evidence"] = process_cpu_evidence;
         write_desktop_report(&report, &args[1..], details)?;
     }
     Ok(())
@@ -12340,9 +12739,6 @@ fn preview_input_overlay_render_scene_patch(
         &mut *columns,
         &touched_nodes,
     );
-    if items.is_empty() && visual_primitives.is_empty() && text_runs.is_empty() {
-        return None;
-    }
     let patch = boon_document::RenderScenePatch {
         operations: vec![
             boon_document::RenderScenePatchOperation::ReplaceNodeEntries {
@@ -12383,9 +12779,6 @@ fn preview_input_overlay_render_scene_patch_from_base(
         materialization: Vec::new(),
         metrics: boon_document::LayoutMetrics::default(),
     };
-    if patch_frame.display_list.is_empty() {
-        return None;
-    }
     preview_apply_hover_overlay_to_render_frame(&mut patch_frame, hover_overlay);
     preview_apply_focus_overlay_lookup_to_render_frame(&mut patch_frame, lookup, focus_overlay);
     let patch_frame =
@@ -13345,6 +13738,8 @@ fn dev_code_editor_model_report(shell: &DevWindowShell) -> serde_json::Value {
 struct DevNativeInputState {
     last_mouse_button_event_count: u64,
     last_mouse_motion_event_count: u64,
+    last_pointer_visual_motion_count: u64,
+    last_pointer_visual_button_sequence: u64,
     last_keyboard_event_sequence: u64,
     primary_modifier_down: bool,
     caret_blink_started_at: Option<Instant>,
@@ -13361,6 +13756,8 @@ struct DevNativeInputState {
     last_editor_click_position: Option<EditorPosition>,
     last_editor_click_sequence: u64,
     editor_click_count: u8,
+    hovered_node: Option<String>,
+    pressed_node: Option<String>,
     column_metric_cache: EditorColumnMetricCache,
 }
 
@@ -13378,6 +13775,19 @@ struct DevRenderState {
     passive_scroll_full_layout_refresh_count: u64,
     passive_scroll_fast_frame_patch_count: u64,
     fast_render_scene_patch: Option<DevFastRenderScenePatch>,
+    hovered_node: Option<String>,
+    pressed_node: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DevInputDispatchObservation {
+    source_path: Option<String>,
+    source_intent: Option<String>,
+    node_id: Option<String>,
+    event_sequence: Option<u64>,
+    button: Option<String>,
+    pressed: Option<bool>,
+    window_protocol_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -13607,6 +14017,128 @@ fn patch_dev_render_caret_visibility(shell: &DevWindowShell, render_state: &mut 
         }
     }
     mark_dev_render_fast_scene_patch(render_state, "dev_editor_caret", touched_nodes);
+}
+
+fn patch_dev_render_pointer_visual_state(
+    input_state: &DevNativeInputState,
+    render_state: &mut DevRenderState,
+) -> bool {
+    let Some(frame) = render_state.layout_frame.as_mut() else {
+        return false;
+    };
+    let mut candidate_nodes = BTreeSet::new();
+    candidate_nodes.extend(render_state.hovered_node.iter().cloned());
+    candidate_nodes.extend(render_state.pressed_node.iter().cloned());
+    candidate_nodes.extend(input_state.hovered_node.iter().cloned());
+    candidate_nodes.extend(input_state.pressed_node.iter().cloned());
+
+    let mut touched_nodes = BTreeSet::new();
+    for item in &mut frame.display_list {
+        if !candidate_nodes.contains(&item.node.0) {
+            continue;
+        }
+        let hover = input_state.hovered_node.as_deref() == Some(item.node.0.as_str());
+        let pressed = input_state.pressed_node.as_deref() == Some(item.node.0.as_str());
+        let mut changed = false;
+        if item.style.keys().any(|key| key.starts_with("__hover_")) {
+            changed |= item.style.insert(
+                "__hover".to_owned(),
+                boon_document_model::StyleValue::Bool(hover),
+            ) != Some(boon_document_model::StyleValue::Bool(hover));
+        }
+        if item.style.keys().any(|key| key.starts_with("__focus_")) {
+            changed |= item.style.insert(
+                "__focus".to_owned(),
+                boon_document_model::StyleValue::Bool(pressed),
+            ) != Some(boon_document_model::StyleValue::Bool(pressed));
+        }
+        if changed {
+            item.style_identity = boon_document::ComputedStyleIdentity::from_style(&item.style);
+            touched_nodes.insert(item.node.clone());
+        }
+    }
+    render_state.hovered_node = input_state.hovered_node.clone();
+    render_state.pressed_node = input_state.pressed_node.clone();
+    if touched_nodes.is_empty() {
+        return false;
+    }
+    mark_dev_render_fast_scene_patch(render_state, "dev_pointer_visual", touched_nodes);
+    true
+}
+
+fn update_dev_pointer_visual_state(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    document: &boon_document_model::DocumentFrame,
+    derived_indexes: Option<&boon_document::DocumentDerivedIndexBundle>,
+    layout_frame: &boon_document::LayoutFrame,
+    surface_width: u32,
+    surface_height: u32,
+    input_state: &mut DevNativeInputState,
+) {
+    if input.mouse_motion_event_count > input_state.last_pointer_visual_motion_count {
+        input_state.last_pointer_visual_motion_count = input.mouse_motion_event_count;
+        input_state.hovered_node =
+            input_layout_position(input.mouse_window_pos, surface_width, surface_height).and_then(
+                |position| {
+                    dev_source_binding_at_with_indexes(
+                        document,
+                        derived_indexes,
+                        layout_frame,
+                        position.x as f32,
+                        position.y as f32,
+                    )
+                    .map(|(node, _, _)| node)
+                },
+            );
+    }
+
+    let last_pointer_visual_button_sequence = input_state.last_pointer_visual_button_sequence;
+    for event in input.mouse_button_events.iter().filter(|event| {
+        event.sequence > last_pointer_visual_button_sequence && event.button == "left"
+    }) {
+        input_state.last_pointer_visual_button_sequence = event.sequence;
+        let hit_node = input_layout_position(
+            event.position.or(input.mouse_window_pos),
+            surface_width,
+            surface_height,
+        )
+        .and_then(|position| {
+            dev_source_binding_at_with_indexes(
+                document,
+                derived_indexes,
+                layout_frame,
+                position.x as f32,
+                position.y as f32,
+            )
+            .map(|(node, _, _)| node)
+        });
+        if event.pressed {
+            input_state.hovered_node = hit_node.clone();
+            input_state.pressed_node = hit_node;
+        } else {
+            input_state.pressed_node = None;
+        }
+    }
+}
+
+fn dev_pointer_cursor_icon(
+    shell: &DevWindowShell,
+    input_state: &DevNativeInputState,
+    layout_frame: Option<&boon_document::LayoutFrame>,
+) -> boon_native_app_window::NativeCursorIcon {
+    if shell.type_inspector_resize_hovered {
+        return boon_native_app_window::NativeCursorIcon::ColumnResize;
+    }
+    let Some(node) = input_state.hovered_node.as_deref() else {
+        return boon_native_app_window::NativeCursorIcon::Default;
+    };
+    layout_frame
+        .into_iter()
+        .flat_map(|frame| frame.display_list.iter())
+        .find(|item| item.node.0 == node)
+        .and_then(|item| display_style_text(&item.style, "cursor"))
+        .and_then(native_cursor_icon_from_style_text)
+        .unwrap_or(boon_native_app_window::NativeCursorIcon::Default)
 }
 
 fn editor_line_number_from_node_id(node_id: &str, prefix: &str) -> Option<usize> {
@@ -14299,6 +14831,48 @@ fn dev_input_may_change(
         })
 }
 
+fn dev_accepted_host_input_hint(
+    input: &boon_native_app_window::NativeInputAdapterProof,
+    observation: &DevInputDispatchObservation,
+) -> Option<boon_native_app_window::NativeHostInputEventHint> {
+    observation.source_path.as_ref()?;
+    let event = observation
+        .event_sequence
+        .and_then(|sequence| {
+            input
+                .mouse_button_events
+                .iter()
+                .find(|event| event.sequence == sequence)
+        })
+        .or_else(|| {
+            input.mouse_button_events.iter().find(|event| {
+                observation
+                    .button
+                    .as_deref()
+                    .is_none_or(|button| event.button == button)
+                    && observation
+                        .pressed
+                        .is_none_or(|pressed| event.pressed == pressed)
+            })
+        });
+    Some(boon_native_app_window::NativeHostInputEventHint {
+        kind: "mouse_button".to_owned(),
+        source_intent: observation.source_intent.clone(),
+        sequence: event
+            .map(|event| event.sequence)
+            .or(observation.event_sequence),
+        window_protocol_id: event
+            .and_then(|event| event.window_protocol_id)
+            .or(observation.window_protocol_id),
+        button: event
+            .map(|event| event.button.clone())
+            .or_else(|| observation.button.clone()),
+        pressed: event.map(|event| event.pressed).or(observation.pressed),
+        key: None,
+        event_elapsed_ms: event.and_then(|event| event.event_elapsed_ms),
+    })
+}
+
 fn editor_positions_same_click_cluster(left: &EditorPosition, right: &EditorPosition) -> bool {
     left.line == right.line && left.column.abs_diff(right.column) <= 2
 }
@@ -14325,30 +14899,6 @@ fn register_editor_click(
     input_state.editor_click_count
 }
 
-fn dev_apply_real_window_input_with_indexes(
-    input: &boon_native_app_window::NativeInputAdapterProof,
-    document: &boon_document_model::DocumentFrame,
-    derived_indexes: &boon_document::DocumentDerivedIndexBundle,
-    layout_frame: &boon_document::LayoutFrame,
-    surface_width: u32,
-    surface_height: u32,
-    shell: &mut DevWindowShell,
-    input_state: &mut DevNativeInputState,
-) -> bool {
-    let mut clipboard = NativeClipboardAdapter;
-    dev_apply_real_window_input_with_clipboard_and_indexes(
-        input,
-        document,
-        Some(derived_indexes),
-        layout_frame,
-        surface_width,
-        surface_height,
-        shell,
-        input_state,
-        &mut clipboard,
-    )
-}
-
 fn dev_apply_real_window_input_with_clipboard_and_indexes(
     input: &boon_native_app_window::NativeInputAdapterProof,
     document: &boon_document_model::DocumentFrame,
@@ -14359,6 +14909,7 @@ fn dev_apply_real_window_input_with_clipboard_and_indexes(
     shell: &mut DevWindowShell,
     input_state: &mut DevNativeInputState,
     clipboard: &mut dyn ClipboardAdapter,
+    mut dispatch_observation: Option<&mut DevInputDispatchObservation>,
 ) -> bool {
     if input.synthetic_input_probe {
         return false;
@@ -14555,9 +15106,11 @@ fn dev_apply_real_window_input_with_clipboard_and_indexes(
         if mouse_event.button != "left" {
             continue;
         }
-        if let Some(position) =
-            input_layout_position(input.mouse_window_pos, surface_width, surface_height)
-        {
+        if let Some(position) = input_layout_position(
+            mouse_event.position.or(input.mouse_window_pos),
+            surface_width,
+            surface_height,
+        ) {
             if !mouse_event.pressed && input_state.type_inspector_resizing {
                 shell.set_type_inspector_width_from_pointer(surface_width, position.x as f32);
                 input_state.type_inspector_resizing = false;
@@ -14626,7 +15179,7 @@ fn dev_apply_real_window_input_with_clipboard_and_indexes(
                 changed = true;
                 continue;
             }
-            if let Some((node_id, source_path)) = dev_source_binding_at_with_indexes(
+            if let Some((node_id, source_path, source_intent)) = dev_source_binding_at_with_indexes(
                 document,
                 derived_indexes,
                 layout_frame,
@@ -14722,8 +15275,37 @@ fn dev_apply_real_window_input_with_clipboard_and_indexes(
                     input_state.type_inspector_mouse_select_anchor = None;
                     input_state.footer_mouse_select_anchor = None;
                     shell.hovered_editor_position = None;
-                    shell.dispatch_source_path(&source_path);
-                    changed = true;
+                    if dev_source_intent_dispatches_on_mouse_event(
+                        source_intent.as_str(),
+                        mouse_event.pressed,
+                    ) {
+                        if let Some(observation) = dispatch_observation.as_deref_mut() {
+                            observation.source_path = Some(source_path.clone());
+                            observation.source_intent = Some(source_intent.clone());
+                            observation.node_id = Some(node_id.clone());
+                            observation.event_sequence = Some(mouse_event.sequence);
+                            observation.button = Some(mouse_event.button.clone());
+                            observation.pressed = Some(mouse_event.pressed);
+                            observation.window_protocol_id = mouse_event.window_protocol_id;
+                        }
+                        let mut dispatch = shell.dispatch_source_path(&source_path);
+                        dispatch["clicked_source_path"] = json!(source_path);
+                        dispatch["clicked_source_intent"] = json!(source_intent);
+                        dispatch["clicked_node"] = json!(node_id);
+                        dispatch["input_event_sequence"] = json!(mouse_event.sequence);
+                        dispatch["input_event_kind"] = json!("HostInputEvent::PointerButton");
+                        dispatch["input_event_edge"] = json!(if mouse_event.pressed {
+                            "press"
+                        } else {
+                            "release"
+                        });
+                        dispatch["dispatch_boundary"] = json!(
+                            "HostInputEvent -> document hit test -> SourceBinding -> DevWindowShell"
+                        );
+                        dispatch["direct_dispatch_without_hit_test"] = json!(false);
+                        shell.last_dev_input_dispatch = Some(dispatch);
+                        changed = true;
+                    }
                 }
             } else {
                 input_state.editor_focused = false;
@@ -15346,7 +15928,7 @@ fn dev_source_binding_at_with_indexes(
     layout_frame: &boon_document::LayoutFrame,
     x: f32,
     y: f32,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     let hit_table = match derived_indexes {
         Some(derived_indexes) => derived_indexes
             .try_hit_side_table(document, layout_frame)
@@ -15354,14 +15936,89 @@ fn dev_source_binding_at_with_indexes(
         None => typed_hit_side_table_for_document_layout(document, layout_frame).ok()?,
     };
     hit_table.hit_test(x, y).and_then(|hit| {
-        let source_path = hit.source_path.as_deref()?;
+        let (source_path, source_intent) = hit
+            .source_path
+            .as_deref()
+            .map(|source_path| {
+                (
+                    source_path,
+                    hit.source_intent.as_deref().unwrap_or("source"),
+                )
+            })
+            .or_else(|| {
+                hit.source_routes
+                    .first()
+                    .map(|route| (route.source_path.as_str(), route.intent.as_str()))
+            })?;
         if matches!(
             source_path,
             "dev.tabs.select" | "dev.project_files.select" | "dev.commands.press"
         ) {
             return None;
         }
-        Some((hit.node.0.clone(), source_path.to_owned()))
+        Some((
+            hit.node.0.clone(),
+            source_path.to_owned(),
+            source_intent.to_owned(),
+        ))
+    })
+}
+
+fn dev_source_intent_dispatches_on_mouse_event(source_intent: &str, pressed: bool) -> bool {
+    match source_intent {
+        "press" => pressed,
+        _ => !pressed,
+    }
+}
+
+fn dev_app_owned_pointer_script_for_source_path(
+    shell: &DevWindowShell,
+    source_path: &str,
+    label: &str,
+    viewport_width: f32,
+    viewport_height: f32,
+    delay_ms: u64,
+) -> Result<boon_native_app_window::NativeAppOwnedPointerScript, String> {
+    let viewport_width_u32 = viewport_width.round().max(1.0) as u32;
+    let viewport_height_u32 = viewport_height.round().max(1.0) as u32;
+    let document = shell.document_for_viewport(viewport_width_u32, viewport_height_u32);
+    let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+    let derived_indexes = boon_document::DocumentDerivedIndexBundle::from_frame(&document)
+        .map_err(|error| format!("dev coalesced input typed index failed: {error}"))?;
+    let layout = derived_indexes
+        .try_layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: viewport_width,
+                height: viewport_height,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        })
+        .map_err(|error| format!("dev coalesced input typed layout failed: {error}"))?;
+    let hit_table = derived_indexes
+        .try_hit_side_table(&document, &layout)
+        .map_err(|error| format!("dev coalesced input typed hit table failed: {error}"))?;
+    let target_entry = hit_table
+        .entry_for_source_path(source_path)
+        .ok_or_else(|| {
+            format!("dev coalesced input source path `{source_path}` is not in the hit table")
+        })?;
+    Ok(boon_native_app_window::NativeAppOwnedPointerScript {
+        label: label.to_owned(),
+        x: f64::from(target_entry.bounds.x + target_entry.bounds.width / 2.0),
+        y: f64::from(target_entry.bounds.y + target_entry.bounds.height / 2.0),
+        base_width: f64::from(viewport_width_u32),
+        base_height: f64::from(viewport_height_u32),
+        delay_ms,
+        press: true,
+        release: true,
+        scroll_delta_x: 0.0,
+        scroll_delta_y: 0.0,
+        key: None,
+        key_pressed: None,
     })
 }
 
@@ -16447,7 +17104,6 @@ struct ExampleWorkspace {
     current_file: String,
     selected_buffer: CodeEditorModel,
     open_buffers: BTreeMap<String, CodeEditorModel>,
-    project_type_hints_by_file: BTreeMap<String, EditorTypeHinting>,
     example_active_files: BTreeMap<String, String>,
     dirty_examples: BTreeSet<String>,
     dirty_files: BTreeSet<String>,
@@ -16537,20 +17193,17 @@ impl ExampleWorkspace {
         };
         let mut example_active_files = BTreeMap::new();
         example_active_files.insert(selected_example_id.clone(), current_file.clone());
-        let mut workspace = Self {
+        Self {
             selected_buffer,
             selected_example_id,
             entry_file,
             current_file,
             open_buffers,
-            project_type_hints_by_file: BTreeMap::new(),
             example_active_files,
             dirty_examples: BTreeSet::new(),
             dirty_files: BTreeSet::new(),
             dirty: false,
-        };
-        let _ = workspace.refresh_selected_project_type_hints(catalog);
-        workspace
+        }
     }
 
     fn selected_dirty(&self) -> bool {
@@ -16564,46 +17217,6 @@ impl ExampleWorkspace {
         self.example_active_files
             .insert(self.selected_example_id.clone(), self.current_file.clone());
         self.dirty = self.selected_dirty();
-    }
-
-    fn refresh_selected_project_type_hints(
-        &mut self,
-        catalog: &ExampleCatalog,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let project_units = self.selected_project_payload_units(catalog)?;
-        let runtime_units = Self::runtime_units_from_project_units(&project_units);
-        let hinting_by_file =
-            BoonLanguageService::project_type_hinting(&self.entry_file, &runtime_units);
-        self.apply_project_type_hinting(hinting_by_file);
-        Ok(())
-    }
-
-    fn apply_project_type_hinting(&mut self, hinting_by_file: BTreeMap<String, EditorTypeHinting>) {
-        self.project_type_hints_by_file = hinting_by_file.clone();
-        for (path, hinting) in hinting_by_file {
-            if let Some((_, buffer)) = self.open_buffers.iter_mut().find(|(candidate, _)| {
-                paths_match_for_preview_units(Path::new(candidate), Path::new(&path))
-            }) {
-                buffer.set_type_hinting(hinting);
-            }
-        }
-        if let Some(buffer) = self
-            .open_buffers
-            .iter()
-            .find(|(path, _)| {
-                paths_match_for_preview_units(Path::new(path), Path::new(&self.current_file))
-            })
-            .map(|(_, buffer)| buffer.clone())
-        {
-            self.selected_buffer = buffer;
-        }
-    }
-
-    fn project_type_hinting_for_file(&self, file_path: &str) -> Option<EditorTypeHinting> {
-        self.project_type_hints_by_file
-            .iter()
-            .find(|(path, _)| paths_match_for_preview_units(Path::new(path), Path::new(file_path)))
-            .map(|(_, hinting)| hinting.clone())
     }
 
     fn selected_project_payload_units(
@@ -16651,14 +17264,6 @@ impl ExampleWorkspace {
         Ok(units)
     }
 
-    fn selected_runtime_units(
-        &self,
-        catalog: &ExampleCatalog,
-    ) -> Result<Vec<boon_runtime::RuntimeSourceUnit>, Box<dyn std::error::Error>> {
-        let units = self.selected_project_payload_units(catalog)?;
-        Ok(Self::runtime_units_from_project_units(&units))
-    }
-
     fn runtime_units_from_project_units(
         units: &[ExampleProjectUnit],
     ) -> Vec<boon_runtime::RuntimeSourceUnit> {
@@ -16670,26 +17275,6 @@ impl ExampleWorkspace {
                 source: unit.text.clone(),
             })
             .collect()
-    }
-
-    fn current_project_hash(
-        &self,
-        catalog: &ExampleCatalog,
-    ) -> Result<String, Box<dyn std::error::Error>> {
-        let payload_units = self
-            .selected_project_payload_units(catalog)?
-            .into_iter()
-            .map(|unit| {
-                let sha256 = boon_runtime::sha256_bytes(unit.text.as_bytes());
-                SourceProjectUnit {
-                    virtual_uri: unit.path,
-                    text: unit.text,
-                    sha256,
-                    role: unit.role,
-                }
-            })
-            .collect::<Vec<_>>();
-        source_project_payload_hash(&payload_units)
     }
 
     fn project_file_tabs(&self, catalog: &ExampleCatalog) -> Vec<ProjectFileTab> {
@@ -16822,7 +17407,6 @@ impl ExampleWorkspace {
         self.entry_file = entry.source.clone();
         self.current_file = buffer.file_name.clone();
         self.selected_buffer = buffer.clone();
-        self.project_type_hints_by_file.clear();
         self.open_buffers.insert(self.current_file.clone(), buffer);
         self.example_active_files
             .insert(entry.id.clone(), self.current_file.clone());
@@ -16891,7 +17475,7 @@ impl ExampleWorkspace {
             .iter()
             .find(|(path, _)| paths_match_for_preview_units(Path::new(path), Path::new(&spec_path)))
             .map(|(_, buffer)| buffer.clone());
-        let (mut buffer, reused_open_buffer) = if let Some(buffer) = open_buffer {
+        let (buffer, reused_open_buffer) = if let Some(buffer) = open_buffer {
             if entry.custom || spec_dirty {
                 (buffer, true)
             } else {
@@ -16908,11 +17492,6 @@ impl ExampleWorkspace {
             self.open_buffers.insert(spec_path, buffer.clone());
             (buffer, false)
         };
-        if let Some(hinting) = self.project_type_hinting_for_file(&buffer.file_name) {
-            buffer.set_type_hinting(hinting);
-            self.open_buffers
-                .insert(buffer.file_name.clone(), buffer.clone());
-        }
         self.current_file = buffer.file_name.clone();
         self.selected_buffer = buffer.clone();
         self.example_active_files
@@ -16970,17 +17549,13 @@ impl ExampleWorkspace {
     fn apply_editor_text_input(
         &mut self,
         text: &str,
-        catalog: &ExampleCatalog,
+        _catalog: &ExampleCatalog,
     ) -> serde_json::Value {
         let before_hash = boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes());
         let before_line_count = self.selected_buffer.line_count;
         self.selected_buffer.insert_text_at_caret(text);
         self.persist_selected_buffer();
         self.set_selected_dirty(true);
-        let project_hint_refresh = self
-            .refresh_selected_project_type_hints(catalog)
-            .map(|()| json!({"status": "pass"}))
-            .unwrap_or_else(|error| json!({"status": "fail", "diagnostic": error.to_string()}));
         let after_hash = boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes());
         json!({
             "status": "pass",
@@ -16999,7 +17574,10 @@ impl ExampleWorkspace {
             "syntax_token_count": self.selected_buffer.syntax_token_count(),
             "type_hint_backend": self.selected_buffer.type_hint_backend(),
             "type_hint_count": self.selected_buffer.type_hint_count(),
-            "project_type_hint_refresh": project_hint_refresh,
+            "project_type_hint_refresh": {
+                "status": "deferred",
+                "reason": "editor input path does not block on project analysis"
+            },
             "parser_bypassed": false,
             "editor_model_command": self.selected_buffer.last_command
         })
@@ -17050,60 +17628,28 @@ impl ExampleWorkspace {
         })
     }
 
-    fn run_selected(&self, catalog: &ExampleCatalog) -> serde_json::Value {
-        let runtime_units = match self.selected_runtime_units(catalog) {
-            Ok(units) => units,
-            Err(error) => {
-                return json!({
-                    "status": "fail",
-                    "command": "Run",
-                    "selected_example_id": self.selected_example_id,
-                    "source_path": self.selected_buffer.file_name,
-                    "diagnostic": error.to_string(),
-                    "parser_bypassed": false,
-                    "runtime_bypassed": true
-                });
-            }
-        };
-        let validation =
-            BoonLanguageService::validate_project_units(&self.entry_file, &runtime_units);
-        let validation_pass =
-            validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
+    fn run_selected(&self, _catalog: &ExampleCatalog) -> serde_json::Value {
         json!({
-            "status": if validation_pass { "pass" } else { "fail" },
+            "status": "pass",
             "command": "Run",
             "selected_example_id": self.selected_example_id,
             "source_path": self.selected_buffer.file_name,
             "entry_file": self.entry_file,
-            "source_hash": BoonLanguageService::runtime_units_hash(&runtime_units),
-            "source_unit_count": runtime_units.len(),
+            "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
+            "source_unit_count": serde_json::Value::Null,
             "program_kind": "generic",
             "preview_transport": "ReplaceCode",
-            "validation": validation,
+            "validation": {
+                "status": "deferred",
+                "owner": "preview latest-wins build worker",
+                "reason": "dev input/render thread never performs whole-project validation"
+            },
             "parser_bypassed": false,
             "runtime_bypassed": false
         })
     }
 
     fn test_selected(&self, catalog: &ExampleCatalog) -> serde_json::Value {
-        let runtime_units = match self.selected_runtime_units(catalog) {
-            Ok(units) => units,
-            Err(error) => {
-                return json!({
-                    "status": "fail",
-                    "command": "Test",
-                    "selected_example_id": self.selected_example_id,
-                    "source_path": self.selected_buffer.file_name,
-                    "diagnostic": error.to_string(),
-                    "parser_bypassed": false,
-                    "runtime_bypassed": true
-                });
-            }
-        };
-        let validation =
-            BoonLanguageService::validate_project_units(&self.entry_file, &runtime_units);
-        let validation_pass =
-            validation.get("status").and_then(serde_json::Value::as_str) == Some("pass");
         let selected_entry = catalog
             .entries
             .iter()
@@ -17144,16 +17690,20 @@ impl ExampleWorkspace {
             Some("pass" | "skipped")
         );
         json!({
-            "status": if validation_pass && scenario_pass { "pass" } else { "fail" },
+            "status": if scenario_pass { "pass" } else { "fail" },
             "command": "Test",
             "selected_example_id": self.selected_example_id,
             "source_path": self.selected_buffer.file_name,
             "entry_file": self.entry_file,
-            "source_hash": BoonLanguageService::runtime_units_hash(&runtime_units),
-            "source_unit_count": runtime_units.len(),
+            "source_hash": boon_runtime::sha256_bytes(self.selected_buffer.source_text.as_bytes()),
+            "source_unit_count": serde_json::Value::Null,
             "program_kind": "generic",
             "preview_transport": "ReplaceCode",
-            "validation": validation,
+            "validation": {
+                "status": "not-required",
+                "owner": "already-running preview runtime",
+                "reason": "TEST exercises the live preview through host input without recompiling on the dev thread"
+            },
             "scenario": scenario_report,
             "parser_bypassed": false,
             "runtime_bypassed": false
@@ -17249,12 +17799,6 @@ impl ExampleWorkspace {
                     .replace_text(&self.current_file, formatted.clone());
                 self.open_buffers
                     .insert(self.current_file.clone(), self.selected_buffer.clone());
-                let project_type_hint_refresh = self
-                    .refresh_selected_project_type_hints(catalog)
-                    .map(|()| json!({"status": "pass"}))
-                    .unwrap_or_else(
-                        |error| json!({"status": "fail", "diagnostic": error.to_string()}),
-                    );
                 if changed {
                     self.set_selected_dirty(true);
                 } else {
@@ -17271,7 +17815,10 @@ impl ExampleWorkspace {
                     "source_hash": BoonLanguageService::runtime_units_hash(&runtime_units),
                     "source_unit_count": runtime_units.len(),
                     "formatter": "boon_parser::format_source_unit",
-                    "project_type_hint_refresh": project_type_hint_refresh,
+                    "project_type_hint_refresh": {
+                        "status": "deferred",
+                        "reason": "format visual path does not block on project analysis"
+                    },
                     "validation": validation,
                     "parser_bypassed": false,
                     "runtime_bypassed": false
@@ -17326,7 +17873,6 @@ impl ExampleWorkspace {
         self.example_active_files
             .insert(self.selected_example_id.clone(), self.current_file.clone());
         self.set_selected_dirty(false);
-        self.refresh_selected_project_type_hints(catalog)?;
         Ok(json!({
             "status": "pass",
             "command": "Reset",
@@ -17335,6 +17881,10 @@ impl ExampleWorkspace {
             "source_path": entry.source,
             "source_hash": boon_runtime::sha256_bytes(source_text.as_bytes()),
             "project_file_count": editor_units.len(),
+            "project_type_hint_refresh": {
+                "status": "deferred",
+                "reason": "reset visual path does not block on project analysis"
+            },
             "dirty": self.dirty
         }))
     }
@@ -17475,16 +18025,6 @@ fn paths_match_for_preview_units(left: &Path, right: &Path) -> bool {
 struct BoonLanguageService;
 
 impl BoonLanguageService {
-    fn diagnostics(path: &str, source: &str) -> Vec<String> {
-        if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
-            return Vec::new();
-        }
-        match boon_parser::parse_source(path.to_owned(), source.to_owned()) {
-            Ok(_) => Vec::new(),
-            Err(error) => vec![error.to_string()],
-        }
-    }
-
     fn format(path: &str, source: &str) -> Result<String, boon_parser::ParseError> {
         if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
             return Ok(source.to_owned());
@@ -17568,84 +18108,6 @@ impl BoonLanguageService {
         }
     }
 
-    fn project_type_hinting(
-        source_label: &str,
-        units: &[boon_runtime::RuntimeSourceUnit],
-    ) -> BTreeMap<String, EditorTypeHinting> {
-        let mut hinting_by_file = units
-            .iter()
-            .map(|unit| {
-                (
-                    unit.path.clone(),
-                    EditorTypeHinting {
-                        backend: "unavailable",
-                        hints: Vec::new(),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        if units.is_empty() {
-            return hinting_by_file;
-        }
-        let total_bytes = units.iter().map(|unit| unit.source.len()).sum::<usize>();
-        if total_bytes > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
-            for hinting in hinting_by_file.values_mut() {
-                hinting.backend = "disabled-large-buffer";
-            }
-            return hinting_by_file;
-        }
-        let parsed = if let [unit] = units {
-            boon_parser::parse_source(unit.path.clone(), unit.source.clone())
-        } else {
-            boon_parser::parse_project(
-                source_label.to_owned(),
-                units
-                    .iter()
-                    .map(|unit| (unit.path.clone(), unit.source.clone())),
-            )
-        };
-        let Ok(parsed) = parsed else {
-            return hinting_by_file;
-        };
-        let report = boon_typecheck::check(&parsed);
-        if report.has_errors() {
-            return hinting_by_file;
-        }
-        let file_spans = project_type_hint_file_spans(units);
-        for entry in report.type_hint_table.entries {
-            let Some(span) = file_spans.iter().find(|span| {
-                entry.line >= span.start_line
-                    && entry.line < span.end_line
-                    && entry.start >= span.start_byte
-                    && entry.end <= span.end_byte
-            }) else {
-                continue;
-            };
-            let local_hint = EditorTypeHint {
-                line: entry.line.saturating_sub(span.start_line).saturating_add(1),
-                start: entry.start.saturating_sub(span.start_byte),
-                end: entry.end.saturating_sub(span.start_byte),
-                anchor_column: entry.anchor_column,
-                category: entry.category,
-                compact_label: entry.compact_label,
-                detail_label: entry.detail_label,
-                display_tree: entry.display_tree,
-            };
-            hinting_by_file
-                .entry(span.path.clone())
-                .or_insert_with(|| EditorTypeHinting {
-                    backend: "boon_typecheck::TypeHintTable(project)",
-                    hints: Vec::new(),
-                })
-                .hints
-                .push(local_hint);
-        }
-        for hinting in hinting_by_file.values_mut() {
-            hinting.backend = "boon_typecheck::TypeHintTable(project)";
-        }
-        hinting_by_file
-    }
-
     fn syntax_highlighting(source: &str) -> SyntaxHighlighting {
         if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
             return SyntaxHighlighting {
@@ -17674,46 +18136,6 @@ impl BoonLanguageService {
             backend: "editor-fallback-tokenizer",
             parser_backed: false,
             tokens: Self::syntax_tokens_fallback(source),
-        }
-    }
-
-    fn type_hinting(source_path_label: &str, source: &str) -> EditorTypeHinting {
-        if source.len() > BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
-            return EditorTypeHinting {
-                backend: "disabled-large-buffer",
-                hints: Vec::new(),
-            };
-        }
-        let Ok(parsed) = boon_parser::parse_source(source_path_label, source) else {
-            return EditorTypeHinting {
-                backend: "unavailable",
-                hints: Vec::new(),
-            };
-        };
-        let report = boon_typecheck::check(&parsed);
-        if report.has_errors() {
-            return EditorTypeHinting {
-                backend: "unavailable",
-                hints: Vec::new(),
-            };
-        }
-        EditorTypeHinting {
-            backend: "boon_typecheck::TypeHintTable",
-            hints: report
-                .type_hint_table
-                .entries
-                .into_iter()
-                .map(|entry| EditorTypeHint {
-                    line: entry.line,
-                    start: entry.start,
-                    end: entry.end,
-                    anchor_column: entry.anchor_column,
-                    category: entry.category,
-                    compact_label: entry.compact_label,
-                    detail_label: entry.detail_label,
-                    display_tree: entry.display_tree,
-                })
-                .collect(),
         }
     }
 
@@ -18378,51 +18800,6 @@ struct EditorTypeHint {
 }
 
 #[derive(Clone, Debug)]
-struct EditorTypeHinting {
-    backend: &'static str,
-    hints: Vec<EditorTypeHint>,
-}
-
-#[derive(Clone, Debug)]
-struct ProjectTypeHintFileSpan {
-    path: String,
-    start_line: usize,
-    end_line: usize,
-    start_byte: usize,
-    end_byte: usize,
-}
-
-fn project_type_hint_file_spans(
-    units: &[boon_runtime::RuntimeSourceUnit],
-) -> Vec<ProjectTypeHintFileSpan> {
-    let mut spans = Vec::new();
-    let mut combined = String::new();
-    let mut next_line = 1usize;
-    for unit in units {
-        if !combined.is_empty() && !combined.ends_with('\n') {
-            combined.push('\n');
-            next_line = next_line.saturating_add(1);
-        }
-        let start_line = next_line;
-        let start_byte = combined.len();
-        combined.push_str(&unit.source);
-        let end_byte = combined.len();
-        if !unit.source.ends_with('\n') {
-            combined.push('\n');
-        }
-        next_line = next_line.saturating_add(unit.source.lines().count().max(1));
-        spans.push(ProjectTypeHintFileSpan {
-            path: unit.path.clone(),
-            start_line,
-            end_line: next_line,
-            start_byte,
-            end_byte,
-        });
-    }
-    spans
-}
-
-#[derive(Clone, Debug)]
 struct SyntaxToken {
     kind: &'static str,
     line: usize,
@@ -18515,17 +18892,6 @@ fn syntax_tokens_by_line(tokens: &[SyntaxToken]) -> BTreeMap<usize, Vec<SyntaxTo
     by_line
 }
 
-fn type_hints_by_line(hints: &[EditorTypeHint]) -> BTreeMap<usize, Vec<EditorTypeHint>> {
-    let mut by_line: BTreeMap<usize, Vec<EditorTypeHint>> = BTreeMap::new();
-    for hint in hints {
-        by_line.entry(hint.line).or_default().push(hint.clone());
-    }
-    for hints in by_line.values_mut() {
-        hints.sort_by_key(|hint| (hint.anchor_column, hint.start, hint.end));
-    }
-    by_line
-}
-
 fn inline_type_hint_is_useful(hint: &EditorTypeHint, line_text: &str) -> bool {
     let line_len = line_text.chars().count();
     if line_len > 96 {
@@ -18613,25 +18979,14 @@ struct CodeEditorModel {
     type_hints: Vec<EditorTypeHint>,
     type_hints_by_line: BTreeMap<usize, Vec<EditorTypeHint>>,
     type_hint_backend: &'static str,
-    formatted_preview_hash: Option<String>,
     clipboard_cache: String,
     last_command: Option<&'static str>,
 }
 
 impl CodeEditorModel {
     fn new(source_path_label: &str, source_text: &str) -> Self {
-        let diagnostics = BoonLanguageService::diagnostics(source_path_label, source_text);
-        let formatted_preview_hash = if source_text.len() <= BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
-            BoonLanguageService::format(source_path_label, source_text)
-                .ok()
-                .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()))
-        } else {
-            None
-        };
         let syntax = BoonLanguageService::syntax_highlighting(source_text);
         let syntax_tokens_by_line = syntax_tokens_by_line(&syntax.tokens);
-        let type_hinting = BoonLanguageService::type_hinting(source_path_label, source_text);
-        let type_hints_by_line = type_hints_by_line(&type_hinting.hints);
         let buffer = EditorBuffer::new(source_text);
         let line_count = buffer.line_count();
         let max_scroll_column = max_editor_scroll_column_for_source(source_text);
@@ -18645,15 +19000,14 @@ impl CodeEditorModel {
             selection: EditorSelection::collapsed(EditorPosition::start()),
             scroll_line: 0,
             scroll_column: 0,
-            diagnostics,
+            diagnostics: Vec::new(),
             syntax_tokens: syntax.tokens,
             syntax_tokens_by_line,
             syntax_backend: syntax.backend,
             syntax_parser_backed: syntax.parser_backed,
-            type_hints: type_hinting.hints,
-            type_hints_by_line,
-            type_hint_backend: type_hinting.backend,
-            formatted_preview_hash,
+            type_hints: Vec::new(),
+            type_hints_by_line: BTreeMap::new(),
+            type_hint_backend: "deferred-off-input-thread",
             clipboard_cache: String::new(),
             last_command: None,
         }
@@ -18677,12 +19031,6 @@ impl CodeEditorModel {
 
     fn type_hint_count(&self) -> usize {
         self.type_hints.len()
-    }
-
-    fn set_type_hinting(&mut self, type_hinting: EditorTypeHinting) {
-        self.type_hints = type_hinting.hints;
-        self.type_hints_by_line = type_hints_by_line(&self.type_hints);
-        self.type_hint_backend = type_hinting.backend;
     }
 
     fn type_hint_samples(&self) -> Vec<serde_json::Value> {
@@ -18933,24 +19281,15 @@ impl CodeEditorModel {
 
     fn refresh_language_state(&mut self) {
         self.line_count = self.buffer.line_count();
-        self.diagnostics = BoonLanguageService::diagnostics(&self.file_name, &self.source_text);
+        self.diagnostics.clear();
         let syntax = BoonLanguageService::syntax_highlighting(&self.source_text);
         self.syntax_tokens = syntax.tokens;
         self.syntax_tokens_by_line = syntax_tokens_by_line(&self.syntax_tokens);
         self.syntax_backend = syntax.backend;
         self.syntax_parser_backed = syntax.parser_backed;
-        let type_hinting = BoonLanguageService::type_hinting(&self.file_name, &self.source_text);
-        self.type_hints = type_hinting.hints;
-        self.type_hints_by_line = type_hints_by_line(&self.type_hints);
-        self.type_hint_backend = type_hinting.backend;
-        self.formatted_preview_hash =
-            if self.source_text.len() <= BOON_EDITOR_FULL_LANGUAGE_BYTES_MAX {
-                BoonLanguageService::format(&self.file_name, &self.source_text)
-                    .ok()
-                    .map(|formatted| boon_runtime::sha256_bytes(formatted.as_bytes()))
-            } else {
-                None
-            };
+        self.type_hints.clear();
+        self.type_hints_by_line.clear();
+        self.type_hint_backend = "deferred-off-input-thread";
     }
 
     fn position_for_offset(&self, target: usize) -> EditorPosition {
@@ -20049,58 +20388,43 @@ impl PreviewTransport {
         }
     }
 
-    fn runtime_summary(&self) -> serde_json::Value {
-        let Some(connect) = &self.connect else {
+    fn verifier_host_click_sequence(&self, clicks: &[serde_json::Value]) -> serde_json::Value {
+        if clicks.is_empty() {
             return json!({
-                "status": "not-bound",
-                "kind": "debug-query-result",
-                "debug_query": "RuntimeSummary",
-                "transport_bound": false
+                "status": "skipped",
+                "kind": "verifier-host-click-sequence",
+                "reason": "scenario has no pointer-click steps",
+                "preview_mutation_allowed": false
             });
-        };
-        match send_preview_ipc_request_with_timeouts(
-            connect,
-            json!({"kind": "runtime-summary"}),
-            Duration::ZERO,
-            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
-            Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
-        ) {
-            Ok(value) => value,
-            Err(error) => json!({
-                "status": "unavailable",
-                "kind": "debug-query-result",
-                "debug_query": "RuntimeSummary",
-                "transport_bound": true,
-                "diagnostic": error.to_string()
-            }),
         }
-    }
-
-    fn preview_perf_snapshot(&self) -> serde_json::Value {
         let Some(connect) = &self.connect else {
             return json!({
                 "status": "not-bound",
-                "kind": "preview-perf-snapshot",
+                "kind": "verifier-host-click-sequence",
+                "queued_click_count": clicks.len(),
                 "transport_bound": false,
-                "bounded_query": true
+                "preview_mutation_allowed": true
             });
         };
-        match send_preview_ipc_request_with_timeouts(
+        send_preview_ipc_request_with_timeouts(
             connect,
-            json!({"kind": "preview-perf-snapshot"}),
+            json!({
+                "kind": "verifier-host-click-sequence",
+                "clicks": clicks,
+            }),
             Duration::ZERO,
             Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
             Duration::from_millis(DEV_PREVIEW_SUMMARY_READ_TIMEOUT_MS),
-        ) {
-            Ok(value) => value,
-            Err(error) => json!({
-                "status": "unavailable",
-                "kind": "preview-perf-snapshot",
+        )
+        .unwrap_or_else(|error| {
+            json!({
+                "status": "fail",
+                "kind": "verifier-host-click-sequence",
                 "transport_bound": true,
-                "bounded_query": true,
+                "preview_mutation_allowed": true,
                 "diagnostic": error.to_string()
-            }),
-        }
+            })
+        })
     }
 
     fn runtime_value(
@@ -20153,6 +20477,8 @@ struct DevWindowShell {
     initial_workspace: ExampleWorkspace,
     editor_view: CodeEditorView,
     preview_transport: PreviewTransport,
+    native_wake: Option<boon_native_app_window::NativeWakeHandle>,
+    latest_preview_replace_command: Arc<AtomicU64>,
     next_command_id: u64,
     selected_source_identity: String,
     selected_source_revision: u64,
@@ -20174,6 +20500,7 @@ struct DevWindowShell {
     last_dev_command: String,
     last_dev_command_status: String,
     last_dev_command_detail: Option<String>,
+    last_dev_input_dispatch: Option<serde_json::Value>,
     footer_scroll_line: usize,
     footer_selection: Option<FooterSelection>,
     type_inspector_scroll_line: usize,
@@ -20197,7 +20524,6 @@ struct PendingPreviewReplace {
 
 struct PreviewReplaceWorkerResult {
     value: serde_json::Value,
-    project_type_hinting: Option<BTreeMap<String, EditorTypeHinting>>,
 }
 
 struct ActiveTypeHint<'a> {
@@ -20306,6 +20632,10 @@ impl Clone for DevWindowShell {
             initial_workspace: self.initial_workspace.clone(),
             editor_view: self.editor_view.clone(),
             preview_transport: self.preview_transport.clone(),
+            native_wake: self.native_wake.clone(),
+            latest_preview_replace_command: Arc::new(AtomicU64::new(
+                self.latest_preview_replace_command.load(Ordering::Acquire),
+            )),
             next_command_id: self.next_command_id,
             selected_source_identity: self.selected_source_identity.clone(),
             selected_source_revision: self.selected_source_revision,
@@ -20328,6 +20658,7 @@ impl Clone for DevWindowShell {
             last_dev_command: self.last_dev_command.clone(),
             last_dev_command_status: self.last_dev_command_status.clone(),
             last_dev_command_detail: self.last_dev_command_detail.clone(),
+            last_dev_input_dispatch: self.last_dev_input_dispatch.clone(),
             footer_scroll_line: self.footer_scroll_line,
             footer_selection: self.footer_selection.clone(),
             type_inspector_scroll_line: self.type_inspector_scroll_line,
@@ -20366,6 +20697,8 @@ impl DevWindowShell {
             initial_workspace,
             editor_view: CodeEditorView::new(),
             preview_transport,
+            native_wake: None,
+            latest_preview_replace_command: Arc::new(AtomicU64::new(0)),
             next_command_id: 1,
             selected_source_identity,
             selected_source_revision: 1,
@@ -20400,6 +20733,7 @@ impl DevWindowShell {
             last_dev_command: "startup".to_owned(),
             last_dev_command_status: "not-run".to_owned(),
             last_dev_command_detail: None,
+            last_dev_input_dispatch: None,
             footer_scroll_line: 0,
             footer_selection: None,
             type_inspector_scroll_line: 0,
@@ -20443,12 +20777,14 @@ impl DevWindowShell {
         true
     }
 
-    fn current_cursor_icon(&self) -> boon_native_app_window::NativeCursorIcon {
-        if self.type_inspector_resize_hovered {
-            boon_native_app_window::NativeCursorIcon::ColumnResize
-        } else {
-            boon_native_app_window::NativeCursorIcon::Default
-        }
+    fn record_dev_command_result(&mut self, command: &str, value: &serde_json::Value) {
+        self.last_dev_command = command.to_owned();
+        self.last_dev_command_status = value
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("not-run")
+            .to_owned();
+        self.last_dev_command_detail = json_diagnostic(value);
     }
 
     fn active_type_hint(&self) -> Option<ActiveTypeHint<'_>> {
@@ -20697,28 +21033,6 @@ impl DevWindowShell {
             )
     }
 
-    fn type_inspector_runtime_value_active(&self) -> bool {
-        let Some(active) = self.active_type_hint() else {
-            return false;
-        };
-        let token = self
-            .workspace
-            .selected_buffer
-            .source_text
-            .get(active.hint.start..active.hint.end)
-            .map(str::trim)
-            .unwrap_or_default();
-        !runtime_value_path_candidates(token).is_empty()
-    }
-
-    fn preview_summary_refresh_interval(&self) -> Duration {
-        if self.type_inspector_runtime_value_active() {
-            Duration::from_millis(DEV_PREVIEW_INSPECTOR_REFRESH_MS)
-        } else {
-            Duration::from_millis(DEV_PREVIEW_SUMMARY_REFRESH_MS)
-        }
-    }
-
     fn footer_lines(&self) -> Vec<(String, String)> {
         let buffer = &self.workspace.selected_buffer;
         let summary_status = self
@@ -20895,32 +21209,25 @@ impl DevWindowShell {
     fn current_source_hash_candidates(&self) -> Vec<String> {
         let selected_buffer_hash =
             boon_runtime::sha256_bytes(self.workspace.selected_buffer.source_text.as_bytes());
-        let persisted_selected_buffer_hash = self
-            .workspace
-            .open_buffers
-            .iter()
-            .find(|(path, _)| {
-                paths_match_for_preview_units(
-                    Path::new(path),
-                    Path::new(&self.workspace.selected_buffer.file_name),
-                )
-            })
-            .map(|(_, buffer)| boon_runtime::sha256_bytes(buffer.source_text.as_bytes()));
-        if self.workspace.dirty
-            || persisted_selected_buffer_hash
-                .as_ref()
-                .is_some_and(|hash| hash != &selected_buffer_hash)
+        let mut hashes = vec![selected_buffer_hash];
+        for transport in [
+            self.latest_ready_replace.as_ref(),
+            Some(&self.last_preview_transport),
+        ]
+        .into_iter()
+        .flatten()
         {
-            return vec![selected_buffer_hash];
+            if transport
+                .get("source_revision")
+                .and_then(serde_json::Value::as_u64)
+                == Some(self.selected_source_revision)
+                && let Some(hash) = transport
+                    .get("source_hash")
+                    .and_then(serde_json::Value::as_str)
+            {
+                hashes.push(hash.to_owned());
+            }
         }
-        let mut hashes = Vec::new();
-        if let Ok(hash) = self.workspace.current_project_hash(&self.catalog) {
-            hashes.push(hash);
-        }
-        if let Ok(units) = self.workspace.selected_runtime_units(&self.catalog) {
-            hashes.push(BoonLanguageService::runtime_units_hash(&units));
-        }
-        hashes.push(selected_buffer_hash);
         hashes.sort();
         hashes.dedup();
         hashes
@@ -21185,19 +21492,12 @@ impl DevWindowShell {
                 });
             }
         };
-        if value.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
-            self.last_dev_command = value
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(source_path)
-                .to_owned();
-            self.last_dev_command_status = value
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("fail")
-                .to_owned();
-            self.last_dev_command_detail = json_diagnostic(&value);
-        }
+        let command_for_status = value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(source_path)
+            .to_owned();
+        self.record_dev_command_result(&command_for_status, &value);
         if value.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
             let command = value
                 .get("command")
@@ -21212,7 +21512,31 @@ impl DevWindowShell {
                         .unwrap_or("DevCommand"),
                 );
             }
-            value["preview_transport"] = self.queue_selected_preview(&command);
+            if command == "Test" {
+                let clicks = preview_test_host_clicks(Path::new(&self.workspace.entry_file));
+                value["preview_transport"] = if clicks.is_empty() {
+                    json!({
+                        "status": "not-run",
+                        "reason": "scenario has no pointer-like test steps",
+                        "preview_mutation_allowed": false
+                    })
+                } else {
+                    self.preview_transport.verifier_host_click_sequence(&clicks)
+                };
+                value["preview_test_host_click_count"] = json!(clicks.len());
+                value["preview_test_route"] = json!(
+                    "scenario pointer targets -> preview host-input queue -> hit test -> source binding"
+                );
+            } else if dev_command_should_queue_preview(&command) {
+                value["preview_transport"] = self.queue_selected_preview(&command);
+            } else {
+                value["preview_transport"] = json!({
+                    "status": "not-run",
+                    "reason": "command does not mutate preview state",
+                    "command": command,
+                    "preview_mutation_allowed": false
+                });
+            }
         }
         value["dispatched_source_path"] = json!(source_path);
         value["dispatch_boundary"] = json!("Document SourceBinding -> DevWindowShell");
@@ -21358,6 +21682,216 @@ impl DevWindowShell {
         value
     }
 
+    fn dispatch_host_synthetic_click_source_path(
+        &mut self,
+        source_path: &str,
+        viewport_width: f32,
+        viewport_height: f32,
+    ) -> serde_json::Value {
+        let viewport_width_u32 = viewport_width.round().max(1.0) as u32;
+        let viewport_height_u32 = viewport_height.round().max(1.0) as u32;
+        let mut activation = self.host_synthetic_activation_for_source_path(
+            source_path,
+            viewport_width,
+            viewport_height,
+        );
+        if activation.get("status").and_then(serde_json::Value::as_str) != Some("pass") {
+            return json!({
+                "status": "fail",
+                "command": "HostSyntheticDevClick",
+                "requested_source_path": source_path,
+                "host_synthetic_activation": activation,
+                "dispatch_skipped": true,
+                "direct_dispatch_without_hit_test": false
+            });
+        }
+
+        let document = self.document_for_viewport(viewport_width_u32, viewport_height_u32);
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let derived_indexes = match boon_document::DocumentDerivedIndexBundle::from_frame(&document)
+        {
+            Ok(indexes) => indexes,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
+                    "command": "HostSyntheticDevClick",
+                    "requested_source_path": source_path,
+                    "typed_index_error": error.to_string(),
+                    "host_synthetic_activation": activation,
+                    "direct_dispatch_without_hit_test": false
+                });
+            }
+        };
+        let layout = match derived_indexes.try_layout(boon_document::LayoutInput {
+            document: &document,
+            viewport: boon_host::Viewport {
+                surface: 1,
+                width: viewport_width,
+                height: viewport_height,
+                scale: 1.0,
+            },
+            text: &mut measurer,
+            capabilities: boon_document::RenderCapabilities::fake_portable(),
+        }) {
+            Ok(layout) => layout,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
+                    "command": "HostSyntheticDevClick",
+                    "requested_source_path": source_path,
+                    "typed_layout_error": error.to_string(),
+                    "host_synthetic_activation": activation,
+                    "direct_dispatch_without_hit_test": false
+                });
+            }
+        };
+        let hit_table = match derived_indexes.try_hit_side_table(&document, &layout) {
+            Ok(table) => table,
+            Err(error) => {
+                return json!({
+                    "status": "fail",
+                    "command": "HostSyntheticDevClick",
+                    "requested_source_path": source_path,
+                    "typed_hit_table_error": error.to_string(),
+                    "host_synthetic_activation": activation,
+                    "direct_dispatch_without_hit_test": false
+                });
+            }
+        };
+        let Some(target_entry) = hit_table.entry_for_source_path(source_path) else {
+            return json!({
+                "status": "fail",
+                "command": "HostSyntheticDevClick",
+                "requested_source_path": source_path,
+                "diagnostic": "source path is not reachable through typed hit side table",
+                "host_synthetic_activation": activation,
+                "direct_dispatch_without_hit_test": false
+            });
+        };
+        let target_x = f64::from(target_entry.bounds.x + target_entry.bounds.width / 2.0);
+        let target_y = f64::from(target_entry.bounds.y + target_entry.bounds.height / 2.0);
+        activation["target_cursor"] = json!({
+            "x": target_x,
+            "y": target_y,
+            "source": "typed-hit-side-table-center"
+        });
+        activation["target_hit_region"] = typed_hit_entry_to_region_json(target_entry);
+
+        let input = boon_native_app_window::NativeInputAdapterProof {
+            installed: true,
+            capture_scope: "dev_window_targeted_app_owned_click".to_owned(),
+            keyboard_api: "none".to_owned(),
+            mouse_api:
+                "boon_native_playground::DevWindowShell::dispatch_host_synthetic_click_source_path"
+                    .to_owned(),
+            wheel_api: "none".to_owned(),
+            per_window_event_provenance_api: "typed-hit-side-table-targeted-dev-click".to_owned(),
+            sampled_after_visible_window: true,
+            real_os_events_observed: false,
+            input_injection_method: "dev_window_targeted_app_owned_host_click".to_owned(),
+            synthetic_input_probe: false,
+            host_events: Vec::new(),
+            mouse_last_window_protocol_id: Some(1),
+            keyboard_last_window_protocol_id: None,
+            mouse_motion_event_count: 1,
+            mouse_button_event_count: 2,
+            mouse_scroll_event_count: 0,
+            mouse_total_event_count: 3,
+            keyboard_key_event_count: 0,
+            mouse_button_events: vec![
+                boon_native_app_window::NativeMouseButtonEventProof {
+                    sequence: 1,
+                    button: "left".to_owned(),
+                    pressed: true,
+                    window_protocol_id: Some(1),
+                    position: Some(boon_native_app_window::NativeMouseWindowPosition {
+                        x: target_x,
+                        y: target_y,
+                        window_width: f64::from(viewport_width_u32),
+                        window_height: f64::from(viewport_height_u32),
+                    }),
+                    event_elapsed_ms: Some(0.0),
+                },
+                boon_native_app_window::NativeMouseButtonEventProof {
+                    sequence: 2,
+                    button: "left".to_owned(),
+                    pressed: false,
+                    window_protocol_id: Some(1),
+                    position: Some(boon_native_app_window::NativeMouseWindowPosition {
+                        x: target_x,
+                        y: target_y,
+                        window_width: f64::from(viewport_width_u32),
+                        window_height: f64::from(viewport_height_u32),
+                    }),
+                    event_elapsed_ms: Some(0.1),
+                },
+            ],
+            keyboard_events: Vec::new(),
+            mouse_window_pos: Some(boon_native_app_window::NativeMouseWindowPosition {
+                x: target_x,
+                y: target_y,
+                window_width: f64::from(viewport_width_u32),
+                window_height: f64::from(viewport_height_u32),
+            }),
+            mouse_buttons_down: Vec::new(),
+            pressed_keys: Vec::new(),
+            scroll_delta_x: 0.0,
+            scroll_delta_y: 0.0,
+        };
+        let mut input_state = DevNativeInputState::default();
+        let mut clipboard = NativeClipboardAdapter;
+        let before_revision = self.selected_source_revision;
+        let before_command = self.last_dev_command.clone();
+        let changed = dev_apply_real_window_input_with_clipboard_and_indexes(
+            &input,
+            &document,
+            Some(&derived_indexes),
+            &layout,
+            viewport_width_u32,
+            viewport_height_u32,
+            self,
+            &mut input_state,
+            &mut clipboard,
+            None,
+        );
+        let dispatch = self
+            .last_dev_input_dispatch
+            .clone()
+            .unwrap_or_else(|| json!({"status": "fail", "diagnostic": "dev click did not dispatch a source binding"}));
+        let clicked_requested_source = dispatch
+            .get("clicked_source_path")
+            .and_then(serde_json::Value::as_str)
+            == Some(source_path);
+        let mut value = dispatch;
+        let click_status = if changed && clicked_requested_source {
+            value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pass")
+                .to_owned()
+        } else {
+            "fail".to_owned()
+        };
+        value["status"] = json!(click_status);
+        value["requested_source_path"] = json!(source_path);
+        value["host_synthetic_activation"] = activation;
+        value["input_evidence_tier"] = json!("boon-driver");
+        value["host_synthetic_input_evidence_tier"] = json!("host-synthetic-targeted-click");
+        value["activation_boundary"] =
+            json!("HostInputEvent -> document hit test -> SourceBinding -> DevWindowShell");
+        value["input_pipeline"] = json!("dev_apply_real_window_input_with_indexes");
+        value["triggered_by_clicking_test_button"] = json!(source_path == "dev.commands.test");
+        value["app_owned_window_input"] = json!(true);
+        value["real_os_input_claimed"] = json!(false);
+        value["direct_dispatch_without_hit_test"] = json!(false);
+        value["clicked_requested_source"] = json!(clicked_requested_source);
+        value["source_revision_unchanged"] =
+            json!(self.selected_source_revision == before_revision);
+        value["before_command"] = json!(before_command);
+        value["native_input_adapter"] = serde_json::to_value(input).unwrap_or_else(|_| json!(null));
+        value
+    }
+
     fn host_synthetic_activation_for_source_path(
         &self,
         source_path: &str,
@@ -21491,19 +22025,30 @@ impl DevWindowShell {
         let selected_for_worker = selected_example_id.clone();
         let source_identity_for_worker = self.selected_source_identity.clone();
         let source_revision = self.selected_source_revision;
+        let completion_wake = self.native_wake.clone();
+        self.latest_preview_replace_command
+            .store(command_id, Ordering::Release);
+        let latest_command = Arc::clone(&self.latest_preview_replace_command);
         let (tx, rx) = mpsc::channel();
         let _ = std::thread::Builder::new()
             .name("boon-native-dev-preview-replace".to_owned())
             .stack_size(PREVIEW_DEEP_WORKER_STACK_BYTES)
             .spawn(move || {
+                let finish = |result: PreviewReplaceWorkerResult| {
+                    let _ = tx.send(result);
+                    if let Some(wake) = completion_wake.as_ref() {
+                        wake.wake();
+                    }
+                };
                 let worker_started = Instant::now();
+                let is_current = || latest_command.load(Ordering::Acquire) == command_id;
                 let payload_started = Instant::now();
                 let project_units = match workspace_for_worker
                     .selected_project_payload_units(&catalog_for_worker)
                 {
                     Ok(units) => units,
                     Err(error) => {
-                        let _ = tx.send(PreviewReplaceWorkerResult {
+                        finish(PreviewReplaceWorkerResult {
                             value: json!({
                                 "status": "fail",
                                 "kind": "ReplaceCode",
@@ -21517,13 +22062,13 @@ impl DevWindowShell {
                                 "dev_payload_build_async": true,
                                 "preview_receives_example_name": false
                             }),
-                            project_type_hinting: None,
                         });
                         return;
                     }
                 };
-                let runtime_units =
-                    ExampleWorkspace::runtime_units_from_project_units(&project_units);
+                if !is_current() {
+                    return;
+                }
                 let payload = match SourceProjectPayload::from_project_units(
                     command_id,
                     source_revision,
@@ -21534,7 +22079,7 @@ impl DevWindowShell {
                 ) {
                     Ok(payload) => payload,
                     Err(error) => {
-                        let _ = tx.send(PreviewReplaceWorkerResult {
+                        finish(PreviewReplaceWorkerResult {
                             value: json!({
                                 "status": "fail",
                                 "kind": "ReplaceCode",
@@ -21548,35 +22093,28 @@ impl DevWindowShell {
                                 "dev_payload_build_async": true,
                                 "preview_receives_example_name": false
                             }),
-                            project_type_hinting: None,
                         });
                         return;
                     }
                 };
+                if !is_current() {
+                    return;
+                }
                 let payload_build_ms = elapsed_ms(payload_started);
                 let mut value = transport.replace_source_project(
                     &command_for_worker,
                     &selected_for_worker,
                     &payload,
                 );
-                let hint_started = Instant::now();
-                let project_type_hinting = Some(BoonLanguageService::project_type_hinting(
-                    &workspace_for_worker.entry_file,
-                    &runtime_units,
-                ));
                 value["dev_to_preview_async"] = json!(true);
                 value["dev_payload_build_async"] = json!(true);
                 value["dev_payload_build_ms"] = json!(payload_build_ms);
                 value["dev_project_type_hint_refresh"] = json!({
-                    "status": "pass",
-                    "async": true,
-                    "elapsed_ms": elapsed_ms(hint_started)
+                    "status": "deferred",
+                    "reason": "preview replacement does not wait for editor analysis"
                 });
                 value["dev_worker_total_ms"] = json!(elapsed_ms(worker_started));
-                let _ = tx.send(PreviewReplaceWorkerResult {
-                    value,
-                    project_type_hinting,
-                });
+                finish(PreviewReplaceWorkerResult { value });
             });
         self.pending_preview_replace = Some(PendingPreviewReplace {
             command_id,
@@ -21662,12 +22200,6 @@ impl DevWindowShell {
                         "dev-side preview replace result did not match pending command/revision"
                     );
                 }
-                if !stale {
-                    if let Some(project_type_hinting) = worker_result.project_type_hinting {
-                        self.workspace
-                            .apply_project_type_hinting(project_type_hinting);
-                    }
-                }
                 if value
                     .pointer("/ack/kind")
                     .and_then(serde_json::Value::as_str)
@@ -21738,8 +22270,16 @@ impl DevWindowShell {
         value: &mut serde_json::Value,
         timeout: Duration,
     ) {
+        let preview_transport_queued = value
+            .pointer("/preview_transport/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("pass")
+            && value
+                .pointer("/preview_transport/preview_mutation_allowed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false);
         if value.get("status").and_then(serde_json::Value::as_str) == Some("pass")
-            && value.get("preview_transport").is_some()
+            && preview_transport_queued
         {
             value["preview_transport_result"] = self.wait_for_preview_replace_result(timeout);
         }
@@ -21764,74 +22304,6 @@ impl DevWindowShell {
         }
     }
 
-    fn refresh_preview_summary_if_due(&mut self, now: Instant) -> bool {
-        let refresh_interval = self.preview_summary_refresh_interval();
-        let due = self
-            .last_preview_summary_refresh
-            .is_none_or(|last| now.duration_since(last) >= refresh_interval);
-        if !due {
-            return false;
-        }
-        self.preview_summary_query_count = self.preview_summary_query_count.saturating_add(1);
-        let previous_hash = boon_runtime::sha256_bytes(
-            &serde_json::to_vec(&self.last_preview_summary).unwrap_or_default(),
-        );
-        let next_summary = self.preview_transport.runtime_summary();
-        if let Some(runtime_summary) = next_summary.get("runtime_summary")
-            && runtime_summary_is_ready(runtime_summary)
-        {
-            self.last_good_runtime_summary = Some(runtime_summary.clone());
-        }
-        self.last_preview_summary = next_summary;
-        self.last_preview_summary_refresh = Some(now);
-        let next_hash = boon_runtime::sha256_bytes(
-            &serde_json::to_vec(&self.last_preview_summary).unwrap_or_default(),
-        );
-        previous_hash != next_hash
-    }
-
-    fn refresh_preview_perf_snapshot_if_due(&mut self, now: Instant) -> bool {
-        let refresh_interval = Duration::from_millis(DEV_PREVIEW_PERF_REFRESH_MS);
-        let due = self
-            .last_preview_perf_refresh
-            .is_none_or(|last| now.duration_since(last) >= refresh_interval);
-        if !due {
-            return false;
-        }
-        self.preview_perf_query_count = self.preview_perf_query_count.saturating_add(1);
-        let previous_hash = boon_runtime::sha256_bytes(
-            &serde_json::to_vec(&self.last_preview_perf_snapshot).unwrap_or_default(),
-        );
-        self.last_preview_perf_snapshot = self.preview_transport.preview_perf_snapshot();
-        self.last_preview_perf_refresh = Some(now);
-        let next_hash = boon_runtime::sha256_bytes(
-            &serde_json::to_vec(&self.last_preview_perf_snapshot).unwrap_or_default(),
-        );
-        previous_hash != next_hash
-    }
-
-    fn preview_summary_wake_after_ms(&self, now: Instant) -> u64 {
-        let refresh_interval = self.preview_summary_refresh_interval();
-        self.last_preview_summary_refresh
-            .and_then(|last| {
-                let due_at = last + refresh_interval;
-                due_at.checked_duration_since(now)
-            })
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or(0)
-    }
-
-    fn preview_perf_wake_after_ms(&self, now: Instant) -> u64 {
-        let refresh_interval = Duration::from_millis(DEV_PREVIEW_PERF_REFRESH_MS);
-        self.last_preview_perf_refresh
-            .and_then(|last| {
-                let due_at = last + refresh_interval;
-                due_at.checked_duration_since(now)
-            })
-            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-            .unwrap_or(0)
-    }
-
     fn command_probe(&self) -> serde_json::Value {
         let mut shell = self.clone();
         shell.workspace = shell.initial_workspace.clone();
@@ -21852,6 +22324,17 @@ impl DevWindowShell {
             .map(|entry| entry.id.clone())
             .or_else(|| shell.catalog.entries.first().map(|entry| entry.id.clone()));
         let preview_probe_timeout = Duration::from_secs(10);
+        let mut run = shell.dispatch_host_synthetic_source_path("dev.commands.run", 1180.0, 820.0);
+        shell.attach_preview_transport_result_if_queued(&mut run, preview_probe_timeout);
+        let mut test =
+            shell.dispatch_host_synthetic_click_source_path("dev.commands.test", 1180.0, 820.0);
+        shell.attach_preview_transport_result_if_queued(&mut test, preview_probe_timeout);
+        let mut format =
+            shell.dispatch_host_synthetic_source_path("dev.commands.format", 1180.0, 820.0);
+        shell.attach_preview_transport_result_if_queued(&mut format, preview_probe_timeout);
+        let mut reset =
+            shell.dispatch_host_synthetic_source_path("dev.commands.reset", 1180.0, 820.0);
+        shell.attach_preview_transport_result_if_queued(&mut reset, preview_probe_timeout);
         let mut tab_switch_json = match alternate {
             Some(example_id) => shell.dispatch_host_synthetic_source_path(
                 &format!("dev.tabs.select.{example_id}"),
@@ -21862,17 +22345,6 @@ impl DevWindowShell {
         };
         shell
             .attach_preview_transport_result_if_queued(&mut tab_switch_json, preview_probe_timeout);
-        let mut run = shell.dispatch_host_synthetic_source_path("dev.commands.run", 1180.0, 820.0);
-        shell.attach_preview_transport_result_if_queued(&mut run, preview_probe_timeout);
-        let mut test =
-            shell.dispatch_host_synthetic_source_path("dev.commands.test", 1180.0, 820.0);
-        shell.attach_preview_transport_result_if_queued(&mut test, preview_probe_timeout);
-        let mut format =
-            shell.dispatch_host_synthetic_source_path("dev.commands.format", 1180.0, 820.0);
-        shell.attach_preview_transport_result_if_queued(&mut format, preview_probe_timeout);
-        let mut reset =
-            shell.dispatch_host_synthetic_source_path("dev.commands.reset", 1180.0, 820.0);
-        shell.attach_preview_transport_result_if_queued(&mut reset, preview_probe_timeout);
         let editor_text_input = shell.dispatch_host_synthetic_editor_text_input(
             "\n-- host synthetic editor input",
             1180.0,
@@ -23416,6 +23888,10 @@ fn friendly_dev_command(command: &str) -> &'static str {
     }
 }
 
+fn dev_command_should_queue_preview(command: &str) -> bool {
+    !matches!(command, "Test")
+}
+
 fn json_diagnostic(value: &serde_json::Value) -> Option<String> {
     for pointer in [
         "/diagnostic",
@@ -24741,6 +25217,26 @@ fn dev_button_node(
     node.style
         .entry("vertical_align".to_owned())
         .or_insert_with(|| boon_document_model::StyleValue::Text("center".to_owned()));
+    node.style.insert(
+        "cursor".to_owned(),
+        boon_document_model::StyleValue::Text("pointer".to_owned()),
+    );
+    node.style.insert(
+        "__hover_bg".to_owned(),
+        boon_document_model::StyleValue::Text("#2563eb".to_owned()),
+    );
+    node.style.insert(
+        "__hover_border".to_owned(),
+        boon_document_model::StyleValue::Text("#bfdbfe".to_owned()),
+    );
+    node.style.insert(
+        "__focus_bg".to_owned(),
+        boon_document_model::StyleValue::Text("#1d4ed8".to_owned()),
+    );
+    node.style.insert(
+        "__focus_border".to_owned(),
+        boon_document_model::StyleValue::Text("#ffffff".to_owned()),
+    );
     node
 }
 
@@ -36037,6 +36533,14 @@ fn preview_apply_verifier_host_click_request(
     } else {
         return Err("preview live runtime is not available for verifier host click".into());
     };
+    let post_click_state_summary = if let Some(live_runtime) = input_context.live_runtime.as_ref() {
+        let mut runtime = live_runtime
+            .lock()
+            .map_err(|_| "preview live runtime mutex poisoned")?;
+        bounded_state_summary_sample(&runtime.state_summary())
+    } else {
+        serde_json::Value::Null
+    };
     Ok((
         applied,
         json!({
@@ -36053,6 +36557,7 @@ fn preview_apply_verifier_host_click_request(
             "real_os_input": false,
             "direct_runtime_state_mutation": false,
             "accepted_host_input_event_hint": input_state.accepted_host_input_event_hint,
+            "bounded_state_summary_sample": post_click_state_summary,
             "native_input_adapter": {
                 "capture_scope": input.capture_scope,
                 "input_injection_method": input.input_injection_method,
@@ -36537,6 +37042,7 @@ fn unhandled_primary_mouse_releases(
             button: "left".to_owned(),
             pressed: false,
             window_protocol_id: input.mouse_last_window_protocol_id,
+            position: input.mouse_window_pos,
             event_elapsed_ms: None,
         }]
     } else {
@@ -36686,6 +37192,12 @@ fn deterministic_click_input_from_start_index(
             button: "left".to_owned(),
             pressed: true,
             window_protocol_id: Some(1),
+            position: Some(boon_native_app_window::NativeMouseWindowPosition {
+                x,
+                y,
+                window_width: 920.0,
+                window_height: 720.0,
+            }),
             event_elapsed_ms: None,
         });
         mouse_button_events.push(boon_native_app_window::NativeMouseButtonEventProof {
@@ -36693,6 +37205,12 @@ fn deterministic_click_input_from_start_index(
             button: "left".to_owned(),
             pressed: false,
             window_protocol_id: Some(1),
+            position: Some(boon_native_app_window::NativeMouseWindowPosition {
+                x,
+                y,
+                window_width: 920.0,
+                window_height: 720.0,
+            }),
             event_elapsed_ms: None,
         });
     }
@@ -36709,6 +37227,7 @@ fn deterministic_click_input_from_start_index(
         real_os_events_observed: false,
         input_injection_method: "deterministic_app_owned_mouse_event_batch".to_owned(),
         synthetic_input_probe: false,
+        host_events: Vec::new(),
         mouse_last_window_protocol_id: Some(1),
         keyboard_last_window_protocol_id: None,
         mouse_motion_event_count: 1,
@@ -36766,6 +37285,7 @@ fn preview_apply_deterministic_drag_motion_with_units(
         button: "left".to_owned(),
         pressed: true,
         window_protocol_id: Some(1),
+        position: press.mouse_window_pos,
         event_elapsed_ms: None,
     }];
     preview_apply_real_window_input_with_units(
@@ -36807,6 +37327,7 @@ fn preview_apply_deterministic_drag_motion_with_units(
         button: "left".to_owned(),
         pressed: false,
         window_protocol_id: Some(1),
+        position: release.mouse_window_pos,
         event_elapsed_ms: None,
     }];
     release.mouse_buttons_down.clear();
@@ -36833,7 +37354,7 @@ fn preview_take_drag_events_from_input(
     for press in unhandled_primary_mouse_presses(input, input_state.last_mouse_press_event_count) {
         input_state.last_mouse_press_event_count =
             input_state.last_mouse_press_event_count.max(press.sequence);
-        let Some(position) = input.mouse_window_pos else {
+        let Some(position) = press.position.or(input.mouse_window_pos) else {
             continue;
         };
         if let Some(route_table) = route_table.as_ref()
@@ -39026,10 +39547,15 @@ fn preview_try_apply_simple_source_click_input(
     let source_intents = pointer_source_intents_for_edges(has_press_edge, has_release_edge, false);
     let click_event_repeat_count = releases.len().max(presses.len()).max(1);
     let coalesced_release_batch = click_event_repeat_count > 1;
-    let Some(position) = input.mouse_window_pos else {
+    let click_position = click_edges
+        .last()
+        .and_then(|event| event.position)
+        .or_else(|| presses.last().and_then(|event| event.position))
+        .or(input.mouse_window_pos);
+    let Some(position) = click_position else {
         return reject("missing_position", input_state);
     };
-    let position_key = preview_mouse_position_key(input.mouse_window_pos);
+    let position_key = preview_mouse_position_key(Some(position));
     let release_sequence = click_edges
         .last()
         .map(|event| event.sequence)
@@ -41311,6 +41837,9 @@ fn preview_apply_real_window_input_with_units(
     shared_render_state: &Arc<Mutex<PreviewSharedRenderState>>,
     input_state: &mut PreviewNativeInputState,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let canonical_input =
+        (!input.host_events.is_empty()).then(|| canonical_native_input_from_host_events(input));
+    let input = canonical_input.as_ref().unwrap_or(input);
     if input.synthetic_input_probe {
         return Ok(false);
     }
@@ -41515,7 +42044,7 @@ fn preview_apply_real_window_input_with_units(
             input_state.last_click_sequence = mouse_release.sequence;
             continue;
         }
-        if let Some(position) = input.mouse_window_pos
+        if let Some(position) = mouse_release.position.or(input.mouse_window_pos)
             && let Some(route_table) = release_route_table.as_deref()
             && let Some(hit) = route_table.hit_test(position.x, position.y)
         {
@@ -41545,19 +42074,22 @@ fn preview_apply_real_window_input_with_units(
             continue;
         }
         let layout = latest_layout.as_ref().unwrap_or(&layout_proof);
-        let hit_region = input.mouse_window_pos.and_then(|position| {
-            document_hit_region_ref_at(layout, position.x, position.y).map(|hit_region| {
-                (
-                    position,
-                    hit_region
-                        .get("node")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    hit_region,
-                )
-            })
-        });
+        let hit_region = mouse_release
+            .position
+            .or(input.mouse_window_pos)
+            .and_then(|position| {
+                document_hit_region_ref_at(layout, position.x, position.y).map(|hit_region| {
+                    (
+                        position,
+                        hit_region
+                            .get("node")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        hit_region,
+                    )
+                })
+            });
         if let Some((position, node, hit_region)) = hit_region {
             if live_source_for_node_intent(layout, &node, "change").is_some()
                 && document_node_wants_text_cursor(layout, &node)
@@ -49994,6 +50526,7 @@ fn preview_apply_world_scene_orbit_probe(
         button: "left".to_owned(),
         pressed: true,
         window_protocol_id: Some(1),
+        position: press.mouse_window_pos,
         event_elapsed_ms: None,
     }];
     press.mouse_button_event_count = 1;
@@ -50022,6 +50555,7 @@ fn preview_apply_world_scene_orbit_probe(
         button: "left".to_owned(),
         pressed: false,
         window_protocol_id: Some(1),
+        position: release.mouse_window_pos,
         event_elapsed_ms: None,
     }];
     release.mouse_button_event_count = 2;
@@ -52498,6 +53032,55 @@ fn preview_verifier_host_click_response(
     }))
 }
 
+fn preview_verifier_host_click_sequence_response(
+    state: &Arc<Mutex<PreviewIpcState>>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let clicks = request
+        .get("clicks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("verifier-host-click-sequence requires clicks")?;
+    if clicks.is_empty() || clicks.len() > 64 {
+        return Err("verifier-host-click-sequence requires 1..=64 clicks".into());
+    }
+    let queue = state
+        .lock()
+        .map_err(|_| "preview IPC state mutex poisoned")?
+        .verifier_host_input
+        .clone();
+    let mut request_ids = Vec::with_capacity(clicks.len());
+    for (index, click) in clicks.iter().enumerate() {
+        let source = click
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let target_text = click
+            .get("target_text")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let label = click
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("test click {}", index + 1));
+        let queued = queue.enqueue_click(source, target_text, None, None, label)?;
+        request_ids.push(queued.request_id);
+    }
+    Ok(json!({
+        "kind": "verifier-host-click-sequence-ack",
+        "status": "pass",
+        "queued_click_count": request_ids.len(),
+        "request_ids": request_ids,
+        "operator_host_input": true,
+        "real_os_input": false,
+        "preview_mutation_allowed": true,
+        "direct_runtime_state_mutation": false,
+        "input_route_contract": "queued click target -> NativeInputAdapterProof -> preview hit test -> source binding",
+        "preview_pid": std::process::id()
+    }))
+}
+
 fn preview_verifier_host_input_status_response(
     state: &Arc<Mutex<PreviewIpcState>>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -52985,7 +53568,7 @@ fn attach_active_pending_snapshot_backpressure(
             value
                 .get("pending_snapshot_commit_currentness_policy")
                 .cloned()
-                .unwrap_or_else(|| json!("source-revision-plus-exact-frame-evidence")),
+                .unwrap_or_else(|| json!("source-revision-plus-surface-epoch")),
         ),
     ];
     if let Some(backpressure) = value
@@ -58564,6 +59147,30 @@ fn handle_preview_ipc_client(
         )?;
         return Ok(());
     }
+    if request.get("kind").and_then(serde_json::Value::as_str)
+        == Some("verifier-host-click-sequence")
+    {
+        let response = preview_verifier_host_click_sequence_response(&state, &request)
+            .unwrap_or_else(|error| {
+                json!({
+                    "kind": "verifier-host-click-sequence-ack",
+                    "status": "fail",
+                    "diagnostic": error.to_string(),
+                    "preview_pid": std::process::id()
+                })
+            });
+        if response.get("status").and_then(serde_json::Value::as_str) == Some("pass") {
+            wake_handle.wake();
+        }
+        write_preview_ipc_response(
+            &mut stream,
+            &state,
+            request_bytes,
+            request_started,
+            &response,
+        )?;
+        return Ok(());
+    }
     if request.get("kind").and_then(serde_json::Value::as_str) == Some("verifier-host-click") {
         let response =
             preview_verifier_host_click_response(&state, &request).unwrap_or_else(|error| {
@@ -58946,21 +59553,6 @@ fn preview_frame_evidence_commit_rejection(
     if accepted.surface_epoch != current.surface_epoch {
         return Some("surface_epoch_changed");
     }
-    if current.frame_seq != accepted.frame_seq {
-        return Some("frame_seq_changed");
-    }
-    if current.content_revision != accepted.content_revision {
-        return Some("content_revision_changed");
-    }
-    if current.layout_revision != accepted.layout_revision {
-        return Some("layout_revision_changed");
-    }
-    if current.render_scene_revision != accepted.render_scene_revision {
-        return Some("render_scene_revision_changed");
-    }
-    if current.present_id != accepted.present_id {
-        return Some("present_id_changed");
-    }
     None
 }
 
@@ -58994,7 +59586,7 @@ fn attach_pending_frame_evidence_fields(
     value["pending_frame_evidence_rejection"] =
         rejection.map_or_else(|| json!(null), |reason| json!(reason));
     value["pending_snapshot_commit_currentness_policy"] =
-        json!("source-revision-plus-exact-frame-evidence");
+        json!("source-revision-plus-surface-epoch");
 }
 
 fn preview_layout_frame_text_evidence(
@@ -59438,7 +60030,7 @@ fn preview_enqueue_source_project(
             None
         ),
         "pending_frame_evidence_rejection": null,
-        "pending_snapshot_commit_currentness_policy": "source-revision-plus-exact-frame-evidence"
+        "pending_snapshot_commit_currentness_policy": "source-revision-plus-surface-epoch"
     });
     attach_latest_wins_metrics(&mut ack, queue_stats.metrics);
     attach_active_pending_snapshot_backpressure(
@@ -62003,6 +62595,7 @@ fn run_dev_ipc_probe(
     replace_code_expected_hash: Option<&str>,
     skip_operator_host_input_probe: bool,
     operator_host_input_source_event_limit: usize,
+    verifier_host_input_expected_completed: usize,
     preview_loop_report: Option<&Path>,
     request_timeout: Duration,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -62127,6 +62720,11 @@ fn run_dev_ipc_probe(
     } else {
         None
     };
+    let verifier_host_input_status = wait_for_preview_verifier_host_input_status(
+        connect,
+        verifier_host_input_expected_completed,
+        request_timeout,
+    );
     let stress_start = Instant::now();
     let runtime_summary_response = send_preview_ipc_request_with_timeouts(
         connect,
@@ -62187,6 +62785,7 @@ fn run_dev_ipc_probe(
     value["dev_ipc_stress_round_trip_ms"] = json!(stress_start.elapsed().as_millis() as u64);
     value["dev_ipc_total_elapsed_ms"] = json!(start.elapsed().as_millis() as u64);
     value["runtime_summary_query"] = runtime_summary_response;
+    value["verifier_host_input_status"] = verifier_host_input_status;
     value["ipc_counter_sources"]["debug_query_bytes"] =
         json!("measured runtime-summary IPC request+response bytes");
     value["ipc_counter_sources"]["debug_subscription_bytes"] =
@@ -62214,6 +62813,62 @@ fn run_dev_ipc_probe(
         };
     }
     Ok(value)
+}
+
+fn wait_for_preview_verifier_host_input_status(
+    connect: &str,
+    expected_completed: usize,
+    timeout: Duration,
+) -> serde_json::Value {
+    let started = Instant::now();
+    let mut last = json!({
+        "kind": "verifier-host-input-status",
+        "status": "pending",
+        "expected_completed_count": expected_completed
+    });
+    loop {
+        match send_preview_ipc_request_with_timeouts(
+            connect,
+            json!({"kind": "verifier-host-input-status", "dev_pid": std::process::id()}),
+            Duration::from_secs(5),
+            timeout,
+            Duration::from_secs(10),
+        ) {
+            Ok(mut response) => {
+                let completed = response
+                    .pointer("/queue/completed_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let pending = response
+                    .pointer("/queue/pending_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                response["expected_completed_count"] = json!(expected_completed);
+                response["wait_elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+                if completed >= expected_completed && pending == 0 {
+                    return response;
+                }
+                last = response;
+            }
+            Err(error) => {
+                last = json!({
+                    "kind": "verifier-host-input-status",
+                    "status": "fail",
+                    "expected_completed_count": expected_completed,
+                    "diagnostic": error.to_string()
+                });
+            }
+        }
+        if started.elapsed() >= timeout {
+            last["status"] = json!("fail");
+            last["diagnostic"] = json!(format!(
+                "timed out waiting for {expected_completed} completed verifier host-input requests"
+            ));
+            last["wait_elapsed_ms"] = json!(started.elapsed().as_millis() as u64);
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn wait_for_preview_loop_readback(
@@ -62607,6 +63262,7 @@ fn aggregate_operator_host_input_responses(responses: Vec<serde_json::Value>) ->
 
 const OPERATOR_HOST_INPUT_SOURCE_EVENTS_PER_REQUEST: usize = 4;
 const DEV_IPC_OPERATOR_HOST_SOURCE_EVENT_LIMIT: usize = 16;
+const DEV_COALESCED_POINTER_CLICK_REPETITIONS: usize = 4;
 
 fn operator_host_input_smoke_probe_requests_with_limit_and_batch_size(
     path: &Path,
@@ -62716,6 +63372,40 @@ fn operator_host_input_source_events(path: &Path) -> Option<Vec<serde_json::Valu
         return None;
     }
     Some(source_events)
+}
+
+fn preview_test_host_clicks(path: &Path) -> Vec<serde_json::Value> {
+    operator_host_input_source_events(path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|input| {
+            let event = input.get("source_event")?;
+            let action_kind = event
+                .get("user_action_kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !action_kind.contains("press")
+                && !action_kind.contains("click")
+                && !action_kind.contains("select")
+            {
+                return None;
+            }
+            let source = event.get("source")?.as_str()?;
+            let target_text = event
+                .get("target_text")
+                .or_else(|| event.get("address"))
+                .and_then(serde_json::Value::as_str);
+            Some(json!({
+                "source": source,
+                "target_text": target_text,
+                "label": input
+                    .get("source_event_index")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|index| format!("scenario click {}", index + 1))
+                    .unwrap_or_else(|| "scenario click".to_owned())
+            }))
+        })
+        .collect()
 }
 
 fn sample_operator_host_input_source_events(
@@ -63311,6 +64001,232 @@ impl Drop for DesktopProgressCleanup {
     }
 }
 
+struct DesktopProcessCpuSampler {
+    stop: Arc<AtomicBool>,
+    samples: Arc<Mutex<Vec<serde_json::Value>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DesktopProcessCpuSampler {
+    fn start(preview_pid: u32, dev_pid: u32, interval: Duration, max_samples: usize) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_samples = Arc::clone(&samples);
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut previous = desktop_process_cpu_tick_snapshot(start, preview_pid, dev_pid);
+            while !thread_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                let next = desktop_process_cpu_tick_snapshot(start, preview_pid, dev_pid);
+                let sample = desktop_process_cpu_delta_json(&previous, &next);
+                if let Ok(mut samples) = thread_samples.lock() {
+                    if samples.len() < max_samples {
+                        samples.push(sample);
+                    }
+                    if samples.len() >= max_samples {
+                        break;
+                    }
+                }
+                previous = next;
+            }
+        });
+        Self {
+            stop,
+            samples,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> serde_json::Value {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let samples = self
+            .samples
+            .lock()
+            .map(|samples| samples.clone())
+            .unwrap_or_default();
+        let summary = desktop_process_cpu_summary(&samples);
+        json!({
+            "status": if samples.is_empty() { "fail" } else { "pass" },
+            "measurement_source": "procfs-child-pid-tick-deltas",
+            "sample_interval_ms": 250,
+            "sample_count": samples.len(),
+            "summary": summary,
+            "samples": samples
+        })
+    }
+}
+
+impl Drop for DesktopProcessCpuSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DesktopProcessCpuTickSnapshot {
+    elapsed_ms: u64,
+    total_ticks: Option<u64>,
+    cpu_count: u64,
+    preview_ticks: Option<u64>,
+    dev_ticks: Option<u64>,
+    preview_alive: bool,
+    dev_alive: bool,
+}
+
+fn finish_desktop_process_cpu_sampler(
+    sampler: &mut Option<DesktopProcessCpuSampler>,
+) -> serde_json::Value {
+    sampler
+        .take()
+        .map(DesktopProcessCpuSampler::finish)
+        .unwrap_or_else(|| {
+            json!({
+                "status": "not-run",
+                "reason": "desktop process CPU sampler only runs in probe mode"
+            })
+        })
+}
+
+fn desktop_process_cpu_tick_snapshot(
+    start: Instant,
+    preview_pid: u32,
+    dev_pid: u32,
+) -> DesktopProcessCpuTickSnapshot {
+    DesktopProcessCpuTickSnapshot {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        total_ticks: proc_total_cpu_ticks(),
+        cpu_count: std::thread::available_parallelism()
+            .map(|count| count.get() as u64)
+            .unwrap_or(1)
+            .max(1),
+        preview_ticks: proc_process_cpu_ticks(preview_pid),
+        dev_ticks: proc_process_cpu_ticks(dev_pid),
+        preview_alive: proc_cmdline(preview_pid).iter().any(|arg| {
+            arg.contains("boon_native_playground")
+                || arg.ends_with("/boon_native_playground")
+                || arg == "boon_native_playground"
+        }),
+        dev_alive: proc_cmdline(dev_pid).iter().any(|arg| {
+            arg.contains("boon_native_playground")
+                || arg.ends_with("/boon_native_playground")
+                || arg == "boon_native_playground"
+        }),
+    }
+}
+
+fn desktop_process_cpu_delta_json(
+    previous: &DesktopProcessCpuTickSnapshot,
+    next: &DesktopProcessCpuTickSnapshot,
+) -> serde_json::Value {
+    let total_delta = next
+        .total_ticks
+        .zip(previous.total_ticks)
+        .map(|(next, previous)| next.saturating_sub(previous))
+        .unwrap_or(0);
+    let preview_delta = next
+        .preview_ticks
+        .zip(previous.preview_ticks)
+        .map(|(next, previous)| next.saturating_sub(previous));
+    let dev_delta = next
+        .dev_ticks
+        .zip(previous.dev_ticks)
+        .map(|(next, previous)| next.saturating_sub(previous));
+    json!({
+        "elapsed_ms": next.elapsed_ms,
+        "duration_ms": next.elapsed_ms.saturating_sub(previous.elapsed_ms),
+        "cpu_count": next.cpu_count,
+        "total_cpu_tick_delta": total_delta,
+        "preview_alive": next.preview_alive,
+        "dev_alive": next.dev_alive,
+        "preview_process_tick_delta": preview_delta,
+        "dev_process_tick_delta": dev_delta,
+        "preview_cpu_pct_one_core": desktop_process_cpu_pct(preview_delta, total_delta, next.cpu_count),
+        "dev_cpu_pct_one_core": desktop_process_cpu_pct(dev_delta, total_delta, next.cpu_count)
+    })
+}
+
+fn desktop_process_cpu_pct(
+    process_delta: Option<u64>,
+    total_delta: u64,
+    cpu_count: u64,
+) -> serde_json::Value {
+    let Some(process_delta) = process_delta else {
+        return serde_json::Value::Null;
+    };
+    if total_delta == 0 {
+        return serde_json::Value::Null;
+    }
+    json!((process_delta as f64 * cpu_count.max(1) as f64 * 100.0) / total_delta as f64)
+}
+
+fn desktop_process_cpu_summary(samples: &[serde_json::Value]) -> serde_json::Value {
+    let preview_values = samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .get("preview_cpu_pct_one_core")
+                .and_then(serde_json::Value::as_f64)
+        })
+        .collect::<Vec<_>>();
+    let dev_values = samples
+        .iter()
+        .filter_map(|sample| {
+            sample
+                .get("dev_cpu_pct_one_core")
+                .and_then(serde_json::Value::as_f64)
+        })
+        .collect::<Vec<_>>();
+    let preview_alive_sample_count = samples
+        .iter()
+        .filter(|sample| {
+            sample
+                .get("preview_alive")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+        .count();
+    let dev_alive_sample_count = samples
+        .iter()
+        .filter(|sample| sample.get("dev_alive").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+    json!({
+        "preview_cpu_pct_one_core": percentile_summary_f64(preview_values),
+        "dev_cpu_pct_one_core": percentile_summary_f64(dev_values),
+        "preview_alive_sample_count": preview_alive_sample_count,
+        "dev_alive_sample_count": dev_alive_sample_count
+    })
+}
+
+fn proc_total_cpu_ticks() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().find(|line| line.starts_with("cpu "))?;
+    let total = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|part| part.parse::<u64>().ok())
+        .sum::<u64>();
+    (total > 0).then_some(total)
+}
+
+fn proc_process_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end_comm = stat.rfind(')')?;
+    let fields = stat
+        .get(end_comm + 1..)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let utime = fields.get(11)?.parse::<u64>().ok()?;
+    let stime = fields.get(12)?.parse::<u64>().ok()?;
+    Some(utime.saturating_add(stime))
+}
+
 fn write_desktop_report(
     path: &Path,
     args: &[String],
@@ -63719,6 +64635,184 @@ mod tests {
     }
 
     #[test]
+    fn test_command_queues_preview_host_clicks_without_replacing_source() {
+        let source_path = "examples/counter.bn";
+        let source = boon_runtime::source_text_for_path(Path::new(source_path)).unwrap();
+        let mut shell = DevWindowShell::new(
+            source_path,
+            &source,
+            Some("counter"),
+            PreviewTransport::new(None),
+        );
+        let before_revision = shell.selected_source_revision;
+
+        let result =
+            shell.dispatch_host_synthetic_click_source_path("dev.commands.test", 1180.0, 820.0);
+
+        assert_eq!(result["status"], "pass");
+        assert_eq!(result["command"], "Test");
+        assert_eq!(
+            result["input_pipeline"],
+            "dev_apply_real_window_input_with_indexes"
+        );
+        assert_eq!(result["clicked_source_path"], "dev.commands.test");
+        assert_eq!(result["clicked_source_intent"], "press");
+        assert_eq!(result["triggered_by_clicking_test_button"], true);
+        assert_eq!(result["direct_dispatch_without_hit_test"], false);
+        assert_eq!(
+            result["host_synthetic_activation"]["source_binding_resolved"],
+            true
+        );
+        assert_eq!(result["preview_test_host_click_count"], 6);
+        assert_eq!(
+            result["preview_transport"]["preview_mutation_allowed"],
+            true
+        );
+        assert_eq!(
+            result["preview_transport"]["kind"],
+            "verifier-host-click-sequence"
+        );
+        assert!(
+            shell.pending_preview_replace.is_none(),
+            "Test must exercise the current preview without replacing its source"
+        );
+        assert_eq!(
+            shell.selected_source_revision, before_revision,
+            "Test must not advance source revision or invalidate preview identity"
+        );
+    }
+
+    #[test]
+    fn dev_pointer_hover_and_click_use_retained_and_event_time_state() {
+        let source_path = "examples/counter.bn";
+        let source = boon_runtime::source_text_for_path(Path::new(source_path)).unwrap();
+        let mut shell = DevWindowShell::new(
+            source_path,
+            &source,
+            Some("counter"),
+            PreviewTransport::new(None),
+        );
+        let width = 1180_u32;
+        let height = 820_u32;
+        let target = dev_app_owned_pointer_script_for_source_path(
+            &shell,
+            "dev.commands.test",
+            "test",
+            width as f32,
+            height as f32,
+            0,
+        )
+        .unwrap();
+        let document = shell.document_for_viewport(width, height);
+        let indexes = boon_document::DocumentDerivedIndexBundle::from_frame(&document).unwrap();
+        let mut measurer = boon_native_gpu::GlyphonTextMeasurer::new();
+        let layout = indexes
+            .try_layout(boon_document::LayoutInput {
+                document: &document,
+                viewport: boon_host::Viewport {
+                    surface: 1,
+                    width: width as f32,
+                    height: height as f32,
+                    scale: 1.0,
+                },
+                text: &mut measurer,
+                capabilities: boon_document::RenderCapabilities::fake_portable(),
+            })
+            .unwrap();
+
+        let hover = deterministic_motion_input_from_counts(
+            0,
+            1,
+            target.x,
+            target.y,
+            (width as f32, height as f32),
+        );
+        let mut input_state = DevNativeInputState::default();
+        update_dev_pointer_visual_state(
+            &hover,
+            &document,
+            Some(&indexes),
+            &layout,
+            width,
+            height,
+            &mut input_state,
+        );
+        assert_eq!(
+            input_state.hovered_node.as_deref(),
+            Some("dev-command-test")
+        );
+
+        let mut render_state = DevRenderState::default();
+        refresh_dev_render_layout(&shell, &mut render_state, &mut measurer, width, height);
+        assert!(patch_dev_render_pointer_visual_state(
+            &input_state,
+            &mut render_state
+        ));
+        let test_item = render_state
+            .layout_frame
+            .as_ref()
+            .unwrap()
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "dev-command-test")
+            .unwrap();
+        assert_eq!(
+            test_item.style.get("__hover"),
+            Some(&boon_document_model::StyleValue::Bool(true))
+        );
+
+        let mut click = deterministic_click_input(1, target.x, target.y);
+        set_input_window_size(&mut click, (width as f32, height as f32));
+        click.mouse_window_pos = Some(boon_native_app_window::NativeMouseWindowPosition {
+            x: 1.0,
+            y: 1.0,
+            window_width: width as f64,
+            window_height: height as f64,
+        });
+        let surface = boon_host::SurfaceId("dev-test-surface".to_owned());
+        let window = boon_host::WindowId("dev-test-window".to_owned());
+        click.host_events = [boon_host::PointerPhase::Down, boon_host::PointerPhase::Up]
+            .into_iter()
+            .enumerate()
+            .map(|(index, phase)| boon_host::HostEventEnvelope {
+                sequence: index as u64 + 1,
+                origin: boon_host::HostEventOrigin::Operator,
+                window: window.clone(),
+                surface: surface.clone(),
+                surface_epoch: 1,
+                event: boon_host::HostEvent::Pointer(boon_host::PointerEvent {
+                    surface: surface.clone(),
+                    x: target.x as f32,
+                    y: target.y as f32,
+                    phase,
+                    button: Some(boon_host::PointerButton::Primary),
+                }),
+            })
+            .collect();
+        click.mouse_button_events.clear();
+        let click = canonical_native_input_from_host_events(&click);
+        let mut clipboard = NativeClipboardAdapter;
+        let mut observation = DevInputDispatchObservation::default();
+        assert!(dev_apply_real_window_input_with_clipboard_and_indexes(
+            &click,
+            &document,
+            Some(&indexes),
+            &layout,
+            width,
+            height,
+            &mut shell,
+            &mut input_state,
+            &mut clipboard,
+            Some(&mut observation),
+        ));
+        assert_eq!(
+            observation.source_path.as_deref(),
+            Some("dev.commands.test")
+        );
+        assert_eq!(shell.last_dev_command, "Test");
+    }
+
+    #[test]
     fn default_catalog_hides_3d_examples_but_keeps_primary_examples_visible() {
         let entries = boon_runtime::example_manifest_entries().unwrap();
         let entry = |id: &str| {
@@ -63763,10 +64857,129 @@ mod tests {
     }
 
     #[test]
-    fn dev_perf_hud_default_refresh_is_not_a_busy_repaint_loop() {
-        assert!(
-            DEV_PREVIEW_PERF_REFRESH_MS >= 1_000,
-            "manual dev-window perf HUD must not force multiple full text-scene repaints per second"
+    fn preview_replace_worker_wakes_dev_loop_on_completion() {
+        let source_path = "examples/counter.bn";
+        let source = boon_runtime::source_text_for_path(Path::new(source_path)).unwrap();
+        let wake = boon_native_app_window::NativeWakeHandle::new();
+        let mut shell = DevWindowShell::new(
+            source_path,
+            &source,
+            Some("counter"),
+            PreviewTransport::new(None),
         );
+        shell.native_wake = Some(wake.clone());
+        let generation = wake.generation();
+
+        let queued = shell.queue_selected_preview("TestWake");
+        assert_eq!(queued["status"], "pass");
+        assert!(
+            wake.wait_for_wake_after(generation, Duration::from_secs(2)) > generation,
+            "preview replacement completion must wake the demand-driven dev loop"
+        );
+        let started = Instant::now();
+        while !shell.collect_preview_replace_result() && started.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::yield_now();
+        }
+        assert!(shell.pending_preview_replace.is_none());
+        assert_eq!(shell.last_preview_transport["status"], "not-bound");
+    }
+
+    #[test]
+    fn pending_preview_commit_survives_intervening_overlay_frame() {
+        let surface = boon_host::SurfaceId("preview-surface".to_owned());
+        let accepted = boon_native_app_window::FrameEvidenceKey {
+            frame_seq: 10,
+            content_revision: 4,
+            layout_revision: 4,
+            render_scene_revision: 4,
+            surface_id: surface.clone(),
+            surface_epoch: 2,
+            input_event_seq: None,
+            present_id: 10,
+            proof_request_id: None,
+        };
+        let current = boon_native_app_window::FrameEvidenceKey {
+            frame_seq: 11,
+            content_revision: 5,
+            layout_revision: 5,
+            render_scene_revision: 5,
+            present_id: 11,
+            ..accepted.clone()
+        };
+        assert_eq!(
+            preview_frame_evidence_commit_rejection(Some(&accepted), Some(&current)),
+            None,
+            "presenting the pending overlay must not invalidate the matching source generation"
+        );
+
+        let replaced_surface = boon_native_app_window::FrameEvidenceKey {
+            surface_epoch: 3,
+            ..current
+        };
+        assert_eq!(
+            preview_frame_evidence_commit_rejection(Some(&accepted), Some(&replaced_surface)),
+            Some("surface_epoch_changed")
+        );
+    }
+
+    #[test]
+    fn input_overlay_patch_can_remove_all_scene_entries_for_a_node() {
+        let node = boon_document_model::DocumentNodeId("hidden-overlay-node".to_owned());
+        let retained_node = boon_document_model::DocumentNodeId("retained-node".to_owned());
+        let mut style = BTreeMap::new();
+        style.insert(
+            "paint".to_owned(),
+            boon_document_model::StyleValue::Bool(false),
+        );
+        let frame = boon_document::LayoutFrame {
+            display_list: vec![boon_document::DisplayItem {
+                node: retained_node,
+                kind: boon_document_model::DocumentNodeKind::Text,
+                bounds: boon_document::Rect {
+                    x: 500.0,
+                    y: 500.0,
+                    width: 100.0,
+                    height: 20.0,
+                },
+                text: Some("hidden".to_owned()),
+                style_identity: boon_document::ComputedStyleIdentity::from_style(&style),
+                style,
+                focused: false,
+            }],
+            hit_regions: Vec::new(),
+            scroll_regions: Vec::new(),
+            accessibility: boon_document::AccessibilityTree::default(),
+            demands: Vec::new(),
+            materialization: Vec::new(),
+            metrics: boon_document::LayoutMetrics::default(),
+        };
+        let touched = BTreeSet::from([node.clone()]);
+        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
+
+        let patch = preview_input_overlay_render_scene_patch_from_base(
+            &frame,
+            &PreviewRenderOverlayLookup::default(),
+            &PreviewHoverOverlayState::default(),
+            &PreviewFocusOverlayState::default(),
+            &touched,
+            200,
+            100,
+            &mut columns,
+        )
+        .expect("an absent touched node still produces a removal patch");
+
+        assert!(matches!(
+            patch.patch.operations.as_slice(),
+            [boon_document::RenderScenePatchOperation::ReplaceNodeEntries {
+                nodes,
+                items,
+                visual_primitives,
+                text_runs,
+            }] if nodes == &vec![node]
+                && items.is_empty()
+                && visual_primitives.is_empty()
+                && text_runs.is_empty()
+        ));
     }
 }

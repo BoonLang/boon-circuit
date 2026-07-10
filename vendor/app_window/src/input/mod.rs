@@ -20,8 +20,6 @@ Input handling functionality for app_window - a cross-platform library for recei
         * We map hardware keys rather than unicode characters
         * If you are trying to implement text input, you have much work to do, including but not limited to the shift key
    * Keycodes are translated into a platform-independent enum that works everywhere
-   * On Linux, key events are broadcasted over ATSPI.  Due to some [questionable decisions in the Linux ecosystem](https://github.com/AccessKit/accesskit/discussions/503#discussioncomment-11862133)
-     this is required for screenreaders to work but nobody does it.  We do!
 
 
 # Supported platforms
@@ -59,6 +57,12 @@ pub use keyboard::sys::debug_window_show;
 ///
 pub use keyboard::sys::debug_window_hide;
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum InputEventOrigin {
+    RealOs,
+    Operator,
+}
+
 /**
 Provides information about the window an event was delivered to.
 
@@ -68,7 +72,7 @@ Provides information about the window an event was delivered to.
 * on wasm32, we attach to the global DOM window, and we choose an opaque value arbitrarily for this type.
 * on Linux, we return the wayland surface ID.  No memory management is performed, so values may refer to previous surfaces, etc.
 */
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Window(pub std::ptr::NonNull<std::ffi::c_void>);
 //we don't do anything with it so it's fine to send
 unsafe impl Send for Window {}
@@ -77,7 +81,8 @@ unsafe impl Send for Window {}
 pub mod linux {
     pub use crate::input::keyboard::linux::wl_keyboard_event;
     pub use crate::input::mouse::linux::{
-        axis_event, button_event, motion_event, xdg_toplevel_configure_event,
+        axis_event, button_event, motion_event, pointer_leave_event, xdg_toplevel_configure_event,
+        xdg_toplevel_configure_event_for_window,
     };
 }
 

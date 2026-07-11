@@ -8,7 +8,7 @@ use boon_document::{
     },
 };
 #[cfg(test)]
-use boon_document::{DocumentNodeKind, LayoutFrame};
+use boon_document::{DocumentNodeKind, LayoutFrame, StyleEditorTypeHint};
 use boon_host::SurfaceId;
 use glyphon::{
     Attrs, Buffer, Cache, Color, ContentType, CustomGlyph, CustomGlyphId, Family, FontSystem,
@@ -592,6 +592,29 @@ pub struct AppOwnedRenderSceneRequest<'a> {
     pub artifact_label: &'a str,
 }
 
+pub struct AppOwnedProofRenderer {
+    renderer: VisibleLayoutRenderer,
+}
+
+impl AppOwnedProofRenderer {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        Self {
+            renderer: VisibleLayoutRenderer::new(
+                device,
+                queue,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+            ),
+        }
+    }
+
+    pub fn render_scene_pixels(
+        &mut self,
+        request: AppOwnedRenderSceneRequest<'_>,
+    ) -> Result<RenderProof, RenderError> {
+        render_app_owned_scene_pixels_with_renderer(request, &mut self.renderer)
+    }
+}
+
 pub struct SurfaceRenderSceneRequest<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
@@ -750,60 +773,6 @@ fn native_gpu_quad_vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &NATIVE_GPU_QUAD_VERTEX_ATTRIBUTES,
     }
-}
-
-pub fn native_gpu_quad_vertex_layout_contract() -> serde_json::Value {
-    let layout = native_gpu_quad_vertex_buffer_layout();
-    let generated = generated::shader_bindings::native_gpu_rect::vs_main_entry(
-        wgpu::VertexStepMode::Vertex,
-        wgpu::VertexStepMode::Vertex,
-        wgpu::VertexStepMode::Vertex,
-    );
-    let generated_attributes = generated
-        .buffers
-        .iter()
-        .flat_map(|buffer| buffer.attributes.iter())
-        .map(|attribute| {
-            serde_json::json!({
-                "shader_location": attribute.shader_location,
-                "offset": attribute.offset,
-                "format": format!("{:?}", attribute.format),
-            })
-        })
-        .collect::<Vec<_>>();
-    let generated_shader_inputs = generated
-        .buffers
-        .iter()
-        .flat_map(|buffer| buffer.attributes.iter())
-        .map(|attribute| {
-            serde_json::json!({
-                "shader_location": attribute.shader_location,
-                "format": format!("{:?}", attribute.format),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "host_struct": "NativeGpuQuadVertex",
-        "pod": true,
-        "size": std::mem::size_of::<NativeGpuQuadVertex>(),
-        "align": std::mem::align_of::<NativeGpuQuadVertex>(),
-        "buffer_count": 1,
-        "array_stride": layout.array_stride,
-        "step_mode": format!("{:?}", layout.step_mode),
-        "attributes": layout
-            .attributes
-            .iter()
-            .map(|attribute| {
-                serde_json::json!({
-                    "shader_location": attribute.shader_location,
-                    "offset": attribute.offset,
-                    "format": format!("{:?}", attribute.format),
-                })
-            })
-            .collect::<Vec<_>>(),
-        "generated_shader_attributes": generated_attributes,
-        "generated_shader_inputs": generated_shader_inputs,
-    })
 }
 
 #[derive(Default)]
@@ -3289,6 +3258,14 @@ fn stable_text_hash(text: &str) -> u64 {
 pub fn render_app_owned_scene_pixels(
     request: AppOwnedRenderSceneRequest<'_>,
 ) -> Result<RenderProof, RenderError> {
+    let mut renderer = AppOwnedProofRenderer::new(request.device, request.queue);
+    renderer.render_scene_pixels(request)
+}
+
+fn render_app_owned_scene_pixels_with_renderer(
+    request: AppOwnedRenderSceneRequest<'_>,
+    renderer: &mut VisibleLayoutRenderer,
+) -> Result<RenderProof, RenderError> {
     std::fs::create_dir_all(request.artifact_dir).map_err(|error| RenderError {
         message: format!(
             "create native GPU artifact directory `{}`: {error}",
@@ -3327,7 +3304,6 @@ pub fn render_app_owned_scene_pixels(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("boon-native-gpu-app-owned-scene-encoder"),
         });
-    let mut renderer = VisibleLayoutRenderer::new(request.device, request.queue, format);
     let mut metrics = renderer.encode_scene(SurfaceRenderSceneRequest {
         device: request.device,
         queue: request.queue,
@@ -4337,11 +4313,9 @@ fn rich_text_spans(style: &StyleMap, text: &str, default_color: [u8; 4]) -> Vec<
 }
 
 fn rich_text_span_payloads(style: &StyleMap) -> Vec<StyleRichTextSpan> {
-    match state_style_value(style, "syntax_spans_json") {
+    match state_style_value(style, "syntax_spans") {
         Some(StyleValue::RichTextSpans(spans)) => spans.clone(),
-        _ => style_text(style, "syntax_spans_json")
-            .and_then(|spans_json| serde_json::from_str::<Vec<StyleRichTextSpan>>(spans_json).ok())
-            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 

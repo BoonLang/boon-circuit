@@ -1,4 +1,0 @@
-#!/bin/bash
-set -e
-scripts/native/tests "$@"
-scripts/wasm32/tests "$@"

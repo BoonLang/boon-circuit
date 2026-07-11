@@ -482,17 +482,26 @@ fn editor_type_hints_render_as_virtual_text_without_changing_source_run() {
         StyleValue::Text("zero,calt".to_owned()),
     );
     style.insert(
-        "syntax_spans_json".to_owned(),
-        StyleValue::Text(
-            r##"[{"text":"count","source_text":"count","color":"#eeeeee"}]"##.to_owned(),
-        ),
+        "syntax_spans".to_owned(),
+        StyleValue::RichTextSpans(vec![StyleRichTextSpan {
+            text: "count".to_owned(),
+            source_text: Some("count".to_owned()),
+            color: Some("#eeeeee".to_owned()),
+            font_style: None,
+            font_weight: None,
+        }]),
     );
     style.insert(
-        "editor_type_hints_json".to_owned(),
-        StyleValue::Text(
-            r#"[{"anchor_column":6,"compact_label":"Number","line":1,"start":0,"end":5,"category":"definition","detail_label":"Number"}]"#
-                .to_owned(),
-        ),
+        "editor_type_hints".to_owned(),
+        StyleValue::EditorTypeHints(vec![StyleEditorTypeHint {
+            line: 1,
+            start: 0,
+            end: 5,
+            anchor_column: 6,
+            category: "definition".to_owned(),
+            compact_label: "Number".to_owned(),
+            detail_label: "Number".to_owned(),
+        }]),
     );
     let frame = LayoutFrame {
         display_list: vec![DisplayItem {
@@ -541,11 +550,16 @@ fn editor_type_hints_do_not_render_sliced_runs_outside_source_bounds() {
         StyleValue::Text("zero,calt".to_owned()),
     );
     style.insert(
-        "editor_type_hints_json".to_owned(),
-        StyleValue::Text(
-            r#"[{"anchor_column":27,"compact_label":"Number","line":1,"start":0,"end":26,"category":"definition","detail_label":"Number"}]"#
-                .to_owned(),
-        ),
+        "editor_type_hints".to_owned(),
+        StyleValue::EditorTypeHints(vec![StyleEditorTypeHint {
+            line: 1,
+            start: 0,
+            end: 26,
+            anchor_column: 27,
+            category: "definition".to_owned(),
+            compact_label: "Number".to_owned(),
+            detail_label: "Number".to_owned(),
+        }]),
     );
     let frame = LayoutFrame {
         display_list: vec![DisplayItem {
@@ -997,7 +1011,7 @@ fn text_input_placeholder_and_value_share_line_box_top() {
 fn rich_text_spans_preserve_exact_line_text() {
     let mut style = StyleMap::new();
     style.insert(
-        "syntax_spans_json".to_owned(),
+        "syntax_spans".to_owned(),
         StyleValue::RichTextSpans(vec![
             StyleRichTextSpan {
                 text: "SOURCE".to_owned(),
@@ -1039,11 +1053,14 @@ fn rich_text_spans_preserve_exact_line_text() {
 fn rich_text_spans_preserve_pipe_forward_source_text() {
     let mut style = StyleMap::new();
     style.insert(
-        "syntax_spans_json".to_owned(),
-        StyleValue::Text(
-            r##"[{"text":"|>","source_text":"|>","color":"#ff9f43","font_weight":"600","font_style":null}]"##
-                .to_owned(),
-        ),
+        "syntax_spans".to_owned(),
+        StyleValue::RichTextSpans(vec![StyleRichTextSpan {
+            text: "|>".to_owned(),
+            source_text: Some("|>".to_owned()),
+            color: Some("#ff9f43".to_owned()),
+            font_weight: Some("600".to_owned()),
+            font_style: None,
+        }]),
     );
 
     let spans = rich_text_spans(&style, "|>", [255, 159, 67, 255]);

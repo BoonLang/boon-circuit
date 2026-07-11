@@ -1,4 +1,0 @@
-#!/bin/bash
-set -e
-scripts/native/clippy "$@"
-scripts/wasm32/clippy "$@"

@@ -6411,13 +6411,25 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         {
             Type::Text
         }
-        AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
-            if function == "List/chunk" =>
-        {
+        AstExprKind::Call { function, args }
+        | AstExprKind::Pipe {
+            op: function, args, ..
+        } if function == "List/chunk" => {
+            let output_name = |role: &str, fallback: &str| {
+                args.iter()
+                    .find(|arg| arg.name.as_deref() == Some(role))
+                    .and_then(|arg| expressions.get(arg.value))
+                    .and_then(expr_single_name)
+                    .unwrap_or(fallback)
+                    .to_owned()
+            };
             Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
                 [
-                    ("row_number".to_owned(), Type::Text),
-                    ("cells".to_owned(), Type::List(Box::new(open_object_type()))),
+                    (output_name("label", "label"), Type::Text),
+                    (
+                        output_name("items", "items"),
+                        Type::List(Box::new(open_object_type())),
+                    ),
                 ]
                 .into_iter(),
                 true,

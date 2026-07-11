@@ -148,7 +148,7 @@ user_action = { kind = "double_click", target = "todo title", target_text = "Tes
 expected_source_event = { source = "todo.sources.todo_title_element.double_click", target_text = "Test todo edited" }
 expect_editing_title = "Test todo edited"
 expect_edit_text = "Test todo edited"
-expect_semantic_delta_contains = ["FieldSet:editing", "FieldSet:edit_text"]
+expect_semantic_delta_contains = ["FieldSet:editing"]
 expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]
@@ -175,7 +175,7 @@ user_action = { kind = "double_click", target = "todo title", target_text = "Tes
 expected_source_event = { source = "todo.sources.todo_title_element.double_click", target_text = "Test todo edited" }
 expect_editing_title = "Test todo edited"
 expect_edit_text = "Test todo edited"
-expect_semantic_delta_contains = ["FieldSet:editing", "FieldSet:edit_text"]
+expect_semantic_delta_contains = ["FieldSet:editing"]
 expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]

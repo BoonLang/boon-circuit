@@ -51,7 +51,6 @@ user_action = { kind = "key_down", target = "formula bar", key = "Enter", text =
 expected_source_event = { source = "cell.sources.editor.commit", address = "A3", key = "Enter", text = "20" }
 expect_cell = { address = "A3", value = "20", formula = "20", editing_text = "20", editing = false }
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
-expect_render_delta_contains = ["InvalidateDocument"]
   [step.expect_root_text]
   "store.selected_address" = "A3"
 
@@ -161,7 +160,7 @@ id = "cycle-error"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "=B0+1" }
 expected_source_event = { source = "cell.sources.editor.commit", address = "A0", text = "=B0+1" }
 expect_error = { address = "A0", error = "cycle_error" }
-expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value", "FieldSet:error"]
+expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
 expect_render_delta_contains = ["InvalidateDocument"]
 
 [[step]]

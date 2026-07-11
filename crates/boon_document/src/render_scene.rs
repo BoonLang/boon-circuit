@@ -83,6 +83,11 @@ pub enum RenderScenePatchOperation {
     RetagNodeEntries {
         items: Vec<RenderSceneItem>,
     },
+    TranslateNodeEntries {
+        nodes: Vec<DocumentNodeId>,
+        delta_x: f32,
+        delta_y: f32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -163,9 +168,64 @@ pub fn apply_render_scene_patch(
                     .patched_text_runs
                     .saturating_add(op_report.patched_text_runs);
             }
+            RenderScenePatchOperation::TranslateNodeEntries {
+                nodes,
+                delta_x,
+                delta_y,
+            } => {
+                let op_report = apply_render_scene_translate_node_entries_patch(
+                    scene, nodes, *delta_x, *delta_y,
+                );
+                report.patched_items = report.patched_items.saturating_add(op_report.patched_items);
+                report.patched_primitives = report
+                    .patched_primitives
+                    .saturating_add(op_report.patched_primitives);
+                report.patched_text_runs = report
+                    .patched_text_runs
+                    .saturating_add(op_report.patched_text_runs);
+            }
         }
     }
     Ok(report)
+}
+
+fn apply_render_scene_translate_node_entries_patch(
+    scene: &mut RenderScene,
+    nodes: &[DocumentNodeId],
+    delta_x: f32,
+    delta_y: f32,
+) -> RenderScenePatchReport {
+    let node_set = nodes.iter().cloned().collect::<BTreeSet<_>>();
+    let mut report = RenderScenePatchReport::default();
+    for item in &mut scene.items {
+        if node_set.contains(&item.node) {
+            translate_rect(&mut item.bounds, delta_x, delta_y);
+            report.patched_items = report.patched_items.saturating_add(1);
+        }
+    }
+    for primitive in &mut scene.visual_primitives {
+        if node_set.contains(&primitive.node) {
+            translate_rect(&mut primitive.bounds, delta_x, delta_y);
+            for point in &mut primitive.control_points {
+                point[0] += delta_x;
+                point[1] += delta_y;
+            }
+            report.patched_primitives = report.patched_primitives.saturating_add(1);
+        }
+    }
+    for text_run in &mut scene.text_runs {
+        if render_text_run_belongs_to_any_node(&text_run.node, &node_set) {
+            translate_rect(&mut text_run.bounds, delta_x, delta_y);
+            report.patched_text_runs = report.patched_text_runs.saturating_add(1);
+        }
+    }
+    scene.quad_batches.clear();
+    report
+}
+
+fn translate_rect(rect: &mut Rect, delta_x: f32, delta_y: f32) {
+    rect.x += delta_x;
+    rect.y += delta_y;
 }
 
 fn apply_render_scene_paint_patch(
@@ -1007,6 +1067,28 @@ fn render_visual_primitives_for_nodes(
             style_identity: item.style_identity,
             dependency_set: visual_primitive_dependencies(item, "fill"),
         });
+        if interactive_kind(&item.kind)
+            && style_bool_raw(&item.style, "__hover") == Some(true)
+            && !has_pseudo_override(&item.style, "hover", &["bg", "background"])
+        {
+            primitives.push(RenderVisualPrimitive {
+                node: item.node.clone(),
+                retained_chunk_id: retained_chunk_id_for_item(item),
+                source_kind: item.kind.clone(),
+                primitive: RenderVisualPrimitiveKind::Fill,
+                bounds: item_bounds,
+                clip: clip_rect_for_style(&item.style),
+                radius,
+                stroke_width: 0.0,
+                color: [36, 112, 220, 24],
+                secondary_color: [0, 0, 0, 0],
+                antialias: 0.0,
+                control_points: Vec::new(),
+                texture: RenderTextureRef::Solid,
+                style_identity: item.style_identity,
+                dependency_set: visual_primitive_dependencies(item, "default-hover"),
+            });
+        }
         primitives.extend(material_highlight_primitives_for_item(
             item,
             item_bounds,
@@ -1048,9 +1130,34 @@ fn render_visual_primitives_for_nodes(
         }
         primitives.extend(text_overlay_primitives(item, columns));
         border_primitives.extend(border_primitives_for_item(item, item_bounds, radius));
+        if interactive_kind(&item.kind)
+            && item.focused
+            && !has_pseudo_override(&item.style, "focus", &["border", "outline"])
+        {
+            border_primitives.push(border_primitive(
+                item,
+                RenderVisualPrimitiveKind::Border,
+                item_bounds,
+                radius,
+                2.0,
+                [44, 107, 216, 255],
+            ));
+        }
     }
     primitives.extend(border_primitives);
     primitives
+}
+
+fn interactive_kind(kind: &DocumentNodeKind) -> bool {
+    matches!(
+        kind,
+        DocumentNodeKind::Button | DocumentNodeKind::Checkbox | DocumentNodeKind::TextInput
+    )
+}
+
+fn has_pseudo_override(style: &StyleMap, pseudo: &str, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| style.contains_key(&format!("__{pseudo}_{key}")))
 }
 
 fn border_primitives_for_item(
@@ -2211,22 +2318,16 @@ fn rich_text_spans(
 }
 
 fn rich_text_span_payloads(style: &StyleMap) -> Vec<StyleRichTextSpan> {
-    match state_style_value(style, "syntax_spans_json") {
+    match state_style_value(style, "syntax_spans") {
         Some(StyleValue::RichTextSpans(spans)) => spans.clone(),
-        _ => style_text(style, "syntax_spans_json")
-            .and_then(|spans_json| serde_json::from_str::<Vec<StyleRichTextSpan>>(spans_json).ok())
-            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 
 fn editor_type_hint_payloads(style: &StyleMap) -> Vec<StyleEditorTypeHint> {
-    match state_style_value(style, "editor_type_hints_json") {
+    match state_style_value(style, "editor_type_hints") {
         Some(StyleValue::EditorTypeHints(hints)) => hints.clone(),
-        _ => style_text(style, "editor_type_hints_json")
-            .and_then(|hints_json| {
-                serde_json::from_str::<Vec<StyleEditorTypeHint>>(hints_json).ok()
-            })
-            .unwrap_or_default(),
+        _ => Vec::new(),
     }
 }
 

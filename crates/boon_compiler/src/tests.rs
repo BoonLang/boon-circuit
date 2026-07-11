@@ -1,184 +1,359 @@
 use super::*;
+use boon_plan::{
+    DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
+    PLAN_MAJOR_VERSION, PlanDerivedExpression, PlanOpKind, PlanRowExpression, RootOutputDemand,
+    ValueRef, plan_sha256,
+};
 
-#[test]
-fn compiler_facade_produces_stable_counter_plan() {
-    let source = include_str!("../../../examples/counter.bn");
-    let parsed =
-        boon_parser::parse_source("examples/counter.bn".to_owned(), source.to_owned()).unwrap();
-    let ir = boon_ir::lower(&parsed).unwrap();
+fn example_path(path: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(path)
+}
 
-    let facade_plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
-    let repeated_plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault).unwrap();
+fn expression_has_typed_list_source(
+    document: &boon_plan::DocumentPlan,
+    expression: DocumentExprId,
+) -> bool {
+    match &document.expressions[expression.0].op {
+        DocumentExprOp::Read {
+            read:
+                DocumentRead::List { .. }
+                | DocumentRead::Field { .. }
+                | DocumentRead::Row { field: Some(_), .. },
+        } => true,
+        DocumentExprOp::Builtin {
+            input: Some(input), ..
+        } => expression_has_typed_list_source(document, *input),
+        _ => false,
+    }
+}
 
-    assert_eq!(
-        boon_plan::plan_sha256(&facade_plan).unwrap(),
-        boon_plan::plan_sha256(&repeated_plan).unwrap()
-    );
+fn expression_reads_field(
+    document: &boon_plan::DocumentPlan,
+    expression: DocumentExprId,
+    expected: boon_plan::FieldId,
+) -> bool {
+    match &document.expressions[expression.0].op {
+        DocumentExprOp::Read {
+            read: DocumentRead::Field { field },
+        } => *field == expected,
+        DocumentExprOp::Project { input, .. } => expression_reads_field(document, *input, expected),
+        _ => false,
+    }
 }
 
 #[test]
-fn compiler_facade_loads_source_path_to_machine_plan() {
-    let compiled = compile_source_path_to_machine_plan(
-        Path::new("../../examples/bytes_length_plan_ops.bn"),
+fn compiler_emits_machine_plan_v2_as_its_only_output() {
+    let compiled = compile_source_text_to_machine_plan(
+        "examples/bytes_length_plan_ops.bn",
+        include_str!("../../../examples/bytes_length_plan_ops.bn"),
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
 
-    assert_eq!(compiled.parsed.files.len(), 1);
-    assert_eq!(
-        compiled.plan.capability_summary.cpu_plan_executor_complete,
-        true
-    );
-    assert_eq!(compiled.load_pipeline_profile["owner"], "boon_compiler");
+    assert_eq!(compiled.plan.version.major, PLAN_MAJOR_VERSION);
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    assert!(compiled.profile.expression_count > 0);
 }
 
 #[test]
-fn compiler_facade_owns_compiled_source_report_context() {
-    let compiled = compile_source_path_to_machine_plan(
-        Path::new("../../examples/bytes_length_plan_ops.bn"),
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-    let context = compiled.report_context();
-
-    assert_eq!(context.program_kind, "generic");
-    assert_eq!(context.program_file_count, 1);
-    assert_eq!(context.source_files.len(), 1);
-    assert_eq!(context.source_units.len(), 1);
-    assert_eq!(context.source_units[0].path, context.source_files[0]);
-    assert!(context.source_units[0].source.contains("Bytes/length"));
-    assert_eq!(context.program_hash, context.source_hash);
-    assert_eq!(context.graph_node_count, compiled.ir.graph_node_count);
-    assert_eq!(context.load_pipeline_profile["owner"], "boon_compiler");
-}
-
-#[test]
-fn compiler_facade_owns_manifest_source_units_for_multifile_examples() {
-    let units = compiler_source_units_for_path(Path::new("../../examples/cells.bn")).unwrap();
-
-    assert!(units.len() > 1);
-    assert!(
-        units
-            .iter()
-            .any(|unit| unit.path.ends_with("examples/cells/model.bn"))
-    );
-    assert!(
-        units
-            .iter()
-            .any(|unit| unit.path.ends_with("examples/cells.bn"))
-    );
-
-    let source = compiler_source_text_for_path(Path::new("../../examples/cells.bn")).unwrap();
-    assert!(source.contains("cells_app()"));
-}
-
-#[test]
-fn compiler_facade_owns_manifest_source_units_from_entry_fields() {
-    let source_files = vec![
-        "examples/cells/defaults.bn".to_owned(),
-        "examples/cells/formula.bn".to_owned(),
-        "examples/cells/cell.bn".to_owned(),
-        "examples/cells/model.bn".to_owned(),
-        "examples/cells/columns.bn".to_owned(),
-        "examples/cells/store.bn".to_owned(),
-        "examples/cells/view.bn".to_owned(),
-        "examples/cells.bn".to_owned(),
-    ];
-    let units =
-        compiler_source_units_for_manifest_source("examples/cells.bn", &source_files).unwrap();
-
-    assert_eq!(units.len(), source_files.len());
-    assert_eq!(
-        compiler_source_text_for_manifest_source("examples/cells.bn")
-            .unwrap()
-            .contains("cells_app()"),
-        true
-    );
-}
-
-#[test]
-fn compiler_facade_loads_runtime_ir_from_source_units() {
-    let units = vec![CompilerSourceUnit {
-        path: "examples/counter.bn".to_owned(),
-        source: include_str!("../../../examples/counter.bn").to_owned(),
-    }];
-    let compiled = compile_source_units_to_runtime_ir("examples/counter.bn", &units).unwrap();
-
-    assert_eq!(compiled.parsed.files.len(), 1);
-    assert!(compiled.ir.expression_count > 0);
-    assert_eq!(compiled.load_pipeline_profile["owner"], "boon_compiler");
-    assert_eq!(compiled.load_pipeline_profile["surface"], "runtime-ir");
-}
-
-#[test]
-fn compiler_facade_loads_full_ir_from_source_units() {
-    let units = vec![CompilerSourceUnit {
-        path: "examples/counter.bn".to_owned(),
-        source: include_str!("../../../examples/counter.bn").to_owned(),
-    }];
-    let compiled = compile_source_units_to_full_ir("examples/counter.bn", &units).unwrap();
-
-    assert_eq!(compiled.parsed.files.len(), 1);
-    assert!(compiled.ir.expression_count > 0);
-    assert_eq!(compiled.load_pipeline_profile["owner"], "boon_compiler");
-    assert_eq!(compiled.load_pipeline_profile["surface"], "full-ir");
-}
-
-#[test]
-fn compiler_facade_loads_machine_plan_from_source_units() {
-    let units = vec![CompilerSourceUnit {
-        path: "examples/counter.bn".to_owned(),
-        source: include_str!("../../../examples/counter.bn").to_owned(),
-    }];
-    let compiled = compile_source_units_to_machine_plan(
+fn compiler_root_demand_is_sorted_and_unique() {
+    let compiled = compile_source_text_to_machine_plan(
         "examples/counter.bn",
-        &units,
+        include_str!("../../../examples/counter.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let RootOutputDemand::Selected(field_ids) = compiled.plan.demand.root_derived_outputs else {
+        panic!("compiler must encode observed roots as selected demand");
+    };
+
+    assert!(field_ids.windows(2).all(|ids| ids[0] < ids[1]));
+}
+
+#[test]
+fn compiler_preserves_empty_selected_demand() {
+    let compiled = compile_source_path_to_machine_plan(
+        Path::new("../../examples/bytes_length_plan_ops.bn"),
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
 
-    assert_eq!(compiled.parsed.files.len(), 1);
-    assert!(compiled.ir.expression_count > 0);
-    assert_eq!(compiled.load_pipeline_profile["owner"], "boon_compiler");
-    assert_eq!(compiled.load_pipeline_profile["surface"], "machine-plan");
-    assert!(!compiled.plan.regions.is_empty());
-    assert!(!compiled.plan.source_routes.is_empty());
-}
-
-#[test]
-fn compiler_facade_owns_scenario_file_decode() {
-    #[derive(Debug, Deserialize)]
-    struct ScenarioLite {
-        name: String,
-        step: Vec<ScenarioStepLite>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct ScenarioStepLite {
-        id: String,
-    }
-
-    let scenario: ScenarioLite =
-        parse_scenario_file(Path::new("../../examples/counter.scn")).unwrap();
-
-    assert_eq!(scenario.name, "generic");
-    assert!(
-        scenario
-            .step
-            .iter()
-            .any(|step| step.id == "press-increment")
+    assert_eq!(
+        compiled.plan.demand.root_derived_outputs,
+        RootOutputDemand::Selected(Vec::new())
     );
 }
 
 #[test]
-fn compiler_facade_lowers_parsed_program_to_runtime_ir() {
-    let source = include_str!("../../../examples/counter.bn");
-    let parsed =
-        boon_parser::parse_source("examples/counter.bn".to_owned(), source.to_owned()).unwrap();
-    let compiled = compile_parsed_program_to_runtime_ir(parsed).unwrap();
+fn scoped_list_event_projection_has_a_typed_source_transform() {
+    let compiled = compile_source_text_to_machine_plan(
+        "scoped-event-projection.bn",
+        r#"
+store: [
+    rows:
+        LIST {
+            [label: TEXT { First }]
+        }
+        |> List/map(model_item, new: new_row(item: model_item))
+    row_selected:
+        rows
+        |> List/map(event_item, new: LATEST {
+            event_item.controls.select.event.press |> THEN { event_item.label }
+        })
+        |> List/latest()
+    selected:
+        TEXT { none } |> HOLD selected {
+            LATEST { row_selected }
+        }
+]
 
-    assert!(compiled.ir.expression_count > 0);
-    assert_eq!(compiled.load_pipeline_profile["owner"], "boon_compiler");
-    assert_eq!(compiled.load_pipeline_profile["surface"], "runtime-ir");
-    assert_eq!(compiled.load_pipeline_profile["parse_ms"], 0.0);
+FUNCTION new_row(item) {
+    [
+        controls: [select: SOURCE]
+        label: item.label
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let field = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.row_selected")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("row_selected field");
+    let op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(field)))
+        .expect("row_selected plan op");
+
+    assert!(matches!(
+        op.kind,
+        PlanOpKind::DerivedValue {
+            expression: Some(PlanDerivedExpression::SourceEventTransform { .. }),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn derived_list_input_wins_over_same_named_list_memory() {
+    let compiled = compile_source_text_to_machine_plan(
+        "derived-list-ownership.bn",
+        r#"
+store: [
+    sources: [events: SOURCE]
+    value: 0 |> HOLD value {
+        LATEST { sources.events |> THEN { value + 1 } }
+    }
+    items: LIST {
+        [id: TEXT { a }]
+        [id: TEXT { b }]
+    }
+    selected:
+        True |> WHEN {
+            True => items |> List/filter_field_equal(field: "id", value: TEXT { a })
+            False => items
+        }
+    mapped:
+        selected
+        |> List/map(item, new: [label: item.id])
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let field_id = |label: &str| {
+        compiled
+            .plan
+            .debug_map
+            .fields
+            .iter()
+            .find(|field| field.label == label)
+            .and_then(|field| field.id.strip_prefix("field:"))
+            .and_then(|id| id.parse::<usize>().ok())
+            .map(boon_plan::FieldId)
+            .unwrap_or_else(|| panic!("missing field `{label}`"))
+    };
+    let selected = field_id("store.selected");
+    let mapped = field_id("store.mapped");
+    let mapped_op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(mapped)))
+        .expect("mapped operation");
+    let PlanOpKind::DerivedValue {
+        expression:
+            Some(PlanDerivedExpression::RowExpression {
+                expression: PlanRowExpression::ListMap { input, .. },
+            }),
+        ..
+    } = &mapped_op.kind
+    else {
+        panic!("mapped must lower as a list map: {mapped_op:#?}");
+    };
+
+    assert_eq!(
+        input.as_ref(),
+        &PlanRowExpression::Field {
+            input: ValueRef::Field(selected),
+        }
+    );
+}
+
+#[test]
+fn document_ids_are_stable_across_identical_compilation() {
+    let path = example_path("examples/counter.bn");
+    let first = compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();
+    let second =
+        compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();
+
+    assert_eq!(first.plan.document, second.plan.document);
+    assert_eq!(
+        plan_sha256(&first.plan).unwrap(),
+        plan_sha256(&second.plan).unwrap()
+    );
+}
+
+#[test]
+fn cells_rows_are_typed_visible_range_materializations() {
+    let compiled = compile_source_path_to_machine_plan(
+        &example_path("examples/cells.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert!(!document.materializations.is_empty());
+    assert!(document.expressions.len() < 2_600);
+    assert!(document.templates.len() < 2_600);
+    assert!(document.materializations.iter().any(|materialization| {
+        matches!(
+            materialization.source,
+            DocumentMaterializationSource::List { .. }
+        )
+    }));
+    assert!(document.materializations.iter().any(|materialization| {
+        matches!(
+            materialization.source,
+            DocumentMaterializationSource::Field { .. }
+                | DocumentMaterializationSource::ScopedField { .. }
+                | DocumentMaterializationSource::ParameterField { .. }
+        )
+    }));
+    assert!(document.materializations.iter().all(|materialization| {
+        match materialization.source {
+            DocumentMaterializationSource::List { .. }
+            | DocumentMaterializationSource::Field { .. }
+            | DocumentMaterializationSource::ScopedField { .. }
+            | DocumentMaterializationSource::ParameterField { .. }
+            | DocumentMaterializationSource::Parameter { .. } => true,
+            DocumentMaterializationSource::Expression { expression } => {
+                expression_has_typed_list_source(document, expression)
+            }
+        }
+    }));
+
+    let address_field = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "cell.address")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("cell.address field id");
+    assert!(!document.expressions.iter().any(|expression| {
+        matches!(
+            expression.op,
+            DocumentExprOp::Read {
+                read: DocumentRead::Field { field }
+            } if field == address_field
+        )
+    }));
+    let editing_state = compiled
+        .plan
+        .debug_map
+        .state_slots
+        .iter()
+        .find(|state| state.label == "cell.editing_text")
+        .and_then(|state| state.id.strip_prefix("state:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(boon_plan::StateId)
+        .expect("cell.editing_text state id");
+    assert!(!document.expressions.iter().any(|expression| {
+        matches!(
+            expression.op,
+            DocumentExprOp::Read {
+                read: DocumentRead::State { state }
+            } if state == editing_state
+        )
+    }));
+
+    let selected_input = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.selected_input")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("store.selected_input field id");
+    assert!(document.expressions.iter().any(|expression| {
+        let DocumentExprOp::Project { field, .. } = &expression.op else {
+            return false;
+        };
+        document.names.get(field.0).map(String::as_str) == Some("editing_text")
+            && expression_reads_field(document, expression.id, selected_input)
+    }));
+}
+
+#[test]
+fn document_backend_contains_no_fixture_branches() {
+    let implementation = include_str!("document_plan_backend.rs");
+    for fixture in [
+        "counter.bn",
+        "todomvc.bn",
+        "todo_mvc_physical",
+        "cells.bn",
+        "novywave",
+    ] {
+        assert!(!implementation.contains(fixture), "found `{fixture}`");
+    }
+}
+
+#[test]
+fn unknown_document_constructor_fails_compilation() {
+    let source = r#"
+events: SOURCE
+value: 0 |> HOLD value { LATEST { events |> THEN { value } } }
+items: LIST {}
+document: Document/new(root: Unknown/widget())
+"#;
+    let error = compile_source_text_to_machine_plan(
+        "unknown-document-constructor.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("unknown") || message.contains("render") || message.contains("typecheck"),
+        "{message}"
+    );
 }

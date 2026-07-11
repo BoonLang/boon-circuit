@@ -164,9 +164,11 @@ fn document_hot_id_table_is_numeric_stable_and_debuggable() {
         table.debug_name(DocumentHotNodeId(3)),
         Some(&DocumentNodeId("zeta".to_owned()))
     );
-    let encoded = serde_json::to_value(&table).expect("hot ID table should serialize");
-    assert_eq!(encoded["root"], 0);
-    assert_eq!(encoded["debug_names"]["node_names"]["0"], "root");
+    assert_eq!(table.root, DocumentHotNodeId(0));
+    assert_eq!(
+        table.debug_names.node_names.get(&DocumentHotNodeId(0)),
+        Some(&DocumentNodeId("root".to_owned()))
+    );
 }
 
 
@@ -310,5 +312,4 @@ fn document_intern_index_deduplicates_text_styles_materials_clips_and_bindings()
         }
     ));
 }
-
 

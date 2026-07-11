@@ -79,7 +79,7 @@ todos: LIST = 4 items
 
 ## Native Metadata
 
-The editor attaches filtered inline hints as `editor_type_hints_json` metadata on
+The editor attaches filtered inline hints as `editor_type_hints` metadata on
 line text nodes. The rendered source text and syntax spans must keep their
 original source ranges so scrolling, selection, and copy/paste do not depend on
 hint text.

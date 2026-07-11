@@ -905,53 +905,22 @@ store: [
         }
 
     compare_file:
-        LATEST {
-            TEXT { none }
-            elements.select_counter_file.event.press |> THEN { TEXT { none } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { simple.vcd } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { none } }
-            file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(file_tree_row, new: LATEST {
-                    file_tree_row.file_row_elements.select_file.event.press |> THEN {
-                        file_tree_row.file |> WHEN {
-                    TEXT { wave_27.fst } => TEXT { simple.vcd }
-                    __ => TEXT { none }
-                }
-                    }
-                })
-                |> List/latest()
-            elements.begin_default_file_load.event.press |> THEN { TEXT { none } }
-            elements.load_default_file.event.press |> THEN { TEXT { none } }
-            elements.external_file_loaded_name.text |> THEN { TEXT { none } }
-            elements.show_empty.event.press |> THEN { TEXT { none } }
+        active_file |> WHEN {
+            TEXT { wave_27.fst } => TEXT { simple.vcd }
+            __ => TEXT { none }
         }
 
     file_compare_status:
-        LATEST {
-            TEXT { single file: simple.vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { single file: simple.vcd } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { comparing simple.vcd to wave_27.fst } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { single file: simple_test.ghw } }
-            file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeFile)
-                |> List/map(file_tree_row, new: LATEST {
-                    file_tree_row.file_row_elements.select_file.event.press |> THEN {
-                        file_tree_row.file |> WHEN {
-                    TEXT { wave_27.fst } => TEXT { comparing simple.vcd to wave_27.fst }
-                    TEXT { simple_test.ghw } => TEXT { single file: simple_test.ghw }
-                    TEXT { simple.vcd } => TEXT { single file: simple.vcd }
-                    __ => TEXT { no waveform loaded }
-                }
-                    }
-                })
-                |> List/latest()
-            elements.begin_default_file_load.event.press |> THEN { TEXT { opening simple.vcd } }
-            elements.load_default_file.event.press |> THEN { TEXT { single file: simple.vcd } }
-            elements.external_file_loaded_name.text |> THEN {
-                TEXT { local file: } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+        compare_file |> WHEN {
+            TEXT { none } => active_file |> WHEN {
+                TEXT { none } => TEXT { no waveform loaded }
+                file => TEXT { single file: } |> Text/concat(with: file, separator: " ")
             }
-            elements.show_empty.event.press |> THEN { TEXT { no waveform loaded } }
+            compare =>
+                TEXT { comparing }
+                |> Text/concat(with: compare, separator: " ")
+                |> Text/concat(with: TEXT { to }, separator: " ")
+                |> Text/concat(with: active_file, separator: " ")
         }
 
     file_compare_descriptor:
@@ -1095,31 +1064,26 @@ store: [
     bridge_module_name: TEXT { wellen.v1 }
 
     compare_request_page:
-        LATEST {
-            TEXT { compare:simple.vcd:primary }
-            elements.select_counter_file.event.press |> THEN { TEXT { compare:simple.vcd:primary } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { compare:simple.vcd+wave_27.fst:0-240ns } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { compare:simple_test.ghw:primary } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { compare:simple.vcd:opening } }
-            elements.load_default_file.event.press |> THEN { TEXT { compare:simple.vcd:primary } }
-            elements.external_file_loaded_name.text |> THEN {
-                TEXT { compare: } |> Text/concat(with: elements.external_file_loaded_name.text, separator: "") |> Text/concat(with: TEXT { primary }, separator: ":")
+        waveform_status |> WHEN {
+            Empty => TEXT { compare:none }
+            Loading => TEXT { compare:simple.vcd:opening }
+            __ => active_file |> WHEN {
+                TEXT { wave_27.fst } => TEXT { compare:simple.vcd+wave_27.fst:0-240ns }
+                TEXT { none } => TEXT { compare:none }
+                __ => TEXT { compare: } |> Text/concat(with: active_file, separator: "") |> Text/concat(with: TEXT { primary }, separator: ":")
             }
-            elements.show_empty.event.press |> THEN { TEXT { compare:none } }
         }
 
     compare_result_label:
-        LATEST {
-            TEXT { primary page: simple.vcd }
-            elements.select_counter_file.event.press |> THEN { TEXT { primary page: simple.vcd } }
-            elements.select_uart_compare_file.event.press |> THEN { TEXT { shared window: 0 ns - 240 ns, 2 files } }
-            elements.select_ghw_file.event.press |> THEN { TEXT { primary page: simple_test.ghw, GHW file } }
-            elements.begin_default_file_load.event.press |> THEN { TEXT { opening page: simple.vcd } }
-            elements.load_default_file.event.press |> THEN { TEXT { primary page: simple.vcd } }
-            elements.external_file_loaded_name.text |> THEN {
-                TEXT { primary page: } |> Text/concat(with: elements.external_file_loaded_name.text, separator: " ")
+        waveform_status |> WHEN {
+            Empty => TEXT { no compare page }
+            Loading => TEXT { opening page: simple.vcd }
+            __ => active_file |> WHEN {
+                TEXT { wave_27.fst } => TEXT { shared window: 0 ns - 240 ns, 2 files }
+                TEXT { simple_test.ghw } => TEXT { primary page: simple_test.ghw, GHW file }
+                TEXT { none } => TEXT { no compare page }
+                __ => TEXT { primary page: } |> Text/concat(with: active_file, separator: " ")
             }
-            elements.show_empty.event.press |> THEN { TEXT { no compare page } }
         }
 
     file_status_detail:
@@ -1181,6 +1145,14 @@ store: [
             elements.mode_to_dark.event.press |> THEN { Dark }
         }
 
+    row_selected_scope_key:
+        file_tree_rows
+        |> List/filter_field_equal(field: "kind", value: FileTreeScope)
+        |> List/map(file_tree_row, new: LATEST {
+            file_tree_row.scope_row_elements.select_scope.event.press |> THEN { file_tree_row.scope_key }
+        })
+        |> List/latest()
+
     active_scope:
         startup_selected_scope_key |> HOLD active_scope {
             LATEST {
@@ -1200,12 +1172,7 @@ store: [
                     }
                 })
                 |> List/latest()
-            file_tree_rows
-                |> List/filter_field_equal(field: "kind", value: FileTreeScope)
-                |> List/map(file_tree_row, new: LATEST {
-                    file_tree_row.scope_row_elements.select_scope.event.press |> THEN { file_tree_row.scope_key }
-                })
-                |> List/latest()
+            row_selected_scope_key
             external_file_tree_file_selected_scope
             external_file_tree_scope_selected_scope
             elements.load_default_file.event.press |> THEN { store.startup_selected_scope_key }
@@ -1217,12 +1184,7 @@ store: [
     active_signal:
         startup_primary_signal |> HOLD active_signal {
             LATEST {
-            signal_catalog
-                |> List/map(signal_catalog_item, new: LATEST {
-                    signal_catalog_item.signal_elements.select_signal.event.press
-                        |> THEN { signal_catalog_item.key }
-                })
-                |> List/latest()
+            row_selected_signal_key
             elements.select_clk.event.press |> THEN { TEXT { clk } }
             elements.select_reset.event.press |> THEN { TEXT { reset_n } }
             elements.select_data.event.press |> THEN {
@@ -1600,8 +1562,14 @@ store: [
         selected_signal_rows
         |> List/map(signal, new: [id: signal.id, formatter: signal.formatter, bit_width: signal.bit_width])
 
+    selected_cursor_pair_source_rows:
+        active_file == TEXT { simple_test.ghw } |> WHEN {
+            True => selected_signal_rows |> List/filter_field_equal(field: "id", value: active_signal)
+            False => selected_signal_rows
+        }
+
     selected_cursor_pair_rows:
-        selected_signal_rows
+        selected_cursor_pair_source_rows
         |> List/map(signal, new: selected_cursor_pair_row(signal: signal))
 
     selected_variable_file:
@@ -1810,6 +1778,11 @@ store: [
                 elements.select_counter_file.event.press |> THEN { selected_timeline_cursor_default }
                 elements.select_uart_compare_file.event.press |> THEN { selected_timeline_cursor_default }
                 elements.select_ghw_file.event.press |> THEN { selected_timeline_cursor_default }
+                elements.select_clk.event.press |> THEN { selected_timeline_cursor_default }
+                elements.select_reset.event.press |> THEN { selected_timeline_cursor_default }
+                elements.select_data.event.press |> THEN { selected_timeline_cursor_default }
+                elements.select_temperature.event.press |> THEN { selected_timeline_cursor_default }
+                row_selected_signal_key |> THEN { selected_timeline_cursor_default }
                 file_tree_selected_file |> THEN { selected_timeline_cursor_default }
                 elements.load_default_file.event.press |> THEN { 50 }
                 elements.show_empty.event.press |> THEN { selected_timeline_cursor_default }
@@ -1886,6 +1859,8 @@ store: [
                 elements.scope_cpu_collapse.event.press |> THEN { TEXT { none } }
                 elements.scope_uart.event.press |> THEN { TEXT { none } }
                 elements.scope_analog.event.press |> THEN { TEXT { none } }
+                row_selected_scope_key |> THEN { TEXT { none } }
+                row_selected_signal_key |> THEN { TEXT { none } }
                 elements.select_counter_file.event.press |> THEN { TEXT { none } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { none } }
@@ -1922,6 +1897,8 @@ store: [
                 elements.scope_cpu_collapse.event.press |> THEN { TEXT { none } }
                 elements.scope_uart.event.press |> THEN { TEXT { none } }
                 elements.scope_analog.event.press |> THEN { TEXT { none } }
+                row_selected_scope_key |> THEN { TEXT { none } }
+                row_selected_signal_key |> THEN { TEXT { none } }
                 elements.select_counter_file.event.press |> THEN { TEXT { none } }
                 elements.select_uart_compare_file.event.press |> THEN { TEXT { none } }
                 elements.select_ghw_file.event.press |> THEN { TEXT { none } }
@@ -2020,6 +1997,8 @@ store: [
                 elements.select_reset.event.press |> THEN { Text/empty() }
                 elements.select_data.event.press |> THEN { Text/empty() }
                 elements.select_temperature.event.press |> THEN { Text/empty() }
+                row_selected_scope_key |> THEN { Text/empty() }
+                row_selected_signal_key |> THEN { Text/empty() }
                 elements.format_dropdown_toggle.event.press |> THEN { Text/empty() }
                 elements.format_cycle.event.press |> THEN { Text/empty() }
                 elements.format_binary.event.press |> THEN { Text/empty() }
@@ -2502,20 +2481,15 @@ store: [
     active_signal_label:
         TEXT { simple_tb.s.A[3:0] } |> HOLD active_signal_label {
             LATEST {
-                signal_catalog
-                    |> List/map(signal_catalog_item, new:
-                        signal_catalog_item.signal_elements.select_signal.event.press
-                        |> THEN {
-                            signal_catalog_item.key |> WHEN {
-                                clk => TEXT { simple_tb.s.A[3:0] }
-                                reset_n => TEXT { simple_tb.s.B[3:0] }
-                                data_bus => TEXT { top.cpu.data_bus[7:0] }
-                                temperature => TEXT { top.analog.temperature }
-                                __ => SKIP
-                            }
-                        }
-                    )
-                    |> List/latest()
+                row_selected_signal_key |> THEN {
+                    row_selected_signal_key |> WHEN {
+                        clk => TEXT { simple_tb.s.A[3:0] }
+                        reset_n => TEXT { simple_tb.s.B[3:0] }
+                        data_bus => TEXT { top.cpu.data_bus[7:0] }
+                        temperature => TEXT { top.analog.temperature }
+                        __ => SKIP
+                    }
+                }
                 elements.select_clk.event.press |> THEN { TEXT { simple_tb.s.A[3:0] } }
                 elements.select_reset.event.press |> THEN { TEXT { simple_tb.s.B[3:0] } }
                 elements.select_data.event.press |> THEN {
@@ -2627,20 +2601,15 @@ store: [
     active_signal_key:
         TEXT { A_SIGNAL } |> HOLD active_signal_key {
             LATEST {
-                signal_catalog
-                    |> List/map(signal_catalog_item, new:
-                        signal_catalog_item.signal_elements.select_signal.event.press
-                        |> THEN {
-                            signal_catalog_item.key |> WHEN {
-                                clk => TEXT { A_SIGNAL }
-                                reset_n => TEXT { B_SIGNAL }
-                                data_bus => TEXT { DATA_BUS }
-                                temperature => TEXT { TEMPERATURE }
-                                __ => SKIP
-                            }
-                        }
-                    )
-                    |> List/latest()
+                row_selected_signal_key |> THEN {
+                    row_selected_signal_key |> WHEN {
+                        clk => TEXT { A_SIGNAL }
+                        reset_n => TEXT { B_SIGNAL }
+                        data_bus => TEXT { DATA_BUS }
+                        temperature => TEXT { TEMPERATURE }
+                        __ => SKIP
+                    }
+                }
                 elements.select_clk.event.press |> THEN { TEXT { A_SIGNAL } }
                 elements.select_reset.event.press |> THEN { TEXT { B_SIGNAL } }
                 elements.select_data.event.press |> THEN {
@@ -2724,6 +2693,15 @@ store: [
                 elements.scope_cpu.event.press |> THEN { TEXT { SIMPLE_TB_S } }
                 elements.scope_uart.event.press |> THEN { TEXT { TOP_UART } }
                 elements.scope_analog.event.press |> THEN { TEXT { TOP_ANALOG } }
+                row_selected_scope_key |> THEN {
+                    row_selected_scope_key |> WHEN {
+                        simple_tb_s => TEXT { SIMPLE_TB_S }
+                        top_uart => TEXT { TOP_UART }
+                        top_analog => TEXT { TOP_ANALOG }
+                        ghw_simple => TEXT { GHW_SIMPLE }
+                        __ => TEXT { NONE }
+                    }
+                }
                 elements.stale_response_probe.event.press |> THEN { TEXT { SIMPLE_TB_S } }
                 elements.load_default_file.event.press |> THEN { TEXT { SIMPLE_TB_S } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
@@ -2748,6 +2726,15 @@ store: [
                 elements.select_reset.event.press |> THEN { TEXT { B_SIGNAL } }
                 elements.select_data.event.press |> THEN { TEXT { DATA_BUS } }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMPERATURE } }
+                row_selected_signal_key |> THEN {
+                    row_selected_signal_key |> WHEN {
+                        clk => TEXT { A_SIGNAL }
+                        reset_n => TEXT { B_SIGNAL }
+                        data_bus => TEXT { DATA_BUS }
+                        temperature => TEXT { TEMPERATURE }
+                        __ => TEXT { NONE }
+                    }
+                }
                 elements.stale_response_probe.event.press |> THEN { TEXT { A_SIGNAL } }
                 elements.load_default_file.event.press |> THEN { TEXT { A_SIGNAL } }
                 elements.show_empty.event.press |> THEN { TEXT { NONE } }
@@ -3176,20 +3163,15 @@ store: [
                     }
                 }
                 elements.select_temperature.event.press |> THEN { TEXT { TEMP_FIT } }
-                signal_catalog
-                    |> List/map(signal_catalog_item, new:
-                        signal_catalog_item.signal_elements.select_signal.event.press
-                        |> THEN {
-                            signal_catalog_item.key |> WHEN {
-                                clk => TEXT { A_FIT }
-                                reset_n => TEXT { B_FIT }
-                                data_bus => TEXT { DATA_FIT }
-                                temperature => TEXT { TEMP_FIT }
-                                __ => SKIP
-                            }
-                        }
-                    )
-                    |> List/latest()
+                row_selected_signal_key |> THEN {
+                    row_selected_signal_key |> WHEN {
+                        clk => TEXT { A_FIT }
+                        reset_n => TEXT { B_FIT }
+                        data_bus => TEXT { DATA_FIT }
+                        temperature => TEXT { TEMP_FIT }
+                        __ => SKIP
+                    }
+                }
                 elements.format_cycle.event.press |> THEN { TEXT { DATA_BIN } }
                 elements.format_binary.event.press |> THEN { TEXT { DATA_BIN } }
                 elements.format_hex.event.press |> THEN { TEXT { DATA_HEX } }

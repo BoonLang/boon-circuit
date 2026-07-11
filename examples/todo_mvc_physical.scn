@@ -56,24 +56,28 @@ id = "filter-all-active-completed"
 user_action = { kind = "click", target = "all filter" }
 expected_source_event = { source = "store.elements.filter_buttons.all" }
 expect_root_text = { "store.selected_filter" = "All" }
+expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "filter-active"
 user_action = { kind = "click", target = "active filter" }
 expected_source_event = { source = "store.elements.filter_buttons.active" }
 expect_root_text = { "store.selected_filter" = "Active" }
+expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "filter-completed"
 user_action = { kind = "click", target = "completed filter" }
 expected_source_event = { source = "store.elements.filter_buttons.completed" }
 expect_root_text = { "store.selected_filter" = "Completed" }
+expect_visible_titles = []
 
 [[step]]
 id = "filter-all-before-edit"
 user_action = { kind = "click", target = "all filter" }
 expected_source_event = { source = "store.elements.filter_buttons.all" }
 expect_root_text = { "store.selected_filter" = "All" }
+expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "edit-todo"
@@ -111,6 +115,7 @@ expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_te
 expect_completed_titles = ["Ship physical TodoMVC edited"]
 expect_active_count = 4
 expect_completed_count = 1
+expect_root_text = { "store.has_completed" = "True" }
 
 [[step]]
 id = "clear-completed"
@@ -120,6 +125,7 @@ expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog"
 expect_completed_titles = []
 expect_active_count = 4
 expect_completed_count = 0
+expect_root_text = { "store.has_completed" = "False" }
 
 [[step]]
 id = "switch-theme-classic"

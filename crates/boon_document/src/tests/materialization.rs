@@ -25,7 +25,8 @@ fn materialization_layout_demands_visible_overscan_and_stable_keys() {
         .expect("vertical materialization demand should exist");
     assert_eq!(vertical.visible, 0..20);
     assert_eq!(vertical.overscan, 0..28);
-    assert_eq!(vertical.logical_item_count, 28);
+    assert_eq!(vertical.materialization, Some(1));
+    assert_eq!(vertical.logical_item_count, 2_600);
     assert_eq!(vertical.materialized_item_count, 28);
     assert_eq!(vertical.stable_key_prefix, "materialized:virtual-table:y");
     assert_eq!(
@@ -49,9 +50,11 @@ fn materialized_scroll_node_marks_descendants_with_clip_rect() {
         .style
         .insert("height".to_owned(), StyleValue::Number(80.0));
     scroll.materialized.push(MaterializedRange {
+        materialization: Some(1),
         axis: Axis::Vertical,
         visible: 0..4,
         overscan: 0..8,
+        logical_item_count: 8,
     });
     scroll.children.push(DocumentNodeId("row".to_owned()));
 

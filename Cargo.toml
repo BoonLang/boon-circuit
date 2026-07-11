@@ -1,18 +1,14 @@
 [workspace]
 members = [
     "crates/boon_parser",
-    "crates/boon_bridge",
     "crates/boon_typecheck",
     "crates/boon_ir",
     "crates/boon_plan",
     "crates/boon_plan_executor",
     "crates/boon_compiler",
     "crates/boon_runtime",
-    "crates/boon_report_schema",
     "crates/boon_cli",
     "crates/boon_document_model",
-    "crates/boon_editor",
-    "crates/boon_driver",
     "crates/boon_host",
     "crates/boon_document",
     "crates/boon_native_gpu",
@@ -20,7 +16,6 @@ members = [
     "crates/boon_native_playground",
     "crates/xtask",
 ]
-exclude = ["vendor/app_window"]
 resolver = "2"
 
 [workspace.package]
@@ -30,45 +25,35 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 boon_parser = { path = "crates/boon_parser" }
-boon_bridge = { path = "crates/boon_bridge" }
 boon_typecheck = { path = "crates/boon_typecheck" }
 boon_ir = { path = "crates/boon_ir" }
 boon_plan = { path = "crates/boon_plan" }
 boon_plan_executor = { path = "crates/boon_plan_executor" }
 boon_compiler = { path = "crates/boon_compiler" }
 boon_runtime = { path = "crates/boon_runtime" }
-boon_report_schema = { path = "crates/boon_report_schema" }
 boon_document_model = { path = "crates/boon_document_model" }
-boon_editor = { path = "crates/boon_editor" }
-boon_driver = { path = "crates/boon_driver" }
 boon_host = { path = "crates/boon_host" }
 boon_document = { path = "crates/boon_document" }
 boon_native_gpu = { path = "crates/boon_native_gpu" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
-accesskit = "0.24.0"
+app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "554dea12623618cad5f4d2ae53b99793a05905d8" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-smallvec = "1.15"
 toml = "0.9"
 sha2 = "0.10"
 chumsky = "0.9"
 ena = "0.14"
-earcutr = "0.5"
-bitvec = "1.0"
-bytes = "1"
 bytemuck = { version = "1.25", features = ["derive"] }
 encase = "0.12"
 ropey = "1.6"
 unicode-segmentation = "1.13"
-arboard = "3.6"
 image = { version = "0.24.9", default-features = false, features = ["png"] }
-flate2 = "1.1"
 resvg = { version = "0.47.0", default-features = false }
 wgpu = "=29.0.1"
 glyphon = "=0.11.0"
-app_window = { path = "vendor/app_window" }
 wgsl_bindgen = "=0.22.2"
 futures = "0.3"
+libc = "0.2"
 
 [profile.dev.package.boon_document]
 opt-level = 2

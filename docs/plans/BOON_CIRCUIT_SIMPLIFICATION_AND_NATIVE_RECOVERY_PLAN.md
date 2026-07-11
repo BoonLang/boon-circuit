@@ -13,6 +13,48 @@ The checkpoint at `6935352` is intentionally not a completed native-input fix:
 the automated Counter TEST route passed while physical COSMIC dev-window input
 remained unresponsive.
 
+## Current Implementation State
+
+Mandatory slices 1 through 5 are implemented in the current worktree. The
+workspace contains 98,403 tracked Rust lines and 12,537 test Rust lines.
+Relative to the cleanup checkpoint, the current diff removes about 289,000
+lines and adds fewer than 8,000, a net reduction above 281,000 lines. The fresh
+architecture report passes every check. `app_window` is published at
+`BoonLang/app_window`, pinned to immutable revision
+`554dea12623618cad5f4d2ae53b99793a05905d8`, and measures 1,140 net code lines
+over v0.3.3 against the 1,200-line cap.
+
+The recovered execution path now preserves generic scoped row sources from the
+typed compiler plan through `Session`, document bindings, retained hit targets,
+and scenario dispatch. Source-event transforms evaluate against the event row,
+helper parameter names no longer define source ownership, and unscoped visual
+target text is not mistaken for a row target. Document evaluation treats equal
+text and enum values semantically, preserves hidden/semantic labels, and checks
+that patch-applied retained frames equal the authoritative runtime frame after
+every test dispatch. NovyWave now uses canonical row-owned scope and signal
+events instead of parallel scenario-only controls.
+
+Fresh semantic runs pass through `MachinePlan`, `Session`, and typed document
+patches: Counter 6 turns, TodoMVC 26, physical TodoMVC 22, Cells 28, and
+NovyWave 90. `cargo fmt --all -- --check`, `cargo check --workspace`, all 260
+workspace unit tests, and all doc tests pass.
+
+The latest private-Wayland diagnostic checkpoint proves the repaired Cells path with
+real app-window callbacks and exact-frame WGPU readback. Warm visible
+interaction is 5.7 ms p95. Retained scroll translation reduced warm scroll
+from 29.2 ms p95 to 14.1 ms p95 with a 16.1 ms maximum and zero outliers. The
+diagnostic report is not handoff evidence because PID 3221 is still running
+`/usr/bin/cosmic-comp (deleted)`. The demand-pacing changes are committed and
+pushed at `cbd1c3b9a19433ef7aa130af7892f2e45f6ecfe2`; the installed compositor
+reports that exact revision, and its SHA-256 matches the clean release artifact.
+
+The remaining completion work is explicit:
+
+1. restart the COSMIC session so the installed compositor exposes demand-paced
+   background launch, then refresh all six manifest reports and the aggregate;
+2. launch the release playground with demand pacing and obtain the required
+   physical human confirmation.
+
 ## Non-Negotiable Rules
 
 - Delete obsolete code. Do not rename, quarantine, alias, or preserve it behind
@@ -59,6 +101,10 @@ remained unresponsive.
 - Every transaction drains input, applies runtime changes, patches retained
   document/render state, submits/presents if dirty, then schedules optional
   proof work. Proof never blocks product presentation.
+- Hidden COSMIC workspaces use explicit demand pacing: requested callbacks are
+  coalesced to output refresh cadence and stop when clients stop requesting
+  frames. Standard inactive-workspace throttling is not valid performance
+  evidence.
 - Source replacement uses one typed depth-one latest-wins mailbox. Product IPC
   is binary and contains no JSON.
 

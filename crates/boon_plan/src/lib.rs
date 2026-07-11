@@ -5,7 +5,12 @@ use std::error::Error;
 use std::fmt;
 use std::path::{Component, Path};
 
-pub const PLAN_MAJOR_VERSION: u32 = 1;
+mod binary;
+mod document;
+
+pub use document::*;
+
+pub const PLAN_MAJOR_VERSION: u32 = 2;
 pub const PLAN_MINOR_VERSION: u32 = 0;
 pub const INLINE_BYTE_CONSTANT_LIMIT: usize = 1024;
 
@@ -129,6 +134,8 @@ pub enum SourcePayloadField {
 pub struct MachinePlan {
     pub version: PlanVersion,
     pub target_profile: TargetProfile,
+    pub demand: DemandPlan,
+    pub document: Option<DocumentPlan>,
     pub constants: Vec<PlanConstant>,
     pub source_routes: Vec<SourceRoute>,
     pub storage_layout: StorageLayout,
@@ -138,6 +145,30 @@ pub struct MachinePlan {
     pub delta_plan: DeltaPlan,
     pub capability_summary: CapabilitySummary,
     pub debug_map: DebugMap,
+}
+
+impl MachinePlan {
+    pub fn document_plan(&self) -> Option<&DocumentPlan> {
+        self.document.as_ref()
+    }
+
+    pub fn initial_document_patch_batch(&self) -> Option<&DocumentInitialPatchBatch> {
+        self.document
+            .as_ref()
+            .map(|document| &document.initial_patch_batch)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DemandPlan {
+    pub root_derived_outputs: RootOutputDemand,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "field_ids", rename_all = "snake_case")]
+pub enum RootOutputDemand {
+    All,
+    Selected(Vec<FieldId>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -203,6 +234,8 @@ pub struct ScalarStorageSlot {
     pub initial_root_field_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_row_field_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_row_expression: Option<PlanRowExpression>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -714,7 +747,7 @@ pub enum PlanExpressionKind {
     MatchConst,
     MatchValueConst,
     MatchTextIsEmptyConst,
-    MatchNumberInfixConst,
+    MatchInfixConst,
     ListFindValue,
     Unknown,
 }
@@ -896,9 +929,12 @@ impl fmt::Display for PlanError {
 
 impl Error for PlanError {}
 
-impl From<serde_json::Error> for PlanError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::new(error.to_string())
+impl serde::ser::Error for PlanError {
+    fn custom<T>(message: T) -> Self
+    where
+        T: fmt::Display,
+    {
+        Self::new(message.to_string())
     }
 }
 
@@ -931,6 +967,34 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         id: "operation-ids-unique".to_owned(),
         pass: unique_operation_ids(&plan.regions),
         detail: format!("{} operation regions", plan.regions.len()),
+    });
+    checks.push(PlanCheck {
+        id: "root-output-demand-resolves".to_owned(),
+        pass: root_output_demand_resolves(plan),
+        detail: match &plan.demand.root_derived_outputs {
+            RootOutputDemand::All => "all root-derived outputs are demanded".to_owned(),
+            RootOutputDemand::Selected(field_ids) => format!(
+                "{} sorted unique root-derived output field id(s) are demanded",
+                field_ids.len()
+            ),
+        },
+    });
+    let document_failure = plan
+        .document
+        .as_ref()
+        .and_then(|document| document.verify(plan).err());
+    checks.push(PlanCheck {
+        id: "document-plan-typed-and-resolved".to_owned(),
+        pass: document_failure.is_none(),
+        detail: document_failure.unwrap_or_else(|| match &plan.document {
+            Some(document) => format!(
+                "{} document expression(s), {} template(s), {} materialization point(s)",
+                document.expressions.len(),
+                document.templates.len(),
+                document.materializations.len()
+            ),
+            None => "no document output root".to_owned(),
+        }),
     });
     checks.push(PlanCheck {
         id: "byte-constants-match-hashes".to_owned(),
@@ -1055,8 +1119,31 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
     })
 }
 
+fn root_output_demand_resolves(plan: &MachinePlan) -> bool {
+    let RootOutputDemand::Selected(field_ids) = &plan.demand.root_derived_outputs else {
+        return true;
+    };
+    if !field_ids.windows(2).all(|pair| pair[0] < pair[1]) {
+        return false;
+    }
+    let root_outputs = plan
+        .regions
+        .iter()
+        .filter(|region| region.kind == RegionKind::DerivedEvaluation)
+        .flat_map(|region| &region.ops)
+        .filter(|op| !op.indexed)
+        .filter_map(|op| match op.output {
+            Some(ValueRef::Field(field_id)) => Some(field_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    field_ids
+        .iter()
+        .all(|field_id| root_outputs.contains(field_id))
+}
+
 pub fn plan_sha256(plan: &MachinePlan) -> Result<String, PlanError> {
-    let bytes = serde_json::to_vec(plan)?;
+    let bytes = binary::encode(plan)?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
@@ -1515,6 +1602,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && update_branch_source_ids(op).len() == 1
                         && text_trim_or_previous_inputs_supported(
                             scalar_slots,
+                            constants,
                             op,
                             source_payload_field,
                         )
@@ -1551,10 +1639,16 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && update_branch_source_ids(op).len() == 1
                         && root_match_value_const_inputs_supported(scalar_slots, constants, op)
                 }
-                PlanExpressionKind::NumberInfix
-                | PlanExpressionKind::ProjectTime
+                PlanExpressionKind::NumberInfix => {
+                    source_payload_field.is_none()
+                        && update_constant_id.is_none()
+                        && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
+                        && update_branch_source_ids(op).len() == 1
+                        && root_number_infix_inputs_supported(scalar_slots, constants, op)
+                }
+                PlanExpressionKind::ProjectTime
                 | PlanExpressionKind::MatchTextIsEmptyConst
-                | PlanExpressionKind::MatchNumberInfixConst
+                | PlanExpressionKind::MatchInfixConst
                 | PlanExpressionKind::ListFindValue
                 | PlanExpressionKind::Unknown => false,
             }
@@ -2032,7 +2126,12 @@ fn cpu_plan_executor_supports_indexed_update_op(
         PlanExpressionKind::TextTrimOrPrevious => {
             update_constant_id.is_none()
                 && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
-                && text_trim_or_previous_inputs_supported(scalar_slots, op, source_payload_field)
+                && text_trim_or_previous_inputs_supported(
+                    scalar_slots,
+                    constants,
+                    op,
+                    source_payload_field,
+                )
                 && (source_payload_field.is_some()
                     || source_payload_inputs_are_empty_or_guard_only(op, source_guard))
         }
@@ -2076,10 +2175,44 @@ fn cpu_plan_executor_supports_indexed_update_op(
         | PlanExpressionKind::ProjectTime
         | PlanExpressionKind::MatchConst
         | PlanExpressionKind::MatchValueConst
-        | PlanExpressionKind::MatchNumberInfixConst
+        | PlanExpressionKind::MatchInfixConst
         | PlanExpressionKind::ListFindValue
         | PlanExpressionKind::Unknown => false,
     }
+}
+
+fn root_number_infix_inputs_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+) -> bool {
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return false;
+    };
+    let [left, operator, right] = ordered_inputs.as_slice() else {
+        return false;
+    };
+    let number_operand = |value: &ValueRef| match value {
+        ValueRef::State(state) => {
+            plan_value_type_for_state_slots(scalar_slots, *state) == Some(&PlanValueType::Number)
+        }
+        ValueRef::Constant(id) => constants.iter().any(|constant| {
+            constant.id == *id && matches!(constant.value, PlanConstantValue::Number { .. })
+        }),
+        _ => false,
+    };
+    let operator_supported = match operator {
+        ValueRef::Constant(id) => constants.iter().any(|constant| {
+            constant.id == *id
+                && matches!(
+                    &constant.value,
+                    PlanConstantValue::Text { value }
+                        if matches!(value.as_str(), "+" | "-" | "*" | "/" | "%")
+                )
+        }),
+        _ => false,
+    };
+    number_operand(left) && operator_supported && number_operand(right)
 }
 
 fn source_payload_inputs_are_empty_or_guard_only(
@@ -3269,16 +3402,22 @@ fn previous_value_inputs_supported(scalar_slots: &[ScalarStorageSlot], op: &Plan
 
 fn text_trim_or_previous_inputs_supported(
     scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
     op: &PlanOp,
     source_payload_field: &Option<SourcePayloadField>,
 ) -> bool {
-    let text_state_inputs_supported = state_input_ids(op).into_iter().all(|state_id| {
-        plan_value_type_for_state_slots(scalar_slots, state_id) == Some(&PlanValueType::Text)
-    });
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return false;
+    };
+    let [input, previous] = ordered_inputs.as_slice() else {
+        return false;
+    };
+    let inputs_supported = text_operand_ref_supported(scalar_slots, constants, input, true)
+        && text_operand_ref_supported(scalar_slots, constants, previous, false);
     if let Some(field) = source_payload_field {
-        source_payload_input_matches_single_source(op, field) && text_state_inputs_supported
+        source_payload_input_matches_single_source(op, field) && inputs_supported
     } else {
-        text_state_inputs_supported
+        inputs_supported
     }
 }
 

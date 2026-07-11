@@ -246,11 +246,11 @@ It is not accepted by semantic tests alone.
 Required commands:
 
 ```bash
-cargo test -p boon_parser -p boon_ir -p boon_runtime --lib
+cargo test -p boon_plan_executor -p boon_runtime
 cargo test -p boon_native_playground --bin boon_native_playground
-cargo run -q -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn --report target/reports/debug/cells-cli-run.json
-cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells.json
-cargo xtask verify-native-gpu-scroll-speed --example cells --report target/reports/native-gpu/scroll-speed-cells.json
+cargo run -q -p boon_cli -- run examples/cells.bn --scenario examples/cells.scn
+cargo xtask verify-cells --report target/reports/report-v2/cells.json
+cargo xtask verify-all --check-existing --report target/reports/report-v2/verify-all.json
 ```
 
 Native GPU and follow-up human passes must test real spreadsheet interaction:

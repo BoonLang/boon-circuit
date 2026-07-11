@@ -36,9 +36,11 @@ fn document_patch_missing_targets_fail_closed() {
         .apply_patch(DocumentPatch::SetListMaterialization {
             id: DocumentNodeId("missing".to_owned()),
             materialized: MaterializedRange {
+                materialization: Some(1),
                 axis: Axis::Vertical,
                 visible: 0..1,
                 overscan: 0..2,
+                logical_item_count: 2,
             },
         })
         .unwrap_err();
@@ -151,5 +153,4 @@ fn trusted_nonstructural_owned_frame_batch_rejects_structural_patch() {
         }
     ));
 }
-
 

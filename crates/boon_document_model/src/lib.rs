@@ -107,43 +107,34 @@ impl<'de> Deserialize<'de> for StyleValue {
     where
         D: Deserializer<'de>,
     {
-        match serde_json::Value::deserialize(deserializer)? {
-            serde_json::Value::String(value) => Ok(StyleValue::Text(value)),
-            serde_json::Value::Number(value) => value
-                .as_f64()
-                .map(StyleValue::Number)
-                .ok_or_else(|| serde::de::Error::custom("style number must fit f64")),
-            serde_json::Value::Bool(value) => Ok(StyleValue::Bool(value)),
-            serde_json::Value::Object(mut value) => {
-                let kind = value
-                    .remove("kind")
-                    .and_then(|kind| kind.as_str().map(str::to_owned))
-                    .ok_or_else(|| serde::de::Error::custom("typed style value needs kind"))?;
-                match kind.as_str() {
-                    "rich_text_spans" => {
-                        serde_json::from_value(value.remove("spans").ok_or_else(|| {
-                            serde::de::Error::custom("rich_text_spans needs spans")
-                        })?)
-                        .map(StyleValue::RichTextSpans)
-                        .map_err(serde::de::Error::custom)
-                    }
-                    "editor_type_hints" => {
-                        serde_json::from_value(value.remove("hints").ok_or_else(|| {
-                            serde::de::Error::custom("editor_type_hints needs hints")
-                        })?)
-                        .map(StyleValue::EditorTypeHints)
-                        .map_err(serde::de::Error::custom)
-                    }
-                    _ => Err(serde::de::Error::custom(format!(
-                        "unknown typed style value kind `{kind}`"
-                    ))),
-                }
+        match StyleValueRepr::deserialize(deserializer)? {
+            StyleValueRepr::Text(value) => Ok(Self::Text(value)),
+            StyleValueRepr::Number(value) => Ok(Self::Number(value)),
+            StyleValueRepr::Bool(value) => Ok(Self::Bool(value)),
+            StyleValueRepr::Typed(TypedStyleValue::RichTextSpans { spans }) => {
+                Ok(Self::RichTextSpans(spans))
             }
-            _ => Err(serde::de::Error::custom(
-                "style value must be a string, number, bool, or typed style object",
-            )),
+            StyleValueRepr::Typed(TypedStyleValue::EditorTypeHints { hints }) => {
+                Ok(Self::EditorTypeHints(hints))
+            }
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StyleValueRepr {
+    Text(String),
+    Number(f64),
+    Bool(bool),
+    Typed(TypedStyleValue),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum TypedStyleValue {
+    RichTextSpans { spans: Vec<StyleRichTextSpan> },
+    EditorTypeHints { hints: Vec<StyleEditorTypeHint> },
 }
 
 pub type StyleMap = BTreeMap<String, StyleValue>;
@@ -202,9 +193,12 @@ pub enum Axis {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaterializedRange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<u64>,
     pub axis: Axis,
     pub visible: Range<u64>,
     pub overscan: Range<u64>,
+    pub logical_item_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

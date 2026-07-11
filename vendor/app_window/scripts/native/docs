@@ -1,7 +1,0 @@
-#!/bin/bash
-set -e
-WARN_FLAGS="-D warnings"
-if [[ " $* " =~ " --relaxed " ]]; then
-    WARN_FLAGS=""
-fi
-RUSTDOCFLAGS="$WARN_FLAGS" cargo doc

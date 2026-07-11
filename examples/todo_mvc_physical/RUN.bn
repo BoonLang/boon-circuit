@@ -23,19 +23,14 @@ store: [
             mode_toggle: SOURCE
         ]
     ]
-    selected_filter: Router/route() |> WHILE {
-        TEXT { / } => All
-        TEXT { /active } => Active
-        TEXT { /completed } => Completed
-        __ => All
-    }
-    go_to_result:
-        LATEST {
-            elements.filter_buttons.all.event.press |> THEN { TEXT { / } }
-            elements.filter_buttons.active.event.press |> THEN { TEXT { /active } }
-            elements.filter_buttons.completed.event.press |> THEN { TEXT { /completed } }
+    selected_filter:
+        All |> HOLD selected_filter {
+            LATEST {
+                elements.filter_buttons.all.event.press |> THEN { All }
+                elements.filter_buttons.active.event.press |> THEN { Active }
+                elements.filter_buttons.completed.event.press |> THEN { Completed }
+            }
         }
-        |> Router/go_to()
     title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
         Enter => BLOCK {
             new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
@@ -77,19 +72,13 @@ store: [
         completed_count > 0
     all_completed:
         active_count == 0 |> Bool/and(completed_count > 0)
-    selected_todo_id: LATEST {
-        None
+    visible_todos:
         todos
-            |> List/map(old, new: LATEST {
-                old.todo_elements.editing_todo_title_element.event.key_down.key
-                    |> WHEN { Escape => None, __ => SKIP }
-                old.title_to_update
-                    |> THEN { None }
-                old.todo_elements.todo_title_element.event.double_click
-                    |> THEN { old.id }
-            })
-            |> List/latest()
-    }
+        |> List/retain(todo, if: selected_filter |> WHEN {
+            All => True
+            Active => todo.completed |> Bool/not()
+            Completed => todo.completed
+        })
 ]
 
 ------------------------------------------------------------------------
@@ -104,7 +93,19 @@ FUNCTION new_todo(title, initial_completed) {
             todo_title_element: SOURCE
             todo_checkbox: SOURCE
         ]
-        id: TodoId[id: Ulid/generate()]
+        editing:
+            False |> HOLD editing {
+                LATEST {
+                    todo_elements.todo_title_element.event.double_click |> THEN { True }
+                    todo_elements.editing_todo_title_element.event.key_down.key
+                        |> WHEN {
+                            Enter => False
+                            Escape => False
+                            __ => SKIP
+                        }
+                    todo_elements.editing_todo_title_element.event.blur |> THEN { False }
+                }
+            }
         title_to_update:
             LATEST {
                 todo_elements.editing_todo_title_element.event.blur
@@ -148,18 +149,19 @@ FUNCTION new_todo(title, initial_completed) {
 ------------------------------------------------------------------------
 
 theme_options: [
-    name: LATEST {
-        Classic
-        store.elements.theme_switcher.classic.event.press
-            |> THEN { Classic }
-        store.elements.theme_switcher.professional.event.press
-            |> THEN { Professional }
-        store.elements.theme_switcher.glassmorphism.event.press
-            |> THEN { Glassmorphism }
-        store.elements.theme_switcher.neobrutalism.event.press
-            |> THEN { Neobrutalism }
-        store.elements.theme_switcher.neumorphism.event.press
-            |> THEN { Neumorphism }
+    name: Classic |> HOLD name {
+        LATEST {
+            store.elements.theme_switcher.classic.event.press
+                |> THEN { Classic }
+            store.elements.theme_switcher.professional.event.press
+                |> THEN { Professional }
+            store.elements.theme_switcher.glassmorphism.event.press
+                |> THEN { Glassmorphism }
+            store.elements.theme_switcher.neobrutalism.event.press
+                |> THEN { Neobrutalism }
+            store.elements.theme_switcher.neumorphism.event.press
+                |> THEN { Neumorphism }
+        }
     }
     mode: Light |> HOLD state {
         store.elements.theme_switcher.mode_toggle.event.press
@@ -596,15 +598,7 @@ FUNCTION todos_element() {
             material: Theme/material(of: SurfaceVariant)
             ...Theme/material(of: TodoListFrame)
         ]
-        items: todos
-            |> List/retain(
-                item
-                if: selected_filter |> WHILE {
-                    All => True
-                    Active => item.completed |> Bool/not()
-                    Completed => item.completed
-                }
-            )
+        items: visible_todos
             |> List/map(old, new: old |> todo_element())
     )
 }
@@ -627,7 +621,7 @@ FUNCTION todo_element(todo) {
             material: Theme/material(of: Interactive[hovered: element.hovered])
             ...Theme/material(of: TodoRowFrame)
         ]
-        items: store.selected_todo_id == todo.id |> WHILE {
+        items: todo.editing |> WHILE {
             True => LIST {
                 editing_todo_title_element(todo: todo)
                     |> SOURCE { todo.todo_elements.editing_todo_title_element }
@@ -809,7 +803,7 @@ FUNCTION panel_footer() {
             store.has_completed |> WHILE {
                 True => remove_completed_button()
                         |> SOURCE { PASSED.store.elements.remove_completed_button }
-                    False => NoElement
+                False => NoElement
                 }
         }
     )

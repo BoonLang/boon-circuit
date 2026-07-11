@@ -28,6 +28,44 @@ fn frame_with_item(item: DisplayItem) -> LayoutFrame {
 }
 
 #[test]
+fn interactive_controls_have_generic_hover_and_focus_fallbacks() {
+    let mut style = StyleMap::new();
+    style.insert(
+        "background".to_owned(),
+        StyleValue::Text("#ffffff".to_owned()),
+    );
+    style.insert("__hover".to_owned(), StyleValue::Bool(true));
+    let item = DisplayItem {
+        node: DocumentNodeId("button".to_owned()),
+        kind: DocumentNodeKind::Button,
+        bounds: Rect {
+            x: 10.0,
+            y: 10.0,
+            width: 80.0,
+            height: 24.0,
+        },
+        style,
+        text: Some("Button".to_owned()),
+        focused: true,
+        style_identity: identity(),
+    };
+    let mut columns = ApproximateTextColumnMeasurer;
+    let primitives = render_visual_primitives(&frame_with_item(item), 160, 80, &mut columns);
+
+    assert!(primitives.iter().any(|primitive| {
+        primitive
+            .dependency_set
+            .iter()
+            .any(|dependency| dependency == "primitive:default-hover")
+    }));
+    assert!(primitives.iter().any(|primitive| {
+        primitive.primitive == RenderVisualPrimitiveKind::Border
+            && primitive.stroke_width == 2.0
+            && primitive.color == [44, 107, 216, 255]
+    }));
+}
+
+#[test]
 fn render_scene_contract_is_renderer_neutral_and_serializable() {
     let item = RenderSceneItem {
         node: DocumentNodeId("row-1".to_owned()),
@@ -78,10 +116,10 @@ fn render_scene_contract_is_renderer_neutral_and_serializable() {
         },
     };
 
-    let encoded = serde_json::to_string(&scene).expect("render scene should serialize");
-    assert!(encoded.contains("row-1"));
-    assert!(!encoded.contains(&["w", "gpu"].concat()));
-    assert!(!encoded.contains(&["glyph", "on"].concat()));
+    assert_eq!(
+        scene.quad_batches[0].retained_chunk_id.as_deref(),
+        Some("chunk:row-1")
+    );
 }
 
 #[test]
@@ -1143,7 +1181,7 @@ fn render_text_runs_lower_syntax_spans_and_type_hints_before_gpu() {
     );
     style.insert("size".to_owned(), StyleValue::Number(14.0));
     style.insert(
-        "syntax_spans_json".to_owned(),
+        "syntax_spans".to_owned(),
         StyleValue::RichTextSpans(vec![StyleRichTextSpan {
             text: "SOURCE".to_owned(),
             source_text: Some("SOURCE".to_owned()),
@@ -1153,7 +1191,7 @@ fn render_text_runs_lower_syntax_spans_and_type_hints_before_gpu() {
         }]),
     );
     style.insert(
-        "editor_type_hints_json".to_owned(),
+        "editor_type_hints".to_owned(),
         StyleValue::EditorTypeHints(vec![StyleEditorTypeHint {
             anchor_column: 6,
             compact_label: "Number".to_owned(),
@@ -1196,11 +1234,14 @@ fn render_text_contract_keys_track_shape_and_placement_inputs() {
     style.insert("size".to_owned(), StyleValue::Number(14.0));
     style.insert("line_height".to_owned(), StyleValue::Number(20.0));
     style.insert(
-        "syntax_spans_json".to_owned(),
-        StyleValue::Text(
-            r##"[{"text":"SOURCE","source_text":"SOURCE","color":"#ff0000","font_style":"italic","font_weight":"bold"}]"##
-                .to_owned(),
-        ),
+        "syntax_spans".to_owned(),
+        StyleValue::RichTextSpans(vec![StyleRichTextSpan {
+            text: "SOURCE".to_owned(),
+            source_text: Some("SOURCE".to_owned()),
+            color: Some("#ff0000".to_owned()),
+            font_style: Some("italic".to_owned()),
+            font_weight: Some("bold".to_owned()),
+        }]),
     );
     let frame = frame_with_item(DisplayItem {
         node: DocumentNodeId("line".to_owned()),

@@ -7,21 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 boon_runtime.workspace = true
-boon_editor.workspace = true
 boon_document.workspace = true
 boon_document_model.workspace = true
 boon_host.workspace = true
 boon_native_gpu.workspace = true
 boon_native_app_window.workspace = true
-boon_parser.workspace = true
-boon_ir.workspace = true
-boon_typecheck.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
-arboard.workspace = true
 futures.workspace = true
 wgpu.workspace = true
-
-[dev-dependencies]
-image.workspace = true
+libc.workspace = true

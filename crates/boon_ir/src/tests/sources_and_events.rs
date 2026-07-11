@@ -9,12 +9,6 @@ fn source_payload_schema_row_lookup_field_uses_generic_name() {
     };
     assert_eq!(schema.row_lookup_field_name(), Some("file"));
 
-    let decoded: SourcePayloadSchema = serde_json::from_value(serde_json::json!({
-        "fields": [],
-        "row_lookup_field": "file"
-    }))
-    .unwrap();
-    assert_eq!(decoded.row_lookup_field_name(), Some("file"));
 }
 
 
@@ -71,6 +65,35 @@ fn view_row_source_alias_resolves_to_unique_canonical_source_path() {
     assert!(
         canonical_view_source_path(&ambiguous, "row.file_row_elements.select_file").is_none(),
         "view row aliases must not guess when suffixes are ambiguous"
+    );
+}
+
+#[test]
+fn selected_row_source_projection_resolves_by_unique_source_suffix() {
+    let sources = [
+        ("cell.sources.editor.change", SourceId(0)),
+        ("cell.sources.editor.commit", SourceId(1)),
+    ];
+    assert_eq!(
+        canonical_view_source_path(
+            &sources,
+            "store.selected_input.sources.editor.change"
+        )
+        .map(|(path, source_id)| (path, source_id.as_usize())),
+        Some(("cell.sources.editor.change", 0))
+    );
+
+    let ambiguous = [
+        ("left.sources.editor.change", SourceId(0)),
+        ("right.sources.editor.change", SourceId(1)),
+    ];
+    assert!(
+        canonical_view_source_path(
+            &ambiguous,
+            "store.selected_input.sources.editor.change"
+        )
+        .is_none(),
+        "selected-row source aliases must remain ambiguity-safe"
     );
 }
 
@@ -206,4 +229,3 @@ fn event_press_pulse_is_not_payload_guard_field() {
         Some("key".to_owned())
     );
 }
-

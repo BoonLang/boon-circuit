@@ -1,178 +1,45 @@
 {
-  "manifest_id": "native-gpu-handoff",
-  "manifest_version": 1,
-  "aggregate_command": "verify-native-gpu-all",
-  "aggregate_report_path": "target/reports/native-gpu-all.json",
-  "reports": [
+  "format": 2,
+  "id": "boon-native-handoff-v2",
+  "aggregate": "verify-all",
+  "aggregate_output": "target/reports/report-v2/verify-all.json",
+  "aggregate_byte_limit": 262144,
+  "gates": [
     {
-      "label": "platform-contract",
-      "path": "target/reports/native-gpu/platform-contract.json",
-      "command": "verify-platform-contract",
-      "required_argv": [],
-      "max_report_bytes": 1048576,
-      "max_sidecar_bytes": 0
+      "gate": "architecture",
+      "verifier": "verify-architecture",
+      "output": "target/reports/report-v2/architecture.json",
+      "byte_limit": 262144
     },
     {
-      "label": "dependency-graph",
-      "path": "target/reports/native-gpu/dependency-graph.json",
-      "command": "verify-native-gpu-dependency-graph",
-      "required_argv": [],
-      "max_report_bytes": 1048576,
-      "max_sidecar_bytes": 0
+      "gate": "counter-dev",
+      "verifier": "verify-counter-dev",
+      "output": "target/reports/report-v2/counter-dev.json",
+      "byte_limit": 262144
     },
     {
-      "label": "architecture",
-      "path": "target/reports/native-gpu/architecture.json",
-      "command": "verify-native-gpu-architecture",
-      "required_argv": [],
-      "max_report_bytes": 1048576,
-      "max_sidecar_bytes": 0
+      "gate": "todomvc-physical",
+      "verifier": "verify-todomvc-physical",
+      "output": "target/reports/report-v2/todomvc-physical.json",
+      "byte_limit": 262144
     },
     {
-      "label": "layout-contract",
-      "path": "target/reports/native-gpu/layout-contract.json",
-      "command": "verify-native-gpu-layout-contract",
-      "required_argv": [],
-      "max_report_bytes": 1048576,
-      "max_sidecar_bytes": 0
+      "gate": "cells",
+      "verifier": "verify-cells",
+      "output": "target/reports/report-v2/cells.json",
+      "byte_limit": 262144
     },
     {
-      "label": "shaders",
-      "path": "target/reports/native-gpu/shaders.json",
-      "command": "verify-native-gpu-shaders",
-      "required_argv": [
-        ["--check", ""]
-      ],
-      "max_report_bytes": 1048576,
-      "max_sidecar_bytes": 0
+      "gate": "novywave",
+      "verifier": "verify-novywave",
+      "output": "target/reports/report-v2/novywave.json",
+      "byte_limit": 262144
     },
     {
-      "label": "multiwindow",
-      "path": "target/reports/native-gpu/multiwindow.json",
-      "command": "verify-native-gpu-multiwindow",
-      "required_argv": [],
-      "max_report_bytes": 2097152,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "ipc-backpressure",
-      "path": "target/reports/native-gpu/ipc-backpressure.json",
-      "command": "verify-native-gpu-ipc-backpressure",
-      "required_argv": [],
-      "max_report_bytes": 2097152,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "observability",
-      "path": "target/reports/native-gpu/observability.json",
-      "command": "verify-native-gpu-observability",
-      "required_argv": [],
-      "max_report_bytes": 2097152,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "present-floor",
-      "path": "target/reports/native-gpu/present-floor.json",
-      "command": "verify-native-gpu-present-floor",
-      "required_argv": [],
-      "max_report_bytes": 1048576,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "preview-e2e-todomvc",
-      "path": "target/reports/native-gpu/preview-e2e-todomvc.json",
-      "command": "verify-native-gpu-preview-e2e",
-      "required_argv": [
-        ["--example", "todomvc"],
-        ["--profile", "release"],
-        ["--require-hardware-adapter", ""]
-      ],
-      "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "preview-e2e-cells",
-      "path": "target/reports/native-gpu/preview-e2e-cells.json",
-      "command": "verify-native-gpu-preview-e2e",
-      "required_argv": [
-        ["--example", "cells"],
-        ["--profile", "release"],
-        ["--require-hardware-adapter", ""]
-      ],
-      "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "preview-e2e-todo_mvc_physical",
-      "path": "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
-      "command": "verify-native-gpu-preview-e2e",
-      "required_argv": [
-        ["--example", "todo_mvc_physical"],
-        ["--profile", "release"],
-        ["--require-hardware-adapter", ""]
-      ],
-      "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "todomvc-physical-reference-parity",
-      "path": "target/reports/native-gpu/todomvc-physical-reference-parity.json",
-      "command": "verify-native-todomvc-physical-reference-parity",
-      "required_argv": [],
-      "max_report_bytes": 2097152,
-      "max_sidecar_bytes": 0,
-      "upstream_dependencies": [
-        {
-          "kind": "consumes-native-report",
-          "label": "preview-e2e-todo_mvc_physical",
-          "path": "target/reports/native-gpu/preview-e2e-todo_mvc_physical.json",
-          "command": "verify-native-gpu-preview-e2e",
-          "required_argv": [
-            ["--example", "todo_mvc_physical"],
-            ["--profile", "release"],
-            ["--require-hardware-adapter", ""]
-          ],
-          "measurement_mode": "proof",
-          "owner_aggregate": "verify-native-gpu-all",
-          "owner_aggregate_report_path": "target/reports/native-gpu-all.json"
-        }
-      ]
-    },
-    {
-      "label": "scroll-speed-cells",
-      "path": "target/reports/native-gpu/scroll-speed-cells.json",
-      "command": "verify-native-gpu-scroll-speed",
-      "required_argv": [
-        ["--example", "cells"]
-      ],
-      "max_report_bytes": 4194304,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "cells-visible-click-e2e-release",
-      "path": "target/reports/native-gpu/cells-visible-click-e2e-release.json",
-      "command": "verify-native-cells-visible-click-e2e",
-      "required_argv": [
-        ["--profile", "release"]
-      ],
-      "max_report_bytes": 8388608,
-      "max_sidecar_bytes": 67108864
-    },
-    {
-      "label": "stale-path-ledger",
-      "path": "target/reports/native-gpu/stale-path-ledger.json",
-      "command": "verify-native-gpu-stale-path-ledger",
-      "required_argv": [],
-      "max_report_bytes": 2097152,
-      "max_sidecar_bytes": 0
-    },
-    {
-      "label": "negative",
-      "path": "target/reports/native-gpu/negative.json",
-      "command": "verify-native-gpu-negative",
-      "required_argv": [],
-      "max_report_bytes": 2097152,
-      "max_sidecar_bytes": 0
+      "gate": "negative",
+      "verifier": "verify-negative",
+      "output": "target/reports/report-v2/negative.json",
+      "byte_limit": 262144
     }
   ]
 }

@@ -13,9 +13,11 @@ fn materialization_patch_reports_logical_counts_and_stable_keys() {
         .apply_patch(DocumentPatch::SetListMaterialization {
             id: DocumentNodeId("virtual-list".to_owned()),
             materialized: MaterializedRange {
+                materialization: Some(1),
                 axis: Axis::Vertical,
                 visible: 10..20,
                 overscan: 8..24,
+                logical_item_count: 24,
             },
         })
         .unwrap();

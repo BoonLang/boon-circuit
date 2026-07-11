@@ -379,8 +379,9 @@ Negative fixtures:
 Native verification after integration:
 
 ```bash
-cargo xtask verify-native-gpu-preview-e2e --example todomvc --report target/reports/native-gpu/preview-e2e-todomvc-typecheck.json
-cargo xtask verify-native-gpu-preview-e2e --example cells --report target/reports/native-gpu/preview-e2e-cells-typecheck.json
+cargo xtask verify-counter-dev --report target/reports/report-v2/counter-dev.json
+cargo xtask verify-cells --report target/reports/report-v2/cells.json
+cargo xtask verify-all --check-existing --report target/reports/report-v2/verify-all.json
 ```
 
 Smell gates after type-driven render lowering lands:

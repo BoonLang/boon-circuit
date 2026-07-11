@@ -68,7 +68,7 @@ fn svg_asset_data_url_renders_into_app_owned_pixels() {
         );
         let render_identity_hash = format!(
             "{:x}",
-            Sha256::digest(serde_json::to_vec(&scene).expect("scene should serialize"))
+            Sha256::digest(format!("{scene:?}").as_bytes())
         );
         let proof = render_app_owned_scene_pixels(AppOwnedRenderSceneRequest {
             device: &device,

@@ -329,6 +329,57 @@ impl HitSideTable {
     pub fn candidate_indices_at(&self, x: f32, y: f32) -> Option<&Vec<usize>> {
         self.bucket_indices(hit_bucket_for_point(x, y, self.bucket_size))
     }
+
+    fn update_node_metadata(
+        &mut self,
+        document: &DocumentFrame,
+        hot_ids: &DocumentHotIdTable,
+        typed_bindings: &DocumentTypedBindingIndex,
+        changed_nodes: &BTreeSet<DocumentNodeId>,
+    ) -> Result<(), PatchApplyError> {
+        for entry in &mut self.entries {
+            if !changed_nodes.contains(&entry.node) {
+                continue;
+            }
+            let node =
+                document
+                    .nodes
+                    .get(&entry.node)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hit_region_node",
+                        id: entry.node.clone(),
+                    })?;
+            let hot =
+                hot_ids
+                    .hot_id(&entry.node)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "hot_id_table",
+                        id: entry.node.clone(),
+                    })?;
+            let bindings = typed_bindings.bindings_for_node(hot);
+            let primary = bindings.first();
+            entry.source_binding_id = primary.map(|binding| binding.binding_id.clone());
+            entry.source_path = primary.map(|binding| binding.route.source_path.clone());
+            entry.source_intent = primary.map(|binding| binding.route.intent.clone());
+            entry.source_binding_refs = bindings.iter().map(|binding| binding.reference).collect();
+            entry.source_routes = bindings
+                .iter()
+                .map(|binding| binding.route.clone())
+                .collect();
+            entry.scroll_root = scroll_root_for_node(document, &entry.node);
+            entry.row_key = style_u64_any(&node.style, &["row_key", "target_key", "__row_key"]);
+            entry.row_generation = style_u64_any(
+                &node.style,
+                &[
+                    "row_generation",
+                    "target_generation",
+                    "generation",
+                    "__row_generation",
+                ],
+            );
+        }
+        Ok(())
+    }
 }
 
 fn hit_bucket_for_point(x: f32, y: f32, bucket_size: f32) -> HitSpatialBucket {
@@ -398,12 +449,22 @@ fn rect_center_distance2(rect: Rect, x: f32, y: f32) -> f32 {
 
 fn scroll_root_for_node(document: &DocumentFrame, node: &DocumentNodeId) -> Option<ScrollRootId> {
     let mut current = Some(node.clone());
-    while let Some(id) = current {
+    while let Some(id) = current.take() {
         let scroll_root = ScrollRootId(id.0.clone());
-        if document.scroll_roots.contains_key(&scroll_root) {
+        let node = document.nodes.get(&id);
+        if document.scroll_roots.contains_key(&scroll_root)
+            || node.is_some_and(|node| {
+                node.scroll.is_some()
+                    || node.kind == DocumentNodeKind::ScrollRoot
+                    || style_bool(&node.style, "scroll") == Some(true)
+                    || style_bool(&node.style, "scroll_x") == Some(true)
+                    || style_bool(&node.style, "scroll_y") == Some(true)
+                    || style_bool(&node.style, "scrollbars") == Some(true)
+            })
+        {
             return Some(scroll_root);
         }
-        current = document.nodes.get(&id).and_then(|node| node.parent.clone());
+        current = node.and_then(|node| node.parent.clone());
     }
     None
 }
@@ -1137,11 +1198,14 @@ fn push_html_text(html: &mut String, value: &str) {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayoutDemand {
     pub node: DocumentNodeId,
+    pub materialization: Option<u64>,
     pub axis: Axis,
     pub visible: Range<u64>,
     pub overscan: Range<u64>,
     pub logical_item_count: u64,
     pub materialized_item_count: u64,
+    pub item_extent_milli: Option<u32>,
+    pub viewport_extent_milli: u32,
     pub stable_key_prefix: String,
     pub first_stable_key: Option<String>,
     pub last_stable_key: Option<String>,
@@ -1150,11 +1214,14 @@ pub struct LayoutDemand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MaterializationReport {
     pub node: DocumentNodeId,
+    pub materialization: Option<u64>,
     pub axis: Axis,
     pub visible: Range<u64>,
     pub overscan: Range<u64>,
     pub logical_item_count: u64,
     pub materialized_item_count: u64,
+    pub item_extent_milli: Option<u32>,
+    pub viewport_extent_milli: u32,
     pub stable_key_prefix: String,
     pub first_stable_key: Option<String>,
     pub last_stable_key: Option<String>,
@@ -1171,6 +1238,40 @@ pub struct LayoutMetrics {
 #[derive(Clone, Debug)]
 pub struct DocumentState {
     frame: DocumentFrame,
+}
+
+pub struct RetainedDocument {
+    document: DocumentState,
+    indexes: DocumentDerivedIndexBundle,
+    layout: LayoutFrame,
+    hits: HitSideTable,
+    scene: RenderScene,
+    viewport: Viewport,
+    hovered: Option<DocumentNodeId>,
+    focused: Option<DocumentNodeId>,
+    content_revision: u64,
+    layout_revision: u64,
+    render_revision: u64,
+    full_lower_count: u64,
+    retained_patch_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetainedDocumentStats {
+    pub content_revision: u64,
+    pub layout_revision: u64,
+    pub render_revision: u64,
+    pub full_lower_count: u64,
+    pub retained_patch_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetainedDocumentUpdate {
+    pub content_changed: bool,
+    pub layout_changed: bool,
+    pub render_changed: bool,
+    pub full_lowered: bool,
+    pub patched_node_count: usize,
 }
 
 macro_rules! document_numeric_ids {
@@ -2576,28 +2677,17 @@ impl DocumentDerivedIndexBundle {
         })
     }
 
-    pub fn from_previous_nonstructural_patch(
-        previous: &Self,
+    pub fn update_nonstructural_nodes(
+        &mut self,
         frame: &DocumentFrame,
         changed_nodes: &BTreeSet<DocumentNodeId>,
-    ) -> Result<Self, PatchApplyError> {
-        validate_frame_integrity(frame)?;
-        if previous.hot_ids.ids_by_node.len() != frame.nodes.len() {
+    ) -> Result<(), PatchApplyError> {
+        if self.hot_ids.ids_by_node.len() != frame.nodes.len() {
             return Err(PatchApplyError::StaleReference {
                 reference_kind: "hot_id_table_node_count",
                 id: frame.root.clone(),
             });
         }
-        for node_id in frame.nodes.keys() {
-            if !previous.hot_ids.ids_by_node.contains_key(node_id) {
-                return Err(PatchApplyError::StaleReference {
-                    reference_kind: "hot_id_table",
-                    id: node_id.clone(),
-                });
-            }
-        }
-
-        let mut next = previous.clone();
         for node_id in changed_nodes {
             let node = frame
                 .nodes
@@ -2607,24 +2697,24 @@ impl DocumentDerivedIndexBundle {
                     id: node_id.clone(),
                 })?;
             let hot_ref =
-                next.hot_ids
+                self.hot_ids
                     .hot_ref(node_id)
                     .ok_or_else(|| PatchApplyError::StaleReference {
                         reference_kind: "hot_id_table",
                         id: node_id.clone(),
                     })?;
-            next.intern_index.update_node(node, hot_ref);
-            next.retained_layout_keys.update_node(
+            self.intern_index.update_node(node, hot_ref);
+            self.retained_layout_keys.update_node(
                 frame,
-                &next.hot_ids,
-                &next.intern_index,
+                &self.hot_ids,
+                &self.intern_index,
                 node_id,
             )?;
-            next.typed_styles.update_node(node_id, node, hot_ref);
-            next.typed_bindings
-                .update_node(node_id, node, hot_ref, &next.intern_index)?;
+            self.typed_styles.update_node(node_id, node, hot_ref);
+            self.typed_bindings
+                .update_node(node_id, node, hot_ref, &self.intern_index)?;
         }
-        Ok(next)
+        Ok(())
     }
 
     pub fn try_layout<'a>(
@@ -2774,6 +2864,23 @@ impl DocumentState {
         Ok(change_set)
     }
 
+    pub fn apply_verified_nonstructural_batch_in_place(
+        &mut self,
+        batch: DocumentChangeBatch,
+    ) -> Result<DocumentChangeSet, PatchApplyError> {
+        for patch in &batch.patches {
+            verify_nonstructural_patch(&self.frame, patch)?;
+        }
+        let node_count = self.frame.nodes.len();
+        let mut reports = Vec::with_capacity(batch.patches.len());
+        for patch in batch.patches {
+            reports.push(apply_document_patch_unchecked(&mut self.frame, patch)?);
+        }
+        Ok(document_change_set_from_reports(
+            reports, node_count, node_count,
+        ))
+    }
+
     pub fn apply_ui_semantic_batch(
         &mut self,
         batch: ChangeBatch<UiSemanticChange>,
@@ -2842,6 +2949,784 @@ impl DocumentState {
             document_change_set_from_reports(reports, node_count_before, frame.nodes.len());
         Ok((frame, change_set))
     }
+}
+
+pub fn diff_document_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec<DocumentPatch> {
+    let mut patches = Vec::new();
+    let removed = previous
+        .nodes
+        .keys()
+        .filter(|id| !next.nodes.contains_key(*id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for id in &removed {
+        let parent_removed = previous
+            .nodes
+            .get(id)
+            .and_then(|node| node.parent.as_ref())
+            .is_some_and(|parent| removed.contains(parent));
+        if !parent_removed {
+            patches.push(DocumentPatch::RemoveNode { id: id.clone() });
+        }
+    }
+
+    let mut order = Vec::new();
+    collect_document_preorder(next, &next.root, &mut order);
+    for id in &order {
+        if previous.nodes.contains_key(id) {
+            continue;
+        }
+        if let Some(mut node) = next.nodes.get(id).cloned() {
+            node.children.clear();
+            patches.push(DocumentPatch::UpsertNode(node));
+        }
+    }
+
+    for id in &order {
+        let (Some(previous_node), Some(next_node)) = (previous.nodes.get(id), next.nodes.get(id))
+        else {
+            continue;
+        };
+        if previous_node.kind != next_node.kind
+            || previous_node.parent != next_node.parent
+            || previous_node.materialized != next_node.materialized
+        {
+            patches.push(DocumentPatch::UpsertNode(next_node.clone()));
+            continue;
+        }
+        if previous_node.text != next_node.text {
+            if let Some(text) = next_node.text.clone() {
+                patches.push(DocumentPatch::SetText {
+                    id: id.clone(),
+                    text,
+                });
+            } else {
+                patches.push(DocumentPatch::UpsertNode(next_node.clone()));
+                continue;
+            }
+        }
+        let style = document_style_diff(&previous_node.style, &next_node.style);
+        if !style.is_empty() {
+            patches.push(DocumentPatch::SetStyle {
+                id: id.clone(),
+                patch: style,
+            });
+        }
+        if previous_node.source_bindings.len() > next_node.source_bindings.len() {
+            patches.push(DocumentPatch::UpsertNode(next_node.clone()));
+            continue;
+        }
+        for (ordinal, binding) in next_node.source_bindings.iter().enumerate() {
+            if previous_node.source_bindings.get(ordinal) != Some(binding) {
+                patches.push(DocumentPatch::SetBindingAt {
+                    id: id.clone(),
+                    ordinal: ordinal as u32,
+                    binding: binding.clone(),
+                });
+            }
+        }
+        if previous_node.scroll != next_node.scroll
+            && let Some(scroll) = next_node.scroll
+        {
+            patches.push(DocumentPatch::SetScroll {
+                id: id.clone(),
+                scroll,
+            });
+        }
+    }
+
+    for id in order {
+        let Some(next_node) = next.nodes.get(&id) else {
+            continue;
+        };
+        let previous_children = previous
+            .nodes
+            .get(&id)
+            .map(|node| node.children.as_slice())
+            .unwrap_or(&[]);
+        for (index, child) in next_node.children.iter().enumerate() {
+            if previous_children.get(index) != Some(child) {
+                patches.push(DocumentPatch::MoveChild {
+                    child: child.clone(),
+                    new_parent: id.clone(),
+                    index,
+                });
+            }
+        }
+    }
+    patches
+}
+
+fn collect_document_preorder(
+    frame: &DocumentFrame,
+    id: &DocumentNodeId,
+    order: &mut Vec<DocumentNodeId>,
+) {
+    let Some(node) = frame.nodes.get(id) else {
+        return;
+    };
+    order.push(id.clone());
+    for child in &node.children {
+        collect_document_preorder(frame, child, order);
+    }
+}
+
+fn document_style_diff(previous: &StyleMap, next: &StyleMap) -> StylePatch {
+    previous
+        .keys()
+        .chain(next.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| previous.get(*name) != next.get(*name))
+        .map(|name| (name.clone(), next.get(name).cloned()))
+        .collect()
+}
+
+impl RetainedDocument {
+    pub fn new(
+        frame: DocumentFrame,
+        viewport: Viewport,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<Self, PatchApplyError> {
+        let document = DocumentState::from_frame(frame)?;
+        let indexes = DocumentDerivedIndexBundle::from_frame(document.frame())?;
+        let (layout, hits, scene) =
+            lower_retained_document(document.frame(), &indexes, viewport, columns)?;
+        Ok(Self {
+            document,
+            indexes,
+            layout,
+            hits,
+            scene,
+            viewport,
+            hovered: None,
+            focused: None,
+            content_revision: 1,
+            layout_revision: 1,
+            render_revision: 1,
+            full_lower_count: 1,
+            retained_patch_count: 0,
+        })
+    }
+
+    pub fn frame(&self) -> &DocumentFrame {
+        self.document.frame()
+    }
+
+    pub fn layout(&self) -> &LayoutFrame {
+        &self.layout
+    }
+
+    pub fn hits(&self) -> &HitSideTable {
+        &self.hits
+    }
+
+    pub fn scene(&self) -> &RenderScene {
+        &self.scene
+    }
+
+    pub fn demands(&self) -> &[LayoutDemand] {
+        &self.layout.demands
+    }
+
+    pub fn stats(&self) -> RetainedDocumentStats {
+        RetainedDocumentStats {
+            content_revision: self.content_revision,
+            layout_revision: self.layout_revision,
+            render_revision: self.render_revision,
+            full_lower_count: self.full_lower_count,
+            retained_patch_count: self.retained_patch_count,
+        }
+    }
+
+    pub fn replace(
+        &mut self,
+        frame: DocumentFrame,
+        viewport: Viewport,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<RetainedDocumentUpdate, PatchApplyError> {
+        self.document = DocumentState::from_frame(frame)?;
+        self.viewport = viewport;
+        self.lower_all(columns)?;
+        self.content_revision = self.content_revision.saturating_add(1);
+        Ok(RetainedDocumentUpdate {
+            content_changed: true,
+            layout_changed: true,
+            render_changed: true,
+            full_lowered: true,
+            patched_node_count: self.document.frame().nodes.len(),
+        })
+    }
+
+    pub fn resize(
+        &mut self,
+        viewport: Viewport,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<RetainedDocumentUpdate, PatchApplyError> {
+        self.viewport = viewport;
+        self.lower_all(columns)?;
+        Ok(RetainedDocumentUpdate {
+            content_changed: false,
+            layout_changed: true,
+            render_changed: true,
+            full_lowered: true,
+            patched_node_count: self.document.frame().nodes.len(),
+        })
+    }
+
+    pub fn apply_patches(
+        &mut self,
+        patches: Vec<DocumentPatch>,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<RetainedDocumentUpdate, PatchApplyError> {
+        if patches.is_empty() {
+            return Ok(RetainedDocumentUpdate::default());
+        }
+        let structural = patches
+            .iter()
+            .any(|patch| document_patch_structural_kind(patch).is_some());
+        let geometry_stable = !structural
+            && patches
+                .iter()
+                .all(|patch| patch_preserves_layout_geometry(self.document.frame(), patch));
+        let scroll_changes = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                DocumentPatch::SetScroll { id, scroll } => Some((
+                    id.clone(),
+                    self.document
+                        .frame()
+                        .nodes
+                        .get(id)
+                        .and_then(|node| node.scroll)
+                        .unwrap_or(boon_document_model::ScrollState { x: 0.0, y: 0.0 }),
+                    *scroll,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let hit_metadata_nodes = patch_hit_metadata_nodes(&patches);
+        let hit_bounds_changed = !scroll_changes.is_empty();
+        let render_nodes = patch_render_nodes(&patches);
+        let batch = DocumentChangeBatch { patches };
+
+        if structural {
+            let change = self.document.apply_batch(batch)?;
+            self.lower_all(columns)?;
+            self.content_revision = self.content_revision.saturating_add(1);
+            return Ok(RetainedDocumentUpdate {
+                content_changed: true,
+                layout_changed: true,
+                render_changed: true,
+                full_lowered: true,
+                patched_node_count: change.targets.len(),
+            });
+        }
+
+        let change = self
+            .document
+            .apply_verified_nonstructural_batch_in_place(batch)?;
+        let changed_nodes = change.targets.iter().cloned().collect::<BTreeSet<_>>();
+        self.indexes
+            .update_nonstructural_nodes(self.document.frame(), &changed_nodes)?;
+        self.content_revision = self.content_revision.saturating_add(1);
+
+        if !geometry_stable {
+            self.lower_all(columns)?;
+            return Ok(RetainedDocumentUpdate {
+                content_changed: true,
+                layout_changed: true,
+                render_changed: true,
+                full_lowered: true,
+                patched_node_count: changed_nodes.len(),
+            });
+        }
+
+        let mut translated = false;
+        for (root, previous, next) in scroll_changes {
+            let delta_x = previous.x - next.x;
+            let delta_y = previous.y - next.y;
+            let scrolled = apply_scroll_delta(
+                self.document.frame(),
+                &mut self.layout,
+                &root,
+                previous,
+                next,
+            );
+            if !scrolled.is_empty() && (delta_x != 0.0 || delta_y != 0.0) {
+                self.scene.apply_patch(&RenderScenePatch {
+                    operations: vec![RenderScenePatchOperation::TranslateNodeEntries {
+                        nodes: scrolled.into_iter().collect(),
+                        delta_x,
+                        delta_y,
+                    }],
+                })?;
+                translated = true;
+            }
+        }
+        refresh_scroll_demands(self.document.frame(), &mut self.layout);
+        self.refresh_display_nodes(&changed_nodes);
+        if hit_bounds_changed {
+            self.hits = self
+                .indexes
+                .try_hit_side_table(self.document.frame(), &self.layout)?;
+        } else if !hit_metadata_nodes.is_empty() {
+            self.hits.update_node_metadata(
+                self.document.frame(),
+                &self.indexes.hot_ids,
+                &self.indexes.typed_bindings,
+                &hit_metadata_nodes,
+            )?;
+        }
+        let rendered = self.replace_scene_nodes(&render_nodes, columns)? || translated;
+        self.retained_patch_count = self.retained_patch_count.saturating_add(1);
+        if rendered {
+            self.render_revision = self.render_revision.saturating_add(1);
+        }
+        Ok(RetainedDocumentUpdate {
+            content_changed: true,
+            layout_changed: false,
+            render_changed: rendered,
+            full_lowered: false,
+            patched_node_count: changed_nodes.len(),
+        })
+    }
+
+    pub fn set_interaction_state(
+        &mut self,
+        hovered: Option<DocumentNodeId>,
+        focused: Option<DocumentNodeId>,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<RetainedDocumentUpdate, PatchApplyError> {
+        if self.hovered == hovered && self.focused == focused {
+            return Ok(RetainedDocumentUpdate::default());
+        }
+        let mut changed = BTreeSet::new();
+        changed.extend(self.hovered.iter().cloned());
+        changed.extend(self.focused.iter().cloned());
+        changed.extend(hovered.iter().cloned());
+        changed.extend(focused.iter().cloned());
+        self.hovered = hovered;
+        self.focused = focused;
+        self.refresh_display_nodes(&changed);
+        let rendered = self.replace_scene_nodes(&changed, columns)?;
+        self.content_revision = self.content_revision.saturating_add(1);
+        self.retained_patch_count = self.retained_patch_count.saturating_add(1);
+        if rendered {
+            self.render_revision = self.render_revision.saturating_add(1);
+        }
+        Ok(RetainedDocumentUpdate {
+            content_changed: true,
+            layout_changed: false,
+            render_changed: rendered,
+            full_lowered: false,
+            patched_node_count: changed.len(),
+        })
+    }
+
+    fn lower_all(
+        &mut self,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<(), PatchApplyError> {
+        self.indexes = DocumentDerivedIndexBundle::from_frame(self.document.frame())?;
+        let (layout, hits, scene) =
+            lower_retained_document(self.document.frame(), &self.indexes, self.viewport, columns)?;
+        self.layout = layout;
+        self.hits = hits;
+        self.scene = scene;
+        let interaction_nodes = self
+            .hovered
+            .iter()
+            .chain(self.focused.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !interaction_nodes.is_empty() {
+            self.refresh_display_nodes(&interaction_nodes);
+            self.replace_scene_nodes(&interaction_nodes, columns)?;
+        }
+        self.layout_revision = self.layout_revision.saturating_add(1);
+        self.render_revision = self.render_revision.saturating_add(1);
+        self.full_lower_count = self.full_lower_count.saturating_add(1);
+        Ok(())
+    }
+
+    fn refresh_display_nodes(&mut self, changed: &BTreeSet<DocumentNodeId>) {
+        for item in &mut self.layout.display_list {
+            if !changed.contains(&item.node) {
+                continue;
+            }
+            let Some(node) = self.document.frame().nodes.get(&item.node) else {
+                continue;
+            };
+            let clip = item
+                .style
+                .iter()
+                .filter(|(key, _)| key.starts_with("__clip_"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<StyleMap>();
+            item.kind = node.kind.clone();
+            item.text = node.text.as_ref().map(|text| text.text.clone());
+            item.style = node.style.clone();
+            item.style.extend(clip);
+            item.focused = self.focused.as_ref() == Some(&item.node);
+            if self.hovered.as_ref() == Some(&item.node) {
+                item.style
+                    .insert("__hover".to_owned(), StyleValue::Bool(true));
+            }
+            if item.focused {
+                item.style
+                    .insert("__focused".to_owned(), StyleValue::Bool(true));
+            }
+            item.style_identity = ComputedStyleIdentity::from_style(&item.style);
+        }
+    }
+
+    fn replace_scene_nodes(
+        &mut self,
+        changed: &BTreeSet<DocumentNodeId>,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<bool, PatchApplyError> {
+        let visible = self
+            .layout
+            .display_list
+            .iter()
+            .filter(|item| changed.contains(&item.node))
+            .map(|item| item.node.clone())
+            .collect::<BTreeSet<_>>();
+        if visible.is_empty() {
+            return Ok(false);
+        }
+        let width = self.viewport.width.max(1.0).round() as u32;
+        let height = self.viewport.height.max(1.0).round() as u32;
+        let items = render_scene::render_scene_items_for_touched_nodes(
+            &self.layout,
+            width,
+            height,
+            &visible,
+        );
+        let visual_primitives = render_scene::render_visual_primitives_for_touched_nodes(
+            &self.layout,
+            width,
+            height,
+            columns,
+            &visible,
+        );
+        let mut text_runs = render_scene::render_text_runs_for_touched_nodes(
+            &self.layout,
+            width,
+            height,
+            columns,
+            &visible,
+        );
+        apply_direct_text_scroll(self.document.frame(), &self.layout, &mut text_runs);
+        self.scene.apply_patch(&RenderScenePatch {
+            operations: vec![RenderScenePatchOperation::ReplaceNodeEntries {
+                nodes: visible.into_iter().collect(),
+                items,
+                visual_primitives,
+                text_runs,
+            }],
+        })?;
+        self.scene.metrics.visible_source_item_count = self.scene.items.len() as u32;
+        self.scene.metrics.visual_primitive_count = self.scene.visual_primitives.len() as u32;
+        self.scene.metrics.rendered_rect_count = self.scene.visual_primitives.len() as u32;
+        Ok(true)
+    }
+}
+
+fn lower_retained_document(
+    document: &DocumentFrame,
+    indexes: &DocumentDerivedIndexBundle,
+    viewport: Viewport,
+    columns: &mut impl render_scene::RenderTextColumnMeasurer,
+) -> Result<(LayoutFrame, HitSideTable, RenderScene), PatchApplyError> {
+    let mut text = SimpleTextMeasurer;
+    let mut layout = indexes.try_layout(LayoutInput {
+        document,
+        viewport,
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    })?;
+    apply_all_scroll_offsets(document, &mut layout);
+    refresh_scroll_demands(document, &mut layout);
+    let hits = indexes.try_hit_side_table(document, &layout)?;
+    let width = viewport.width.max(1.0).round() as u32;
+    let height = viewport.height.max(1.0).round() as u32;
+    let mut scene = indexes.try_render_scene(&layout, width, height, columns)?;
+    apply_direct_text_scroll(document, &layout, &mut scene.text_runs);
+    Ok((layout, hits, scene))
+}
+
+fn apply_all_scroll_offsets(document: &DocumentFrame, layout: &mut LayoutFrame) {
+    for node in document.nodes.values() {
+        let Some(scroll) = node.scroll else {
+            continue;
+        };
+        if scroll.x == 0.0 && scroll.y == 0.0 {
+            continue;
+        }
+        shift_descendant_layout(document, layout, &node.id, -scroll.x, -scroll.y);
+    }
+}
+
+fn refresh_scroll_demands(document: &DocumentFrame, layout: &mut LayoutFrame) {
+    for demand in &mut layout.demands {
+        let Some(item_extent_milli) = demand.item_extent_milli else {
+            continue;
+        };
+        if item_extent_milli == 0 || demand.logical_item_count == 0 {
+            continue;
+        }
+        let offset = scroll_offset_for_demand(document, &demand.node, demand.axis);
+        let item_extent = item_extent_milli as f32 / 1_000.0;
+        let viewport_extent = demand.viewport_extent_milli as f32 / 1_000.0;
+        let start = (offset / item_extent).floor() as u64;
+        let visible_count = (viewport_extent / item_extent).ceil().max(1.0) as u64 + 1;
+        let start = start.min(demand.logical_item_count.saturating_sub(1));
+        let end = start
+            .saturating_add(visible_count)
+            .min(demand.logical_item_count);
+        let overscan_margin = demand
+            .overscan
+            .end
+            .saturating_sub(demand.visible.end)
+            .max(demand.visible.start.saturating_sub(demand.overscan.start))
+            .max(1);
+        demand.visible = start..end;
+        demand.overscan = start.saturating_sub(overscan_margin)
+            ..end
+                .saturating_add(overscan_margin)
+                .min(demand.logical_item_count);
+        demand.materialized_item_count = demand.overscan.end.saturating_sub(demand.overscan.start);
+        demand.first_stable_key = (demand.materialized_item_count > 0)
+            .then(|| format!("{}:{}", demand.stable_key_prefix, demand.overscan.start));
+        demand.last_stable_key = (demand.materialized_item_count > 0).then(|| {
+            format!(
+                "{}:{}",
+                demand.stable_key_prefix,
+                demand.overscan.end.saturating_sub(1)
+            )
+        });
+    }
+}
+
+fn scroll_offset_for_demand(document: &DocumentFrame, node: &DocumentNodeId, axis: Axis) -> f32 {
+    let mut current = Some(node.clone());
+    while let Some(id) = current.take() {
+        let Some(node) = document.nodes.get(&id) else {
+            break;
+        };
+        let supports_axis = node.kind == DocumentNodeKind::ScrollRoot
+            || style_bool(&node.style, "scroll") == Some(true)
+            || style_bool(&node.style, "scrollbars") == Some(true)
+            || match axis {
+                Axis::Horizontal => style_bool(&node.style, "scroll_x") == Some(true),
+                Axis::Vertical => style_bool(&node.style, "scroll_y") == Some(true),
+            };
+        if supports_axis {
+            let scroll = node
+                .scroll
+                .unwrap_or(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
+            return match axis {
+                Axis::Horizontal => scroll.x,
+                Axis::Vertical => scroll.y,
+            }
+            .max(0.0);
+        }
+        current.clone_from(&node.parent);
+    }
+    0.0
+}
+
+fn apply_scroll_delta(
+    document: &DocumentFrame,
+    layout: &mut LayoutFrame,
+    root: &DocumentNodeId,
+    previous: boon_document_model::ScrollState,
+    next: boon_document_model::ScrollState,
+) -> BTreeSet<DocumentNodeId> {
+    let descendants = document_descendants(document, root);
+    let delta_x = previous.x - next.x;
+    let delta_y = previous.y - next.y;
+    shift_layout_nodes(layout, &descendants, delta_x, delta_y);
+    descendants
+}
+
+fn shift_descendant_layout(
+    document: &DocumentFrame,
+    layout: &mut LayoutFrame,
+    root: &DocumentNodeId,
+    delta_x: f32,
+    delta_y: f32,
+) {
+    let descendants = document_descendants(document, root);
+    shift_layout_nodes(layout, &descendants, delta_x, delta_y);
+}
+
+fn shift_layout_nodes(
+    layout: &mut LayoutFrame,
+    nodes: &BTreeSet<DocumentNodeId>,
+    delta_x: f32,
+    delta_y: f32,
+) {
+    if delta_x == 0.0 && delta_y == 0.0 {
+        return;
+    }
+    for item in &mut layout.display_list {
+        if nodes.contains(&item.node) {
+            item.bounds.x += delta_x;
+            item.bounds.y += delta_y;
+        }
+    }
+    for hit in &mut layout.hit_regions {
+        if nodes.contains(&hit.node) {
+            hit.bounds.x += delta_x;
+            hit.bounds.y += delta_y;
+        }
+    }
+    for scroll in &mut layout.scroll_regions {
+        if nodes.contains(&scroll.node) {
+            scroll.bounds.x += delta_x;
+            scroll.bounds.y += delta_y;
+        }
+    }
+}
+
+fn document_descendants(
+    document: &DocumentFrame,
+    root: &DocumentNodeId,
+) -> BTreeSet<DocumentNodeId> {
+    let mut descendants = BTreeSet::new();
+    let mut pending = document
+        .nodes
+        .get(root)
+        .map(|node| node.children.clone())
+        .unwrap_or_default();
+    while let Some(id) = pending.pop() {
+        if !descendants.insert(id.clone()) {
+            continue;
+        }
+        if let Some(node) = document.nodes.get(&id) {
+            pending.extend(node.children.iter().cloned());
+        }
+    }
+    descendants
+}
+
+fn apply_direct_text_scroll(
+    document: &DocumentFrame,
+    layout: &LayoutFrame,
+    runs: &mut [RenderTextRun],
+) {
+    for run in runs {
+        let Some(node) = document.nodes.get(&run.node) else {
+            continue;
+        };
+        let Some(scroll) = node.scroll else {
+            continue;
+        };
+        let Some(bounds) = layout
+            .display_list
+            .iter()
+            .find(|item| item.node == run.node)
+            .map(|item| item.bounds)
+        else {
+            continue;
+        };
+        run.bounds.x -= scroll.x;
+        run.bounds.y -= scroll.y;
+        run.clip = run
+            .clip
+            .and_then(|clip| rect_intersection(clip, bounds))
+            .or(Some(bounds));
+    }
+}
+
+fn patch_preserves_layout_geometry(frame: &DocumentFrame, patch: &DocumentPatch) -> bool {
+    match patch {
+        DocumentPatch::SetBinding { .. } | DocumentPatch::SetBindingAt { .. } => true,
+        DocumentPatch::SetText { id, .. } => frame
+            .nodes
+            .get(id)
+            .is_some_and(node_has_stable_text_geometry),
+        DocumentPatch::SetStyle { patch, .. } => patch.keys().all(|key| {
+            !style_key_affects_layout(key)
+                && !style_key_affects_clip(key)
+                && !matches!(
+                    key.as_str(),
+                    "scroll" | "scroll_x" | "scroll_y" | "scrollbars"
+                )
+        }),
+        DocumentPatch::SetScroll { .. } => true,
+        DocumentPatch::SetListMaterialization { .. }
+        | DocumentPatch::UpsertNode(_)
+        | DocumentPatch::RemoveNode { .. }
+        | DocumentPatch::InsertChild { .. }
+        | DocumentPatch::RemoveChild { .. }
+        | DocumentPatch::MoveChild { .. } => false,
+    }
+}
+
+fn node_has_stable_text_geometry(node: &DocumentNode) -> bool {
+    node.style.contains_key("width") && node.style.contains_key("height")
+}
+
+fn patch_render_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
+    patches
+        .iter()
+        .filter_map(|patch| match patch {
+            DocumentPatch::SetText { id, .. } | DocumentPatch::SetStyle { id, .. } => {
+                Some(id.clone())
+            }
+            DocumentPatch::UpsertNode(_)
+            | DocumentPatch::RemoveNode { .. }
+            | DocumentPatch::InsertChild { .. }
+            | DocumentPatch::RemoveChild { .. }
+            | DocumentPatch::MoveChild { .. }
+            | DocumentPatch::SetBinding { .. }
+            | DocumentPatch::SetBindingAt { .. }
+            | DocumentPatch::SetScroll { .. }
+            | DocumentPatch::SetListMaterialization { .. } => None,
+        })
+        .collect()
+}
+
+fn patch_hit_metadata_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
+    patches
+        .iter()
+        .filter_map(|patch| match patch {
+            DocumentPatch::SetBinding { id, .. } | DocumentPatch::SetBindingAt { id, .. } => {
+                Some(id.clone())
+            }
+            DocumentPatch::SetStyle { id, patch }
+                if patch.keys().any(|key| hit_metadata_style_key(key)) =>
+            {
+                Some(id.clone())
+            }
+            DocumentPatch::SetText { .. }
+            | DocumentPatch::SetStyle { .. }
+            | DocumentPatch::SetScroll { .. }
+            | DocumentPatch::SetListMaterialization { .. }
+            | DocumentPatch::UpsertNode(_)
+            | DocumentPatch::RemoveNode { .. }
+            | DocumentPatch::InsertChild { .. }
+            | DocumentPatch::RemoveChild { .. }
+            | DocumentPatch::MoveChild { .. } => None,
+        })
+        .collect()
+}
+
+fn hit_metadata_style_key(key: &str) -> bool {
+    matches!(
+        key,
+        "row_key"
+            | "target_key"
+            | "__row_key"
+            | "row_generation"
+            | "target_generation"
+            | "generation"
+            | "__row_generation"
+    )
 }
 
 fn apply_ui_semantic_changes_unchecked(
@@ -2926,6 +3811,54 @@ fn document_patch_structural_kind(patch: &DocumentPatch) -> Option<&'static str>
         | DocumentPatch::SetScroll { .. }
         | DocumentPatch::SetListMaterialization { .. } => None,
     }
+}
+
+fn verify_nonstructural_patch(
+    frame: &DocumentFrame,
+    patch: &DocumentPatch,
+) -> Result<(), PatchApplyError> {
+    if let Some(patch_kind) = document_patch_structural_kind(patch) {
+        return Err(PatchApplyError::UnsupportedTrustedNonstructuralPatch { patch_kind });
+    }
+    let (patch_kind, id) = match patch {
+        DocumentPatch::SetText { id, .. } => ("set_text", id),
+        DocumentPatch::SetStyle { id, .. } => ("set_style", id),
+        DocumentPatch::SetBinding { id, .. } => ("set_binding", id),
+        DocumentPatch::SetBindingAt { id, ordinal, .. } => {
+            let node = frame
+                .nodes
+                .get(id)
+                .ok_or_else(|| PatchApplyError::MissingTarget {
+                    patch_kind: "set_binding_at",
+                    id: id.clone(),
+                })?;
+            if usize::try_from(*ordinal)
+                .ok()
+                .is_none_or(|ordinal| ordinal >= node.source_bindings.len())
+            {
+                return Err(PatchApplyError::StaleReference {
+                    reference_kind: "source_binding_at",
+                    id: id.clone(),
+                });
+            }
+            return Ok(());
+        }
+        DocumentPatch::SetScroll { id, .. } => ("set_scroll", id),
+        DocumentPatch::SetListMaterialization { id, .. } => ("set_list_materialization", id),
+        DocumentPatch::UpsertNode(_)
+        | DocumentPatch::RemoveNode { .. }
+        | DocumentPatch::InsertChild { .. }
+        | DocumentPatch::RemoveChild { .. }
+        | DocumentPatch::MoveChild { .. } => unreachable!("structural patch rejected above"),
+    };
+    frame
+        .nodes
+        .contains_key(id)
+        .then_some(())
+        .ok_or_else(|| PatchApplyError::MissingTarget {
+            patch_kind,
+            id: id.clone(),
+        })
 }
 
 fn apply_document_patch_unchecked(
@@ -3860,11 +4793,16 @@ impl LayoutBuilder<'_, '_> {
             "height",
             available_height,
         );
-        let style_identity = typed_record
+        let mut style_identity = typed_record
             .as_ref()
             .map(|record| record.identity)
             .unwrap_or_else(|| computed_style_identity(&node.style));
         let mut display_style = node.style.clone();
+        let focused = self.document.focus.as_ref() == Some(&node.id);
+        if focused {
+            display_style.insert("__focused".to_owned(), StyleValue::Bool(true));
+            style_identity = computed_style_identity(&display_style);
+        }
         if matches!(node.kind, DocumentNodeKind::TextInput)
             && !display_style.contains_key("placeholder")
             && let Some(placeholder) = layout_text(&node.style, typed_layout, "placeholder")
@@ -3896,7 +4834,7 @@ impl LayoutBuilder<'_, '_> {
             text,
             style_identity,
             style: display_style,
-            focused: self.document.focus.as_ref() == Some(&node.id),
+            focused,
         });
         let subtree_display_start = self.display_list.len();
         let subtree_hit_start = self.hit_regions.len();
@@ -4124,7 +5062,24 @@ impl LayoutBuilder<'_, '_> {
         }
         for range in &node.materialized {
             self.materialized_range_count += 1;
-            let report = materialization_report(&node, range);
+            let item_extent_milli = node.children.iter().find_map(|child| {
+                let item = self.display_list.iter().find(|item| &item.node == child)?;
+                extent_milli(match range.axis {
+                    Axis::Horizontal => item.bounds.width,
+                    Axis::Vertical => item.bounds.height,
+                })
+            });
+            let viewport_extent_milli = extent_milli(match range.axis {
+                Axis::Horizontal => rect.width,
+                Axis::Vertical => rect.height,
+            })
+            .unwrap_or_default();
+            let report = materialization_report_with_geometry(
+                &node,
+                range,
+                item_extent_milli,
+                viewport_extent_milli,
+            );
             self.scroll_regions.push(ScrollRegion {
                 id: format!("scroll:{}", node.id.0),
                 node: node.id.clone(),
@@ -4591,14 +5546,18 @@ pub fn fixture_frame_with_virtualized_table() -> DocumentFrame {
         text: "Virtualized logical table".to_owned(),
     });
     table.materialized.push(MaterializedRange {
+        materialization: Some(1),
         axis: Axis::Vertical,
         visible: 0..20,
         overscan: 0..28,
+        logical_item_count: 2_600,
     });
     table.materialized.push(MaterializedRange {
+        materialization: Some(2),
         axis: Axis::Horizontal,
         visible: 0..8,
         overscan: 0..12,
+        logical_item_count: 26,
     });
     if let Some(root) = frame.nodes.get_mut(&frame.root) {
         root.children.push(table.id.clone());
@@ -4989,12 +5948,23 @@ fn materialization_report(
     node: &DocumentNode,
     materialized: &MaterializedRange,
 ) -> MaterializationReport {
-    let logical_item_count = materialized
-        .overscan
-        .end
-        .max(materialized.visible.end)
-        .max(materialized.overscan.start)
-        .max(materialized.visible.start);
+    materialization_report_with_geometry(node, materialized, None, 0)
+}
+
+fn extent_milli(value: f32) -> Option<u32> {
+    (value.is_finite() && value > 0.0).then(|| {
+        (f64::from(value) * 1_000.0)
+            .round()
+            .clamp(1.0, f64::from(u32::MAX)) as u32
+    })
+}
+
+fn materialization_report_with_geometry(
+    node: &DocumentNode,
+    materialized: &MaterializedRange,
+    item_extent_milli: Option<u32>,
+    viewport_extent_milli: u32,
+) -> MaterializationReport {
     let materialized_item_count = materialized
         .overscan
         .end
@@ -5002,11 +5972,14 @@ fn materialization_report(
     let stable_key_prefix = stable_materialization_key_prefix(node, materialized.axis);
     MaterializationReport {
         node: node.id.clone(),
+        materialization: materialized.materialization,
         axis: materialized.axis,
         visible: materialized.visible.clone(),
         overscan: materialized.overscan.clone(),
-        logical_item_count,
+        logical_item_count: materialized.logical_item_count,
         materialized_item_count,
+        item_extent_milli,
+        viewport_extent_milli,
         first_stable_key: (materialized_item_count > 0)
             .then(|| format!("{}:{}", stable_key_prefix, materialized.overscan.start)),
         last_stable_key: (materialized_item_count > 0).then(|| {
@@ -5031,11 +6004,14 @@ fn stable_materialization_key_prefix(node: &DocumentNode, axis: Axis) -> String 
 fn demand_from_report(report: &MaterializationReport) -> LayoutDemand {
     LayoutDemand {
         node: report.node.clone(),
+        materialization: report.materialization,
         axis: report.axis,
         visible: report.visible.clone(),
         overscan: report.overscan.clone(),
         logical_item_count: report.logical_item_count,
         materialized_item_count: report.materialized_item_count,
+        item_extent_milli: report.item_extent_milli,
+        viewport_extent_milli: report.viewport_extent_milli,
         stable_key_prefix: report.stable_key_prefix.clone(),
         first_stable_key: report.first_stable_key.clone(),
         last_stable_key: report.last_stable_key.clone(),

@@ -217,38 +217,6 @@ pub struct SemanticIndexReuse {
     pub shared_tables: Vec<String>,
 }
 
-impl SemanticIndex {
-    pub fn report(&self) -> serde_json::Value {
-        serde_json::json!({
-            "present": true,
-            "version": self.version,
-            "computed_from": self.computed_from,
-            "parser_policy_phase": self.parser_policy_phase,
-            "reuse_key": self.reuse_key,
-            "source_unit_count": self.source_units.len(),
-            "source_count": self.sources.len(),
-            "list_count": self.lists.len(),
-            "row_scope_count": self.row_scopes.len(),
-            "function_count": self.functions.len(),
-            "field_count": self.fields.len(),
-            "view_binding_count": self.view_bindings.len(),
-            "diagnostic_span_count": self.diagnostic_spans.len(),
-            "symbol_count": self.symbols.len(),
-            "symbol_categories": semantic_symbol_category_counts(&self.symbols),
-            "readiness": &self.readiness,
-            "reuse": &self.reuse,
-        })
-    }
-}
-
-fn semantic_symbol_category_counts(symbols: &[SemanticSymbolEntry]) -> BTreeMap<&str, usize> {
-    let mut counts = BTreeMap::new();
-    for symbol in symbols {
-        *counts.entry(symbol.category.as_str()).or_insert(0) += 1;
-    }
-    counts
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExpressionCoverage {
     pub computed_from: String,
@@ -416,6 +384,7 @@ pub struct StateCell {
     pub scope_id: Option<ScopeId>,
     pub hold_name: String,
     pub initial_value: InitialValue,
+    pub initial_expr_id: Option<ExprId>,
     pub indexed: bool,
     pub source_line: usize,
 }
@@ -589,7 +558,7 @@ pub enum UpdateValueExpression {
         op: String,
         right: String,
     },
-    MatchNumberInfixConst {
+    MatchInfixConst {
         left: String,
         op: String,
         right: String,
@@ -768,7 +737,7 @@ pub enum UpdateExpression {
         input: String,
         arms: Vec<UpdateValueMatchArm>,
     },
-    MatchNumberInfixConst {
+    MatchInfixConst {
         left: String,
         op: String,
         right: String,
@@ -853,41 +822,33 @@ pub enum ViewBindingKind {
 }
 
 pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
-    Ok(lower_profiled(program)?.0)
+    lower_with_typecheck(program, true)
 }
 
-pub fn lower_profiled(
-    program: &ParsedProgram,
-) -> Result<(TypedProgram, serde_json::Value), String> {
-    lower_profiled_with_typecheck(program, true)
+pub fn lower_runtime(program: &ParsedProgram) -> Result<TypedProgram, String> {
+    lower_with_typecheck(program, false)
 }
 
-pub fn lower_runtime_profiled(
-    program: &ParsedProgram,
-) -> Result<(TypedProgram, serde_json::Value), String> {
-    lower_profiled_with_typecheck(program, false)
-}
-
-fn lower_profiled_with_typecheck(
+fn lower_with_typecheck(
     program: &ParsedProgram,
     include_type_hints: bool,
-) -> Result<(TypedProgram, serde_json::Value), String> {
+) -> Result<TypedProgram, String> {
     let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
     let trace_phase = |phase: &str, elapsed_ms: f64| {
         if trace_lower {
             eprintln!("boon_ir lower {phase}: {elapsed_ms:.3}ms");
         }
     };
-    let total_started = Instant::now();
     let typecheck_started = Instant::now();
     if trace_lower {
         eprintln!("boon_ir lower typecheck:start");
     }
-    let (typecheck_report, typecheck_profile) = if include_type_hints {
+    let typecheck_report = if include_type_hints {
         boon_typecheck::check_profiled(program)
     } else {
         boon_typecheck::check_runtime_profiled(program)
-    };
+    }
+    .0;
     let typecheck_ms = lower_elapsed_ms(typecheck_started);
     trace_phase("typecheck", typecheck_ms);
     if typecheck_report.has_errors() {
@@ -938,20 +899,24 @@ fn lower_profiled_with_typecheck(
         .state_cells
         .iter()
         .enumerate()
-        .map(|(id, cell)| StateCell {
-            id: StateId(id),
-            path: cell.path.clone(),
-            scope_id: scope_id_for_path(&row_scopes, &cell.path),
-            hold_name: cell.hold_name.clone(),
-            initial_value: fields
-                .iter()
-                .find(|field| field.path == cell.path)
-                .map(|field| field_initial_value(field, &row_scopes))
-                .unwrap_or_else(|| InitialValue::Unknown {
-                    summary: "missing initial value".to_owned(),
-                }),
-            indexed: cell.indexed,
-            source_line: cell.line,
+        .map(|(id, cell)| {
+            let field = fields.iter().find(|field| field.path == cell.path);
+            StateCell {
+                id: StateId(id),
+                path: cell.path.clone(),
+                scope_id: scope_id_for_path(&row_scopes, &cell.path),
+                hold_name: cell.hold_name.clone(),
+                initial_value: field
+                    .map(|field| field_initial_value(field, &row_scopes))
+                    .unwrap_or_else(|| InitialValue::Unknown {
+                        summary: "missing initial value".to_owned(),
+                    }),
+                initial_expr_id: field
+                    .and_then(field_initial_expr)
+                    .map(|expr| ExprId(expr.id)),
+                indexed: cell.indexed,
+                source_line: cell.line,
+            }
         })
         .collect::<Vec<_>>();
     let state_cells_ms = lower_elapsed_ms(state_cells_started);
@@ -1089,687 +1054,7 @@ fn lower_profiled_with_typecheck(
     verify_hidden_identity(&typed)?;
     let verify_hidden_ms = lower_elapsed_ms(verify_hidden_started);
     trace_phase("verify_hidden_identity", verify_hidden_ms);
-    let representation_analysis_started = Instant::now();
-    let representation_analysis = representation_analysis(program, &typed);
-    let representation_analysis_ms = lower_elapsed_ms(representation_analysis_started);
-    trace_phase("representation_analysis", representation_analysis_ms);
-    let profile = serde_json::json!({
-        "typecheck_ms": typecheck_ms,
-        "typecheck_profile": typecheck_profile,
-        "source_driven_nodes_ms": nodes_ms,
-        "typed_field_defs_ms": fields_ms,
-        "direct_source_refs_ms": direct_sources_ms,
-        "row_scopes_ms": row_scopes_ms,
-        "sources_ms": sources_ms,
-        "state_cells_ms": state_cells_ms,
-        "verify_combinational_field_cycles_ms": verify_cycles_ms,
-        "lists_ms": lists_ms,
-        "dependency_edges_ms": dependencies_ms,
-        "possible_causes_ms": possible_causes_ms,
-        "update_branches_ms": update_branches_ms,
-        "list_operations_ms": list_operations_ms,
-        "list_projections_ms": list_projections_ms,
-        "function_definitions_ms": functions_ms,
-        "output_values_ms": output_values_ms,
-        "derived_values_ms": derived_values_ms,
-        "view_bindings_ms": view_bindings_ms,
-        "expression_coverage_ms": expression_coverage_ms,
-        "semantic_index_ms": semantic_index_ms,
-        "verify_static_schedule_ms": verify_static_ms,
-        "verify_hidden_identity_ms": verify_hidden_ms,
-        "representation_analysis_ms": representation_analysis_ms,
-        "representation_analysis": representation_analysis,
-        "expression_count": typed.expression_count,
-        "graph_node_count": typed.graph_node_count,
-        "total_ms": lower_elapsed_ms(total_started)
-    });
-    Ok((typed, profile))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RepresentationExprClass {
-    LiteralConstant,
-    StaticComposite,
-    RowDependent,
-    SourceOrHoldDynamic,
-    RuntimeDynamic,
-    UnknownDynamic,
-}
-
-impl RepresentationExprClass {
-    fn label(self) -> &'static str {
-        match self {
-            Self::LiteralConstant => "literal_constant",
-            Self::StaticComposite => "static_composite",
-            Self::RowDependent => "row_dependent",
-            Self::SourceOrHoldDynamic => "source_or_hold_dynamic",
-            Self::RuntimeDynamic => "runtime_dynamic",
-            Self::UnknownDynamic => "unknown_dynamic",
-        }
-    }
-
-    fn is_static(self) -> bool {
-        matches!(self, Self::LiteralConstant | Self::StaticComposite)
-    }
-}
-
-fn representation_analysis(program: &ParsedProgram, typed: &TypedProgram) -> serde_json::Value {
-    let mut cache = vec![None; program.expressions.len()];
-    let row_scope_names = representation_row_binding_names(program);
-    let source_paths = program
-        .source_ports
-        .iter()
-        .map(|source| source.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let state_paths = program
-        .state_cells
-        .iter()
-        .map(|cell| cell.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let list_names = program
-        .list_memories
-        .iter()
-        .map(|list| list.name.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut expression_class_counts = BTreeMap::<&'static str, usize>::new();
-    let mut static_list_literal_count = 0usize;
-    let mut dynamic_list_literal_count = 0usize;
-    let mut list_literal_item_count = 0usize;
-    for expr in &program.expressions {
-        let class = representation_expr_class(
-            expr.id,
-            program,
-            &row_scope_names,
-            &source_paths,
-            &state_paths,
-            &list_names,
-            &mut cache,
-        );
-        *expression_class_counts.entry(class.label()).or_default() += 1;
-        if let AstExprKind::ListLiteral { items, .. } = &expr.kind {
-            list_literal_item_count = list_literal_item_count.saturating_add(items.len());
-            if class.is_static() {
-                static_list_literal_count = static_list_literal_count.saturating_add(1);
-            } else {
-                dynamic_list_literal_count = dynamic_list_literal_count.saturating_add(1);
-            }
-        }
-    }
-    let list_storage_mode_candidates = representation_list_storage_mode_candidates(typed);
-    let root_derived_samples = representation_root_derived_samples(
-        program,
-        typed,
-        &row_scope_names,
-        &source_paths,
-        &state_paths,
-        &list_names,
-        &mut cache,
-    );
-    serde_json::json!({
-        "version": 1,
-        "computed_from": "parser_ast_and_typed_ir",
-        "policy": "diagnostic_only_no_folding_or_storage_rewrite",
-        "expression_class_counts": expression_class_counts,
-        "list_literal_counts": {
-            "static": static_list_literal_count,
-            "dynamic": dynamic_list_literal_count,
-            "item_count": list_literal_item_count
-        },
-        "list_storage_mode_candidates": list_storage_mode_candidates,
-        "root_derived_samples": root_derived_samples,
-    })
-}
-
-fn representation_row_binding_names(program: &ParsedProgram) -> BTreeSet<String> {
-    let mut names = program
-        .row_scope_functions
-        .iter()
-        .map(|scope| scope.row_scope.clone())
-        .collect::<BTreeSet<_>>();
-    for expr in &program.expressions {
-        match &expr.kind {
-            AstExprKind::Pipe { op, args, .. } if representation_op_binds_row(op) => {
-                if let Some(name) = representation_positional_identifier_arg(program, args) {
-                    names.insert(name);
-                }
-            }
-            AstExprKind::Call { function, args } if representation_op_binds_row(function) => {
-                if let Some(name) = representation_positional_identifier_arg(program, args) {
-                    names.insert(name);
-                }
-            }
-            _ => {}
-        }
-    }
-    names
-}
-
-fn representation_op_binds_row(op: &str) -> bool {
-    matches!(
-        op,
-        "List/map"
-            | "List/retain"
-            | "List/remove"
-            | "List/every"
-            | "List/filter_text_contains"
-            | "List/filter_field_equal"
-            | "List/filter_field_not_equal"
-            | "List/move_field_first"
-            | "List/move_field_last"
-    )
-}
-
-fn representation_positional_identifier_arg(
-    program: &ParsedProgram,
-    args: &[AstCallArg],
-) -> Option<String> {
-    let value = args.iter().find(|arg| arg.name.is_none())?.value;
-    match program.expressions.get(value).map(|expr| &expr.kind) {
-        Some(AstExprKind::Identifier(name)) => Some(name.clone()),
-        _ => None,
-    }
-}
-
-fn representation_expr_class(
-    expr_id: usize,
-    program: &ParsedProgram,
-    row_scope_names: &BTreeSet<String>,
-    source_paths: &BTreeSet<&str>,
-    state_paths: &BTreeSet<&str>,
-    list_names: &BTreeSet<&str>,
-    cache: &mut [Option<RepresentationExprClass>],
-) -> RepresentationExprClass {
-    if let Some(class) = cache.get(expr_id).copied().flatten() {
-        return class;
-    }
-    let Some(expr) = program.expressions.iter().find(|expr| expr.id == expr_id) else {
-        return RepresentationExprClass::UnknownDynamic;
-    };
-    let class = match &expr.kind {
-        AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_) => RepresentationExprClass::LiteralConstant,
-        AstExprKind::Object(fields)
-        | AstExprKind::Record(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
-            representation_merge_child_classes(fields.iter().map(|field| {
-                representation_expr_class(
-                    field.value,
-                    program,
-                    row_scope_names,
-                    source_paths,
-                    state_paths,
-                    list_names,
-                    cache,
-                )
-            }))
-            .filter(
-                RepresentationExprClass::is_static,
-                RepresentationExprClass::StaticComposite,
-            )
-        }
-        AstExprKind::ListLiteral { items, .. } => {
-            representation_merge_child_classes(items.iter().map(|item| {
-                representation_expr_class(
-                    *item,
-                    program,
-                    row_scope_names,
-                    source_paths,
-                    state_paths,
-                    list_names,
-                    cache,
-                )
-            }))
-            .filter(
-                RepresentationExprClass::is_static,
-                RepresentationExprClass::StaticComposite,
-            )
-        }
-        AstExprKind::BytesLiteral { items, .. } => {
-            representation_merge_child_classes(items.iter().map(|item| {
-                representation_expr_class(
-                    *item,
-                    program,
-                    row_scope_names,
-                    source_paths,
-                    state_paths,
-                    list_names,
-                    cache,
-                )
-            }))
-            .filter(
-                RepresentationExprClass::is_static,
-                RepresentationExprClass::StaticComposite,
-            )
-        }
-        AstExprKind::Identifier(name) => representation_symbol_class(
-            name,
-            row_scope_names,
-            source_paths,
-            state_paths,
-            list_names,
-        ),
-        AstExprKind::Path(parts) => representation_symbol_class(
-            &parts.join("."),
-            row_scope_names,
-            source_paths,
-            state_paths,
-            list_names,
-        ),
-        AstExprKind::Source | AstExprKind::Hold { .. } => {
-            RepresentationExprClass::SourceOrHoldDynamic
-        }
-        AstExprKind::Pipe { input, op, args } => {
-            if op == "HOLD" {
-                RepresentationExprClass::SourceOrHoldDynamic
-            } else {
-                let input_class = representation_expr_class(
-                    *input,
-                    program,
-                    row_scope_names,
-                    source_paths,
-                    state_paths,
-                    list_names,
-                    cache,
-                );
-                let arg_class = representation_merge_child_classes(args.iter().map(|arg| {
-                    representation_expr_class(
-                        arg.value,
-                        program,
-                        row_scope_names,
-                        source_paths,
-                        state_paths,
-                        list_names,
-                        cache,
-                    )
-                }));
-                representation_merge_child_classes([input_class, arg_class])
-                    .promote_dynamic_default()
-            }
-        }
-        AstExprKind::Call { args, .. } => {
-            representation_merge_child_classes(args.iter().map(|arg| {
-                representation_expr_class(
-                    arg.value,
-                    program,
-                    row_scope_names,
-                    source_paths,
-                    state_paths,
-                    list_names,
-                    cache,
-                )
-            }))
-            .promote_dynamic_default()
-        }
-        AstExprKind::Infix { left, right, .. } => representation_merge_child_classes([
-            representation_expr_class(
-                *left,
-                program,
-                row_scope_names,
-                source_paths,
-                state_paths,
-                list_names,
-                cache,
-            ),
-            representation_expr_class(
-                *right,
-                program,
-                row_scope_names,
-                source_paths,
-                state_paths,
-                list_names,
-                cache,
-            ),
-        ])
-        .promote_dynamic_default(),
-        AstExprKind::When { .. } | AstExprKind::Then { .. } | AstExprKind::Latest => {
-            RepresentationExprClass::RuntimeDynamic
-        }
-        AstExprKind::MatchArm {
-            output: Some(output),
-            ..
-        } => representation_expr_class(
-            *output,
-            program,
-            row_scope_names,
-            source_paths,
-            state_paths,
-            list_names,
-            cache,
-        )
-        .promote_dynamic_default(),
-        AstExprKind::MatchArm { output: None, .. }
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => RepresentationExprClass::UnknownDynamic,
-    };
-    if let Some(slot) = cache.get_mut(expr_id) {
-        *slot = Some(class);
-    }
-    class
-}
-
-trait RepresentationClassExt {
-    fn filter(self, predicate: impl FnOnce(Self) -> bool, replacement: Self) -> Self
-    where
-        Self: Sized;
-    fn promote_dynamic_default(self) -> Self;
-}
-
-impl RepresentationClassExt for RepresentationExprClass {
-    fn filter(self, predicate: impl FnOnce(Self) -> bool, replacement: Self) -> Self {
-        if predicate(self) { replacement } else { self }
-    }
-
-    fn promote_dynamic_default(self) -> Self {
-        if self.is_static() {
-            RepresentationExprClass::RuntimeDynamic
-        } else {
-            self
-        }
-    }
-}
-
-fn representation_merge_child_classes(
-    classes: impl IntoIterator<Item = RepresentationExprClass>,
-) -> RepresentationExprClass {
-    let mut saw_static = false;
-    let mut saw_unknown = false;
-    let mut saw_runtime = false;
-    let mut saw_row = false;
-    let mut saw_source_or_hold = false;
-    for class in classes {
-        match class {
-            RepresentationExprClass::SourceOrHoldDynamic => {
-                saw_source_or_hold = true;
-            }
-            RepresentationExprClass::RowDependent => saw_row = true,
-            RepresentationExprClass::RuntimeDynamic => saw_runtime = true,
-            RepresentationExprClass::UnknownDynamic => saw_unknown = true,
-            RepresentationExprClass::LiteralConstant | RepresentationExprClass::StaticComposite => {
-                saw_static = true;
-            }
-        }
-    }
-    if saw_source_or_hold {
-        RepresentationExprClass::SourceOrHoldDynamic
-    } else if saw_row {
-        RepresentationExprClass::RowDependent
-    } else if saw_runtime {
-        RepresentationExprClass::RuntimeDynamic
-    } else if saw_unknown {
-        RepresentationExprClass::UnknownDynamic
-    } else if saw_static {
-        RepresentationExprClass::StaticComposite
-    } else {
-        RepresentationExprClass::LiteralConstant
-    }
-}
-
-fn representation_symbol_class(
-    name: &str,
-    row_scope_names: &BTreeSet<String>,
-    source_paths: &BTreeSet<&str>,
-    state_paths: &BTreeSet<&str>,
-    list_names: &BTreeSet<&str>,
-) -> RepresentationExprClass {
-    if row_scope_names.iter().any(|scope| {
-        name == scope.as_str()
-            || name
-                .strip_prefix(scope.as_str())
-                .is_some_and(|suffix| suffix.starts_with('.'))
-    }) {
-        return RepresentationExprClass::RowDependent;
-    }
-    if source_paths.contains(name) || state_paths.contains(name) || list_names.contains(name) {
-        return RepresentationExprClass::RuntimeDynamic;
-    }
-    if name == "SOURCE" || name == "HOLD" || name.contains(".event.") {
-        return RepresentationExprClass::SourceOrHoldDynamic;
-    }
-    RepresentationExprClass::UnknownDynamic
-}
-
-fn representation_list_storage_mode_candidates(
-    typed: &TypedProgram,
-) -> BTreeMap<&'static str, usize> {
-    let mut counts = BTreeMap::<&'static str, usize>::new();
-    for list in &typed.lists {
-        let mode = match &list.initializer {
-            ListInitializer::RecordLiteral { rows } => {
-                if list_initializer_has_dynamic_fields(rows) {
-                    "dense_vec_dynamic_initializer"
-                } else {
-                    "constant_array_literal"
-                }
-            }
-            ListInitializer::Range { .. } => "virtual_range",
-            ListInitializer::Empty => "dense_vec_empty",
-            ListInitializer::Unknown { .. } => "unknown_initializer",
-        };
-        *counts.entry(mode).or_default() += 1;
-    }
-    for value in typed
-        .derived_values
-        .iter()
-        .filter(|value| matches!(value.kind, DerivedValueKind::ListView))
-    {
-        for mode in representation_list_view_mode_hints(&value.statement, &typed.expressions) {
-            *counts.entry(mode).or_default() += 1;
-        }
-    }
-    counts
-}
-
-fn representation_root_derived_samples(
-    program: &ParsedProgram,
-    typed: &TypedProgram,
-    row_scope_names: &BTreeSet<String>,
-    source_paths: &BTreeSet<&str>,
-    state_paths: &BTreeSet<&str>,
-    list_names: &BTreeSet<&str>,
-    cache: &mut [Option<RepresentationExprClass>],
-) -> Vec<serde_json::Value> {
-    typed
-        .derived_values
-        .iter()
-        .filter(|value| !value.indexed && value.scope_id.is_none())
-        .take(64)
-        .map(|value| {
-            let class = representation_statement_class(
-                &value.statement,
-                program,
-                row_scope_names,
-                source_paths,
-                state_paths,
-                list_names,
-                cache,
-            );
-            serde_json::json!({
-                "path": value.path,
-                "line": value.statement.line,
-                "kind": derived_value_kind_label_ir(&value.kind),
-                "class": class.label(),
-                "list_storage_hints": if matches!(value.kind, DerivedValueKind::ListView) {
-                    representation_list_view_mode_hints(&value.statement, &typed.expressions)
-                } else {
-                    Vec::new()
-                }
-            })
-        })
-        .collect()
-}
-
-fn representation_statement_class(
-    statement: &AstStatement,
-    program: &ParsedProgram,
-    row_scope_names: &BTreeSet<String>,
-    source_paths: &BTreeSet<&str>,
-    state_paths: &BTreeSet<&str>,
-    list_names: &BTreeSet<&str>,
-    cache: &mut [Option<RepresentationExprClass>],
-) -> RepresentationExprClass {
-    let ids = representation_statement_expr_ids(statement, &program.expressions);
-    representation_merge_child_classes(ids.into_iter().map(|expr_id| {
-        representation_expr_class(
-            expr_id,
-            program,
-            row_scope_names,
-            source_paths,
-            state_paths,
-            list_names,
-            cache,
-        )
-    }))
-}
-
-fn representation_statement_expr_ids(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-) -> Vec<usize> {
-    let mut ids = Vec::new();
-    representation_collect_statement_expr_ids(statement, expressions, &mut ids);
-    ids
-}
-
-fn representation_collect_statement_expr_ids(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    ids: &mut Vec<usize>,
-) {
-    if let Some(expr_id) = statement.expr {
-        representation_push_expr_id(expr_id, expressions, ids);
-    }
-    for child in &statement.children {
-        representation_collect_statement_expr_ids(child, expressions, ids);
-    }
-}
-
-fn representation_push_expr_id(expr_id: usize, expressions: &[AstExpr], ids: &mut Vec<usize>) {
-    if !ids.contains(&expr_id) {
-        ids.push(expr_id);
-    }
-    let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
-        return;
-    };
-    match &expr.kind {
-        AstExprKind::Call { args, .. } => {
-            for arg in args {
-                representation_push_expr_id(arg.value, expressions, ids);
-            }
-        }
-        AstExprKind::Pipe { input, args, .. } => {
-            representation_push_expr_id(*input, expressions, ids);
-            for arg in args {
-                representation_push_expr_id(arg.value, expressions, ids);
-            }
-        }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
-            representation_push_expr_id(*initial, expressions, ids);
-        }
-        AstExprKind::Then { input, output } => {
-            representation_push_expr_id(*input, expressions, ids);
-            if let Some(output) = output {
-                representation_push_expr_id(*output, expressions, ids);
-            }
-        }
-        AstExprKind::MatchArm {
-            output: Some(output),
-            ..
-        } => representation_push_expr_id(*output, expressions, ids),
-        AstExprKind::Infix { left, right, .. } => {
-            representation_push_expr_id(*left, expressions, ids);
-            representation_push_expr_id(*right, expressions, ids);
-        }
-        AstExprKind::Record(fields)
-        | AstExprKind::Object(fields)
-        | AstExprKind::TaggedObject { fields, .. } => {
-            for field in fields {
-                representation_push_expr_id(field.value, expressions, ids);
-            }
-        }
-        AstExprKind::ListLiteral { items, .. } => {
-            for item in items {
-                representation_push_expr_id(*item, expressions, ids);
-            }
-        }
-        AstExprKind::BytesLiteral { items, .. } => {
-            for item in items {
-                representation_push_expr_id(*item, expressions, ids);
-            }
-        }
-        AstExprKind::Identifier(_)
-        | AstExprKind::Path(_)
-        | AstExprKind::StringLiteral(_)
-        | AstExprKind::TextLiteral(_)
-        | AstExprKind::ByteLiteral { .. }
-        | AstExprKind::Number(_)
-        | AstExprKind::Bool(_)
-        | AstExprKind::Enum(_)
-        | AstExprKind::Tag(_)
-        | AstExprKind::Source
-        | AstExprKind::Latest
-        | AstExprKind::MatchArm { output: None, .. }
-        | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => {}
-    }
-}
-
-fn representation_list_view_mode_hints(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-) -> Vec<&'static str> {
-    let mut hints = BTreeSet::new();
-    for expr_id in representation_statement_expr_ids(statement, expressions) {
-        let Some(expr) = expressions.iter().find(|expr| expr.id == expr_id) else {
-            continue;
-        };
-        match &expr.kind {
-            AstExprKind::Pipe { op, .. } | AstExprKind::Call { function: op, .. } => {
-                match op.as_str() {
-                    "List/map" => {
-                        hints.insert("incremental_projection");
-                    }
-                    "List/retain"
-                    | "List/filter_text_contains"
-                    | "List/filter_field_equal"
-                    | "List/filter_field_not_equal"
-                    | "List/move_field_first"
-                    | "List/move_field_last" => {
-                        hints.insert("selection_view");
-                    }
-                    "List/chunk" => {
-                        hints.insert("page_or_chunk_view");
-                    }
-                    "List/range" => {
-                        hints.insert("virtual_range");
-                    }
-                    _ => {}
-                }
-            }
-            AstExprKind::ListLiteral { .. } => {
-                hints.insert("constant_or_dense_literal");
-            }
-            _ => {}
-        }
-    }
-    if hints.is_empty() {
-        hints.insert("dense_vec_materialized");
-    }
-    hints.into_iter().collect()
-}
-
-fn derived_value_kind_label_ir(kind: &DerivedValueKind) -> &'static str {
-    match kind {
-        DerivedValueKind::SourceEventTransform => "source_event_transform",
-        DerivedValueKind::ListView => "list_view",
-        DerivedValueKind::Aggregate => "aggregate",
-        DerivedValueKind::Pure => "pure",
-        DerivedValueKind::Unknown => "unknown",
-    }
+    Ok(typed)
 }
 
 fn semantic_index(
@@ -4811,6 +4096,18 @@ fn canonical_view_source_path<'a>(
     let mut matches = source_paths
         .iter()
         .filter(|(source_path, _)| source_path.ends_with(&suffix));
+    if let Some(first) = matches.next()
+        && matches.next().is_none()
+    {
+        return Some((first.0, first.1));
+    }
+
+    let source_suffix = normalized_value
+        .find(".sources.")
+        .map(|offset| &normalized_value[offset..])?;
+    let mut matches = source_paths
+        .iter()
+        .filter(|(source_path, _)| source_path.ends_with(source_suffix));
     let first = matches.next()?;
     matches.next().is_none().then_some((first.0, first.1))
 }
@@ -5259,7 +4556,7 @@ fn verify_scheduled_update_expression(
             }
             Ok(())
         }
-        UpdateExpression::MatchNumberInfixConst {
+        UpdateExpression::MatchInfixConst {
             left,
             op,
             right,
@@ -5487,7 +4784,7 @@ fn verify_update_value_expression(
             }
             Ok(())
         }
-        UpdateValueExpression::MatchNumberInfixConst {
+        UpdateValueExpression::MatchInfixConst {
             left,
             op,
             right,
@@ -5941,7 +5238,7 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             reject_hidden_identity_identifier("project time viewport_end", viewport_end)?;
             reject_hidden_identity_identifier("project time fallback", fallback)
         }
-        UpdateExpression::MatchNumberInfixConst {
+        UpdateExpression::MatchInfixConst {
             left, right, arms, ..
         } => {
             reject_hidden_identity_identifier("match number infix left", left)?;
@@ -6021,7 +5318,7 @@ fn reject_update_value_expression_identity(value: &UpdateValueExpression) -> Res
             reject_hidden_identity_identifier("match output number infix left", left)?;
             reject_hidden_identity_identifier("match output number infix right", right)
         }
-        UpdateValueExpression::MatchNumberInfixConst {
+        UpdateValueExpression::MatchInfixConst {
             left, right, arms, ..
         } => {
             reject_hidden_identity_identifier("match output match number infix left", left)?;
@@ -6123,29 +5420,6 @@ fn hidden_identity_token(value: &str) -> Option<&'static str> {
             .iter()
             .copied()
             .find(|forbidden| token == *forbidden)
-    })
-}
-
-pub fn debug_tables(program: &TypedProgram) -> serde_json::Value {
-    serde_json::json!({
-        "semantic_index": program.semantic_index,
-        "semantic_index_report": program.semantic_index.report(),
-        "expression_coverage": program.expression_coverage,
-        "row_scopes": program.row_scopes,
-        "sources": program.sources,
-        "state_cells": program.state_cells,
-        "lists": program.lists,
-        "derived_values": program.derived_values,
-        "dependencies": program.dependencies,
-        "possible_causes": program.possible_causes,
-        "update_branches": program.update_branches,
-        "list_operations": program.list_operations,
-        "list_projections": program.list_projections,
-        "functions": program.functions,
-        "view_bindings": program.view_bindings,
-        "typecheck_report": program.typecheck_report,
-        "render_slot_table": program.typecheck_report.render_slot_table,
-        "list_map_bindings": program.typecheck_report.list_map_bindings,
     })
 }
 
@@ -6686,11 +5960,13 @@ fn list_operations(
             let canonical_row_scope = row_scope_for_list(program, &list);
             let row_scope = ast_call_argument(field, "List/retain")
                 .or_else(|| canonical_row_scope.map(str::to_owned));
-            if field_is_derived_list_memory_view(field, program) {
-                continue;
-            }
             let retain_predicate =
                 list_retain_predicate(field, row_scope.as_deref(), canonical_row_scope);
+            if field_is_derived_list_memory_view(field, program)
+                && matches!(retain_predicate, ListPredicate::Unknown { .. })
+            {
+                continue;
+            }
             for source in
                 retain_remove_sources(field, program, row_scope.as_deref(), canonical_row_scope)
             {
@@ -7308,18 +6584,7 @@ fn list_scalar_reducer_operator(operator: &str) -> bool {
 }
 
 fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValue {
-    let initial_expr = if let Some(initial) =
-        field.ast_exprs.iter().find_map(|expr| match expr.kind {
-            AstExprKind::Hold { initial, .. } => Some(initial),
-            AstExprKind::Pipe { input, ref op, .. } if op == "HOLD" => Some(input),
-            _ => None,
-        }) {
-        field.ast_exprs.iter().find(|expr| expr.id == initial)
-    } else {
-        field.ast_exprs.iter().find(|expr| {
-            !matches!(expr.kind, AstExprKind::Latest) && !ast_expr_is_block_marker(expr)
-        })
-    };
+    let initial_expr = field_initial_expr(field);
     let Some(expr) = initial_expr else {
         return InitialValue::Unknown {
             summary: "missing initial value".to_owned(),
@@ -7330,6 +6595,20 @@ fn field_initial_value(field: &FieldDef, row_scopes: &[RowScope]) -> InitialValu
         .find(|scope| field.path.starts_with(&format!("{}.", scope.row_scope)))
         .map(|scope| scope.row_scope.as_str());
     ast_initial_value(expr, &field.ast_exprs, row_scopes, current_row_scope)
+}
+
+fn field_initial_expr(field: &FieldDef) -> Option<&AstExpr> {
+    if let Some(initial) = field.ast_exprs.iter().find_map(|expr| match expr.kind {
+        AstExprKind::Hold { initial, .. } => Some(initial),
+        AstExprKind::Pipe { input, ref op, .. } if op == "HOLD" => Some(input),
+        _ => None,
+    }) {
+        field.ast_exprs.iter().find(|expr| expr.id == initial)
+    } else {
+        field.ast_exprs.iter().find(|expr| {
+            !matches!(expr.kind, AstExprKind::Latest) && !ast_expr_is_block_marker(expr)
+        })
+    }
 }
 
 fn ast_expr_is_block_marker(expr: &AstExpr) -> bool {
@@ -10004,7 +9283,7 @@ fn guarded_function_match_update_expression_from_expr(
     if let Some(input_expr) = field_expr(field, input)
         && let AstExprKind::Infix { left, op, right } = &input_expr.kind
     {
-        return Some(UpdateExpression::MatchNumberInfixConst {
+        return Some(UpdateExpression::MatchInfixConst {
             left: scalar_update_operand_for_source(field, target, fields, *left, source)?,
             op: op.clone(),
             right: scalar_update_operand_for_source(field, target, fields, *right, source)?,
@@ -10540,7 +9819,7 @@ fn match_const_update_expression_from_expr(
     let expr = field_expr(field, expr_id)?;
     match &expr.kind {
         AstExprKind::When { input } => {
-            if let Some(expression) = match_number_infix_const_update_expression_from_input(
+            if let Some(expression) = match_infix_const_update_expression_from_input(
                 field, target, fields, *input, expr.id, source,
             ) {
                 return Some(expression);
@@ -10598,7 +9877,7 @@ fn match_text_is_empty_const_update_expression_from_input(
     (!arms.is_empty()).then_some(UpdateExpression::MatchValueConst { input, arms })
 }
 
-fn match_number_infix_const_update_expression_from_input(
+fn match_infix_const_update_expression_from_input(
     field: &FieldDef,
     target: &str,
     fields: &[FieldDef],
@@ -10613,7 +9892,7 @@ fn match_number_infix_const_update_expression_from_input(
     let left = scalar_number_operand(field, *left, target)?;
     let right = scalar_number_operand(field, *right, target)?;
     let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
-    (!arms.is_empty()).then_some(UpdateExpression::MatchNumberInfixConst {
+    (!arms.is_empty()).then_some(UpdateExpression::MatchInfixConst {
         left,
         op: op.clone(),
         right,
@@ -10945,9 +10224,9 @@ fn update_value_expression_from_expr(
         return Some(UpdateValueExpression::Const { value });
     }
     if let AstExprKind::When { input } = expr.kind {
-        if let Some(expression) = update_value_match_number_infix_from_input(
-            field, target, fields, input, expr.id, source,
-        ) {
+        if let Some(expression) =
+            update_value_match_infix_from_input(field, target, fields, input, expr.id, source)
+        {
             return Some(expression);
         }
         let raw_input = ast_argument_value(field, input)?;
@@ -10974,7 +10253,7 @@ fn update_value_expression_from_expr(
     })
 }
 
-fn update_value_match_number_infix_from_input(
+fn update_value_match_infix_from_input(
     field: &FieldDef,
     target: &str,
     fields: &[FieldDef],
@@ -10989,7 +10268,7 @@ fn update_value_match_number_infix_from_input(
     let left = scalar_number_operand(field, *left, target)?;
     let right = scalar_number_operand(field, *right, target)?;
     let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
-    (!arms.is_empty()).then_some(UpdateValueExpression::MatchNumberInfixConst {
+    (!arms.is_empty()).then_some(UpdateValueExpression::MatchInfixConst {
         left,
         op: op.clone(),
         right,

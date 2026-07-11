@@ -62,9 +62,10 @@ FUNCTION app_shell() {
         ]
         items: LIST {
             header()
-            PASSED.store.waveform_status == Loading |> WHEN {
-                True => loading_state()
-                False => loaded_app()
+            PASSED.store.waveform_status |> WHEN {
+                Loading => loading_state()
+                Empty => empty_state()
+                __ => loaded_app()
             }
         }
     )

@@ -6,18 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-bitvec.workspace = true
-boon_bridge.workspace = true
 boon_compiler.workspace = true
+boon_document_model.workspace = true
 boon_plan.workspace = true
 boon_plan_executor.workspace = true
-boon_report_schema.workspace = true
-bytes.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
-smallvec.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-boon_ir.workspace = true
+boon_document.workspace = true

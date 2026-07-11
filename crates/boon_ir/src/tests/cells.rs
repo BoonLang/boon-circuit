@@ -345,12 +345,20 @@ fn todomvc_lowering_is_static_and_keyed() {
             && operation.kind
                 == ListOperationKind::Append {
                     trigger: "store.title_to_add".to_owned(),
-                    fields: vec![ListAppendField {
-                        name: "title".to_owned(),
-                        value: ListAppendFieldValue::Source {
-                            path: "store.title_to_add".to_owned(),
+                    fields: vec![
+                        ListAppendField {
+                            name: "title".to_owned(),
+                            value: ListAppendFieldValue::Source {
+                                path: "store.title_to_add".to_owned(),
+                            },
                         },
-                    }],
+                        ListAppendField {
+                            name: "completed".to_owned(),
+                            value: ListAppendFieldValue::Const {
+                                value: "False".to_owned(),
+                            },
+                        },
+                    ],
                 }
     }));
     assert!(ir.list_operations.iter().any(|operation| {
@@ -570,5 +578,4 @@ fn cause_tables_derive_row_scope_from_list_map_function() {
                 .contains(&"todo.sources.todo_checkbox.click".to_owned())
     }));
 }
-
 

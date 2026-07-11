@@ -57,7 +57,7 @@ store: [
             [title: TEXT { Buy groceries }, completed: False]
         }
         |> List/append(item: title_to_add |> THEN {
-            [title: title_to_add]
+            [title: title_to_add, completed: False]
         })
         |> List/remove(todo, when:
             LATEST {
@@ -163,7 +163,7 @@ FUNCTION new_todo(todo, store) {
             }
 
         completed:
-            False |> HOLD completed {
+            todo.completed |> HOLD completed {
                 LATEST {
                     sources.todo_checkbox.events.click |> THEN {
                         completed |> Bool/not()

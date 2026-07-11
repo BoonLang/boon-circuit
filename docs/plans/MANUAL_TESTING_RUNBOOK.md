@@ -10,7 +10,7 @@ Refresh native evidence with the manifest-backed handoff commands from
 `docs/architecture/native_gpu_handoff_manifest.json`, then run:
 
 ```bash
-cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
+cargo xtask verify-all --check-existing --report target/reports/report-v2/verify-all.json
 ```
 
 The native GPU reports are the automated source of truth. They must use
@@ -32,14 +32,14 @@ the native gates have run. Use the native two-window playground:
 
 ```bash
 cargo build --release -p boon_native_playground
-cosmic-background-launch --workspace boon-circuit -- ./target/release/boon_native_playground --role desktop --example todomvc
-cosmic-background-launch --workspace boon-circuit -- ./target/release/boon_native_playground --role desktop --example cells
+cosmic-background-launch --workspace boon-circuit --frame-pacing demand -- ./target/release/boon_native_playground --role desktop --example todomvc
 ```
 
-Stop matching old playground processes for the same example before launching a
-new one. The launch must create the production-style preview window and the
-dev/debug window. The preview receives Boon source, not example-specific render
-shortcuts.
+Stop the existing playground process tree before launching another one. Use the
+dev selector to switch from TodoMVC to Cells rather than starting a second
+desktop/preview/dev tree. The launch must create the production-style preview
+window and the dev/debug window. The preview receives Boon source, not
+example-specific render shortcuts.
 
 ## Human Follow-Up
 

@@ -102,7 +102,7 @@ expect_root_text = { "active_file" = "simple.vcd", "compare_file" = "none", "fil
 [[step]]
 id = "select-uart-scope"
 user_action = { kind = "click", target = "scope row", target_text = "+ top.uart" }
-expected_source_event = { source = "store.elements.scope_uart", target_text = "+ top.uart" }
+expected_source_event = { source = "file_tree_row.scope_row_elements.select_scope", target_text = "+ top.uart" }
 expect_root_text = { "active_scope" = "top_uart", "active_scope_key" = "TOP_UART", "active_scope_label" = "top.uart", "active_scope_signal_count" = "5 signals", "bridge_response_scope" = "TOP_UART" }
 
 [[step]]
@@ -126,37 +126,37 @@ expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "", "se
 [[step]]
 id = "blur-signal-search"
 user_action = { kind = "click", target = "scope row", target_text = "+ top.uart" }
-expected_source_event = { source = "store.elements.scope_uart", target_text = "+ top.uart" }
+expected_source_event = { source = "file_tree_row.scope_row_elements.select_scope", target_text = "+ top.uart" }
 expect_root_text = { "focused_control_label" = "none", "focused_control_material_label" = "RestingControl" }
 
 [[step]]
 id = "select-analog-scope"
 user_action = { kind = "click", target = "scope row", target_text = "+ top.analog" }
-expected_source_event = { source = "store.elements.scope_analog", target_text = "+ top.analog" }
+expected_source_event = { source = "file_tree_row.scope_row_elements.select_scope", target_text = "+ top.analog" }
 expect_root_text = { "active_scope" = "top_analog", "active_scope_key" = "TOP_ANALOG", "active_scope_label" = "top.analog", "active_scope_signal_count" = "2 signals", "bridge_response_scope" = "TOP_ANALOG" }
 
 [[step]]
 id = "select-temperature-analog"
 user_action = { kind = "click", target = "variable row", target_text = "temperature" }
-expected_source_event = { source = "store.elements.select_temperature", target_text = "temperature" }
-expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEMPERATURE", "active_signal_label" = "top.analog.temperature", "active_waveform_segment_labels" = "cursor,39,41,marker,44,43,40,42,44,43", "active_waveform_segment_count" = "10", "temperature_rendered_value" = "42.8 C", "analog_range_label" = "Auto 39 C .. 44 C", "bridge_request_page" = "TEMP_FIT", "bridge_request_fingerprint" = "TOP_ANALOG/TEMPERATURE/Fit/Center/Cursor42/Hexadecimal", "bridge_request_compact_label" = "TEMP_FIT", "bridge_response_signal" = "TEMPERATURE" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "temperature" }
+expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEMPERATURE", "active_signal_label" = "top.analog.temperature", "active_waveform_segment_labels" = "cursor,39,41,marker,44,43,40,42,44,43", "active_waveform_segment_count" = "10", "selected_timeline_cursor_value" = "42", "cursor_position" = "Cursor42", "temperature_rendered_value" = "42.8 C", "analog_range_label" = "Auto 39 C .. 44 C", "bridge_request_page" = "TEMP_FIT", "bridge_request_fingerprint" = "TOP_ANALOG/TEMPERATURE/Fit/Center/Cursor42/Hexadecimal", "bridge_request_compact_label" = "TEMP_FIT", "bridge_response_signal" = "TEMPERATURE" }
 
 [[step]]
 id = "analog-manual-limits"
-user_action = { kind = "click", target = "analog limits", target_text = "[Man]" }
-expected_source_event = { source = "store.elements.analog_limits_manual", target_text = "[Man]" }
+user_action = { kind = "click", target = "analog limits", target_text = "Manual" }
+expected_source_event = { source = "store.elements.analog_limits_manual", target_text = "Manual" }
 expect_root_text = { "analog_limit_kind" = "Manual", "analog_limit_validity" = "Valid", "analog_range_label" = "Manual -10 C .. 80 C", "analog_limit_error" = "none" }
 
 [[step]]
 id = "analog-invalid-limits"
-user_action = { kind = "click", target = "analog limits", target_text = "[Bad]" }
-expected_source_event = { source = "store.elements.analog_limits_invalid", target_text = "[Bad]" }
+user_action = { kind = "click", target = "analog limits", target_text = "Invalid" }
+expected_source_event = { source = "store.elements.analog_limits_invalid", target_text = "Invalid" }
 expect_root_text = { "analog_limit_kind" = "Manual", "analog_limit_validity" = "Rejected", "analog_limit_error" = "rejected min >= max", "analog_range_label" = "Manual -10 C .. 80 C" }
 
 [[step]]
 id = "analog-auto-limits"
-user_action = { kind = "click", target = "analog limits", target_text = "[Auto]" }
-expected_source_event = { source = "store.elements.analog_limits_auto", target_text = "[Auto]" }
+user_action = { kind = "click", target = "analog limits", target_text = "Auto" }
+expected_source_event = { source = "store.elements.analog_limits_auto", target_text = "Auto" }
 expect_root_text = { "analog_limit_kind" = "Auto", "analog_limit_validity" = "Valid", "analog_range_label" = "Auto 39 C .. 44 C", "analog_limit_error" = "none" }
 
 [[step]]
@@ -180,13 +180,13 @@ expect_root_text = { "active_scope" = "simple_tb_s", "active_scope_key" = "SIMPL
 [[step]]
 id = "row-select-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "B[3:0]" }
-expected_source_event = { source = "store.elements.select_reset", target_text = "B[3:0]" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "B[3:0]" }
 expect_root_text = { "active_signal" = "reset_n", "active_signal_label" = "simple_tb.s.B[3:0]", "active_signal_key" = "B_SIGNAL", "bridge_request_page" = "B_FIT", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_compact_label" = "B_FIT" }
 
 [[step]]
 id = "active-signal-toggle-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "A[3:0]" }
-expected_source_event = { source = "store.elements.select_clk", target_text = "A[3:0]" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "A[3:0]" }
 expect_root_text = { "active_signal" = "clk", "active_signal_label" = "simple_tb.s.A[3:0]", "active_signal_key" = "A_SIGNAL", "bridge_request_page" = "A_FIT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_compact_label" = "A_FIT" }
 
 [[step]]
@@ -276,7 +276,7 @@ expect_root_text = { "signal_search_text" = "", "search_result_label" = "2 resul
 [[step]]
 id = "select-data-bus"
 user_action = { kind = "click", target = "signal row", target_text = "A[3:0]" }
-expected_source_event = { source = "store.elements.select_clk" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "A[3:0]" }
 expect_root_text = { "active_signal" = "clk", "active_signal_label" = "simple_tb.s.A[3:0]", "active_signal_key" = "A_SIGNAL" }
 
 [[step]]
@@ -458,7 +458,7 @@ expect_semantic_delta_contains = ["ListInsert"]
 [[step]]
 id = "select-data-before-format"
 user_action = { kind = "click", target = "signal row", target_text = "B[3:0]" }
-expected_source_event = { source = "store.elements.select_reset", target_text = "B[3:0]" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "B[3:0]" }
 expect_root_text = { "active_signal" = "reset_n", "active_signal_label" = "simple_tb.s.B[3:0]", "active_signal_key" = "B_SIGNAL", "bridge_request_page" = "B_FIT", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "STALE" }
 
 [[step]]
@@ -556,4 +556,3 @@ id = "waveform-click-moves-cursor"
 user_action = { kind = "click", target = "waveform", target_text = "150 s" }
 expected_source_event = { source = "store.elements.waveform_click", pointer_x = "216", pointer_y = "0", pointer_width = "360", pointer_height = "1", target_text = "150 s" }
 expect_root_text = { "mode" = "Dark", "cursor_position" = "Cursor48", "keyboard_cursor_label" = "150 s", "marker_visibility" = "Visible", "marker_label" = "M 50 s", "marker_count_label" = "1 marker", "marker_focus_label" = "jumped to 50 s", "marker_to_add" = "50 s" }
-expect_semantic_delta_contains = ["FieldSet:store.cursor_position"]

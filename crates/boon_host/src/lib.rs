@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub use boon_document_model::{DocumentNodeId, Rect, SourceBindingId};
 
@@ -48,8 +49,10 @@ pub struct SurfaceResizeEvent {
 pub enum HostEvent {
     Keyboard(KeyEvent),
     TextInput(TextInputEvent),
+    Ime(ImeInputEvent),
     Pointer(PointerEvent),
     Wheel(WheelEvent),
+    Accessibility(AccessibilityInputEvent),
     Focus { surface: SurfaceId, focused: bool },
     CloseRequested { window: WindowId },
     Resize(SurfaceResizeEvent),
@@ -62,10 +65,39 @@ pub enum HostEventOrigin {
     Operator,
 }
 
+/// Saturating callback-to-host latency in nanoseconds.
+///
+/// This remains an eight-byte scalar in memory and serializes as a number, while
+/// preventing timing values with an unspecified unit from entering metrics.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(transparent)]
+#[serde(transparent)]
+pub struct CallbackToHostNs(u64);
+
+impl CallbackToHostNs {
+    pub const ZERO: Self = Self(0);
+    pub const MAX: Self = Self(u64::MAX);
+
+    pub fn saturating_from_duration(duration: Duration) -> Self {
+        Self(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<CallbackToHostNs> for u64 {
+    fn from(value: CallbackToHostNs) -> Self {
+        value.get()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostEventEnvelope {
     pub sequence: u64,
     pub origin: HostEventOrigin,
+    pub callback_to_host_ns: CallbackToHostNs,
     pub window: WindowId,
     pub surface: SurfaceId,
     pub surface_epoch: u64,
@@ -75,14 +107,65 @@ pub struct HostEventEnvelope {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeyEvent {
     pub surface: SurfaceId,
-    pub key: String,
+    pub physical_key: Option<String>,
+    pub logical_key: LogicalKey,
     pub pressed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum LogicalKey {
+    Character(String),
+    Named(String),
+    Dead(Option<char>),
+    Unidentified,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextInputEvent {
     pub surface: SurfaceId,
     pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImeInputEvent {
+    pub surface: SurfaceId,
+    pub kind: ImeInputKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImeInputKind {
+    Enabled,
+    Disabled,
+    Preedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    Commit {
+        text: String,
+    },
+    DeleteSurrounding {
+        before_bytes: u32,
+        after_bytes: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AccessibilityInputEvent {
+    pub surface: SurfaceId,
+    pub target: u64,
+    pub action: AccessibilityInputAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum AccessibilityInputAction {
+    Click,
+    Focus,
+    Increment,
+    Decrement,
+    Other(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -348,4 +431,22 @@ fn semantic_source_for_action(node: &SemanticNode, action: &SemanticAction) -> O
         SemanticAction::Decrement => intent == "decrement",
     };
     matches_action.then(|| node.source_path.clone()).flatten()
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn callback_latency_is_compact_and_saturating() {
+        assert_eq!(std::mem::size_of::<CallbackToHostNs>(), 8);
+        assert_eq!(
+            CallbackToHostNs::saturating_from_duration(Duration::from_nanos(27)).get(),
+            27
+        );
+        assert_eq!(
+            CallbackToHostNs::saturating_from_duration(Duration::from_secs(u64::MAX)),
+            CallbackToHostNs::MAX
+        );
+    }
 }

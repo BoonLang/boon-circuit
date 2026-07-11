@@ -39,8 +39,8 @@ only when a visible manual launch is explicitly needed:
 
 ```bash
 cargo build -p boon_native_playground
-cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_playground --role desktop --example todomvc
-cosmic-background-launch --workspace boon-circuit -- ./target/debug/boon_native_playground --role desktop --example cells
+cosmic-background-launch --workspace boon-circuit --frame-pacing demand -- ./target/debug/boon_native_playground --role desktop --example todomvc
+cosmic-background-launch --workspace boon-circuit --frame-pacing demand -- ./target/debug/boon_native_playground --role desktop --example cells
 ```
 
 After finishing native playground work that the user should manually test,
@@ -54,7 +54,7 @@ tree for that same example, then build and launch the current binary:
 pgrep -af 'boon_native_playground.*todo_mvc_physical'
 # Stop only the matching old desktop/preview/dev PIDs for the same example.
 cargo build --release -p boon_native_playground
-cosmic-background-launch --workspace boon-circuit -- ./target/release/boon_native_playground --role desktop --example todo_mvc_physical
+cosmic-background-launch --workspace boon-circuit --frame-pacing demand -- ./target/release/boon_native_playground --role desktop --example todo_mvc_physical
 ```
 
 The native desktop launch must create two native windows: a production-style
@@ -83,7 +83,7 @@ reports listed in `docs/architecture/native_gpu_handoff_manifest.json`, then run
 the manifest-backed aggregate:
 
 ```bash
-cargo xtask verify-native-gpu-all --check-existing --report target/reports/native-gpu-all.json
+cargo xtask verify-all --check-existing --report target/reports/report-v2/verify-all.json
 ```
 
 The manifest is the single source of truth for handoff report labels, paths,

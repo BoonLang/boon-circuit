@@ -15,9 +15,9 @@ fn derived_index_bundle_incrementally_updates_nonstructural_nodes() {
 
     let mut state = DocumentState::new("root");
     state.apply_patch(DocumentPatch::UpsertNode(alpha)).unwrap();
-    let previous_bundle = DocumentDerivedIndexBundle::from_frame(state.frame()).unwrap();
+    let mut incremental = DocumentDerivedIndexBundle::from_frame(state.frame()).unwrap();
     let alpha_node = DocumentNodeId("alpha".to_owned());
-    let alpha_hot = previous_bundle.hot_ids.hot_id(&alpha_node).unwrap();
+    let alpha_hot = incremental.hot_ids.hot_id(&alpha_node).unwrap();
 
     state
         .apply_batch(DocumentChangeBatch {
@@ -45,12 +45,9 @@ fn derived_index_bundle_incrementally_updates_nonstructural_nodes() {
         .unwrap();
 
     let changed_nodes = BTreeSet::from([alpha_node]);
-    let incremental = DocumentDerivedIndexBundle::from_previous_nonstructural_patch(
-        &previous_bundle,
-        state.frame(),
-        &changed_nodes,
-    )
-    .unwrap();
+    incremental
+        .update_nonstructural_nodes(state.frame(), &changed_nodes)
+        .unwrap();
     let full = DocumentDerivedIndexBundle::from_frame(state.frame()).unwrap();
     let after_route = DocumentTypedBindingRoute {
         source_path: "store.after".to_owned(),
@@ -109,6 +106,291 @@ fn derived_index_bundle_incrementally_updates_nonstructural_nodes() {
             .typed_bindings
             .refs_for_route(&before_route)
             .is_empty()
+    );
+}
+
+#[test]
+fn retained_document_patches_fixed_geometry_without_full_lowering() {
+    let mut label = node("label", DocumentNodeKind::Text, Some("root"));
+    label.text = Some(TextValue {
+        text: "before".to_owned(),
+    });
+    label
+        .style
+        .insert("width".to_owned(), StyleValue::Number(160.0));
+    label
+        .style
+        .insert("height".to_owned(), StyleValue::Number(32.0));
+    label
+        .style
+        .insert("color".to_owned(), StyleValue::Text("black".to_owned()));
+    let mut state = DocumentState::new("root");
+    state.apply_patch(DocumentPatch::UpsertNode(label)).unwrap();
+    let viewport = Viewport {
+        surface: 1,
+        width: 320.0,
+        height: 200.0,
+        scale: 1.0,
+    };
+    let mut columns = render_scene::ApproximateTextColumnMeasurer;
+    let mut retained =
+        RetainedDocument::new(state.into_frame(), viewport, &mut columns).unwrap();
+
+    let update = retained
+        .apply_patches(
+            vec![
+                DocumentPatch::SetText {
+                    id: DocumentNodeId("label".to_owned()),
+                    text: TextValue {
+                        text: "after".to_owned(),
+                    },
+                },
+                DocumentPatch::SetStyle {
+                    id: DocumentNodeId("label".to_owned()),
+                    patch: BTreeMap::from([(
+                        "color".to_owned(),
+                        Some(StyleValue::Text("blue".to_owned())),
+                    )]),
+                },
+            ],
+            &mut columns,
+        )
+        .unwrap();
+
+    assert!(!update.full_lowered);
+    assert!(!update.layout_changed);
+    assert!(update.render_changed);
+    assert_eq!(retained.stats().full_lower_count, 1);
+    assert_eq!(retained.stats().retained_patch_count, 1);
+    assert_eq!(retained.stats().layout_revision, 1);
+    assert_eq!(
+        retained.frame().nodes[&DocumentNodeId("label".to_owned())]
+            .text
+            .as_ref()
+            .unwrap()
+            .text,
+        "after"
+    );
+    assert!(retained.scene().text_runs.iter().any(|run| run.text == "after"));
+
+    let update = retained
+        .apply_patches(
+            vec![DocumentPatch::SetStyle {
+                id: DocumentNodeId("label".to_owned()),
+                patch: BTreeMap::from([(
+                    "width".to_owned(),
+                    Some(StyleValue::Number(200.0)),
+                )]),
+            }],
+            &mut columns,
+        )
+        .unwrap();
+    assert!(update.full_lowered);
+    assert!(update.layout_changed);
+    assert_eq!(retained.stats().full_lower_count, 2);
+}
+
+#[test]
+fn retained_document_updates_hit_metadata_without_rebuilding_layout() {
+    let mut button = node("button", DocumentNodeKind::Button, Some("root"));
+    button
+        .style
+        .insert("width".to_owned(), StyleValue::Number(120.0));
+    button
+        .style
+        .insert("height".to_owned(), StyleValue::Number(32.0));
+    button
+        .style
+        .insert("row_key".to_owned(), StyleValue::Number(1.0));
+    button.set_primary_source_binding(boon_document_model::SourceBinding {
+        id: SourceBindingId("button-binding".to_owned()),
+        source_path: "store.before".to_owned(),
+        intent: "click".to_owned(),
+    });
+    let mut state = DocumentState::new("root");
+    state
+        .apply_patch(DocumentPatch::UpsertNode(button))
+        .unwrap();
+    let viewport = Viewport {
+        surface: 1,
+        width: 320.0,
+        height: 200.0,
+        scale: 1.0,
+    };
+    let mut columns = render_scene::ApproximateTextColumnMeasurer;
+    let mut retained =
+        RetainedDocument::new(state.into_frame(), viewport, &mut columns).unwrap();
+
+    let update = retained
+        .apply_patches(
+            vec![
+                DocumentPatch::SetBindingAt {
+                    id: DocumentNodeId("button".to_owned()),
+                    ordinal: 0,
+                    binding: boon_document_model::SourceBinding {
+                        id: SourceBindingId("button-binding".to_owned()),
+                        source_path: "store.after".to_owned(),
+                        intent: "select".to_owned(),
+                    },
+                },
+                DocumentPatch::SetStyle {
+                    id: DocumentNodeId("button".to_owned()),
+                    patch: BTreeMap::from([(
+                        "row_key".to_owned(),
+                        Some(StyleValue::Number(2.0)),
+                    )]),
+                },
+            ],
+            &mut columns,
+        )
+        .unwrap();
+
+    assert!(!update.full_lowered);
+    assert!(!update.layout_changed);
+    let hit = retained
+        .hits()
+        .entries
+        .iter()
+        .find(|entry| entry.node.0 == "button")
+        .unwrap();
+    assert_eq!(hit.source_path.as_deref(), Some("store.after"));
+    assert_eq!(hit.source_intent.as_deref(), Some("select"));
+    assert_eq!(hit.row_key, Some(2));
+}
+
+#[test]
+fn retained_document_scrolls_descendants_without_full_lowering() {
+    let mut scroll = node("scroll", DocumentNodeKind::ScrollRoot, Some("root"));
+    scroll
+        .style
+        .insert("width".to_owned(), StyleValue::Number(200.0));
+    scroll
+        .style
+        .insert("height".to_owned(), StyleValue::Number(80.0));
+    scroll.scroll = Some(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
+    scroll.materialized.push(MaterializedRange {
+        materialization: Some(42),
+        axis: Axis::Vertical,
+        visible: 0..4,
+        overscan: 0..8,
+        logical_item_count: 100,
+    });
+    let mut child = node("child", DocumentNodeKind::Text, Some("scroll"));
+    child.text = Some(TextValue {
+        text: "scroll me".to_owned(),
+    });
+    child
+        .style
+        .insert("width".to_owned(), StyleValue::Number(180.0));
+    child
+        .style
+        .insert("height".to_owned(), StyleValue::Number(30.0));
+    let mut second = node("second", DocumentNodeKind::Text, Some("scroll"));
+    second.text = Some(TextValue {
+        text: "keep visible".to_owned(),
+    });
+    second
+        .style
+        .insert("width".to_owned(), StyleValue::Number(180.0));
+    second
+        .style
+        .insert("height".to_owned(), StyleValue::Number(30.0));
+    let mut state = DocumentState::new("root");
+    state
+        .apply_batch(DocumentChangeBatch {
+            patches: vec![
+                DocumentPatch::UpsertNode(scroll),
+                DocumentPatch::UpsertNode(child),
+                DocumentPatch::UpsertNode(second),
+            ],
+        })
+        .unwrap();
+    let viewport = Viewport {
+        surface: 1,
+        width: 320.0,
+        height: 200.0,
+        scale: 1.0,
+    };
+    let mut columns = render_scene::ApproximateTextColumnMeasurer;
+    let mut retained =
+        RetainedDocument::new(state.into_frame(), viewport, &mut columns).unwrap();
+    let before = retained
+        .scene()
+        .items
+        .iter()
+        .find(|item| item.node.0 == "second")
+        .unwrap()
+        .bounds
+        .y;
+
+    let update = retained
+        .apply_patches(
+            vec![DocumentPatch::SetScroll {
+                id: DocumentNodeId("scroll".to_owned()),
+                scroll: boon_document_model::ScrollState { x: 0.0, y: 30.0 },
+            }],
+            &mut columns,
+        )
+        .unwrap();
+    let after = retained
+        .scene()
+        .items
+        .iter()
+        .find(|item| item.node.0 == "second")
+        .unwrap()
+        .bounds
+        .y;
+
+    assert!(!update.full_lowered);
+    assert!(!update.layout_changed);
+    assert!(update.render_changed);
+    assert_eq!(retained.stats().full_lower_count, 1);
+    assert_eq!(after, before - 30.0);
+    let demand = retained
+        .demands()
+        .iter()
+        .find(|demand| demand.materialization == Some(42))
+        .unwrap();
+    assert_eq!(demand.visible.start, 1);
+    assert!(demand.visible.end >= 4);
+}
+
+#[test]
+fn verified_nonstructural_batch_preflights_before_mutation() {
+    let mut label = node("label", DocumentNodeKind::Text, Some("root"));
+    label.text = Some(TextValue {
+        text: "before".to_owned(),
+    });
+    let mut state = DocumentState::new("root");
+    state.apply_patch(DocumentPatch::UpsertNode(label)).unwrap();
+
+    let error = state
+        .apply_verified_nonstructural_batch_in_place(DocumentChangeBatch {
+            patches: vec![
+                DocumentPatch::SetText {
+                    id: DocumentNodeId("label".to_owned()),
+                    text: TextValue {
+                        text: "must not commit".to_owned(),
+                    },
+                },
+                DocumentPatch::SetText {
+                    id: DocumentNodeId("missing".to_owned()),
+                    text: TextValue {
+                        text: "invalid".to_owned(),
+                    },
+                },
+            ],
+        })
+        .unwrap_err();
+
+    assert!(matches!(error, PatchApplyError::MissingTarget { .. }));
+    assert_eq!(
+        state.frame().nodes[&DocumentNodeId("label".to_owned())]
+            .text
+            .as_ref()
+            .unwrap()
+            .text,
+        "before"
     );
 }
 
@@ -465,5 +747,3 @@ fn retained_layout_cache_reuses_paint_only_geometry_and_refreshes_layout_dirty_n
         180.0
     );
 }
-
-

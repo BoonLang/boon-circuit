@@ -124,9 +124,11 @@ fn typed_hit_side_table_carries_route_identity_and_bucket_index() {
         .style
         .insert("height".to_owned(), StyleValue::Number(120.0));
     scroll.materialized.push(MaterializedRange {
+        materialization: Some(1),
         axis: Axis::Vertical,
         visible: 0..4,
         overscan: 0..8,
+        logical_item_count: 8,
     });
     let mut button = node("row-button", DocumentNodeKind::Button, Some("scroll"));
     button

@@ -305,11 +305,30 @@ verify-negative
 verify-all
 ```
 
-The product gates launch a private Weston 13 server with the tracked
-`tools/native-wayland-test` module/driver. Input travels through real Wayland and
-the app_window callback. The server is correctness infrastructure; hardware
-adapter and product timings are observed from the app, not inferred from the
-compositor.
+The product gates launch the ordinary preview and dev windows through
+`cosmic-background-launch` in the named `boon-circuit` workspace. The launcher
+returns an opaque launch ID. Before input begins, its launch-scoped reconcile
+operation gathers every mapped descendant surface into that workspace without
+matching titles, app IDs, geometry, roles, or example names. The standard
+ext-workspace protocol activates the workspace, the public COSMIC workspace
+extension resets and enables tiling, and a bounded guard restores the previous
+workspace on exit or parent death.
+
+The verifier creates a kernel uinput mouse and keyboard. Mouse motion, buttons,
+wheel axes, key presses, and chords pass through the kernel, udev/libinput,
+COSMIC's real seat, Wayland, and the normal app_window callbacks. Scenarios use
+the same executable roles and host-event route as the product. There is no
+nested compositor, private input protocol, compositor toplevel selection,
+desktop scraping, or private runtime dispatch. `/dev/uinput` must be writable
+by the test user. Hardware adapter, product timings, exact frame identity, and
+pixels are observed from the app and app-owned WGPU readback, never inferred
+from the compositor.
+
+The system cursor is visible while the bounded workspace is active, as it is
+for human interaction. It is compositor-owned and therefore intentionally not
+part of app-owned WGPU readback. Cursor movement is proven by the originating
+uinput process plus the corresponding `RealOs` app_window callback; rendered
+application state is proven separately by exact-frame readback.
 
 Run fresh reports:
 

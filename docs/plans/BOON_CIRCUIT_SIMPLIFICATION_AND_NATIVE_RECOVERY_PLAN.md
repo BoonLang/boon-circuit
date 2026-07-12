@@ -39,19 +39,22 @@ patches: Counter 6 turns, TodoMVC 26, physical TodoMVC 22, Cells 28, and
 NovyWave 90. `cargo fmt --all -- --check`, `cargo check --workspace`, all 260
 workspace unit tests, and all doc tests pass.
 
-The latest private-Wayland diagnostic checkpoint proves the repaired Cells path with
-real app-window callbacks and exact-frame WGPU readback. Warm visible
-interaction is 5.7 ms p95. Retained scroll translation reduced warm scroll
-from 29.2 ms p95 to 14.1 ms p95 with a 16.1 ms maximum and zero outliers. The
-diagnostic report is not handoff evidence because PID 3221 is still running
-`/usr/bin/cosmic-comp (deleted)`. The demand-pacing changes are committed and
-pushed at `cbd1c3b9a19433ef7aa130af7892f2e45f6ecfe2`; the installed compositor
-reports that exact revision, and its SHA-256 matches the clean release artifact.
+The nested-compositor diagnostic path has been deleted. The replacement uses
+ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
+the normal app_window callback route, and app-owned exact-frame WGPU readback.
+The compositor fork now has a generic launch-scoped reconciliation operation so
+all descendant windows of one background launch are gathered and tiled without
+fixture, role, title, app-ID, or geometry matching. The matching compositor and
+launcher release binaries are installed, but the running compositor predates
+that operation. No refreshed native report is accepted until the COSMIC session
+loads the installed binary and the real Counter, Cells, wheel, keyboard, TEST,
+proof, and aggregate gates pass.
 
 The remaining completion work is explicit:
 
-1. restart the COSMIC session so the installed compositor exposes demand-paced
-   background launch, then refresh all six manifest reports and the aggregate;
+1. restart the COSMIC session so the installed compositor exposes launch-scoped
+   window reconciliation, then refresh all six manifest reports and the
+   aggregate;
 2. launch the release playground with demand pacing and obtain the required
    physical human confirmation.
 

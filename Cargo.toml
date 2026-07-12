@@ -54,6 +54,10 @@ glyphon = "=0.11.0"
 wgsl_bindgen = "=0.22.2"
 futures = "0.3"
 libc = "0.2"
+evdev = "0.13.2"
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.12", features = ["client", "staging"] }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086abe03cd34a8a375d7fbe47b24308d1f38", default-features = false, features = ["client"] }
 
 [profile.dev.package.boon_document]
 opt-level = 2

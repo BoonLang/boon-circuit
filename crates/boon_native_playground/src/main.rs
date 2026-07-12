@@ -4,6 +4,8 @@ mod desktop;
 mod dev;
 mod dev_state;
 mod frame;
+#[cfg(target_os = "linux")]
+mod native_input;
 mod observer;
 mod preview;
 mod proof;
@@ -12,6 +14,8 @@ mod runtime_view;
 mod ui;
 mod verify;
 mod view;
+#[cfg(target_os = "linux")]
+mod workspace_control;
 
 use std::path::PathBuf;
 
@@ -29,6 +33,10 @@ fn main() {
         "preview" => run_preview(&args),
         "dev" => run_dev(&args),
         "verify-v2" => verify::run(&args),
+        #[cfg(target_os = "linux")]
+        "native-input" => native_input::run_device_process(),
+        #[cfg(target_os = "linux")]
+        "workspace-control" => workspace_control::run_guard_process(&args),
         unknown => Err(format!("unknown native playground role `{unknown}`")),
     };
     if let Err(error) = result {

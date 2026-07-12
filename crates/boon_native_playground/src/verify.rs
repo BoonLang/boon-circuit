@@ -10,7 +10,7 @@ use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixListener;
 #[cfg(target_os = "linux")]
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
@@ -28,14 +28,12 @@ use crate::observer::{
     ObserverRole, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV, PROOF_SAMPLE_ORDINAL_ENV, ProofArtifact,
     RoleMetadata, read_event,
 };
+#[cfg(target_os = "linux")]
+use crate::{native_input::NativeInput, ui::DEV_EDITOR, workspace_control::WorkspaceGuard};
 
 const FORMAT_VERSION: u16 = 2;
 const PROTOCOL: &str = "boon-gate-evidence-v2";
 const MAX_DETAIL_BYTES: usize = 1_000;
-#[cfg(target_os = "linux")]
-const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(target_os = "linux")]
-const WESTON_READY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const ROLE_READY_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(target_os = "linux")]
@@ -45,13 +43,13 @@ const NORMAL_VISIBLE_SAMPLE_COUNT: usize = 120;
 #[cfg(target_os = "linux")]
 const INPUT_CALIBRATION_QUIET: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
-const DRIVER_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(target_os = "linux")]
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
 const MAX_OBSERVER_EVENTS: usize = 8_192;
 #[cfg(target_os = "linux")]
 const OBSERVER_QUEUE_DEPTH: usize = 8_192;
+#[cfg(target_os = "linux")]
+const NATIVE_WORKSPACE: &str = "boon-circuit";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let gate = Gate::parse(required(args, "--gate")?)?;
@@ -118,8 +116,8 @@ fn run_native_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvid
     {
         let _ = (gate, run_id, artifact_dir);
         GateEvidence::failed(Check::fail(
-            "private-wayland-harness",
-            "the tracked private-Weston real-input harness is available only on Linux",
+            "native-os-input-harness",
+            "the kernel virtual-input harness is available only on Linux",
         ))
     }
 }
@@ -143,38 +141,10 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
         Err(error) => {
             capture
                 .checks
-                .push(Check::fail("private-wayland-scratch", error));
+                .push(Check::fail("native-os-input-scratch", error));
             return capture.into_evidence(gate);
         }
     };
-
-    let build_script = workspace.join("tools/native-wayland-test/build.sh");
-    let build_log = scratch.path.join("tool-build.log");
-    let mut build = Command::new(&build_script);
-    build.current_dir(&workspace);
-    match run_logged(&mut build, &build_log, TOOL_TIMEOUT) {
-        Ok(result) if result.success() => capture.checks.push(Check::pass(
-            "private-wayland-tool",
-            format!(
-                "tracked Weston control module and driver built in {}ms",
-                result.elapsed.as_millis()
-            ),
-        )),
-        Ok(result) => {
-            capture.checks.push(Check::fail(
-                "private-wayland-tool",
-                process_failure("native Wayland tool build", &result, &build_log),
-            ));
-            return capture.into_evidence(gate);
-        }
-        Err(error) => {
-            capture.checks.push(Check::fail(
-                "private-wayland-tool",
-                format!("cannot run {}: {error}", build_script.display()),
-            ));
-            return capture.into_evidence(gate);
-        }
-    }
 
     let observer_path = scratch.path.join("observer.sock");
     let mut observer = match ObserverServer::bind(&observer_path) {
@@ -186,9 +156,6 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
             return capture.into_evidence(gate);
         }
     };
-    let tools = workspace.join("target/tools/native-wayland-test");
-    let module = tools.join("native-wayland-test-module.so");
-    let driver = tools.join("native-wayland-test-driver");
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
@@ -202,8 +169,6 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
     let mut session = match NativeSession::start(
         &workspace,
         &scratch.path,
-        &module,
-        &driver,
         &executable,
         gate.example_id(),
         &observer_path,
@@ -213,17 +178,17 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
         Err(error) => {
             capture
                 .checks
-                .push(Check::fail("private-wayland-server", error));
+                .push(Check::fail("native-os-input-session", error));
             return capture.into_evidence(gate);
         }
     };
     capture.checks.push(Check::pass(
-        "private-wayland-server",
-        "private Weston 13 compositor advertised weston_test v1",
+        "kernel-virtual-input",
+        "uinput pointer and keyboard devices were created for the real COSMIC seat",
     ));
     capture.checks.push(Check::pass(
-        "nested-hardware-wayland",
-        "nested Weston Wayland/GL launched through cosmic-background-launch",
+        "regular-cosmic-wayland",
+        "preview and dev were launched as ordinary windows in the named COSMIC workspace",
     ));
 
     let roles = match session.wait_for_roles(ROLE_READY_TIMEOUT) {
@@ -248,6 +213,18 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
         }
     };
 
+    if let Err(error) = session.activate_workspace(&executable) {
+        capture
+            .checks
+            .push(Check::fail("active-cosmic-workspace", error));
+        capture.checks.push(cleanup_check(session.shutdown()));
+        return capture.into_evidence(gate);
+    }
+    capture.checks.push(Check::pass(
+        "active-cosmic-workspace",
+        "the standard ext-workspace protocol activated the bounded test workspace and armed restoration",
+    ));
+
     let exercise = exercise_native_roles(
         gate,
         &mut session,
@@ -258,7 +235,7 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
     match exercise {
         Ok(()) => capture.checks.push(Check::pass(
             "real-native-scenario",
-            "real Weston input clicked dev TEST, exercised preview input, and completed bounded samples",
+            "kernel virtual devices clicked dev TEST, exercised preview input, and completed bounded samples through COSMIC",
         )),
         Err(error) => capture
             .checks
@@ -331,13 +308,12 @@ fn exercise_native_roles(
         ))),
         _ => None,
     })??;
-    let (mut placements, mut front_role) = discover_window_placements(session, observer, events)?;
+    let mut placements = discover_window_placements(session, observer, events)?;
     let mut dev_placement = activate_window(
         session,
         observer,
         events,
         &mut placements,
-        &mut front_role,
         ObserverRole::Dev,
     )?;
     let dev_test_center =
@@ -350,6 +326,55 @@ fn exercise_native_roles(
             } if node == "dev.test" => Some((*x, *y)),
             _ => None,
         })?;
+    let dev_editor_center =
+        wait_for_value(observer, events, EVENT_TIMEOUT, 0, |event| match event {
+            ObserverEvent::RoleTarget {
+                role: ObserverRole::Dev,
+                node,
+                x,
+                y,
+            } if node == DEV_EDITOR => Some((*x, *y)),
+            _ => None,
+        })?;
+
+    let editor_point = locate_target(
+        session,
+        observer,
+        events,
+        ObserverRole::Dev,
+        DEV_EDITOR,
+        dev_editor_center,
+        translated_target_candidates(
+            dev_placement.origin,
+            dev_editor_center.0,
+            dev_editor_center.1,
+        ),
+    )?;
+    let dev_input_start = events.len();
+    session.run_driver(&[
+        "move",
+        &editor_point.0.to_string(),
+        &editor_point.1.to_string(),
+    ])?;
+    session.run_driver(&["click", "left"])?;
+    session.run_driver(&["key", "down", "left"])?;
+    session.run_driver(&["key", "up", "left"])?;
+    session.run_driver(&["axis", "vertical", "4"])?;
+    session.run_driver(&["axis", "vertical", "-4"])?;
+    wait_for_event(observer, events, EVENT_TIMEOUT, dev_input_start, |event| {
+        matches!(event, ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Dev
+                    && input.real_os
+                    && input.kind == InputKind::Keyboard)
+    })
+    .map_err(|error| format!("dev editor did not accept real keyboard input: {error}"))?;
+    wait_for_event(observer, events, EVENT_TIMEOUT, dev_input_start, |event| {
+        matches!(event, ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Dev
+                    && input.real_os
+                    && input.kind == InputKind::Wheel)
+    })
+    .map_err(|error| format!("dev editor did not accept real wheel input: {error}"))?;
 
     let test_point = locate_target(
         session,
@@ -401,7 +426,6 @@ fn exercise_native_roles(
         observer,
         events,
         &mut placements,
-        &mut front_role,
         ObserverRole::Preview,
     )?;
     let completion =
@@ -538,7 +562,6 @@ fn exercise_native_roles(
             observer,
             events,
             &mut placements,
-            &mut front_role,
             ObserverRole::Dev,
         )?;
         let next_center = observed_role_target(events, ObserverRole::Dev, "dev.next")
@@ -724,51 +747,15 @@ fn discover_window_placements(
     session: &mut NativeSession,
     observer: &mut ObserverServer,
     events: &mut Vec<ObserverEvent>,
-) -> Result<(BTreeMap<ObserverRole, WindowPlacement>, ObserverRole), String> {
+) -> Result<BTreeMap<ObserverRole, WindowPlacement>, String> {
     let mut placements = BTreeMap::new();
     let (first_role, _) = observe_window(session, observer, events, None)?;
     let first_placement = stable_window_placement(session, observer, events, first_role)?;
     placements.insert(first_role, first_placement);
     let second_role = other_role(first_role);
-    let second_placement = switch_until_front(
-        session,
-        observer,
-        events,
-        first_placement.visible_point,
-        second_role,
-    )?;
+    let second_placement = stable_window_placement(session, observer, events, second_role)?;
     placements.insert(second_role, second_placement);
-    Ok((placements, second_role))
-}
-
-#[cfg(target_os = "linux")]
-fn switch_front_window(session: &mut NativeSession, focus_point: (i32, i32)) -> Result<(), String> {
-    session.move_pointer(focus_point)?;
-    session.run_driver(&["click", "right"])?;
-    session.run_driver(&["chord", "125", "tab"])?;
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn switch_until_front(
-    session: &mut NativeSession,
-    observer: &mut ObserverServer,
-    events: &mut Vec<ObserverEvent>,
-    focus_point: (i32, i32),
-    expected: ObserverRole,
-) -> Result<WindowPlacement, String> {
-    let mut last_error = None;
-    for _ in 0..4 {
-        switch_front_window(session, focus_point)?;
-        match stable_window_placement(session, observer, events, expected) {
-            Ok(placement) => return Ok(placement),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(format!(
-        "real keyboard switching did not activate {expected:?} after 4 attempts: {}",
-        last_error.unwrap_or_else(|| "no role observation".to_owned())
-    ))
+    Ok(placements)
 }
 
 #[cfg(target_os = "linux")]
@@ -778,10 +765,13 @@ fn stable_window_placement(
     events: &mut Vec<ObserverEvent>,
     expected: ObserverRole,
 ) -> Result<WindowPlacement, String> {
-    let mut previous = None;
+    let mut previous: Option<(i32, i32)> = None;
     for _ in 0..8 {
         let (_, placement) = observe_window(session, observer, events, Some(expected))?;
-        if previous == Some(placement.origin) {
+        if previous.is_some_and(|previous| {
+            (previous.0 - placement.origin.0).abs() <= 1
+                && (previous.1 - placement.origin.1).abs() <= 1
+        }) {
             return Ok(placement);
         }
         previous = Some(placement.origin);
@@ -797,29 +787,42 @@ fn activate_window(
     observer: &mut ObserverServer,
     events: &mut Vec<ObserverEvent>,
     placements: &mut BTreeMap<ObserverRole, WindowPlacement>,
-    front_role: &mut ObserverRole,
     expected: ObserverRole,
 ) -> Result<WindowPlacement, String> {
-    if *front_role != expected {
-        let current = *placements
-            .get(front_role)
-            .ok_or("front native role has no calibrated placement")?;
-        let placement =
-            switch_until_front(session, observer, events, current.visible_point, expected)?;
-        placements.insert(expected, placement);
-        *front_role = expected;
-    }
-    let placement = *placements
-        .get(&expected)
-        .ok_or("activated native role has no calibrated placement")?;
-    session.move_pointer(placement.visible_point)?;
-    session.run_driver(&["click", "right"])?;
-    let placement = match stable_window_placement(session, observer, events, expected) {
-        Ok(placement) => placement,
-        Err(_) => switch_until_front(session, observer, events, placement.visible_point, expected)?,
+    let placement = match placements.get(&expected).copied() {
+        Some(placement)
+            if role_at_point(session, observer, events, placement.visible_point)? == expected =>
+        {
+            placement
+        }
+        _ => {
+            session.run_driver(&["chord", "125", "left"])?;
+            thread::sleep(Duration::from_millis(150));
+            stable_window_placement(session, observer, events, expected)?
+        }
     };
     placements.insert(expected, placement);
     Ok(placement)
+}
+
+#[cfg(target_os = "linux")]
+fn role_at_point(
+    session: &mut NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    point: (i32, i32),
+) -> Result<ObserverRole, String> {
+    move_with_marker(session, observer, events, point, Duration::from_millis(400))
+        .or_else(|_| {
+            move_with_marker(
+                session,
+                observer,
+                events,
+                (point.0.saturating_add(1), point.1),
+                Duration::from_millis(400),
+            )
+        })
+        .map(|(_, input)| input.role)
 }
 
 #[cfg(target_os = "linux")]
@@ -833,11 +836,10 @@ fn move_with_marker(
     drain_events(observer, events, INPUT_CALIBRATION_QUIET);
     let start = events.len();
     let actual = session.move_pointer(point)?;
-    session.run_driver(&["axis", "vertical", "1"])?;
     let marker = wait_for_value(observer, events, timeout, start, |event| match event {
         ObserverEvent::InputAccepted(input)
             if input.real_os
-                && input.kind == InputKind::Wheel
+                && input.kind == InputKind::PointerMove
                 && input.pointer_x.is_some()
                 && input.pointer_y.is_some() =>
         {
@@ -845,7 +847,7 @@ fn move_with_marker(
         }
         _ => None,
     })
-    .map_err(|error| format!("pointer wheel marker was not accepted: {error}"))?;
+    .map_err(|error| format!("pointer move marker was not accepted: {error}"))?;
     Ok((actual, marker))
 }
 
@@ -857,17 +859,22 @@ fn observe_window(
     expected: Option<ObserverRole>,
 ) -> Result<(ObserverRole, WindowPlacement), String> {
     let mut last_role = None;
-    let mut foreign_observations = 0usize;
+    let mut observations = VecDeque::with_capacity(12);
     for point in window_scan_candidates() {
         if let Ok((actual, input)) =
             move_with_marker(session, observer, events, point, Duration::from_millis(100))
         {
             last_role = Some(input.role);
+            if observations.len() == 12 {
+                observations.pop_front();
+            }
+            observations.push_back(format!(
+                "requested={point:?} acknowledged={actual:?} role={:?} local=({:.1},{:.1})",
+                input.role,
+                input.pointer_x.unwrap_or_default(),
+                input.pointer_y.unwrap_or_default()
+            ));
             if expected.is_some() && expected != Some(input.role) {
-                foreign_observations = foreign_observations.saturating_add(1);
-                if foreign_observations >= 12 {
-                    break;
-                }
                 continue;
             }
             let local_x = input.pointer_x.expect("filtered pointer x");
@@ -886,7 +893,7 @@ fn observe_window(
     }
     match expected {
         Some(role) => Err(format!(
-            "real pointer scan could not observe {role:?}; last visible role was {last_role:?}"
+            "real pointer scan could not observe {role:?}; last visible role was {last_role:?}; observations={observations:?}"
         )),
         None => Err("real pointer input did not identify a native role".to_owned()),
     }
@@ -902,7 +909,14 @@ fn other_role(role: ObserverRole) -> ObserverRole {
 
 #[cfg(target_os = "linux")]
 fn window_scan_candidates() -> Vec<(i32, i32)> {
-    let mut candidates = vec![(540, 380), (960, 500), (1_200, 500), (1_800, 500)];
+    let mut candidates = vec![
+        (540, 280),
+        (1_500, 280),
+        (540, 820),
+        (1_500, 820),
+        (960, 500),
+        (1_800, 500),
+    ];
     for y in (40..=960).step_by(80) {
         for x in (40..=2_360).step_by(120) {
             if !candidates.contains(&(x, y)) {
@@ -1187,6 +1201,25 @@ impl Capture {
             "dev TEST was not both clicked through real app_window input and completed in preview",
         ));
 
+        let real_dev_keyboard = self.events.iter().any(|event| {
+            matches!(event, ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Dev
+                    && input.real_os
+                    && input.kind == InputKind::Keyboard)
+        });
+        let real_dev_wheel = self.events.iter().any(|event| {
+            matches!(event, ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Dev
+                    && input.real_os
+                    && input.kind == InputKind::Wheel)
+        });
+        self.checks.push(check_result(
+            "real-dev-keyboard-and-wheel",
+            real_dev_keyboard && real_dev_wheel,
+            "kernel keyboard and wheel events reached the focused dev editor through app_window",
+            "dev editor did not receive both real keyboard and wheel callbacks",
+        ));
+
         let real_preview = self.events.iter().any(|event| {
             matches!(event, ObserverEvent::InputAccepted(input)
                 if input.role == ObserverRole::Preview
@@ -1305,7 +1338,7 @@ impl Capture {
                     preview.adapter_name, preview.adapter_device_type
                 ),
                 format!(
-                    "private Weston exposed software adapter {} ({}); correctness evidence remains valid but the product gate cannot pass",
+                    "the real COSMIC session exposed software adapter {} ({}); correctness evidence remains valid but the product gate cannot pass",
                     preview.adapter_name, preview.adapter_device_type
                 ),
             ));
@@ -1561,7 +1594,7 @@ fn native_evidence(metadata: &RoleMetadata, dev_pid: u32) -> Option<NativeEviden
         window_backend: metadata.window_backend.clone(),
         preview_pid: metadata.pid,
         dev_pid,
-        input_delivery: "private-wayland-app-window-callback",
+        input_delivery: "native-os-app-window-callback",
         scenario_boundary: "public-host-event",
         capture_method: "app-owned-wgpu-readback",
         private_runtime_dispatch_used: false,
@@ -2133,7 +2166,7 @@ impl ScratchDir {
                 Err(error) => return Err(format!("create {}: {error}", path.display())),
             }
         }
-        Err("cannot allocate a unique private-Weston runtime directory".to_owned())
+        Err("cannot allocate a unique native verifier scratch directory".to_owned())
     }
 }
 
@@ -2150,182 +2183,137 @@ impl Drop for ScratchDir {
 
 #[cfg(target_os = "linux")]
 struct NativeSession {
-    runtime_dir: PathBuf,
-    wayland_runtime_dir: PathBuf,
-    socket_name: String,
-    driver: PathBuf,
-    weston: Option<Child>,
-    compositor_pid: Option<u32>,
-    desktop: Option<Child>,
+    desktop_pid: u32,
+    launch_id: String,
     observed_roles: Vec<u32>,
-    command_sequence: u32,
+    input: Option<NativeInput>,
+    workspace: Option<WorkspaceGuard>,
+    closed: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl NativeSession {
-    #[allow(clippy::too_many_arguments)]
     fn start(
         workspace: &Path,
         runtime_dir: &Path,
-        module: &Path,
-        driver: &Path,
         executable: &Path,
         example: &str,
         observer_socket: &Path,
         artifact_dir: &Path,
     ) -> Result<Self, String> {
-        let socket_name = format!("boon-v2-{}", std::process::id());
-        let mut session = Self {
-            runtime_dir: runtime_dir.to_owned(),
-            wayland_runtime_dir: runtime_dir.to_owned(),
-            socket_name,
-            driver: driver.to_owned(),
-            weston: None,
-            compositor_pid: None,
-            desktop: None,
-            observed_roles: Vec::new(),
-            command_sequence: 0,
-        };
-        session.start_nested_weston(module)?;
-
-        let desktop_log =
-            File::create(runtime_dir.join("desktop.log")).map_err(|error| error.to_string())?;
         let ipc = runtime_dir.join("desktop.sock");
-        let mut desktop = Command::new(executable);
-        desktop
-            .current_dir(workspace)
-            .env("XDG_RUNTIME_DIR", &session.wayland_runtime_dir)
-            .env("WAYLAND_DISPLAY", &session.socket_name)
-            .env(OBSERVER_SOCKET_ENV, observer_socket)
-            .env(PROOF_MODE_ENV, "readback")
-            .env(PROOF_ARTIFACT_DIR_ENV, artifact_dir)
-            .env(PROOF_SAMPLE_ORDINAL_ENV, "64")
-            .env(crate::protocol::VERIFY_BOUNDED_WINDOWS_ENV, "1")
-            .args(["--role", "desktop", "--example", example, "--ipc-path"])
-            .arg(ipc)
-            .stdout(Stdio::from(
-                desktop_log.try_clone().map_err(|error| error.to_string())?,
-            ))
-            .stderr(Stdio::from(desktop_log));
-        session.desktop = Some(
-            desktop
-                .spawn()
-                .map_err(|error| format!("launch native desktop role: {error}"))?,
-        );
-        Ok(session)
-    }
-
-    fn start_nested_weston(&mut self, module: &Path) -> Result<(), String> {
-        let parent_runtime = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .ok_or("parent XDG_RUNTIME_DIR is unavailable")?;
-        let parent_display = std::env::var("WAYLAND_DISPLAY")
-            .map_err(|_| "parent WAYLAND_DISPLAY is unavailable".to_owned())?;
-        let weston_log = self.runtime_dir.join("weston-nested.log");
-        let weston_config = self.runtime_dir.join("weston.ini");
-        fs::write(
-            &weston_config,
-            include_str!("../../../tools/native-wayland-test/weston.ini"),
-        )
-        .map_err(|error| format!("write private Weston config: {error}"))?;
-        let weston_config = weston_config
-            .to_str()
-            .ok_or("private Weston config path is not valid UTF-8")?;
-        let weston_stdio = File::create(self.runtime_dir.join("weston-nested-stdio.log"))
-            .map_err(|error| error.to_string())?;
+        let launch_log = runtime_dir.join("desktop-launch.log");
+        let environment = [
+            (
+                OBSERVER_SOCKET_ENV,
+                observer_socket.to_string_lossy().into_owned(),
+            ),
+            (PROOF_MODE_ENV, "readback".to_owned()),
+            (
+                PROOF_ARTIFACT_DIR_ENV,
+                artifact_dir.to_string_lossy().into_owned(),
+            ),
+            (PROOF_SAMPLE_ORDINAL_ENV, "64".to_owned()),
+            (crate::protocol::VERIFY_BOUNDED_WINDOWS_ENV, "1".to_owned()),
+        ];
         let mut launcher = Command::new("cosmic-background-launch");
+        launcher.current_dir(workspace).args([
+            "--workspace",
+            NATIVE_WORKSPACE,
+            "--frame-pacing",
+            "demand",
+            "--",
+            "env",
+        ]);
+        for (name, value) in environment {
+            launcher.arg(format!("{name}={value}"));
+        }
         launcher
-            .env("XDG_RUNTIME_DIR", &parent_runtime)
-            .env("WAYLAND_DISPLAY", &parent_display)
-            .args([
-                "--workspace",
-                "boon-circuit",
-                "--frame-pacing",
-                "demand",
-                "--",
-                "weston",
-                "--backend=wayland",
-                "--renderer=gl",
-                "--shell=desktop-shell.so",
-                "--width=1024",
-                "--height=800",
-                "--idle-time=0",
-                "--config",
-                weston_config,
-                "--socket",
-                &self.socket_name,
-                "--display",
-                &parent_display,
-                "--log",
-            ])
-            .arg(&weston_log)
-            .arg("--modules")
-            .arg(module)
-            .stdout(Stdio::from(
-                weston_stdio
-                    .try_clone()
-                    .map_err(|error| error.to_string())?,
-            ))
-            .stderr(Stdio::from(weston_stdio));
-        self.wayland_runtime_dir = parent_runtime;
-        self.weston = Some(
-            launcher
-                .spawn()
-                .map_err(|error| format!("launch nested Weston through COSMIC: {error}"))?,
-        );
-        self.wait_for_weston(WESTON_READY_TIMEOUT, &weston_log)?;
-        Ok(())
+            .arg(executable)
+            .args(["--role", "desktop", "--example", example, "--ipc-path"])
+            .arg(ipc);
+        let result = run_logged(&mut launcher, &launch_log, Duration::from_secs(10))
+            .map_err(|error| format!("launch ordinary COSMIC windows: {error}"))?;
+        if !result.success() {
+            return Err(process_failure(
+                "cosmic-background-launch",
+                &result,
+                &launch_log,
+            ));
+        }
+        let mut launch_fields = result.output.split_whitespace();
+        let desktop_pid = launch_fields
+            .next()
+            .ok_or("cosmic-background-launch omitted the desktop PID")?
+            .parse::<u32>()
+            .map_err(|error| {
+                format!("invalid desktop PID from cosmic-background-launch: {error}")
+            })?;
+        let launch_id = launch_fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or("cosmic-background-launch omitted the launch ID")?
+            .to_owned();
+        let input = match NativeInput::start(executable) {
+            Ok(input) => input,
+            Err(error) => {
+                terminate_process(desktop_pid, "TERM");
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            desktop_pid,
+            launch_id,
+            observed_roles: Vec::new(),
+            input: Some(input),
+            workspace: None,
+            closed: false,
+        })
     }
 
     fn desktop_id(&self) -> u32 {
-        self.desktop.as_ref().map(Child::id).unwrap_or(0)
+        self.desktop_pid
     }
 
-    fn wait_for_weston(&mut self, timeout: Duration, log_path: &Path) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if self.run_driver(&["query"]).is_ok() {
-                self.compositor_pid = find_weston_process(&self.socket_name);
-                return Ok(());
-            }
-            if let Some(status) = self
-                .weston
-                .as_mut()
-                .expect("Weston child")
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                && !status.success()
-            {
-                return Err(format!(
-                    "private Weston launcher exited before readiness: {status}; {}",
-                    tail(log_path, 2_000)
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "private Weston did not expose weston_test v1 within {}ms: {}",
-                    timeout.as_millis(),
-                    tail(log_path, 2_000)
-                ));
-            }
-            thread::sleep(Duration::from_millis(50));
+    fn activate_workspace(&mut self, executable: &Path) -> Result<(), String> {
+        let output = Command::new("cosmic-background-launch")
+            .args(["--reconcile", &self.launch_id])
+            .output()
+            .map_err(|error| format!("reconcile COSMIC background launch: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "COSMIC background launch reconciliation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
+        let reconciled = String::from_utf8(output.stdout)
+            .map_err(|error| format!("invalid COSMIC reconciliation output: {error}"))?
+            .trim()
+            .parse::<usize>()
+            .map_err(|error| format!("invalid COSMIC reconciliation count: {error}"))?;
+        if reconciled < self.observed_roles.len() {
+            return Err(format!(
+                "COSMIC reconciled only {reconciled} of {} native role windows",
+                self.observed_roles.len()
+            ));
+        }
+        let workspace = WorkspaceGuard::start(executable, NATIVE_WORKSPACE)?;
+        let (width, height) = workspace.output_size();
+        let input = self
+            .input
+            .as_mut()
+            .ok_or("kernel virtual input process is unavailable")?;
+        input.set_pointer_space(width, height)?;
+        input.prepare_pointer()?;
+        self.workspace = Some(workspace);
+        Ok(())
     }
 
     fn wait_for_roles(&mut self, timeout: Duration) -> Result<RolePids, String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(status) = self
-                .desktop
-                .as_mut()
-                .expect("desktop child")
-                .try_wait()
-                .map_err(|error| error.to_string())?
-            {
-                return Err(format!(
-                    "desktop exited before both roles connected: {status}; {}",
-                    tail(&self.runtime_dir.join("desktop.log"), 4_000)
-                ));
+            if !process_exists(self.desktop_id()) {
+                return Err("desktop exited before preview and dev connected".to_owned());
             }
             let descendants = process_descendants(self.desktop_id());
             let preview = descendants
@@ -2342,35 +2330,63 @@ impl NativeSession {
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "did not observe distinct preview/dev children within {}ms; descendants={descendants:?}; {}",
-                    timeout.as_millis(),
-                    tail(&self.runtime_dir.join("desktop.log"), 4_000)
+                    "did not observe distinct preview/dev children within {}ms; descendants={descendants:?}",
+                    timeout.as_millis()
                 ));
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    fn run_driver(&mut self, arguments: &[&str]) -> Result<LoggedProcess, String> {
-        self.command_sequence = self.command_sequence.saturating_add(1);
-        let log = self
-            .runtime_dir
-            .join(format!("driver-{}.log", self.command_sequence));
-        let mut command = Command::new(&self.driver);
-        command
-            .env("XDG_RUNTIME_DIR", &self.wayland_runtime_dir)
-            .env("WAYLAND_DISPLAY", &self.socket_name)
-            .args(arguments);
-        let result = run_logged(&mut command, &log, DRIVER_TIMEOUT)
-            .map_err(|error| format!("run driver {}: {error}", arguments.join(" ")))?;
-        if result.success() {
-            Ok(result)
-        } else {
-            Err(process_failure(
-                &format!("driver {}", arguments.join(" ")),
-                &result,
-                &log,
-            ))
+    fn run_driver(&mut self, arguments: &[&str]) -> Result<DriverAck, String> {
+        let input = self
+            .input
+            .as_mut()
+            .ok_or("kernel virtual input process is unavailable")?;
+        match arguments {
+            ["move", x, y] => {
+                let point = (
+                    x.parse::<i32>().map_err(|error| error.to_string())?,
+                    y.parse::<i32>().map_err(|error| error.to_string())?,
+                );
+                let actual = input.move_pointer(point)?;
+                Ok(DriverAck {
+                    output: format!("x={} y={}", actual.0, actual.1),
+                })
+            }
+            ["click", button] => {
+                input.click(pointer_button_code(button)?)?;
+                Ok(DriverAck::default())
+            }
+            ["button", state, button] => {
+                input.button(pointer_button_code(button)?, *state == "down")?;
+                Ok(DriverAck::default())
+            }
+            ["button", state] => {
+                input.button(0x110, *state == "down")?;
+                Ok(DriverAck::default())
+            }
+            ["axis", axis, amount] => {
+                input.wheel(
+                    *axis == "horizontal",
+                    amount.parse().map_err(|error| {
+                        format!("invalid virtual wheel amount `{amount}`: {error}")
+                    })?,
+                )?;
+                Ok(DriverAck::default())
+            }
+            ["chord", modifier, key] => {
+                input.chord(&[key_code(modifier)?], key_code(key)?)?;
+                Ok(DriverAck::default())
+            }
+            ["key", state, key] => {
+                input.key(key_code(key)?, *state == "down")?;
+                Ok(DriverAck::default())
+            }
+            _ => Err(format!(
+                "unsupported kernel virtual input command: {}",
+                arguments.join(" ")
+            )),
         }
     }
 
@@ -2395,6 +2411,21 @@ impl NativeSession {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let mut errors = Vec::new();
+        if let Some(mut input) = self.input.take()
+            && let Err(error) = input.shutdown()
+        {
+            errors.push(error);
+        }
+        if let Some(mut workspace) = self.workspace.take()
+            && let Err(error) = workspace.restore()
+        {
+            errors.push(error);
+        }
         let desktop_id = self.desktop_id();
         let mut pids = process_descendants(desktop_id);
         pids.extend(self.observed_roles.iter().copied());
@@ -2416,50 +2447,56 @@ impl NativeSession {
         {
             terminate_process(pid, "KILL");
         }
-        if let Some(mut desktop) = self.desktop.take() {
-            let _ = desktop.wait();
-        }
-        self.stop_compositor();
+        self.desktop_pid = 0;
         let leaked = pids
             .into_iter()
             .filter(|pid| *pid != 0 && process_exists(*pid))
             .collect::<Vec<_>>();
-        let role_log = fs::read_to_string(self.runtime_dir.join("desktop.log")).unwrap_or_default();
-        let panic_lines = role_log
-            .lines()
-            .filter(|line| line.contains("panicked at") || line.contains("Broken pipe"))
-            .take(4)
-            .collect::<Vec<_>>();
-        match (leaked.is_empty(), panic_lines.is_empty()) {
-            (true, true) => Ok(()),
-            (false, _) => Err(format!(
+        if !leaked.is_empty() {
+            errors.push(format!(
                 "native verifier process cleanup left live PIDs {leaked:?}"
-            )),
-            (true, false) => Err(format!(
-                "native role panic detected during verifier lifecycle: {}",
-                panic_lines.join(" | ")
-            )),
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
+}
 
-    fn stop_compositor(&mut self) {
-        if let Some(pid) = self.compositor_pid.take() {
-            terminate_process(pid, "TERM");
-            let deadline = Instant::now() + CLEANUP_TIMEOUT;
-            while process_exists(pid) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(25));
-            }
-            if process_exists(pid) {
-                terminate_process(pid, "KILL");
-            }
-        }
-        if let Some(mut launcher) = self.weston.take() {
-            if launcher.try_wait().ok().flatten().is_none() {
-                let _ = launcher.kill();
-            }
-            let _ = launcher.wait();
-        }
-        let _ = fs::remove_file(self.wayland_runtime_dir.join(&self.socket_name));
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct DriverAck {
+    output: String,
+}
+
+#[cfg(target_os = "linux")]
+fn pointer_button_code(name: &str) -> Result<u16, String> {
+    match name {
+        "left" => Ok(0x110),
+        "right" => Ok(0x111),
+        "middle" => Ok(0x112),
+        value => value
+            .parse()
+            .map_err(|error| format!("invalid pointer button `{value}`: {error}")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn key_code(name: &str) -> Result<u16, String> {
+    match name {
+        "tab" => Ok(15),
+        "enter" => Ok(28),
+        "escape" => Ok(1),
+        "left" => Ok(105),
+        "right" => Ok(106),
+        "i" => Ok(23),
+        "u" => Ok(22),
+        "y" => Ok(21),
+        value => value
+            .parse()
+            .map_err(|error| format!("invalid keyboard key `{value}`: {error}")),
     }
 }
 
@@ -2480,7 +2517,6 @@ struct RolePids {
 #[cfg(target_os = "linux")]
 struct LoggedProcess {
     status: ExitStatus,
-    elapsed: Duration,
     timed_out: bool,
     output: String,
 }
@@ -2496,10 +2532,10 @@ impl LoggedProcess {
 fn cleanup_check(result: Result<(), String>) -> Check {
     match result {
         Ok(()) => Check::pass(
-            "private-wayland-cleanup",
-            "private compositor and desktop/preview/dev process tree stopped without leaked processes",
+            "native-os-input-cleanup",
+            "virtual devices, workspace guard, and desktop/preview/dev process tree stopped without leaks",
         ),
-        Err(error) => Check::fail("private-wayland-cleanup", error),
+        Err(error) => Check::fail("native-os-input-cleanup", error),
     }
 }
 
@@ -2527,7 +2563,6 @@ fn run_logged(
     };
     Ok(LoggedProcess {
         status,
-        elapsed: started.elapsed(),
         timed_out,
         output: fs::read_to_string(log_path).unwrap_or_default(),
     })
@@ -2583,36 +2618,6 @@ fn process_role(pid: u32) -> Option<String> {
         .windows(2)
         .find(|pair| pair[0] == "--role")
         .map(|pair| pair[1].clone())
-}
-
-#[cfg(target_os = "linux")]
-fn find_weston_process(socket_name: &str) -> Option<u32> {
-    let entries = fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(bytes) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let arguments = bytes
-            .split(|byte| *byte == 0)
-            .filter(|value| !value.is_empty())
-            .map(|value| String::from_utf8_lossy(value).into_owned())
-            .collect::<Vec<_>>();
-        let executable_is_weston = arguments
-            .first()
-            .and_then(|value| Path::new(value).file_name())
-            .and_then(|value| value.to_str())
-            == Some("weston");
-        let names_socket = arguments.iter().any(|argument| {
-            argument == socket_name || argument == &format!("--socket={socket_name}")
-        });
-        if executable_is_weston && names_socket {
-            return Some(pid);
-        }
-    }
-    None
 }
 
 #[cfg(target_os = "linux")]

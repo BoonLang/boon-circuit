@@ -77,6 +77,11 @@ Do not use Ply, Xvfb, whole-desktop screenshots, `xdotool`, `ydotool`,
 direct COSMIC toplevel probing, or browser windows as evidence for the native
 GPU path. Use app-owned WGPU readback screenshots, native GPU reports, and the
 host-event verifier route described in `docs/architecture/NATIVE_GPU_PIPELINE.md`.
+Automated product scenarios use the repository's kernel-uinput device role on
+the ordinary COSMIC seat. Workspace setup may use only the opaque launch ID,
+the standard workspace protocols, and the fork's launch-scoped reconcile
+operation; it must not identify or activate toplevels by title, app ID, role,
+geometry, or example name.
 
 Before claiming native GPU handoff readiness, run only the native GPU handoff
 reports listed in `docs/architecture/native_gpu_handoff_manifest.json`, then run

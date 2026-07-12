@@ -568,13 +568,13 @@ fn exercise_native_roles(
             &preview_point.0.to_string(),
             &preview_point.1.to_string(),
         ])?;
-        wait_for_event(observer, events, EVENT_TIMEOUT, move_start, |event| {
-            matches!(event, ObserverEvent::InputAccepted(input)
-                if input.role == ObserverRole::Preview
-                    && input.real_os
-                    && input.kind == InputKind::PointerMove
-                    && input.target.as_deref() == Some(test_target.1.as_str()))
-        })
+        wait_for_visible_present(
+            observer,
+            events,
+            move_start,
+            InputKind::PointerMove,
+            |input| input.target.as_deref() == Some(test_target.1.as_str()),
+        )
         .map_err(|error| {
             format!(
                 "preview scroll target was not entered: {error}; observed={}",

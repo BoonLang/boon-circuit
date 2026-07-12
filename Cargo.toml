@@ -36,7 +36,7 @@ boon_host = { path = "crates/boon_host" }
 boon_document = { path = "crates/boon_document" }
 boon_native_gpu = { path = "crates/boon_native_gpu" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
-app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "0895892b0358164097287668c5575532c639eb79" }
+app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "6aec9831f281df355736df28a4c3aacdef7cf8a1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"

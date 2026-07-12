@@ -551,7 +551,6 @@ pub enum WindowBackend {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum InputDelivery {
-    PrivateWaylandAppWindowCallback,
     NativeOsAppWindowCallback,
 }
 
@@ -597,9 +596,9 @@ impl NativeEvidence {
             );
         }
         if self.window_backend != WindowBackend::Wayland {
-            return Err("passing native evidence requires the private Wayland path".to_owned());
+            return Err("passing native evidence requires the native Wayland path".to_owned());
         }
-        if self.input_delivery != InputDelivery::PrivateWaylandAppWindowCallback {
+        if self.input_delivery != InputDelivery::NativeOsAppWindowCallback {
             return Err(
                 "passing native evidence must enter through the app_window callback path"
                     .to_owned(),

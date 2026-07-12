@@ -358,7 +358,7 @@ fn native_evidence() -> NativeEvidence {
         window_backend: WindowBackend::Wayland,
         preview_pid: 100,
         dev_pid: 101,
-        input_delivery: InputDelivery::PrivateWaylandAppWindowCallback,
+        input_delivery: InputDelivery::NativeOsAppWindowCallback,
         scenario_boundary: HostBoundary::PublicHostEvent,
         capture_method: CaptureMethod::AppOwnedWgpuReadback,
         private_runtime_dispatch_used: false,

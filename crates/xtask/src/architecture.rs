@@ -58,6 +58,11 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
         "single-machine-plan-executor-path",
         single_execution_path(workspace),
     );
+    push_check(
+        &mut checks,
+        "isolated-native-input-path",
+        isolated_native_input_path(workspace),
+    );
 
     match rust_line_counts(workspace) {
         Ok(counts) => {
@@ -105,6 +110,50 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     }
 
     empty_evidence(checks)
+}
+
+fn isolated_native_input_path(workspace: &Path) -> Result<String, String> {
+    let verifier =
+        fs::read_to_string(workspace.join("crates/boon_native_playground/src/verify.rs"))
+            .map_err(|error| format!("read native verifier: {error}"))?;
+    let input =
+        fs::read_to_string(workspace.join("crates/boon_native_playground/src/native_input.rs"))
+            .map_err(|error| format!("read native input role: {error}"))?;
+    let workspace_control = fs::read_to_string(
+        workspace.join("crates/boon_native_playground/src/workspace_control.rs"),
+    )
+    .map_err(|error| format!("read workspace control role: {error}"))?;
+
+    let required = [
+        (verifier.as_str(), "\"--isolated-input\""),
+        (verifier.as_str(), "\"--isolation-status\""),
+        (verifier.as_str(), "wait_for_isolated_input"),
+        (verifier.as_str(), "maximized_windows="),
+        (verifier.as_str(), "require_layout"),
+        (
+            verifier.as_str(),
+            "window_scan_candidates(session.pointer_space()?",
+        ),
+        (input.as_str(), "COSMIC Isolated {seat_name} {kind}"),
+    ];
+    if let Some((_, missing)) = required
+        .into_iter()
+        .find(|(source, needle)| !source.contains(needle))
+    {
+        return Err(format!(
+            "native input isolation contract omitted `{missing}`"
+        ));
+    }
+    if workspace_control.contains(".activate()") {
+        return Err(
+            "workspace-control must not activate or restore a user workspace during automation"
+                .to_owned(),
+        );
+    }
+    Ok(
+        "native verifier requires a launch-scoped COSMIC seat and keeps its workspace inactive"
+            .to_owned(),
+    )
 }
 
 fn push_check(

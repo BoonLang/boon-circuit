@@ -84,7 +84,7 @@ impl WorkspaceGuard {
         self.output_size
     }
 
-    pub fn restore(&mut self) -> Result<(), String> {
+    pub fn shutdown(&mut self) -> Result<(), String> {
         if let Some(mut input) = self.input.take() {
             input
                 .write_all(&[0])
@@ -94,7 +94,7 @@ impl WorkspaceGuard {
         let status = self
             .child
             .wait()
-            .map_err(|error| format!("wait for Wayland workspace restoration: {error}"))?;
+            .map_err(|error| format!("wait for Wayland workspace guard: {error}"))?;
         if status.success() {
             Ok(())
         } else {
@@ -105,7 +105,7 @@ impl WorkspaceGuard {
 
 impl Drop for WorkspaceGuard {
     fn drop(&mut self) {
-        let _ = self.restore();
+        let _ = self.shutdown();
     }
 }
 
@@ -119,7 +119,7 @@ pub fn run_guard_process(args: &[String]) -> Result<(), String> {
         .map_err(|error| format!("invalid workspace-control timeout: {error}"))?
         .unwrap_or(DEFAULT_TIMEOUT_MS)
         .clamp(1_000, DEFAULT_TIMEOUT_MS);
-    let mut lease = WorkspaceLease::activate(&workspace)?;
+    let mut lease = WorkspaceLease::prepare(&workspace)?;
     let (width, height) = lease.output_size;
     let mut ready = [0_u8; READY.len() + 8];
     ready[..4].copy_from_slice(&READY);
@@ -137,7 +137,7 @@ pub fn run_guard_process(args: &[String]) -> Result<(), String> {
         let _ = send.send(());
     });
     let _ = receive.recv_timeout(Duration::from_millis(timeout_ms));
-    lease.restore()
+    lease.finish()
 }
 
 fn argument<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
@@ -149,16 +149,14 @@ fn argument<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 struct WorkspaceLease {
     queue: wayland_client::EventQueue<Catalog>,
     catalog: Catalog,
-    manager: ExtWorkspaceManagerV1,
-    group: wayland_client::backend::ObjectId,
+    _manager: ExtWorkspaceManagerV1,
     target: wayland_client::backend::ObjectId,
-    previous: wayland_client::backend::ObjectId,
     output_size: (i32, i32),
-    restored: bool,
+    closed: bool,
 }
 
 impl WorkspaceLease {
-    fn activate(name: &str) -> Result<Self, String> {
+    fn prepare(name: &str) -> Result<Self, String> {
         let connection = Connection::connect_to_env()
             .map_err(|error| format!("connect workspace-control to Wayland: {error}"))?;
         let (globals, mut queue) = registry_queue_init::<Catalog>(&connection)
@@ -220,17 +218,21 @@ impl WorkspaceLease {
             .find(|(_, workspaces)| workspaces.contains(&target.id()))
             .map(|(group, _)| group.clone())
             .ok_or_else(|| format!("Wayland workspace `{name}` has no output group"))?;
-        let previous = catalog
+        let active = catalog
             .groups
             .get(&group)
             .into_iter()
             .flatten()
             .filter_map(|id| catalog.workspaces.get(id))
             .find(|workspace| workspace.active)
-            .map(|workspace| workspace.handle.clone())
             .ok_or_else(|| {
                 format!("Wayland workspace group for `{name}` has no active workspace")
             })?;
+        if active.handle == target {
+            return Err(format!(
+                "Wayland workspace `{name}` is active; isolated verification refuses to disturb it"
+            ));
+        }
         let cosmic_target = catalog
             .cosmic_workspaces
             .get(&target.id())
@@ -246,35 +248,11 @@ impl WorkspaceLease {
             .map(|output| (output.width, output.height))
             .ok_or_else(|| format!("Wayland workspace `{name}` has no logical output geometry"))?;
 
-        cosmic_target.set_tiling_state(zcosmic_workspace_handle_v2::TilingState::FloatingOnly);
-        target.activate();
-        manager.commit();
-        queue
-            .roundtrip(&mut catalog)
-            .map_err(|error| format!("activate Wayland workspace `{name}`: {error}"))?;
-        let target_floating =
-            catalog
-                .cosmic_workspaces
-                .get(&target.id())
-                .is_some_and(|workspace| {
-                    matches!(
-                        workspace.tiling,
-                        Some(WEnum::Value(
-                            zcosmic_workspace_handle_v2::TilingState::FloatingOnly
-                        ))
-                    )
-                });
-        if !target_floating {
-            return Err(format!(
-                "COSMIC did not reset the Wayland workspace `{name}` layout"
-            ));
-        }
-
         cosmic_target.set_tiling_state(zcosmic_workspace_handle_v2::TilingState::TilingEnabled);
         manager.commit();
         queue
             .roundtrip(&mut catalog)
-            .map_err(|error| format!("tile Wayland workspace `{name}`: {error}"))?;
+            .map_err(|error| format!("enable background workspace tiling for `{name}`: {error}"))?;
         let target_tiled = catalog
             .cosmic_workspaces
             .get(&target.id())
@@ -295,58 +273,46 @@ impl WorkspaceLease {
             .workspaces
             .get(&target.id())
             .is_some_and(|workspace| workspace.active);
-        if !target_active {
+        if target_active {
             return Err(format!(
-                "COSMIC did not activate Wayland workspace `{name}`"
+                "COSMIC activated background workspace `{name}` during isolated setup"
             ));
         }
         Ok(Self {
             queue,
             catalog,
-            manager,
-            group,
+            _manager: manager,
             target: target.id(),
-            previous: previous.id(),
             output_size,
-            restored: false,
+            closed: false,
         })
     }
 
-    fn restore(&mut self) -> Result<(), String> {
-        if self.restored {
+    fn finish(&mut self) -> Result<(), String> {
+        if self.closed {
             return Ok(());
         }
         self.queue
             .roundtrip(&mut self.catalog)
-            .map_err(|error| format!("refresh workspaces before restoration: {error}"))?;
-        let restore = self
+            .map_err(|error| format!("refresh isolated workspace before shutdown: {error}"))?;
+        if self
             .catalog
             .workspaces
-            .get(&self.previous)
-            .or_else(|| {
-                self.catalog
-                    .groups
-                    .get(&self.group)
-                    .into_iter()
-                    .flatten()
-                    .filter(|id| **id != self.target)
-                    .find_map(|id| self.catalog.workspaces.get(id))
-            })
-            .map(|workspace| workspace.handle.clone())
-            .ok_or("previous Wayland workspace disappeared and no replacement is available")?;
-        restore.activate();
-        self.manager.commit();
-        self.queue
-            .roundtrip(&mut self.catalog)
-            .map_err(|error| format!("restore previous Wayland workspace: {error}"))?;
-        self.restored = true;
+            .get(&self.target)
+            .is_some_and(|workspace| workspace.active)
+        {
+            return Err(
+                "isolated background workspace became active during verification".to_owned(),
+            );
+        }
+        self.closed = true;
         Ok(())
     }
 }
 
 impl Drop for WorkspaceLease {
     fn drop(&mut self) {
-        let _ = self.restore();
+        let _ = self.finish();
     }
 }
 

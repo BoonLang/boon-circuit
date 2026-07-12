@@ -130,7 +130,17 @@ fn typed_hit_side_table_carries_route_identity_and_bucket_index() {
         overscan: 0..8,
         logical_item_count: 8,
     });
-    let mut button = node("row-button", DocumentNodeKind::Button, Some("scroll"));
+    let mut materialized_row = node(
+        "materialized-row",
+        DocumentNodeKind::Stack,
+        Some("scroll"),
+    );
+    materialized_row.scroll = Some(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
+    let mut button = node(
+        "row-button",
+        DocumentNodeKind::Button,
+        Some("materialized-row"),
+    );
     button
         .style
         .insert("width".to_owned(), StyleValue::Number(80.0));
@@ -157,10 +167,17 @@ fn typed_hit_side_table_carries_route_identity_and_bucket_index() {
         .push(DocumentNodeId("scroll".to_owned()));
     scroll
         .children
+        .push(DocumentNodeId("materialized-row".to_owned()));
+    materialized_row
+        .children
         .push(DocumentNodeId("row-button".to_owned()));
     frame
         .nodes
         .insert(DocumentNodeId("scroll".to_owned()), scroll);
+    frame.nodes.insert(
+        DocumentNodeId("materialized-row".to_owned()),
+        materialized_row,
+    );
     frame
         .nodes
         .insert(DocumentNodeId("row-button".to_owned()), button);

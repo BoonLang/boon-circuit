@@ -301,6 +301,29 @@ impl HitSideTable {
         self.entries.push(entry);
     }
 
+    fn translate_nodes(&mut self, nodes: &BTreeSet<DocumentNodeId>, delta_x: f32, delta_y: f32) {
+        if nodes.is_empty() || (delta_x == 0.0 && delta_y == 0.0) {
+            return;
+        }
+        for entry in &mut self.entries {
+            if nodes.contains(&entry.node) {
+                entry.bounds.x += delta_x;
+                entry.bounds.y += delta_y;
+                entry.spatial_bucket =
+                    hit_bucket_for_point(entry.bounds.x, entry.bounds.y, self.bucket_size);
+            }
+        }
+        self.buckets.clear();
+        for (index, entry) in self.entries.iter().enumerate() {
+            for bucket in buckets_for_rect(entry.bounds, self.bucket_size) {
+                self.buckets
+                    .entry(hit_bucket_key(bucket))
+                    .or_default()
+                    .push(index);
+            }
+        }
+    }
+
     pub fn hit_test(&self, x: f32, y: f32) -> Option<&HitSideTableEntry> {
         let bucket = hit_bucket_for_point(x, y, self.bucket_size);
         let candidates = self.buckets.get(&hit_bucket_key(bucket))?;
@@ -454,8 +477,7 @@ fn scroll_root_for_node(document: &DocumentFrame, node: &DocumentNodeId) -> Opti
         let node = document.nodes.get(&id);
         if document.scroll_roots.contains_key(&scroll_root)
             || node.is_some_and(|node| {
-                node.scroll.is_some()
-                    || node.kind == DocumentNodeKind::ScrollRoot
+                node.kind == DocumentNodeKind::ScrollRoot
                     || style_bool(&node.style, "scroll") == Some(true)
                     || style_bool(&node.style, "scroll_x") == Some(true)
                     || style_bool(&node.style, "scroll_y") == Some(true)
@@ -1244,6 +1266,7 @@ pub struct RetainedDocument {
     document: DocumentState,
     indexes: DocumentDerivedIndexBundle,
     layout: LayoutFrame,
+    scroll_groups: BTreeMap<DocumentNodeId, BTreeSet<DocumentNodeId>>,
     hits: HitSideTable,
     scene: RenderScene,
     viewport: Viewport,
@@ -3092,10 +3115,12 @@ impl RetainedDocument {
         let indexes = DocumentDerivedIndexBundle::from_frame(document.frame())?;
         let (layout, hits, scene) =
             lower_retained_document(document.frame(), &indexes, viewport, columns)?;
+        let scroll_groups = build_retained_scroll_groups(document.frame(), &layout);
         Ok(Self {
             document,
             indexes,
             layout,
+            scroll_groups,
             hits,
             scene,
             viewport,
@@ -3206,7 +3231,6 @@ impl RetainedDocument {
             })
             .collect::<Vec<_>>();
         let hit_metadata_nodes = patch_hit_metadata_nodes(&patches);
-        let hit_bounds_changed = !scroll_changes.is_empty();
         let render_nodes = patch_render_nodes(&patches);
         let batch = DocumentChangeBatch { patches };
 
@@ -3246,14 +3270,10 @@ impl RetainedDocument {
         for (root, previous, next) in scroll_changes {
             let delta_x = previous.x - next.x;
             let delta_y = previous.y - next.y;
-            let scrolled = apply_scroll_delta(
-                self.document.frame(),
-                &mut self.layout,
-                &root,
-                previous,
-                next,
-            );
+            let scrolled = self.scroll_groups.get(&root).cloned().unwrap_or_default();
+            apply_scroll_delta(&mut self.layout, &scrolled, previous, next);
             if !scrolled.is_empty() && (delta_x != 0.0 || delta_y != 0.0) {
+                self.hits.translate_nodes(&scrolled, delta_x, delta_y);
                 self.scene.apply_patch(&RenderScenePatch {
                     operations: vec![RenderScenePatchOperation::TranslateNodeEntries {
                         nodes: scrolled.into_iter().collect(),
@@ -3266,11 +3286,7 @@ impl RetainedDocument {
         }
         refresh_scroll_demands(self.document.frame(), &mut self.layout);
         self.refresh_display_nodes(&changed_nodes);
-        if hit_bounds_changed {
-            self.hits = self
-                .indexes
-                .try_hit_side_table(self.document.frame(), &self.layout)?;
-        } else if !hit_metadata_nodes.is_empty() {
+        if !hit_metadata_nodes.is_empty() {
             self.hits.update_node_metadata(
                 self.document.frame(),
                 &self.indexes.hot_ids,
@@ -3332,6 +3348,7 @@ impl RetainedDocument {
         let (layout, hits, scene) =
             lower_retained_document(self.document.frame(), &self.indexes, self.viewport, columns)?;
         self.layout = layout;
+        self.scroll_groups = build_retained_scroll_groups(self.document.frame(), &self.layout);
         self.hits = hits;
         self.scene = scene;
         let interaction_nodes = self
@@ -3539,17 +3556,59 @@ fn scroll_offset_for_demand(document: &DocumentFrame, node: &DocumentNodeId, axi
 }
 
 fn apply_scroll_delta(
-    document: &DocumentFrame,
     layout: &mut LayoutFrame,
-    root: &DocumentNodeId,
+    descendants: &BTreeSet<DocumentNodeId>,
     previous: boon_document_model::ScrollState,
     next: boon_document_model::ScrollState,
-) -> BTreeSet<DocumentNodeId> {
-    let descendants = document_descendants(document, root);
+) {
     let delta_x = previous.x - next.x;
     let delta_y = previous.y - next.y;
-    shift_layout_nodes(layout, &descendants, delta_x, delta_y);
-    descendants
+    shift_layout_nodes(layout, descendants, delta_x, delta_y);
+}
+
+fn build_retained_scroll_groups(
+    document: &DocumentFrame,
+    layout: &LayoutFrame,
+) -> BTreeMap<DocumentNodeId, BTreeSet<DocumentNodeId>> {
+    let visible = layout
+        .display_list
+        .iter()
+        .map(|item| item.node.clone())
+        .chain(layout.hit_regions.iter().map(|hit| hit.node.clone()))
+        .chain(
+            layout
+                .scroll_regions
+                .iter()
+                .map(|region| region.node.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut groups = BTreeMap::<DocumentNodeId, BTreeSet<DocumentNodeId>>::new();
+    for visible_node in visible {
+        let mut current = document
+            .nodes
+            .get(&visible_node)
+            .and_then(|node| node.parent.clone());
+        while let Some(id) = current.take() {
+            let Some(node) = document.nodes.get(&id) else {
+                break;
+            };
+            let root = ScrollRootId(id.0.clone());
+            if document.scroll_roots.contains_key(&root)
+                || node.kind == DocumentNodeKind::ScrollRoot
+                || style_bool(&node.style, "scroll") == Some(true)
+                || style_bool(&node.style, "scroll_x") == Some(true)
+                || style_bool(&node.style, "scroll_y") == Some(true)
+                || style_bool(&node.style, "scrollbars") == Some(true)
+            {
+                groups
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(visible_node.clone());
+            }
+            current.clone_from(&node.parent);
+        }
+    }
+    groups
 }
 
 fn shift_descendant_layout(

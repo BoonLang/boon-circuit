@@ -21,6 +21,7 @@ pub struct RuntimeView {
     focused: Option<String>,
     text_inputs: std::collections::BTreeMap<String, String>,
     scroll_offsets: std::collections::BTreeMap<String, boon_document_model::ScrollState>,
+    materialization_overscan: std::collections::BTreeMap<u64, std::ops::Range<u64>>,
     pending_patches: Vec<DocumentPatch>,
     sequence: u64,
     last_dispatched_source: Option<String>,
@@ -59,6 +60,7 @@ impl RuntimeView {
             focused: None,
             text_inputs,
             scroll_offsets: std::collections::BTreeMap::new(),
+            materialization_overscan: std::collections::BTreeMap::new(),
             pending_patches: Vec::new(),
             sequence: 0,
             last_dispatched_source: None,
@@ -143,11 +145,20 @@ impl RuntimeView {
         }
         let mut changed = false;
         for (materialization, (visible, overscan)) in windows {
-            for patch in self
-                .runtime
-                .demand_document_window_by_id(materialization, visible, overscan)
-                .map_err(|error| error.to_string())?
+            if self
+                .materialization_overscan
+                .get(&materialization)
+                .is_some_and(|current| current.start <= visible.start && current.end >= visible.end)
             {
+                continue;
+            }
+            let patches = self
+                .runtime
+                .demand_document_window_by_id(materialization, visible, overscan.clone())
+                .map_err(|error| error.to_string())?;
+            self.materialization_overscan
+                .insert(materialization, overscan);
+            for patch in patches {
                 let patch = self.with_view_state(patch);
                 self.sync_text_input_patch(&patch);
                 self.pending_patches.push(patch);
@@ -596,8 +607,8 @@ mod tests {
             model.frame(),
             boon_host::Viewport {
                 surface: 1,
-                width: 1_100.0,
-                height: 720.0,
+                width: 440.0,
+                height: 680.0,
                 scale: 1.0,
             },
             &mut columns,
@@ -672,6 +683,7 @@ mod tests {
             .target_for_source("cell.sources.editor.select", Some("15"))
             .expect("visible A2 target");
         assert!(target.scroll_root.is_some());
+        let scroll_target = target.clone();
         let full_lowers = view.retained_stats().full_lower_count;
         let changed = model
             .handle_event(
@@ -691,15 +703,38 @@ mod tests {
             .unwrap();
         assert!(!update.full_lowered);
         assert_eq!(view.retained_stats().full_lower_count, full_lowers);
-        assert!(model.apply_layout_demands(view.demands()).unwrap());
-        view.apply_patches(model.take_patches(), &mut columns)
-            .unwrap();
+        assert!(
+            !model.apply_layout_demands(view.demands()).unwrap(),
+            "scrolling inside retained overscan must not rematerialize rows"
+        );
         assert!(
             view.frame()
                 .nodes
                 .values()
                 .any(|node| node.scroll.is_some_and(|scroll| scroll.y == 52.0))
         );
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::Wheel(WheelEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        x: scroll_target.center_x,
+                        y: scroll_target.center_y,
+                        delta_x: 0.0,
+                        delta_y: 520.0,
+                    }),
+                    Some(scroll_target),
+                )
+                .unwrap()
+        );
+        view.apply_patches(model.take_patches(), &mut columns)
+            .unwrap();
+        assert!(
+            model.apply_layout_demands(view.demands()).unwrap(),
+            "leaving retained overscan must request a new materialization window"
+        );
+        view.apply_patches(model.take_patches(), &mut columns)
+            .unwrap();
         assert!(!model.apply_layout_demands(view.demands()).unwrap());
     }
 
@@ -903,8 +938,12 @@ mod tests {
                 model.frame(),
                 boon_host::Viewport {
                     surface: 1,
-                    width: 1_100.0,
-                    height: 760.0,
+                    width: if example_id == "cells" {
+                        510.0
+                    } else {
+                        1_100.0
+                    },
+                    height: if example_id == "cells" { 540.0 } else { 760.0 },
                     scale: 1.0,
                 },
                 &mut columns,
@@ -918,6 +957,74 @@ mod tests {
                 .take(crate::preview::TEST_STEP_LIMIT)
             {
                 drive_scenario_step(&mut model, &mut view, &mut columns, step);
+            }
+            if example_id == "cells" {
+                for ordinal in 0..24 {
+                    drive_scenario_step(
+                        &mut model,
+                        &mut view,
+                        &mut columns,
+                        &example.test_steps[ordinal % 2],
+                    );
+                }
+                let step = example.test_steps.first().expect("Cells test target");
+                let target_row = model
+                    .scenario_target_row(
+                        &step.source_path,
+                        step.target_text.as_deref(),
+                        step.address.as_deref(),
+                        step.target_occurrence,
+                    )
+                    .unwrap();
+                let target = view
+                    .target_for_scenario(
+                        &step.source_path,
+                        step.action_kind.as_deref(),
+                        step.target_text.as_deref(),
+                        step.address.as_deref(),
+                        target_row,
+                    )
+                    .expect("visible Cells target after TEST");
+                model
+                    .handle_event(
+                        &HostEvent::Pointer(PointerEvent {
+                            surface: SurfaceId("preview".to_owned()),
+                            x: target.center_x,
+                            y: target.center_y,
+                            phase: PointerPhase::Move,
+                            button: None,
+                        }),
+                        Some(target.clone()),
+                    )
+                    .unwrap();
+                view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
+                    .unwrap();
+                let wheel_target = view
+                    .wheel_target(target.center_x, target.center_y, 0.0, 4.0)
+                    .filter(|target| target.scroll_root.is_some())
+                    .expect("post-TEST hovered Cells target must retain a vertical scroll owner");
+                assert!(
+                    model
+                        .handle_event(
+                            &HostEvent::Wheel(WheelEvent {
+                                surface: SurfaceId("preview".to_owned()),
+                                x: target.center_x,
+                                y: target.center_y,
+                                delta_x: 0.0,
+                                delta_y: 4.0,
+                            }),
+                            Some(wheel_target),
+                        )
+                        .unwrap(),
+                    "wheel event must enqueue a retained scroll patch"
+                );
+                let scroll_update = view
+                    .apply_patches(model.take_patches(), &mut columns)
+                    .unwrap();
+                assert!(
+                    scroll_update.layout_changed || scroll_update.render_changed,
+                    "wheel patch must visibly update retained layout or rendering"
+                );
             }
             assert!(
                 model.event_sequence()

@@ -78,9 +78,16 @@ direct COSMIC toplevel probing, or browser windows as evidence for the native
 GPU path. Use app-owned WGPU readback screenshots, native GPU reports, and the
 host-event verifier route described in `docs/architecture/NATIVE_GPU_PIPELINE.md`.
 Automated product scenarios use the repository's kernel-uinput device role on
-the ordinary COSMIC seat. Workspace setup may use only the opaque launch ID,
-the standard workspace protocols, and the fork's launch-scoped reconcile
-operation; it must not identify or activate toplevels by title, app ID, role,
+a launch-scoped COSMIC `wl_seat`, never the user's physical seat. The local
+compositor fork must assign both named uinput devices to that seat, route it to
+the inactive launch workspace, hide its compositor cursor, bypass global
+shortcuts/idle wake, and fail closed if the seat or workspace is unavailable.
+The verifier must prove two-device ownership and inactive-workspace status
+before emitting input. It must also prove that all expected role windows are
+tiled with zero floating or maximized windows; there is no shared-seat or
+input-before-layout fallback. Workspace setup may use only the opaque launch
+ID, the standard workspace protocols, and the fork's launch-scoped reconcile
+operation; it must not activate or identify toplevels by title, app ID, role,
 geometry, or example name.
 
 Before claiming native GPU handoff readiness, run only the native GPU handoff

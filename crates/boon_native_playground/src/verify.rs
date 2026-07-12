@@ -184,11 +184,14 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
     };
     capture.checks.push(Check::pass(
         "kernel-virtual-input",
-        "uinput pointer and keyboard devices were created for the real COSMIC seat",
+        format!(
+            "uinput pointer and keyboard are owned by launch-scoped seat {}",
+            session.isolated_seat_name
+        ),
     ));
     capture.checks.push(Check::pass(
         "regular-cosmic-wayland",
-        "preview and dev were launched as ordinary windows in the named COSMIC workspace",
+        "preview and dev use ordinary Wayland/app_window callbacks on a launch-scoped COSMIC seat",
     ));
 
     let roles = match session.wait_for_roles(ROLE_READY_TIMEOUT) {
@@ -213,16 +216,16 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
         }
     };
 
-    if let Err(error) = session.activate_workspace(&executable) {
+    if let Err(error) = session.prepare_background_workspace(&executable) {
         capture
             .checks
-            .push(Check::fail("active-cosmic-workspace", error));
+            .push(Check::fail("isolated-cosmic-workspace", error));
         capture.checks.push(cleanup_check(session.shutdown()));
         return capture.into_evidence(gate);
     }
     capture.checks.push(Check::pass(
-        "active-cosmic-workspace",
-        "the standard ext-workspace protocol activated the bounded test workspace and armed restoration",
+        "isolated-cosmic-workspace",
+        "the bounded test workspace remained inactive while launch-scoped input targeted it",
     ));
 
     let exercise = exercise_native_roles(
@@ -296,7 +299,8 @@ fn exercise_native_roles(
     events: &mut Vec<ObserverEvent>,
     samples: &mut ProductSamples,
 ) -> Result<(), String> {
-    wait_for_metadata(observer, events)?;
+    wait_for_metadata(observer, events)
+        .map_err(|error| format!("preview/dev metadata did not become ready: {error}"))?;
     wait_for_value(observer, events, EVENT_TIMEOUT, 0, |event| match event {
         ObserverEvent::SourceSwitchFinal { .. } => Some(Ok(())),
         ObserverEvent::SourceFailed {
@@ -307,7 +311,8 @@ fn exercise_native_roles(
             "preview source revision {revision} failed during {stage}: {message}"
         ))),
         _ => None,
-    })??;
+    })
+    .map_err(|error| format!("initial preview source did not become ready: {error}"))??;
     let mut placements = discover_window_placements(session, observer, events)?;
     let mut dev_placement = activate_window(
         session,
@@ -316,16 +321,16 @@ fn exercise_native_roles(
         &mut placements,
         ObserverRole::Dev,
     )?;
-    let dev_test_center =
-        wait_for_value(observer, events, EVENT_TIMEOUT, 0, |event| match event {
-            ObserverEvent::RoleTarget {
-                role: ObserverRole::Dev,
-                node,
-                x,
-                y,
-            } if node == "dev.test" => Some((*x, *y)),
-            _ => None,
-        })?;
+    let dev_test_center = wait_for_value(observer, events, EVENT_TIMEOUT, 0, |event| match event {
+        ObserverEvent::RoleTarget {
+            role: ObserverRole::Dev,
+            node,
+            x,
+            y,
+        } if node == "dev.test" => Some((*x, *y)),
+        _ => None,
+    })
+    .map_err(|error| format!("dev TEST target was not published: {error}"))?;
     let dev_editor_center =
         wait_for_value(observer, events, EVENT_TIMEOUT, 0, |event| match event {
             ObserverEvent::RoleTarget {
@@ -335,7 +340,8 @@ fn exercise_native_roles(
                 y,
             } if node == DEV_EDITOR => Some((*x, *y)),
             _ => None,
-        })?;
+        })
+        .map_err(|error| format!("dev editor target was not published: {error}"))?;
 
     let editor_point = locate_target(
         session,
@@ -389,38 +395,57 @@ fn exercise_native_roles(
     let before_test = events.len();
     session.run_driver(&["move", &test_point.0.to_string(), &test_point.1.to_string()])?;
     session.run_driver(&["click", "left"])?;
-    wait_for_event(observer, events, EVENT_TIMEOUT, before_test, |event| {
-        matches!(event, ObserverEvent::InputAccepted(input)
-            if input.role == ObserverRole::Dev
-                && input.real_os
-                && input.target.as_deref() == Some("dev.test")
-                && input.kind == InputKind::PointerButton
-                && input.pointer_button_pressed == Some(false))
-    })
+    let test_action_visible = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        before_test,
+        |event| match event {
+            ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Dev
+                    && input.real_os
+                    && input.target.as_deref() == Some("dev.test")
+                    && input.kind == InputKind::PointerButton
+                    && input.pointer_button_pressed == Some(false) =>
+            {
+                Some(input.visible_change)
+            }
+            _ => None,
+        },
+    )
     .map_err(|error| {
         format!(
             "dev TEST click was not accepted: {error}; observed={}",
             input_event_trace(events, before_test, 8)
         )
     })?;
-    let test_target =
-        wait_for_value(
-            observer,
-            events,
-            EVENT_TIMEOUT,
-            before_test,
-            |event| match event {
-                ObserverEvent::TestTarget {
-                    request_id,
-                    node,
-                    source_path,
-                    x,
-                    y,
-                } => Some((*request_id, node.clone(), source_path.clone(), *x, *y)),
-                _ => None,
-            },
-        )
-        .map_err(|error| format!("preview did not publish a TEST target: {error}"))?;
+    if !test_action_visible {
+        return Err(format!(
+            "dev TEST release reached the button but did not activate it; observed={}",
+            input_event_trace(events, before_test, 8)
+        ));
+    }
+    let test_target = wait_for_value(observer, events, EVENT_TIMEOUT, before_test, |event| {
+        match event {
+            ObserverEvent::TestTarget {
+                request_id,
+                node,
+                source_path,
+                x,
+                y,
+            } => Some(Ok((*request_id, node.clone(), source_path.clone(), *x, *y))),
+            ObserverEvent::TestCompleted {
+                request_id,
+                passed: false,
+                completed_steps,
+                message,
+            } => Some(Err(format!(
+                "preview TEST request {request_id} failed after {completed_steps} steps: {message}"
+            ))),
+            _ => None,
+        }
+    })
+    .map_err(|error| format!("preview did not publish a TEST result: {error}"))??;
     let preview_placement = activate_window(
         session,
         observer,
@@ -537,18 +562,37 @@ fn exercise_native_roles(
     }
 
     if gate == Gate::Cells {
+        let move_start = events.len();
         session.run_driver(&[
             "move",
             &preview_point.0.to_string(),
             &preview_point.1.to_string(),
         ])?;
+        wait_for_event(observer, events, EVENT_TIMEOUT, move_start, |event| {
+            matches!(event, ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Preview
+                    && input.real_os
+                    && input.kind == InputKind::PointerMove
+                    && input.target.as_deref() == Some(test_target.1.as_str()))
+        })
+        .map_err(|error| {
+            format!(
+                "preview scroll target was not entered: {error}; observed={}",
+                input_event_trace(events, move_start, 8)
+            )
+        })?;
         for ordinal in 0..148 {
-            let amount = if ordinal % 2 == 0 { "4" } else { "-4" };
+            let amount = if ordinal % 2 == 0 { "-4" } else { "4" };
             let start = events.len();
             session.run_driver(&["axis", "vertical", amount])?;
             let sequence =
                 wait_for_visible_present(observer, events, start, InputKind::Wheel, |_| true)
-                    .map_err(|error| format!("scroll sample {ordinal} failed: {error}"))?;
+                    .map_err(|error| {
+                        format!(
+                            "scroll sample {ordinal} failed: {error}; observed={}",
+                            input_event_trace(events, start, 8)
+                        )
+                    })?;
             samples.scroll.insert(sequence);
         }
         if samples.scroll.len() < 148 {
@@ -607,7 +651,8 @@ fn exercise_native_roles(
                     }
                     _ => None,
                 },
-            )?;
+            )
+            .map_err(|error| format!("Counter source switch {ordinal} did not finish: {error}"))?;
         }
     }
 
@@ -620,7 +665,8 @@ fn exercise_native_roles(
                 ..
             }
         )
-    })?;
+    })
+    .map_err(|error| format!("final app-owned proof did not complete: {error}"))?;
     Ok(())
 }
 
@@ -860,7 +906,7 @@ fn observe_window(
 ) -> Result<(ObserverRole, WindowPlacement), String> {
     let mut last_role = None;
     let mut observations = VecDeque::with_capacity(12);
-    for point in window_scan_candidates() {
+    for point in window_scan_candidates(session.pointer_space()?) {
         if let Ok((actual, input)) =
             move_with_marker(session, observer, events, point, Duration::from_millis(100))
         {
@@ -908,19 +954,26 @@ fn other_role(role: ObserverRole) -> ObserverRole {
 }
 
 #[cfg(target_os = "linux")]
-fn window_scan_candidates() -> Vec<(i32, i32)> {
+fn window_scan_candidates((width, height): (i32, i32)) -> Vec<(i32, i32)> {
+    let point = |x_num: i32, x_den: i32, y_num: i32, y_den: i32| {
+        (
+            (width.saturating_mul(x_num) / x_den).clamp(0, width.saturating_sub(1)),
+            (height.saturating_mul(y_num) / y_den).clamp(0, height.saturating_sub(1)),
+        )
+    };
     let mut candidates = vec![
-        (540, 280),
-        (1_500, 280),
-        (540, 820),
-        (1_500, 820),
-        (960, 500),
-        (1_800, 500),
+        point(1, 4, 1, 4),
+        point(3, 4, 1, 4),
+        point(1, 4, 3, 4),
+        point(3, 4, 3, 4),
+        point(1, 2, 1, 2),
+        point(7, 8, 1, 2),
     ];
-    for y in (40..=960).step_by(80) {
-        for x in (40..=2_360).step_by(120) {
-            if !candidates.contains(&(x, y)) {
-                candidates.push((x, y));
+    for y_index in 1..10 {
+        for x_index in 1..16 {
+            let candidate = point(x_index, 16, y_index, 10);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
             }
         }
     }
@@ -1949,6 +2002,18 @@ fn add_frame_budget_check(
                 .map(|sample| sample.render_us)
                 .collect(),
         );
+        let render_component_p95 = |select: fn(&FramePresented) -> u64| {
+            component_summary(samples.iter().skip(warmup).map(select).collect::<Vec<_>>()).p95_us
+        };
+        let scene_convert = render_component_p95(|sample| sample.document_scene_convert_us);
+        let scene_key = render_component_p95(|sample| sample.scene_key_us);
+        let rect_vertices = render_component_p95(|sample| sample.rect_vertices_us);
+        let asset_prepare = render_component_p95(|sample| sample.asset_prepare_us);
+        let quad_batch_key = render_component_p95(|sample| sample.quad_batch_key_us);
+        let quad_upload = render_component_p95(|sample| sample.quad_upload_us);
+        let draw_pass = render_component_p95(|sample| sample.draw_pass_us);
+        let retained_metrics = render_component_p95(|sample| sample.retained_metrics_us);
+        let text_render = render_component_p95(|sample| sample.text_render_us);
         let submit = component_summary(
             samples
                 .iter()
@@ -1965,7 +2030,7 @@ fn add_frame_budget_check(
         );
         if let Some(check) = checks.last_mut() {
             check.detail = bounded_detail(format!(
-                "{}; component p95/max: dispatch={}/{}us executor={}/{}us runtime_document={}/{}us retained={}/{}us frame={}/{}us acquire={}us render={}us submit={}us present={}us",
+                "{}; component p95/max: dispatch={}/{}us executor={}/{}us runtime_document={}/{}us retained={}/{}us frame={}/{}us acquire={}us render={}us submit={}us present={}us; render p95: convert={}us scene_key={}us rects={}us assets={}us batch_key={}us upload={}us draw={}us metrics={}us text={}us",
                 check.detail,
                 event_dispatch.p95_us,
                 event_dispatch.max_us,
@@ -1980,7 +2045,16 @@ fn add_frame_budget_check(
                 acquire.p95_us,
                 render.p95_us,
                 submit.p95_us,
-                present.p95_us
+                present.p95_us,
+                scene_convert,
+                scene_key,
+                rect_vertices,
+                asset_prepare,
+                quad_batch_key,
+                quad_upload,
+                draw_pass,
+                retained_metrics,
+                text_render,
             ));
         }
     }
@@ -2185,9 +2259,11 @@ impl Drop for ScratchDir {
 struct NativeSession {
     desktop_pid: u32,
     launch_id: String,
+    isolated_seat_name: String,
     observed_roles: Vec<u32>,
     input: Option<NativeInput>,
     workspace: Option<WorkspaceGuard>,
+    pointer_space: Option<(i32, i32)>,
     closed: bool,
 }
 
@@ -2222,6 +2298,7 @@ impl NativeSession {
             NATIVE_WORKSPACE,
             "--frame-pacing",
             "demand",
+            "--isolated-input",
             "--",
             "env",
         ]);
@@ -2233,7 +2310,7 @@ impl NativeSession {
             .args(["--role", "desktop", "--example", example, "--ipc-path"])
             .arg(ipc);
         let result = run_logged(&mut launcher, &launch_log, Duration::from_secs(10))
-            .map_err(|error| format!("launch ordinary COSMIC windows: {error}"))?;
+            .map_err(|error| format!("launch isolated COSMIC windows: {error}"))?;
         if !result.success() {
             return Err(process_failure(
                 "cosmic-background-launch",
@@ -2254,19 +2331,39 @@ impl NativeSession {
             .filter(|value| !value.is_empty())
             .ok_or("cosmic-background-launch omitted the launch ID")?
             .to_owned();
-        let input = match NativeInput::start(executable) {
+        let isolated_seat_name = launch_fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or("cosmic-background-launch omitted the isolated seat name")?
+            .to_owned();
+        if launch_fields.next().is_some() {
+            terminate_process(desktop_pid, "TERM");
+            let _ = release_background_launch(&launch_id);
+            return Err("cosmic-background-launch returned unexpected fields".to_owned());
+        }
+        let input = match NativeInput::start(executable, &isolated_seat_name) {
             Ok(input) => input,
             Err(error) => {
                 terminate_process(desktop_pid, "TERM");
+                let _ = release_background_launch(&launch_id);
                 return Err(error);
             }
         };
+        if let Err(error) = wait_for_isolated_input(&launch_id, &isolated_seat_name) {
+            let mut input = input;
+            let _ = input.shutdown();
+            terminate_process(desktop_pid, "TERM");
+            let _ = release_background_launch(&launch_id);
+            return Err(error);
+        }
         Ok(Self {
             desktop_pid,
             launch_id,
+            isolated_seat_name,
             observed_roles: Vec::new(),
             input: Some(input),
             workspace: None,
+            pointer_space: None,
             closed: false,
         })
     }
@@ -2275,7 +2372,7 @@ impl NativeSession {
         self.desktop_pid
     }
 
-    fn activate_workspace(&mut self, executable: &Path) -> Result<(), String> {
+    fn prepare_background_workspace(&mut self, executable: &Path) -> Result<(), String> {
         let output = Command::new("cosmic-background-launch")
             .args(["--reconcile", &self.launch_id])
             .output()
@@ -2298,6 +2395,9 @@ impl NativeSession {
             ));
         }
         let workspace = WorkspaceGuard::start(executable, NATIVE_WORKSPACE)?;
+        let isolation = query_isolation_status(&self.launch_id)?;
+        isolation.require_safe(&self.isolated_seat_name)?;
+        isolation.require_layout(self.observed_roles.len())?;
         let (width, height) = workspace.output_size();
         let input = self
             .input
@@ -2305,6 +2405,7 @@ impl NativeSession {
             .ok_or("kernel virtual input process is unavailable")?;
         input.set_pointer_space(width, height)?;
         input.prepare_pointer()?;
+        self.pointer_space = Some((width, height));
         self.workspace = Some(workspace);
         Ok(())
     }
@@ -2410,6 +2511,12 @@ impl NativeSession {
         Ok((coordinate("x=")?, coordinate("y=")?))
     }
 
+    fn pointer_space(&self) -> Result<(i32, i32), String> {
+        self.pointer_space.ok_or(
+            "native pointer space is unavailable before isolated layout preparation".to_owned(),
+        )
+    }
+
     fn shutdown(&mut self) -> Result<(), String> {
         if self.closed {
             return Ok(());
@@ -2422,7 +2529,7 @@ impl NativeSession {
             errors.push(error);
         }
         if let Some(mut workspace) = self.workspace.take()
-            && let Err(error) = workspace.restore()
+            && let Err(error) = workspace.shutdown()
         {
             errors.push(error);
         }
@@ -2447,6 +2554,9 @@ impl NativeSession {
         {
             terminate_process(pid, "KILL");
         }
+        if let Err(error) = release_background_launch(&self.launch_id) {
+            errors.push(error);
+        }
         self.desktop_pid = 0;
         let leaked = pids
             .into_iter()
@@ -2462,6 +2572,145 @@ impl NativeSession {
         } else {
             Err(errors.join("; "))
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct IsolationStatus {
+    seat_name: String,
+    device_count: usize,
+    workspace_active: bool,
+    mapped_surface_count: usize,
+    tiling_enabled: bool,
+    floating_window_count: usize,
+    tiled_window_count: usize,
+    maximized_window_count: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl IsolationStatus {
+    fn require_safe(&self, expected_seat: &str) -> Result<(), String> {
+        if self.seat_name != expected_seat {
+            return Err(format!(
+                "isolated input status named seat `{}`, expected `{expected_seat}`",
+                self.seat_name
+            ));
+        }
+        if self.device_count != 2 {
+            return Err(format!(
+                "isolated seat `{expected_seat}` owns {} devices, expected pointer and keyboard",
+                self.device_count
+            ));
+        }
+        if self.workspace_active {
+            return Err(format!(
+                "isolated seat `{expected_seat}` targets the active workspace; refusing input"
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_layout(&self, expected_windows: usize) -> Result<(), String> {
+        if !self.tiling_enabled
+            || self.floating_window_count != 0
+            || self.tiled_window_count < expected_windows
+            || self.maximized_window_count != 0
+            || self.mapped_surface_count < expected_windows
+        {
+            return Err(format!(
+                "isolated workspace layout is not independently tiled: mapped={}, tiled={}, \
+                 floating={}, maximized={}, tiling_enabled={}, expected_windows={expected_windows}",
+                self.mapped_surface_count,
+                self.tiled_window_count,
+                self.floating_window_count,
+                self.maximized_window_count,
+                self.tiling_enabled,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_isolated_input(
+    launch_id: &str,
+    expected_seat: &str,
+) -> Result<IsolationStatus, String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let error = match query_isolation_status(launch_id) {
+            Ok(status) => match status.require_safe(expected_seat) {
+                Ok(()) => return Ok(status),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(error);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_isolation_status(launch_id: &str) -> Result<IsolationStatus, String> {
+    let output = Command::new("cosmic-background-launch")
+        .args(["--isolation-status", launch_id])
+        .output()
+        .map_err(|error| format!("query COSMIC input isolation: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "COSMIC input isolation query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let output = String::from_utf8(output.stdout)
+        .map_err(|error| format!("invalid COSMIC isolation status: {error}"))?;
+    let value = |name: &str| {
+        output
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(name))
+            .ok_or_else(|| format!("COSMIC isolation status omitted {name}"))
+    };
+    Ok(IsolationStatus {
+        seat_name: value("seat=")?.to_owned(),
+        device_count: value("devices=")?
+            .parse()
+            .map_err(|error| format!("invalid isolated device count: {error}"))?,
+        workspace_active: value("workspace_active=")?
+            .parse()
+            .map_err(|error| format!("invalid isolated workspace state: {error}"))?,
+        mapped_surface_count: value("mapped_surfaces=")?
+            .parse()
+            .map_err(|error| format!("invalid isolated mapped-surface count: {error}"))?,
+        tiling_enabled: value("tiling_enabled=")?
+            .parse()
+            .map_err(|error| format!("invalid isolated tiling state: {error}"))?,
+        floating_window_count: value("floating_windows=")?
+            .parse()
+            .map_err(|error| format!("invalid isolated floating-window count: {error}"))?,
+        tiled_window_count: value("tiled_windows=")?
+            .parse()
+            .map_err(|error| format!("invalid isolated tiled-window count: {error}"))?,
+        maximized_window_count: value("maximized_windows=")?
+            .parse()
+            .map_err(|error| format!("invalid isolated maximized-window count: {error}"))?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn release_background_launch(launch_id: &str) -> Result<(), String> {
+    let output = Command::new("cosmic-background-launch")
+        .args(["--release", launch_id])
+        .output()
+        .map_err(|error| format!("release COSMIC background launch: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "release COSMIC background launch failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
@@ -2533,7 +2782,7 @@ fn cleanup_check(result: Result<(), String>) -> Check {
     match result {
         Ok(()) => Check::pass(
             "native-os-input-cleanup",
-            "virtual devices, workspace guard, and desktop/preview/dev process tree stopped without leaks",
+            "isolated virtual devices and desktop/preview/dev process tree stopped without leaks or workspace activation",
         ),
         Err(error) => Check::fail("native-os-input-cleanup", error),
     }
@@ -2979,5 +3228,17 @@ mod tests {
     fn scratch_names_cannot_escape_the_runtime_directory() {
         assert_eq!(safe_component("../../run/id"), "______run_id");
         assert_eq!(safe_component("cells-01"), "cells-01");
+    }
+
+    #[test]
+    fn window_scan_covers_the_entire_reported_output() {
+        let candidates = window_scan_candidates((5_120, 1_440));
+        assert!(candidates.iter().any(|(x, _)| *x > 3_500));
+        assert!(candidates.iter().any(|(_, y)| *y > 1_000));
+        assert!(
+            candidates
+                .iter()
+                .all(|(x, y)| (0..5_120).contains(x) && (0..1_440).contains(y))
+        );
     }
 }

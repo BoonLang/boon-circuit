@@ -18,11 +18,12 @@ use glyphon::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 pub mod generated {
@@ -324,6 +325,14 @@ struct RenderSceneItem {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct InternalRenderSceneCacheKey {
     scene_identity: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct DocumentQuadCacheKey {
+    retained_chunk_id: String,
+    occurrence: u32,
     width: u32,
     height: u32,
 }
@@ -657,9 +666,9 @@ enum QuadTexture {
 
 #[derive(Clone, Debug)]
 struct QuadBatch {
-    retained_chunk_id: String,
+    retained_chunk_id: Arc<str>,
     texture: QuadTexture,
-    vertices: Vec<NativeGpuQuadVertex>,
+    vertices: Arc<Vec<NativeGpuQuadVertex>>,
 }
 
 #[repr(C)]
@@ -993,20 +1002,20 @@ impl QuadBuilder {
         color: [f32; 4],
     ) {
         let batch = if self.batches.last().is_some_and(|batch| {
-            batch.texture == texture && batch.retained_chunk_id == self.retained_chunk_id
+            batch.texture == texture && batch.retained_chunk_id.as_ref() == self.retained_chunk_id
         }) {
             self.batches.last_mut().unwrap()
         } else {
             self.batches.push(QuadBatch {
-                retained_chunk_id: self.retained_chunk_id.clone(),
+                retained_chunk_id: Arc::from(self.retained_chunk_id.as_str()),
                 texture,
-                vertices: Vec::new(),
+                vertices: Arc::new(Vec::new()),
             });
             self.batches.last_mut().unwrap()
         };
         let color = pack_rgba8_from_f32(color);
         for (point, uv) in points.into_iter().zip(uvs) {
-            batch.vertices.push(NativeGpuQuadVertex {
+            Arc::make_mut(&mut batch.vertices).push(NativeGpuQuadVertex {
                 position: [
                     (point[0] / surface_width.max(1.0))
                         .mul_add(2.0, -1.0)
@@ -1343,11 +1352,13 @@ pub struct VisibleLayoutRenderer {
     text: GlyphonTextState,
     textures: TextureState,
     internal_scene_cache: BTreeMap<InternalRenderSceneCacheKey, RenderScene>,
+    document_quad_cache: HashMap<DocumentQuadCacheKey, Vec<QuadBatch>>,
     quad_buffers: BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>,
     quad_upload_ring: QuadUploadRing,
     prepared_quads: BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>,
     previous_chunk_ids: BTreeSet<String>,
     product_frame_graph: ProductFrameGraphState,
+    diagnostics_enabled: bool,
 }
 
 impl VisibleLayoutRenderer {
@@ -1395,12 +1406,18 @@ impl VisibleLayoutRenderer {
             text: GlyphonTextState::new(device, queue, format),
             textures: TextureState::new(device, queue),
             internal_scene_cache: BTreeMap::new(),
+            document_quad_cache: HashMap::new(),
             quad_buffers: BTreeMap::new(),
             quad_upload_ring: QuadUploadRing::default(),
             prepared_quads: BTreeMap::new(),
             previous_chunk_ids: BTreeSet::new(),
             product_frame_graph: ProductFrameGraphState::default(),
+            diagnostics_enabled: true,
         }
+    }
+
+    pub fn set_diagnostics_enabled(&mut self, enabled: bool) {
+        self.diagnostics_enabled = enabled;
     }
 
     pub fn encode_scene(
@@ -1414,12 +1431,14 @@ impl VisibleLayoutRenderer {
             &mut self.text,
             &mut self.textures,
             &mut self.internal_scene_cache,
+            &mut self.document_quad_cache,
             &mut self.quad_buffers,
             &mut self.quad_upload_ring,
             &mut self.prepared_quads,
             &mut self.previous_chunk_ids,
             &mut self.product_frame_graph,
             self.frame_seq,
+            self.diagnostics_enabled,
         )
     }
 }
@@ -1475,12 +1494,14 @@ fn encode_render_scene_to_surface_with_pipeline(
     text: &mut GlyphonTextState,
     textures: &mut TextureState,
     internal_scene_cache: &mut BTreeMap<InternalRenderSceneCacheKey, RenderScene>,
+    document_quad_cache: &mut HashMap<DocumentQuadCacheKey, Vec<QuadBatch>>,
     quad_buffers: &mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>,
     quad_upload_ring: &mut QuadUploadRing,
     prepared_quads: &mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>,
     previous_chunk_ids: &mut BTreeSet<String>,
     product_frame_graph: &mut ProductFrameGraphState,
     frame_seq: u64,
+    diagnostics_enabled: bool,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width.clamp(1, 1920);
     let height = request.height.clamp(1, 1080);
@@ -1492,7 +1513,14 @@ fn encode_render_scene_to_surface_with_pipeline(
         evict_internal_scene_cache_if_needed(internal_scene_cache);
         internal_scene_cache.insert(
             cache_key.clone(),
-            render_scene_from_document_scene(request.scene, width, height),
+            render_scene_from_document_scene_cached(
+                request.scene,
+                width,
+                height,
+                document_quad_cache,
+                request.scene_identity.is_some(),
+                false,
+            ),
         );
     }
     let cache_entry_count = internal_scene_cache.len() as u32;
@@ -1512,6 +1540,8 @@ fn encode_render_scene_to_surface_with_pipeline(
             height,
         },
         scene,
+        Some(&request.scene.items),
+        Some(&request.scene.text_runs),
         pipeline,
         text,
         textures,
@@ -1522,6 +1552,7 @@ fn encode_render_scene_to_surface_with_pipeline(
         product_frame_graph,
         render_scene_supplied_cache_key(request.scene_identity, width, height),
         frame_seq,
+        diagnostics_enabled,
     )?;
     metrics.document_scene_convert_ms = document_scene_convert_ms;
     metrics.document_scene_cache_hit = cache_hit;
@@ -2077,6 +2108,8 @@ fn product_frame_graph_schedule_metrics(
 fn encode_internal_scene_to_surface(
     request: SceneEncodeRequest<'_>,
     scene: &RenderScene,
+    document_metric_items: Option<&[boon_document::RenderSceneItem]>,
+    document_text_runs: Option<&[RenderTextRun]>,
     pipeline: &wgpu::RenderPipeline,
     text: &mut GlyphonTextState,
     textures: &mut TextureState,
@@ -2087,11 +2120,13 @@ fn encode_internal_scene_to_surface(
     product_frame_graph: &mut ProductFrameGraphState,
     scene_key_override: Option<u64>,
     frame_seq: u64,
+    diagnostics_enabled: bool,
 ) -> Result<FrameMetrics, RenderError> {
     let width = request.width;
     let height = request.height;
-    let text_runs_shaped = scene.text_runs.len() as u32;
-    let render_schedule = ProductFrameSchedule::product_surface(scene.text_runs.len());
+    let text_runs = document_text_runs.unwrap_or(&scene.text_runs);
+    let text_runs_shaped = text_runs.len() as u32;
+    let render_schedule = ProductFrameSchedule::product_surface(text_runs.len());
     let mut render_graph = ProductFrameGraphExecutor::new(render_schedule);
     let (scene_key, scene_key_ms) = render_graph.run_product_pass(
         ProductFrameGraphPassId::SceneKey,
@@ -2189,7 +2224,7 @@ fn encode_internal_scene_to_surface(
                             let reservation_size =
                                 quad_upload_reservation_size(vertex_bytes.len() as u64);
                             let cache_key = QuadBatchCacheKey {
-                                retained_chunk_id: batch.retained_chunk_id.clone(),
+                                retained_chunk_id: batch.retained_chunk_id.to_string(),
                                 texture: batch.texture.clone(),
                                 vertex_count,
                                 content_key: quad_batch_content_key(vertex_bytes),
@@ -2263,7 +2298,7 @@ fn encode_internal_scene_to_surface(
                                     request.queue,
                                     vertex_bytes,
                                     vertex_count,
-                                    Some(batch.retained_chunk_id.clone()),
+                                    Some(batch.retained_chunk_id.to_string()),
                                 )?;
                                 upload_bytes = upload_bytes.saturating_add(stats.upload_bytes);
                                 allocated_gpu_bytes =
@@ -2380,12 +2415,26 @@ fn encode_internal_scene_to_surface(
         ProductFrameGraphResourceId::RenderScene,
         ProductFrameGraphResourceId::FrameMetrics,
         || {
-            let metrics = sampled_retained_render_chunks(
-                scene,
-                frame_seq,
-                Some(previous_chunk_ids),
-                RETAINED_CHUNK_METRIC_SAMPLE_LIMIT,
-            );
+            let metrics = if diagnostics_enabled {
+                match document_metric_items {
+                    Some(items) => sampled_retained_render_chunks(
+                        items,
+                        text_runs,
+                        frame_seq,
+                        Some(previous_chunk_ids),
+                        RETAINED_CHUNK_METRIC_SAMPLE_LIMIT,
+                    ),
+                    None => sampled_retained_render_chunks(
+                        &scene.items,
+                        text_runs,
+                        frame_seq,
+                        Some(previous_chunk_ids),
+                        RETAINED_CHUNK_METRIC_SAMPLE_LIMIT,
+                    ),
+                }
+            } else {
+                RetainedRenderChunkMetricSummary::default()
+            };
             Ok((metrics, RendererRenderGraphPassStats::default()))
         },
     )?;
@@ -2408,15 +2457,14 @@ fn encode_internal_scene_to_surface(
     let ((rendered_text_runs, text_cache_metrics), text_render_ms) = render_graph
         .run_product_pass(
             ProductFrameGraphPassId::TextDraw,
-            if scene.text_runs.is_empty() {
+            if text_runs.is_empty() {
                 ProductFrameGraphResourceId::NoTextRuns
             } else {
                 ProductFrameGraphResourceId::TextRuns
             },
             ProductFrameGraphResourceId::ColorTarget,
             || {
-                let glyphon_text_runs = scene
-                    .text_runs
+                let glyphon_text_runs = text_runs
                     .iter()
                     .cloned()
                     .map(TextRun::from)
@@ -2440,78 +2488,68 @@ fn encode_internal_scene_to_surface(
             },
         )?;
     let render_execution = render_graph.finish()?;
-    let renderer_render_graph_passes = render_execution.executed_passes;
-    let mut renderer_render_graph_resources = render_execution.schedule.planned_resources();
-    let renderer_render_graph_resource_signatures = renderer_render_graph_resource_signatures(
-        scene_key,
-        frame_seq,
-        text_runs_shaped,
-        rendered_text_runs,
-        &dirty_upload_chunk_ids,
-    );
-    let retained_state_metrics = product_frame_graph.update_resources(
-        frame_seq,
-        &mut renderer_render_graph_resources,
-        &renderer_render_graph_resource_signatures,
-    );
-    let renderer_render_graph_schedule_decisions = render_execution
-        .schedule
-        .schedule_decisions(&renderer_render_graph_resources, &dirty_upload_chunk_ids);
-    let schedule_metrics =
-        product_frame_graph_schedule_metrics(&renderer_render_graph_schedule_decisions);
-    let renderer_render_graph_plan_hash = render_execution.schedule.plan_hash();
-    let renderer_render_graph_workload_hash =
-        renderer_render_graph_workload_hash(&renderer_render_graph_passes);
-    let renderer_render_graph_resource_lifetime_hash =
-        renderer_render_graph_resource_lifetime_hash(&renderer_render_graph_resources);
-    let renderer_render_graph_kind = "boon_native_gpu_product_frame_graph".to_owned();
-    let renderer_render_graph_execution_kind = "retained_product_frame_graph_linear_v1".to_owned();
-    let renderer_render_graph_pass_count = renderer_render_graph_passes.len() as u32;
-    let renderer_render_graph_product_pass_count = renderer_render_graph_passes
-        .iter()
-        .filter(|pass| pass.product_visible)
-        .count() as u32;
-    let renderer_render_graph_proof_pass_count = renderer_render_graph_passes
-        .iter()
-        .filter(|pass| pass.proof_or_readback)
-        .count() as u32;
-    let renderer_render_graph_resource_count = renderer_render_graph_resources.len() as u32;
-    let renderer_render_graph_product_resource_count = renderer_render_graph_resources
-        .iter()
-        .filter(|resource| resource.product_visible)
-        .count() as u32;
-    let renderer_render_graph_scheduler_kind = render_execution.schedule.scheduler_kind.to_owned();
-    let product_frame_graph = ProductFrameGraphReport {
-        schema_version: 1,
-        owner: "boon_native_gpu".to_owned(),
-        graph_kind: renderer_render_graph_kind.clone(),
-        execution_kind: renderer_render_graph_execution_kind.clone(),
-        plan_hash: renderer_render_graph_plan_hash.clone(),
-        workload_hash: renderer_render_graph_workload_hash.clone(),
-        pass_count: renderer_render_graph_pass_count,
-        product_pass_count: renderer_render_graph_product_pass_count,
-        proof_pass_count: renderer_render_graph_proof_pass_count,
-        resource_count: renderer_render_graph_resource_count,
-        product_resource_count: renderer_render_graph_product_resource_count,
-        resource_lifetime_hash: renderer_render_graph_resource_lifetime_hash.clone(),
-        retained_resource_epoch_hash: retained_state_metrics.resource_epoch_hash.clone(),
-        retained_dirty_resource_count: retained_state_metrics.dirty_resource_count,
-        retained_reused_resource_count: retained_state_metrics.reused_resource_count,
-        retained_state_resource_count: retained_state_metrics.resource_count,
-        scheduler_kind: renderer_render_graph_scheduler_kind.clone(),
-        schedule_hash: schedule_metrics.schedule_hash.clone(),
-        schedule_decision_count: schedule_metrics.decision_count,
-        dirty_resource_decision_count: schedule_metrics.dirty_resource_decision_count,
-        reuse_resource_decision_count: schedule_metrics.reuse_resource_decision_count,
-        per_present_resource_decision_count: schedule_metrics.per_present_resource_decision_count,
-        passes: renderer_render_graph_passes.clone(),
-        resources: renderer_render_graph_resources.clone(),
-        schedule_decisions: renderer_render_graph_schedule_decisions.clone(),
-    };
+    let product_frame_graph = diagnostics_enabled.then(|| {
+        let renderer_render_graph_passes = render_execution.executed_passes;
+        let mut renderer_render_graph_resources = render_execution.schedule.planned_resources();
+        let signatures = renderer_render_graph_resource_signatures(
+            scene_key,
+            frame_seq,
+            text_runs_shaped,
+            rendered_text_runs,
+            &dirty_upload_chunk_ids,
+        );
+        let retained = product_frame_graph.update_resources(
+            frame_seq,
+            &mut renderer_render_graph_resources,
+            &signatures,
+        );
+        let decisions = render_execution
+            .schedule
+            .schedule_decisions(&renderer_render_graph_resources, &dirty_upload_chunk_ids);
+        let schedule = product_frame_graph_schedule_metrics(&decisions);
+        ProductFrameGraphReport {
+            schema_version: 1,
+            owner: "boon_native_gpu".to_owned(),
+            graph_kind: "boon_native_gpu_product_frame_graph".to_owned(),
+            execution_kind: "retained_product_frame_graph_linear_v1".to_owned(),
+            plan_hash: render_execution.schedule.plan_hash(),
+            workload_hash: renderer_render_graph_workload_hash(&renderer_render_graph_passes),
+            pass_count: renderer_render_graph_passes.len() as u32,
+            product_pass_count: renderer_render_graph_passes
+                .iter()
+                .filter(|pass| pass.product_visible)
+                .count() as u32,
+            proof_pass_count: renderer_render_graph_passes
+                .iter()
+                .filter(|pass| pass.proof_or_readback)
+                .count() as u32,
+            resource_count: renderer_render_graph_resources.len() as u32,
+            product_resource_count: renderer_render_graph_resources
+                .iter()
+                .filter(|resource| resource.product_visible)
+                .count() as u32,
+            resource_lifetime_hash: renderer_render_graph_resource_lifetime_hash(
+                &renderer_render_graph_resources,
+            ),
+            retained_resource_epoch_hash: retained.resource_epoch_hash,
+            retained_dirty_resource_count: retained.dirty_resource_count,
+            retained_reused_resource_count: retained.reused_resource_count,
+            retained_state_resource_count: retained.resource_count,
+            scheduler_kind: render_execution.schedule.scheduler_kind.to_owned(),
+            schedule_hash: schedule.schedule_hash,
+            schedule_decision_count: schedule.decision_count,
+            dirty_resource_decision_count: schedule.dirty_resource_decision_count,
+            reuse_resource_decision_count: schedule.reuse_resource_decision_count,
+            per_present_resource_decision_count: schedule.per_present_resource_decision_count,
+            passes: renderer_render_graph_passes,
+            resources: renderer_render_graph_resources,
+            schedule_decisions: decisions,
+        }
+    });
     Ok(FrameMetrics {
         frame_seq,
         render_scene_source: RENDER_SCENE_SOURCE_INTERNAL_RENDER_SCENE.to_owned(),
-        product_frame_graph: Some(product_frame_graph),
+        product_frame_graph,
         document_scene_convert_ms: 0.0,
         document_scene_cache_hit: false,
         document_scene_cache_entry_count: 0,
@@ -2799,7 +2837,7 @@ fn render_scene_cache_key(scene: &RenderScene) -> u64 {
                 key.height.hash(&mut hasher);
             }
         }
-        for vertex in &batch.vertices {
+        for vertex in batch.vertices.iter() {
             for coordinate in vertex.position {
                 coordinate.to_bits().hash(&mut hasher);
             }
@@ -2838,10 +2876,13 @@ fn hash_rect(hasher: &mut DefaultHasher, rect: Rect) {
     rect.height.to_bits().hash(hasher);
 }
 
-fn render_scene_from_document_scene(
+fn render_scene_from_document_scene_cached(
     scene: &DocumentRenderScene,
     width: u32,
     height: u32,
+    document_quad_cache: &mut HashMap<DocumentQuadCacheKey, Vec<QuadBatch>>,
+    use_retained_quad_cache: bool,
+    retain_metric_items: bool,
 ) -> RenderScene {
     let viewport = Rect {
         x: scene.viewport.x,
@@ -2849,24 +2890,41 @@ fn render_scene_from_document_scene(
         width: scene.viewport.width.min(width as f32).max(1.0),
         height: scene.viewport.height.min(height as f32).max(1.0),
     };
-    let items = scene
-        .items
-        .iter()
-        .map(|item| RenderSceneItem {
-            node: item.node.clone(),
-            retained_chunk_id: document_item_retained_chunk_id(item),
-            source_kind: format!("{:?}", item.source_kind),
-            bounds: item.bounds,
-            clip: item.clip,
-            transform: item.transform,
-            style_identity: item.style_identity,
-            dependency_set: item.dependency_set.clone(),
-            texture_asset_refs: item.texture_asset_refs.clone(),
-            estimated_vertex_count: item.estimated_vertex_count,
+    let items = retain_metric_items
+        .then(|| {
+            scene
+                .items
+                .iter()
+                .map(|item| RenderSceneItem {
+                    node: item.node.clone(),
+                    retained_chunk_id: document_item_retained_chunk_id(item),
+                    source_kind: format!("{:?}", item.source_kind),
+                    bounds: item.bounds,
+                    clip: item.clip,
+                    transform: item.transform,
+                    style_identity: item.style_identity,
+                    dependency_set: item.dependency_set.clone(),
+                    texture_asset_refs: item.texture_asset_refs.clone(),
+                    estimated_vertex_count: item.estimated_vertex_count,
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     let quad_batches = if scene.quad_batches.is_empty() {
-        quad_batches_from_visual_primitives(&scene.visual_primitives, width as f32, height as f32)
+        if use_retained_quad_cache {
+            cached_quad_batches_from_visual_primitives(
+                &scene.visual_primitives,
+                width,
+                height,
+                document_quad_cache,
+            )
+        } else {
+            quad_batches_from_visual_primitives_iter(
+                scene.visual_primitives.iter(),
+                width as f32,
+                height as f32,
+            )
+        }
     } else {
         scene
             .quad_batches
@@ -2884,8 +2942,19 @@ fn render_scene_from_document_scene(
             cap_hit: scene.metrics.cap_hit,
         },
         quad_batches,
-        text_runs: scene.text_runs.clone(),
+        text_runs: retain_metric_items
+            .then(|| scene.text_runs.clone())
+            .unwrap_or_default(),
     }
+}
+
+#[cfg(test)]
+fn render_scene_from_document_scene(
+    scene: &DocumentRenderScene,
+    width: u32,
+    height: u32,
+) -> RenderScene {
+    render_scene_from_document_scene_cached(scene, width, height, &mut HashMap::new(), false, true)
 }
 
 fn document_item_retained_chunk_id(item: &boon_document::RenderSceneItem) -> String {
@@ -2904,11 +2973,11 @@ fn document_item_retained_chunk_id(item: &boon_document::RenderSceneItem) -> Str
     )
 }
 
-fn document_primitive_retained_chunk_id(primitive: &RenderVisualPrimitive) -> String {
+fn document_primitive_retained_chunk_id(primitive: &RenderVisualPrimitive) -> Cow<'_, str> {
     if !primitive.retained_chunk_id.is_empty() {
-        return primitive.retained_chunk_id.clone();
+        return Cow::Borrowed(&primitive.retained_chunk_id);
     }
-    format!(
+    Cow::Owned(format!(
         "chunk:{}:{:?}:{:x}:{:x}:{:x}:{:x}:{:x}",
         primitive.node.0,
         primitive.source_kind,
@@ -2917,15 +2986,50 @@ fn document_primitive_retained_chunk_id(primitive: &RenderVisualPrimitive) -> St
         primitive.style_identity.paint_id,
         primitive.style_identity.material_id,
         primitive.style_identity.pseudo_state_id
-    )
+    ))
 }
 
-fn quad_batches_from_visual_primitives(
+fn cached_quad_batches_from_visual_primitives(
     primitives: &[RenderVisualPrimitive],
-    width: f32,
-    height: f32,
+    width: u32,
+    height: u32,
+    cache: &mut HashMap<DocumentQuadCacheKey, Vec<QuadBatch>>,
 ) -> Vec<QuadBatch> {
-    quad_batches_from_visual_primitives_iter(primitives.iter(), width, height)
+    let mut current = HashSet::new();
+    let mut occurrences = HashMap::<String, u32>::new();
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < primitives.len() {
+        let retained_chunk_id = document_primitive_retained_chunk_id(&primitives[start]);
+        let mut end = start + 1;
+        while end < primitives.len()
+            && document_primitive_retained_chunk_id(&primitives[end]).as_ref()
+                == retained_chunk_id.as_ref()
+        {
+            end += 1;
+        }
+        let retained_chunk_id = retained_chunk_id.into_owned();
+        let occurrence = occurrences.entry(retained_chunk_id.clone()).or_default();
+        let key = DocumentQuadCacheKey {
+            retained_chunk_id,
+            occurrence: *occurrence,
+            width,
+            height,
+        };
+        *occurrence = occurrence.saturating_add(1);
+        current.insert(key.clone());
+        let cached = cache.entry(key).or_insert_with(|| {
+            quad_batches_from_visual_primitives_iter(
+                primitives[start..end].iter(),
+                width as f32,
+                height as f32,
+            )
+        });
+        batches.extend(cached.iter().cloned());
+        start = end;
+    }
+    cache.retain(|key, _| current.contains(key));
+    batches
 }
 
 fn quad_batches_from_visual_primitives_iter<'a>(
@@ -2935,7 +3039,7 @@ fn quad_batches_from_visual_primitives_iter<'a>(
 ) -> Vec<QuadBatch> {
     let mut builder = QuadBuilder::default();
     for primitive in primitives {
-        builder.set_retained_chunk_id(&document_primitive_retained_chunk_id(primitive));
+        builder.set_retained_chunk_id(document_primitive_retained_chunk_id(primitive).as_ref());
         match primitive.primitive {
             RenderVisualPrimitiveKind::Asset => {
                 if let RenderTextureRef::Asset { url, .. } = &primitive.texture {
@@ -3048,12 +3152,18 @@ fn quad_batch_from_document_batch(
     fallback_index: usize,
 ) -> QuadBatch {
     QuadBatch {
-        retained_chunk_id: batch
-            .retained_chunk_id
-            .clone()
-            .unwrap_or_else(|| format!("document-quad-batch:{fallback_index}")),
+        retained_chunk_id: Arc::from(
+            batch
+                .retained_chunk_id
+                .clone()
+                .unwrap_or_else(|| format!("document-quad-batch:{fallback_index}")),
+        ),
         texture: quad_texture_from_render_texture_ref(&batch.texture),
-        vertices: quad_vertices_from_split_buffers(&batch.positions, &batch.colors, &batch.uvs),
+        vertices: Arc::new(quad_vertices_from_split_buffers(
+            &batch.positions,
+            &batch.colors,
+            &batch.uvs,
+        )),
     }
 }
 
@@ -3112,7 +3222,7 @@ fn rect_vertices_from_scene(
     (scene.quad_batches.clone(), scene.rect_metrics)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct RetainedRenderChunkMetricSummary {
     retained_chunk_count: u32,
     retained_chunk_hit_count: u32,
@@ -3121,14 +3231,112 @@ struct RetainedRenderChunkMetricSummary {
     current_chunk_ids: BTreeSet<String>,
 }
 
-fn sampled_retained_render_chunks(
-    scene: &RenderScene,
+trait RetainedMetricItem {
+    fn node(&self) -> &DocumentNodeId;
+    fn retained_chunk_id(&self) -> String;
+    fn kind(&self) -> String;
+    fn bounds(&self) -> Rect;
+    fn clip(&self) -> Option<Rect>;
+    fn transform(&self) -> [f32; 6];
+    fn style_identity(&self) -> boon_document::ComputedStyleIdentity;
+    fn dependency_set(&self) -> &[String];
+    fn texture_asset_refs(&self) -> &[String];
+    fn estimated_vertex_count(&self) -> u32;
+}
+
+impl RetainedMetricItem for RenderSceneItem {
+    fn node(&self) -> &DocumentNodeId {
+        &self.node
+    }
+
+    fn retained_chunk_id(&self) -> String {
+        self.retained_chunk_id.clone()
+    }
+
+    fn kind(&self) -> String {
+        self.source_kind.clone()
+    }
+
+    fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    fn clip(&self) -> Option<Rect> {
+        self.clip
+    }
+
+    fn transform(&self) -> [f32; 6] {
+        self.transform
+    }
+
+    fn style_identity(&self) -> boon_document::ComputedStyleIdentity {
+        self.style_identity
+    }
+
+    fn dependency_set(&self) -> &[String] {
+        &self.dependency_set
+    }
+
+    fn texture_asset_refs(&self) -> &[String] {
+        &self.texture_asset_refs
+    }
+
+    fn estimated_vertex_count(&self) -> u32 {
+        self.estimated_vertex_count
+    }
+}
+
+impl RetainedMetricItem for boon_document::RenderSceneItem {
+    fn node(&self) -> &DocumentNodeId {
+        &self.node
+    }
+
+    fn retained_chunk_id(&self) -> String {
+        document_item_retained_chunk_id(self)
+    }
+
+    fn kind(&self) -> String {
+        format!("{:?}", self.source_kind)
+    }
+
+    fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    fn clip(&self) -> Option<Rect> {
+        self.clip
+    }
+
+    fn transform(&self) -> [f32; 6] {
+        self.transform
+    }
+
+    fn style_identity(&self) -> boon_document::ComputedStyleIdentity {
+        self.style_identity
+    }
+
+    fn dependency_set(&self) -> &[String] {
+        &self.dependency_set
+    }
+
+    fn texture_asset_refs(&self) -> &[String] {
+        &self.texture_asset_refs
+    }
+
+    fn estimated_vertex_count(&self) -> u32 {
+        self.estimated_vertex_count
+    }
+}
+
+fn sampled_retained_render_chunks<Item: RetainedMetricItem>(
+    items: &[Item],
+    text_runs: &[RenderTextRun],
     generation: u64,
     previous_chunk_ids: Option<&BTreeSet<String>>,
     sample_limit: usize,
 ) -> RetainedRenderChunkMetricSummary {
     let mut text_run_ids_by_node: BTreeMap<DocumentNodeId, Vec<String>> = BTreeMap::new();
-    for run in &scene.text_runs {
+    for run in text_runs {
         text_run_ids_by_node
             .entry(run.node.clone())
             .or_default()
@@ -3141,11 +3349,11 @@ fn sampled_retained_render_chunks(
     let mut retained_chunk_hit_count = 0_u32;
     let mut retained_chunk_miss_count = 0_u32;
 
-    for item in &scene.items {
-        let vertex_count = item.estimated_vertex_count;
+    for item in items {
+        let vertex_count = item.estimated_vertex_count();
         let start = vertex_start;
         vertex_start = vertex_start.saturating_add(vertex_count);
-        let id = retained_chunk_id(item, generation);
+        let id = item.retained_chunk_id();
         current_chunk_ids.insert(id.clone());
         retained_chunk_count = retained_chunk_count.saturating_add(1);
         let cache_hit = previous_chunk_ids.is_some_and(|previous| previous.contains(&id));
@@ -3160,19 +3368,19 @@ fn sampled_retained_render_chunks(
         if should_sample {
             retained_chunks.push(RetainedRenderChunkMetric {
                 id,
-                node: item.node.clone(),
-                kind: item.source_kind.clone(),
-                bounds: item.bounds,
-                clip: item.clip,
-                transform: item.transform,
-                style_identity: item.style_identity,
-                dependency_set: item.dependency_set.clone(),
+                node: item.node().clone(),
+                kind: item.kind(),
+                bounds: item.bounds(),
+                clip: item.clip(),
+                transform: item.transform(),
+                style_identity: item.style_identity(),
+                dependency_set: item.dependency_set().to_vec(),
                 gpu_buffer_range: start..vertex_start,
                 text_run_ids: text_run_ids_by_node
-                    .get(&item.node)
+                    .get(item.node())
                     .cloned()
                     .unwrap_or_default(),
-                texture_asset_refs: item.texture_asset_refs.clone(),
+                texture_asset_refs: item.texture_asset_refs().to_vec(),
                 generation,
                 cache_status: if cache_hit {
                     "hit".to_owned()
@@ -3190,30 +3398,30 @@ fn sampled_retained_render_chunks(
     {
         retained_chunks.clear();
         vertex_start = 0;
-        for item in &scene.items {
-            let vertex_count = item.estimated_vertex_count;
+        for item in items {
+            let vertex_count = item.estimated_vertex_count();
             let start = vertex_start;
             vertex_start = vertex_start.saturating_add(vertex_count);
-            let id = retained_chunk_id(item, generation);
+            let id = item.retained_chunk_id();
             let cache_hit = previous_chunk_ids.is_some_and(|previous| previous.contains(&id));
             if cache_hit {
                 continue;
             }
             retained_chunks.push(RetainedRenderChunkMetric {
                 id,
-                node: item.node.clone(),
-                kind: item.source_kind.clone(),
-                bounds: item.bounds,
-                clip: item.clip,
-                transform: item.transform,
-                style_identity: item.style_identity,
-                dependency_set: item.dependency_set.clone(),
+                node: item.node().clone(),
+                kind: item.kind(),
+                bounds: item.bounds(),
+                clip: item.clip(),
+                transform: item.transform(),
+                style_identity: item.style_identity(),
+                dependency_set: item.dependency_set().to_vec(),
                 gpu_buffer_range: start..vertex_start,
                 text_run_ids: text_run_ids_by_node
-                    .get(&item.node)
+                    .get(item.node())
                     .cloned()
                     .unwrap_or_default(),
-                texture_asset_refs: item.texture_asset_refs.clone(),
+                texture_asset_refs: item.texture_asset_refs().to_vec(),
                 generation,
                 cache_status: "miss".to_owned(),
             });
@@ -3230,10 +3438,6 @@ fn sampled_retained_render_chunks(
         retained_chunks,
         current_chunk_ids,
     }
-}
-
-fn retained_chunk_id(item: &RenderSceneItem, _generation: u64) -> String {
-    item.retained_chunk_id.clone()
 }
 
 fn text_run_id(run: &RenderTextRun) -> String {

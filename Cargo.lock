@@ -115,7 +115,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "app_window"
 version = "0.3.3"
-source = "git+https://github.com/BoonLang/app_window.git?rev=554dea12623618cad5f4d2ae53b99793a05905d8#554dea12623618cad5f4d2ae53b99793a05905d8"
+source = "git+https://github.com/BoonLang/app_window.git?rev=0895892b0358164097287668c5575532c639eb79#0895892b0358164097287668c5575532c639eb79"
 dependencies = [
  "accesskit",
  "accesskit_unix",

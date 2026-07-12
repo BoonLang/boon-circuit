@@ -214,7 +214,7 @@ fn apply_render_scene_translate_node_entries_patch(
         }
     }
     for text_run in &mut scene.text_runs {
-        if render_text_run_belongs_to_any_node(&text_run.node, &node_set) {
+        if node_set.contains(&text_run.owner_node) {
             translate_rect(&mut text_run.bounds, delta_x, delta_y);
             report.patched_text_runs = report.patched_text_runs.saturating_add(1);
         }
@@ -271,7 +271,7 @@ fn apply_render_scene_paint_patch(
         }
         RenderScenePaintPatch::TextColor { color } => {
             for text_run in &mut scene.text_runs {
-                if text_run.node == *node {
+                if text_run.owner_node == *node {
                     text_run.color = *color;
                     text_run.paint_id = style_identity.paint_id;
                     report.patched_text_runs = report.patched_text_runs.saturating_add(1);
@@ -325,9 +325,7 @@ fn apply_render_scene_retag_node_entries_patch(
         report.patched_primitives = report.patched_primitives.saturating_add(1);
     }
     for text_run in &mut scene.text_runs {
-        let Some((_, style_identity)) = updates.iter().find_map(|(node, update)| {
-            render_text_run_belongs_to_node(&text_run.node, node).then_some(update)
-        }) else {
+        let Some((_, style_identity)) = updates.get(&text_run.owner_node) else {
             continue;
         };
         text_run.paint_id = style_identity.paint_id;
@@ -380,8 +378,8 @@ fn apply_render_scene_replace_node_entries_patch(
         &mut scene.text_runs,
         &node_set,
         text_runs,
-        |text_run| &text_run.node,
-        render_text_run_belongs_to_any_node,
+        |text_run| &text_run.owner_node,
+        |owner, nodes| nodes.contains(owner),
         false,
     )?;
     report.patched_text_runs = report.patched_text_runs.saturating_add(text_runs.len());
@@ -409,10 +407,10 @@ fn replace_render_scene_entries_for_nodes<T: Clone>(
     let original = std::mem::take(entries);
     let mut inserted_nodes = BTreeSet::new();
     for entry in original {
-        let node = node_for_entry(&entry).clone();
-        let remove = entry_belongs_to_nodes(&node, node_set);
+        let remove = entry_belongs_to_nodes(node_for_entry(&entry), node_set);
         saw_existing |= remove;
         if remove {
+            let node = node_for_entry(&entry).clone();
             if inserted_nodes.insert(node.clone()) {
                 entries.extend(
                     replacements
@@ -434,23 +432,6 @@ fn replace_render_scene_entries_for_nodes<T: Clone>(
         entries.splice(insert_at..insert_at, remaining);
     }
     Ok(saw_existing || replacements.is_empty())
-}
-
-fn render_text_run_belongs_to_any_node(
-    text_run_node: &DocumentNodeId,
-    nodes: &BTreeSet<DocumentNodeId>,
-) -> bool {
-    nodes
-        .iter()
-        .any(|node| render_text_run_belongs_to_node(text_run_node, node))
-}
-
-fn render_text_run_belongs_to_node(text_run_node: &DocumentNodeId, node: &DocumentNodeId) -> bool {
-    text_run_node == node
-        || text_run_node
-            .0
-            .strip_prefix(node.0.as_str())
-            .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 fn apply_render_scene_text_content_patch(
@@ -475,7 +456,7 @@ fn apply_render_scene_text_content_patch(
         });
     }
     for text_run in &mut scene.text_runs {
-        if text_run.node == *node {
+        if text_run.owner_node == *node {
             text_run.text = text.to_owned();
             report.patched_text_runs = report.patched_text_runs.saturating_add(1);
         }
@@ -624,6 +605,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RenderTextRun {
     pub node: DocumentNodeId,
+    pub owner_node: DocumentNodeId,
     pub font_id: u64,
     pub paint_id: u64,
     pub bounds: Rect,
@@ -2165,6 +2147,7 @@ fn render_text_runs_for_nodes(
         let rich_spans = rich_text_spans(&item.style, &text, color);
         runs.push(RenderTextRun {
             node: item.node.clone(),
+            owner_node: item.node.clone(),
             font_id: item.style_identity.font_id,
             paint_id: item.style_identity.paint_id,
             bounds: text_content_bounds_for_item(item),
@@ -2251,6 +2234,7 @@ fn editor_type_hint_runs(
             }
             Some(RenderTextRun {
                 node: DocumentNodeId(format!("{}:type-hint:{index}", item.node.0)),
+                owner_node: item.node.clone(),
                 font_id: item.style_identity.font_id,
                 paint_id: item.style_identity.paint_id,
                 bounds: Rect {

@@ -15,6 +15,8 @@ const COMMAND_BYTES: usize = 9;
 const AXIS_MAX: i32 = 65_535;
 const DEFAULT_POINTER_SPACE: (i32, i32) = (2_400, 1_200);
 const DEVICE_SETTLE: Duration = Duration::from_millis(500);
+const CLICK_HOLD: Duration = Duration::from_millis(32);
+const UINPUT_NAME_MAX_BYTES: usize = 79;
 
 const MOVE_ABSOLUTE: u8 = 1;
 const MOVE_RELATIVE: u8 = 2;
@@ -31,9 +33,10 @@ pub struct NativeInput {
 }
 
 impl NativeInput {
-    pub fn start(executable: &std::path::Path) -> Result<Self, String> {
+    pub fn start(executable: &std::path::Path, seat_name: &str) -> Result<Self, String> {
+        validate_seat_name(seat_name)?;
         let mut child = Command::new(executable)
-            .args(["--role", "native-input"])
+            .args(["--role", "native-input", "--seat", seat_name])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -98,6 +101,7 @@ impl NativeInput {
 
     pub fn click(&mut self, code: u16) -> Result<(), String> {
         self.button(code, true)?;
+        thread::sleep(CLICK_HOLD);
         self.button(code, false)
     }
 
@@ -174,9 +178,11 @@ fn scale_axis(value: i32, extent: i32) -> i32 {
         .unwrap_or(0)
 }
 
-pub fn run_device_process() -> Result<(), String> {
-    let mut devices =
-        Devices::create().map_err(|error| format!("create uinput devices: {error}"))?;
+pub fn run_device_process(args: &[String]) -> Result<(), String> {
+    let seat_name = argument(args, "--seat").ok_or("native-input requires --seat")?;
+    validate_seat_name(seat_name)?;
+    let mut devices = Devices::create(seat_name)
+        .map_err(|error| format!("create isolated uinput devices: {error}"))?;
     thread::sleep(DEVICE_SETTLE);
     io::stdout()
         .write_all(&[READY[0], READY[1], READY[2], READY[3], VERSION])
@@ -210,7 +216,7 @@ struct Devices {
 }
 
 impl Devices {
-    fn create() -> io::Result<Self> {
+    fn create(seat_name: &str) -> io::Result<Self> {
         let pointer_keys =
             AttributeSet::from_iter([KeyCode::BTN_LEFT, KeyCode::BTN_MIDDLE, KeyCode::BTN_RIGHT]);
         let relative_axes = AttributeSet::from_iter([
@@ -222,7 +228,7 @@ impl Devices {
         let properties = AttributeSet::from_iter([PropType::POINTER]);
         let absolute = AbsInfo::new(0, 0, AXIS_MAX, 0, 0, 1);
         let pointer = VirtualDevice::builder()?
-            .name("Boon Circuit Virtual Pointer")
+            .name(&device_name(seat_name, "Pointer"))
             .with_properties(&properties)?
             .with_keys(&pointer_keys)?
             .with_relative_axes(&relative_axes)?
@@ -232,7 +238,7 @@ impl Devices {
 
         let keyboard_keys = AttributeSet::from_iter((1..=255).map(KeyCode::new));
         let keyboard = VirtualDevice::builder()?
-            .name("Boon Circuit Virtual Keyboard")
+            .name(&device_name(seat_name, "Keyboard"))
             .with_keys(&keyboard_keys)?
             .build()?;
         Ok(Self { pointer, keyboard })
@@ -284,6 +290,35 @@ impl Devices {
     }
 }
 
+fn argument<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str())
+}
+
+fn device_name(seat_name: &str, kind: &str) -> String {
+    format!("COSMIC Isolated {seat_name} {kind}")
+}
+
+fn validate_seat_name(seat_name: &str) -> Result<(), String> {
+    if seat_name.is_empty()
+        || !seat_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!("invalid isolated seat name `{seat_name}`"));
+    }
+    for kind in ["Pointer", "Keyboard"] {
+        let name = device_name(seat_name, kind);
+        if name.len() > UINPUT_NAME_MAX_BYTES {
+            return Err(format!(
+                "isolated seat name is too long for a uinput {kind} device"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +331,17 @@ mod tests {
             scale_axis(1_200, DEFAULT_POINTER_SPACE.0) > scale_axis(600, DEFAULT_POINTER_SPACE.0)
         );
         assert_eq!(scale_axis(i32::MAX, DEFAULT_POINTER_SPACE.0), AXIS_MAX);
+    }
+
+    #[test]
+    fn isolated_device_names_are_exact_and_bounded() {
+        let seat = "cosmic-isolated-background-launch-1234-7";
+        validate_seat_name(seat).unwrap();
+        assert_eq!(
+            device_name(seat, "Pointer"),
+            "COSMIC Isolated cosmic-isolated-background-launch-1234-7 Pointer"
+        );
+        assert!(validate_seat_name("physical seat").is_err());
+        assert!(validate_seat_name(&"x".repeat(UINPUT_NAME_MAX_BYTES)).is_err());
     }
 }

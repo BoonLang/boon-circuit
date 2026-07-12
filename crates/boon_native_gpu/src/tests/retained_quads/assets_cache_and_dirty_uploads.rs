@@ -384,6 +384,7 @@ fn renderer_uploads_only_changed_retained_chunk_after_document_scene_interaction
         });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut renderer = VisibleLayoutRenderer::new(&device, &queue, format);
+        renderer.set_diagnostics_enabled(false);
         let first_scene = retained_chunk_test_scene([170, 80, 40, 255]);
         let second_scene = retained_chunk_test_scene([210, 110, 60, 255]);
 
@@ -424,11 +425,15 @@ fn renderer_uploads_only_changed_retained_chunk_after_document_scene_interaction
         queue.submit([second_encoder.finish()]);
 
         assert_eq!(first.dirty_upload_chunk_count, 2);
+        assert!(first.product_frame_graph.is_none());
+        assert!(first.retained_chunks.is_empty());
         assert_eq!(
             first.dirty_upload_chunk_ids,
             vec!["chunk:left", "chunk:right"]
         );
         assert_eq!(second.dirty_upload_range_count, 1);
+        assert!(second.product_frame_graph.is_none());
+        assert!(second.retained_chunks.is_empty());
         assert_eq!(second.dirty_upload_chunk_count, 1);
         assert_eq!(second.dirty_upload_chunk_ids, vec!["chunk:right"]);
         assert_eq!(

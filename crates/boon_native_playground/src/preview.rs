@@ -905,7 +905,9 @@ fn emit(observer: &Option<ObserverClient>, event: ObserverEvent) {
 fn event_target(view: &RetainedView, event: &HostEvent) -> Option<HitTarget> {
     match event {
         HostEvent::Pointer(pointer) => view.hit_target(pointer.x, pointer.y),
-        HostEvent::Wheel(wheel) => view.hit_target(wheel.x, wheel.y),
+        HostEvent::Wheel(wheel) => {
+            view.wheel_target(wheel.x, wheel.y, wheel.delta_x, wheel.delta_y)
+        }
         _ => None,
     }
 }

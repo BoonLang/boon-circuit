@@ -34,7 +34,7 @@ fn flatten_quad_batches(batches: &[QuadBatch]) -> (Vec<f32>, Vec<u8>) {
     let mut positions = Vec::new();
     let mut colors = Vec::new();
     for batch in batches {
-        for vertex in &batch.vertices {
+        for vertex in batch.vertices.iter() {
             positions.extend_from_slice(&vertex.position);
             colors.extend_from_slice(&rgba8_from_packed(vertex.color));
         }

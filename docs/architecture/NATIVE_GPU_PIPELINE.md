@@ -112,7 +112,8 @@ The queue contract is:
 - timestamp at the platform callback before the queue lock;
 - coalesce only adjacent pointer motion and wheel events;
 - motion keeps the newest timestamp;
-- summed wheel input keeps the oldest timestamp;
+- summed wheel input keeps the newest callback timestamp because the accepted
+  envelope represents the completed coalesced callback burst;
 - preserve every discrete event in order;
 - overflow is fatal because input order has been lost;
 - no polling timer, event history, resampling, or public verifier injection.
@@ -193,6 +194,19 @@ identity from labels or geometry. Dirty chunks, transforms, clips, glyph runs,
 assets, buffers, and pipelines remain cached across frames. Surface loss or
 format/scale change increments the surface epoch and invalidates only resources
 tied to that epoch.
+
+`boon_document` is the single owner of retained scene items and text runs.
+Product encoding borrows those arrays; it does not clone them into a second
+renderer scene. Renderer-owned quad caches use document-provided content-addressed
+chunk identities and shared immutable vertex payloads. Callers that do not
+provide a trusted scene identity use uncached conversion so an arbitrary external
+scene cannot reuse stale geometry.
+
+The product renderer executes the same typed render graph with diagnostics
+disabled. Cheap scalar counters remain enabled and count against the UX budget.
+Full retained-chunk inventories, graph resource signatures, schedule decisions,
+and report objects are built only by an explicit diagnostic/proof renderer; they
+must not be constructed and discarded on normal preview frames.
 
 Every visible surface receives a viewport background primitive. An empty area
 must never expose an unpainted compositor-sized hole.
@@ -307,28 +321,44 @@ verify-all
 
 The product gates launch the ordinary preview and dev windows through
 `cosmic-background-launch` in the named `boon-circuit` workspace. The launcher
-returns an opaque launch ID. Before input begins, its launch-scoped reconcile
-operation gathers every mapped descendant surface into that workspace without
-matching titles, app IDs, geometry, roles, or example names. The standard
-ext-workspace protocol activates the workspace, the public COSMIC workspace
-extension resets and enables tiling, and a bounded guard restores the previous
-workspace on exit or parent death.
+returns an opaque launch ID and a unique standard `wl_seat` name. Before input
+begins, its launch-scoped reconcile operation gathers every mapped descendant
+surface into that workspace without matching titles, app IDs, geometry, roles,
+or example names. The public COSMIC workspace extension asserts tiling once
+while the workspace remains inactive. Reconcile clears inherited
+maximized state before mapping launch descendants into the retained tiling
+layout. A bounded guard verifies that the workspace never becomes active.
 
 The verifier creates a kernel uinput mouse and keyboard. Mouse motion, buttons,
 wheel axes, key presses, and chords pass through the kernel, udev/libinput,
-COSMIC's real seat, Wayland, and the normal app_window callbacks. Scenarios use
-the same executable roles and host-event route as the product. There is no
-nested compositor, private input protocol, compositor toplevel selection,
-desktop scraping, or private runtime dispatch. `/dev/uinput` must be writable
-by the test user. Hardware adapter, product timings, exact frame identity, and
-pixels are observed from the app and app-owned WGPU readback, never inferred
-from the compositor.
+COSMIC's ordinary libinput backend, a launch-scoped compositor seat, Wayland,
+and the normal app_window callbacks. Device names encode the returned seat;
+the compositor ignores a named device when that seat does not exist. The
+preview/dev processes select the seat by its standard `wl_seat.name`. Before
+the first event, compositor-owned status must prove that exactly the pointer
+and keyboard belong to that seat, that its target workspace is inactive, and
+that every expected role window is tiled with zero floating or maximized
+windows. There is no fallback to the physical seat and no input-before-layout
+fallback.
 
-The system cursor is visible while the bounded workspace is active, as it is
-for human interaction. It is compositor-owned and therefore intentionally not
-part of app-owned WGPU readback. Cursor movement is proven by the originating
-uinput process plus the corresponding `RealOs` app_window callback; rendered
-application state is proven separately by exact-frame readback.
+The isolated seat hit-tests the retained surfaces in its inactive launch
+workspace. It does not move or draw the user's compositor cursor, activate a
+workspace, invoke global keyboard shortcuts, update accessibility cursor state,
+or wake idle outputs. If the workspace becomes active, the compositor drops
+isolated input until it is inactive again. Scenarios still use the same
+executable roles and public host-event route as the product. There is no nested
+compositor, private input protocol, compositor toplevel selection, desktop
+scraping, or private runtime dispatch. `/dev/uinput` must be writable by the
+test user. Hardware adapter, product timings, exact frame identity, callbacks,
+and pixels are observed from the app and app-owned WGPU readback, never inferred
+from the compositor. A TEST cursor is application-owned content and remains
+visible in that readback; the isolated compositor cursor is intentionally not
+rendered.
+
+Inactive-workspace hit testing clips each toplevel to its retained tile
+geometry even while the client still has an older, larger buffer attached.
+Verifier discovery derives every candidate from the compositor-reported
+logical output size; fixed desktop dimensions are forbidden.
 
 Run fresh reports:
 

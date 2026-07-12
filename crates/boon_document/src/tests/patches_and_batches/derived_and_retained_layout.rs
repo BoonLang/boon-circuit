@@ -275,7 +275,7 @@ fn retained_document_scrolls_descendants_without_full_lowering() {
         overscan: 0..8,
         logical_item_count: 100,
     });
-    let mut child = node("child", DocumentNodeKind::Text, Some("scroll"));
+    let mut child = node("child", DocumentNodeKind::Button, Some("scroll"));
     child.text = Some(TextValue {
         text: "scroll me".to_owned(),
     });
@@ -285,6 +285,11 @@ fn retained_document_scrolls_descendants_without_full_lowering() {
     child
         .style
         .insert("height".to_owned(), StyleValue::Number(30.0));
+    child.set_primary_source_binding(boon_document_model::SourceBinding {
+        id: SourceBindingId("source:child:press".to_owned()),
+        source_path: "child.press".to_owned(),
+        intent: "press".to_owned(),
+    });
     let mut second = node("second", DocumentNodeKind::Text, Some("scroll"));
     second.text = Some(TextValue {
         text: "keep visible".to_owned(),
@@ -322,6 +327,11 @@ fn retained_document_scrolls_descendants_without_full_lowering() {
         .unwrap()
         .bounds
         .y;
+    let hit_before = retained
+        .hits()
+        .entry_for_source_path("child.press")
+        .expect("interactive scroll child hit")
+        .clone();
 
     let update = retained
         .apply_patches(
@@ -346,6 +356,13 @@ fn retained_document_scrolls_descendants_without_full_lowering() {
     assert!(update.render_changed);
     assert_eq!(retained.stats().full_lower_count, 1);
     assert_eq!(after, before - 30.0);
+    let hit_after = retained
+        .hits()
+        .entry_for_source_path("child.press")
+        .expect("translated interactive scroll child hit");
+    assert_eq!(hit_after.bounds.y, hit_before.bounds.y - 30.0);
+    assert_eq!(hit_after.source_binding_id, hit_before.source_binding_id);
+    assert_eq!(hit_after.source_path, hit_before.source_path);
     let demand = retained
         .demands()
         .iter()

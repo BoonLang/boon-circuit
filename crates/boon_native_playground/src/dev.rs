@@ -327,7 +327,14 @@ fn emit_dev_targets(
     view: &RetainedView,
     observed: &mut BTreeMap<String, (f32, f32)>,
 ) {
-    for node in [DEV_PREVIOUS, DEV_NEXT, DEV_RUN, DEV_RESET, DEV_TEST] {
+    for node in [
+        DEV_PREVIOUS,
+        DEV_NEXT,
+        DEV_RUN,
+        DEV_RESET,
+        DEV_TEST,
+        DEV_EDITOR,
+    ] {
         let Some(target) = view.target_for_source(node, None) else {
             continue;
         };
@@ -542,6 +549,9 @@ mod tests {
         let initial_full_lowers = view.retained_stats().full_lower_count;
         let test = view.target_for_source(DEV_TEST, None).expect("TEST target");
         let next = view.target_for_source(DEV_NEXT, None).expect("Next target");
+        let mut observed_targets = BTreeMap::new();
+        emit_dev_targets(&None, &view, &mut observed_targets);
+        assert!(observed_targets.contains_key(DEV_EDITOR));
 
         for index in 0..200 {
             let target = if index % 2 == 0 { &test } else { &next };

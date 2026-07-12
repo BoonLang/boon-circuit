@@ -1,6 +1,6 @@
 use boon_document::render_scene::RenderTextColumnMeasurer;
 use boon_document::{
-    ComputedStyleIdentity, DocumentFrame, DocumentNodeId, DocumentNodeKind, DocumentPatch,
+    Axis, ComputedStyleIdentity, DocumentFrame, DocumentNodeId, DocumentNodeKind, DocumentPatch,
     PatchApplyError, Rect, RenderScene, RenderTextureRef, RenderVisualPrimitive,
     RenderVisualPrimitiveKind, RetainedDocument, RetainedDocumentUpdate,
 };
@@ -151,6 +151,33 @@ impl RetainedView {
 
     pub fn hit_target(&self, x: f32, y: f32) -> Option<HitTarget> {
         self.retained.hits().hit_test(x, y).map(hit_target)
+    }
+
+    pub fn wheel_target(&self, x: f32, y: f32, delta_x: f32, delta_y: f32) -> Option<HitTarget> {
+        let mut target = self.hit_target(x, y);
+        let axis = if delta_y != 0.0 && delta_y.abs() >= delta_x.abs() {
+            Axis::Vertical
+        } else {
+            Axis::Horizontal
+        };
+        let scroll_root = scroll_root_at(self.retained.frame(), self.retained.layout(), axis, x, y);
+        match (&mut target, scroll_root) {
+            (Some(target), Some(root)) => target.scroll_root = Some(root),
+            (None, Some(root)) => {
+                target = Some(HitTarget {
+                    node: root.clone(),
+                    source_path: None,
+                    source_intent: None,
+                    row_key: None,
+                    row_generation: None,
+                    scroll_root: Some(root),
+                    center_x: x,
+                    center_y: y,
+                });
+            }
+            _ => {}
+        }
+        target
     }
 
     pub fn first_visible_hit_target(&self) -> Option<HitTarget> {
@@ -351,9 +378,130 @@ fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
     }
 }
 
+fn scroll_root_at(
+    document: &DocumentFrame,
+    layout: &boon_document::LayoutFrame,
+    axis: Axis,
+    x: f32,
+    y: f32,
+) -> Option<String> {
+    layout
+        .display_list
+        .iter()
+        .filter(|item| {
+            rect_contains(item.bounds, x, y)
+                && document
+                    .nodes
+                    .get(&item.node)
+                    .is_some_and(|node| node_scrolls_axis(document, node, axis))
+        })
+        .min_by(|left, right| rect_area(left.bounds).total_cmp(&rect_area(right.bounds)))
+        .map(|item| item.node.0.clone())
+        .or_else(|| nearest_scroll_region(&layout.scroll_regions, axis, x, y))
+}
+
+fn nearest_scroll_region(
+    regions: &[boon_document::ScrollRegion],
+    axis: Axis,
+    x: f32,
+    y: f32,
+) -> Option<String> {
+    regions
+        .iter()
+        .filter(|region| region.axis == axis && rect_contains(region.bounds, x, y))
+        .min_by(|left, right| rect_area(left.bounds).total_cmp(&rect_area(right.bounds)))
+        .map(|region| region.node.0.clone())
+}
+
+fn node_scrolls_axis(
+    document: &DocumentFrame,
+    node: &boon_document::DocumentNode,
+    axis: Axis,
+) -> bool {
+    document
+        .scroll_roots
+        .contains_key(&boon_document::ScrollRootId(node.id.0.clone()))
+        || node.kind == DocumentNodeKind::ScrollRoot
+        || style_bool(&node.style, "scroll")
+        || style_bool(&node.style, "scrollbars")
+        || match axis {
+            Axis::Horizontal => style_bool(&node.style, "scroll_x"),
+            Axis::Vertical => style_bool(&node.style, "scroll_y"),
+        }
+}
+
+fn style_bool(style: &boon_document::StyleMap, key: &str) -> bool {
+    match style.get(key) {
+        Some(boon_document::StyleValue::Bool(value)) => *value,
+        Some(boon_document::StyleValue::Text(value)) => value.parse().unwrap_or(false),
+        Some(boon_document::StyleValue::Number(value)) => *value != 0.0,
+        _ => false,
+    }
+}
+
+fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
+}
+
+fn rect_area(rect: Rect) -> f32 {
+    rect.width.max(0.0) * rect.height.max(0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_target_uses_the_smallest_scroll_region_on_the_requested_axis() {
+        let regions = vec![
+            boon_document::ScrollRegion {
+                id: "outer".to_owned(),
+                node: DocumentNodeId("outer".to_owned()),
+                axis: Axis::Vertical,
+                bounds: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 200.0,
+                    height: 200.0,
+                },
+            },
+            boon_document::ScrollRegion {
+                id: "inner".to_owned(),
+                node: DocumentNodeId("inner".to_owned()),
+                axis: Axis::Vertical,
+                bounds: Rect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 80.0,
+                    height: 80.0,
+                },
+            },
+            boon_document::ScrollRegion {
+                id: "horizontal".to_owned(),
+                node: DocumentNodeId("horizontal".to_owned()),
+                axis: Axis::Horizontal,
+                bounds: Rect {
+                    x: 20.0,
+                    y: 20.0,
+                    width: 80.0,
+                    height: 80.0,
+                },
+            },
+        ];
+
+        assert_eq!(
+            nearest_scroll_region(&regions, Axis::Vertical, 40.0, 40.0).as_deref(),
+            Some("inner")
+        );
+        assert_eq!(
+            nearest_scroll_region(&regions, Axis::Horizontal, 40.0, 40.0).as_deref(),
+            Some("horizontal")
+        );
+        assert_eq!(
+            nearest_scroll_region(&regions, Axis::Vertical, 240.0, 40.0),
+            None
+        );
+    }
 
     #[test]
     fn retained_view_keeps_distinct_content_layout_and_render_revisions() {

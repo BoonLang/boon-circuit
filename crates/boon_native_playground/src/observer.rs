@@ -167,6 +167,15 @@ pub struct FramePresented {
     pub runtime_document_us: u64,
     pub document_update_us: u64,
     pub render_us: u64,
+    pub document_scene_convert_us: u64,
+    pub scene_key_us: u64,
+    pub rect_vertices_us: u64,
+    pub asset_prepare_us: u64,
+    pub quad_batch_key_us: u64,
+    pub quad_upload_us: u64,
+    pub draw_pass_us: u64,
+    pub retained_metrics_us: u64,
+    pub text_render_us: u64,
     pub submit_us: u64,
     pub present_us: u64,
     pub frame_us: u64,
@@ -303,6 +312,15 @@ impl ObserverEvent {
                 out.u64(value.runtime_document_us);
                 out.u64(value.document_update_us);
                 out.u64(value.render_us);
+                out.u64(value.document_scene_convert_us);
+                out.u64(value.scene_key_us);
+                out.u64(value.rect_vertices_us);
+                out.u64(value.asset_prepare_us);
+                out.u64(value.quad_batch_key_us);
+                out.u64(value.quad_upload_us);
+                out.u64(value.draw_pass_us);
+                out.u64(value.retained_metrics_us);
+                out.u64(value.text_render_us);
                 out.u64(value.submit_us);
                 out.u64(value.present_us);
                 out.u64(value.frame_us);
@@ -450,6 +468,15 @@ impl ObserverEvent {
                 runtime_document_us: input.u64()?,
                 document_update_us: input.u64()?,
                 render_us: input.u64()?,
+                document_scene_convert_us: input.u64()?,
+                scene_key_us: input.u64()?,
+                rect_vertices_us: input.u64()?,
+                asset_prepare_us: input.u64()?,
+                quad_batch_key_us: input.u64()?,
+                quad_upload_us: input.u64()?,
+                draw_pass_us: input.u64()?,
+                retained_metrics_us: input.u64()?,
+                text_render_us: input.u64()?,
                 submit_us: input.u64()?,
                 present_us: input.u64()?,
                 frame_us: input.u64()?,
@@ -929,6 +956,15 @@ mod tests {
             runtime_document_us: 6,
             document_update_us: 12,
             render_us: 7,
+            document_scene_convert_us: 1,
+            scene_key_us: 2,
+            rect_vertices_us: 3,
+            asset_prepare_us: 4,
+            quad_batch_key_us: 5,
+            quad_upload_us: 6,
+            draw_pass_us: 7,
+            retained_metrics_us: 8,
+            text_render_us: 9,
             submit_us: 8,
             present_us: 9,
             frame_us: 10,

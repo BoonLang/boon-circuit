@@ -73,7 +73,7 @@ fn split_document_quad_batch_interleaves_without_value_drift() {
     let converted = quad_batch_from_document_batch(&batch, 0);
 
     assert_eq!(
-        converted.vertices,
+        converted.vertices.as_ref(),
         vec![
             NativeGpuQuadVertex {
                 position: [1.0, 2.0],
@@ -85,7 +85,7 @@ fn split_document_quad_batch_interleaves_without_value_drift() {
                 color: 0x8877_6655,
                 uv: [0.75, 1.0],
             },
-        ]
+        ].as_slice()
     );
 }
 
@@ -344,5 +344,4 @@ fn quad_upload_ring_grows_before_multi_batch_frame_can_overwrite_live_ranges() {
         assert_eq!(first_range.ring_generation, second_range.ring_generation);
     });
 }
-
 

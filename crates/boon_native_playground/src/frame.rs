@@ -160,6 +160,15 @@ pub struct PresentedFrame {
     pub runtime_document_us: u64,
     pub document_update_us: u64,
     pub render_us: u64,
+    pub document_scene_convert_us: u64,
+    pub scene_key_us: u64,
+    pub rect_vertices_us: u64,
+    pub asset_prepare_us: u64,
+    pub quad_batch_key_us: u64,
+    pub quad_upload_us: u64,
+    pub draw_pass_us: u64,
+    pub retained_metrics_us: u64,
+    pub text_render_us: u64,
     pub submit_us: u64,
     pub present_us: u64,
     pub frame_us: u64,
@@ -179,6 +188,15 @@ impl PresentedFrame {
             runtime_document_us: self.runtime_document_us,
             document_update_us: self.document_update_us,
             render_us: self.render_us,
+            document_scene_convert_us: self.document_scene_convert_us,
+            scene_key_us: self.scene_key_us,
+            rect_vertices_us: self.rect_vertices_us,
+            asset_prepare_us: self.asset_prepare_us,
+            quad_batch_key_us: self.quad_batch_key_us,
+            quad_upload_us: self.quad_upload_us,
+            draw_pass_us: self.draw_pass_us,
+            retained_metrics_us: self.retained_metrics_us,
+            text_render_us: self.text_render_us,
             submit_us: self.submit_us,
             present_us: self.present_us,
             frame_us: self.frame_us,
@@ -223,7 +241,8 @@ impl ProductFrame {
         let binding = host
             .configure(&adapter, &device, SurfacePreferences::default())
             .await?;
-        let renderer = VisibleLayoutRenderer::new(&device, &queue, binding.format);
+        let mut renderer = VisibleLayoutRenderer::new(&device, &queue, binding.format);
+        renderer.set_diagnostics_enabled(false);
         let viewport = binding.viewport;
         let adapter_name_lower = adapter_info.name.to_ascii_lowercase();
         let software_adapter = matches!(adapter_info.device_type, wgpu::DeviceType::Cpu)
@@ -371,7 +390,7 @@ impl ProductFrame {
             });
 
         let render_started = Instant::now();
-        let _metrics: FrameMetrics = self.renderer.encode_scene(SurfaceRenderSceneRequest {
+        let metrics: FrameMetrics = self.renderer.encode_scene(SurfaceRenderSceneRequest {
             device: &self.device,
             queue: &self.queue,
             encoder: &mut encoder,
@@ -457,11 +476,24 @@ impl ProductFrame {
                 .map(|input| input.document_update_us)
                 .unwrap_or(0),
             render_us,
+            document_scene_convert_us: milliseconds_us(metrics.document_scene_convert_ms),
+            scene_key_us: milliseconds_us(metrics.scene_key_ms),
+            rect_vertices_us: milliseconds_us(metrics.rect_vertices_ms),
+            asset_prepare_us: milliseconds_us(metrics.asset_prepare_ms),
+            quad_batch_key_us: milliseconds_us(metrics.quad_batch_key_ms),
+            quad_upload_us: milliseconds_us(metrics.quad_upload_ms),
+            draw_pass_us: milliseconds_us(metrics.draw_pass_ms),
+            retained_metrics_us: milliseconds_us(metrics.retained_metrics_ms),
+            text_render_us: milliseconds_us(metrics.text_render_ms),
             submit_us,
             present_us,
             frame_us,
         }))
     }
+}
+
+fn milliseconds_us(milliseconds: f64) -> u64 {
+    (milliseconds.max(0.0) * 1_000.0).round() as u64
 }
 
 pub fn input_kind(event: &HostEvent) -> InputKind {

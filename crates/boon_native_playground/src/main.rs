@@ -34,7 +34,7 @@ fn main() {
         "dev" => run_dev(&args),
         "verify-v2" => verify::run(&args),
         #[cfg(target_os = "linux")]
-        "native-input" => native_input::run_device_process(),
+        "native-input" => native_input::run_device_process(&args),
         #[cfg(target_os = "linux")]
         "workspace-control" => workspace_control::run_guard_process(&args),
         unknown => Err(format!("unknown native playground role `{unknown}`")),

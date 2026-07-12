@@ -48,7 +48,8 @@ fn renderer_helpers_accept_prelowered_render_scene_without_layout_frame() {
     };
 
     let (batches, metrics) = rect_vertices_from_scene(&scene, 320.0, 200.0);
-    let chunk_summary = sampled_retained_render_chunks(&scene, 3, None, 16);
+    let chunk_summary =
+        sampled_retained_render_chunks(&scene.items, &scene.text_runs, 3, None, 16);
     let chunks = chunk_summary.retained_chunks;
 
     assert_eq!(batches.len(), 1);
@@ -120,7 +121,8 @@ fn renderer_adapts_external_document_render_scene_without_layout_frame() {
 
     let scene = render_scene_from_document_scene(&document_scene, 320, 200);
     let (batches, metrics) = rect_vertices_from_scene(&scene, 320.0, 200.0);
-    let chunk_summary = sampled_retained_render_chunks(&scene, 11, None, 16);
+    let chunk_summary =
+        sampled_retained_render_chunks(&scene.items, &scene.text_runs, 11, None, 16);
     let chunks = chunk_summary.retained_chunks;
 
     assert_eq!(scene.items[0].source_kind, "Button");
@@ -254,4 +256,3 @@ fn app_owned_scene_readback_uses_prelowered_render_scene_identity() {
         );
     });
 }
-

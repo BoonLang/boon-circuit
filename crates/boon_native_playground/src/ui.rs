@@ -22,6 +22,23 @@ pub const DEV_EDITOR: &str = "dev.editor";
 
 const EDITOR_LINE_HEIGHT: f64 = 23.0;
 const EDITOR_WINDOW_LINES: usize = 36;
+const DEV_BG: &str = "#0f1724";
+const DEV_PANEL: &str = "#141b2a";
+const DEV_PANEL_RAISED: &str = "#1a2435";
+const DEV_PANEL_ACTIVE: &str = "#26354d";
+const DEV_BORDER: &str = "#334155";
+const DEV_BORDER_MUTED: &str = "#243244";
+const DEV_TEXT: &str = "#eef2ff";
+const DEV_TEXT_MUTED: &str = "#9aa8bd";
+const DEV_ACCENT: &str = "#6ca2ff";
+const EDITOR_BG: &str = "#282c34";
+const EDITOR_BG_DARK: &str = "#21252b";
+const EDITOR_BG_ACTIVE: &str = "#2c313a";
+const EDITOR_TEXT: &str = "#d9e1f2";
+const EDITOR_GUTTER: &str = "#5c6773";
+const EDITOR_SELECTION: &str = "#3E4451";
+const EDITOR_CARET: &str = "#528bff";
+const EDITOR_BRACKET: &str = "#528bff40";
 
 pub struct InspectorState<'a> {
     pub symbol: &'a str,
@@ -47,10 +64,7 @@ pub struct DevFrameState<'a> {
 
 pub fn dev_frame(state: DevFrameState<'_>) -> DocumentFrame {
     let mut frame = DocumentFrame::empty("dev.root");
-    style_root(
-        frame.nodes.get_mut(&frame.root).expect("dev root"),
-        "#11151b",
-    );
+    style_root(frame.nodes.get_mut(&frame.root).expect("dev root"), DEV_BG);
     add_header(&mut frame);
     add_example_tabs(&mut frame, &state);
     add_file_tabs(&mut frame, &state);
@@ -65,8 +79,12 @@ fn add_header(frame: &mut DocumentFrame) {
     header.style.insert("width".into(), text("Fill"));
     header.style.insert("gap".into(), number(4.0));
     header.style.insert("padding".into(), number(4.0));
-    header.style.insert("background".into(), text("#1b212a"));
-    header.style.insert("border_bottom".into(), text("#303947"));
+    header
+        .style
+        .insert("background".into(), text(DEV_PANEL_RAISED));
+    header
+        .style
+        .insert("border_bottom".into(), text(DEV_BORDER));
     header
         .style
         .insert("border_bottom_width".into(), number(1.0));
@@ -76,7 +94,7 @@ fn add_header(frame: &mut DocumentFrame) {
     brand.style.insert("width".into(), number(70.0));
     brand.style.insert("font_size".into(), number(12.0));
     brand.style.insert("font_weight".into(), text("700"));
-    brand.style.insert("color".into(), text("#78dcca"));
+    brand.style.insert("color".into(), text(DEV_ACCENT));
     add(frame, "dev.header", brand);
 
     for (id, label, width, accent) in [
@@ -109,7 +127,7 @@ fn add_example_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     strip.style.insert("width".into(), text("Fill"));
     strip.style.insert("gap".into(), number(2.0));
     strip.style.insert("padding".into(), number(4.0));
-    strip.style.insert("background".into(), text("#151a21"));
+    strip.style.insert("background".into(), text(DEV_PANEL));
     add(frame, "dev.root", strip);
 
     add(
@@ -128,9 +146,10 @@ fn add_example_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
         let mut tab = button(&id, &entry.label, 116.0, "dev.examples", false);
         tab.style.insert("height".into(), number(32.0));
         if entry.id == state.active_id {
-            tab.style.insert("background".into(), text("#263443"));
-            tab.style.insert("border".into(), text("#59cbb6"));
-            tab.style.insert("color".into(), text("#eef7f5"));
+            tab.style
+                .insert("background".into(), text(DEV_PANEL_ACTIVE));
+            tab.style.insert("border".into(), text(DEV_ACCENT));
+            tab.style.insert("color".into(), text(DEV_TEXT));
         } else if entry.custom {
             tab.style.insert("color".into(), text("#d6b6ff"));
         }
@@ -144,8 +163,10 @@ fn add_file_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     strip.style.insert("width".into(), text("Fill"));
     strip.style.insert("gap".into(), number(2.0));
     strip.style.insert("padding".into(), number(4.0));
-    strip.style.insert("background".into(), text("#202731"));
-    strip.style.insert("border_bottom".into(), text("#303947"));
+    strip
+        .style
+        .insert("background".into(), text(DEV_PANEL_RAISED));
+    strip.style.insert("border_bottom".into(), text(DEV_BORDER));
     strip
         .style
         .insert("border_bottom_width".into(), number(1.0));
@@ -160,9 +181,9 @@ fn add_file_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
         let mut tab = button(&id, name, 126.0, "dev.files", false);
         tab.style.insert("height".into(), number(30.0));
         if index == state.active_file {
-            tab.style.insert("background".into(), text("#11151b"));
-            tab.style.insert("border".into(), text("#4d5d70"));
-            tab.style.insert("color".into(), text("#f1f5f9"));
+            tab.style.insert("background".into(), text(DEV_BG));
+            tab.style.insert("border".into(), text(DEV_BORDER));
+            tab.style.insert("color".into(), text(DEV_TEXT));
         }
         add(frame, "dev.files", tab);
     }
@@ -174,7 +195,7 @@ fn add_file_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     identity.style.insert(
         "color".into(),
         text(if state.origin == ProjectOrigin::BuiltIn {
-            "#79b9ff"
+            DEV_ACCENT
         } else {
             "#d1a6ff"
         }),
@@ -193,7 +214,7 @@ fn add_workspace(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     let mut workspace = node("dev.workspace", DocumentNodeKind::Row, Some("dev.root"));
     workspace.style.insert("width".into(), text("Fill"));
     workspace.style.insert("height".into(), text("Fill"));
-    workspace.style.insert("background".into(), text("#11151b"));
+    workspace.style.insert("background".into(), text(DEV_BG));
     add(frame, "dev.root", workspace);
 
     let mut editor = node(
@@ -203,8 +224,8 @@ fn add_workspace(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     );
     editor.style.insert("width".into(), text("Fill"));
     editor.style.insert("height".into(), text("Fill"));
-    editor.style.insert("background".into(), text("#11151b"));
-    editor.style.insert("border".into(), text("#303947"));
+    editor.style.insert("background".into(), text(EDITOR_BG));
+    editor.style.insert("border".into(), text(DEV_BORDER));
     editor
         .style
         .insert("border_right_width".into(), number(1.0));
@@ -253,9 +274,10 @@ fn add_editor_line(
     row.style.insert("width".into(), text("Fill"));
     row.style
         .insert("height".into(), number(EDITOR_LINE_HEIGHT));
-    row.style.insert("background".into(), text("#11151b"));
+    row.style.insert("background".into(), text(EDITOR_BG));
     row.style
-        .insert("__hover_background".into(), text("#171e27"));
+        .insert("__hover_background".into(), text(EDITOR_BG_ACTIVE));
+    row.source_bindings.push(binding(&row_id, "edit"));
     add(frame, "dev.editor.lines", row);
 
     let mut gutter = label(
@@ -269,9 +291,12 @@ fn add_editor_line(
         .insert("height".into(), number(EDITOR_LINE_HEIGHT));
     gutter.style.insert("font".into(), text("JetBrains Mono"));
     gutter.style.insert("font_size".into(), number(13.0));
-    gutter.style.insert("color".into(), text("#596777"));
+    gutter.style.insert("color".into(), text(EDITOR_GUTTER));
     gutter.style.insert("text_align".into(), text("Right"));
     gutter.style.insert("padding_right".into(), number(10.0));
+    gutter
+        .source_bindings
+        .push(binding(&format!("dev.editor.gutter.{slot}"), "edit"));
     add(frame, &row_id, gutter);
 
     let line_text = state.buffer.line(line_index);
@@ -284,14 +309,14 @@ fn add_editor_line(
     code.style.insert("font_size".into(), number(14.0));
     code.style
         .insert("line_height".into(), number(EDITOR_LINE_HEIGHT));
-    code.style.insert("color".into(), text("#d9e1ea"));
+    code.style.insert("color".into(), text(EDITOR_TEXT));
     code.style.insert("text_inset".into(), number(5.0));
     code.style
-        .insert("editor_selection_color".into(), text("#274d72"));
+        .insert("editor_selection_color".into(), text(EDITOR_SELECTION));
     code.style
-        .insert("editor_caret_color".into(), text("#7ee1cf"));
+        .insert("editor_caret_color".into(), text(EDITOR_CARET));
     code.style
-        .insert("editor_bracket_color".into(), text("#4f7faa"));
+        .insert("editor_bracket_color".into(), text(EDITOR_BRACKET));
     if let Some(language) = state
         .language
         .filter(|language| language.file_index == state.active_file)
@@ -305,6 +330,8 @@ fn add_editor_line(
             "editor_type_hints".into(),
             StyleValue::EditorTypeHints(decorations.type_hints.clone()),
         );
+        code.style
+            .insert("editor_type_hint_color".into(), text("#8aa0b8"));
     }
     add_selection_style(&mut code, selection, state.buffer, line_index);
     if selection.is_collapsed() && selection.head.line == line_index {
@@ -362,14 +389,14 @@ fn add_inspector(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     inspector.style.insert("height".into(), text("Fill"));
     inspector.style.insert("padding".into(), number(14.0));
     inspector.style.insert("gap".into(), number(8.0));
-    inspector.style.insert("background".into(), text("#181e26"));
+    inspector.style.insert("background".into(), text(DEV_PANEL));
     add(frame, "dev.workspace", inspector);
 
     let mut title = label("dev.inspector.title", "INSPECT", "dev.inspector");
     title.style.insert("height".into(), number(24.0));
     title.style.insert("font_size".into(), number(12.0));
     title.style.insert("font_weight".into(), text("700"));
-    title.style.insert("color".into(), text("#78dcca"));
+    title.style.insert("color".into(), text(DEV_ACCENT));
     add(frame, "dev.inspector", title);
     inspector_field(frame, "Symbol", state.inspector.symbol, 44.0, "symbol");
     inspector_field(
@@ -410,22 +437,61 @@ fn inspector_field(frame: &mut DocumentFrame, name: &str, value: &str, height: f
     heading.style.insert("height".into(), number(19.0));
     heading.style.insert("font_size".into(), number(11.0));
     heading.style.insert("font_weight".into(), text("600"));
-    heading.style.insert("color".into(), text("#8796a8"));
+    heading.style.insert("color".into(), text(DEV_TEXT_MUTED));
     add(frame, "dev.inspector", heading);
+    let max_lines = ((height - 14.0) / 16.0).floor().max(1.0) as usize;
+    let bounded = bounded_panel_text(if value.is_empty() { "-" } else { value }, 31, max_lines);
     let mut body = label(
         &format!("dev.inspector.{key}.body"),
-        if value.is_empty() { "-" } else { value },
+        &bounded,
         "dev.inspector",
     );
+    body.style.insert("width".into(), text("Fill"));
     body.style.insert("height".into(), number(height));
     body.style.insert("font".into(), text("JetBrains Mono"));
-    body.style.insert("font_size".into(), number(12.0));
-    body.style.insert("color".into(), text("#d9e1ea"));
-    body.style.insert("background".into(), text("#11161d"));
+    body.style.insert("font_size".into(), number(11.0));
+    body.style.insert("color".into(), text(EDITOR_TEXT));
+    body.style.insert("background".into(), text(EDITOR_BG_DARK));
     body.style.insert("padding".into(), number(8.0));
-    body.style.insert("border".into(), text("#303947"));
+    body.style.insert("border".into(), text(DEV_BORDER_MUTED));
     body.style.insert("border_width".into(), number(1.0));
     add(frame, "dev.inspector", body);
+}
+
+fn bounded_panel_text(value: &str, columns: usize, max_lines: usize) -> String {
+    let mut lines = Vec::new();
+    for raw_line in value.lines().chain(value.is_empty().then_some("")) {
+        let mut remaining = raw_line.trim_end();
+        if remaining.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        while !remaining.is_empty() {
+            let end = remaining
+                .char_indices()
+                .nth(columns)
+                .map_or(remaining.len(), |(index, _)| index);
+            let candidate = &remaining[..end];
+            let split = if end < remaining.len() {
+                candidate
+                    .rfind(char::is_whitespace)
+                    .filter(|index| *index > columns / 2)
+                    .unwrap_or(end)
+            } else {
+                end
+            };
+            lines.push(remaining[..split].trim().to_owned());
+            remaining = remaining[split..].trim_start();
+        }
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            let keep = columns.saturating_sub(3);
+            *last = format!("{}...", last.chars().take(keep).collect::<String>());
+        }
+    }
+    lines.join("\n")
 }
 
 fn add_footer(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
@@ -434,8 +500,10 @@ fn add_footer(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     footer.style.insert("width".into(), text("Fill"));
     footer.style.insert("gap".into(), number(16.0));
     footer.style.insert("padding".into(), number(6.0));
-    footer.style.insert("background".into(), text("#202731"));
-    footer.style.insert("border_top".into(), text("#303947"));
+    footer
+        .style
+        .insert("background".into(), text(DEV_PANEL_RAISED));
+    footer.style.insert("border_top".into(), text(DEV_BORDER));
     footer.style.insert("border_top_width".into(), number(1.0));
     add(frame, "dev.root", footer);
     add(
@@ -509,9 +577,17 @@ fn bracket_columns(line: &str, caret: usize) -> Option<String> {
 }
 
 pub fn editor_line_from_target(target: &str) -> Option<usize> {
-    target
-        .strip_prefix("dev.editor.code.")
-        .and_then(|line| line.parse().ok())
+    ["dev.editor.code.", "dev.editor.row.", "dev.editor.gutter."]
+        .into_iter()
+        .find_map(|prefix| {
+            target.strip_prefix(prefix).and_then(|suffix| {
+                let digits = suffix
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>();
+                (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+            })
+        })
 }
 
 pub fn editor_first_line(scroll: f32) -> usize {
@@ -522,7 +598,7 @@ fn style_root(root: &mut DocumentNode, background: &str) {
     root.style.insert("width".into(), text("Fill"));
     root.style.insert("height".into(), text("Fill"));
     root.style.insert("background".into(), text(background));
-    root.style.insert("color".into(), text("#d9e1ea"));
+    root.style.insert("color".into(), text(DEV_TEXT));
     root.style.insert("font_size".into(), number(14.0));
 }
 
@@ -536,22 +612,22 @@ fn button(id: &str, label: &str, width: f64, parent: &str, accent: bool) -> Docu
     button.style.insert("padding".into(), number(5.0));
     button.style.insert(
         "background".into(),
-        text(if accent { "#275d55" } else { "#29323e" }),
+        text(if accent { "#315f9d" } else { DEV_PANEL_ACTIVE }),
     );
     button.style.insert(
         "__hover_background".into(),
-        text(if accent { "#34796d" } else { "#3a4655" }),
+        text(if accent { "#417ac2" } else { DEV_BORDER }),
     );
     button.style.insert(
         "__focus_background".into(),
-        text(if accent { "#34796d" } else { "#3a4655" }),
+        text(if accent { "#417ac2" } else { DEV_BORDER }),
     );
     button.style.insert(
         "border".into(),
-        text(if accent { "#54ad9c" } else { "#465363" }),
+        text(if accent { DEV_ACCENT } else { DEV_BORDER }),
     );
     button.style.insert("border_width".into(), number(1.0));
-    button.style.insert("color".into(), text("#e8eef5"));
+    button.style.insert("color".into(), text(DEV_TEXT));
     button.style.insert("font_size".into(), number(12.0));
     button.style.insert("font_weight".into(), text("600"));
     button.source_bindings.push(binding(id, "press"));
@@ -563,7 +639,7 @@ fn footer_label(id: &str, value: &str) -> DocumentNode {
     node.style.insert("width".into(), text("Fill"));
     node.style.insert("height".into(), number(18.0));
     node.style.insert("font_size".into(), number(11.0));
-    node.style.insert("color".into(), text("#a8b4c2"));
+    node.style.insert("color".into(), text(DEV_TEXT_MUTED));
     node
 }
 
@@ -662,7 +738,22 @@ mod tests {
     #[test]
     fn editor_target_line_is_stable() {
         assert_eq!(editor_line_from_target("dev.editor.code.17"), Some(17));
+        assert_eq!(
+            editor_line_from_target("dev.editor.code.17:type-hint:0"),
+            Some(17)
+        );
+        assert_eq!(editor_line_from_target("dev.editor.row.17"), Some(17));
+        assert_eq!(editor_line_from_target("dev.editor.gutter.17"), Some(17));
         assert_eq!(editor_line_from_target("dev.editor"), None);
+    }
+
+    #[test]
+    fn inspector_text_is_bounded_to_its_panel() {
+        let text = "invalid MachinePlan detail that must not cross the inspector panel boundary";
+        let bounded = bounded_panel_text(text, 20, 2);
+        assert!(bounded.lines().count() <= 2);
+        assert!(bounded.lines().all(|line| line.chars().count() <= 20));
+        assert!(bounded.ends_with("..."));
     }
 
     #[test]

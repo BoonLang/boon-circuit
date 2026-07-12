@@ -127,6 +127,7 @@ impl DevState {
 
     pub fn set_caret(&mut self, position: Position, extend: bool) -> bool {
         self.editor_focused = true;
+        self.inspector_position = None;
         let changed = self.buffer.set_caret(position, extend);
         if changed {
             self.reveal_caret();
@@ -459,5 +460,32 @@ mod tests {
         );
         assert_eq!(result.change, DevChange::Scroll);
         assert_eq!(state.editor_scroll(), 40.0);
+    }
+
+    #[test]
+    fn clicking_a_caret_clears_the_hover_inspector_override() {
+        let mut state = DevState::new("one two".to_owned());
+        state.set_inspector_position(Some(Position { line: 0, column: 1 }));
+        state.set_caret(Position { line: 0, column: 6 }, false);
+        assert_eq!(state.inspection_position(), Position { line: 0, column: 6 });
+    }
+
+    #[test]
+    fn row_hits_keep_mouse_drag_selection_active() {
+        let mut state = DevState::new("select this".to_owned());
+        state.handle_event(&pointer(PointerPhase::Down), |_, _| {
+            Some("dev.editor.row.0".to_owned())
+        });
+        state.set_caret(Position { line: 0, column: 0 }, false);
+        state.handle_event(&pointer(PointerPhase::Move), |_, _| {
+            Some("dev.editor.row.0".to_owned())
+        });
+        assert!(state.dragging_editor());
+        state.set_caret(Position { line: 0, column: 6 }, true);
+        state.handle_event(&pointer(PointerPhase::Up), |_, _| {
+            Some("dev.editor.row.0".to_owned())
+        });
+        assert_eq!(state.selected_text(), "select");
+        assert!(!state.dragging_editor());
     }
 }

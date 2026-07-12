@@ -297,32 +297,77 @@ fn token_style(
     tokens: &[AstToken],
 ) -> (&'static str, Option<&'static str>, Option<&'static str>) {
     match token.kind {
-        AstTokenKind::Comment => ("#6f8f72", None, Some("italic")),
-        AstTokenKind::String => ("#d7b46a", None, None),
-        AstTokenKind::Number => ("#8fc7ff", None, None),
-        AstTokenKind::Operator => ("#ff9d66", Some("600"), None),
-        AstTokenKind::Symbol => ("#aeb8c5", None, None),
-        AstTokenKind::Unknown => ("#ff6b7a", Some("700"), None),
-        AstTokenKind::Newline => ("#d9e1ea", None, None),
-        AstTokenKind::Identifier if is_keyword(&token.lexeme) => ("#c69cff", Some("700"), None),
-        AstTokenKind::Identifier if is_definition(token, tokens) => ("#67d5b5", Some("600"), None),
-        AstTokenKind::Identifier if token.lexeme.contains('/') => ("#72b7ff", Some("600"), None),
-        AstTokenKind::Identifier => ("#d9e1ea", None, None),
+        AstTokenKind::Comment => ("#778899", None, Some("italic")),
+        AstTokenKind::String => ("#fff59e", None, None),
+        AstTokenKind::Number => ("#7ad1ff", None, None),
+        AstTokenKind::Operator if token.lexeme == "|>" => ("#D2691E", Some("700"), None),
+        AstTokenKind::Operator => ("#ff9f43", Some("600"), None),
+        AstTokenKind::Symbol => ("#D2691E", Some("700"), None),
+        AstTokenKind::Unknown => ("#ffffff", None, None),
+        AstTokenKind::Newline => ("#d9e1f2", None, None),
+        AstTokenKind::Identifier if is_keyword(&token.lexeme) => {
+            ("#D2691E", Some("800"), Some("italic"))
+        }
+        AstTokenKind::Identifier if is_definition(token, tokens) => {
+            ("#ff6ec7", Some("600"), Some("italic"))
+        }
+        AstTokenKind::Identifier if is_function(token, tokens) => ("#fcbf49", Some("600"), None),
+        AstTokenKind::Identifier if token.lexeme.contains('/') => ("#6cb6ff", None, None),
+        AstTokenKind::Identifier if is_tag(token, tokens) => ("#6df59a", None, None),
+        AstTokenKind::Identifier if is_type(&token.lexeme) => ("#6f9cff", None, None),
+        AstTokenKind::Identifier => ("#eeeeee", None, None),
     }
 }
 
 fn is_definition(token: &AstToken, tokens: &[AstToken]) -> bool {
-    tokens
-        .iter()
-        .find(|candidate| candidate.start >= token.end && candidate.kind != AstTokenKind::Newline)
+    next_token(token, tokens)
         .is_some_and(|candidate| candidate.kind == AstTokenKind::Symbol && candidate.lexeme == ":")
 }
 
 fn is_keyword(value: &str) -> bool {
-    matches!(
-        value,
-        "SOURCE" | "HOLD" | "LATEST" | "LIST" | "WHEN" | "WHILE" | "WHERE" | "True" | "False"
-    )
+    value.chars().count() >= 2
+        && value
+            .chars()
+            .any(|character| character.is_ascii_uppercase())
+        && value
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character == '_')
+}
+
+fn is_function(token: &AstToken, tokens: &[AstToken]) -> bool {
+    next_token(token, tokens)
+        .is_some_and(|candidate| candidate.kind == AstTokenKind::Symbol && candidate.lexeme == "(")
+        || previous_token(token, tokens).is_some_and(|candidate| candidate.lexeme == "FUNCTION")
+}
+
+fn is_tag(token: &AstToken, tokens: &[AstToken]) -> bool {
+    matches!(token.lexeme.as_str(), "True" | "False" | "Null")
+        || (is_type(&token.lexeme)
+            && next_token(token, tokens).is_some_and(|candidate| {
+                candidate.kind == AstTokenKind::Symbol && candidate.lexeme == "["
+            }))
+}
+
+fn is_type(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_uppercase())
+}
+
+fn next_token<'a>(token: &AstToken, tokens: &'a [AstToken]) -> Option<&'a AstToken> {
+    tokens.iter().find(|candidate| {
+        candidate.start >= token.end
+            && candidate.line == token.line
+            && candidate.kind != AstTokenKind::Newline
+    })
+}
+
+fn previous_token<'a>(token: &AstToken, tokens: &'a [AstToken]) -> Option<&'a AstToken> {
+    tokens
+        .iter()
+        .rev()
+        .find(|candidate| candidate.end <= token.start && candidate.kind != AstTokenKind::Newline)
 }
 
 fn line_offsets(source: &str) -> Vec<usize> {

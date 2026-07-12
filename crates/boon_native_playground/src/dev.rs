@@ -236,9 +236,7 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                             let dragging = state.dragging_editor();
                             let target = view.hit(pointer.x, pointer.y).map(str::to_owned);
                             if pointer.phase == PointerPhase::Move && !dragging {
-                                let position = target
-                                    .as_deref()
-                                    .and_then(editor_line_from_target)
+                                let position = editor_slot_at(&view, target.as_deref(), pointer.y)
                                     .map(|slot| {
                                         let line = editor_first_line(state.editor_scroll()) + slot;
                                         let column = editor_column(&view, &state, line, pointer.x);
@@ -250,7 +248,7 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                                     request_inspection(&mut model, &state, &mut writer)?;
                                 }
                             } else if let Some(slot) =
-                                target.as_deref().and_then(editor_line_from_target)
+                                editor_slot_at(&view, target.as_deref(), pointer.y)
                                 && (pointer.phase == PointerPhase::Down || dragging)
                             {
                                 let line = editor_first_line(state.editor_scroll()) + slot;
@@ -359,11 +357,7 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         if model.pending_inspection.as_ref()
                             == Some(&(request_id, revision, path.clone()))
                         {
-                            model.runtime_value = if ok {
-                                value
-                            } else {
-                                format!("Not available: {value}")
-                            };
+                            model.runtime_value = if ok { value } else { value };
                             model.runtime_value_path = Some((revision, path));
                             model.pending_inspection = None;
                             frame_changed = true;
@@ -727,10 +721,18 @@ fn request_inspection(
     let byte = state
         .buffer()
         .byte_for_position(state.inspection_position());
-    let path = symbol_at(&state.source(), byte);
-    if path.is_empty() {
+    let source = state.source();
+    let path = symbol_at(&source, byte);
+    if let Some(literal) = literal_value(&path) {
         model.pending_inspection = None;
-        model.runtime_value = "Move the caret onto a value".to_owned();
+        model.runtime_value_path = None;
+        model.runtime_value = literal;
+        return Ok(());
+    }
+    if !is_runtime_path(&path) {
+        model.pending_inspection = None;
+        model.runtime_value_path = None;
+        model.runtime_value = "No runtime binding at this position".to_owned();
         return Ok(());
     }
     if model
@@ -753,6 +755,27 @@ fn request_inspection(
     Ok(())
 }
 
+fn is_runtime_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+        })
+}
+
+fn literal_value(value: &str) -> Option<String> {
+    if value.parse::<i64>().is_ok() || matches!(value, "True" | "False" | "Null") {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
 fn editor_column(view: &RetainedView, state: &DevState, line: usize, pointer_x: f32) -> usize {
     let slot = line.saturating_sub(editor_first_line(state.editor_scroll()));
     let id = format!("dev.editor.code.{slot}");
@@ -767,6 +790,18 @@ fn editor_column(view: &RetainedView, state: &DevState, line: usize, pointer_x: 
         .enumerate()
         .min_by(|(_, left), (_, right)| (**left - local).abs().total_cmp(&(**right - local).abs()))
         .map_or(0, |(index, _)| index)
+}
+
+fn editor_slot_at(view: &RetainedView, target: Option<&str>, pointer_y: f32) -> Option<usize> {
+    if let Some(slot) = target.and_then(editor_line_from_target) {
+        return Some(slot);
+    }
+    if !target.is_some_and(|target| target == DEV_EDITOR || target.starts_with("dev.editor.")) {
+        return None;
+    }
+    let bounds = view.node_bounds("dev.editor.lines")?;
+    let slot = ((pointer_y - bounds.y).max(0.0) / 23.0).floor() as usize;
+    (slot < 36).then_some(slot)
 }
 
 fn emit_dev_targets(
@@ -939,5 +974,14 @@ mod tests {
     fn symbol_lookup_tracks_dotted_runtime_paths() {
         let source = "text: store.count";
         assert_eq!(symbol_at(source, source.len()), "store.count");
+    }
+
+    #[test]
+    fn runtime_inspection_rejects_literals_and_malformed_paths() {
+        assert!(is_runtime_path("store.count"));
+        assert!(is_runtime_path("cell.value"));
+        assert!(!is_runtime_path("42"));
+        assert!(!is_runtime_path("Document/new"));
+        assert_eq!(literal_value("42").as_deref(), Some("42"));
     }
 }

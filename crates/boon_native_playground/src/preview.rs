@@ -392,7 +392,10 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         };
                         let (ok, value) = match result {
                             Ok(value) => (true, value),
-                            Err(error) => (false, error),
+                            Err(_) => (
+                                false,
+                                "No current runtime value for this expression".to_owned(),
+                            ),
                         };
                         output.send(Message::PreviewInspectResult {
                             request_id,

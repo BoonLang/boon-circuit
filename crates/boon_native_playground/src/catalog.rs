@@ -44,6 +44,7 @@ impl Catalog {
             .map(|entry| CatalogItem {
                 id: entry.id.clone(),
                 label: entry.label.clone(),
+                custom: false,
             })
             .collect()
     }

@@ -2,89 +2,132 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::thread;
 
-use boon_document::{DocumentNodeId, DocumentPatch, TextValue};
-use boon_document_model::ScrollState;
-use boon_host::{HostEvent, HostEventEnvelope, HostEventOrigin, Viewport};
+use boon_document::diff_document_frames;
+use boon_editor::Position;
+use boon_host::{HostEvent, HostEventEnvelope, HostEventOrigin, PointerPhase, Viewport};
 use boon_native_app_window::{NativeRoleResult, NativeSurfaceHost};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt, pin_mut, select};
 
-use crate::dev_state::{DevAction, DevChange, DevState};
+use crate::dev_state::{ClipboardAction, DevAction, DevChange, DevState};
 use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, input_kind,
     pointer_button_pressed,
 };
+use crate::language::{LanguageSnapshot, LanguageWorker};
 use crate::observer::{InputAccepted, ObserverClient, ObserverEvent, ObserverRole};
 use crate::protocol::{
     CatalogItem, Connection, FrameMode, Message, PreviewStats, ProofMode, Role, SourceUnit,
 };
 use crate::ui::{
-    DEV_EDITOR, DEV_NEXT, DEV_PREVIOUS, DEV_RESET, DEV_RUN, DEV_TEST, DevFrameState, dev_frame,
+    DEV_EDITOR, DEV_FORMAT, DEV_NEW, DEV_NEXT, DEV_PREVIOUS, DEV_REMOVE, DEV_RESET, DEV_RUN,
+    DEV_SAVE, DEV_TEST, DevFrameState, InspectorState, dev_frame, editor_first_line,
+    editor_line_from_target,
 };
 use crate::view::RetainedView;
+use crate::workspace::{
+    PersistRequest, PersistenceWorker, ProjectOrigin, ProjectStore, StoredProject,
+};
 
 pub fn connect(path: &Path) -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Connection::connect(path, Role::Dev)?)
 }
 
-#[derive(Default)]
-struct DevUiUpdate {
-    title: Option<String>,
-    source: bool,
-    scroll: bool,
-    status: bool,
-    perf: Option<String>,
-    interaction: bool,
-    resized: bool,
+struct DevModel {
+    catalog: Vec<CatalogItem>,
+    custom: BTreeMap<String, StoredProject>,
+    active: StoredProject,
+    active_file: usize,
+    revision: u64,
+    request_id: u64,
+    inspect_request_id: u64,
+    pending_inspection: Option<(u64, u64, String)>,
+    runtime_value_path: Option<(u64, String)>,
+    language: Option<LanguageSnapshot>,
+    perf: String,
+    runtime_value: String,
 }
 
-impl DevUiUpdate {
-    fn record(&mut self, change: DevChange) {
-        match change {
-            DevChange::None => {}
-            DevChange::Interaction => self.interaction = true,
-            DevChange::Scroll => self.scroll = true,
-            DevChange::SourceAndStatus => {
-                self.source = true;
-                self.status = true;
-            }
+impl DevModel {
+    fn waiting() -> Self {
+        Self {
+            catalog: Vec::new(),
+            custom: BTreeMap::new(),
+            active: StoredProject {
+                id: "waiting".to_owned(),
+                label: "Boon".to_owned(),
+                origin: ProjectOrigin::BuiltIn,
+                units: vec![SourceUnit {
+                    path: "no source".to_owned(),
+                    source: String::new(),
+                }],
+            },
+            active_file: 0,
+            revision: 0,
+            request_id: 0,
+            inspect_request_id: 0,
+            pending_inspection: None,
+            runtime_value_path: None,
+            language: None,
+            perf: "Preview mode idle, proof off".to_owned(),
+            runtime_value: "Waiting for preview".to_owned(),
         }
     }
 
-    fn patches(&self, state: &DevState) -> Vec<DocumentPatch> {
-        let mut patches = Vec::with_capacity(5);
-        if let Some(title) = &self.title {
-            patches.push(text_patch("dev.example", title));
+    fn sync_editor(&mut self, state: &DevState) {
+        if let Some(unit) = self.active.units.get_mut(self.active_file) {
+            unit.source = state.source();
         }
-        if self.source {
-            patches.push(text_patch(DEV_EDITOR, state.source()));
+        if self.active.origin == ProjectOrigin::Custom {
+            self.custom
+                .insert(self.active.id.clone(), self.active.clone());
         }
-        if self.scroll {
-            patches.push(DocumentPatch::SetScroll {
-                id: DocumentNodeId(DEV_EDITOR.to_owned()),
-                scroll: ScrollState {
-                    x: 0.0,
-                    y: state.editor_scroll(),
-                },
+    }
+
+    fn source_paths(&self) -> Vec<String> {
+        self.active
+            .units
+            .iter()
+            .map(|unit| unit.path.clone())
+            .collect()
+    }
+
+    fn source(&self) -> String {
+        self.active
+            .units
+            .get(self.active_file)
+            .map_or_else(String::new, |unit| unit.source.clone())
+    }
+
+    fn set_catalog(&mut self, built_ins: Vec<CatalogItem>) {
+        self.catalog = built_ins;
+        self.catalog
+            .extend(self.custom.values().map(|project| CatalogItem {
+                id: project.id.clone(),
+                label: project.label.clone(),
+                custom: true,
+            }));
+    }
+
+    fn upsert_custom_catalog(&mut self, project: &StoredProject) {
+        if let Some(entry) = self.catalog.iter_mut().find(|entry| entry.id == project.id) {
+            entry.label.clone_from(&project.label);
+            entry.custom = true;
+        } else {
+            self.catalog.push(CatalogItem {
+                id: project.id.clone(),
+                label: project.label.clone(),
+                custom: true,
             });
         }
-        if self.status {
-            patches.push(text_patch("dev.status", state.status()));
-        }
-        if let Some(perf) = &self.perf {
-            patches.push(text_patch("dev.perf", perf));
-        }
-        patches
     }
 }
 
-fn text_patch(id: &str, text: &str) -> DocumentPatch {
-    DocumentPatch::SetText {
-        id: DocumentNodeId(id.to_owned()),
-        text: TextValue {
-            text: text.to_owned(),
-        },
-    }
+struct InspectorOwned {
+    symbol: String,
+    static_type: String,
+    detail: String,
+    current_value: String,
 }
 
 pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeRoleResult {
@@ -94,19 +137,24 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
         &observer,
         ObserverEvent::RoleMetadata(product.role_metadata()),
     );
+
+    let store = ProjectStore::discover()?;
+    let custom_projects = store
+        .load_custom()?
+        .into_iter()
+        .map(|project| (project.id.clone(), project))
+        .collect::<BTreeMap<_, _>>();
+    let persistence = PersistenceWorker::new()?;
+    let mut language_worker = LanguageWorker::new();
+    let mut language_output = language_worker.take_output();
+    let mut model = DevModel::waiting();
+    model.custom = custom_projects;
+    let mut state = DevState::new(String::new());
+    state.set_status("Waiting for source...");
+
     let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
-    let mut view = RetainedView::new(
-        dev_frame(DevFrameState {
-            example_label: "Boon",
-            source_path: "no source",
-            source: "",
-            editor_scroll: 0.0,
-            status: "Waiting for source...",
-            perf: "Preview idle, proof off",
-        }),
-        viewport(&host),
-        &mut columns,
-    )?;
+    let initial = build_frame(&model, &state);
+    let mut view = RetainedView::new(initial, viewport(&host), &mut columns)?;
     if let Some(presented) = product.present(&mut host, &view).await? {
         emit_presented(&observer, &presented);
     }
@@ -130,30 +178,28 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
         })?;
     writer.send(&Message::Ready { role: Role::Dev })?;
 
-    let mut state = DevState::new(String::new());
-    let mut catalog = Vec::<CatalogItem>::new();
-    let mut active_id = String::new();
-    let mut units = Vec::<SourceUnit>::new();
-    let mut editable_index = 0usize;
-    let mut revision = 0u64;
-    let mut request_id = 0u64;
+    let mut clipboard = None::<arboard::Clipboard>;
     let mut observed_targets = BTreeMap::<String, (f32, f32)>::new();
     loop {
         enum Wake {
             Native(Result<HostEventEnvelope, boon_native_app_window::NativeHostError>),
             Ipc(Option<Result<Message, String>>),
+            Language(Option<LanguageSnapshot>),
         }
         let wake = {
             let native = host.next_event().fuse();
             let command = incoming.next().fuse();
-            pin_mut!(native, command);
+            let language = language_output.next().fuse();
+            pin_mut!(native, command, language);
             select! {
                 event = native => Wake::Native(event),
                 message = command => Wake::Ipc(message),
+                snapshot = language => Wake::Language(snapshot),
             }
         };
         let mut transaction = NativeFrameTransaction::default();
-        let mut update = DevUiUpdate::default();
+        let mut frame_changed = false;
+        let mut interaction_changed = false;
         match wake {
             Wake::Native(event) => {
                 for accepted in drain_native_events(&mut host, event).await? {
@@ -161,60 +207,83 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                     let target_name = native_target_name(&view, &envelope.event, &state);
                     let visible_input = if matches!(envelope.event, HostEvent::Resize(_)) {
                         view.resize(viewport(&host), &mut columns)?;
-                        update.resized = true;
+                        frame_changed = true;
                         true
                     } else {
                         let result = state.handle_event(&envelope.event, |x, y| {
                             view.hit(x, y).map(str::to_owned)
                         });
-                        update.record(result.change);
-                        match result.action {
-                            DevAction::None => {}
-                            DevAction::Previous | DevAction::Next => {
-                                if let Some(id) = adjacent_id(
-                                    &catalog,
-                                    &active_id,
-                                    result.action == DevAction::Next,
-                                ) {
-                                    writer.send(&Message::DevSelectExample { example_id: id })?;
-                                    state.set_status("Opening example...");
-                                    update.status = true;
+                        interaction_changed |= result.change == DevChange::Interaction;
+                        frame_changed |= matches!(
+                            result.change,
+                            DevChange::EditorText | DevChange::EditorSelection | DevChange::Scroll
+                        );
+                        if result.change == DevChange::EditorText {
+                            model.sync_editor(&state);
+                            model.revision = model.revision.saturating_add(1);
+                            language_worker.submit(
+                                model.revision,
+                                model.active_file,
+                                model.active.units.clone(),
+                            );
+                        } else if result.change == DevChange::EditorSelection {
+                            request_inspection(&mut model, &state, &mut writer)?;
+                        }
+                        let mut inspector_changed = false;
+                        if let HostEvent::Pointer(pointer) = &envelope.event
+                            && matches!(pointer.phase, PointerPhase::Down | PointerPhase::Move)
+                        {
+                            let dragging = state.dragging_editor();
+                            let target = view.hit(pointer.x, pointer.y).map(str::to_owned);
+                            if pointer.phase == PointerPhase::Move && !dragging {
+                                let position = target
+                                    .as_deref()
+                                    .and_then(editor_line_from_target)
+                                    .map(|slot| {
+                                        let line = editor_first_line(state.editor_scroll()) + slot;
+                                        let column = editor_column(&view, &state, line, pointer.x);
+                                        Position { line, column }
+                                    });
+                                if state.set_inspector_position(position) {
+                                    inspector_changed = true;
+                                    frame_changed = true;
+                                    request_inspection(&mut model, &state, &mut writer)?;
                                 }
-                            }
-                            DevAction::Run => {
-                                update_editable_unit(&state, &mut units, editable_index);
-                                revision = revision.saturating_add(1);
-                                writer.send(&Message::DevRun {
-                                    revision,
-                                    units: units.clone(),
-                                })?;
-                                state.set_status("Compiling...");
-                                update.status = true;
-                            }
-                            DevAction::Reset => {
-                                writer.send(&Message::DevReset)?;
-                                state.set_status("Resetting...");
-                                update.status = true;
-                            }
-                            DevAction::Test => {
-                                update_editable_unit(&state, &mut units, editable_index);
-                                revision = revision.saturating_add(1);
-                                request_id = request_id.saturating_add(1);
-                                writer.send(&Message::DevTest {
-                                    request_id,
-                                    revision,
-                                    units: units.clone(),
-                                })?;
-                                state.set_status("TEST running in preview...");
-                                update.status = true;
-                            }
-                            DevAction::Close => {
-                                observe_input(&observer, envelope, target_name, false);
-                                let _ = writer.send(&Message::Shutdown);
-                                return Ok(());
+                            } else if let Some(slot) =
+                                target.as_deref().and_then(editor_line_from_target)
+                                && (pointer.phase == PointerPhase::Down || dragging)
+                            {
+                                let line = editor_first_line(state.editor_scroll()) + slot;
+                                let column = editor_column(&view, &state, line, pointer.x);
+                                let caret_changed = state.set_caret(
+                                    Position { line, column },
+                                    pointer.phase == PointerPhase::Move || state.shift_held(),
+                                );
+                                frame_changed |= caret_changed;
+                                if caret_changed {
+                                    request_inspection(&mut model, &state, &mut writer)?;
+                                }
+                                inspector_changed |= caret_changed;
                             }
                         }
-                        result.visible_change()
+                        let changed = result.visible_change() || inspector_changed;
+                        let action_changed = result.action != DevAction::None;
+                        let close = result.action == DevAction::Close;
+                        handle_action(
+                            result.action,
+                            &mut model,
+                            &mut state,
+                            &store,
+                            &persistence,
+                            &language_worker,
+                            &mut writer,
+                            &mut clipboard,
+                        )?;
+                        frame_changed |= action_changed;
+                        if close {
+                            return Ok(());
+                        }
+                        changed
                     };
                     observe_input(&observer, envelope, target_name, visible_input);
                     if visible_input {
@@ -227,67 +296,95 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                 match message {
                     Message::Catalog {
                         entries,
-                        active_id: next_active,
+                        active_id: _,
                     } => {
-                        catalog = entries;
-                        active_id = next_active;
+                        model.set_catalog(entries);
+                        frame_changed = true;
                     }
                     Message::OpenEditor {
                         example_id,
                         label,
-                        revision: next_revision,
-                        units: next_units,
+                        revision,
+                        units,
                     } => {
-                        active_id = example_id;
-                        revision = next_revision;
-                        units = next_units;
-                        editable_index = units.len().saturating_sub(1);
-                        state.replace_source(
-                            units
-                                .get(editable_index)
-                                .map(|unit| unit.source.clone())
-                                .unwrap_or_default(),
+                        model.sync_editor(&state);
+                        model.active = StoredProject {
+                            id: example_id,
+                            label,
+                            origin: ProjectOrigin::BuiltIn,
+                            units,
+                        };
+                        model.active_file = model.active.units.len().saturating_sub(1);
+                        model.revision = revision;
+                        model.language = None;
+                        model.runtime_value = "Compiling preview...".to_owned();
+                        state.replace_source(model.source());
+                        language_worker.submit(
+                            model.revision,
+                            model.active_file,
+                            model.active.units.clone(),
                         );
-                        let source_path = units
-                            .get(editable_index)
-                            .map(|unit| unit.path.as_str())
-                            .unwrap_or("no source");
-                        update.title = Some(format!("{label}  {source_path}"));
-                        update.source = true;
-                        update.scroll = true;
-                        update.status = true;
-                        update.interaction = true;
+                        frame_changed = true;
                     }
                     Message::PreviewStats(stats) => {
-                        update.perf = Some(perf_line(&stats));
+                        model.perf = perf_line(&stats);
+                        frame_changed = true;
                     }
                     Message::PreviewStatus {
-                        revision: status_revision,
+                        revision,
                         ok,
                         message,
                     } => {
+                        model.runtime_value = if ok {
+                            "Preview current".to_owned()
+                        } else {
+                            "Unavailable while source has errors".to_owned()
+                        };
                         state.set_status(format!(
-                            "r{status_revision} {}: {message}",
+                            "r{revision} {}: {message}",
                             if ok { "ready" } else { "error" }
                         ));
-                        update.status = true;
+                        if ok && revision == model.revision {
+                            request_inspection(&mut model, &state, &mut writer)?;
+                        }
+                        frame_changed = true;
+                    }
+                    Message::PreviewInspectResult {
+                        request_id,
+                        revision,
+                        path,
+                        ok,
+                        value,
+                    } => {
+                        if model.pending_inspection.as_ref()
+                            == Some(&(request_id, revision, path.clone()))
+                        {
+                            model.runtime_value = if ok {
+                                value
+                            } else {
+                                format!("Not available: {value}")
+                            };
+                            model.runtime_value_path = Some((revision, path));
+                            model.pending_inspection = None;
+                            frame_changed = true;
+                        }
                     }
                     Message::PreviewTestResult {
-                        request_id: completed,
+                        request_id,
                         passed,
                         message,
                     } => {
                         state.set_status(format!(
-                            "TEST #{completed} {}: {message}",
+                            "TEST #{request_id} {}: {message}",
                             if passed { "passed" } else { "failed" }
                         ));
-                        update.status = true;
+                        frame_changed = true;
                     }
                     Message::Ready {
                         role: Role::Preview,
                     } => {
                         state.set_status("Preview connected");
-                        update.status = true;
+                        frame_changed = true;
                     }
                     Message::Shutdown => return Ok(()),
                     other => {
@@ -295,22 +392,49 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                     }
                 }
             }
+            Wake::Language(Some(snapshot)) => {
+                if snapshot.revision == model.revision && snapshot.file_index == model.active_file {
+                    model.language = Some(snapshot);
+                    model.sync_editor(&state);
+                    if model.active.origin == ProjectOrigin::Custom {
+                        persistence
+                            .submit(PersistRequest::Save(model.active.clone()))
+                            .map_err(|error| format!("custom autosave failed: {error}"))?;
+                    }
+                    writer.send(&Message::DevSourceChanged {
+                        revision: model.revision,
+                        units: model.active.units.clone(),
+                    })?;
+                    frame_changed = true;
+                }
+            }
+            Wake::Language(None) => return Err("language worker stopped".into()),
         }
 
-        let mut render_changed = update.resized;
-        let patches = update.patches(&state);
-        if !patches.is_empty() {
-            let document_update = view.apply_patches(patches, &mut columns)?;
-            render_changed |= document_update.render_changed || document_update.layout_changed;
+        while let Some(result) = persistence.try_result() {
+            state.set_status(match result.result {
+                Ok(()) => format!("Saved {}", result.project_id),
+                Err(error) => format!("Save failed: {error}"),
+            });
+            frame_changed = true;
         }
-        if update.interaction {
-            let interaction_update = view.set_interaction_state(
+
+        let mut render_changed = frame_changed;
+        if frame_changed {
+            let next = build_frame(&model, &state);
+            let patches = diff_document_frames(view.frame(), &next);
+            if !patches.is_empty() {
+                let update = view.apply_patches(patches, &mut columns)?;
+                render_changed |= update.layout_changed || update.render_changed;
+            }
+        }
+        if interaction_changed || frame_changed {
+            let update = view.set_interaction_state(
                 state.hovered(),
-                state.editor_focused().then_some(crate::ui::DEV_EDITOR),
+                state.editor_focused().then_some(DEV_EDITOR),
                 &mut columns,
             )?;
-            render_changed |=
-                interaction_update.render_changed || interaction_update.layout_changed;
+            render_changed |= update.layout_changed || update.render_changed;
         }
         if render_changed {
             transaction.mark_dirty();
@@ -320,6 +444,329 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
             emit_presented(&observer, &presented);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_action(
+    action: DevAction,
+    model: &mut DevModel,
+    state: &mut DevState,
+    store: &ProjectStore,
+    persistence: &PersistenceWorker,
+    language: &LanguageWorker,
+    writer: &mut Connection,
+    clipboard: &mut Option<arboard::Clipboard>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match action {
+        DevAction::None => {}
+        DevAction::Previous | DevAction::Next => {
+            if let Some(id) =
+                adjacent_id(&model.catalog, &model.active.id, action == DevAction::Next)
+            {
+                select_project(id, model, state, persistence, language, writer)?;
+            }
+        }
+        DevAction::SelectExample(id) => {
+            select_project(id, model, state, persistence, language, writer)?;
+        }
+        DevAction::SelectFile(index) if index < model.active.units.len() => {
+            model.sync_editor(state);
+            model.active_file = index;
+            model.language = None;
+            state.replace_source(model.source());
+            language.submit(model.revision, index, model.active.units.clone());
+        }
+        DevAction::SelectFile(_) => {}
+        DevAction::NewProject => {
+            model.sync_editor(state);
+            let project = store.create_custom(model.catalog.iter().map(|entry| entry.id.clone()));
+            persistence.submit(PersistRequest::Save(project.clone()))?;
+            model.custom.insert(project.id.clone(), project.clone());
+            model.upsert_custom_catalog(&project);
+            model.active = project;
+            model.active_file = 0;
+            model.revision = model.revision.saturating_add(1);
+            model.language = None;
+            state.replace_source(model.source());
+            language.submit(model.revision, 0, model.active.units.clone());
+            writer.send(&Message::DevRun {
+                revision: model.revision,
+                units: model.active.units.clone(),
+            })?;
+            state.set_status("Created local custom example");
+        }
+        DevAction::RemoveProject if model.active.origin == ProjectOrigin::Custom => {
+            let removed = model.active.id.clone();
+            persistence.submit(PersistRequest::Remove(removed.clone()))?;
+            model.custom.remove(&removed);
+            model.catalog.retain(|entry| entry.id != removed);
+            if let Some(next) = model.catalog.iter().find(|entry| !entry.custom) {
+                writer.send(&Message::DevSelectExample {
+                    example_id: next.id.clone(),
+                })?;
+            }
+            state.set_status("Removed local custom example");
+        }
+        DevAction::RemoveProject => {}
+        DevAction::Run => {
+            model.sync_editor(state);
+            model.revision = model.revision.saturating_add(1);
+            writer.send(&Message::DevRun {
+                revision: model.revision,
+                units: model.active.units.clone(),
+            })?;
+            state.set_status("Compiling...");
+        }
+        DevAction::Reset => {
+            if model.active.origin == ProjectOrigin::BuiltIn {
+                writer.send(&Message::DevReset)?;
+                state.set_status("Resetting versioned example...");
+            } else {
+                let project = store
+                    .load_custom()?
+                    .into_iter()
+                    .find(|project| project.id == model.active.id)
+                    .unwrap_or_else(|| model.active.clone());
+                model.active = project;
+                model.active_file = model.active_file.min(model.active.units.len() - 1);
+                state.replace_source(model.source());
+                state.set_status("Reloaded local example");
+            }
+        }
+        DevAction::Test => {
+            model.sync_editor(state);
+            model.revision = model.revision.saturating_add(1);
+            model.request_id = model.request_id.saturating_add(1);
+            writer.send(&Message::DevTest {
+                request_id: model.request_id,
+                revision: model.revision,
+                units: model.active.units.clone(),
+            })?;
+            state.set_status("TEST running in preview...");
+        }
+        DevAction::Save => {
+            model.sync_editor(state);
+            persistence.submit(PersistRequest::Save(model.active.clone()))?;
+            state.set_status(match model.active.origin {
+                ProjectOrigin::BuiltIn => "Saving versioned source...",
+                ProjectOrigin::Custom => "Saving local custom source...",
+            });
+        }
+        DevAction::Format => {
+            let path = model
+                .active
+                .units
+                .get(model.active_file)
+                .map(|unit| unit.path.as_str())
+                .unwrap_or("RUN.bn");
+            match boon_parser::format_source_unit(path, state.source()) {
+                Ok(source) => {
+                    state.format(source);
+                    model.sync_editor(state);
+                    model.revision = model.revision.saturating_add(1);
+                    language.submit(
+                        model.revision,
+                        model.active_file,
+                        model.active.units.clone(),
+                    );
+                }
+                Err(error) => state.set_status(format!("Format failed: {error}")),
+            }
+        }
+        DevAction::Clipboard(action) => {
+            let clipboard = clipboard_instance(clipboard)?;
+            let mut edited = false;
+            match action {
+                ClipboardAction::Copy => {
+                    let selected = state.selected_text();
+                    if !selected.is_empty() {
+                        clipboard.set_text(selected)?;
+                    }
+                }
+                ClipboardAction::Cut => {
+                    let selected = state.selected_text();
+                    if !selected.is_empty() {
+                        clipboard.set_text(selected)?;
+                        edited = state.cut_selection();
+                    }
+                }
+                ClipboardAction::Paste => {
+                    let text = clipboard.get_text()?;
+                    edited = state.paste(&text);
+                }
+            }
+            if edited {
+                model.sync_editor(state);
+                model.revision = model.revision.saturating_add(1);
+                language.submit(
+                    model.revision,
+                    model.active_file,
+                    model.active.units.clone(),
+                );
+            }
+        }
+        DevAction::Close => {
+            let _ = writer.send(&Message::Shutdown);
+        }
+    }
+    Ok(())
+}
+
+fn select_project(
+    id: String,
+    model: &mut DevModel,
+    state: &mut DevState,
+    persistence: &PersistenceWorker,
+    language: &LanguageWorker,
+    writer: &mut Connection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    model.sync_editor(state);
+    if model.active.origin == ProjectOrigin::Custom {
+        persistence.submit(PersistRequest::Save(model.active.clone()))?;
+    }
+    if let Some(project) = model.custom.get(&id).cloned() {
+        model.active = project;
+        model.active_file = model.active.units.len().saturating_sub(1);
+        model.revision = model.revision.saturating_add(1);
+        model.language = None;
+        state.replace_source(model.source());
+        language.submit(
+            model.revision,
+            model.active_file,
+            model.active.units.clone(),
+        );
+        writer.send(&Message::DevRun {
+            revision: model.revision,
+            units: model.active.units.clone(),
+        })?;
+        state.set_status("Opened local custom example");
+    } else {
+        writer.send(&Message::DevSelectExample { example_id: id })?;
+        state.set_status("Opening versioned example...");
+    }
+    Ok(())
+}
+
+fn clipboard_instance(
+    clipboard: &mut Option<arboard::Clipboard>,
+) -> Result<&mut arboard::Clipboard, arboard::Error> {
+    if clipboard.is_none() {
+        *clipboard = Some(arboard::Clipboard::new()?);
+    }
+    Ok(clipboard.as_mut().expect("clipboard initialized"))
+}
+
+fn build_frame(model: &DevModel, state: &DevState) -> boon_document::DocumentFrame {
+    let inspector = inspector(model, state);
+    let paths = model.source_paths();
+    dev_frame(DevFrameState {
+        catalog: &model.catalog,
+        active_id: &model.active.id,
+        example_label: &model.active.label,
+        origin: model.active.origin,
+        source_paths: &paths,
+        active_file: model.active_file,
+        buffer: state.buffer(),
+        editor_scroll: state.editor_scroll(),
+        language: model.language.as_ref(),
+        inspector: InspectorState {
+            symbol: &inspector.symbol,
+            static_type: &inspector.static_type,
+            detail: &inspector.detail,
+            current_value: &inspector.current_value,
+        },
+        status: state.status(),
+        perf: &model.perf,
+    })
+}
+
+fn inspector(model: &DevModel, state: &DevState) -> InspectorOwned {
+    let byte = state
+        .buffer()
+        .byte_for_position(state.inspection_position());
+    let source = state.source();
+    let symbol = symbol_at(&source, byte);
+    let hint = model
+        .language
+        .as_ref()
+        .filter(|snapshot| snapshot.revision == model.revision)
+        .and_then(|snapshot| snapshot.hint_at(byte));
+    InspectorOwned {
+        symbol,
+        static_type: hint.map_or_else(
+            || "No type at caret".to_owned(),
+            |hint| hint.compact_label.clone(),
+        ),
+        detail: hint.map_or_else(String::new, |hint| {
+            format!("{}\n{}", hint.category, hint.detail_label)
+        }),
+        current_value: model.runtime_value.clone(),
+    }
+}
+
+fn symbol_at(source: &str, byte: usize) -> String {
+    let is_symbol =
+        |value: u8| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-' | b'/' | b'.');
+    let bytes = source.as_bytes();
+    let mut start = byte.min(bytes.len());
+    let mut end = start;
+    while start > 0 && is_symbol(bytes[start - 1]) {
+        start -= 1;
+    }
+    while end < bytes.len() && is_symbol(bytes[end]) {
+        end += 1;
+    }
+    source.get(start..end).unwrap_or_default().to_owned()
+}
+
+fn request_inspection(
+    model: &mut DevModel,
+    state: &DevState,
+    writer: &mut Connection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let byte = state
+        .buffer()
+        .byte_for_position(state.inspection_position());
+    let path = symbol_at(&state.source(), byte);
+    if path.is_empty() {
+        model.pending_inspection = None;
+        model.runtime_value = "Move the caret onto a value".to_owned();
+        return Ok(());
+    }
+    if model
+        .pending_inspection
+        .as_ref()
+        .is_some_and(|(_, revision, pending)| *revision == model.revision && pending == &path)
+        || model.runtime_value_path.as_ref() == Some(&(model.revision, path.clone()))
+    {
+        return Ok(());
+    }
+    model.inspect_request_id = model.inspect_request_id.saturating_add(1);
+    let request_id = model.inspect_request_id;
+    model.pending_inspection = Some((request_id, model.revision, path.clone()));
+    model.runtime_value = "Reading current value...".to_owned();
+    writer.send(&Message::DevInspect {
+        request_id,
+        revision: model.revision,
+        path,
+    })?;
+    Ok(())
+}
+
+fn editor_column(view: &RetainedView, state: &DevState, line: usize, pointer_x: f32) -> usize {
+    let slot = line.saturating_sub(editor_first_line(state.editor_scroll()));
+    let id = format!("dev.editor.code.{slot}");
+    let Some(bounds) = view.node_bounds(&id) else {
+        return 0;
+    };
+    let text = state.buffer().line(line);
+    let edges = boon_native_gpu::editor_text_column_edges(&text, 14.0, 23.0, "JetBrains Mono", "");
+    let local = (pointer_x - bounds.x - 5.0).max(0.0);
+    edges
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| (**left - local).abs().total_cmp(&(**right - local).abs()))
+        .map_or(0, |(index, _)| index)
 }
 
 fn emit_dev_targets(
@@ -333,6 +780,10 @@ fn emit_dev_targets(
         DEV_RUN,
         DEV_RESET,
         DEV_TEST,
+        DEV_SAVE,
+        DEV_FORMAT,
+        DEV_NEW,
+        DEV_REMOVE,
         DEV_EDITOR,
     ] {
         let Some(target) = view.target_for_source(node, None) else {
@@ -362,7 +813,7 @@ fn native_target_name(view: &RetainedView, event: &HostEvent, state: &DevState) 
         HostEvent::Keyboard(_) | HostEvent::TextInput(_) | HostEvent::Ime(_)
             if state.editor_focused() =>
         {
-            Some(crate::ui::DEV_EDITOR.to_owned())
+            Some(DEV_EDITOR.to_owned())
         }
         _ => None,
     }
@@ -426,13 +877,10 @@ fn viewport(host: &NativeSurfaceHost) -> Viewport {
     }
 }
 
-fn update_editable_unit(state: &DevState, units: &mut [SourceUnit], index: usize) {
-    if let Some(unit) = units.get_mut(index) {
-        unit.source = state.source().to_owned();
-    }
-}
-
 fn adjacent_id(entries: &[CatalogItem], active: &str, next: bool) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
     let index = entries.iter().position(|entry| entry.id == active)?;
     let index = if next {
         (index + 1) % entries.len()
@@ -468,43 +916,6 @@ fn perf_line(stats: &PreviewStats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_document::render_scene::ApproximateTextColumnMeasurer;
-    use boon_host::{PointerButton, PointerEvent, PointerPhase, SurfaceId, WheelEvent};
-
-    fn pointer(x: f32, y: f32, phase: PointerPhase) -> HostEvent {
-        HostEvent::Pointer(PointerEvent {
-            surface: SurfaceId("dev".to_owned()),
-            x,
-            y,
-            phase,
-            button: (phase != PointerPhase::Move).then_some(PointerButton::Primary),
-        })
-    }
-
-    fn apply_state_event(
-        state: &mut DevState,
-        view: &mut RetainedView,
-        columns: &mut ApproximateTextColumnMeasurer,
-        event: &HostEvent,
-    ) -> (crate::dev_state::DevEventResult, usize) {
-        let result = state.handle_event(event, |x, y| view.hit(x, y).map(str::to_owned));
-        let mut update = DevUiUpdate::default();
-        update.record(result.change);
-        let patches = update.patches(state);
-        let patch_count = patches.len();
-        if !patches.is_empty() {
-            view.apply_patches(patches, columns).unwrap();
-        }
-        if update.interaction {
-            view.set_interaction_state(
-                state.hovered(),
-                state.editor_focused().then_some(DEV_EDITOR),
-                columns,
-            )
-            .unwrap();
-        }
-        (result, patch_count)
-    }
 
     #[test]
     fn example_navigation_wraps_without_special_example_names() {
@@ -512,10 +923,12 @@ mod tests {
             CatalogItem {
                 id: "a".into(),
                 label: "A".into(),
+                custom: false,
             },
             CatalogItem {
                 id: "b".into(),
                 label: "B".into(),
+                custom: true,
             },
         ];
         assert_eq!(adjacent_id(&entries, "a", false).as_deref(), Some("b"));
@@ -523,89 +936,8 @@ mod tests {
     }
 
     #[test]
-    fn large_source_hover_test_and_wheel_stay_on_retained_dev_path() {
-        let source = "value: 1234567890\n".repeat(3_000);
-        assert!(source.len() >= 50_000);
-        let mut state = DevState::new(source);
-        let mut columns = ApproximateTextColumnMeasurer;
-        let mut view = RetainedView::new(
-            dev_frame(DevFrameState {
-                example_label: "Counter",
-                source_path: "examples/counter.bn",
-                source: state.source(),
-                editor_scroll: 0.0,
-                status: state.status(),
-                perf: "Preview idle, proof off",
-            }),
-            Viewport {
-                surface: 1,
-                width: 1_160.0,
-                height: 820.0,
-                scale: 1.0,
-            },
-            &mut columns,
-        )
-        .unwrap();
-        let initial_full_lowers = view.retained_stats().full_lower_count;
-        let test = view.target_for_source(DEV_TEST, None).expect("TEST target");
-        let next = view.target_for_source(DEV_NEXT, None).expect("Next target");
-        let mut observed_targets = BTreeMap::new();
-        emit_dev_targets(&None, &view, &mut observed_targets);
-        assert!(observed_targets.contains_key(DEV_EDITOR));
-
-        for index in 0..200 {
-            let target = if index % 2 == 0 { &test } else { &next };
-            let (_, patch_count) = apply_state_event(
-                &mut state,
-                &mut view,
-                &mut columns,
-                &pointer(target.center_x, target.center_y, PointerPhase::Move),
-            );
-            assert_eq!(patch_count, 0, "hover must not clone or patch source text");
-        }
-
-        apply_state_event(
-            &mut state,
-            &mut view,
-            &mut columns,
-            &pointer(test.center_x, test.center_y, PointerPhase::Down),
-        );
-        let (result, patch_count) = apply_state_event(
-            &mut state,
-            &mut view,
-            &mut columns,
-            &pointer(test.center_x, test.center_y, PointerPhase::Up),
-        );
-        assert_eq!(result.action, DevAction::Test);
-        assert_eq!(patch_count, 0);
-
-        let editor = view
-            .target_for_source(DEV_EDITOR, None)
-            .expect("editor target");
-        apply_state_event(
-            &mut state,
-            &mut view,
-            &mut columns,
-            &pointer(editor.center_x, editor.center_y, PointerPhase::Down),
-        );
-        assert!(view.scene().visual_primitives.iter().any(|primitive| {
-            primitive.node.0 == DEV_EDITOR
-                && primitive.primitive == boon_document::RenderVisualPrimitiveKind::Border
-        }));
-        let (_, patch_count) = apply_state_event(
-            &mut state,
-            &mut view,
-            &mut columns,
-            &HostEvent::Wheel(WheelEvent {
-                surface: SurfaceId("dev".to_owned()),
-                x: editor.center_x,
-                y: editor.center_y,
-                delta_x: 0.0,
-                delta_y: 120.0,
-            }),
-        );
-        assert_eq!(patch_count, 1, "wheel must emit one retained scroll patch");
-        assert_eq!(state.editor_scroll(), 120.0);
-        assert_eq!(view.retained_stats().full_lower_count, initial_full_lowers);
+    fn symbol_lookup_tracks_dotted_runtime_paths() {
+        let source = "text: store.count";
+        assert_eq!(symbol_at(source, source.len()), "store.count");
     }
 }

@@ -4,6 +4,7 @@ mod desktop;
 mod dev;
 mod dev_state;
 mod frame;
+mod language;
 #[cfg(target_os = "linux")]
 mod native_input;
 mod observer;
@@ -14,6 +15,7 @@ mod runtime_view;
 mod ui;
 mod verify;
 mod view;
+mod workspace;
 #[cfg(target_os = "linux")]
 mod workspace_control;
 

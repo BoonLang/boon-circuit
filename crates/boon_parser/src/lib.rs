@@ -847,6 +847,27 @@ fn bracket_inline(prefix: &str, inner: &str) -> String {
 }
 
 pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
+    let tokens = lex_source(path, source)?;
+    let text_body_line_ranges = text_literal_body_line_ranges(&tokens);
+    let lines = parser_lines(&tokens);
+    let item_lines = merge_multiline_bytes_lines(&lines, &text_body_line_ranges);
+    let items = parser_items(&item_lines, &text_body_line_ranges);
+    let mut expressions = Vec::new();
+    let statements = ast_statement_tree(&items, &mut expressions, source);
+    Ok(AstProgram {
+        tokens,
+        lines,
+        items,
+        statements,
+        expressions,
+    })
+}
+
+/// Tokenizes Boon source with the same lexer used by the parser.
+///
+/// Editor tooling uses this surface so highlighting and semantic inspection do
+/// not need a second, drifting approximation of the language grammar.
+pub fn lex_source(path: &str, source: &str) -> Result<Vec<AstToken>, ParseError> {
     let source_index = SourceIndex::new(source);
     let spanned = token_parser()
         .repeated()
@@ -863,7 +884,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
                 message,
             }
         })?;
-    let tokens = spanned
+    Ok(spanned
         .into_iter()
         .map(|(kind, span)| {
             let start = source_index.char_offset_to_byte(span.start);
@@ -883,20 +904,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
                 end,
             }
         })
-        .collect::<Vec<_>>();
-    let text_body_line_ranges = text_literal_body_line_ranges(&tokens);
-    let lines = parser_lines(&tokens);
-    let item_lines = merge_multiline_bytes_lines(&lines, &text_body_line_ranges);
-    let items = parser_items(&item_lines, &text_body_line_ranges);
-    let mut expressions = Vec::new();
-    let statements = ast_statement_tree(&items, &mut expressions, source);
-    Ok(AstProgram {
-        tokens,
-        lines,
-        items,
-        statements,
-        expressions,
-    })
+        .collect())
 }
 
 fn document_statement(ast: &AstProgram) -> Option<&AstStatement> {

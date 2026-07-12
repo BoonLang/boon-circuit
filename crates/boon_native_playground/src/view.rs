@@ -77,9 +77,17 @@ impl RetainedView {
         self.retained.scene()
     }
 
-    #[cfg(test)]
     pub fn frame(&self) -> &DocumentFrame {
         self.retained.frame()
+    }
+
+    pub fn node_bounds(&self, id: &str) -> Option<Rect> {
+        self.retained
+            .layout()
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == id)
+            .map(|item| item.bounds)
     }
 
     pub fn demands(&self) -> &[boon_document::LayoutDemand] {

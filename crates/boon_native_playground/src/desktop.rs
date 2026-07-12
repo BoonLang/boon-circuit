@@ -201,6 +201,18 @@ impl DesktopSupervisor {
             (Role::Dev, Message::DevReset) => self.reset_source(),
             (
                 Role::Dev,
+                Message::DevInspect {
+                    request_id,
+                    revision,
+                    path,
+                },
+            ) => self.preview.send(&Message::PreviewInspect {
+                request_id,
+                revision,
+                path,
+            }),
+            (
+                Role::Dev,
                 Message::DevTest {
                     request_id,
                     revision,
@@ -215,7 +227,8 @@ impl DesktopSupervisor {
             }),
             (Role::Preview, message @ Message::PreviewStats(_))
             | (Role::Preview, message @ Message::PreviewStatus { .. })
-            | (Role::Preview, message @ Message::PreviewTestResult { .. }) => {
+            | (Role::Preview, message @ Message::PreviewTestResult { .. })
+            | (Role::Preview, message @ Message::PreviewInspectResult { .. }) => {
                 self.dev.send(&message)
             }
             (_, Message::Shutdown) => return Some(Ok(())),

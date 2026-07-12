@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -41,6 +41,7 @@ pub struct SourceUnit {
 pub struct CatalogItem {
     pub id: String,
     pub label: String,
+    pub custom: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,6 +183,23 @@ pub enum Message {
         passed: bool,
         message: String,
     },
+    DevInspect {
+        request_id: u64,
+        revision: u64,
+        path: String,
+    },
+    PreviewInspect {
+        request_id: u64,
+        revision: u64,
+        path: String,
+    },
+    PreviewInspectResult {
+        request_id: u64,
+        revision: u64,
+        path: String,
+        ok: bool,
+        value: String,
+    },
     Shutdown,
 }
 
@@ -202,6 +220,9 @@ impl Message {
             Self::PreviewStatus { .. } => 12,
             Self::PreviewTestResult { .. } => 13,
             Self::Shutdown => 14,
+            Self::DevInspect { .. } => 15,
+            Self::PreviewInspect { .. } => 16,
+            Self::PreviewInspectResult { .. } => 17,
         }
     }
 
@@ -286,6 +307,33 @@ impl Message {
                 out.bool(*passed);
                 out.string(message)?;
             }
+            Self::DevInspect {
+                request_id,
+                revision,
+                path,
+            }
+            | Self::PreviewInspect {
+                request_id,
+                revision,
+                path,
+            } => {
+                out.u64(*request_id);
+                out.u64(*revision);
+                out.string(path)?;
+            }
+            Self::PreviewInspectResult {
+                request_id,
+                revision,
+                path,
+                ok,
+                value,
+            } => {
+                out.u64(*request_id);
+                out.u64(*revision);
+                out.string(path)?;
+                out.bool(*ok);
+                out.string(value)?;
+            }
             Self::Shutdown => {}
         }
         Ok(())
@@ -358,6 +406,23 @@ impl Message {
                 message: input.string()?,
             },
             14 => Self::Shutdown,
+            15 => Self::DevInspect {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                path: input.string()?,
+            },
+            16 => Self::PreviewInspect {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                path: input.string()?,
+            },
+            17 => Self::PreviewInspectResult {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                path: input.string()?,
+                ok: input.bool()?,
+                value: input.string()?,
+            },
             _ => return Err(ProtocolError::UnknownMessage(tag)),
         };
         input.finish()?;
@@ -577,6 +642,7 @@ impl Encoder {
         for entry in entries {
             self.string(&entry.id)?;
             self.string(&entry.label)?;
+            self.bool(entry.custom);
         }
         Ok(())
     }
@@ -699,6 +765,7 @@ impl<'a> Decoder<'a> {
                 Ok(CatalogItem {
                     id: self.string()?,
                     label: self.string()?,
+                    custom: self.bool()?,
                 })
             })
             .collect()
@@ -779,6 +846,7 @@ mod tests {
                 entries: vec![CatalogItem {
                     id: "counter".to_owned(),
                     label: "Counter".to_owned(),
+                    custom: false,
                 }],
                 active_id: "counter".to_owned(),
             },
@@ -787,6 +855,23 @@ mod tests {
                 label: "Counter".to_owned(),
                 revision: 7,
                 units: units(),
+            },
+            Message::DevInspect {
+                request_id: 9,
+                revision: 7,
+                path: "store.count".to_owned(),
+            },
+            Message::PreviewInspect {
+                request_id: 9,
+                revision: 7,
+                path: "store.count".to_owned(),
+            },
+            Message::PreviewInspectResult {
+                request_id: 9,
+                revision: 7,
+                path: "store.count".to_owned(),
+                ok: true,
+                value: "3".to_owned(),
             },
             Message::DevSourceChanged {
                 revision: 8,

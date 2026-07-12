@@ -296,6 +296,10 @@ impl LiveRuntime {
         Ok(self.session.root_value_current(name)?)
     }
 
+    pub fn inspect_value_current(&mut self, name: &str, max_rows: usize) -> RuntimeResult<Value> {
+        Ok(self.session.inspect_value_current(name, max_rows)?)
+    }
+
     pub fn document_frame(&self) -> Option<&DocumentFrame> {
         self.document.as_ref().map(document::DocumentRuntime::frame)
     }

@@ -103,6 +103,14 @@ impl RuntimeView {
         self.last_runtime_phase
     }
 
+    pub fn inspect_root_current(&mut self, path: &str) -> ViewResult<String> {
+        let value = self
+            .runtime
+            .inspect_value_current(path, 8)
+            .map_err(|error| error.to_string())?;
+        Ok(format_inspection_value(&value, 0))
+    }
+
     pub fn scenario_target_row(
         &self,
         source_path: &str,
@@ -528,6 +536,60 @@ impl RuntimeView {
             .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
             .map(Some)
             .map_err(|error| error.to_string())
+    }
+}
+
+fn format_inspection_value(value: &Value, depth: usize) -> String {
+    const MAX_DEPTH: usize = 4;
+    const MAX_ITEMS: usize = 24;
+    const MAX_TEXT: usize = 256;
+    if depth >= MAX_DEPTH {
+        return "...".to_owned();
+    }
+    match value {
+        Value::Null => "Null".to_owned(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::Text(value) => {
+            let mut bounded = value.chars().take(MAX_TEXT).collect::<String>();
+            if value.chars().count() > MAX_TEXT {
+                bounded.push_str("...");
+            }
+            format!("\"{bounded}\"")
+        }
+        Value::Bytes(value) => format!("Bytes[{}]", value.len()),
+        Value::List(values) => {
+            let mut parts = values
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|value| format_inspection_value(value, depth + 1))
+                .collect::<Vec<_>>();
+            if values.len() > MAX_ITEMS {
+                parts.push(format!("... {} more", values.len() - MAX_ITEMS));
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Record(fields) => {
+            let mut parts = fields
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|(name, value)| {
+                    format!("{name}: {}", format_inspection_value(value, depth + 1))
+                })
+                .collect::<Vec<_>>();
+            if fields.len() > MAX_ITEMS {
+                parts.push(format!("... {} more", fields.len() - MAX_ITEMS));
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        Value::Row { id, fields } => format!(
+            "Row(list={}, key={}, generation={}, fields={})",
+            id.list.0,
+            id.key,
+            id.generation,
+            fields.len()
+        ),
+        Value::Error { code } => format!("Error[{code}]"),
     }
 }
 

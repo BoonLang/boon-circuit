@@ -601,44 +601,33 @@ fn exercise_native_roles(
     }
 
     if gate == Gate::CounterDev {
-        dev_placement = activate_window(
-            session,
-            observer,
-            events,
-            &mut placements,
-            ObserverRole::Dev,
-        )?;
-        let next_center = observed_role_target(events, ObserverRole::Dev, "dev.next")
-            .ok_or("dev.next retained hit center was not observed")?;
-        let previous_center = observed_role_target(events, ObserverRole::Dev, "dev.previous")
-            .ok_or("dev.previous retained hit center was not observed")?;
-        let next = locate_target(
-            session,
-            observer,
-            events,
-            ObserverRole::Dev,
-            "dev.next",
-            next_center,
-            translated_target_candidates(dev_placement.origin, next_center.0, next_center.1),
-        )?;
-        let previous = locate_target(
-            session,
-            observer,
-            events,
-            ObserverRole::Dev,
-            "dev.previous",
-            previous_center,
-            translated_target_candidates(
-                dev_placement.origin,
-                previous_center.0,
-                previous_center.1,
-            ),
-        )?;
         let mut revision = maximum_switch_revision(events);
         for ordinal in 0..23 {
-            let point = if ordinal % 2 == 0 { next } else { previous };
+            session.reconcile_background_layout()?;
+            dev_placement = activate_window(
+                session,
+                observer,
+                events,
+                &mut placements,
+                ObserverRole::Dev,
+            )?;
+            let target = if ordinal % 2 == 0 {
+                "dev.next"
+            } else {
+                "dev.previous"
+            };
+            let center = observed_role_target(events, ObserverRole::Dev, target)
+                .ok_or_else(|| format!("{target} retained hit center was not observed"))?;
+            locate_target(
+                session,
+                observer,
+                events,
+                ObserverRole::Dev,
+                target,
+                center,
+                translated_target_candidates(dev_placement.origin, center.0, center.1),
+            )?;
             let start = events.len();
-            session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
             session.run_driver(&["click", "left"])?;
             revision = wait_for_value(
                 observer,
@@ -652,7 +641,12 @@ fn exercise_native_roles(
                     _ => None,
                 },
             )
-            .map_err(|error| format!("Counter source switch {ordinal} did not finish: {error}"))?;
+            .map_err(|error| {
+                format!(
+                    "Counter source switch {ordinal} did not finish: {error}; observed={}",
+                    input_event_trace(events, start, 12)
+                )
+            })?;
         }
     }
 
@@ -841,11 +835,7 @@ fn activate_window(
         {
             placement
         }
-        _ => {
-            session.run_driver(&["chord", "125", "left"])?;
-            thread::sleep(Duration::from_millis(150));
-            stable_window_placement(session, observer, events, expected)?
-        }
+        _ => stable_window_placement(session, observer, events, expected)?,
     };
     placements.insert(expected, placement);
     Ok(placement)
@@ -2373,6 +2363,21 @@ impl NativeSession {
     }
 
     fn prepare_background_workspace(&mut self, executable: &Path) -> Result<(), String> {
+        self.reconcile_background_layout()?;
+        let workspace = WorkspaceGuard::start(executable, NATIVE_WORKSPACE)?;
+        let (width, height) = workspace.output_size();
+        let input = self
+            .input
+            .as_mut()
+            .ok_or("kernel virtual input process is unavailable")?;
+        input.set_pointer_space(width, height)?;
+        input.prepare_pointer()?;
+        self.pointer_space = Some((width, height));
+        self.workspace = Some(workspace);
+        Ok(())
+    }
+
+    fn reconcile_background_layout(&self) -> Result<(), String> {
         let output = Command::new("cosmic-background-launch")
             .args(["--reconcile", &self.launch_id])
             .output()
@@ -2394,19 +2399,9 @@ impl NativeSession {
                 self.observed_roles.len()
             ));
         }
-        let workspace = WorkspaceGuard::start(executable, NATIVE_WORKSPACE)?;
         let isolation = query_isolation_status(&self.launch_id)?;
         isolation.require_safe(&self.isolated_seat_name)?;
         isolation.require_layout(self.observed_roles.len())?;
-        let (width, height) = workspace.output_size();
-        let input = self
-            .input
-            .as_mut()
-            .ok_or("kernel virtual input process is unavailable")?;
-        input.set_pointer_space(width, height)?;
-        input.prepare_pointer()?;
-        self.pointer_space = Some((width, height));
-        self.workspace = Some(workspace);
         Ok(())
     }
 

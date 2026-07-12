@@ -522,6 +522,23 @@ fn cells_mount_is_sparse_and_selected_formula_is_current() {
 }
 
 #[test]
+fn inspector_reads_bounded_current_list_fields_without_materializing_the_grid() {
+    let mut runtime = runtime_for_path("../../examples/cells.bn");
+    runtime.mount();
+
+    let Value::List(values) = runtime.inspect_value_current("cell.address", 3).unwrap() else {
+        panic!("cell.address inspection should return bounded row samples");
+    };
+    assert_eq!(values.len(), 3);
+    assert!(values.iter().all(|value| matches!(value, Value::Record(_))));
+
+    let Value::List(values) = runtime.inspect_value_current("cell.value", 1).unwrap() else {
+        panic!("cell.value inspection should cross the row currentness barrier");
+    };
+    assert_eq!(values.len(), 1);
+}
+
+#[test]
 fn cells_commit_with_unchanged_display_emits_no_redundant_patch() {
     let mut runtime = runtime_for_path("../../examples/cells.bn");
     let event = |runtime: &LiveRuntime, sequence, path: &str, address: &str, text: Option<&str>| {

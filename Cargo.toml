@@ -11,6 +11,7 @@ members = [
     "crates/boon_document_model",
     "crates/boon_host",
     "crates/boon_document",
+    "crates/boon_editor",
     "crates/boon_native_gpu",
     "crates/boon_native_app_window",
     "crates/boon_native_playground",
@@ -34,6 +35,7 @@ boon_runtime = { path = "crates/boon_runtime" }
 boon_document_model = { path = "crates/boon_document_model" }
 boon_host = { path = "crates/boon_host" }
 boon_document = { path = "crates/boon_document" }
+boon_editor = { path = "crates/boon_editor" }
 boon_native_gpu = { path = "crates/boon_native_gpu" }
 boon_native_app_window = { path = "crates/boon_native_app_window" }
 app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "6aec9831f281df355736df28a4c3aacdef7cf8a1" }
@@ -47,6 +49,7 @@ bytemuck = { version = "1.25", features = ["derive"] }
 encase = "0.12"
 ropey = "1.6"
 unicode-segmentation = "1.13"
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 image = { version = "0.24.9", default-features = false, features = ["png"] }
 resvg = { version = "0.47.0", default-features = false }
 wgpu = "=29.0.1"

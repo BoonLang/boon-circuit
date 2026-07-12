@@ -375,6 +375,33 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             message: "source accepted by latest-wins compiler".to_owned(),
                         })?;
                     }
+                    Message::PreviewInspect {
+                        request_id,
+                        revision,
+                        path,
+                    } => {
+                        let result = if revision != source_revision {
+                            Err(format!(
+                                "preview revision {source_revision} is not editor revision {revision}"
+                            ))
+                        } else {
+                            runtime
+                                .as_mut()
+                                .ok_or_else(|| "preview runtime is not mounted".to_owned())
+                                .and_then(|runtime| runtime.inspect_root_current(&path))
+                        };
+                        let (ok, value) = match result {
+                            Ok(value) => (true, value),
+                            Err(error) => (false, error),
+                        };
+                        output.send(Message::PreviewInspectResult {
+                            request_id,
+                            revision,
+                            path,
+                            ok,
+                            value,
+                        })?;
+                    }
                     Message::Shutdown => return Ok(()),
                     other => {
                         return Err(format!("invalid desktop-to-preview message: {other:?}").into());

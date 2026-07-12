@@ -779,6 +779,29 @@ impl Metadata {
             .ok_or_else(|| Error::InvalidPlan(format!("list {} has no debug label", list.0)))?;
         self.list_field(list, &format!("{list_label}.{name}"))
     }
+
+    fn any_list_field(&self, name: &str) -> Result<(ListId, FieldId), Error> {
+        let collect = |candidate: &str| {
+            self.list_fields_by_name
+                .iter()
+                .filter(|((_, field_name), fields)| field_name == candidate && fields.len() == 1)
+                .map(|((list, _), fields)| (*list, fields[0]))
+                .collect::<BTreeSet<_>>()
+        };
+        let mut matches = collect(name);
+        if matches.is_empty() {
+            matches = collect(local_name(name));
+        }
+        match matches.into_iter().collect::<Vec<_>>().as_slice() {
+            [match_] => Ok(*match_),
+            [] => Err(Error::InvalidPlan(format!(
+                "no root value or list field `{name}`"
+            ))),
+            matches => Err(Error::InvalidPlan(format!(
+                "list field `{name}` is ambiguous across {matches:?}"
+            ))),
+        }
+    }
 }
 
 fn debug_name_variants(label: &str) -> Vec<String> {
@@ -1145,6 +1168,53 @@ impl Session {
             .get(&state)
             .cloned()
             .ok_or_else(|| Error::Evaluation(format!("root state `{name}` has no value")))
+    }
+
+    pub fn inspect_value_current(&mut self, name: &str, max_rows: usize) -> Result<Value, Error> {
+        if self.metadata.root_field_by_name.contains_key(name)
+            || self
+                .metadata
+                .root_field_by_name
+                .contains_key(local_name(name))
+            || self.metadata.root_state_by_name.contains_key(name)
+            || self
+                .metadata
+                .root_state_by_name
+                .contains_key(local_name(name))
+        {
+            return self.root_value_current(name);
+        }
+        let (list, field) = self.metadata.any_list_field(name)?;
+        let rows = self
+            .lists
+            .get(&list)
+            .map(|state| {
+                state
+                    .order
+                    .iter()
+                    .copied()
+                    .take(max_rows)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut work = Work::default();
+        let mut values = Vec::with_capacity(rows.len());
+        for row in rows {
+            let value = if self.metadata.row_computations.contains_key(&field) {
+                self.ensure_row_field(row, field, None, &mut work)?
+            } else {
+                self.row_value(row, field)?
+            };
+            values.push(Value::Record(BTreeMap::from([
+                ("key".to_owned(), Value::Number(row.key as i64)),
+                (
+                    "generation".to_owned(),
+                    Value::Number(row.generation as i64),
+                ),
+                ("value".to_owned(), value),
+            ])));
+        }
+        Ok(Value::List(values))
     }
 
     pub fn row_target_for_source(

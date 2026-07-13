@@ -220,6 +220,7 @@ fn quarter_turn_text_run_rasterizes_a_centered_rotated_mask() {
         align: TextAlign::Center,
         vertical_align: TextVerticalAlign::Center,
         rotate_degrees: 90,
+        wrap: false,
     };
     let mut font_system = editor_font_system();
     let mut swash_cache = SwashCache::new();
@@ -950,6 +951,7 @@ fn text_clip_padding_expands_text_bounds_on_all_edges() {
         align: TextAlign::Left,
         vertical_align: TextVerticalAlign::Center,
         rotate_degrees: 0,
+        wrap: false,
     };
 
     let bounds = text_bounds(&run, 100, 100);

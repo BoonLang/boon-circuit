@@ -35,6 +35,54 @@ pub trait TextMeasurer {
         let _ = style;
         self.measure(text, font_size)
     }
+
+    fn measure_wrapped_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        style: &BTreeMap<String, StyleValue>,
+    ) -> TextMetrics {
+        let max_width = max_width.max(1.0);
+        let space_width = self.measure_styled(" ", font_size, style).width;
+        let line_height = self.measure_styled("M", font_size, style).height;
+        let mut line_count = 0usize;
+        let mut widest = 0.0_f32;
+        for logical_line in text.split('\n') {
+            let mut line_width = 0.0_f32;
+            let mut has_word = false;
+            for word in logical_line.split_whitespace() {
+                let word_width = self.measure_styled(word, font_size, style).width;
+                let additional = if has_word {
+                    space_width + word_width
+                } else {
+                    word_width
+                };
+                if has_word && line_width + additional > max_width {
+                    widest = widest.max(line_width);
+                    line_count = line_count.saturating_add(1);
+                    line_width = word_width;
+                } else {
+                    line_width += additional;
+                }
+                if word_width > max_width {
+                    let wrapped_lines = (word_width / max_width).ceil().max(1.0) as usize;
+                    line_count = line_count.saturating_add(wrapped_lines.saturating_sub(1));
+                    line_width = word_width % max_width;
+                    if line_width <= f32::EPSILON {
+                        line_width = max_width;
+                    }
+                }
+                has_word = true;
+            }
+            widest = widest.max(line_width);
+            line_count = line_count.saturating_add(1);
+        }
+        TextMetrics {
+            width: widest.min(max_width),
+            height: line_height * line_count.max(1) as f32,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -521,7 +569,9 @@ fn semantic_node_from_document_node(
     let source_intent = source_binding.map(|binding| binding.intent.clone());
     let link = semantic_style_bool(&node.style, "link") == Some(true)
         || semantic_style_text_any(&node.style, &["href", "to", "url"]).is_some();
-    let role = if link {
+    let role = if node.kind == DocumentNodeKind::EmbeddedMedia {
+        SemanticRole::EmbeddedMedia
+    } else if link {
         SemanticRole::Link
     } else {
         semantic_role_for_document_kind(&node.kind)
@@ -587,6 +637,7 @@ fn semantic_role_for_document_kind(kind: &DocumentNodeKind) -> SemanticRole {
         DocumentNodeKind::Button => SemanticRole::Button,
         DocumentNodeKind::Checkbox => SemanticRole::Checkbox,
         DocumentNodeKind::TextInput => SemanticRole::TextInput,
+        DocumentNodeKind::EmbeddedMedia => SemanticRole::EmbeddedMedia,
         DocumentNodeKind::Table => SemanticRole::Table,
         DocumentNodeKind::TableCell => SemanticRole::Cell,
         DocumentNodeKind::ScrollRoot => SemanticRole::ScrollRegion,
@@ -1181,6 +1232,11 @@ fn semantic_dom_shape(
             }
             ("input".to_owned(), None, None)
         }
+        SemanticRole::EmbeddedMedia => (
+            "figure".to_owned(),
+            Some("group".to_owned()),
+            node.name.clone(),
+        ),
         SemanticRole::Table => ("table".to_owned(), None, node.name.clone()),
         SemanticRole::Cell => ("div".to_owned(), Some("cell".to_owned()), node.name.clone()),
         SemanticRole::ScrollRegion => (
@@ -4626,6 +4682,7 @@ fn layout_unchecked_with_typed_styles<'a>(
         demands: Vec::new(),
         materialization: Vec::new(),
         materialized_range_count: 0,
+        viewport_width: input.viewport.width,
     };
     if let Some(root) = input.document.nodes.get(&input.document.root).cloned() {
         let mut cursor_y = 0.0;
@@ -4670,6 +4727,7 @@ fn layout_subtree_unchecked(input: LayoutSubtreeInput<'_>) -> LayoutFrame {
         demands: Vec::new(),
         materialization: Vec::new(),
         materialized_range_count: 0,
+        viewport_width: input.available_width,
     };
     let subtree_node_count = document_subtree_node_count(input.document, input.root);
     builder.layout_node(
@@ -4756,9 +4814,18 @@ struct LayoutBuilder<'a, 'b> {
     demands: Vec<LayoutDemand>,
     materialization: Vec<MaterializationReport>,
     materialized_range_count: usize,
+    viewport_width: f32,
 }
 
 impl LayoutBuilder<'_, '_> {
+    fn node_is_visible(&self, node: &DocumentNode) -> bool {
+        let visible_min_width = style_spacing(&node.style, "visible_min_width");
+        let visible_max_width = style_spacing(&node.style, "visible_max_width");
+        style_bool(&node.style, "visible") != Some(false)
+            && visible_min_width.is_none_or(|minimum| self.viewport_width >= minimum)
+            && visible_max_width.is_none_or(|maximum| self.viewport_width <= maximum)
+    }
+
     fn typed_style_record(&self, node: &DocumentNode) -> Option<DocumentTypedStyleRecord> {
         let typed_styles = self.typed_styles?;
         let hot_id = typed_styles.hot_ids.hot_id(&node.id)?;
@@ -4776,7 +4843,41 @@ impl LayoutBuilder<'_, '_> {
 
     fn preferred_row_child_width(&mut self, node: &DocumentNode) -> Option<f32> {
         let typed_layout = self.typed_layout_style(node);
+        if layout_dimension_is_auto(&node.style, typed_layout.as_ref(), "width")
+            && let Some(width) = self.auto_control_intrinsic_width(node)
+        {
+            return Some(width);
+        }
         preferred_row_child_width_with_typed(node, typed_layout.as_ref(), self.text)
+    }
+
+    fn auto_control_intrinsic_width(&mut self, node: &DocumentNode) -> Option<f32> {
+        if node.text.is_some()
+            || !matches!(
+                node.kind,
+                DocumentNodeKind::Button | DocumentNodeKind::Checkbox
+            )
+        {
+            return None;
+        }
+        let typed_layout = self.typed_layout_style(node);
+        let label = node.children.iter().find_map(|child| {
+            let child = self.document.nodes.get(child)?.clone();
+            let typed_layout = self.typed_layout_style(&child);
+            row_child_measurement_text(&child, typed_layout.as_ref()).map(|text| {
+                let font_size =
+                    layout_spacing(&child.style, typed_layout.as_ref(), "size").unwrap_or(14.0);
+                self.text
+                    .measure_styled(text, font_size, &child.style)
+                    .width
+                    + layout_edges(&child.style, typed_layout.as_ref(), "padding").horizontal()
+            })
+        })?;
+        let padding = layout_edges(&node.style, typed_layout.as_ref(), "padding");
+        let font_size = layout_spacing(&node.style, typed_layout.as_ref(), "size").unwrap_or(14.0);
+        let auto_padding = layout_spacing(&node.style, typed_layout.as_ref(), "auto_padding")
+            .unwrap_or_else(|| font_size * 0.9);
+        Some((label + auto_padding + padding.horizontal()).max(1.0))
     }
 
     fn constrain_row_child_width(&self, node: &DocumentNode, width: f32, fill_extent: f32) -> f32 {
@@ -4806,6 +4907,14 @@ impl LayoutBuilder<'_, '_> {
                 height: 0.0,
             };
         };
+        if !self.node_is_visible(&node) {
+            return Rect {
+                x,
+                y,
+                width: 0.0,
+                height: 0.0,
+            };
+        }
         let typed_record = self.typed_style_record(&node);
         let typed_layout = typed_record.as_ref().map(|record| &record.layout);
         let padding = layout_edges(&node.style, typed_layout, "padding");
@@ -4835,6 +4944,7 @@ impl LayoutBuilder<'_, '_> {
                     .flatten()
             });
         let font_size = layout_spacing(&node.style, typed_layout, "size").unwrap_or(14.0);
+        let text_wrap = layout_bool(&node.style, typed_layout, "text_wrap").unwrap_or(false);
         let mut measured = measurement_text
             .filter(|value| !value.is_empty())
             .map(|value| self.text.measure_styled(value, font_size, &node.style))
@@ -4847,6 +4957,11 @@ impl LayoutBuilder<'_, '_> {
             && measured.width > 0.0
         {
             measured.width += 8.0;
+        }
+        if auto_width && let Some(intrinsic_width) = self.auto_control_intrinsic_width(&node) {
+            measured.width = measured
+                .width
+                .max((intrinsic_width - padding.horizontal()).max(1.0));
         }
         let shrink_to_child_width = explicit_width.is_none()
             && text.is_none()
@@ -4861,15 +4976,38 @@ impl LayoutBuilder<'_, '_> {
             (measured.width + auto_padding + padding.horizontal()).max(1.0)
         } else if shrink_to_child_width {
             padding.horizontal().max(1.0)
+        } else if text_wrap && explicit_width.is_none() {
+            available_width.max(1.0)
         } else {
             explicit_width
                 .unwrap_or_else(|| measured.width.max(available_width))
                 .max(1.0)
         };
+        if auto_width {
+            width = width.min(available_width.max(1.0));
+        }
         width =
             constrain_layout_dimension(width, &node.style, typed_layout, "width", available_width);
-        let mut height =
-            explicit_height.unwrap_or_else(|| measured.height.max(24.0) + padding.vertical());
+        if text_wrap {
+            let text_inset = layout_spacing(&node.style, typed_layout, "text_inset").unwrap_or(0.0);
+            let wrap_width = (width - padding.horizontal() - text_inset * 2.0).max(1.0);
+            measured = measurement_text
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    self.text
+                        .measure_wrapped_styled(value, font_size, wrap_width, &node.style)
+                })
+                .unwrap_or(TextMetrics {
+                    width: 0.0,
+                    height: 0.0,
+                });
+        }
+        let aspect_ratio = layout_spacing(&node.style, typed_layout, "aspect_ratio")
+            .filter(|ratio| *ratio > f32::EPSILON);
+        let content_sized_height = explicit_height.is_none() && aspect_ratio.is_none();
+        let mut height = explicit_height
+            .or_else(|| aspect_ratio.map(|ratio| width / ratio))
+            .unwrap_or_else(|| measured.height.max(24.0) + padding.vertical());
         height = constrain_layout_dimension(
             height,
             &node.style,
@@ -4929,17 +5067,99 @@ impl LayoutBuilder<'_, '_> {
             let content_y = y + padding.top;
             let content_width = (width - padding.horizontal()).max(1.0);
             match node.kind {
+                DocumentNodeKind::Row
+                    if layout_bool(&node.style, typed_layout, "wrap").unwrap_or(false) =>
+                {
+                    let child_count = node
+                        .children
+                        .iter()
+                        .filter(|child| {
+                            self.document
+                                .nodes
+                                .get(child)
+                                .is_some_and(|child| self.node_is_visible(child))
+                        })
+                        .count();
+                    let minimum = layout_spacing(&node.style, typed_layout, "wrap_min_width")
+                        .unwrap_or(240.0)
+                        .max(1.0);
+                    let columns = (((content_width + gap) / (minimum + gap)).floor() as usize)
+                        .clamp(1, child_count.max(1));
+                    let child_width = ((content_width - gap * columns.saturating_sub(1) as f32)
+                        / columns as f32)
+                        .max(1.0);
+                    let mut cursor_x = content_x;
+                    let mut cursor_y = content_y;
+                    let mut column = 0usize;
+                    let mut row_height = 0.0_f32;
+                    let mut max_child_width = 0.0_f32;
+                    for child in &node.children {
+                        if self
+                            .document
+                            .nodes
+                            .get(child)
+                            .is_none_or(|child| !self.node_is_visible(child))
+                        {
+                            continue;
+                        }
+                        let child_rect = self.layout_node(
+                            child,
+                            cursor_x,
+                            cursor_y,
+                            child_width,
+                            available_height.max(1.0),
+                        );
+                        row_height = row_height.max(child_rect.height);
+                        max_child_width = max_child_width.max(child_rect.width);
+                        column += 1;
+                        if column == columns {
+                            column = 0;
+                            cursor_x = content_x;
+                            cursor_y += row_height + gap;
+                            row_height = 0.0;
+                        } else {
+                            cursor_x += child_width + gap;
+                        }
+                    }
+                    let content_height = if column == 0 {
+                        (cursor_y - content_y - gap).max(0.0)
+                    } else {
+                        cursor_y - content_y + row_height
+                    };
+                    if explicit_width.is_none() {
+                        width = constrain_layout_dimension(
+                            max_child_width.max(content_width) + padding.horizontal(),
+                            &node.style,
+                            typed_layout,
+                            "width",
+                            available_width,
+                        );
+                    }
+                    if content_sized_height {
+                        height = (content_height + padding.vertical()).max(24.0);
+                    }
+                }
                 DocumentNodeKind::Row => {
                     let display_start = self.display_list.len();
                     let hit_start = self.hit_regions.len();
                     let scroll_start = self.scroll_regions.len();
-                    let child_count = node.children.len();
+                    let child_count = node
+                        .children
+                        .iter()
+                        .filter(|child| {
+                            self.document
+                                .nodes
+                                .get(child)
+                                .is_some_and(|child| self.node_is_visible(child))
+                        })
+                        .count();
                     let fill_child_count = node
                         .children
                         .iter()
                         .filter(|child| {
                             self.document.nodes.get(child).is_some_and(|child| {
-                                self.node_layout_dimension_is_fill(child, "width")
+                                self.node_is_visible(child)
+                                    && self.node_layout_dimension_is_fill(child, "width")
                             })
                         })
                         .count();
@@ -4948,7 +5168,7 @@ impl LayoutBuilder<'_, '_> {
                     } else {
                         0.0
                     };
-                    let mut row_child_widths = vec![None; child_count];
+                    let mut row_child_widths = vec![None; node.children.len()];
                     if fill_child_count > 0 {
                         let mut fixed_child_width = 0.0;
                         let mut fill_children = Vec::with_capacity(fill_child_count);
@@ -4956,6 +5176,9 @@ impl LayoutBuilder<'_, '_> {
                             let Some(child_node) = self.document.nodes.get(child).cloned() else {
                                 continue;
                             };
+                            if !self.node_is_visible(&child_node) {
+                                continue;
+                            }
                             if self.node_layout_dimension_is_fill(&child_node, "width") {
                                 fill_children.push((index, child_node));
                                 continue;
@@ -5003,6 +5226,14 @@ impl LayoutBuilder<'_, '_> {
                     let mut cursor_x = content_x;
                     let mut max_child_height: f32 = 0.0;
                     for (index, child) in node.children.iter().enumerate() {
+                        if self
+                            .document
+                            .nodes
+                            .get(child)
+                            .is_none_or(|child| !self.node_is_visible(child))
+                        {
+                            continue;
+                        }
                         let child_available_width = row_child_widths[index]
                             .unwrap_or_else(|| (content_x + content_width - cursor_x).max(1.0))
                             .max(1.0);
@@ -5031,7 +5262,7 @@ impl LayoutBuilder<'_, '_> {
                             }
                         }
                     }
-                    if explicit_height.is_none() {
+                    if content_sized_height {
                         height = (max_child_height + padding.vertical()).max(24.0);
                     }
                 }
@@ -5041,6 +5272,14 @@ impl LayoutBuilder<'_, '_> {
                     let mut max_child_width: f32 = 0.0;
                     let mut max_child_height: f32 = 0.0;
                     for child in &node.children {
+                        if self
+                            .document
+                            .nodes
+                            .get(child)
+                            .is_none_or(|child| !self.node_is_visible(child))
+                        {
+                            continue;
+                        }
                         let child_rect = self.layout_node(
                             child,
                             content_x,
@@ -5060,7 +5299,7 @@ impl LayoutBuilder<'_, '_> {
                             available_width,
                         );
                     }
-                    if explicit_height.is_none() {
+                    if content_sized_height {
                         height = constrain_layout_dimension(
                             (max_child_height + padding.vertical()).max(24.0),
                             &node.style,
@@ -5073,7 +5312,19 @@ impl LayoutBuilder<'_, '_> {
                 _ => {
                     let mut cursor_y = content_y;
                     let mut max_child_width: f32 = 0.0;
+                    let mut laid_out_child = false;
                     for child in &node.children {
+                        if self
+                            .document
+                            .nodes
+                            .get(child)
+                            .is_none_or(|child| !self.node_is_visible(child))
+                        {
+                            continue;
+                        }
+                        if laid_out_child {
+                            cursor_y += gap;
+                        }
                         let child_rect = self.layout_node(
                             child,
                             content_x,
@@ -5081,8 +5332,9 @@ impl LayoutBuilder<'_, '_> {
                             content_width,
                             (content_y + height - cursor_y).max(1.0),
                         );
-                        cursor_y += child_rect.height + gap;
+                        cursor_y += child_rect.height;
                         max_child_width = max_child_width.max(child_rect.width);
+                        laid_out_child = true;
                     }
                     if explicit_width.is_none() {
                         width = if shrink_to_child_width {
@@ -5094,7 +5346,8 @@ impl LayoutBuilder<'_, '_> {
                                 } else {
                                     0.0
                                 };
-                            (max_child_width + padding.horizontal() + padded_button_safety).max(1.0)
+                            (max_child_width + padding.horizontal() + padded_button_safety)
+                                .clamp(1.0, available_width.max(1.0))
                         } else {
                             constrain_layout_dimension(
                                 max_child_width.max(width).max(1.0) + padding.horizontal(),
@@ -5105,9 +5358,9 @@ impl LayoutBuilder<'_, '_> {
                             )
                         };
                     }
-                    if explicit_height.is_none() {
+                    if content_sized_height {
                         height = constrain_layout_dimension(
-                            (cursor_y - y - gap).max(24.0) + padding.bottom,
+                            (cursor_y - y).max(24.0) + padding.bottom,
                             &node.style,
                             typed_layout,
                             "height",
@@ -5641,8 +5894,16 @@ impl TextMeasurer for SimpleTextMeasurer {
         style: &BTreeMap<String, StyleValue>,
     ) -> TextMetrics {
         let width_factor = style_text(style, "font")
-            .filter(|family| family.to_ascii_lowercase().contains("mono"))
-            .map_or(0.55, |_| 0.62);
+            .map(|family| family.to_ascii_lowercase())
+            .map_or(0.55, |family| {
+                if family.contains("mono") {
+                    0.62
+                } else if family.contains("nimbus sans") || family.contains("dejavu sans") {
+                    0.50
+                } else {
+                    0.55
+                }
+            });
         TextMetrics {
             width: text.chars().count() as f32 * font_size * width_factor,
             height: font_size * 1.4,
@@ -6003,6 +6264,13 @@ fn style_key_affects_layout(key: &str) -> bool {
         || key == "center"
         || key == "align_x"
         || key == "overlay_children"
+        || key == "wrap"
+        || key == "wrap_min_width"
+        || key == "text_wrap"
+        || key == "visible"
+        || key == "visible_min_width"
+        || key == "visible_max_width"
+        || key == "aspect_ratio"
         || key == "placeholder"
         || key.starts_with("padding")
         || key.starts_with("__clip_")

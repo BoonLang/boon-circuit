@@ -140,6 +140,7 @@ The protocol carries only:
 - role hello/ready and shutdown;
 - catalog labels for dev;
 - source-unit bundles and monotonic source revisions;
+- immutable content-addressed asset bundles declared by the selected manifest;
 - Run, Reset, and TEST requests;
 - bounded preview status and scalar performance snapshots.
 
@@ -216,6 +217,49 @@ must not be constructed and discarded on normal preview frames.
 
 Every visible surface receives a viewport background primitive. An empty area
 must never expose an unpainted compositor-sized hole.
+
+## Portable Assets, Responsive Layout, And Media
+
+Versioned examples may declare asset files or directories in `examples/manifest.toml`.
+Desktop loads and hashes those files once per example selection, assigns stable
+`asset://<example>/<path>` URLs, and sends one bounded `PreviewAssets` message
+before the source revision. Preview verifies every SHA-256 digest and installs
+the same latest-wins immutable bundle into the product and proof renderers.
+Decode, rasterization, and GPU upload are cached by content hash and requested
+size. Normal render hooks never read the filesystem, fetch the network, or send
+assets over IPC. A missing, mismatched, unsupported, or oversized asset fails
+closed instead of silently drawing unrelated bytes.
+
+Responsive layout is generic document behavior:
+
+- `text_wrap` measures and shapes text within the assigned content width;
+- wrapped rows use stable tracks and bounded minimum widths;
+- `visible_min_width` and `visible_max_width` exclude hidden subtrees from
+  layout, hit testing, semantics, and rendering, leaving no phantom gaps;
+- `aspect_ratio` remains authoritative when an image has an empty sizing child;
+- auto controls reserve intrinsic label width but cannot exceed a wrapped track.
+
+These rules are portable inputs to native and future browser/Wasm renderers.
+They must not branch on an example id, route label, asset filename, or provider.
+
+`Element/embedded_media` and `Scene/Element/embedded_media` lower to the generic
+`EmbeddedMedia` document and semantic role. A media descriptor carries a media
+kind, provider, stable content id, title, poster asset, lazy-loading policy,
+user-activation policy, embed URL, external fallback URL, sandbox policy,
+referrer policy, feature permissions, and fullscreen policy. WGPU renders the
+poster and ordinary Boon overlay children; it contains no YouTube-specific code.
+
+The current native host opens the fallback URL through the platform's standard
+URL launcher. A browser/Wasm host may map the same descriptor to a lazy,
+sandboxed iframe after user activation. For YouTube it must use the
+privacy-enhanced `youtube-nocookie.com` embed URL, set the page origin when API
+control is enabled, and keep postMessage/player lifecycle in the host adapter,
+not in Boon runtime or WGPU. See the official [iframe API](https://developers.google.com/youtube/iframe_api_reference),
+[player parameters](https://developers.google.com/youtube/player_parameters),
+and [privacy-enhanced embed guidance](https://support.google.com/youtube/answer/171780).
+A platform that later supports an inline native web surface may add that as a
+host capability, but the poster/external fallback remains mandatory and fully
+functional on every native platform.
 
 ## Interaction State
 

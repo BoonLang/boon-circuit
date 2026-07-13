@@ -5,7 +5,9 @@ use boon_host::{HostEvent, HostEventEnvelope, PointerPhase};
 use boon_native_app_window::{
     NativeHostError, NativeSurfaceHost, SurfaceAcquireError, SurfacePreferences,
 };
-use boon_native_gpu::{FrameMetrics, SurfaceRenderSceneRequest, VisibleLayoutRenderer};
+use boon_native_gpu::{
+    FrameMetrics, RenderAssetSource, SurfaceRenderSceneRequest, VisibleLayoutRenderer,
+};
 
 use crate::observer::{
     FrameEvidenceKey, FramePresented, InputKind, ObserverEvent, ObserverRole, RoleMetadata,
@@ -323,6 +325,14 @@ impl ProductFrame {
 
     pub fn set_proof_enabled(&mut self, enabled: bool) {
         self.stats.proof_enabled = enabled;
+    }
+
+    pub fn replace_asset_sources(
+        &mut self,
+        sources: Vec<RenderAssetSource>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.renderer.replace_asset_sources(sources)?;
+        Ok(())
     }
 
     pub async fn present(

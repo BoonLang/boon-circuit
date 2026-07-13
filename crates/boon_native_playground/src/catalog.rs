@@ -1,7 +1,8 @@
-use crate::protocol::{CatalogItem, SourceUnit, TestStep};
+use crate::protocol::{AssetBlob, CatalogItem, SourceUnit, TestStep};
 use boon_runtime::{ExampleManifestEntry, RuntimeResult};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::{fs, path::PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedExample {
@@ -9,6 +10,7 @@ pub struct LoadedExample {
     pub label: String,
     pub units: Vec<SourceUnit>,
     pub test_steps: Vec<TestStep>,
+    pub assets: Vec<AssetBlob>,
 }
 
 pub struct Catalog {
@@ -114,12 +116,86 @@ impl Catalog {
                 }
             })
             .collect();
+        let mut assets = entry
+            .asset_files
+            .iter()
+            .map(|path| load_asset(&entry.id, path))
+            .collect::<RuntimeResult<Vec<_>>>()?;
+        for directory in &entry.asset_directories {
+            assets.extend(load_asset_directory(&entry.id, directory)?);
+        }
+        assets.sort_by(|left, right| left.url.cmp(&right.url));
         Ok(LoadedExample {
             id: entry.id.clone(),
             label: entry.label.clone(),
             units,
             test_steps,
+            assets,
         })
+    }
+}
+
+fn load_asset_directory(example_id: &str, directory: &str) -> RuntimeResult<Vec<AssetBlob>> {
+    let mut paths = Vec::new();
+    collect_asset_paths(&resolve_repo_path(directory), &mut paths)?;
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| load_asset(example_id, &path.to_string_lossy()))
+        .collect()
+}
+
+fn collect_asset_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> RuntimeResult<()> {
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_asset_paths(&path, paths)?;
+        } else {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_asset(example_id: &str, path: &str) -> RuntimeResult<AssetBlob> {
+    let filesystem_path = resolve_repo_path(path);
+    let bytes = fs::read(&filesystem_path)?;
+    let relative = path
+        .split_once("/assets/")
+        .map(|(_, relative)| relative)
+        .or_else(|| Path::new(path).file_name().and_then(|name| name.to_str()))
+        .ok_or_else(|| format!("asset path `{path}` has no file name"))?;
+    let media_type = match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        extension => {
+            return Err(format!("unsupported asset extension `{extension}`: {path}").into());
+        }
+    };
+    Ok(AssetBlob {
+        url: format!("asset://{example_id}/{relative}"),
+        media_type: media_type.to_owned(),
+        sha256: boon_runtime::sha256_bytes(&bytes),
+        bytes,
+    })
+}
+
+fn resolve_repo_path(path: &str) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.exists() {
+        candidate
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path)
     }
 }
 

@@ -245,6 +245,7 @@ pub enum SemanticRole {
     Button,
     Checkbox,
     TextInput,
+    EmbeddedMedia,
     Table,
     Cell,
     ScrollRegion,

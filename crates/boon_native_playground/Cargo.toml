@@ -24,6 +24,7 @@ toml.workspace = true
 arboard.workspace = true
 wgpu.workspace = true
 libc.workspace = true
+open.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev.workspace = true

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -24,7 +23,8 @@ use crate::observer::{
 };
 use crate::proof::{ProofConfig, ProofRequest, ProofResult, ProofWorker};
 use crate::protocol::{
-    Connection, FrameMode, Message, PreviewIntent, PreviewStats, ProofMode, Role, TestStep,
+    AssetBlob, Connection, FrameMode, Message, PreviewIntent, PreviewStats, ProofMode, Role,
+    TestStep,
 };
 use crate::runtime_view::RuntimeView;
 use crate::view::{HitTarget, RetainedView};
@@ -316,7 +316,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             latest_runtime_sequence = Some(sequence_after);
                         }
                         if let Some(url) = model.take_external_url() {
-                            let _ = Command::new("xdg-open").arg(url).spawn();
+                            if let Err(error) = open_external_url(&url) {
+                                eprintln!("open external URL: {error}");
+                            }
                         }
                         event_dispatch_us = duration_us(started.elapsed());
                         let phase = model.last_runtime_phase();
@@ -378,6 +380,16 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             Wake::Ipc(message) => {
                 let message = message.ok_or("desktop IPC reader stopped")??;
                 match message {
+                    Message::PreviewAssets { assets } => {
+                        let sources = assets
+                            .into_iter()
+                            .map(render_asset_source)
+                            .collect::<Vec<_>>();
+                        product.replace_asset_sources(sources.clone())?;
+                        if let Some(proof) = proof.as_ref() {
+                            proof.replace_asset_sources(sources)?;
+                        }
+                    }
                     Message::PreviewApply {
                         intent,
                         request_id,
@@ -733,6 +745,26 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             }
         }
     }
+}
+
+fn render_asset_source(asset: AssetBlob) -> boon_native_gpu::RenderAssetSource {
+    boon_native_gpu::RenderAssetSource {
+        url: asset.url,
+        media_type: asset.media_type,
+        sha256: asset.sha256,
+        bytes: asset.bytes.into(),
+    }
+}
+
+fn open_external_url(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !["https://", "http://", "mailto:"]
+        .into_iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return Err(format!("unsupported external URL scheme: {trimmed}"));
+    }
+    open::that_detached(trimmed).map_err(|error| error.to_string())
 }
 
 fn activate(compiled: CompiledPreview) -> Result<RuntimeView, String> {

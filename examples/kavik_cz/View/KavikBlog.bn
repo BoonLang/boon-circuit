@@ -1,0 +1,230 @@
+FUNCTION page() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 24
+        style: [width: Fill, paint: False]
+        items: LIST {
+            KavikComponents/page_hero(PASS: [store: PASSED.store], title: TEXT { Blog }, tagline: TEXT { News, notes, and build logs. })
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 16
+                style: [width: Fill, wrap: True, wrap_min_width: 320, paint: False]
+                items: LIST {
+                    boon_post_card() |> SOURCE { PASSED.store.elements.post.boon }
+                    novywave_post_card() |> SOURCE { PASSED.store.elements.post.novywave }
+                    moonzoon_foundations_card() |> SOURCE { PASSED.store.elements.post.moonzoon_foundations }
+                    moonzoon_history_card() |> SOURCE { PASSED.store.elements.post.moonzoon_history }
+                }
+            )
+            KavikComponents/contact_section(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION boon_post_card() {
+    KavikComponents/post_card(PASS: [store: PASSED.store]
+        title: TEXT { The Boon of Dataflow }
+        description: TEXT { What time manipulation games, hardware circuits, and factory sims taught me about programming. }
+        meta: TEXT { Boon / dataflow / games / books }
+        latest: True
+    )
+}
+
+FUNCTION novywave_post_card() {
+    KavikComponents/post_card(PASS: [store: PASSED.store]
+        title: TEXT { Building NovyWave: GTKWave alternative }
+        description: TEXT { NovyWave, user feedback, and the final stretch to a polished release. }
+        meta: TEXT { NovyWave / user research / EDA / waveforms }
+        latest: False
+    )
+}
+
+FUNCTION moonzoon_foundations_card() {
+    KavikComponents/post_card(PASS: [store: PASSED.store]
+        title: TEXT { MoonZoon: Foundations (2021) }
+        description: TEXT { Signals over hooks, Wasm size battles, and fullstack Rust lessons. }
+        meta: TEXT { MoonZoon / Rust / Wasm / signals / Boon }
+        latest: False
+    )
+}
+
+FUNCTION moonzoon_history_card() {
+    KavikComponents/post_card(PASS: [store: PASSED.store]
+        title: TEXT { MoonZoon: 2021-2025 }
+        description: TEXT { 922 commits and 4.5 years of routing, animations, workers, desktop apps, and GPU graphics. }
+        meta: TEXT { MoonZoon / Rust / Wasm / graphics / Tauri }
+        latest: False
+    )
+}
+
+FUNCTION article(title, deck, meta, image_url, image_alt, items) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 20
+        style: [
+            width: [sizing: Fill, maximum: 860]
+            center: True
+            padding: [bottom: 40]
+            paint: False
+        ]
+        items: LIST {
+            KavikComponents/action_button(PASS: [store: PASSED.store], label: TEXT { Back to Blog })
+                |> SOURCE { PASSED.store.elements.nav.blog }
+            KavikComponents/page_hero(PASS: [store: PASSED.store], title: title, tagline: deck)
+            KavikComponents/muted(PASS: [store: PASSED.store], text: meta)
+            KavikComponents/image(PASS: [store: PASSED.store], url: image_url, alt: image_alt, aspect: 1.75)
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                gap: 20
+                style: [width: Fill, paint: False]
+                items: items
+            )
+            KavikComponents/contact_section(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION article_section(title, text) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [width: Fill, paint: False]
+        items: LIST {
+            KavikComponents/heading(PASS: [store: PASSED.store], text: title, size: 27)
+            KavikComponents/paragraph(PASS: [store: PASSED.store], text: text)
+        }
+    )
+}
+
+FUNCTION boon_post() {
+    article(
+        title: TEXT { The Boon of Dataflow }
+        deck: TEXT { What time manipulation games, hardware circuits, and factory sims taught me about programming. }
+        meta: TEXT { Boon / dataflow / games / books }
+        image_url: TEXT { asset://kavik_cz/images/blog/boon-ascii-logo.png }
+        image_alt: TEXT { Boon ASCII logo }
+        items: LIST {
+            article_section(
+                title: TEXT { Time as data }
+                text: TEXT { Lucid and games such as Braid, TimeShift, and Katana ZERO all explore the human desire to control time. Our brains experience one now, so programming languages and databases often pretend the world advances step by step. Reality does not. Distributed systems expose how costly that simplification becomes. }
+            )
+            article_section(
+                title: TEXT { Build factories, not instruction lists }
+                text: TEXT { Actors, streams, and dataflow offer another model. Factorio and Desynced make it intuitive: resources move through a system while independent parts react. Flow-Based Programming, Lucid, and Domain Modeling Made Functional show how to construct those factories with code. Hardware circuits reveal the same shape. }
+            )
+            KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/blog/factorio-train.jpg }, alt: TEXT { Factorio train system }, aspect: 1.78)
+            article_section(
+                title: TEXT { Loops, portals, and fast failures }
+                text: TEXT { Immutable trees are the simplest dataflow, but real systems cycle: blood returns to the heart, engines adjust from exhaust sensors, and users feed events back into a UI. Boon uses explicit links to create controlled portals against the main flow and FLUSH for urgent short-circuit delivery. These escape routes stay visible in the model. }
+            )
+            KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/blog/cocoon-worlds.webp }, alt: TEXT { COCOON worlds within worlds }, aspect: 1.78)
+            article_section(
+                title: TEXT { Maps for living systems }
+                text: TEXT { Dataflows need real-time maps. Factory games expose logistics and statistics because invisible flow is impossible to operate. Boon follows that lesson with a visual debugger. RayBox explores a portable physical renderer, while elm-ui and Refactoring UI inform a layout language that does not inherit every CSS interaction. }
+            )
+            KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/blog/factorio-electric.png }, alt: TEXT { Factorio electrical statistics }, aspect: 1.78)
+            article_section(
+                title: TEXT { Shape the work }
+                text: TEXT { Implementing the language, runtime, debugger, renderer, and BoonComputer is painful by design. Shape Up makes the work finite enough to ship, and Rework is permission to change the approach when evidence says it is wrong. The destination is one understandable dataflow model from an app to a circuit. }
+            )
+        }
+    )
+}
+
+FUNCTION novywave_post() {
+    article(
+        title: TEXT { Building NovyWave: GTKWave alternative }
+        deck: TEXT { User feedback, waveform-viewer research, and the final stretch to a polished release. }
+        meta: TEXT { NovyWave / user research / EDA / waveforms }
+        image_url: TEXT { asset://kavik_cz/images/novywave_dark_linux.png }
+        image_alt: TEXT { NovyWave desktop UI on Linux }
+        items: LIST {
+            article_section(
+                title: TEXT { Why another waveform viewer? }
+                text: TEXT { GTKWave earned its position by being available and dependable for decades, but its interaction model, packaging, large-file memory use, and platform support now block many users. NovyWave began as a modern cross-platform viewer with fast daily workflows and gamer-style keyboard navigation. }
+            )
+            article_section(
+                title: TEXT { Four conversations changed the priorities }
+                text: TEXT { A physicist needed GHDL compatibility, auto-reload, and usable analog limits. macOS and WSL users needed installation to work before they could evaluate anything else. A student praised docked layouts and comparison after filesystem blockers were fixed. A MIPS developer exposed a local dependency that CI should have caught. The common lesson was simple: setup is part of the product. }
+            )
+            KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/gtkwave_interface.png }, alt: TEXT { GTKWave interface }, aspect: 1.58)
+            article_section(
+                title: TEXT { What research confirmed }
+                text: TEXT { Public issue trackers repeat the same clusters: signal onboarding is confusing; RAM spikes and stalls destroy flow; format edges remain painful; navigation is manual; theming is inconsistent; packaging and macOS support block adoption; and users explicitly ask for plugins and automation. This is compounding friction, not one missing feature. }
+            )
+            article_section(
+                title: TEXT { What already works }
+                text: TEXT { NovyWave reads VCD, FST, and GHW, compares multiple dumps, renders special signal states, supports WASD-style zoom and pan, preserves peaks while decimating, ships native and browser modes, persists workspaces, and hosts sandboxed Wasm plugins. Auto-reload is itself a plugin, proving the extension boundary with a real workflow. }
+            )
+            KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/novywave_plugin_wit.png }, alt: TEXT { NovyWave plugin WIT interface }, aspect: 1.78)
+            article_section(
+                title: TEXT { Before beta }
+                text: TEXT { The remaining release priorities are analog line rendering with manual limits, resizable signal rows, named signal groups, named time markers, and correct platform roots in file pickers. These changes bridge the gap between works on my machine and a tool that can be recommended to a hardware developer without caveats. }
+            )
+            KavikComponents/external_link(PASS: [store: PASSED.store], label: TEXT { NovyWave on GitHub }, to: TEXT { https://github.com/NovyWave/NovyWave })
+        }
+    )
+}
+
+FUNCTION moonzoon_foundations_post() {
+    article(
+        title: TEXT { MoonZoon: Foundations (2021) }
+        deck: TEXT { Signals over hooks, Wasm size battles, and fullstack Rust lessons. }
+        meta: TEXT { MoonZoon / Rust / Wasm / signals / Boon }
+        image_url: TEXT { asset://kavik_cz/images/moonzoon-logo.png }
+        image_alt: TEXT { MoonZoon logo }
+        items: LIST {
+            article_section(
+                title: TEXT { Beyond Virtual DOM }
+                text: TEXT { MoonZoon grew out of maintaining Seed and experimenting with React-style hooks in Rust. The deeper problem was not syntax but the update model: virtual trees and hook ordering made state and rendering harder to reason about. Signals provided direct, typed change propagation without diffing an entire UI tree. }
+            )
+            article_section(
+                title: TEXT { One Rust system }
+                text: TEXT { The frontend compiles to WebAssembly while the backend remains native Rust. Typed routes and UpMsg and DownMsg connect both sides. The mzoon CLI watches source, rebuilds only what changed, and reloads the application. Styling is expressed through Rust APIs rather than stringly HTML and CSS. }
+            )
+            KavikComponents/image(PASS: [store: PASSED.store], url: TEXT { asset://kavik_cz/images/moonzoon_counter_button.png }, alt: TEXT { MoonZoon counter button example }, aspect: 1.78)
+            article_section(
+                title: TEXT { Size and ergonomics }
+                text: TEXT { WebAssembly made every dependency visible in download size. Feature flags, allocator choices, panic behavior, and bindings all mattered. The work established a practical rule that still guides Boon: ergonomics must be paid for with measured runtime and binary costs, not assumed to be free. }
+            )
+            article_section(
+                title: TEXT { The path to Boon }
+                text: TEXT { MoonZoon proved that signals and a coherent fullstack toolchain can remove large categories of glue. It also showed where Rust remains too implementation-oriented for product authors. Boon takes the next step: describe persistent dataflow directly and let interchangeable engines and renderers execute it. }
+            )
+        }
+    )
+}
+
+FUNCTION moonzoon_history_post() {
+    article(
+        title: TEXT { MoonZoon: 2021-2025 }
+        deck: TEXT { 922 commits and 4.5 years of routing, animations, workers, desktop apps, and GPU graphics. }
+        meta: TEXT { MoonZoon / Rust / Wasm / graphics / Tauri }
+        image_url: TEXT { asset://kavik_cz/images/moonzoon_send_message.png }
+        image_alt: TEXT { MoonZoon typed message example }
+        items: LIST {
+            article_section(
+                title: TEXT { A framework under real pressure }
+                text: TEXT { MoonZoon expanded from a signal-based web framework into the foundation for Boon Playground, NovyWave, desktop shells, and experiments with graphics. Each product forced infrastructure to become less theoretical: routing needed typed state, animations needed scheduling, and development reloads needed predictable persistence. }
+            )
+            article_section(
+                title: TEXT { Workers and shared memory }
+                text: TEXT { Browser workloads pushed computation into Web Workers and explored shared memory. The hard part was not starting a worker; it was keeping ownership, typed communication, cancellation, and stale-result handling clear. Those lessons directly inform Boon's latest-wins compiler workers and retained runtime snapshots. }
+            )
+            article_section(
+                title: TEXT { Desktop and native boundaries }
+                text: TEXT { Tauri made a browser UI available as a desktop app, but every platform exposed different filesystem, windowing, and packaging constraints. NovyWave converted those constraints into product requirements. The experience now motivates a native WGPU path whose host effects are explicit and whose browser future shares semantic document nodes. }
+            )
+            article_section(
+                title: TEXT { What remains }
+                text: TEXT { MoonZoon remains useful infrastructure and a record of hard-earned Rust and Wasm lessons. Boon is not a rewrite for novelty; it is an attempt to move the same ideas into a smaller, persistent dataflow language where runtime state, UI semantics, and hardware descriptions can share one model. }
+            )
+            KavikComponents/external_link(PASS: [store: PASSED.store], label: TEXT { MoonZoon on GitHub }, to: TEXT { https://github.com/MoonZoon/MoonZoon })
+        }
+    )
+}

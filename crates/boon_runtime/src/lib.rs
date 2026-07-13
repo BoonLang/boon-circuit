@@ -1245,6 +1245,10 @@ pub struct ExampleManifestEntry {
     pub source: String,
     #[serde(default)]
     pub source_files: Vec<String>,
+    #[serde(default)]
+    pub asset_files: Vec<String>,
+    #[serde(default)]
+    pub asset_directories: Vec<String>,
     pub scenario: String,
     pub budget: String,
 }

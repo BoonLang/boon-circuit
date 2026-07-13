@@ -674,3 +674,25 @@ fn coalesced_quad_draw_ranges_merge_only_adjacent_compatible_batches() {
     assert_eq!(ranges[1].byte_range, 320..416);
     assert_eq!(ranges[2].ring_generation, 8);
 }
+#[test]
+fn bundled_raster_assets_decode_and_resize_to_requested_texture() {
+    let mut bytes = Vec::new();
+    let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([12, 34, 56, 255]));
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode PNG fixture");
+    let source = RenderAssetSource {
+        url: "asset://fixture/photo.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        sha256: hex_sha256(&bytes),
+        bytes: bytes.into(),
+    };
+
+    let pixels = decode_asset_pixels(&source.url, 8, 6, Some(&source)).expect("decode asset");
+
+    assert_eq!(pixels.len(), 8 * 6 * 4);
+    assert_eq!(&pixels[..4], &[12, 34, 56, 255]);
+}

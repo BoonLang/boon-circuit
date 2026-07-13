@@ -140,6 +140,7 @@ impl DesktopSupervisor {
             active_id: self.source.active.id.clone(),
         })?;
         self.send_open_editor()?;
+        self.send_preview_assets()?;
         self.send_preview(PreviewIntent::Replace, None)?;
 
         let result = loop {
@@ -250,6 +251,7 @@ impl DesktopSupervisor {
             active_id: self.source.active.id.clone(),
         })?;
         self.send_open_editor()?;
+        self.send_preview_assets()?;
         self.send_preview(PreviewIntent::Replace, None)
     }
 
@@ -305,6 +307,13 @@ impl DesktopSupervisor {
             } else {
                 Vec::new()
             },
+        })?;
+        Ok(())
+    }
+
+    fn send_preview_assets(&mut self) -> DesktopResult<()> {
+        self.preview.send(&Message::PreviewAssets {
+            assets: self.source.active.assets.clone(),
         })?;
         Ok(())
     }

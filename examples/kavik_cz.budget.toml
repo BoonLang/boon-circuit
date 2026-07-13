@@ -1,0 +1,15 @@
+[latency_ms]
+route_change_input_to_idle_p95 = 8.0
+theme_switch_input_to_idle_p95 = 8.0
+resize_input_to_idle_p95 = 12.0
+max_single_step = 20.0
+
+[memory]
+normal_steady_rss_delta_mib = 96
+normal_peak_rss_delta_mib = 144
+steady_vram_delta_mib = 96
+peak_vram_delta_mib = 144
+
+[allocations]
+bounded_profile_allocs_after_warmup = 0
+graph_rebuilds_per_interaction = 0

@@ -398,6 +398,7 @@ pub enum DocumentConstructor {
     ElementButton,
     ElementCheckbox,
     ElementTextInput,
+    ElementEmbeddedMedia,
     SceneNew,
     SceneElementStripe,
     SceneElementBlock,
@@ -408,6 +409,7 @@ pub enum DocumentConstructor {
     SceneElementButton,
     SceneElementParagraph,
     SceneElementLink,
+    SceneElementEmbeddedMedia,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

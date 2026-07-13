@@ -2310,6 +2310,7 @@ fn document_constructor(function: &str) -> Option<DocumentConstructor> {
         "Element/button" => DocumentConstructor::ElementButton,
         "Element/checkbox" => DocumentConstructor::ElementCheckbox,
         "Element/text_input" => DocumentConstructor::ElementTextInput,
+        "Element/embedded_media" => DocumentConstructor::ElementEmbeddedMedia,
         "Scene/new" => DocumentConstructor::SceneNew,
         "Scene/Element/stripe" => DocumentConstructor::SceneElementStripe,
         "Scene/Element/block" => DocumentConstructor::SceneElementBlock,
@@ -2320,6 +2321,7 @@ fn document_constructor(function: &str) -> Option<DocumentConstructor> {
         "Scene/Element/button" => DocumentConstructor::SceneElementButton,
         "Scene/Element/paragraph" => DocumentConstructor::SceneElementParagraph,
         "Scene/Element/link" => DocumentConstructor::SceneElementLink,
+        "Scene/Element/embedded_media" => DocumentConstructor::SceneElementEmbeddedMedia,
         _ => return None,
     })
 }

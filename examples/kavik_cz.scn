@@ -1,0 +1,84 @@
+name = "kavik.cz physical portfolio"
+source = "examples/kavik_cz/RUN.bn"
+
+[[step]]
+id = "initial-home"
+expect_root_text = { "page" = "Home", "mode" = "Light" }
+
+[[step]]
+id = "open-work"
+user_action = { kind = "click", target = "navigation", target_text = "Work" }
+expected_source_event = { source = "store.elements.nav.work", target_text = "Work" }
+expect_root_text = { "page" = "Work" }
+
+[[step]]
+id = "open-blog"
+user_action = { kind = "click", target = "navigation", target_text = "Blog" }
+expected_source_event = { source = "store.elements.nav.blog", target_text = "Blog" }
+expect_root_text = { "page" = "Blog" }
+
+[[step]]
+id = "open-boon-article"
+user_action = { kind = "click", target = "article", target_text = "The Boon of Dataflow" }
+expected_source_event = { source = "store.elements.post.boon", target_text = "The Boon of Dataflow" }
+expect_root_text = { "page" = "BoonPost" }
+
+[[step]]
+id = "back-to-blog"
+user_action = { kind = "click", target = "navigation", target_text = "Back to Blog" }
+expected_source_event = { source = "store.elements.nav.blog", target_text = "Back to Blog" }
+expect_root_text = { "page" = "Blog" }
+
+[[step]]
+id = "open-novywave-article"
+user_action = { kind = "click", target = "article", target_text = "Building NovyWave: GTKWave alternative" }
+expected_source_event = { source = "store.elements.post.novywave", target_text = "Building NovyWave: GTKWave alternative" }
+expect_root_text = { "page" = "NovyWavePost" }
+
+[[step]]
+id = "back-from-novywave-article"
+user_action = { kind = "click", target = "navigation", target_text = "Back to Blog" }
+expected_source_event = { source = "store.elements.nav.blog", target_text = "Back to Blog" }
+expect_root_text = { "page" = "Blog" }
+
+[[step]]
+id = "open-moonzoon-foundations-article"
+user_action = { kind = "click", target = "article", target_text = "MoonZoon: Foundations (2021)" }
+expected_source_event = { source = "store.elements.post.moonzoon_foundations", target_text = "MoonZoon: Foundations (2021)" }
+expect_root_text = { "page" = "MoonZoonFoundationsPost" }
+
+[[step]]
+id = "back-from-moonzoon-foundations-article"
+user_action = { kind = "click", target = "navigation", target_text = "Back to Blog" }
+expected_source_event = { source = "store.elements.nav.blog", target_text = "Back to Blog" }
+expect_root_text = { "page" = "Blog" }
+
+[[step]]
+id = "open-moonzoon-history-article"
+user_action = { kind = "click", target = "article", target_text = "MoonZoon: 2021-2025" }
+expected_source_event = { source = "store.elements.post.moonzoon_history", target_text = "MoonZoon: 2021-2025" }
+expect_root_text = { "page" = "MoonZoonHistoryPost" }
+
+[[step]]
+id = "back-from-moonzoon-history-article"
+user_action = { kind = "click", target = "navigation", target_text = "Back to Blog" }
+expected_source_event = { source = "store.elements.nav.blog", target_text = "Back to Blog" }
+expect_root_text = { "page" = "Blog" }
+
+[[step]]
+id = "open-shelf"
+user_action = { kind = "click", target = "navigation", target_text = "Shelf" }
+expected_source_event = { source = "store.elements.nav.shelf", target_text = "Shelf" }
+expect_root_text = { "page" = "Shelf" }
+
+[[step]]
+id = "open-about"
+user_action = { kind = "click", target = "navigation", target_text = "About" }
+expected_source_event = { source = "store.elements.nav.about", target_text = "About" }
+expect_root_text = { "page" = "About" }
+
+[[step]]
+id = "toggle-dark"
+user_action = { kind = "click", target = "theme", target_text = "Dark mode" }
+expected_source_event = { source = "store.elements.theme_toggle", target_text = "Dark mode" }
+expect_root_text = { "mode" = "Dark" }

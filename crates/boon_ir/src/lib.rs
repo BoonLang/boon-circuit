@@ -853,15 +853,35 @@ fn lower_with_typecheck(
     let typecheck_ms = lower_elapsed_ms(typecheck_started);
     trace_phase("typecheck", typecheck_ms);
     if typecheck_report.has_errors() {
-        let messages = typecheck_report
+        let mut failures = typecheck_report
             .diagnostics
             .iter()
+            .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
             .map(|diagnostic| format!("line {}: {}", diagnostic.line, diagnostic.message))
-            .collect::<Vec<_>>()
-            .join("; ");
+            .collect::<Vec<_>>();
+        failures.extend(
+            typecheck_report
+                .render_slot_table
+                .slots
+                .iter()
+                .flat_map(|slot| {
+                    slot.diagnostics
+                        .iter()
+                        .filter(|diagnostic| {
+                            diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
+                        })
+                        .map(|diagnostic| {
+                            format!(
+                                "render slot `{}` at line {}: {}",
+                                slot.slot_name, diagnostic.line, diagnostic.message
+                            )
+                        })
+                }),
+        );
+        let messages = failures.join("; ");
         return Err(format!(
-            "typecheck failed with {} diagnostic(s): {messages}",
-            typecheck_report.diagnostics.len(),
+            "typecheck failed with {} error diagnostic(s): {messages}",
+            failures.len(),
         ));
     }
     let nodes_started = Instant::now();

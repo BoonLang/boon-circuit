@@ -1,0 +1,252 @@
+-- Responsive application shell and route composition.
+
+FUNCTION main_scene() {
+    Scene/new(
+        root: root()
+        lights: [
+            key: [x: -0.4, y: -0.8, z: 1.0, intensity: 0.65]
+            rim: [x: 0.8, y: 0.2, z: 0.5, intensity: 0.18]
+        ]
+        geometry: [depth_scale: 0.45]
+    )
+}
+
+FUNCTION root() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            ...KavikTheme/page(mode: PASSED.store.mode)
+            scroll_y: True
+            scrollbars: True
+        ]
+        items: LIST {
+            desktop_header()
+            mobile_header()
+            page_content()
+            footer()
+        }
+    )
+}
+
+FUNCTION desktop_header() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [
+            width: Fill
+            height: 72
+            visible_min_width: 700
+            padding: [left: 28, right: 28, top: 14, bottom: 14]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #10141ee8 }
+                Light => TEXT { #fffffff0 }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #283044 }
+                Light => TEXT { #e3e6ee }
+            }]
+            border_width: 1
+        ]
+        items: LIST {
+            brand()
+            header_spacer()
+            nav_button(label: TEXT { Home }, selected: PASSED.store.page == Home)
+                |> SOURCE { PASSED.store.elements.nav.home }
+            nav_button(label: TEXT { Work }, selected: PASSED.store.page == Work)
+                |> SOURCE { PASSED.store.elements.nav.work }
+            nav_button(label: TEXT { Blog }, selected: PASSED.store.page == Blog)
+                |> SOURCE { PASSED.store.elements.nav.blog }
+            nav_button(label: TEXT { Shelf }, selected: PASSED.store.page == Shelf)
+                |> SOURCE { PASSED.store.elements.nav.shelf }
+            nav_button(label: TEXT { About }, selected: PASSED.store.page == About)
+                |> SOURCE { PASSED.store.elements.nav.about }
+            theme_button() |> SOURCE { PASSED.store.elements.theme_toggle }
+        }
+    )
+}
+
+FUNCTION mobile_header() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 8
+        style: [
+            width: Fill
+            visible_max_width: 699
+            padding: [left: 14, right: 14, top: 12, bottom: 12]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #10141ef4 }
+                Light => TEXT { #fffffff7 }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #283044 }
+                Light => TEXT { #e3e6ee }
+            }]
+            border_width: 1
+        ]
+        items: LIST {
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 8
+                style: [width: Fill, paint: False]
+                items: LIST {
+                    brand()
+                    header_spacer()
+                    theme_button() |> SOURCE { PASSED.store.elements.theme_toggle }
+                }
+            )
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 4
+                style: [width: Fill, wrap: True, wrap_min_width: 64, paint: False]
+                items: LIST {
+                    nav_button(label: TEXT { Home }, selected: PASSED.store.page == Home)
+                        |> SOURCE { PASSED.store.elements.nav.home }
+                    nav_button(label: TEXT { Work }, selected: PASSED.store.page == Work)
+                        |> SOURCE { PASSED.store.elements.nav.work }
+                    nav_button(label: TEXT { Blog }, selected: PASSED.store.page == Blog)
+                        |> SOURCE { PASSED.store.elements.nav.blog }
+                    nav_button(label: TEXT { Shelf }, selected: PASSED.store.page == Shelf)
+                        |> SOURCE { PASSED.store.elements.nav.shelf }
+                    nav_button(label: TEXT { About }, selected: PASSED.store.page == About)
+                        |> SOURCE { PASSED.store.elements.nav.about }
+                }
+            )
+        }
+    )
+}
+
+FUNCTION brand() {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...KavikTheme/heading(mode: PASSED.store.mode, size: 20)
+            width: 152
+            height: 40
+            vertical_align: Center
+        ]
+        text: TEXT { Martin Kavik }
+    )
+}
+
+FUNCTION header_spacer() {
+    Scene/Element/text(
+        element: []
+        style: [width: Fill, height: 1, paint: False]
+        text: Text/empty()
+    )
+}
+
+FUNCTION nav_button(label, selected) {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            ...KavikTheme/control(
+                mode: PASSED.store.mode
+                selected: selected
+                hovered: element.hovered
+            )
+            width: Auto
+            auto_padding: 20
+            height: 38
+            padding: [left: 9, right: 9, top: 6, bottom: 6]
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...KavikTheme/control_text(mode: PASSED.store.mode, selected: selected)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: label
+        )
+    )
+}
+
+FUNCTION theme_button() {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            ...KavikTheme/control(mode: PASSED.store.mode, selected: False, hovered: element.hovered)
+            width: 92
+            height: 38
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...KavikTheme/control_text(mode: PASSED.store.mode, selected: False)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: PASSED.store.mode |> WHEN {
+                Light => TEXT { Dark mode }
+                Dark => TEXT { Light mode }
+            }
+        )
+    )
+}
+
+FUNCTION page_content() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            width: [sizing: Fill, maximum: 1160]
+            center: True
+            padding: [left: 18, right: 18, top: 8, bottom: 48]
+            paint: False
+        ]
+        items: LIST {
+            PASSED.store.page |> WHEN {
+                Home => KavikHome/page(PASS: [store: PASSED.store])
+                Work => KavikWork/page(PASS: [store: PASSED.store])
+                Blog => KavikBlog/page(PASS: [store: PASSED.store])
+                Shelf => KavikShelf/page(PASS: [store: PASSED.store])
+                About => KavikAbout/page(PASS: [store: PASSED.store])
+                BoonPost => KavikBlog/boon_post(PASS: [store: PASSED.store])
+                NovyWavePost => KavikBlog/novywave_post(PASS: [store: PASSED.store])
+                MoonZoonFoundationsPost => KavikBlog/moonzoon_foundations_post(PASS: [store: PASSED.store])
+                MoonZoonHistoryPost => KavikBlog/moonzoon_history_post(PASS: [store: PASSED.store])
+            }
+        }
+    )
+}
+
+FUNCTION footer() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 12
+        style: [
+            width: Fill
+            wrap: True
+            wrap_min_width: 190
+            padding: [left: 28, right: 28, top: 24, bottom: 30]
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #10141e }
+                Light => TEXT { #f3f4f7 }
+            }]
+        ]
+        items: LIST {
+            KavikComponents/muted(PASS: [store: PASSED.store], text: TEXT { Martin Kavik - Prague, Czechia })
+            KavikComponents/external_link(PASS: [store: PASSED.store], label: TEXT { GitHub }, to: TEXT { https://github.com/MartinKavik })
+            KavikComponents/external_link(PASS: [store: PASSED.store], label: TEXT { kavik.cz }, to: TEXT { https://kavik.cz })
+        }
+    )
+}

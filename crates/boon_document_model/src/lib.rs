@@ -32,6 +32,7 @@ pub enum DocumentNodeKind {
     Button,
     Checkbox,
     TextInput,
+    EmbeddedMedia,
     Table,
     TableCell,
     ScrollRoot,

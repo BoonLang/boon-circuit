@@ -541,17 +541,19 @@ impl RuntimeView {
     }
 
     fn external_url_for_node(&self, node_id: &str) -> Option<String> {
-        let value = self
+        let style = &self
             .runtime
             .document_frame()?
             .nodes
             .get(&DocumentNodeId(node_id.to_owned()))?
-            .style
-            .get("to")?;
+            .style;
+        let value = ["to", "href", "url"]
+            .into_iter()
+            .find_map(|key| style.get(key))?;
         let StyleValue::Text(url) = value else {
             return None;
         };
-        (url.starts_with("https://") || url.starts_with("http://")).then(|| url.clone())
+        external_url_scheme_is_allowed(url).then(|| url.clone())
     }
 
     fn dispatch_target(
@@ -957,6 +959,12 @@ impl RuntimeView {
     }
 }
 
+fn external_url_scheme_is_allowed(url: &str) -> bool {
+    ["https://", "http://", "mailto:"]
+        .into_iter()
+        .any(|prefix| url.starts_with(prefix))
+}
+
 fn single_line_text(text: &str) -> String {
     text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
@@ -1163,6 +1171,453 @@ mod tests {
     use super::*;
     use boon_host::{KeyEvent, LogicalKey, PointerEvent, SurfaceId, TextInputEvent, WheelEvent};
     use boon_runtime::RuntimeSourceUnit;
+
+    #[test]
+    fn kavik_portfolio_reflows_without_horizontal_overflow() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("kavik_cz")
+            .unwrap();
+        assert!(
+            example.assets.len() >= 70,
+            "portfolio asset bundle is incomplete"
+        );
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/kavik_cz/RUN.bn", &units).unwrap();
+        let mount = runtime.mount();
+        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1440.0,
+                height: 900.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+
+        let visible_text = view
+            .scene()
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            visible_text.contains(&"Martin Kavik"),
+            "initial portfolio text runs: {visible_text:?}"
+        );
+        assert!(view.scene().visual_primitives.iter().any(|primitive| {
+            matches!(
+                &primitive.texture,
+                boon_document::RenderTextureRef::Asset { url, .. }
+                    if url == "asset://kavik_cz/images/martin_coffee.webp"
+            )
+        }));
+        assert_scene_has_no_horizontal_overflow(view.scene(), 1440.0);
+        let desktop_intro_height = view
+            .scene()
+            .text_runs
+            .iter()
+            .find(|run| run.text.starts_with("15+ years building"))
+            .expect("desktop hero introduction should be visible")
+            .bounds
+            .height;
+
+        for (width, height) in [
+            (320.0, 640.0),
+            (390.0, 844.0),
+            (699.0, 800.0),
+            (700.0, 800.0),
+            (768.0, 1024.0),
+            (1024.0, 768.0),
+        ] {
+            view.resize(
+                boon_host::Viewport {
+                    surface: 1,
+                    width,
+                    height,
+                    scale: 1.0,
+                },
+                &mut columns,
+            )
+            .unwrap();
+            assert_scene_has_no_horizontal_overflow(view.scene(), width);
+            assert_eq!(
+                view.scene()
+                    .text_runs
+                    .iter()
+                    .filter(|run| run.text == "Home")
+                    .count(),
+                1,
+                "exactly one responsive navigation should be visible at {width}x{height}"
+            );
+        }
+
+        view.resize(
+            boon_host::Viewport {
+                surface: 1,
+                width: 390.0,
+                height: 844.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
+        let mobile_text = view
+            .scene()
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>();
+        let home_nodes = view
+            .frame()
+            .nodes
+            .values()
+            .filter(|node| node.text.as_ref().is_some_and(|text| text.text == "Home"))
+            .map(|node| (node.id.0.clone(), view.node_bounds(&node.id.0)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mobile_text.iter().filter(|text| **text == "Home").count(),
+            1,
+            "only the mobile or desktop navigation may be materialized: text={mobile_text:?}, nodes={home_nodes:?}"
+        );
+        let mobile_intro = view
+            .scene()
+            .text_runs
+            .iter()
+            .find(|run| run.text.starts_with("15+ years building"))
+            .expect("mobile hero introduction should be visible");
+        assert!(mobile_intro.wrap);
+        assert!(mobile_intro.bounds.width <= 354.0);
+        assert!(mobile_intro.bounds.height >= desktop_intro_height);
+
+        let about = view
+            .target_for_source("store.elements.nav.about", Some("About"))
+            .unwrap_or_else(|| {
+                let routes = view
+                    .frame()
+                    .nodes
+                    .values()
+                    .flat_map(|node| {
+                        node.source_bindings
+                            .iter()
+                            .map(move |binding| (node.id.0.as_str(), binding.source_path.as_str()))
+                    })
+                    .collect::<Vec<_>>();
+                panic!("mobile About navigation target; routes={routes:?}")
+            });
+        click_target(&mut model, &mut view, &mut columns, about);
+        let media = view
+            .frame()
+            .nodes
+            .values()
+            .find(|node| node.kind == DocumentNodeKind::EmbeddedMedia)
+            .expect("About route should contain semantic embedded media")
+            .clone();
+        assert_eq!(
+            media.style.get("provider"),
+            Some(&StyleValue::Text("youtube".to_owned()))
+        );
+        assert!(matches!(
+            media.style.get("embed_url"),
+            Some(StyleValue::Text(url)) if url.starts_with("https://www.youtube-nocookie.com/embed/")
+        ));
+        assert_eq!(
+            media.style.get("playback"),
+            Some(&StyleValue::Text("user_activated".to_owned()))
+        );
+        assert_eq!(
+            media.style.get("privacy_mode"),
+            Some(&StyleValue::Bool(true))
+        );
+        assert!(matches!(
+            media.style.get("sandbox"),
+            Some(StyleValue::Text(policy))
+                if policy.contains("allow-scripts") && policy.contains("allow-presentation")
+        ));
+        assert_eq!(
+            media.style.get("referrer_policy"),
+            Some(&StyleValue::Text(
+                "strict-origin-when-cross-origin".to_owned()
+            ))
+        );
+        assert_eq!(
+            media.style.get("allow_fullscreen"),
+            Some(&StyleValue::Bool(true))
+        );
+        let bounds = view.node_bounds(&media.id.0).unwrap();
+        click_target(
+            &mut model,
+            &mut view,
+            &mut columns,
+            HitTarget {
+                node: media.id.0,
+                source_path: None,
+                source_intent: None,
+                row_key: None,
+                row_generation: None,
+                scroll_root: None,
+                center_x: bounds.x + bounds.width / 2.0,
+                center_y: bounds.y + bounds.height / 2.0,
+                bounds_x: bounds.x,
+                bounds_y: bounds.y,
+                bounds_width: bounds.width,
+                bounds_height: bounds.height,
+                text_column: None,
+            },
+        );
+        assert!(
+            model
+                .take_external_url()
+                .is_some_and(|url| url.starts_with("https://www.youtube.com/watch?v="))
+        );
+    }
+
+    #[test]
+    fn kavik_portfolio_renders_desktop_and_mobile_app_owned_pixels() {
+        futures::executor::block_on(async {
+            let example = crate::catalog::Catalog::load()
+                .unwrap()
+                .open("kavik_cz")
+                .unwrap();
+            let sources = example
+                .assets
+                .iter()
+                .cloned()
+                .map(|asset| boon_native_gpu::RenderAssetSource {
+                    url: asset.url,
+                    media_type: asset.media_type,
+                    sha256: asset.sha256,
+                    bytes: asset.bytes.into(),
+                })
+                .collect::<Vec<_>>();
+            let units = example
+                .units
+                .into_iter()
+                .map(|unit| RuntimeSourceUnit {
+                    path: unit.path,
+                    source: unit.source,
+                })
+                .collect::<Vec<_>>();
+            let runtime = LiveRuntime::from_project("examples/kavik_cz/RUN.bn", &units).unwrap();
+            let mount = runtime.mount();
+            let mut model = RuntimeView::mount(runtime, mount).unwrap();
+            let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+            let mut view = crate::view::RetainedView::new(
+                model.frame(),
+                boon_host::Viewport {
+                    surface: 1,
+                    width: 1440.0,
+                    height: 900.0,
+                    scale: 1.0,
+                },
+                &mut columns,
+            )
+            .unwrap();
+
+            let instance =
+                wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .expect("kavik.cz visual verification requires a WGPU adapter");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("kavik-cz-responsive-proof-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_defaults()
+                        .using_resolution(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                })
+                .await
+                .unwrap();
+            let mut renderer = boon_native_gpu::AppOwnedProofRenderer::new(&device, &queue);
+            renderer.replace_asset_sources(sources).unwrap();
+            let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("target/artifacts/native-gpu/kavik-cz-responsive");
+
+            let desktop = renderer
+                .render_scene_pixels(boon_native_gpu::AppOwnedRenderSceneRequest {
+                    device: &device,
+                    queue: &queue,
+                    scene: view.scene(),
+                    render_identity_hash: "kavik-cz-desktop-1440x900-v1",
+                    surface_id: SurfaceId("kavik-cz-desktop".to_owned()),
+                    surface_epoch: 1,
+                    width: 1440,
+                    height: 900,
+                    artifact_dir: &artifact_dir,
+                    artifact_label: "desktop-1440x900",
+                })
+                .unwrap();
+            assert_kavik_proof(&desktop, 1440, 900);
+            assert!(desktop.metrics.asset_ref_count >= 1);
+            assert!(desktop.metrics.asset_decode_count >= 1);
+            assert!(desktop.metrics.asset_upload_count >= 1);
+
+            view.resize(
+                boon_host::Viewport {
+                    surface: 1,
+                    width: 390.0,
+                    height: 844.0,
+                    scale: 1.0,
+                },
+                &mut columns,
+            )
+            .unwrap();
+            let mobile = renderer
+                .render_scene_pixels(boon_native_gpu::AppOwnedRenderSceneRequest {
+                    device: &device,
+                    queue: &queue,
+                    scene: view.scene(),
+                    render_identity_hash: "kavik-cz-mobile-390x844-v1",
+                    surface_id: SurfaceId("kavik-cz-mobile".to_owned()),
+                    surface_epoch: 1,
+                    width: 390,
+                    height: 844,
+                    artifact_dir: &artifact_dir,
+                    artifact_label: "mobile-390x844",
+                })
+                .unwrap();
+            assert_kavik_proof(&mobile, 390, 844);
+            assert!(mobile.metrics.asset_ref_count >= 1);
+
+            assert!(
+                model
+                    .dispatch_source("store.elements.nav.about", None, SourcePayload::default(),)
+                    .unwrap()
+            );
+            view.apply_patches(model.take_patches(), &mut columns)
+                .unwrap();
+            let media_viewport = boon_host::Viewport {
+                surface: 1,
+                width: 960.0,
+                height: 720.0,
+                scale: 1.0,
+            };
+            view.resize(media_viewport, &mut columns).unwrap();
+            let media_node = view
+                .frame()
+                .nodes
+                .values()
+                .find(|node| node.kind == DocumentNodeKind::EmbeddedMedia)
+                .expect("About route media node")
+                .id
+                .clone();
+            let media_y = view.node_bounds(&media_node.0).unwrap().y;
+            let root = view.frame().root.0.clone();
+            model.scroll_offsets.insert(
+                root,
+                boon_document_model::ScrollState {
+                    x: 0.0,
+                    y: (media_y - 110.0).max(0.0),
+                },
+            );
+            view.replace(model.frame(), media_viewport, &mut columns)
+                .unwrap();
+            assert!(view.scene().items.iter().any(|item| {
+                item.node == media_node && item.source_kind == DocumentNodeKind::EmbeddedMedia
+            }));
+            assert!(view.scene().text_runs.iter().any(|run| run.text == "Play"));
+            let media = renderer
+                .render_scene_pixels(boon_native_gpu::AppOwnedRenderSceneRequest {
+                    device: &device,
+                    queue: &queue,
+                    scene: view.scene(),
+                    render_identity_hash: "kavik-cz-media-fallback-960x720-v1",
+                    surface_id: SurfaceId("kavik-cz-media-fallback".to_owned()),
+                    surface_epoch: 1,
+                    width: 960,
+                    height: 720,
+                    artifact_dir: &artifact_dir,
+                    artifact_label: "media-fallback-960x720",
+                })
+                .unwrap();
+            assert_kavik_proof(&media, 960, 720);
+            assert!(media.metrics.asset_ref_count >= 1);
+        });
+    }
+
+    fn assert_kavik_proof(proof: &boon_native_gpu::RenderProof, width: u32, height: u32) {
+        let boon_native_gpu::RenderProofArtifact::AppOwnedPixels {
+            artifact_path,
+            width: actual_width,
+            height: actual_height,
+            nonblank_samples,
+            unique_rgba_values,
+            ..
+        } = &proof.artifact
+        else {
+            panic!("expected app-owned pixel proof")
+        };
+        assert_eq!((*actual_width, *actual_height), (width, height));
+        assert!(std::path::Path::new(artifact_path).is_file());
+        assert!(*nonblank_samples >= 8);
+        assert!(*unique_rgba_values >= 8);
+    }
+
+    fn click_target(
+        model: &mut RuntimeView,
+        view: &mut crate::view::RetainedView,
+        columns: &mut impl boon_document::render_scene::RenderTextColumnMeasurer,
+        target: HitTarget,
+    ) {
+        let mut dirty = false;
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            dirty |= model
+                .handle_event(
+                    &HostEvent::Pointer(PointerEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        x: target.center_x,
+                        y: target.center_y,
+                        phase,
+                        button: Some(PointerButton::Primary),
+                    }),
+                    Some(target.clone()),
+                )
+                .unwrap();
+        }
+        let patches = model.take_patches();
+        if !patches.is_empty() {
+            view.apply_patches(patches, columns).unwrap();
+        }
+        if dirty {
+            view.set_interaction_state(model.hovered(), model.focused(), columns)
+                .unwrap();
+        }
+    }
+
+    fn assert_scene_has_no_horizontal_overflow(scene: &boon_document::RenderScene, width: f32) {
+        for item in &scene.items {
+            if item.bounds.y >= scene.viewport.height || item.bounds.y + item.bounds.height <= 0.0 {
+                continue;
+            }
+            assert!(
+                item.bounds.x >= -0.5 && item.bounds.x + item.bounds.width <= width + 0.5,
+                "{} overflows {width}px viewport: {:?}",
+                item.node.0,
+                item.bounds
+            );
+        }
+    }
 
     #[test]
     fn cells_scroll_patches_retained_view_and_requests_typed_window() {

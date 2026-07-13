@@ -1,0 +1,169 @@
+-- Neutral portfolio surfaces with the original kavik.cz rainbow accents.
+
+FUNCTION page(mode) {
+    [
+        width: Fill
+        height: [sizing: Fill, minimum: Screen]
+        background: [
+            color: mode |> WHEN {
+                Dark => TEXT { #090b11 }
+                Light => TEXT { #ffffff }
+            }
+            url: mode |> WHEN {
+                Dark => TEXT { asset://kavik_cz/backgrounds/bg-main-dark-1440w.jpg }
+                Light => TEXT { asset://kavik_cz/backgrounds/bg-main-light-1440w.jpg }
+            }
+        ]
+        material: [
+            color: mode |> WHEN {
+                Dark => TEXT { #090b11 }
+                Light => TEXT { #ffffff }
+            }
+            gloss: 0.01
+        ]
+    ]
+}
+
+FUNCTION body(mode) {
+    [
+        font: [family: TEXT { Nimbus Sans }, weight: 400]
+        color: mode |> WHEN {
+            Dark => TEXT { #c3cadb }
+            Light => TEXT { #3d4663 }
+        }
+        size: 16
+        line_height: 24
+    ]
+}
+
+FUNCTION body_muted(mode) {
+    [
+        ...body(mode: mode)
+        color: mode |> WHEN {
+            Dark => TEXT { #8490b5 }
+            Light => TEXT { #6474a2 }
+        }
+    ]
+}
+
+FUNCTION heading(mode, size) {
+    [
+        font: [family: TEXT { Nimbus Sans }, weight: 700]
+        color: mode |> WHEN {
+            Dark => TEXT { #f3f4f7 }
+            Light => TEXT { #141925 }
+        }
+        size: size
+        line_height: size * 1.15
+    ]
+}
+
+FUNCTION panel(mode) {
+    [
+        background: [color: mode |> WHEN {
+            Dark => TEXT { #141925 }
+            Light => TEXT { #f3f4f7 }
+        }]
+        border: [color: mode |> WHEN {
+            Dark => TEXT { #283044 }
+            Light => TEXT { #e3e6ee }
+        }]
+        border_width: 1
+        rounded_corners: 8
+        material: [
+            color: mode |> WHEN {
+                Dark => TEXT { #141925 }
+                Light => TEXT { #f3f4f7 }
+            }
+            gloss: 0.025
+            shadows: LIST {
+                [y: 6, blur: 18, color: TEXT { #090b1116 }]
+            }
+        ]
+    ]
+}
+
+FUNCTION panel_alt(mode) {
+    [
+        ...panel(mode: mode)
+        background: [color: mode |> WHEN {
+            Dark => TEXT { #101622 }
+            Light => TEXT { #f8f6ff }
+        }]
+        material: [
+            color: mode |> WHEN {
+                Dark => TEXT { #101622 }
+                Light => TEXT { #f8f6ff }
+            }
+            gloss: 0.02
+        ]
+    ]
+}
+
+FUNCTION control(mode, selected, hovered) {
+    [
+        background: [color: selected |> WHEN {
+            True => TEXT { #7611a6 }
+            False => hovered |> WHEN {
+                True => mode |> WHEN {
+                    Dark => TEXT { #283044 }
+                    Light => TEXT { #e3e6ee }
+                }
+                False => TEXT { #00000000 }
+            }
+        }]
+        border: [color: selected |> WHEN {
+            True => TEXT { #c561f6 }
+            False => TEXT { #00000000 }
+        }]
+        border_width: 1
+        rounded_corners: 6
+        material: [
+            color: selected |> WHEN {
+                True => TEXT { #7611a6 }
+                False => TEXT { #00000000 }
+            }
+            gloss: 0.025
+        ]
+    ]
+}
+
+FUNCTION control_text(mode, selected) {
+    [
+        ...body(mode: mode)
+        size: 14
+        line_height: 18
+        color: selected |> WHEN {
+            True => TEXT { #ffffff }
+            False => mode |> WHEN {
+                Dark => TEXT { #c3cadb }
+                Light => TEXT { #3d4663 }
+            }
+        }
+    ]
+}
+
+FUNCTION link_text(mode) {
+    [
+        ...body(mode: mode)
+        color: mode |> WHEN {
+            Dark => TEXT { #c561f6 }
+            Light => TEXT { #7611a6 }
+        }
+        weight: 600
+    ]
+}
+
+FUNCTION accent(of) {
+    of |> WHEN {
+        Purple => TEXT { #9b5de5 }
+        Cyan => TEXT { #00b4d8 }
+        Teal => TEXT { #2a9d8f }
+        Yellow => TEXT { #e9c46a }
+        Orange => TEXT { #f4a261 }
+        Red => TEXT { #e63946 }
+        Pink => TEXT { #f72585 }
+        Blue => TEXT { #3a86ff }
+        __ => TEXT { #7611a6 }
+    }
+}

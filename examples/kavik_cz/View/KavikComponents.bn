@@ -1,0 +1,352 @@
+-- Reusable portfolio scene components. They contain no route-specific behavior.
+
+FUNCTION heading(text, size) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...KavikTheme/heading(mode: PASSED.store.mode, size: size)
+            width: Fill
+            text_wrap: True
+        ]
+        text: text
+    )
+}
+
+FUNCTION paragraph(text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...KavikTheme/body(mode: PASSED.store.mode)
+            width: Fill
+            text_wrap: True
+        ]
+        text: text
+    )
+}
+
+FUNCTION muted(text) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...KavikTheme/body_muted(mode: PASSED.store.mode)
+            width: Fill
+            text_wrap: True
+        ]
+        text: text
+    )
+}
+
+FUNCTION page_hero(title, tagline) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [
+            width: Fill
+            padding: [top: 54, bottom: 34]
+            paint: False
+            align: [row: Center]
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...KavikTheme/heading(mode: PASSED.store.mode, size: 48)
+                    width: Fill
+                    text_wrap: True
+                    center: True
+                ]
+                text: title
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...KavikTheme/body_muted(mode: PASSED.store.mode)
+                    width: Fill
+                    text_wrap: True
+                    center: True
+                    size: 19
+                ]
+                text: tagline
+            )
+        }
+    )
+}
+
+FUNCTION section_header(title, subtitle) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 6
+        style: [width: Fill, paint: False]
+        items: LIST {
+            heading(text: title, size: 32)
+            muted(text: subtitle)
+        }
+    )
+}
+
+FUNCTION image(url, alt, aspect) {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: Fill
+            aspect_ratio: aspect
+            rounded_corners: 6
+            background: [url: url, color: TEXT { #141925 }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #283044 }
+                Light => TEXT { #e3e6ee }
+            }]
+            border_width: 1
+            accessibility_description: alt
+        ]
+        child: Scene/Element/text(
+            element: []
+            style: [width: Fill, height: Fill, paint: False]
+            text: Text/empty()
+        )
+    )
+}
+
+FUNCTION pill(label, accent) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...KavikTheme/body(mode: PASSED.store.mode)
+            width: Auto
+            auto_padding: 18
+            height: 32
+            line_height: 18
+            vertical_align: Center
+            size: 13
+            rounded_corners: 8
+            background: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #1c2230 }
+                Light => TEXT { #f3f4f7 }
+            }]
+            border: [color: accent]
+            border_width: 1
+        ]
+        text: label
+    )
+}
+
+FUNCTION external_link(label, to) {
+    Scene/Element/link(
+        element: [hovered: SOURCE]
+        style: [
+            ...KavikTheme/link_text(mode: PASSED.store.mode)
+            width: Auto
+            auto_padding: 20
+            height: 34
+            line_height: 20
+            vertical_align: Center
+            rounded_corners: 6
+            background: [color: element.hovered |> WHILE {
+                True => PASSED.store.mode |> WHEN {
+                    Dark => TEXT { #283044 }
+                    Light => TEXT { #e3e6ee }
+                }
+                False => TEXT { #00000000 }
+            }]
+            border: [color: PASSED.store.mode |> WHEN {
+                Dark => TEXT { #505d84 }
+                Light => TEXT { #c3cadb }
+            }]
+            border_width: 1
+        ]
+        label: label
+        to: to
+        new_tab: []
+    )
+}
+
+FUNCTION action_button(label) {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            width: Auto
+            auto_padding: 28
+            height: 42
+            padding: [left: 14, right: 14, top: 8, bottom: 8]
+            rounded_corners: 6
+            background: [color: element.hovered |> WHILE {
+                True => TEXT { #8f2fbd }
+                False => TEXT { #7611a6 }
+            }]
+            border: [color: TEXT { #c561f6 }]
+            border_width: 1
+            material: [color: TEXT { #7611a6 }, gloss: 0.04]
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                font: [family: TEXT { Nimbus Sans }, weight: 700]
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                color: TEXT { #ffffff }
+                size: 15
+            ]
+            text: label
+        )
+    )
+}
+
+FUNCTION project_card(title, description, body, tags, image_url, image_alt, link_label, link_url) {
+    Scene/Element/stripe(
+        element: [hovered: SOURCE]
+        direction: Column
+        gap: 12
+        style: [
+            ...KavikTheme/panel(mode: PASSED.store.mode)
+            width: Fill
+            padding: 14
+            __hover_border: TEXT { #9b5de5 }
+        ]
+        items: LIST {
+            image(url: image_url, alt: image_alt, aspect: 1.65)
+            heading(text: title, size: 25)
+            muted(text: description)
+            paragraph(text: body)
+            pill(label: tags, accent: KavikTheme/accent(of: Purple))
+            external_link(label: link_label, to: link_url)
+        }
+    )
+}
+
+FUNCTION post_card(title, description, meta, latest) {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            ...KavikTheme/panel_alt(mode: PASSED.store.mode)
+            width: Fill
+            padding: 18
+            __hover_border: TEXT { #00b4d8 }
+        ]
+        label: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 8
+            style: [width: Fill, paint: False]
+            items: LIST {
+                latest |> WHEN {
+                    True => pill(label: TEXT { Latest }, accent: KavikTheme/accent(of: Pink))
+                    False => NoElement
+                }
+                heading(text: title, size: 23)
+                muted(text: meta)
+                paragraph(text: description)
+            }
+        )
+    )
+}
+
+FUNCTION media(title, video_id, poster_url, to) {
+    Scene/Element/embedded_media(
+        element: [hovered: SOURCE]
+        style: [
+            ...KavikTheme/panel(mode: PASSED.store.mode)
+            width: Fill
+            aspect_ratio: 1.777777
+            background: [url: poster_url, color: TEXT { #090b11 }]
+            media_kind: TEXT { video }
+            provider: TEXT { youtube }
+            content_id: video_id
+            embed_url: TEXT { https://www.youtube-nocookie.com/embed/{video_id} }
+            loading: TEXT { lazy }
+            playback: TEXT { user_activated }
+            privacy_mode: True
+            sandbox: TEXT { allow-scripts allow-same-origin allow-presentation }
+            permissions: TEXT { accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture; web-share }
+            referrer_policy: TEXT { strict-origin-when-cross-origin }
+            allow_fullscreen: True
+            accessibility_description: title
+            __hover_border: TEXT { #f72585 }
+        ]
+        title: title
+        to: to
+        child: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 8
+            style: [
+                width: Fill
+                height: Fill
+                overlay_children: True
+                padding: 18
+                background: [color: TEXT { #090b1138 }]
+            ]
+            items: LIST {
+                Scene/Element/text(
+                    element: []
+                    style: [
+                        width: 58
+                        height: 58
+                        center: True
+                        vertical_align: Center
+                        rounded_corners: 8
+                        background: [color: TEXT { #7611a6e8 }]
+                        color: TEXT { #ffffff }
+                        size: 28
+                    ]
+                    text: TEXT { Play }
+                )
+            }
+        )
+    )
+}
+
+FUNCTION shelf_group(title, entries) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 9
+        style: [
+            ...KavikTheme/panel(mode: PASSED.store.mode)
+            width: Fill
+            padding: 16
+        ]
+        items: LIST {
+            heading(text: title, size: 22)
+            paragraph(text: entries)
+        }
+    )
+}
+
+FUNCTION contact_section() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 14
+        style: [
+            ...KavikTheme/panel_alt(mode: PASSED.store.mode)
+            width: Fill
+            padding: [left: 24, right: 24, top: 30, bottom: 30]
+            align: [row: Center]
+        ]
+        items: LIST {
+            heading(text: TEXT { Let's build something useful. }, size: 30)
+            muted(text: TEXT { Product design, Rust, Wasm, systems, and tools. })
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 10
+                style: [width: Fill, wrap: True, wrap_min_width: 180, paint: False]
+                items: LIST {
+                    external_link(label: TEXT { Email }, to: TEXT { mailto:martin@kavik.cz })
+                    external_link(label: TEXT { GitHub }, to: TEXT { https://github.com/MartinKavik })
+                    external_link(label: TEXT { LinkedIn }, to: TEXT { https://www.linkedin.com/in/martinkavik/ })
+                }
+            )
+        }
+    )
+}

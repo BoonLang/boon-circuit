@@ -1,0 +1,51 @@
+-- Martin Kavik's portfolio, ported from kavik.cz to Boon's physical scene model.
+
+store: [
+    elements: [
+        nav: [
+            home: SOURCE
+            work: SOURCE
+            blog: SOURCE
+            shelf: SOURCE
+            about: SOURCE
+        ]
+        theme_toggle: SOURCE
+        post: [
+            boon: SOURCE
+            novywave: SOURCE
+            moonzoon_foundations: SOURCE
+            moonzoon_history: SOURCE
+        ]
+        view_all_work: SOURCE
+        view_all_posts: SOURCE
+    ]
+
+    page:
+        Home |> HOLD page {
+            LATEST {
+                elements.nav.home.event.press |> THEN { Home }
+                elements.nav.work.event.press |> THEN { Work }
+                elements.nav.blog.event.press |> THEN { Blog }
+                elements.nav.shelf.event.press |> THEN { Shelf }
+                elements.nav.about.event.press |> THEN { About }
+                elements.view_all_work.event.press |> THEN { Work }
+                elements.view_all_posts.event.press |> THEN { Blog }
+                elements.post.boon.event.press |> THEN { BoonPost }
+                elements.post.novywave.event.press |> THEN { NovyWavePost }
+                elements.post.moonzoon_foundations.event.press |> THEN { MoonZoonFoundationsPost }
+                elements.post.moonzoon_history.event.press |> THEN { MoonZoonHistoryPost }
+            }
+        }
+
+    mode:
+        Light |> HOLD mode {
+            elements.theme_toggle.event.press |> THEN {
+                mode |> WHEN {
+                    Light => Dark
+                    Dark => Light
+                }
+            }
+        }
+]
+
+scene: KavikView/main_scene(PASS: [store: store])

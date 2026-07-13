@@ -1,7 +1,7 @@
 use boon_document::{
     DocumentNodeId, Rect, StyleMap, StyleRichTextSpan, StyleValue,
     render_scene::{
-        RenderAssetRef, RenderFontStyle, RenderFontWeight, RenderRichTextSpan,
+        RenderAssetRef, RenderBlobRef, RenderFontStyle, RenderFontWeight, RenderRichTextSpan,
         RenderScene as DocumentRenderScene, RenderTextAlign, RenderTextColumnMeasurer,
         RenderTextRun, RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive,
         RenderVisualPrimitiveKind,
@@ -48,6 +48,14 @@ const MAX_CACHED_QUAD_BATCHES: usize = 4096;
 const MAX_CACHED_ASSET_TEXTURE_BYTES: u64 = 32 * 1024 * 1024;
 const APP_OWNED_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const PRODUCT_FRAME_GRAPH_SCHEDULER_KIND: &str = "renderer_owned_product_frame_schedule_v1";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderAssetSource {
+    pub url: String,
+    pub media_type: String,
+    pub sha256: String,
+    pub bytes: Arc<[u8]>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceFormat(pub String);
@@ -354,7 +362,7 @@ impl std::error::Error for RenderError {}
 
 pub struct GlyphonTextMeasurer {
     service: GlyphonTextService,
-    cache: BTreeMap<(String, TextMeasureStyleKey), boon_document::TextMetrics>,
+    cache: BTreeMap<(String, TextMeasureStyleKey, Option<u32>), boon_document::TextMetrics>,
 }
 
 impl GlyphonTextMeasurer {
@@ -381,7 +389,7 @@ impl boon_document::TextMeasurer for GlyphonTextMeasurer {
             font_style: "normal".to_owned(),
             font_weight: "normal".to_owned(),
         };
-        self.measure_with_key(text, style_key)
+        self.measure_with_key(text, style_key, None)
     }
 
     fn measure_styled(
@@ -403,7 +411,30 @@ impl boon_document::TextMeasurer for GlyphonTextMeasurer {
                 .to_owned(),
             font_weight: style_text(style, "weight").unwrap_or("normal").to_owned(),
         };
-        self.measure_with_key(text, style_key)
+        self.measure_with_key(text, style_key, None)
+    }
+
+    fn measure_wrapped_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        max_width: f32,
+        style: &StyleMap,
+    ) -> boon_document::TextMetrics {
+        let font_size = font_size.max(1.0);
+        let style_key = TextMeasureStyleKey {
+            font_size_bits: font_size.to_bits(),
+            line_height_bits: style_line_height(style, font_size).to_bits(),
+            font_family: style_text(style, "font")
+                .unwrap_or(DOCUMENT_FONT_FAMILY)
+                .to_owned(),
+            font_style: style_text(style, "font_style")
+                .or_else(|| style_text(style, "style"))
+                .unwrap_or("normal")
+                .to_owned(),
+            font_weight: style_text(style, "weight").unwrap_or("normal").to_owned(),
+        };
+        self.measure_with_key(text, style_key, Some(max_width.max(1.0).to_bits()))
     }
 }
 
@@ -412,8 +443,9 @@ impl GlyphonTextMeasurer {
         &mut self,
         text: &str,
         style_key: TextMeasureStyleKey,
+        max_width_bits: Option<u32>,
     ) -> boon_document::TextMetrics {
-        let cache_key = (text.to_owned(), style_key.clone());
+        let cache_key = (text.to_owned(), style_key.clone(), max_width_bits);
         if let Some(metrics) = self.cache.get(&cache_key) {
             return *metrics;
         }
@@ -423,7 +455,9 @@ impl GlyphonTextMeasurer {
                 height: 0.0,
             };
         }
-        let metrics = self.service.measure_text(text, &style_key);
+        let metrics =
+            self.service
+                .measure_text(text, &style_key, max_width_bits.map(f32::from_bits));
         self.cache.insert(cache_key, metrics);
         metrics
     }
@@ -446,11 +480,16 @@ impl GlyphonTextService {
         &mut self,
         text: &str,
         style_key: &TextMeasureStyleKey,
+        max_width: Option<f32>,
     ) -> boon_document::TextMetrics {
         let font_size = f32::from_bits(style_key.font_size_bits).max(1.0);
         let line_height = f32::from_bits(style_key.line_height_bits).max(font_size);
         let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
-        buffer.set_size(&mut self.font_system, None, Some(line_height));
+        buffer.set_size(
+            &mut self.font_system,
+            max_width.map(|width| width.max(1.0)),
+            None,
+        );
         buffer.set_text(
             &mut self.font_system,
             text,
@@ -465,9 +504,15 @@ impl GlyphonTextService {
             None,
         );
         buffer.shape_until_scroll(&mut self.font_system, false);
+        let mut line_count = 0usize;
+        let mut width = 0.0_f32;
+        for run in buffer.layout_runs() {
+            line_count = line_count.saturating_add(1);
+            width = width.max(run.line_w);
+        }
         boon_document::TextMetrics {
-            width: shaped_line_width(&buffer).unwrap_or_default(),
-            height: line_height,
+            width,
+            height: line_height * line_count.max(1) as f32,
         }
     }
 
@@ -621,6 +666,13 @@ impl AppOwnedProofRenderer {
         request: AppOwnedRenderSceneRequest<'_>,
     ) -> Result<RenderProof, RenderError> {
         render_app_owned_scene_pixels_with_renderer(request, &mut self.renderer)
+    }
+
+    pub fn replace_asset_sources(
+        &mut self,
+        sources: Vec<RenderAssetSource>,
+    ) -> Result<(), RenderError> {
+        self.renderer.replace_asset_sources(sources)
     }
 }
 
@@ -1034,6 +1086,7 @@ struct TextureState {
     _white_texture: wgpu::Texture,
     _white_view: wgpu::TextureView,
     white_bind_group: TextureBindGroup,
+    sources: BTreeMap<String, RenderAssetSource>,
     assets: BTreeMap<AssetTextureKey, GpuTextureAsset>,
     cached_asset_bytes: u64,
 }
@@ -1130,9 +1183,41 @@ impl TextureState {
             _white_texture: white_texture,
             _white_view: white_view,
             white_bind_group,
+            sources: BTreeMap::new(),
             assets: BTreeMap::new(),
             cached_asset_bytes: 0,
         }
+    }
+
+    fn replace_sources(&mut self, sources: Vec<RenderAssetSource>) -> Result<(), RenderError> {
+        let mut next = BTreeMap::new();
+        for source in sources {
+            if !source.url.starts_with("asset://") {
+                return Err(RenderError {
+                    message: format!("render asset URL must use asset://: {}", source.url),
+                });
+            }
+            let actual_sha256 = hex_sha256(&source.bytes);
+            if source.sha256 != actual_sha256 {
+                return Err(RenderError {
+                    message: format!(
+                        "render asset {} hash mismatch: expected {}, got {actual_sha256}",
+                        source.url, source.sha256
+                    ),
+                });
+            }
+            if next.insert(source.url.clone(), source).is_some() {
+                return Err(RenderError {
+                    message: "render asset bundle contains a duplicate URL".to_owned(),
+                });
+            }
+        }
+        if self.sources != next {
+            self.sources = next;
+            self.assets.clear();
+            self.cached_asset_bytes = 0;
+        }
+        Ok(())
     }
 
     fn prepare_assets(
@@ -1146,14 +1231,19 @@ impl TextureState {
             let QuadTexture::Asset(key) = &batch.texture else {
                 continue;
             };
-            let asset_ref = key.asset_ref();
+            let asset_ref = self.asset_ref_for_key(key);
             metrics.refs.insert(asset_ref.id.clone(), asset_ref);
             if self.assets.contains_key(key) {
                 metrics.cache_hits = metrics.cache_hits.saturating_add(1);
                 continue;
             }
             metrics.cache_misses = metrics.cache_misses.saturating_add(1);
-            let pixels = match rasterize_svg_data_url(&key.url, key.width, key.height) {
+            let pixels = match decode_asset_pixels(
+                &key.url,
+                key.width,
+                key.height,
+                self.sources.get(&key.url),
+            ) {
                 Ok(pixels) => pixels,
                 Err(error) => {
                     metrics.failure_diagnostics.push(error.to_string());
@@ -1214,7 +1304,7 @@ impl TextureState {
             let QuadTexture::Asset(key) = texture else {
                 continue;
             };
-            let asset_ref = key.asset_ref();
+            let asset_ref = self.asset_ref_for_key(key);
             metrics.refs.insert(asset_ref.id.clone(), asset_ref);
             if self.assets.contains_key(key) {
                 metrics.cache_hits = metrics.cache_hits.saturating_add(1);
@@ -1233,6 +1323,23 @@ impl TextureState {
         match texture {
             QuadTexture::Solid => Some(&self.white_bind_group),
             QuadTexture::Asset(key) => self.assets.get(key).map(|asset| &asset.bind_group),
+        }
+    }
+
+    fn asset_ref_for_key(&self, key: &AssetTextureKey) -> AssetRef {
+        let Some(source) = self.sources.get(&key.url) else {
+            return key.asset_ref();
+        };
+        let id_digest =
+            hex_sha256(format!("{}\n{}x{}", source.sha256, key.width, key.height).as_bytes());
+        AssetRef {
+            id: format!("asset:blob:{id_digest}:{}x{}", key.width, key.height),
+            blob_ref: RenderBlobRef {
+                id: format!("blob:sha256:{}", source.sha256),
+                sha256: source.sha256.clone(),
+            },
+            width: key.width,
+            height: key.height,
         }
     }
 }
@@ -1304,6 +1411,63 @@ fn rasterize_svg_data_url(url: &str, width: u32, height: u32) -> Result<Vec<u8>,
         &mut pixmap.as_mut(),
     );
     Ok(pixmap.take())
+}
+
+fn decode_asset_pixels(
+    url: &str,
+    width: u32,
+    height: u32,
+    source: Option<&RenderAssetSource>,
+) -> Result<Vec<u8>, RenderError> {
+    if url.starts_with("data:image/svg+xml") {
+        return rasterize_svg_data_url(url, width, height);
+    }
+    let source = source.ok_or_else(|| RenderError {
+        message: format!("native GPU asset bundle does not contain `{url}`"),
+    })?;
+    match source.media_type.as_str() {
+        "image/svg+xml" => rasterize_svg_bytes(&source.bytes, width, height),
+        "image/jpeg" | "image/png" | "image/webp" => {
+            let decoded = image::load_from_memory(&source.bytes).map_err(|error| RenderError {
+                message: format!("decode {}: {error}", source.url),
+            })?;
+            Ok(decoded
+                .resize_to_fill(
+                    width.max(1),
+                    height.max(1),
+                    image::imageops::FilterType::Lanczos3,
+                )
+                .to_rgba8()
+                .into_raw())
+        }
+        media_type => Err(RenderError {
+            message: format!("unsupported render asset media type `{media_type}`"),
+        }),
+    }
+}
+
+fn rasterize_svg_bytes(bytes: &[u8], width: u32, height: u32) -> Result<Vec<u8>, RenderError> {
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(bytes, &options).map_err(|error| RenderError {
+        message: format!("parse SVG asset: {error}"),
+    })?;
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(width.max(1), height.max(1)).ok_or_else(|| RenderError {
+            message: format!("allocate SVG raster target {width}x{height}"),
+        })?;
+    let svg_size = tree.size();
+    let scale_x = width.max(1) as f32 / svg_size.width().max(1.0);
+    let scale_y = height.max(1) as f32 / svg_size.height().max(1.0);
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale_x, scale_y),
+        &mut pixmap.as_mut(),
+    );
+    Ok(pixmap.take())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn decode_svg_data_url(url: &str) -> Option<String> {
@@ -1418,6 +1582,13 @@ impl VisibleLayoutRenderer {
 
     pub fn set_diagnostics_enabled(&mut self, enabled: bool) {
         self.diagnostics_enabled = enabled;
+    }
+
+    pub fn replace_asset_sources(
+        &mut self,
+        sources: Vec<RenderAssetSource>,
+    ) -> Result<(), RenderError> {
+        self.textures.replace_sources(sources)
     }
 
     pub fn encode_scene(
@@ -3715,6 +3886,7 @@ struct TextRunSignature {
     align: TextAlign,
     vertical_align: TextVerticalAlign,
     rotate_degrees: u32,
+    wrap: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3737,6 +3909,7 @@ struct TextRunPlacementSignature {
     align: TextAlign,
     vertical_align: TextVerticalAlign,
     rotate_degrees: u32,
+    wrap: bool,
     clip_x: Option<u32>,
     clip_y: Option<u32>,
     clip_width: Option<u32>,
@@ -3798,6 +3971,7 @@ impl TextRunSignature {
             align: run.align,
             vertical_align: run.vertical_align,
             rotate_degrees: run.rotate_degrees,
+            wrap: run.wrap,
         }
     }
 }
@@ -3841,6 +4015,7 @@ impl TextRunPlacementSignature {
             align: run.align,
             vertical_align: run.vertical_align,
             rotate_degrees: run.rotate_degrees,
+            wrap: run.wrap,
             clip_x: run.clip.map(|clip| clip.x.to_bits()),
             clip_y: run.clip.map(|clip| clip.y.to_bits()),
             clip_width: run.clip.map(|clip| clip.width.to_bits()),
@@ -4260,7 +4435,11 @@ fn shape_text_run(font_system: &mut FontSystem, run: &TextRun) -> Buffer {
     );
     let line_height = run.line_height.max(font_size);
     let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    buffer.set_size(font_system, None, Some(bounds.height.max(line_height)));
+    buffer.set_size(
+        font_system,
+        run.wrap.then_some(bounds.width.max(1.0)),
+        Some(bounds.height.max(line_height)),
+    );
     if run.rich_spans.is_empty() {
         buffer.set_text(
             font_system,
@@ -4362,6 +4541,7 @@ struct TextRun {
     align: TextAlign,
     vertical_align: TextVerticalAlign,
     rotate_degrees: u32,
+    wrap: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4440,6 +4620,7 @@ impl From<RenderTextRun> for TextRun {
             align: text_align_from_render(run.align),
             vertical_align: text_vertical_align_from_render(run.vertical_align),
             rotate_degrees: run.rotate_degrees,
+            wrap: run.wrap,
         }
     }
 }

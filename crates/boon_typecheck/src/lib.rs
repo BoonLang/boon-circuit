@@ -707,8 +707,9 @@ impl<'a> Checker<'a> {
             .render_slot_table
             .slots
             .iter()
-            .map(|slot| slot.diagnostics.len())
-            .sum();
+            .flat_map(|slot| &slot.diagnostics)
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .count();
         let list_map_binding_count_render_slot_materialization = self
             .list_map_bindings
             .iter()
@@ -5181,6 +5182,7 @@ impl RuntimeRootContract {
             "Stack",
             "Text",
             "TextInput",
+            "EmbeddedMedia",
         ])
         .with_fixed_constructor("Document/new", "Document")
         .with_fixed_constructor("Element/container", "Stack")
@@ -5192,6 +5194,7 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Element/button", "Button")
         .with_fixed_constructor("Element/checkbox", "Checkbox")
         .with_fixed_constructor("Element/text_input", "TextInput")
+        .with_fixed_constructor("Element/embedded_media", "EmbeddedMedia")
     }
 
     fn scene() -> Self {
@@ -5207,6 +5210,7 @@ impl RuntimeRootContract {
             "Stack",
             "Text",
             "TextInput",
+            "EmbeddedMedia",
         ])
         .with_fixed_constructor("Scene/new", "Scene")
         .with_stripe_direction_constructor("Scene/Element/stripe")
@@ -5218,6 +5222,7 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Scene/Element/button", "Button")
         .with_fixed_constructor("Scene/Element/paragraph", "Paragraph")
         .with_fixed_constructor("Scene/Element/link", "Link")
+        .with_fixed_constructor("Scene/Element/embedded_media", "EmbeddedMedia")
     }
 }
 
@@ -5332,6 +5337,7 @@ const RENDER_CONSTRUCTORS: &[&str] = &[
     "Element/button",
     "Element/checkbox",
     "Element/text_input",
+    "Element/embedded_media",
     "Scene/new",
     "Scene/Element/stripe",
     "Scene/Element/block",
@@ -5342,6 +5348,7 @@ const RENDER_CONSTRUCTORS: &[&str] = &[
     "Scene/Element/button",
     "Scene/Element/paragraph",
     "Scene/Element/link",
+    "Scene/Element/embedded_media",
 ];
 
 pub fn is_registered_render_constructor(function: &str) -> bool {

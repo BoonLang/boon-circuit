@@ -2907,6 +2907,8 @@ fn constructor_kind(constructor: DocumentConstructor, direction: Option<&str>) -
         DocumentConstructor::ElementTextInput | DocumentConstructor::SceneElementTextInput => {
             DocumentNodeKind::TextInput
         }
+        DocumentConstructor::ElementEmbeddedMedia
+        | DocumentConstructor::SceneElementEmbeddedMedia => DocumentNodeKind::EmbeddedMedia,
         DocumentConstructor::ElementContainer
         | DocumentConstructor::SceneElementBlock
         | DocumentConstructor::DocumentNew

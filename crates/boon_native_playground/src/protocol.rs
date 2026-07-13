@@ -5,13 +5,15 @@ use std::path::Path;
 use std::time::Duration;
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_UNITS: usize = 1_024;
 const MAX_CATALOG_ENTRIES: usize = 1_024;
 const MAX_TEST_STEPS: usize = 4_096;
+const MAX_ASSET_BLOBS: usize = 1_024;
+const MAX_ASSET_BLOB_BYTES: usize = 8 * 1024 * 1024;
 pub const VERIFY_BOUNDED_WINDOWS_ENV: &str = "BOON_VERIFY_BOUNDED_WINDOWS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +37,14 @@ impl Role {
 pub struct SourceUnit {
     pub path: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetBlob {
+    pub url: String,
+    pub media_type: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +186,9 @@ pub enum Message {
         units: Vec<SourceUnit>,
         test_steps: Vec<TestStep>,
     },
+    PreviewAssets {
+        assets: Vec<AssetBlob>,
+    },
     PreviewStats(PreviewStats),
     PreviewStatus {
         revision: u64,
@@ -233,6 +246,7 @@ impl Message {
             Self::PreviewInspect { .. } => 16,
             Self::PreviewInspectResult { .. } => 17,
             Self::PreviewRuntimeChanged { .. } => 18,
+            Self::PreviewAssets { .. } => 19,
         }
     }
 
@@ -286,6 +300,7 @@ impl Message {
                 out.source_units(units)?;
                 out.test_steps(test_steps)?;
             }
+            Self::PreviewAssets { assets } => out.asset_blobs(assets)?,
             Self::PreviewStats(stats) => {
                 out.u64(stats.frame_seq);
                 out.u64(stats.source_revision);
@@ -446,6 +461,9 @@ impl Message {
             18 => Self::PreviewRuntimeChanged {
                 revision: input.u64()?,
                 runtime_sequence: input.u64()?,
+            },
+            19 => Self::PreviewAssets {
+                assets: input.asset_blobs()?,
             },
             _ => return Err(ProtocolError::UnknownMessage(tag)),
         };
@@ -655,6 +673,27 @@ impl Encoder {
         Ok(())
     }
 
+    fn asset_blobs(&mut self, assets: &[AssetBlob]) -> Result<(), ProtocolError> {
+        if assets.len() > MAX_ASSET_BLOBS {
+            return Err(ProtocolError::LimitExceeded("asset count", assets.len()));
+        }
+        self.u32(assets.len() as u32);
+        for asset in assets {
+            self.string(&asset.url)?;
+            self.string(&asset.media_type)?;
+            self.string(&asset.sha256)?;
+            if asset.bytes.len() > MAX_ASSET_BLOB_BYTES {
+                return Err(ProtocolError::LimitExceeded(
+                    "asset blob bytes",
+                    asset.bytes.len(),
+                ));
+            }
+            self.u32(asset.bytes.len() as u32);
+            self.bytes.extend_from_slice(&asset.bytes);
+        }
+        Ok(())
+    }
+
     fn catalog(&mut self, entries: &[CatalogItem]) -> Result<(), ProtocolError> {
         if entries.len() > MAX_CATALOG_ENTRIES {
             return Err(ProtocolError::LimitExceeded(
@@ -778,6 +817,30 @@ impl<'a> Decoder<'a> {
                 Ok(SourceUnit {
                     path: self.string()?,
                     source: self.string()?,
+                })
+            })
+            .collect()
+    }
+
+    fn asset_blobs(&mut self) -> Result<Vec<AssetBlob>, ProtocolError> {
+        let count = self.u32()? as usize;
+        if count > MAX_ASSET_BLOBS {
+            return Err(ProtocolError::LimitExceeded("asset count", count));
+        }
+        (0..count)
+            .map(|_| {
+                let url = self.string()?;
+                let media_type = self.string()?;
+                let sha256 = self.string()?;
+                let length = self.u32()? as usize;
+                if length > MAX_ASSET_BLOB_BYTES {
+                    return Err(ProtocolError::LimitExceeded("asset blob bytes", length));
+                }
+                Ok(AssetBlob {
+                    url,
+                    media_type,
+                    sha256,
+                    bytes: self.take(length)?.to_vec(),
                 })
             })
             .collect()
@@ -934,6 +997,14 @@ mod tests {
                     pointer_height: Some("1".to_owned()),
                 }],
             },
+            Message::PreviewAssets {
+                assets: vec![AssetBlob {
+                    url: "asset://portfolio/hero.webp".to_owned(),
+                    media_type: "image/webp".to_owned(),
+                    sha256: "abc123".to_owned(),
+                    bytes: vec![1, 2, 3, 4],
+                }],
+            },
             Message::Shutdown,
         ];
         for message in messages {
@@ -970,6 +1041,21 @@ mod tests {
             passed: true,
             message: "counter scenario passed".to_owned(),
         });
+    }
+
+    #[test]
+    fn kavik_asset_bundle_roundtrips_inside_the_bounded_preview_frame() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("kavik_cz")
+            .unwrap();
+        let message = Message::PreviewAssets {
+            assets: example.assets,
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &message).expect("portfolio assets should fit one IPC frame");
+        assert!(bytes.len() <= MAX_FRAME_BYTES + std::mem::size_of::<u32>());
+        assert_eq!(read_message(&mut bytes.as_slice()).unwrap(), Some(message));
     }
 
     #[test]

@@ -1,0 +1,170 @@
+FUNCTION page() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 58
+        style: [width: Fill, paint: False]
+        items: LIST {
+            hero()
+            skills()
+            selected_work()
+            news()
+            KavikComponents/contact_section(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION hero() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 34
+        style: [
+            width: Fill
+            wrap: True
+            wrap_min_width: 330
+            padding: [top: 54, bottom: 30]
+            paint: False
+        ]
+        items: LIST {
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                gap: 14
+                style: [width: Fill, padding: 12, paint: False]
+                items: LIST {
+                    KavikComponents/heading(PASS: [store: PASSED.store], text: TEXT { Martin Kavik }, size: 54)
+                    Scene/Element/text(
+                        element: []
+                        style: [
+                            ...KavikTheme/body_muted(mode: PASSED.store.mode)
+                            width: Fill
+                            text_wrap: True
+                            size: 21
+                            line_height: 30
+                        ]
+                        text: TEXT { 15+ years building the full stack. From ideas and business requirements to silicon. }
+                    )
+                    Scene/Element/stripe(
+                        element: []
+                        direction: Row
+                        gap: 8
+                        style: [width: Fill, wrap: True, wrap_min_width: 130, paint: False]
+                        items: LIST {
+                            KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Rust & Wasm }, accent: KavikTheme/accent(of: Orange))
+                            KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Product Design }, accent: KavikTheme/accent(of: Teal))
+                            KavikComponents/pill(PASS: [store: PASSED.store], label: TEXT { Open Source }, accent: KavikTheme/accent(of: Pink))
+                        }
+                    )
+                }
+            )
+            portrait(max_width: 330, visible_min_width: 700, visible_max_width: 100000)
+            portrait(max_width: 200, visible_min_width: 0, visible_max_width: 699)
+        }
+    )
+}
+
+FUNCTION portrait(max_width, visible_min_width, visible_max_width) {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: Fill
+            max_width: max_width
+            aspect_ratio: 1
+            center: True
+            visible_min_width: visible_min_width
+            visible_max_width: visible_max_width
+            rounded_corners: 165
+            background: [url: TEXT { asset://kavik_cz/images/martin_coffee.webp }, color: TEXT { #e3e6ee }]
+            border: [color: TEXT { #9b5de5 }]
+            border_width: 4
+            accessibility_description: TEXT { Martin Kavik enjoying coffee }
+        ]
+        child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+    )
+}
+
+FUNCTION skills() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 12
+        style: [width: Fill, wrap: True, wrap_min_width: 210, paint: False]
+        items: LIST {
+            skill(title: TEXT { Build }, detail: TEXT { Rust, Wasm, native GPU, systems architecture }, accent: Blue)
+            skill(title: TEXT { Design }, detail: TEXT { Product strategy, UI systems, prototyping }, accent: Teal)
+            skill(title: TEXT { Explore }, detail: TEXT { Languages, dataflow, hardware, open source }, accent: Orange)
+        }
+    )
+}
+
+FUNCTION skill(title, detail, accent) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 7
+        style: [
+            ...KavikTheme/panel(mode: PASSED.store.mode)
+            width: Fill
+            padding: 16
+        ]
+        items: LIST {
+            KavikComponents/heading(PASS: [store: PASSED.store], text: title, size: 21)
+            KavikComponents/muted(PASS: [store: PASSED.store], text: detail)
+        }
+    )
+}
+
+FUNCTION selected_work() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 20
+        style: [...KavikTheme/panel_alt(mode: PASSED.store.mode), width: Fill, padding: 20]
+        items: LIST {
+            KavikComponents/section_header(PASS: [store: PASSED.store], title: TEXT { Selected Work }, subtitle: TEXT { I'm mostly a toolmaker. })
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 16
+                style: [width: Fill, wrap: True, wrap_min_width: 330, paint: False]
+                items: LIST {
+                    KavikWork/boon_card(PASS: [store: PASSED.store])
+                    KavikWork/novywave_card(PASS: [store: PASSED.store])
+                    KavikWork/moonzoon_card(PASS: [store: PASSED.store])
+                    KavikWork/boon_computer_card(PASS: [store: PASSED.store])
+                }
+            )
+            KavikComponents/action_button(PASS: [store: PASSED.store], label: TEXT { View All Work })
+                |> SOURCE { PASSED.store.elements.view_all_work }
+        }
+    )
+}
+
+FUNCTION news() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 20
+        style: [...KavikTheme/panel(mode: PASSED.store.mode), width: Fill, padding: 20]
+        items: LIST {
+            KavikComponents/section_header(PASS: [store: PASSED.store], title: TEXT { News & Notes }, subtitle: TEXT { From the workshop. })
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 14
+                style: [width: Fill, wrap: True, wrap_min_width: 260, paint: False]
+                items: LIST {
+                    KavikBlog/boon_post_card(PASS: [store: PASSED.store])
+                        |> SOURCE { PASSED.store.elements.post.boon }
+                    KavikBlog/novywave_post_card(PASS: [store: PASSED.store])
+                        |> SOURCE { PASSED.store.elements.post.novywave }
+                    KavikBlog/moonzoon_foundations_card(PASS: [store: PASSED.store])
+                        |> SOURCE { PASSED.store.elements.post.moonzoon_foundations }
+                }
+            )
+            KavikComponents/action_button(PASS: [store: PASSED.store], label: TEXT { View All Posts })
+                |> SOURCE { PASSED.store.elements.view_all_posts }
+        }
+    )
+}

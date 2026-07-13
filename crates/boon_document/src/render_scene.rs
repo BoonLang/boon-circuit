@@ -641,6 +641,8 @@ pub struct RenderTextRun {
     pub align: RenderTextAlign,
     pub vertical_align: RenderTextVerticalAlign,
     pub rotate_degrees: u32,
+    #[serde(default)]
+    pub wrap: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -663,6 +665,8 @@ pub struct RenderTextShapeKey {
     pub align: RenderTextAlign,
     pub vertical_align: RenderTextVerticalAlign,
     pub rotate_degrees: u32,
+    #[serde(default)]
+    pub wrap: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -709,6 +713,7 @@ impl RenderTextRun {
             align: self.align,
             vertical_align: self.vertical_align,
             rotate_degrees: self.rotate_degrees,
+            wrap: self.wrap,
         }
     }
 
@@ -2221,6 +2226,7 @@ fn render_text_runs_for_nodes(
             align: text_align(&item.kind, &item.style),
             vertical_align: text_vertical_align(&item.kind, &item.style),
             rotate_degrees: normalized_quarter_turn(style_number(&item.style, "rotate")),
+            wrap: style_bool(&item.style, "text_wrap") == Some(true),
         });
         runs.extend(editor_type_hint_runs(item, columns));
     }
@@ -2300,6 +2306,7 @@ fn editor_type_hint_runs(
                 align: RenderTextAlign::Left,
                 vertical_align: RenderTextVerticalAlign::Center,
                 rotate_degrees: 0,
+                wrap: false,
             })
         })
         .collect()
@@ -2610,6 +2617,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [u8; 4] {
             }
         }
         DocumentNodeKind::TextInput => [255, 255, 255, 255],
+        DocumentNodeKind::EmbeddedMedia => [255, 255, 255, 0],
         DocumentNodeKind::Button | DocumentNodeKind::Checkbox | DocumentNodeKind::Text => {
             [255, 255, 255, 0]
         }

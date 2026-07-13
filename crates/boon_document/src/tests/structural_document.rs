@@ -1,6 +1,135 @@
 // Included by `../tests.rs`; kept in the parent test module for private document helper access.
 
 #[test]
+fn wrapped_rows_and_text_reflow_with_viewport_width() {
+    let mut frame = DocumentFrame::empty("root");
+    let mut row = DocumentNode::new("cards", DocumentNodeKind::Row);
+    row.parent = Some(frame.root.clone());
+    row.style.insert("wrap".to_owned(), StyleValue::Bool(true));
+    row.style
+        .insert("wrap_min_width".to_owned(), StyleValue::Number(180.0));
+    row.style.insert("gap".to_owned(), StyleValue::Number(12.0));
+
+    for index in 0..3 {
+        let id = DocumentNodeId(format!("card-{index}"));
+        let mut card = DocumentNode::new(id.0.clone(), DocumentNodeKind::Text);
+        card.parent = Some(row.id.clone());
+        card.text = Some(TextValue {
+            text: "A responsive paragraph with enough words to wrap.".to_owned(),
+        });
+        card.style
+            .insert("text_wrap".to_owned(), StyleValue::Bool(true));
+        row.children.push(id.clone());
+        frame.nodes.insert(id, card);
+    }
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(row.id.clone());
+    frame.nodes.insert(row.id.clone(), row);
+
+    let mut text = SimpleTextMeasurer;
+    let narrow = layout(LayoutInput {
+        document: &frame,
+        viewport: Viewport {
+            surface: 1,
+            width: 360.0,
+            height: 800.0,
+            scale: 1.0,
+        },
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    });
+    let card_bounds = |layout: &LayoutFrame, id: &str| {
+        layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == id)
+            .unwrap()
+            .bounds
+    };
+    assert!(card_bounds(&narrow, "card-1").y > card_bounds(&narrow, "card-0").y);
+    assert!(card_bounds(&narrow, "card-0").height > 24.0);
+
+    let wide = layout(LayoutInput {
+        document: &frame,
+        viewport: Viewport {
+            surface: 1,
+            width: 900.0,
+            height: 800.0,
+            scale: 1.0,
+        },
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    });
+    assert_eq!(card_bounds(&wide, "card-0").y, card_bounds(&wide, "card-2").y);
+    assert!(card_bounds(&wide, "card-2").x > card_bounds(&wide, "card-1").x);
+}
+
+#[test]
+fn breakpoint_visibility_does_not_leave_parent_gaps() {
+    let mut frame = DocumentFrame::empty("root");
+    let mut stack = DocumentNode::new("stack", DocumentNodeKind::Stack);
+    stack.parent = Some(frame.root.clone());
+    stack.style.insert("gap".to_owned(), StyleValue::Number(20.0));
+
+    let mut desktop = DocumentNode::new("desktop", DocumentNodeKind::Text);
+    desktop.parent = Some(stack.id.clone());
+    desktop.text = Some(TextValue {
+        text: "Desktop".to_owned(),
+    });
+    desktop
+        .style
+        .insert("visible_min_width".to_owned(), StyleValue::Number(700.0));
+    let mut mobile = DocumentNode::new("mobile", DocumentNodeKind::Text);
+    mobile.parent = Some(stack.id.clone());
+    mobile.text = Some(TextValue {
+        text: "Mobile".to_owned(),
+    });
+    mobile
+        .style
+        .insert("visible_max_width".to_owned(), StyleValue::Number(699.0));
+    stack.children = vec![desktop.id.clone(), mobile.id.clone()];
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(stack.id.clone());
+    frame.nodes.insert(stack.id.clone(), stack);
+    frame.nodes.insert(desktop.id.clone(), desktop);
+    frame.nodes.insert(mobile.id.clone(), mobile);
+
+    let mut text = SimpleTextMeasurer;
+    let narrow = layout(LayoutInput {
+        document: &frame,
+        viewport: Viewport {
+            surface: 1,
+            width: 390.0,
+            height: 200.0,
+            scale: 1.0,
+        },
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    });
+    assert!(narrow.display_list.iter().any(|item| item.node.0 == "mobile"));
+    assert!(!narrow.display_list.iter().any(|item| item.node.0 == "desktop"));
+    let stack = narrow
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "stack")
+        .unwrap();
+    let mobile = narrow
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "mobile")
+        .unwrap();
+    assert_eq!(stack.bounds.height, mobile.bounds.height);
+}
+
+#[test]
 fn row_fill_uses_remaining_width_after_fixed_siblings() {
     let mut frame = DocumentFrame::empty("root");
 
@@ -68,6 +197,144 @@ fn row_fill_uses_remaining_width_after_fixed_siblings() {
     assert_eq!(fill.bounds.x, 58.0);
     assert_eq!(fill.bounds.width, 242.0);
     assert!(fill.bounds.x + fill.bounds.width <= 300.0);
+}
+
+#[test]
+fn row_fill_reserves_intrinsic_width_for_auto_button_labels() {
+    let mut frame = DocumentFrame::empty("root");
+    let mut row = DocumentNode::new("toolbar", DocumentNodeKind::Row);
+    row.parent = Some(frame.root.clone());
+    row.style
+        .insert("width".to_owned(), StyleValue::Number(300.0));
+    row.style
+        .insert("height".to_owned(), StyleValue::Number(40.0));
+    row.style.insert("gap".to_owned(), StyleValue::Number(5.0));
+    row.style
+        .insert("padding_left".to_owned(), StyleValue::Number(10.0));
+    row.style
+        .insert("padding_right".to_owned(), StyleValue::Number(10.0));
+
+    let mut brand = DocumentNode::new("brand", DocumentNodeKind::Text);
+    brand.parent = Some(row.id.clone());
+    brand
+        .style
+        .insert("width".to_owned(), StyleValue::Number(50.0));
+
+    let mut spacer = DocumentNode::new("spacer", DocumentNodeKind::Stack);
+    spacer.parent = Some(row.id.clone());
+    spacer
+        .style
+        .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+
+    let mut button = DocumentNode::new("mode", DocumentNodeKind::Button);
+    button.parent = Some(row.id.clone());
+    button
+        .style
+        .insert("width".to_owned(), StyleValue::Text("Auto".to_owned()));
+    button
+        .style
+        .insert("auto_padding".to_owned(), StyleValue::Number(20.0));
+    button
+        .style
+        .insert("padding_left".to_owned(), StyleValue::Number(9.0));
+    button
+        .style
+        .insert("padding_right".to_owned(), StyleValue::Number(9.0));
+
+    let mut label = DocumentNode::new("mode-label", DocumentNodeKind::Text);
+    label.parent = Some(button.id.clone());
+    label.text = Some(TextValue {
+        text: "Dark mode".to_owned(),
+    });
+    label
+        .style
+        .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+
+    row.children = vec![brand.id.clone(), spacer.id.clone(), button.id.clone()];
+    button.children.push(label.id.clone());
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(row.id.clone());
+    frame.nodes.insert(row.id.clone(), row);
+    frame.nodes.insert(brand.id.clone(), brand);
+    frame.nodes.insert(spacer.id.clone(), spacer);
+    frame.nodes.insert(button.id.clone(), button);
+    frame.nodes.insert(label.id.clone(), label);
+
+    let mut text = SimpleTextMeasurer;
+    let layout = layout(LayoutInput {
+        document: &frame,
+        viewport: Viewport {
+            surface: 1,
+            width: 300.0,
+            height: 80.0,
+            scale: 1.0,
+        },
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    });
+    let button = layout
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "mode")
+        .unwrap();
+    let label = layout
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "mode-label")
+        .unwrap();
+    let content_right = 290.0;
+    assert!(button.bounds.x + button.bounds.width <= content_right);
+    assert!(label.bounds.width >= 60.0);
+}
+
+#[test]
+fn aspect_ratio_is_not_replaced_by_empty_child_height() {
+    let mut frame = DocumentFrame::empty("root");
+    let mut image = DocumentNode::new("image", DocumentNodeKind::Stack);
+    image.parent = Some(frame.root.clone());
+    image
+        .style
+        .insert("width".to_owned(), StyleValue::Number(200.0));
+    image
+        .style
+        .insert("aspect_ratio".to_owned(), StyleValue::Number(2.0));
+    let mut child = DocumentNode::new("empty", DocumentNodeKind::Text);
+    child.parent = Some(image.id.clone());
+    child.text = Some(TextValue {
+        text: String::new(),
+    });
+    image.children.push(child.id.clone());
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(image.id.clone());
+    frame.nodes.insert(image.id.clone(), image);
+    frame.nodes.insert(child.id.clone(), child);
+
+    let mut text = SimpleTextMeasurer;
+    let layout = layout(LayoutInput {
+        document: &frame,
+        viewport: Viewport {
+            surface: 1,
+            width: 300.0,
+            height: 200.0,
+            scale: 1.0,
+        },
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    });
+    let image = layout
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "image")
+        .unwrap();
+    assert_eq!(image.bounds.height, 100.0);
 }
 
 

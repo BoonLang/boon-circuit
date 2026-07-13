@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use boon_document::RenderScene;
 use boon_host::SurfaceId;
 use boon_native_gpu::{
-    AppOwnedProofRenderer, AppOwnedRenderSceneRequest, RenderProof, RenderProofArtifact,
+    AppOwnedProofRenderer, AppOwnedRenderSceneRequest, RenderAssetSource, RenderProof,
+    RenderProofArtifact,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -103,6 +104,7 @@ impl ProofResult {
 #[derive(Default)]
 struct QueueState {
     pending: Option<ProofRequest>,
+    pending_asset_sources: Option<Vec<RenderAssetSource>>,
     closing: bool,
     replaced: u64,
 }
@@ -169,6 +171,17 @@ impl ProofWorker {
         Ok(())
     }
 
+    pub fn replace_asset_sources(&self, sources: Vec<RenderAssetSource>) -> Result<(), String> {
+        let (lock, wake) = &*self.queue;
+        let mut state = lock.lock().expect("proof queue lock");
+        if state.closing {
+            return Err("proof worker is closing".to_owned());
+        }
+        state.pending_asset_sources = Some(sources);
+        wake.notify_one();
+        Ok(())
+    }
+
     pub async fn next_result(&mut self) -> Option<ProofResult> {
         self.results.next().await
     }
@@ -201,35 +214,54 @@ fn proof_loop(
 ) {
     demote_proof_worker();
     let mut gpu = futures::executor::block_on(create_gpu());
+    let mut asset_error = None;
     loop {
-        let request = {
+        let (asset_sources, request) = {
             let (lock, wake) = &*queue;
             let mut state = lock.lock().expect("proof queue lock");
-            while state.pending.is_none() && !state.closing {
+            while state.pending.is_none() && state.pending_asset_sources.is_none() && !state.closing
+            {
                 state = wake.wait(state).expect("proof queue wait");
             }
             if state.closing {
                 return;
             }
-            state.pending.take().expect("pending proof request")
+            (state.pending_asset_sources.take(), state.pending.take())
+        };
+
+        if let Some(sources) = asset_sources {
+            asset_error = match &mut gpu {
+                Ok((_, _, renderer)) => renderer
+                    .replace_asset_sources(sources)
+                    .err()
+                    .map(|error| error.to_string()),
+                Err(error) => Some(error.clone()),
+            };
+        }
+
+        let Some(request) = request else {
+            continue;
         };
         let started = Instant::now();
-        let proof = match &mut gpu {
-            Ok((device, queue, renderer)) => renderer
-                .render_scene_pixels(AppOwnedRenderSceneRequest {
-                    device,
-                    queue,
-                    scene: &request.scene,
-                    render_identity_hash: &render_identity(&request.key),
-                    surface_id: request.surface_id,
-                    surface_epoch: request.key.surface_epoch,
-                    width: request.width,
-                    height: request.height,
-                    artifact_dir: &artifact_dir,
-                    artifact_label: &request.artifact_label,
-                })
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error.clone()),
+        let proof = match asset_error.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => match &mut gpu {
+                Ok((device, queue, renderer)) => renderer
+                    .render_scene_pixels(AppOwnedRenderSceneRequest {
+                        device,
+                        queue,
+                        scene: &request.scene,
+                        render_identity_hash: &render_identity(&request.key),
+                        surface_id: request.surface_id,
+                        surface_epoch: request.key.surface_epoch,
+                        width: request.width,
+                        height: request.height,
+                        artifact_dir: &artifact_dir,
+                        artifact_label: &request.artifact_label,
+                    })
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.clone()),
+            },
         };
         if results
             .try_send(ProofResult {
@@ -375,6 +407,30 @@ mod tests {
         queue.replace_pending(request(3));
         assert_eq!(queue.replaced, 2);
         assert_eq!(queue.pending.unwrap().key.frame_id, 3);
+    }
+
+    #[test]
+    fn pending_asset_sources_are_latest_wins_without_consuming_proof_depth() {
+        let mut queue = QueueState::default();
+        queue.replace_pending(request(1));
+        queue.pending_asset_sources = Some(vec![asset("asset://first")]);
+        queue.pending_asset_sources = Some(vec![asset("asset://latest")]);
+
+        assert_eq!(queue.replaced, 0);
+        assert_eq!(queue.pending.unwrap().key.frame_id, 1);
+        assert_eq!(
+            queue.pending_asset_sources.unwrap()[0].url,
+            "asset://latest"
+        );
+    }
+
+    fn asset(url: &str) -> RenderAssetSource {
+        RenderAssetSource {
+            url: url.to_owned(),
+            media_type: "image/png".to_owned(),
+            sha256: "00".repeat(32),
+            bytes: vec![0].into(),
+        }
     }
 
     #[test]

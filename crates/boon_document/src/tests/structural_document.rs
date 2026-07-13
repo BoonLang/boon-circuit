@@ -239,6 +239,73 @@ fn row_multiple_fill_children_share_remaining_width() {
     assert!(right.bounds.x + right.bounds.width <= 330.0);
 }
 
+#[test]
+fn row_fill_redistributes_width_after_min_max_constraints() {
+    let mut frame = DocumentFrame::empty("root");
+    let mut row = DocumentNode::new("row", DocumentNodeKind::Row);
+    row.parent = Some(frame.root.clone());
+    row.style
+        .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+    row.style
+        .insert("height".to_owned(), StyleValue::Number(40.0));
+    row.style.insert("gap".to_owned(), StyleValue::Number(4.0));
+
+    let mut left = DocumentNode::new("left", DocumentNodeKind::Stack);
+    left.parent = Some(row.id.clone());
+    left.style
+        .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+    left.style
+        .insert("min_width".to_owned(), StyleValue::Number(220.0));
+    left.style
+        .insert("max_width".to_owned(), StyleValue::Number(430.0));
+
+    let mut right = DocumentNode::new("right", DocumentNodeKind::Stack);
+    right.parent = Some(row.id.clone());
+    right
+        .style
+        .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+
+    row.children.push(left.id.clone());
+    row.children.push(right.id.clone());
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(row.id.clone());
+    frame.nodes.insert(row.id.clone(), row);
+    frame.nodes.insert(left.id.clone(), left);
+    frame.nodes.insert(right.id.clone(), right);
+
+    let bounds_at = |width: f32| {
+        let mut text = SimpleTextMeasurer;
+        let layout = layout(LayoutInput {
+            document: &frame,
+            viewport: Viewport {
+                surface: 1,
+                width,
+                height: 80.0,
+                scale: 1.0,
+            },
+            text: &mut text,
+            capabilities: RenderCapabilities::fake_portable(),
+        });
+        let child_width = |id: &str| {
+            layout
+                .display_list
+                .iter()
+                .find(|item| item.node.0 == id)
+                .unwrap()
+                .bounds
+                .width
+        };
+        (child_width("left"), child_width("right"))
+    };
+
+    assert_eq!(bounds_at(508.0), (252.0, 252.0));
+    assert_eq!(bounds_at(1_020.0), (430.0, 586.0));
+}
+
 
 #[test]
 fn button_with_element_label_shrinks_to_label_child() {

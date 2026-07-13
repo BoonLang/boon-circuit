@@ -61,7 +61,6 @@ pub struct RuntimeTurn {
     pub deltas: Vec<Delta>,
     pub document_patches: Vec<DocumentPatch>,
     pub document_patch_status: DocumentPatchStatus,
-    pub source_inventory: SourceInventory,
     pub metrics: TurnMetrics,
     pub materialization: DocumentMaterializationStats,
     pub phase_timings: RuntimePhaseTimings,
@@ -216,13 +215,20 @@ impl LiveRuntime {
     }
 
     pub fn from_machine_plan(plan: MachinePlan, options: SessionOptions) -> RuntimeResult<Self> {
+        Self::from_shared_machine_plan(Arc::new(plan), options)
+    }
+
+    fn from_shared_machine_plan(
+        plan: Arc<MachinePlan>,
+        options: SessionOptions,
+    ) -> RuntimeResult<Self> {
         let source_inventory = source_inventory(&plan);
         let source_ids_by_path = source_inventory
             .sources
             .iter()
             .map(|source| (source.path.clone(), source.id))
             .collect();
-        let mut session = Session::new(plan, options)?;
+        let mut session = Session::new_shared(plan, options)?;
         let document = document::DocumentRuntime::new(&mut session)?;
         Ok(Self {
             session,
@@ -233,7 +239,7 @@ impl LiveRuntime {
     }
 
     fn from_cached_plan(cached: CachedPlan) -> RuntimeResult<Self> {
-        Self::from_machine_plan(cached.plan.as_ref().clone(), SessionOptions::default())
+        Self::from_shared_machine_plan(cached.plan, SessionOptions::default())
     }
 
     pub fn mount(&self) -> RuntimeTurn {
@@ -246,7 +252,6 @@ impl LiveRuntime {
                 .map(document::DocumentRuntime::mount_patches)
                 .unwrap_or_default(),
             document_patch_status: DocumentPatchStatus::Complete,
-            source_inventory: self.source_inventory.clone(),
             metrics: TurnMetrics::default(),
             materialization: self
                 .document
@@ -399,6 +404,15 @@ impl LiveRuntime {
             .find(|route| route.path == path)?
             .payload_schema
             .row_lookup_field_name()
+    }
+
+    pub fn source_is_row_scoped(&self, path: &str) -> Option<bool> {
+        self.session
+            .plan()
+            .source_routes
+            .iter()
+            .find(|route| route.path == path)
+            .map(|route| route.scope_id.is_some())
     }
 
     pub fn run_scenario(&mut self, scenario: &Scenario) -> RuntimeResult<Vec<RuntimeTurn>> {
@@ -821,7 +835,6 @@ impl LiveRuntime {
             deltas: turn.deltas,
             document_patches,
             document_patch_status: DocumentPatchStatus::Complete,
-            source_inventory: self.source_inventory.clone(),
             metrics: turn.metrics,
             materialization: self
                 .document
@@ -1219,7 +1232,7 @@ fn scenario_value_text(value: &Value) -> RuntimeResult<String> {
         Value::Text(value) => Ok(value.clone()),
         Value::Bytes(value) => Ok(String::from_utf8(value.clone())?),
         Value::Error { code } => Ok(code.clone()),
-        Value::List(_) | Value::Record(_) | Value::Row { .. } => {
+        Value::List(_) | Value::Record(_) | Value::MappedRow { .. } | Value::Row { .. } => {
             Err("scenario text expectation targeted a structured value".into())
         }
     }

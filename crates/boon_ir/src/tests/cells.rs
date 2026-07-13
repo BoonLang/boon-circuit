@@ -169,6 +169,49 @@ fn novywave_project_lowers_source_wrapped_controls() {
             .cloned()
             .collect::<Vec<_>>()
     );
+    assert!(
+        ir.update_branches.iter().any(|branch| {
+            branch.source == "file_tree_row.file_row_elements.select_file"
+                && branch.target == "store.active_scope"
+                && matches!(
+                    &branch.expression,
+                    UpdateExpression::ListFindValue {
+                        list,
+                        field,
+                        target,
+                        ..
+                    } if list == "store.startup_workspace_opened_files"
+                        && field == "file"
+                        && target == "selected_scope_key"
+                )
+        }),
+        "default file-row scope selection must keep its own indexed lookup branch: {:?}",
+        ir.update_branches
+            .iter()
+            .filter(|branch| {
+                branch.source == "file_tree_row.file_row_elements.select_file"
+                    && branch.target == "store.active_scope"
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ir.update_branches.iter().any(|branch| {
+            branch.source == "store.elements.panels_toggle_arrangement"
+                && branch.target == "store.panel_arrangement"
+                && matches!(
+                    &branch.expression,
+                    UpdateExpression::MatchValueConst { input, arms }
+                        if input == "store.panel_arrangement"
+                            && arms.iter().any(|arm| {
+                                arm.pattern == "__"
+                                    && arm.output == UpdateValueExpression::Const {
+                                        value: "Docked".to_owned(),
+                                    }
+                            })
+                )
+        }),
+        "multiline toggle WHEN must remain owned by its THEN branch"
+    );
 }
 
 
@@ -578,4 +621,3 @@ fn cause_tables_derive_row_scope_from_list_map_function() {
                 .contains(&"todo.sources.todo_checkbox.click".to_owned())
     }));
 }
-

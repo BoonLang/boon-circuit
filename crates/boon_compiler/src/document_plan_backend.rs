@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn compile_document_plan(
     program: &TypedProgram,
+    executable_fields: &BTreeSet<FieldId>,
 ) -> Result<Option<DocumentPlan>, PlanError> {
     let mut roots = program
         .output_values
@@ -19,7 +20,9 @@ pub(super) fn compile_document_plan(
             "MachinePlan can contain only one document or scene output root",
         ));
     }
-    DocumentCompiler::new(program)?.compile(output).map(Some)
+    DocumentCompiler::new(program, executable_fields)?
+        .compile(output)
+        .map(Some)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +85,10 @@ struct DocumentCompiler<'a> {
 }
 
 impl<'a> DocumentCompiler<'a> {
-    fn new(program: &'a TypedProgram) -> Result<Self, PlanError> {
+    fn new(
+        program: &'a TypedProgram,
+        executable_fields: &BTreeSet<FieldId>,
+    ) -> Result<Self, PlanError> {
         let mut globals = BTreeMap::new();
         for source in &program.sources {
             globals.insert(
@@ -100,10 +106,7 @@ impl<'a> DocumentCompiler<'a> {
             globals.insert(list.name.clone(), GlobalValue::List(ListId(list.id.0)));
         }
         for field in &program.derived_values {
-            if field.scope_id.is_some()
-                || statement_is_source_group(&field.statement)
-                || list_for_semantic_path(program, &field.path).is_some()
-            {
+            if field.scope_id.is_some() || statement_is_source_group(program, &field.statement) {
                 continue;
             }
             let field_id = program
@@ -113,13 +116,17 @@ impl<'a> DocumentCompiler<'a> {
                 .find(|semantic| semantic.path == field.path)
                 .map(|semantic| semantic.id.0)
                 .unwrap_or(field.id.0);
-            globals
-                .entry(field.path.clone())
-                .or_insert(GlobalValue::Field(FieldId(field_id)));
+            let field_id = FieldId(field_id);
+            let computed_list_view = field.kind == ir::DerivedValueKind::ListView
+                && executable_fields.contains(&field_id);
+            if list_for_semantic_path(program, &field.path).is_some() && !computed_list_view {
+                continue;
+            }
+            globals.insert(field.path.clone(), GlobalValue::Field(field_id));
         }
         for field in &program.semantic_index.fields {
             let source_group = program.derived_values.iter().any(|derived| {
-                derived.path == field.path && statement_is_source_group(&derived.statement)
+                derived.path == field.path && statement_is_source_group(program, &derived.statement)
             });
             if field.scope_id.is_none() && !source_group {
                 let list = list_for_semantic_path(program, &field.path);
@@ -348,6 +355,10 @@ impl<'a> DocumentCompiler<'a> {
         context: &CompileContext,
         compiler_id: usize,
     ) -> Result<DocumentExprId, PlanError> {
+        let statements = statements
+            .iter()
+            .filter(|statement| !statement_is_empty_delimiter(statement, self.program))
+            .collect::<Vec<_>>();
         if statements.is_empty() {
             return Err(PlanError::new(format!(
                 "document block {compiler_id} has no result"
@@ -360,18 +371,22 @@ impl<'a> DocumentCompiler<'a> {
             )
         });
         if statements.len() > 1
-            && statements.iter().all(statement_is_record_entry)
+            && statements
+                .iter()
+                .all(|statement| statement_is_record_entry(statement))
             && statements
                 .iter()
                 .any(|statement| matches!(statement.kind, AstStatementKind::Spread))
         {
-            return self.compile_record_children(statements, context, compiler_id);
+            return self.compile_record_children_refs(&statements, context, compiler_id);
         }
         if !has_expression_result
-            && statements.iter().all(statement_has_named_field)
+            && statements
+                .iter()
+                .all(|statement| statement_has_named_field(statement))
             && statements.len() > 1
         {
-            return self.compile_record_children(statements, context, compiler_id);
+            return self.compile_record_children_refs(&statements, context, compiler_id);
         }
 
         let mut scoped = context.clone();
@@ -1346,6 +1361,19 @@ impl<'a> DocumentCompiler<'a> {
         context: &CompileContext,
         compiler_id: usize,
     ) -> Result<DocumentExprId, PlanError> {
+        self.compile_record_children_refs(
+            &children.iter().collect::<Vec<_>>(),
+            context,
+            compiler_id,
+        )
+    }
+
+    fn compile_record_children_refs(
+        &mut self,
+        children: &[&AstStatement],
+        context: &CompileContext,
+        compiler_id: usize,
+    ) -> Result<DocumentExprId, PlanError> {
         let mut fields = Vec::new();
         for child in children {
             let value = self.compile_statement_value(child, context, None)?;
@@ -1578,6 +1606,56 @@ impl<'a> DocumentCompiler<'a> {
             self.record_compiled_path(context, path, expression);
             return Ok(expression);
         }
+        if !explicit_passed && stripped.len() > 1 {
+            let first = stripped[0];
+            let projection = stripped[1..]
+                .iter()
+                .map(|part| self.intern_name(part))
+                .collect::<Vec<_>>();
+            if let Some(scope) = context.row_aliases.get(first).copied() {
+                let field = stripped
+                    .get(1)
+                    .and_then(|name| self.resolve_scoped_field(scope, name));
+                let expression = self.push_expr(
+                    expr_id,
+                    DocumentValueClass::DynamicScalar,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Row {
+                            scope,
+                            field,
+                            projection,
+                        },
+                    },
+                );
+                self.record_compiled_path(context, path, expression);
+                return Ok(expression);
+            }
+            if let Some(parameter) = context.parameters.get(first).copied() {
+                let expression = self.push_expr(
+                    expr_id,
+                    DocumentValueClass::DynamicScalar,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Parameter {
+                            parameter,
+                            projection,
+                        },
+                    },
+                );
+                self.record_compiled_path(context, path, expression);
+                return Ok(expression);
+            }
+            if let Some(local) = context.locals.get(first).copied() {
+                let expression = self.push_expr(
+                    expr_id,
+                    DocumentValueClass::DynamicScalar,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Local { local, projection },
+                    },
+                );
+                self.record_compiled_path(context, path, expression);
+                return Ok(expression);
+            }
+        }
         if let Some(source) = self.resolve_source_alias(stripped) {
             let expression = self.push_expr(
                 expr_id,
@@ -1637,49 +1715,6 @@ impl<'a> DocumentCompiler<'a> {
             .iter()
             .map(|part| self.intern_name(part))
             .collect::<Vec<_>>();
-        if let Some(scope) = context.row_aliases.get(first).copied() {
-            let field = stripped
-                .get(1)
-                .and_then(|name| self.resolve_scoped_field(scope, name));
-            let expression = self.push_expr(
-                expr_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Row {
-                        scope,
-                        field,
-                        projection,
-                    },
-                },
-            );
-            self.record_compiled_path(context, path, expression);
-            return Ok(expression);
-        }
-        if let Some(parameter) = context.parameters.get(first).copied() {
-            let expression = self.push_expr(
-                expr_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Parameter {
-                        parameter,
-                        projection,
-                    },
-                },
-            );
-            self.record_compiled_path(context, path, expression);
-            return Ok(expression);
-        }
-        if let Some(local) = context.locals.get(first).copied() {
-            let expression = self.push_expr(
-                expr_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::Read {
-                    read: DocumentRead::Local { local, projection },
-                },
-            );
-            self.record_compiled_path(context, path, expression);
-            return Ok(expression);
-        }
         if first == "element" {
             let expression = self.push_expr(
                 expr_id,
@@ -2106,11 +2141,12 @@ fn parameter_id(
         .ok_or_else(|| PlanError::new("typed document parameter id overflow"))
 }
 
-fn statement_is_source_group(statement: &AstStatement) -> bool {
+fn statement_is_source_group(program: &TypedProgram, statement: &AstStatement) -> bool {
     !statement.children.is_empty()
         && statement.children.iter().all(|child| match child.kind {
             AstStatementKind::Source { .. } => true,
-            AstStatementKind::Field { .. } => statement_is_source_group(child),
+            AstStatementKind::Field { .. } => statement_is_source_group(program, child),
+            _ if statement_is_empty_delimiter(child, program) => true,
             _ => false,
         })
 }

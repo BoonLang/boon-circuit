@@ -39,7 +39,55 @@ expect_root_text = { "panel_arrangement" = "Stacked", "panel_arrangement_label" 
 id = "open-load-files-dialog"
 user_action = { kind = "click", target = "load", target_text = "Load Files" }
 expected_source_event = { source = "store.elements.open_load_files_dialog", target_text = "Load Files" }
-expect_root_text = { "load_files_dialog" = "Open", "load_files_dialog_title" = "Load files", "load_files_dialog_hint" = "Enter a local VCD, FST, or GHW path. The native host validates the file and sends pure metadata to Boon.", "load_files_path" = "~/repos/NovyWave/test_files/simple.vcd", "load_files_dialog_selection" = "Path: ~/repos/NovyWave/test_files/simple.vcd" }
+expect_root_text = { "load_files_dialog" = "Open", "load_files_dialog_title" = "Load files", "load_files_dialog_hint" = "Enter a built-in VCD, FST, or GHW fixture path. Fixture metadata and bounded pages remain pure Boon data.", "load_files_path" = "~/repos/NovyWave/test_files/simple.vcd", "load_files_dialog_selection" = "Path: ~/repos/NovyWave/test_files/simple.vcd" }
+
+[[step]]
+id = "enter-fst-fixture-path"
+user_action = { kind = "type_text", target = "waveform file path", text = "~/repos/NovyWave/test_files/wave_27.fst" }
+expected_source_event = { source = "store.elements.load_file_path_input", text = "~/repos/NovyWave/test_files/wave_27.fst" }
+expect_root_text = { "load_files_dialog" = "Open", "load_fixture_path_match" = "wave_27.fst", "load_requested_fixture_supported" = "True", "load_files_dialog_selection" = "Path: ~/repos/NovyWave/test_files/wave_27.fst" }
+
+[[step]]
+id = "open-fst-fixture"
+user_action = { kind = "click", target = "load fixture", target_text = "Open" }
+expected_source_event = { source = "store.elements.load_external_file", target_text = "Open" }
+expect_root_text = { "load_files_dialog" = "Closed", "waveform_status" = "Loaded", "active_file" = "wave_27.fst", "active_scope" = "top_uart", "active_signal" = "tx_data", "selected_rows_count" = "4", "selected_rows_order_label" = "tx_data[7:0], rx_data[7:0], baud_tick, uart_busy", "diagnostic_state" = "OK", "diagnostic_label" = "fixture metadata OK", "bridge_open_status" = "FILE_READY", "bridge_file_format" = "FST", "bridge_waveform_ref" = "wave:fst:wave-27:0-240ns" }
+
+[[step]]
+id = "reopen-load-files-dialog"
+user_action = { kind = "click", target = "load", target_text = "Load Files" }
+expected_source_event = { source = "store.elements.open_load_files_dialog", target_text = "Load Files" }
+expect_root_text = { "load_files_dialog" = "Open", "load_files_path" = "~/repos/NovyWave/test_files/wave_27.fst", "load_files_dialog_selection" = "Path: ~/repos/NovyWave/test_files/wave_27.fst" }
+
+[[step]]
+id = "enter-unsupported-fixture-path"
+user_action = { kind = "type_text", target = "waveform file path", text = "unsupported.wave" }
+expected_source_event = { source = "store.elements.load_file_path_input", text = "unsupported.wave" }
+expect_root_text = { "load_files_dialog" = "Open", "load_fixture_path_match" = "none", "load_requested_fixture_supported" = "False", "load_files_dialog_selection" = "Path: unsupported.wave" }
+
+[[step]]
+id = "reject-unsupported-fixture-path"
+user_action = { kind = "click", target = "load fixture", target_text = "Open" }
+expected_source_event = { source = "store.elements.load_external_file", target_text = "Open" }
+expect_root_text = { "load_files_dialog" = "Open", "active_file" = "wave_27.fst", "diagnostic_state" = "Unsupported", "diagnostic_label" = "Unsupported fixture path. Choose simple.vcd, wave_27.fst, or simple_test.ghw.", "diagnostic_file" = "unsupported fixture path", "bridge_open_status" = "FILE_ERROR", "load_files_dialog_selection" = "Unsupported fixture path. Choose simple.vcd, wave_27.fst, or simple_test.ghw." }
+
+[[step]]
+id = "enter-vcd-fixture-path"
+user_action = { kind = "type_text", target = "waveform file path", text = "simple.vcd" }
+expected_source_event = { source = "store.elements.load_file_path_input", text = "simple.vcd" }
+expect_root_text = { "load_files_dialog" = "Open", "load_fixture_path_match" = "simple.vcd", "load_requested_fixture_supported" = "True", "load_files_dialog_selection" = "Path: simple.vcd" }
+
+[[step]]
+id = "open-vcd-fixture"
+user_action = { kind = "click", target = "load fixture", target_text = "Open" }
+expected_source_event = { source = "store.elements.load_external_file", target_text = "Open" }
+expect_root_text = { "load_files_dialog" = "Closed", "waveform_status" = "Loaded", "active_file" = "simple.vcd", "active_scope" = "simple_tb_s", "active_signal" = "clk", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "diagnostic_state" = "OK", "diagnostic_label" = "fixture metadata OK", "bridge_open_status" = "FILE_READY", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:simple:0-250s" }
+
+[[step]]
+id = "open-load-files-dialog-for-cancel"
+user_action = { kind = "click", target = "load", target_text = "Load Files" }
+expected_source_event = { source = "store.elements.open_load_files_dialog", target_text = "Load Files" }
+expect_root_text = { "load_files_dialog" = "Open" }
 
 [[step]]
 id = "cancel-load-files-dialog"
@@ -57,7 +105,7 @@ expect_root_text = { "waveform_status" = "Empty", "active_file" = "none", "compa
 id = "begin-default-file-load"
 user_action = { kind = "click", target = "open file", target_text = "Open file" }
 expected_source_event = { source = "store.elements.open_load_files_dialog", target_text = "Open file" }
-expect_root_text = { "waveform_status" = "Empty", "load_files_dialog" = "Open", "load_files_dialog_title" = "Load files", "load_files_dialog_selection" = "Path: ~/repos/NovyWave/test_files/simple.vcd" }
+expect_root_text = { "waveform_status" = "Empty", "load_files_dialog" = "Open", "load_files_dialog_title" = "Load files", "load_files_dialog_selection" = "Path: simple.vcd" }
 
 [[step]]
 id = "cancel-empty-load-files-dialog"
@@ -69,11 +117,11 @@ expect_root_text = { "waveform_status" = "Empty", "load_files_dialog" = "Closed"
 id = "load-default-file-from-empty"
 user_action = { kind = "click", target = "open default", target_text = "Open default" }
 expected_source_event = { source = "store.elements.load_default_file", target_text = "Open default" }
-expect_root_text = { "waveform_status" = "Loaded", "active_signal" = "clk", "active_waveform_segment_labels" = "cursor,0xa,marker,0xc,0x0", "active_waveform_segment_count" = "5", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s", "selected_timeline_full_range" = "0 s - 250 s", "selected_timeline_initial_window" = "0 s - 250 s", "selected_timeline_time_unit" = "s", "bridge_contract" = "wellen.v1 pure-data contract draft: open, hierarchy_page, signal_page, cursor_values, file_stats", "bridge_effect_exports" = "open/hierarchy/signal/cursor/stats", "bridge_data_policy" = "comparable descriptors only; no Rust handles" }
+expect_root_text = { "waveform_status" = "Loaded", "active_signal" = "clk", "active_waveform_segment_labels" = "cursor,0xa,marker,0xc,0x0", "active_waveform_segment_count" = "5", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s", "selected_timeline_full_range" = "0 s - 250 s", "selected_timeline_initial_window" = "0 s - 250 s", "selected_timeline_time_unit" = "s", "bridge_contract" = "wellen.v1-compatible fixture contract: open, hierarchy_page, signal_page, cursor_values, file_stats", "bridge_effect_exports" = "open/hierarchy/signal/cursor/stats", "bridge_data_policy" = "comparable descriptors only; no Rust handles" }
 
 [[step]]
 id = "bridge-contract-descriptor"
-expect_root_text = { "bridge_provider_version" = "planned official wellen 0.24.x provider", "bridge_schema_version" = "wellen.v1 waveform schema; real file hashes in descriptors", "bridge_descriptor_file" = "simple.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:simple:0-250s", "bridge_open_status" = "FILE_READY", "bridge_open_summary" = "opened VCD wave:vcd:simple:0-250s", "bridge_hierarchy_page_label" = "HIER:simple_tb/s", "bridge_file_stats_label" = "VCD 2 signals, 0-250s, bounded pages", "bridge_cursor_values_label" = "A=0xc B=0x5 at 50 s", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_window_label" = "0 s - 250 s", "bridge_response_window_label" = "0 s - 250 s", "bridge_large_file_contract" = "simple.vcd 311B -> bounded page requests only", "bridge_payload_limit_bytes" = "65536", "bridge_transition_limit" = "256", "bridge_visible_row_limit" = "32", "bridge_segment_limit" = "256", "bridge_page_window_label" = "window 0 s - 250 s, max 256 transitions, payload <= 64KiB", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor simple_tb.s:0..64 next=none", "bridge_materialization_bound_label" = "visible rows 2/2, waveform segments 6/256 max", "bridge_payload_bound_label" = "payload <= 64KiB; full waveform never enters Boon", "reference_visual_basis" = "figma dark/light loaded + empty, docs full UI", "reference_loaded_basis" = "figma loaded 1440x1024/1920x1080; docs full UI 1364x747", "reference_workflow_basis" = "docs: analog limits, markers, loading, errors, multi-file", "reference_waveform_basis" = "simple.vcd 311B; simple_test.ghw 833B; wave_27.fst 28.9MB", "reference_comparison_status" = "ref: figma/docs + waveform files" }
+expect_root_text = { "bridge_provider_version" = "deterministic fixture provider v1", "bridge_schema_version" = "wellen.v1 fixture schema; stable fixture hashes in descriptors", "bridge_descriptor_file" = "simple.vcd", "bridge_file_format" = "VCD", "bridge_waveform_ref" = "wave:vcd:simple:0-250s", "bridge_open_status" = "FILE_READY", "bridge_open_summary" = "opened VCD wave:vcd:simple:0-250s", "bridge_hierarchy_page_label" = "HIER:simple_tb/s", "bridge_file_stats_label" = "VCD 2 signals, 0-250s, bounded pages", "bridge_cursor_values_label" = "A=0xc B=0x5 at 50 s", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_window_label" = "0 s - 250 s", "bridge_response_window_label" = "0 s - 250 s", "bridge_large_file_contract" = "simple.vcd 311B -> bounded page requests only", "bridge_payload_limit_bytes" = "65536", "bridge_transition_limit" = "256", "bridge_visible_row_limit" = "32", "bridge_segment_limit" = "256", "bridge_page_window_label" = "window 0 s - 250 s, max 256 transitions, payload <= 64KiB", "bridge_hierarchy_page_cursor_label" = "hierarchy cursor simple_tb.s:0..64 next=none", "bridge_materialization_bound_label" = "visible rows 2/2, waveform segments 6/256 max", "bridge_payload_bound_label" = "payload <= 64KiB; full waveform never enters Boon", "reference_visual_basis" = "figma dark/light loaded + empty, docs full UI", "reference_loaded_basis" = "figma loaded 1440x1024/1920x1080; docs full UI 1364x747", "reference_workflow_basis" = "docs: analog limits, markers, loading, errors, multi-file", "reference_waveform_basis" = "simple.vcd 311B; simple_test.ghw 833B; wave_27.fst 28.9MB", "reference_comparison_status" = "ref: figma/docs + waveform files" }
 
 [[step]]
 id = "select-compare-file"
@@ -92,6 +140,18 @@ id = "select-ghw-file"
 user_action = { kind = "click", target = "file row", target_text = "- simple_test.ghw" }
 expected_source_event = { source = "file_tree_row.file_row_elements.select_file", address = "simple_test.ghw", target_text = "- simple_test.ghw" }
 expect_root_text = { "active_file" = "simple_test.ghw", "compare_file" = "none", "file_compare_status" = "single file: simple_test.ghw", "compare_request_page" = "compare:simple_test.ghw:primary", "compare_result_label" = "primary page: simple_test.ghw, GHW file", "active_scope" = "ghw_simple", "active_scope_key" = "GHW_SIMPLE", "active_scope_label" = "ghw.simple", "active_signal" = "ghw_counter", "active_signal_key" = "GHW_COUNTER", "active_signal_label" = "ghw.simple.counter[3:0]", "active_waveform_segment_labels" = "cursor,init,marker,1,2,3", "active_waveform_segment_count" = "6", "selected_rows_count" = "3", "selected_rows_order_label" = "ghw.counter[3:0], ghw.enable, ghw.state", "selected_signal_count_label" = "3 selected", "diagnostic_state" = "OK", "bridge_descriptor_file" = "simple_test.ghw", "bridge_file_format" = "GHW", "bridge_waveform_ref" = "wave:ghw:simple-test:0-100ns", "bridge_open_status" = "FILE_READY", "bridge_open_summary" = "opened GHW wave:ghw:simple-test:0-100ns", "bridge_hierarchy_page_label" = "HIER:ghw.simple/counter", "bridge_file_stats_label" = "GHW 4 signals, 0-100ns, bounded pages", "bridge_cursor_values_label" = "ghw_counter=3 at 42 ns", "bridge_request_page" = "GHW_MAIN", "bridge_request_fingerprint" = "GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal", "bridge_response_page" = "GHW_MAIN", "bridge_response_fingerprint" = "GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal", "bridge_response_descriptor_label" = "GHW_SIMPLE/GHW_COUNTER/Fit/Center/Cursor42/Hexadecimal", "bridge_response_status_compact_label" = "CURRENT", "bridge_response_status" = "ACCEPTED_CURRENT_PAGE" }
+
+[[step]]
+id = "select-ghw-clock"
+user_action = { kind = "click", target = "variable row", target_text = "ghw.clk" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "ghw.clk" }
+expect_root_text = { "active_signal" = "ghw_clk", "active_signal_key" = "GHW_CLK", "active_signal_label" = "ghw.simple.clk", "active_waveform_segment_labels" = "cursor,0,marker,1,0,1,0", "active_waveform_segment_count" = "7", "selected_rows_count" = "4", "selected_rows_order_label" = "ghw.counter[3:0], ghw.enable, ghw.state, ghw.clk", "selected_signal_count_label" = "4 selected", "bridge_request_page" = "GHW_MAIN", "bridge_request_fingerprint" = "GHW_SIMPLE/GHW_CLK/Fit/Center/Cursor42/Hexadecimal", "bridge_response_signal" = "GHW_CLK" }
+
+[[step]]
+id = "remove-ghw-clock-row"
+user_action = { kind = "click", target = "selected variable remove", target_text = "ghw.clk" }
+expected_source_event = { source = "selected_signal.row_elements.remove_signal", target_text = "ghw.clk" }
+expect_root_text = { "selected_rows_profile" = "WithoutSelection", "selected_rows_count" = "3", "selected_rows_order_label" = "ghw.counter[3:0], ghw.enable, ghw.state", "selected_signal_count_label" = "3 selected" }
 
 [[step]]
 id = "return-primary-after-ghw"
@@ -124,6 +184,18 @@ expected_source_event = { source = "store.elements.signal_search_input", text = 
 expect_root_text = { "active_scope" = "top_uart", "signal_search_text" = "", "search_result_label" = "5 results in top.uart", "search_results_count" = "5", "search_results_key_summary" = "tx_data,rx_data,baud_tick,uart_busy,framing_error" }
 
 [[step]]
+id = "select-framing-error"
+user_action = { kind = "click", target = "variable row", target_text = "framing_error" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "framing_error" }
+expect_root_text = { "active_signal" = "framing_error", "active_signal_key" = "FRAMING_ERROR", "active_signal_label" = "top.uart.framing_error", "active_waveform_segment_labels" = "cursor,0,marker,error,0", "active_waveform_segment_count" = "5", "selected_rows_count" = "5", "selected_rows_order_label" = "tx_data[7:0], rx_data[7:0], baud_tick, uart_busy, framing_error", "selected_signal_count_label" = "5 selected", "bridge_request_page" = "CMP_UART", "bridge_request_fingerprint" = "TOP_UART/FRAMING_ERROR/Fit/Center/Cursor42/Hexadecimal", "bridge_response_signal" = "FRAMING_ERROR" }
+
+[[step]]
+id = "remove-framing-error-row"
+user_action = { kind = "click", target = "selected variable remove", target_text = "framing_error" }
+expected_source_event = { source = "selected_signal.row_elements.remove_signal", target_text = "framing_error" }
+expect_root_text = { "selected_rows_profile" = "WithoutSelection", "selected_rows_count" = "4", "selected_rows_order_label" = "tx_data[7:0], rx_data[7:0], baud_tick, uart_busy", "selected_signal_count_label" = "4 selected" }
+
+[[step]]
 id = "blur-signal-search"
 user_action = { kind = "click", target = "scope row", target_text = "+ top.uart" }
 expected_source_event = { source = "file_tree_row.scope_row_elements.select_scope", target_text = "+ top.uart" }
@@ -140,6 +212,24 @@ id = "select-temperature-analog"
 user_action = { kind = "click", target = "variable row", target_text = "temperature" }
 expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "temperature" }
 expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEMPERATURE", "active_signal_label" = "top.analog.temperature", "active_waveform_segment_labels" = "cursor,39,41,marker,44,43,40,42,44,43", "active_waveform_segment_count" = "10", "selected_timeline_cursor_value" = "42", "cursor_position" = "Cursor42", "temperature_rendered_value" = "42.8 C", "analog_range_label" = "Auto 39 C .. 44 C", "bridge_request_page" = "TEMP_FIT", "bridge_request_fingerprint" = "TOP_ANALOG/TEMPERATURE/Fit/Center/Cursor42/Hexadecimal", "bridge_request_compact_label" = "TEMP_FIT", "bridge_response_signal" = "TEMPERATURE" }
+
+[[step]]
+id = "select-vcore-analog"
+user_action = { kind = "click", target = "variable row", target_text = "vcore" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "vcore" }
+expect_root_text = { "active_signal" = "voltage", "active_signal_key" = "VOLTAGE", "active_signal_label" = "top.analog.vcore", "active_waveform_segment_labels" = "cursor,1.18,marker,1.20,1.23", "active_waveform_segment_count" = "5", "selected_rows_count" = "2", "selected_rows_order_label" = "temperature, vcore", "selected_signal_count_label" = "2 selected", "bridge_request_page" = "TEMP_FIT", "bridge_request_fingerprint" = "TOP_ANALOG/VOLTAGE/Fit/Center/Cursor42/Hexadecimal", "bridge_response_signal" = "VOLTAGE" }
+
+[[step]]
+id = "remove-vcore-row"
+user_action = { kind = "click", target = "selected variable remove", target_text = "vcore" }
+expected_source_event = { source = "selected_signal.row_elements.remove_signal", target_text = "vcore" }
+expect_root_text = { "selected_rows_profile" = "WithoutSelection", "selected_rows_count" = "1", "selected_rows_order_label" = "temperature", "selected_signal_count_label" = "1 selected" }
+
+[[step]]
+id = "reselect-temperature-after-vcore"
+user_action = { kind = "click", target = "variable row", target_text = "temperature" }
+expected_source_event = { source = "signal.signal_elements.select_signal", target_text = "temperature" }
+expect_root_text = { "active_signal" = "temperature", "active_signal_key" = "TEMPERATURE", "active_signal_label" = "top.analog.temperature", "selected_rows_count" = "1", "selected_rows_order_label" = "temperature", "selected_signal_count_label" = "1 selected" }
 
 [[step]]
 id = "analog-manual-limits"
@@ -161,14 +251,14 @@ expect_root_text = { "analog_limit_kind" = "Auto", "analog_limit_validity" = "Va
 
 [[step]]
 id = "select-cpu-scope"
-user_action = { kind = "click", target = "scope row", target_text = "+ simple_tb.s" }
-expected_source_event = { source = "store.elements.scope_cpu_expand", target_text = "+ simple_tb.s" }
+user_action = { kind = "click", target = "scope row", target_text = "- simple_tb.s" }
+expected_source_event = { source = "file_tree_row.scope_row_elements.select_scope", target_text = "- simple_tb.s" }
 expect_root_text = { "active_scope" = "simple_tb_s", "active_scope_key" = "SIMPLE_TB_S", "active_scope_label" = "simple_tb.s", "active_scope_signal_count" = "2 signals", "active_scope_expansion_label" = "Expanded", "active_scope_visible_signal_count" = "2 visible" }
 
 [[step]]
 id = "collapse-top-cpu-scope"
-user_action = { kind = "click", target = "scope row", target_text = "- simple_tb.s" }
-expected_source_event = { source = "store.elements.scope_cpu_collapse", target_text = "- simple_tb.s" }
+user_action = { kind = "click", target = "scope disclosure", target_text = "-" }
+expected_source_event = { source = "store.elements.scope_cpu_collapse", target_text = "-" }
 expect_root_text = { "active_scope" = "simple_tb_s", "active_scope_key" = "SIMPLE_TB_S", "active_scope_label" = "simple_tb.s", "active_scope_signal_count" = "2 signals", "scope_cpu_expansion_state" = "Collapsed", "active_scope_expansion_label" = "Collapsed", "active_scope_visible_signal_count" = "0 visible" }
 
 [[step]]
@@ -191,38 +281,50 @@ expect_root_text = { "active_signal" = "clk", "active_signal_label" = "simple_tb
 
 [[step]]
 id = "selected-remove-data"
-user_action = { kind = "click", target = "selected row control", target_text = "[Rm data]" }
-expected_source_event = { source = "store.elements.selected_remove_data", target_text = "[Rm data]" }
+user_action = { kind = "click", target = "selected row control", target_text = "Remove data" }
+expected_source_event = { source = "store.elements.selected_remove_data", target_text = "Remove data" }
 expect_root_text = { "selected_rows_profile" = "WithoutData", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected" }
 
 [[step]]
 id = "selected-restore-data"
-user_action = { kind = "click", target = "selected row control", target_text = "[Restore]" }
-expected_source_event = { source = "store.elements.selected_restore_data", target_text = "[Restore]" }
+user_action = { kind = "click", target = "selected row control", target_text = "Restore" }
+expected_source_event = { source = "store.elements.selected_restore_data", target_text = "Restore" }
 expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected" }
 
 [[step]]
 id = "selected-remove-reset-row"
-user_action = { kind = "click", target = "selected variable remove", target_text = "rst" }
-expected_source_event = { source = "store.elements.selected_remove_reset", target_text = "rst" }
+user_action = { kind = "click", target = "selected variable remove", target_text = "B[3:0]" }
+expected_source_event = { source = "selected_signal.row_elements.remove_signal", target_text = "B[3:0]" }
 expect_root_text = { "selected_rows_profile" = "WithoutSelection", "selected_rows_count" = "1", "selected_rows_order_label" = "A[3:0]", "selected_signal_count_label" = "1 selected" }
 
 [[step]]
 id = "selected-restore-after-row-remove"
-user_action = { kind = "click", target = "selected row control", target_text = "[Restore]" }
-expected_source_event = { source = "store.elements.selected_restore_data", target_text = "[Restore]" }
+user_action = { kind = "click", target = "selected row control", target_text = "Restore" }
+expected_source_event = { source = "store.elements.selected_restore_data", target_text = "Restore" }
+expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected" }
+
+[[step]]
+id = "selected-clear-all"
+user_action = { kind = "click", target = "selected clear all", target_text = "Clear All" }
+expected_source_event = { source = "store.elements.selected_clear_all", target_text = "Clear All" }
+expect_root_text = { "waveform_status" = "Loaded", "active_file" = "simple.vcd", "selected_rows_profile" = "Empty", "selected_rows_count" = "0", "selected_rows_order_label" = "none", "selected_signal_count_label" = "0 selected" }
+
+[[step]]
+id = "selected-restore-after-clear-all"
+user_action = { kind = "click", target = "selected row control", target_text = "Restore" }
+expected_source_event = { source = "store.elements.selected_restore_data", target_text = "Restore" }
 expect_root_text = { "selected_rows_profile" = "DefaultOrder", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected" }
 
 [[step]]
 id = "selected-data-up"
-user_action = { kind = "click", target = "selected row control", target_text = "[Up]" }
-expected_source_event = { source = "store.elements.selected_data_up", target_text = "[Up]" }
+user_action = { kind = "click", target = "selected row control", target_text = "Up" }
+expected_source_event = { source = "store.elements.selected_data_up", target_text = "Up" }
 expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected" }
 
 [[step]]
 id = "selected-data-down"
-user_action = { kind = "click", target = "selected row control", target_text = "[Down]" }
-expected_source_event = { source = "store.elements.selected_data_down", target_text = "[Down]" }
+user_action = { kind = "click", target = "selected row control", target_text = "Down" }
+expected_source_event = { source = "store.elements.selected_data_down", target_text = "Down" }
 expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected" }
 
 [[step]]
@@ -292,10 +394,16 @@ expected_source_event = { source = "store.elements.zoom_in" }
 expect_root_text = { "viewport_label" = "0 s - 150 s", "keyboard_viewport_label" = "0 s - 150 s", "analog_limit_kind" = "Auto", "analog_range_label" = "Auto 40 C .. 43 C" }
 
 [[step]]
+id = "zoom-reset"
+user_action = { kind = "click", target = "zoom reset", target_text = "R" }
+expected_source_event = { source = "store.elements.zoom_reset", target_text = "R" }
+expect_root_text = { "zoom_level" = "Fit", "pan_window" = "Center", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s", "cursor_position" = "Cursor42", "keyboard_cursor_label" = "50 s" }
+
+[[step]]
 id = "zoom-out"
 user_action = { kind = "click", target = "zoom out" }
 expected_source_event = { source = "store.elements.zoom_out" }
-expect_root_text = { "zoom_level" = "Fit", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s" }
+expect_root_text = { "zoom_level" = "Wide", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s" }
 
 [[step]]
 id = "cursor-right"
@@ -319,25 +427,25 @@ expect_root_text = { "pan_window" = "LeftWindow", "viewport_label" = "0 s - 250 
 id = "pan-right"
 user_action = { kind = "click", target = "pan right" }
 expected_source_event = { source = "store.elements.pan_right" }
-expect_root_text = { "pan_window" = "RightWindow", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s", "bridge_page_window_label" = "window 0 s - 250 s, max 256 transitions, payload <= 64KiB", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor36/Binary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor36/Binary", "bridge_request_window_label" = "0 s - 250 s" }
+expect_root_text = { "pan_window" = "RightWindow", "viewport_label" = "0 s - 250 s", "keyboard_viewport_label" = "0 s - 250 s", "bridge_page_window_label" = "window 0 s - 250 s, max 256 transitions, payload <= 64KiB", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Wide/RightWindow/Cursor36/Binary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/A_SIGNAL/Wide/RightWindow/Cursor36/Binary", "bridge_request_window_label" = "0 s - 250 s" }
 
 [[step]]
 id = "keyboard-pan-right"
 user_action = { kind = "key_down", target = "keyboard capture", key = "D" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "D" }
-expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "keyboard_viewport_label" = "0 s - 250 s", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor42/Binary" }
+expect_root_text = { "keyboard_last_key" = "D", "pan_window" = "RightWindow", "keyboard_viewport_label" = "0 s - 250 s", "bridge_request_page" = "DATA_RIGHT", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Wide/RightWindow/Cursor42/Binary" }
 
 [[step]]
 id = "keyboard-cursor-left"
 user_action = { kind = "key_down", target = "keyboard capture", key = "Q" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "Q" }
-expect_root_text = { "keyboard_last_key" = "Q", "keyboard_cursor_label" = "0 s", "bridge_request_page" = "DATA_36NS", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Fit/RightWindow/Cursor36/Binary" }
+expect_root_text = { "keyboard_last_key" = "Q", "keyboard_cursor_label" = "0 s", "bridge_request_page" = "DATA_36NS", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Wide/RightWindow/Cursor36/Binary" }
 
 [[step]]
 id = "keyboard-zoom-wide"
 user_action = { kind = "key_down", target = "keyboard capture", key = "S" }
 expected_source_event = { source = "store.elements.keyboard_capture", key = "S" }
-expect_root_text = { "keyboard_last_key" = "S", "keyboard_viewport_label" = "0 s - 250 s", "bridge_request_page" = "DATA_WIDE", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Wide/RightWindow/Cursor36/Binary" }
+expect_root_text = { "keyboard_last_key" = "S", "zoom_level" = "Widest", "keyboard_viewport_label" = "0 s - 250 s", "bridge_request_page" = "DATA_WIDE", "bridge_request_fingerprint" = "SIMPLE_TB_S/A_SIGNAL/Widest/RightWindow/Cursor36/Binary" }
 
 [[step]]
 id = "keyboard-zoom-reset"
@@ -404,6 +512,12 @@ expect_root_text = { "group_creation_state" = "Created", "group_name" = "simple_
 expect_semantic_delta_contains = ["ListInsert"]
 
 [[step]]
+id = "rename-group"
+user_action = { kind = "click", target = "group rename", target_text = "Rename" }
+expected_source_event = { source = "store.elements.group_rename", target_text = "Rename" }
+expect_root_text = { "group_creation_state" = "Created", "group_name" = "core buses", "group_count_label" = "1 group", "group_members_label" = "A[3:0], B[3:0]", "selected_group" = "Expanded" }
+
+[[step]]
 id = "collapse-group"
 user_action = { kind = "click", target = "group" }
 expected_source_event = { source = "store.elements.group_toggle" }
@@ -416,6 +530,20 @@ user_action = { kind = "click", target = "group expand", target_text = "Expand g
 expected_source_event = { source = "store.elements.group_expand", target_text = "Expand group" }
 expect_root_text = { "selected_group" = "Expanded", "selected_rows_count" = "2", "selected_signal_count_label" = "2 selected" }
 expect_semantic_delta_contains = ["FieldSet:collapsed"]
+
+[[step]]
+id = "remove-group"
+user_action = { kind = "click", target = "group remove", target_text = "x" }
+expected_source_event = { source = "store.elements.group_remove", target_text = "x" }
+expect_root_text = { "group_creation_state" = "None", "group_name" = "No group", "group_count_label" = "0 groups", "group_members_label" = "none", "group_status_label" = "no group", "selected_group" = "None", "selected_rows_count" = "2", "selected_signal_count_label" = "2 selected" }
+expect_semantic_delta_contains = ["ListRemove"]
+
+[[step]]
+id = "recreate-group"
+user_action = { kind = "click", target = "create group", target_text = "New group" }
+expected_source_event = { source = "store.elements.group_create", target_text = "New group" }
+expect_root_text = { "group_creation_state" = "Created", "group_name" = "simple_tb.s group", "group_count_label" = "1 group", "group_members_label" = "A[3:0], B[3:0]", "group_status_label" = "1 group", "selected_group" = "Expanded" }
+expect_semantic_delta_contains = ["ListInsert"]
 
 [[step]]
 id = "row-tall"
@@ -504,40 +632,28 @@ expected_source_event = { source = "store.elements.format_cycle" }
 expect_root_text = { "value_format" = "Hexadecimal", "format_label" = "Hex", "data_bus_rendered_value" = "0x2a", "bridge_request_page" = "DATA_HEX", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal" }
 
 [[step]]
-id = "format-grouped-binary"
-user_action = { kind = "click", target = "Grp" }
-expected_source_event = { source = "store.elements.format_grouped" }
-expect_root_text = { "value_format" = "GroupedBinary", "format_label" = "Grouped bin", "data_bus_rendered_value" = "0010 1010", "bridge_request_page" = "DATA_GROUP", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/GroupedBinary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/GroupedBinary", "bridge_response_page" = "A_FIT", "bridge_response_status_compact_label" = "STALE", "bridge_response_status" = "REJECTED_STALE_PAGE" }
+id = "open-data-row-format-dropdown"
+user_action = { kind = "click", target = "row format", target_text = "B[3:0]" }
+expected_source_event = { source = "selected_signal.format_elements.format_dropdown_toggle", address = "reset_n", target_text = "B[3:0]" }
+expect_root_text = { "value_format" = "Hexadecimal", "active_signal_format" = "Hexadecimal", "data_bus_rendered_value" = "0x2a" }
 
 [[step]]
-id = "format-octal"
-user_action = { kind = "click", target = "Oct" }
-expected_source_event = { source = "store.elements.format_octal" }
-expect_root_text = { "value_format" = "Octal", "format_label" = "Octal", "data_bus_rendered_value" = "052", "bridge_request_page" = "DATA_OCT", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Octal", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Octal", "bridge_response_page" = "A_FIT", "bridge_response_status_compact_label" = "STALE" }
+id = "format-data-row-grouped-binary"
+user_action = { kind = "click", target = "row format option", target_text = "B[3:0]" }
+expected_source_event = { source = "selected_signal.format_elements.format_grouped", address = "reset_n", target_text = "B[3:0]" }
+expect_root_text = { "value_format" = "Hexadecimal", "active_signal_format" = "GroupedBinary", "format_label" = "Grouped bin", "data_bus_rendered_value" = "0010 1010", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/GroupedBinary", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/GroupedBinary" }
 
 [[step]]
-id = "format-signed"
-user_action = { kind = "click", target = "Sgn" }
-expected_source_event = { source = "store.elements.format_signed" }
-expect_root_text = { "value_format" = "Signed", "format_label" = "Signed", "data_bus_rendered_value" = "42", "bridge_request_page" = "DATA_SGN", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Signed", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Signed", "bridge_response_page" = "A_FIT", "bridge_response_status_compact_label" = "STALE" }
+id = "reopen-data-row-format-dropdown"
+user_action = { kind = "click", target = "row format", target_text = "B[3:0]" }
+expected_source_event = { source = "selected_signal.format_elements.format_dropdown_toggle", address = "reset_n", target_text = "B[3:0]" }
+expect_root_text = { "value_format" = "Hexadecimal", "active_signal_format" = "GroupedBinary", "data_bus_rendered_value" = "0010 1010" }
 
 [[step]]
-id = "format-unsigned"
-user_action = { kind = "click", target = "Uns" }
-expected_source_event = { source = "store.elements.format_unsigned" }
-expect_root_text = { "value_format" = "Unsigned", "format_label" = "Unsigned", "data_bus_rendered_value" = "42", "bridge_request_page" = "DATA_UNS", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Unsigned", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Unsigned", "bridge_response_page" = "A_FIT", "bridge_response_status_compact_label" = "STALE" }
-
-[[step]]
-id = "format-ascii"
-user_action = { kind = "click", target = "Asc" }
-expected_source_event = { source = "store.elements.format_ascii" }
-expect_root_text = { "value_format" = "ASCII", "format_label" = "ASCII", "data_bus_rendered_value" = "*", "bridge_request_page" = "DATA_ASC", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/ASCII", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/ASCII", "bridge_response_page" = "A_FIT", "bridge_response_status_compact_label" = "STALE" }
-
-[[step]]
-id = "format-hex"
-user_action = { kind = "click", target = "Hex" }
-expected_source_event = { source = "store.elements.format_hex" }
-expect_root_text = { "value_format" = "Hexadecimal", "format_label" = "Hex", "data_bus_rendered_value" = "0x2a", "bridge_request_page" = "DATA_HEX", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_response_page" = "A_FIT", "bridge_response_status_compact_label" = "STALE" }
+id = "restore-data-row-hex"
+user_action = { kind = "click", target = "row format option", target_text = "B[3:0]" }
+expected_source_event = { source = "selected_signal.format_elements.format_hex", address = "reset_n", target_text = "B[3:0]" }
+expect_root_text = { "value_format" = "Hexadecimal", "active_signal_format" = "Hexadecimal", "format_label" = "Hex", "data_bus_rendered_value" = "0x2a", "bridge_request_fingerprint" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal", "bridge_request_descriptor_label" = "SIMPLE_TB_S/B_SIGNAL/Fit/Center/Cursor42/Hexadecimal" }
 
 [[step]]
 id = "switch-dark"
@@ -553,6 +669,6 @@ expect_root_text = { "mode" = "Dark", "marker_visibility" = "Visible", "marker_l
 
 [[step]]
 id = "waveform-click-moves-cursor"
-user_action = { kind = "click", target = "waveform", target_text = "150 s" }
-expected_source_event = { source = "store.elements.waveform_click", pointer_x = "216", pointer_y = "0", pointer_width = "360", pointer_height = "1", target_text = "150 s" }
+user_action = { kind = "click", target = "waveform", target_text = "waveform canvas" }
+expected_source_event = { source = "store.elements.waveform_click", pointer_x = "216", pointer_y = "0", pointer_width = "360", pointer_height = "1", target_text = "waveform canvas" }
 expect_root_text = { "mode" = "Dark", "cursor_position" = "Cursor48", "keyboard_cursor_label" = "150 s", "marker_visibility" = "Visible", "marker_label" = "M 50 s", "marker_count_label" = "1 marker", "marker_focus_label" = "jumped to 50 s", "marker_to_add" = "50 s" }

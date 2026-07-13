@@ -306,7 +306,16 @@ impl RuntimeView {
                     } else {
                         false
                     };
-                    Ok(hover_changed || selection_changed)
+                    let source_changed = if let Some(target) = target.as_ref() {
+                        self.dispatch_pointer_intent(
+                            target,
+                            &["pointer_move", "move"],
+                            pointer_source_payload(pointer, target),
+                        )?
+                    } else {
+                        false
+                    };
+                    Ok(hover_changed || selection_changed || source_changed)
                 }
                 PointerPhase::Leave => {
                     self.text_drag = None;
@@ -361,7 +370,10 @@ impl RuntimeView {
                                                 <= DOUBLE_CLICK_INTERVAL
                                     });
                                 if is_double_click {
-                                    return self.dispatch_target(&target, SourcePayload::default());
+                                    return self.dispatch_target(
+                                        &target,
+                                        pointer_source_payload(pointer, &target),
+                                    );
                                 }
                                 self.last_primary_click = Some((target.node, now));
                                 return Ok(false);
@@ -369,7 +381,10 @@ impl RuntimeView {
                             if pointer_activation_intent(target.source_intent.as_deref())
                                 && !self.bare_source_is_text_input(&target)
                             {
-                                return self.dispatch_target(&target, SourcePayload::default());
+                                return self.dispatch_target(
+                                    &target,
+                                    pointer_source_payload(pointer, &target),
+                                );
                             }
                         }
                     }
@@ -467,6 +482,10 @@ impl RuntimeView {
             scroll_root: None,
             center_x: 0.0,
             center_y: 0.0,
+            bounds_x: 0.0,
+            bounds_y: 0.0,
+            bounds_width: 0.0,
+            bounds_height: 0.0,
             text_column: None,
         };
         if payload.text.is_none()
@@ -481,6 +500,33 @@ impl RuntimeView {
                 .or_else(|| node.text.as_ref().map(|text| text.text.clone()));
         }
         self.dispatch_target(&target, payload)
+    }
+
+    fn dispatch_pointer_intent(
+        &mut self,
+        target: &HitTarget,
+        intents: &[&str],
+        payload: SourcePayload,
+    ) -> ViewResult<bool> {
+        let binding = self
+            .runtime
+            .document_frame()
+            .and_then(|frame| frame.nodes.get(&DocumentNodeId(target.node.clone())))
+            .and_then(|node| {
+                intents.iter().find_map(|intent| {
+                    node.source_bindings
+                        .iter()
+                        .find(|binding| binding.intent == *intent)
+                })
+            })
+            .cloned();
+        let Some(binding) = binding else {
+            return Ok(false);
+        };
+        let mut routed = target.clone();
+        routed.source_path = Some(binding.source_path);
+        routed.source_intent = Some(binding.intent);
+        self.dispatch_target(&routed, payload)
     }
 
     fn bare_source_is_text_input(&self, target: &HitTarget) -> bool {
@@ -537,7 +583,11 @@ impl RuntimeView {
                 }
             }
         }
-        let row = self.row_target(path, target.row_key, target.row_generation)?;
+        let row = if self.runtime.source_is_row_scoped(path) == Some(true) {
+            self.row_target(path, target.row_key, target.row_generation)?
+        } else {
+            None
+        };
         self.dispatch_source(path, row, payload)
     }
 
@@ -1001,6 +1051,25 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
             }
             format!("[{}]", parts.join(", "))
         }
+        Value::MappedRow { id, fields } => {
+            let mut parts = fields
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|(name, value)| {
+                    format!("{name}: {}", format_inspection_value(value, depth + 1))
+                })
+                .collect::<Vec<_>>();
+            if fields.len() > MAX_ITEMS {
+                parts.push(format!("... {} more", fields.len() - MAX_ITEMS));
+            }
+            format!(
+                "MappedRow(list={}, key={}, generation={}, [{}])",
+                id.list.0,
+                id.key,
+                id.generation,
+                parts.join(", ")
+            )
+        }
         Value::Row { id, fields } => format!(
             "Row(list={}, key={}, generation={}, fields={})",
             id.list.0,
@@ -1019,6 +1088,35 @@ fn pointer_activation_intent(intent: Option<&str>) -> bool {
             "press" | "click" | "source" | "activate" | "toggle" | "submit" | "open" | "select"
         )
     })
+}
+
+fn pointer_source_payload(pointer: &boon_host::PointerEvent, target: &HitTarget) -> SourcePayload {
+    let mut payload = SourcePayload::default();
+    if target.bounds_width.is_finite()
+        && target.bounds_height.is_finite()
+        && target.bounds_width > 0.0
+        && target.bounds_height > 0.0
+    {
+        let local_x = (pointer.x - target.bounds_x).clamp(0.0, target.bounds_width);
+        let local_y = (pointer.y - target.bounds_y).clamp(0.0, target.bounds_height);
+        payload.fields.insert(
+            "pointer_x".to_owned(),
+            Value::Number(local_x.round() as i64),
+        );
+        payload.fields.insert(
+            "pointer_y".to_owned(),
+            Value::Number(local_y.round() as i64),
+        );
+        payload.fields.insert(
+            "pointer_width".to_owned(),
+            Value::Number(target.bounds_width.round() as i64),
+        );
+        payload.fields.insert(
+            "pointer_height".to_owned(),
+            Value::Number(target.bounds_height.round() as i64),
+        );
+    }
+    payload
 }
 
 fn style_payload_value(value: &StyleValue) -> Option<Value> {
@@ -1475,6 +1573,7 @@ mod tests {
                     step.address
                 )
             });
+        let target_point = crate::preview::test_step_pointer_position(view, &target, step);
         let mut dirty = false;
         let pointer_cycles = usize::from(
             step.action_kind.as_deref() == Some("double_click")
@@ -1486,14 +1585,19 @@ mod tests {
                     .handle_event(
                         &HostEvent::Pointer(PointerEvent {
                             surface: surface.clone(),
-                            x: target.center_x,
-                            y: target.center_y,
+                            x: target_point.0,
+                            y: target_point.1,
                             phase,
                             button: (phase != PointerPhase::Move).then_some(PointerButton::Primary),
                         }),
                         Some(target.clone()),
                     )
-                    .unwrap();
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "scenario action failed to dispatch {} ({phase:?}) to row {target_row:?}: {error}",
+                            step.source_path
+                        )
+                    });
             }
         }
         if let Some(text) = &step.text {
@@ -1601,7 +1705,7 @@ mod tests {
     #[test]
     fn core_examples_test_slice_dispatches_declared_public_host_events() {
         let catalog = crate::catalog::Catalog::load().unwrap();
-        for example_id in ["counter", "todomvc", "cells"] {
+        for example_id in ["counter", "todomvc", "cells", "novywave"] {
             let example = catalog.open(example_id).unwrap();
             let units = example
                 .units
@@ -1717,6 +1821,183 @@ mod tests {
                 "{example_id} missed source events"
             );
         }
+    }
+
+    #[test]
+    fn novywave_test_slice_builds_complete_loaded_render_scene() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("novywave")
+            .unwrap();
+        let units = example
+            .units
+            .iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path.clone(),
+                source: unit.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/novywave/RUN.bn", &units).unwrap();
+        let mount = runtime.mount();
+        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 508.0,
+                height: 540.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        converge_test_demands(&mut model, &mut view, &mut columns);
+
+        for step in example
+            .test_steps
+            .iter()
+            .take(crate::preview::TEST_STEP_LIMIT)
+        {
+            drive_scenario_step(&mut model, &mut view, &mut columns, step);
+        }
+
+        let selected_lane_count = model
+            .runtime
+            .inspect_value_current("selected_lane_materialized_row_count", 1)
+            .unwrap();
+        assert_eq!(
+            selected_lane_count,
+            boon_runtime::Value::Number(3),
+            "NovyWave selected lane model is not current"
+        );
+
+        for expected in [
+            "Variables",
+            "Selected Variables",
+            "Value",
+            "ghw.counter[3:0]",
+            "ghw.enable",
+            "ghw.state",
+            "3",
+            "1",
+            "Count",
+        ] {
+            let node = view
+                .frame()
+                .nodes
+                .values()
+                .find(|node| node.text.as_ref().is_some_and(|text| text.text == expected))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "NovyWave loaded frame is missing `{expected}`; selected lane count={selected_lane_count:?}"
+                    )
+                });
+            let bounds = view
+                .node_bounds(&node.id.0)
+                .unwrap_or_else(|| panic!("NovyWave `{expected}` has no retained layout bounds"));
+            let vertical_limit = 540.0;
+            assert!(
+                bounds.width > 1.0
+                    && bounds.height > 1.0
+                    && bounds.x < 508.0
+                    && bounds.y < vertical_limit
+                    && bounds.x + bounds.width > 0.0
+                    && bounds.y + bounds.height > 0.0,
+                "NovyWave `{expected}` is outside the retained viewport: {bounds:?}"
+            );
+        }
+
+        let fills = view
+            .scene()
+            .visual_primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(
+                    primitive.primitive,
+                    boon_document::RenderVisualPrimitiveKind::Fill
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            fills.iter().any(|primitive| {
+                primitive.bounds.x >= 220.0
+                    && primitive.bounds.y <= 60.0
+                    && primitive.bounds.width >= 220.0
+                    && primitive.bounds.height >= 300.0
+                    && primitive.color[0] < 80
+                    && primitive.color[1] < 80
+                    && primitive.color[2] < 100
+            }),
+            "NovyWave Variables panel has no retained dark surface; large fills={:?}",
+            fills
+                .iter()
+                .filter(|primitive| {
+                    primitive.bounds.width >= 300.0 && primitive.bounds.height >= 100.0
+                })
+                .map(|primitive| (primitive.node.0.as_str(), primitive.bounds, primitive.color))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            fills
+                .iter()
+                .filter(|primitive| primitive.color[2] > 150)
+                .count()
+                >= 4,
+            "NovyWave loaded waveform has no visible trace segments"
+        );
+    }
+
+    #[test]
+    fn novywave_all_scenario_steps_reach_retained_host_targets() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("novywave")
+            .unwrap();
+        let units = example
+            .units
+            .iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path.clone(),
+                source: unit.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/novywave/RUN.bn", &units).unwrap();
+        let mount = runtime.mount();
+        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1_100.0,
+                height: 760.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        converge_test_demands(&mut model, &mut view, &mut columns);
+
+        for step in &example.test_steps {
+            drive_scenario_step(&mut model, &mut view, &mut columns, step);
+        }
+
+        assert_eq!(model.event_sequence(), example.test_steps.len() as u64);
+        assert_eq!(
+            model
+                .runtime
+                .inspect_value_current("cursor_position", 1)
+                .unwrap(),
+            Value::Text("Cursor48".to_owned())
+        );
+        assert_eq!(
+            model
+                .runtime
+                .inspect_value_current("keyboard_cursor_label", 1)
+                .unwrap(),
+            Value::Text("150 s".to_owned())
+        );
     }
 
     #[test]
@@ -2174,6 +2455,10 @@ mod tests {
             scroll_root: None,
             center_x: link_bounds.x + link_bounds.width / 2.0,
             center_y: link_bounds.y + link_bounds.height / 2.0,
+            bounds_x: link_bounds.x,
+            bounds_y: link_bounds.y,
+            bounds_width: link_bounds.width,
+            bounds_height: link_bounds.height,
             text_column: None,
         };
         for phase in [PointerPhase::Down, PointerPhase::Up] {

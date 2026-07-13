@@ -6,7 +6,7 @@ use boon_plan::{
     RootOutputDemand, ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute,
     StateId, ValueRef,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -19,6 +19,10 @@ pub enum Value {
     Bytes(Vec<u8>),
     List(Vec<Value>),
     Record(BTreeMap<String, Value>),
+    MappedRow {
+        id: RowId,
+        fields: BTreeMap<String, Value>,
+    },
     Row {
         id: RowId,
         fields: BTreeMap<FieldId, Value>,
@@ -237,7 +241,11 @@ impl ScalarKey {
             Value::Number(value) => Some(Self::Number(*value)),
             Value::Text(value) => Some(Self::Text(value.clone())),
             Value::Bytes(value) => Some(Self::Bytes(value.clone())),
-            Value::List(_) | Value::Record(_) | Value::Row { .. } | Value::Error { .. } => None,
+            Value::List(_)
+            | Value::Record(_)
+            | Value::MappedRow { .. }
+            | Value::Row { .. }
+            | Value::Error { .. } => None,
         }
     }
 }
@@ -249,7 +257,7 @@ struct IndexKey {
     value: ScalarKey,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Consumer {
     Root(FieldId),
     Row(RowId, FieldId),
@@ -340,8 +348,8 @@ struct Dependencies {
 #[derive(Clone, Debug)]
 struct Metadata {
     constants: BTreeMap<PlanConstantId, Value>,
-    root_computations: BTreeMap<FieldId, PlanOp>,
-    row_computations: BTreeMap<FieldId, PlanOp>,
+    root_computations: BTreeMap<FieldId, Arc<PlanOp>>,
+    row_computations: BTreeMap<FieldId, Arc<PlanOp>>,
     row_field_owner: BTreeMap<FieldId, ListId>,
     indexed_state_field: BTreeMap<StateId, FieldId>,
     indexed_state_owner: BTreeMap<StateId, ListId>,
@@ -351,8 +359,8 @@ struct Metadata {
     root_field_by_name: BTreeMap<String, Vec<FieldId>>,
     root_state_by_name: BTreeMap<String, Vec<StateId>>,
     routes: BTreeMap<SourceId, SourceRoute>,
-    updates_by_source: BTreeMap<SourceId, Vec<PlanOp>>,
-    mutations: Vec<PlanOp>,
+    updates_by_source: BTreeMap<SourceId, Vec<Arc<PlanOp>>>,
+    mutations: Vec<Arc<PlanOp>>,
     source_derived_by_source: BTreeMap<SourceId, BTreeSet<FieldId>>,
     published: BTreeSet<FieldId>,
     dependencies: Dependencies,
@@ -473,7 +481,7 @@ impl Metadata {
         let mut root_computations = BTreeMap::new();
         let mut row_computations = BTreeMap::new();
         let mut source_derived_by_source = BTreeMap::<SourceId, BTreeSet<FieldId>>::new();
-        let mut updates_by_source = BTreeMap::<SourceId, Vec<PlanOp>>::new();
+        let mut updates_by_source = BTreeMap::<SourceId, Vec<Arc<PlanOp>>>::new();
         let mut mutations = Vec::new();
         for op in plan.regions.iter().flat_map(|region| &region.ops) {
             match &op.kind {
@@ -485,9 +493,9 @@ impl Metadata {
                         )));
                     };
                     if op.indexed {
-                        row_computations.insert(field, op.clone());
+                        row_computations.insert(field, Arc::new(op.clone()));
                     } else {
-                        root_computations.insert(field, op.clone());
+                        root_computations.insert(field, Arc::new(op.clone()));
                         if *derived_kind == PlanDerivedKind::SourceEventTransform {
                             for source in op.inputs.iter().filter_map(|input| match input {
                                 ValueRef::Source(source) => Some(*source),
@@ -508,9 +516,10 @@ impl Metadata {
                             op.id.0
                         )));
                     };
-                    root_computations.insert(field, op.clone());
+                    root_computations.insert(field, Arc::new(op.clone()));
                 }
                 PlanOpKind::UpdateBranch { .. } => {
+                    let op = Arc::new(op.clone());
                     for source in op.inputs.iter().filter_map(|input| match input {
                         ValueRef::Source(source) => Some(*source),
                         _ => None,
@@ -518,7 +527,7 @@ impl Metadata {
                         updates_by_source
                             .entry(source)
                             .or_default()
-                            .push(op.clone());
+                            .push(Arc::clone(&op));
                     }
                 }
                 PlanOpKind::ListOperation {
@@ -528,7 +537,7 @@ impl Metadata {
                     ..
                 } => match operation_kind {
                     PlanListOperationKind::Append | PlanListOperationKind::Remove => {
-                        mutations.push(op.clone());
+                        mutations.push(Arc::new(op.clone()));
                     }
                     PlanListOperationKind::Retain => {
                         let Some(ValueRef::Field(field)) =
@@ -539,7 +548,7 @@ impl Metadata {
                                 op.id.0
                             )));
                         };
-                        root_computations.insert(*field, op.clone());
+                        root_computations.insert(*field, Arc::new(op.clone()));
                     }
                     PlanListOperationKind::Count => {
                         let Some(ValueRef::Field(field)) =
@@ -550,7 +559,7 @@ impl Metadata {
                                 op.id.0
                             )));
                         };
-                        root_computations.insert(*field, op.clone());
+                        root_computations.insert(*field, Arc::new(op.clone()));
                     }
                 },
                 PlanOpKind::SourceRoute
@@ -777,7 +786,8 @@ impl Metadata {
             .list_labels
             .get(&list)
             .ok_or_else(|| Error::InvalidPlan(format!("list {} has no debug label", list.0)))?;
-        self.list_field(list, &format!("{list_label}.{name}"))
+        self.list_field(list, &format!("{list_label}.$input${name}"))
+            .or_else(|_| self.list_field(list, &format!("{list_label}.{name}")))
     }
 
     fn any_list_field(&self, name: &str) -> Result<(ListId, FieldId), Error> {
@@ -867,31 +877,39 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Work {
     emit: bool,
     deltas: Vec<Delta>,
     metrics: TurnMetrics,
-    dirty_states: BTreeSet<StateId>,
-    dirty_consumers: BTreeSet<Consumer>,
-    changed_rows: BTreeSet<RowId>,
-    suppress_row_deltas: BTreeSet<RowId>,
-    recomputed_targets: BTreeSet<ValueTarget>,
+    dirty_states: HashSet<StateId>,
+    dirty_consumers: HashSet<Consumer>,
+    changed_rows: HashSet<RowId>,
+    suppress_row_deltas: HashSet<RowId>,
+    recomputed_targets: HashSet<ValueTarget>,
 }
 
 impl Work {
-    fn turn() -> Self {
-        Self {
-            emit: true,
-            ..Self::default()
-        }
+    fn begin_turn(&mut self) {
+        self.emit = true;
+        self.deltas.clear();
+        self.metrics = TurnMetrics::default();
+        self.dirty_states.clear();
+        self.dirty_consumers.clear();
+        self.changed_rows.clear();
+        self.suppress_row_deltas.clear();
+        self.recomputed_targets.clear();
     }
 
     fn finish_metrics(&mut self) {
         self.metrics.dirty_state_count = self.dirty_states.len();
         self.metrics.dirty_field_count = self.dirty_consumers.len();
         self.metrics.changed_row_count = self.changed_rows.len();
-        self.metrics.recomputed_targets = self.recomputed_targets.iter().copied().collect();
+        self.metrics.recomputed_targets.clear();
+        self.metrics
+            .recomputed_targets
+            .extend(self.recomputed_targets.iter().copied());
+        self.metrics.recomputed_targets.sort_unstable();
     }
 }
 
@@ -901,6 +919,10 @@ enum EvalValue {
     Row(RowId),
     List(Vec<EvalValue>),
     Record(BTreeMap<String, EvalValue>),
+    MappedRow {
+        id: RowId,
+        fields: BTreeMap<String, EvalValue>,
+    },
 }
 
 #[derive(Clone)]
@@ -915,10 +937,15 @@ pub struct Session {
     dynamic_dependencies: DynamicDependencies,
     last_sequence: Option<u64>,
     next_binding_id: u64,
+    turn_work: Work,
 }
 
 impl Session {
     pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
+        Self::new_shared(Arc::new(plan), options)
+    }
+
+    pub fn new_shared(plan: Arc<MachinePlan>, options: SessionOptions) -> Result<Self, Error> {
         if plan.version.major != boon_plan::PLAN_MAJOR_VERSION {
             return Err(Error::InvalidPlan(format!(
                 "plan major version {} is not supported",
@@ -927,7 +954,7 @@ impl Session {
         }
         let metadata = Arc::new(Metadata::new(&plan)?);
         let mut session = Self {
-            plan: Arc::new(plan),
+            plan,
             options,
             metadata,
             root_states: BTreeMap::new(),
@@ -937,6 +964,7 @@ impl Session {
             dynamic_dependencies: DynamicDependencies::default(),
             last_sequence: None,
             next_binding_id: 1,
+            turn_work: Work::default(),
         };
         let mut work = Work::default();
         session.initialize(&mut work)?;
@@ -945,6 +973,10 @@ impl Session {
 
     pub fn plan(&self) -> &MachinePlan {
         &self.plan
+    }
+
+    pub fn shared_plan(&self) -> Arc<MachinePlan> {
+        Arc::clone(&self.plan)
     }
 
     pub fn list_rows(&self, list: ListId) -> Vec<RowId> {
@@ -1468,63 +1500,64 @@ impl Session {
 
     pub fn apply_with_demand(
         &mut self,
-        mut event: SourceEvent,
+        event: SourceEvent,
         demanded_targets: &[ValueTarget],
     ) -> Result<Turn, Error> {
+        let mut work = std::mem::take(&mut self.turn_work);
+        work.begin_turn();
+        let result = self.apply_with_work(event, demanded_targets, &mut work);
+        self.turn_work = work;
+        result
+    }
+
+    fn apply_with_work(
+        &mut self,
+        mut event: SourceEvent,
+        demanded_targets: &[ValueTarget],
+        work: &mut Work,
+    ) -> Result<Turn, Error> {
         self.validate_event(&event)?;
-        let mut work = Work::turn();
-        self.complete_target_payload(&mut event, &mut work)?;
-        let targets = self.event_targets(&event, &mut work)?;
+        self.complete_target_payload(&mut event, work)?;
+        let targets = self.event_targets(&event, work)?;
+        let metadata = Arc::clone(&self.metadata);
 
-        let source_fields = self
-            .metadata
-            .source_derived_by_source
-            .get(&event.source)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        for field in &source_fields {
-            self.mark_root_dirty(*field, &mut work);
-        }
-        for field in source_fields {
-            self.ensure_root_field(field, Some(&event), &mut work)?;
+        if let Some(source_fields) = metadata.source_derived_by_source.get(&event.source) {
+            for field in source_fields {
+                self.mark_root_dirty(*field, work);
+            }
+            for field in source_fields {
+                self.ensure_root_field(*field, Some(&event), work)?;
+            }
         }
 
-        let updates = self
-            .metadata
-            .updates_by_source
-            .get(&event.source)
-            .cloned()
-            .unwrap_or_default();
-        let scoped_update_row = self
-            .metadata
+        let scoped_update_row = metadata
             .routes
             .get(&event.source)
             .and_then(|route| route.scope_id)
             .and_then(|_| event.target.or_else(|| targets.first().copied()));
-        for op in updates {
-            if op.indexed {
-                let rows = self.indexed_update_targets(&op, &event, &targets)?;
-                self.execute_indexed_update_batch(&op, &rows, &event, &mut work)?;
-            } else {
-                self.execute_update(&op, scoped_update_row, &event, &mut work)?;
+        if let Some(updates) = metadata.updates_by_source.get(&event.source) {
+            for op in updates {
+                if op.indexed {
+                    let rows = self.indexed_update_targets(op, &event, &targets)?;
+                    self.execute_indexed_update_batch(op, &rows, &event, work)?;
+                } else {
+                    self.execute_update(op, scoped_update_row, &event, work)?;
+                }
             }
         }
 
-        let mutations = self.metadata.mutations.clone();
-        for op in mutations {
-            self.execute_mutation(&op, &event, &targets, &mut work)?;
+        for op in &metadata.mutations {
+            self.execute_mutation(op, &event, &targets, work)?;
         }
 
-        self.ensure_demanded_current(demanded_targets, Some(&event), &mut work)?;
+        self.ensure_demanded_current(demanded_targets, Some(&event), work)?;
 
         self.last_sequence = Some(event.sequence);
         work.finish_metrics();
         Ok(Turn {
             sequence: event.sequence,
-            deltas: coalesce_deltas(work.deltas),
-            metrics: work.metrics,
+            deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
+            metrics: std::mem::take(&mut work.metrics),
         })
     }
 
@@ -2366,6 +2399,12 @@ impl Session {
         if became_dirty.is_none() || (!became_dirty.unwrap_or_default() && !first_in_turn) {
             return;
         }
+        let dynamic_dependents = self
+            .dynamic_dependencies
+            .by_row_field
+            .get(&(row, field))
+            .cloned()
+            .unwrap_or_default();
         self.dynamic_dependencies.clear(consumer);
         let dependents = self
             .metadata
@@ -2377,6 +2416,11 @@ impl Session {
         for dependent in dependents {
             if dependent != field {
                 self.mark_row_dirty(row, dependent, work);
+            }
+        }
+        for dependent in dynamic_dependents {
+            if dependent != consumer {
+                self.mark_consumer_dirty(dependent, work);
             }
         }
     }
@@ -2540,6 +2584,11 @@ impl Session {
                 .map(|(name, value)| Ok((name, self.materialize_eval(value, event, work)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()
                 .map(Value::Record),
+            EvalValue::MappedRow { id, fields } => fields
+                .into_iter()
+                .map(|(name, value)| Ok((name, self.materialize_eval(value, event, work)?)))
+                .collect::<Result<BTreeMap<_, _>, Error>>()
+                .map(|fields| Value::MappedRow { id, fields }),
         }
     }
 }
@@ -2728,7 +2777,7 @@ impl Session {
                             .metadata
                             .row_computations
                             .get(field)
-                            .is_some_and(source_event_transform_op)
+                            .is_some_and(|op| source_event_transform_op(op))
                     {
                         return self.row_value(row, *field).map(EvalValue::Value);
                     }
@@ -2753,7 +2802,7 @@ impl Session {
                         .metadata
                         .root_computations
                         .get(field)
-                        .is_some_and(source_event_transform_op)
+                        .is_some_and(|op| source_event_transform_op(op))
                     && let Some(value) = self
                         .root_fields
                         .get(field)
@@ -3235,10 +3284,16 @@ impl Session {
                 let previous = bindings.get(binding).cloned();
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
+                    let origin = eval_row_id(&item);
                     bindings.insert(binding.clone(), item);
-                    values.push(self.eval_row_expression(
-                        value, row, event, output, consumer, bindings, work,
-                    )?);
+                    let value = self
+                        .eval_row_expression(value, row, event, output, consumer, bindings, work)?;
+                    values.push(match (origin, value) {
+                        (Some(id), EvalValue::Record(fields)) => {
+                            EvalValue::MappedRow { id, fields }
+                        }
+                        (_, value) => value,
+                    });
                 }
                 match previous {
                     Some(previous) => {
@@ -3389,7 +3444,14 @@ impl Session {
             EvalValue::Record(mut record) => record
                 .remove(field)
                 .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
+            EvalValue::MappedRow { mut fields, .. } => fields
+                .remove(field)
+                .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
             EvalValue::Value(Value::Record(mut record)) => record
+                .remove(field)
+                .map(EvalValue::Value)
+                .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
+            EvalValue::Value(Value::MappedRow { mut fields, .. }) => fields
                 .remove(field)
                 .map(EvalValue::Value)
                 .ok_or_else(|| Error::Evaluation(format!("record has no field `{field}`"))),
@@ -3703,6 +3765,51 @@ impl Session {
                 Ok(EvalValue::Value(Value::Number(
                     eval_to_list(value)?.len() as i64
                 )))
+            }
+            "List/any" => {
+                let input = input.ok_or_else(|| {
+                    Error::Evaluation("List/any requires an input list".to_owned())
+                })?;
+                let input =
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
+                let binding = self
+                    .eval_named_arg(
+                        args, "binding", row, event, output, consumer, bindings, work,
+                    )?
+                    .map(|value| eval_to_text(&value))
+                    .transpose()?
+                    .ok_or_else(|| Error::Evaluation("List/any requires `binding`".to_owned()))?;
+                let predicate = args
+                    .iter()
+                    .find(|arg| arg.name.as_deref() == Some("if"))
+                    .ok_or_else(|| Error::Evaluation("List/any requires `if`".to_owned()))?;
+                let previous = bindings.get(&binding).cloned();
+                let mut matched = false;
+                for item in eval_to_list(input)? {
+                    bindings.insert(binding.clone(), item);
+                    let include = self.eval_row_expression(
+                        &predicate.value,
+                        row,
+                        event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )?;
+                    if eval_to_bool(&include)? {
+                        matched = true;
+                        break;
+                    }
+                }
+                match previous {
+                    Some(previous) => {
+                        bindings.insert(binding, previous);
+                    }
+                    None => {
+                        bindings.remove(&binding);
+                    }
+                }
+                Ok(EvalValue::Value(Value::Bool(matched)))
             }
             "List/retain" => {
                 let input = input.ok_or_else(|| {
@@ -5163,6 +5270,16 @@ fn row_identity_value(row: RowId) -> Value {
     }
 }
 
+fn eval_row_id(value: &EvalValue) -> Option<RowId> {
+    match value {
+        EvalValue::Row(id) | EvalValue::MappedRow { id, .. } => Some(*id),
+        EvalValue::Value(Value::Row { id, .. }) | EvalValue::Value(Value::MappedRow { id, .. }) => {
+            Some(*id)
+        }
+        EvalValue::Value(_) | EvalValue::List(_) | EvalValue::Record(_) => None,
+    }
+}
+
 fn eval_to_list(value: EvalValue) -> Result<Vec<EvalValue>, Error> {
     match value {
         EvalValue::List(values) => Ok(values),
@@ -5191,9 +5308,9 @@ fn value_to_text(value: &Value) -> Result<String, Error> {
         Value::Bytes(bytes) => String::from_utf8(bytes.clone())
             .map_err(|error| Error::Evaluation(format!("invalid UTF-8: {error}"))),
         Value::Error { code } => Ok(code.clone()),
-        Value::List(_) | Value::Record(_) | Value::Row { .. } => Err(Error::Evaluation(
-            "list or record cannot be converted to text".to_owned(),
-        )),
+        Value::List(_) | Value::Record(_) | Value::MappedRow { .. } | Value::Row { .. } => Err(
+            Error::Evaluation("list or record cannot be converted to text".to_owned()),
+        ),
     }
 }
 

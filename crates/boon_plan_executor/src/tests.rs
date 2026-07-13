@@ -354,6 +354,326 @@ fn text_filter_uses_empty_scope_only_for_empty_queries() {
 }
 
 #[test]
+fn list_any_evaluates_bound_row_predicates() {
+    let row = |selected: bool| PlanInitialListRow {
+        fields: vec![PlanInitialListField {
+            name: "selected".into(),
+            field_id: Some(FieldId(10)),
+            value: PlanConstantValue::Bool { value: selected },
+        }],
+    };
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: None,
+        row_field_ids: vec![FieldId(10)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![row(false), row(true)],
+    };
+    let expression = PlanRowExpression::BuiltinCall {
+        function: "List/any".into(),
+        input: Some(Box::new(PlanRowExpression::ListRef { list_id: ListId(0) })),
+        args: vec![
+            PlanRowCallArg {
+                name: Some("binding".into()),
+                value: PlanRowExpression::Constant {
+                    constant_id: PlanConstantId(0),
+                },
+            },
+            PlanRowCallArg {
+                name: Some("if".into()),
+                value: PlanRowExpression::ObjectField {
+                    object: Box::new(PlanRowExpression::ListMapItem {
+                        binding: "item".into(),
+                    }),
+                    field: "selected".into(),
+                },
+            },
+        ],
+    };
+    let session = Session::new(
+        plan(
+            RootOutputDemand::All,
+            vec![constant(
+                0,
+                PlanConstantValue::Text {
+                    value: "item".into(),
+                },
+            )],
+            Vec::new(),
+            Vec::new(),
+            vec![list],
+            vec![derived(
+                0,
+                20,
+                vec![ValueRef::List(ListId(0))],
+                Some(expression),
+            )],
+            Vec::new(),
+            vec![(ListId(0), "rows")],
+            vec![(FieldId(10), "rows.selected"), (FieldId(20), "any")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.snapshot().unwrap().fields[&FieldId(20)],
+        Value::Bool(true)
+    );
+}
+
+#[test]
+fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
+    let source_rows = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_field_ids: vec![FieldId(10), FieldId(11), FieldId(12)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![PlanInitialListRow {
+            fields: vec![
+                PlanInitialListField {
+                    name: "key".into(),
+                    field_id: Some(FieldId(10)),
+                    value: PlanConstantValue::Text {
+                        value: "candidate".into(),
+                    },
+                },
+                PlanInitialListField {
+                    name: "initial".into(),
+                    field_id: Some(FieldId(12)),
+                    value: PlanConstantValue::Bool { value: false },
+                },
+            ],
+        }],
+    };
+    let projected_rows = ListStorageSlot {
+        id: PlanStorageId(1),
+        list_id: ListId(1),
+        scope_id: None,
+        row_field_ids: vec![FieldId(20), FieldId(21)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![PlanInitialListRow {
+            fields: vec![PlanInitialListField {
+                name: "id".into(),
+                field_id: Some(FieldId(20)),
+                value: PlanConstantValue::Text {
+                    value: "projected".into(),
+                },
+            }],
+        }],
+    };
+    let selected_state = ScalarStorageSlot {
+        id: PlanStorageId(2),
+        state_id: StateId(0),
+        value_type: PlanValueType::Bool,
+        scope_id: Some(ScopeId(0)),
+        indexed: true,
+        initial_value_kind: InitialValueKind::RowInitialField,
+        initial_constant_id: None,
+        initial_root_field_path: None,
+        initial_row_field_path: Some("source.initial".into()),
+        initial_row_expression: None,
+    };
+    let select_route = SourceRoute {
+        id: PlanSourceRouteId(0),
+        source_id: SourceId(0),
+        path: "source.select".into(),
+        scoped: true,
+        scope_id: Some(ScopeId(0)),
+        interval_ms: None,
+        payload_schema: SourcePayloadSchema {
+            fields: Vec::new(),
+            typed_fields: Vec::new(),
+            row_lookup_field: Some("key".into()),
+        },
+    };
+    let select_update = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::Const,
+            ordered_inputs: Vec::new(),
+            source_payload_field: None,
+            update_constant_id: Some(PlanConstantId(0)),
+            source_guard: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let projected_selected = PlanOp {
+        id: PlanOpId(1),
+        kind: PlanOpKind::DerivedValue {
+            derived_kind: PlanDerivedKind::Pure,
+            startup_recompute: true,
+            expression: Some(PlanDerivedExpression::RowExpression {
+                expression: PlanRowExpression::BuiltinCall {
+                    function: "List/any".into(),
+                    input: Some(Box::new(PlanRowExpression::ListRef { list_id: ListId(0) })),
+                    args: vec![
+                        PlanRowCallArg {
+                            name: Some("binding".into()),
+                            value: PlanRowExpression::Constant {
+                                constant_id: PlanConstantId(1),
+                            },
+                        },
+                        PlanRowCallArg {
+                            name: Some("if".into()),
+                            value: PlanRowExpression::ObjectField {
+                                object: Box::new(PlanRowExpression::ListMapItem {
+                                    binding: "source".into(),
+                                }),
+                                field: "selected".into(),
+                            },
+                        },
+                    ],
+                },
+            }),
+        },
+        inputs: vec![ValueRef::List(ListId(0))],
+        output: Some(ValueRef::Field(FieldId(21))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let visible_rows = derived(
+        2,
+        30,
+        vec![ValueRef::List(ListId(1))],
+        Some(PlanRowExpression::BuiltinCall {
+            function: "List/filter_field_equal".into(),
+            input: Some(Box::new(PlanRowExpression::ListRef { list_id: ListId(1) })),
+            args: vec![
+                PlanRowCallArg {
+                    name: Some("field".into()),
+                    value: PlanRowExpression::Constant {
+                        constant_id: PlanConstantId(2),
+                    },
+                },
+                PlanRowCallArg {
+                    name: Some("value".into()),
+                    value: PlanRowExpression::Constant {
+                        constant_id: PlanConstantId(0),
+                    },
+                },
+            ],
+        }),
+    );
+    let mut session = Session::new(
+        plan(
+            RootOutputDemand::All,
+            vec![
+                constant(0, PlanConstantValue::Bool { value: true }),
+                constant(
+                    1,
+                    PlanConstantValue::Text {
+                        value: "source".into(),
+                    },
+                ),
+                constant(
+                    2,
+                    PlanConstantValue::Text {
+                        value: "selected".into(),
+                    },
+                ),
+            ],
+            vec![select_route],
+            vec![selected_state],
+            vec![source_rows, projected_rows],
+            vec![select_update, projected_selected, visible_rows],
+            vec![(StateId(0), "source.selected")],
+            vec![(ListId(0), "source"), (ListId(1), "projected")],
+            vec![
+                (FieldId(10), "source.key"),
+                (FieldId(11), "source.selected"),
+                (FieldId(12), "source.initial"),
+                (FieldId(20), "projected.id"),
+                (FieldId(21), "projected.selected"),
+                (FieldId(30), "visible"),
+            ],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        session.snapshot().unwrap().fields[&FieldId(30)],
+        Value::List(ref rows) if rows.is_empty()
+    ));
+
+    session
+        .apply(event(
+            1,
+            0,
+            Some(RowId {
+                list: ListId(0),
+                key: 1,
+                generation: 1,
+            }),
+        ))
+        .unwrap();
+
+    assert!(matches!(
+        session.snapshot().unwrap().fields[&FieldId(30)],
+        Value::List(ref rows) if rows.len() == 1
+    ));
+}
+
+#[test]
+fn mapped_range_initializes_synthetic_input_columns() {
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: None,
+        row_field_ids: vec![FieldId(10), FieldId(11)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Range,
+        range: Some(PlanRangeInitializer { from: 3, to: 4 }),
+        initial_rows: Vec::new(),
+    };
+    let session = Session::new(
+        plan(
+            RootOutputDemand::Selected(Vec::new()),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![list],
+            Vec::new(),
+            Vec::new(),
+            vec![(ListId(0), "items")],
+            vec![
+                (FieldId(10), "items.$input$index"),
+                (FieldId(11), "items.$input$value"),
+            ],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    let rows = &session.snapshot().unwrap().lists[&ListId(0)];
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].fields[&FieldId(10)], Value::Text("3".into()));
+    assert_eq!(rows[0].fields[&FieldId(11)], Value::Text("3".into()));
+    assert_eq!(rows[1].fields[&FieldId(10)], Value::Text("4".into()));
+    assert_eq!(rows[1].fields[&FieldId(11)], Value::Text("4".into()));
+}
+
+#[test]
 fn unscoped_source_updates_every_row_owned_by_indexed_state() {
     let row = |id: &str| PlanInitialListRow {
         fields: vec![
@@ -606,6 +926,76 @@ fn list_find_uses_typed_index_without_scanning() {
         }],
         Value::Text("B".into())
     );
+}
+
+#[test]
+fn list_map_records_preserve_source_row_identity() {
+    let list = ListStorageSlot {
+        id: PlanStorageId(1),
+        list_id: ListId(0),
+        scope_id: None,
+        row_field_ids: vec![FieldId(10)],
+        capacity: None,
+        hidden_key_type: "Key".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![PlanInitialListRow {
+            fields: vec![PlanInitialListField {
+                name: "label".into(),
+                field_id: Some(FieldId(10)),
+                value: PlanConstantValue::Text {
+                    value: "first".into(),
+                },
+            }],
+        }],
+    };
+    let map = derived(
+        0,
+        0,
+        vec![ValueRef::List(ListId(0))],
+        Some(PlanRowExpression::ListMap {
+            input: Box::new(PlanRowExpression::ListRef { list_id: ListId(0) }),
+            binding: "item".into(),
+            value: Box::new(PlanRowExpression::Object {
+                fields: vec![PlanRowObjectField {
+                    name: "title".into(),
+                    value: PlanRowExpression::ObjectField {
+                        object: Box::new(PlanRowExpression::ListMapItem {
+                            binding: "item".into(),
+                        }),
+                        field: "label".into(),
+                    },
+                }],
+            }),
+        }),
+    );
+    let session = Session::new(
+        plan(
+            RootOutputDemand::All,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![list],
+            vec![map],
+            Vec::new(),
+            vec![(ListId(0), "items")],
+            vec![(FieldId(0), "mapped"), (FieldId(10), "items.label")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    let snapshot = session.snapshot().unwrap();
+    let source_row = snapshot.lists[&ListId(0)][0].id;
+    let Value::List(mapped) = &snapshot.fields[&FieldId(0)] else {
+        panic!("mapped value is not a list");
+    };
+    let Value::MappedRow { id, fields } = &mapped[0] else {
+        panic!("List/map object result lost its source row identity");
+    };
+    assert_eq!(*id, source_row);
+    assert_eq!(fields["title"], Value::Text("first".into()));
 }
 
 #[test]

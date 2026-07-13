@@ -16,6 +16,10 @@ pub struct HitTarget {
     pub scroll_root: Option<String>,
     pub center_x: f32,
     pub center_y: f32,
+    pub bounds_x: f32,
+    pub bounds_y: f32,
+    pub bounds_width: f32,
+    pub bounds_height: f32,
     pub text_column: Option<usize>,
 }
 
@@ -230,6 +234,10 @@ impl RetainedView {
                     scroll_root: Some(root),
                     center_x: x,
                     center_y: y,
+                    bounds_x: x,
+                    bounds_y: y,
+                    bounds_width: 0.0,
+                    bounds_height: 0.0,
                     text_column: None,
                 });
             }
@@ -433,6 +441,10 @@ fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
         scroll_root: entry.scroll_root.as_ref().map(|root| root.0.clone()),
         center_x: entry.bounds.x + entry.bounds.width * 0.5,
         center_y: entry.bounds.y + entry.bounds.height * 0.5,
+        bounds_x: entry.bounds.x,
+        bounds_y: entry.bounds.y,
+        bounds_width: entry.bounds.width,
+        bounds_height: entry.bounds.height,
         text_column: None,
     }
 }

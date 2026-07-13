@@ -40,7 +40,7 @@ fn demand_plan(program: &TypedProgram) -> DemandPlan {
         .derived_values
         .iter()
         .filter(|derived| !derived.indexed)
-        .filter(|derived| !statement_is_source_group(&derived.statement))
+        .filter(|derived| !statement_is_source_group(program, &derived.statement))
         .filter(|derived| root_path_is_observed(&observed_paths, &derived.path))
         .filter_map(|derived| match derived_output_ref(program, derived) {
             ValueRef::Field(field_id) => Some(field_id),
@@ -54,11 +54,12 @@ fn demand_plan(program: &TypedProgram) -> DemandPlan {
     }
 }
 
-fn statement_is_source_group(statement: &AstStatement) -> bool {
+fn statement_is_source_group(program: &TypedProgram, statement: &AstStatement) -> bool {
     !statement.children.is_empty()
         && statement.children.iter().all(|child| match child.kind {
             AstStatementKind::Source { .. } => true,
-            AstStatementKind::Field { .. } => statement_is_source_group(child),
+            AstStatementKind::Field { .. } => statement_is_source_group(program, child),
+            _ if row_statement_is_empty_delimiter(child, program) => true,
             _ => false,
         })
 }
@@ -742,7 +743,22 @@ pub fn compile_typed_program(
         region(5, RegionKind::ListProjections, list_projection_ops),
         region(6, RegionKind::DependencyEdges, dependency_ops),
     ];
-    let document = super::document_plan_backend::compile_document_plan(program)?;
+    let executable_fields = regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match (&op.output, &op.kind) {
+            (
+                Some(ValueRef::Field(field)),
+                PlanOpKind::DerivedValue {
+                    expression: Some(_),
+                    ..
+                },
+            ) => Some(*field),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let document =
+        super::document_plan_backend::compile_document_plan(program, &executable_fields)?;
 
     let operation_count = regions.iter().map(|region| region.ops.len()).sum::<usize>();
     let unresolved_executable_ref_count = regions
@@ -892,12 +908,7 @@ pub fn compile_typed_program(
                                 .lists
                                 .iter()
                                 .find(|list| list.name == *list_name)
-                                .filter(|list| {
-                                    matches!(
-                                        list.initializer,
-                                        ListInitializer::RecordLiteral { .. }
-                                    ) && list_has_runtime_constructor_map(program, list)
-                                })
+                                .filter(|list| list_has_runtime_constructor_map(program, list))
                                 .map(|_| format!("{list_name}.$input${field_name}"))
                                 .unwrap_or_else(|| format!("{list_name}.{field_name}")),
                         }
@@ -1051,7 +1062,7 @@ fn initial_row_expression(
     context.scope_id = state.scope_id;
     context.kind = DerivedValueKind::Pure;
 
-    let input_names = match &list.initializer {
+    let mut input_names = match &list.initializer {
         ListInitializer::RecordLiteral { rows } => rows
             .iter()
             .flat_map(|row| row.fields.iter().map(|field| field.name.clone()))
@@ -1059,6 +1070,12 @@ fn initial_row_expression(
         ListInitializer::Range { .. } => BTreeSet::from(["index".to_owned(), "value".to_owned()]),
         ListInitializer::Empty | ListInitializer::Unknown { .. } => BTreeSet::new(),
     };
+    input_names.extend(
+        synthetic_field_ids
+            .keys()
+            .filter(|(list_name, _)| list_name == &list.name)
+            .map(|(_, field_name)| field_name.clone()),
+    );
     let object = input_names
         .into_iter()
         .filter_map(|name| {
@@ -1844,6 +1861,25 @@ fn synthetic_initial_list_field_ids(program: &TypedProgram) -> BTreeMap<(String,
                         });
                 }
             }
+            ListInitializer::Empty if list_has_runtime_constructor_map(program, list) => {
+                for field in program
+                    .list_operations
+                    .iter()
+                    .filter(|operation| operation.list == list.name)
+                    .filter_map(|operation| match &operation.kind {
+                        ListOperationKind::Append { fields, .. } => Some(fields),
+                        _ => None,
+                    })
+                    .flatten()
+                {
+                    ids.entry((list.name.clone(), field.name.clone()))
+                        .or_insert_with(|| {
+                            let id = FieldId(next_id);
+                            next_id += 1;
+                            id
+                        });
+                }
+            }
             ListInitializer::Empty | ListInitializer::Unknown { .. } => {}
         }
     }
@@ -1901,12 +1937,64 @@ fn derived_expression_for_value(
     inputs: &mut Vec<ValueRef>,
     _unresolved_refs: &mut BTreeSet<String>,
 ) -> Option<PlanDerivedExpression> {
-    source_key_text_trim_non_empty_expression(program, derived, index, inputs)
+    source_group_derived_expression(program, derived, index, inputs)
+        .or_else(|| source_key_text_trim_non_empty_expression(program, derived, index, inputs))
         .or_else(|| source_event_transform_expression(program, derived, index, constants, inputs))
         .or_else(|| bool_not_derived_expression(program, derived, index, inputs))
         .or_else(|| number_compare_const_derived_expression(program, derived, index, inputs))
         .or_else(|| root_bool_derived_expression(program, derived, index, inputs))
         .or_else(|| row_expression_for_value(program, derived, index, constants, inputs))
+}
+
+fn source_group_derived_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    inputs: &mut Vec<ValueRef>,
+) -> Option<PlanDerivedExpression> {
+    if !statement_is_source_group(program, &derived.statement) {
+        return None;
+    }
+    let expression =
+        source_group_row_expression(program, &derived.statement, &derived.path, index, inputs)?;
+    Some(PlanDerivedExpression::RowExpression { expression })
+}
+
+fn source_group_row_expression(
+    program: &TypedProgram,
+    statement: &AstStatement,
+    path: &str,
+    index: &ValueIndex,
+    inputs: &mut Vec<ValueRef>,
+) -> Option<PlanRowExpression> {
+    let mut fields = Vec::with_capacity(statement.children.len());
+    for child in &statement.children {
+        let (name, value) = match &child.kind {
+            AstStatementKind::Source { field, .. } => {
+                let field = field.as_ref()?;
+                let source_path = format!("{path}.{field}");
+                let source = index.resolve(&source_path)?;
+                if !matches!(source, ValueRef::Source(_)) {
+                    return None;
+                }
+                if !inputs.contains(&source) {
+                    inputs.push(source.clone());
+                }
+                (field.clone(), PlanRowExpression::Field { input: source })
+            }
+            AstStatementKind::Field { name } if statement_is_source_group(program, child) => {
+                let child_path = format!("{path}.{name}");
+                (
+                    name.clone(),
+                    source_group_row_expression(program, child, &child_path, index, inputs)?,
+                )
+            }
+            _ if row_statement_is_empty_delimiter(child, program) => continue,
+            _ => return None,
+        };
+        fields.push(PlanRowObjectField { name, value });
+    }
+    Some(PlanRowExpression::Object { fields })
 }
 
 fn source_event_transform_expression(
@@ -2017,7 +2105,8 @@ fn source_event_transform_arm_expression(
     exprs: &[AstExpr],
     source: &str,
 ) -> Option<PlanRowExpression> {
-    let arm = source_event_transform_arm_statement(program, exprs, source, &derived.statement)?;
+    let arm =
+        source_event_transform_arm_statement(program, derived, exprs, source, &derived.statement)?;
     let arm_expr = expr_by_id(program, arm.expr?)?;
     let ValueRef::Source(source_id) = index.resolve(source)? else {
         return None;
@@ -2111,7 +2200,7 @@ fn source_event_transform_arm_expression(
             &mut env,
             expr_value_types,
         ),
-        _ => lower_row_expr(
+        _ => lower_row_statement_value(
             program,
             derived,
             index,
@@ -2119,7 +2208,7 @@ fn source_event_transform_arm_expression(
             inputs,
             &mut env,
             expr_value_types,
-            arm_expr.id,
+            arm,
         ),
     };
     lowered.and_then(lowered_scalar)
@@ -2127,19 +2216,53 @@ fn source_event_transform_arm_expression(
 
 fn source_event_transform_arm_statement<'a>(
     program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
     exprs: &[AstExpr],
     source: &str,
     statement: &'a AstStatement,
 ) -> Option<&'a AstStatement> {
+    if let Some(arm) = statement.children.iter().find_map(|child| {
+        source_event_transform_arm_statement(program, derived, exprs, source, child)
+    }) {
+        return Some(arm);
+    }
     if let Some(expr_id) = statement.expr
-        && super::expr_tree_mentions_source(exprs, expr_id, source)
+        && expression_tree_reaches_source(program, derived, exprs, expr_id, source)
     {
         return source_event_then_continuation(program, statement).or(Some(statement));
     }
-    statement
-        .children
-        .iter()
-        .find_map(|child| source_event_transform_arm_statement(program, exprs, source, child))
+    None
+}
+
+fn expression_tree_reaches_source(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    exprs: &[AstExpr],
+    expr_id: usize,
+    source: &str,
+) -> bool {
+    if super::expr_tree_mentions_source(exprs, expr_id, source) {
+        return true;
+    }
+    let mut ids = BTreeSet::new();
+    super::collect_expr_ids(expr_id, exprs, &mut ids);
+    exprs.iter().any(|expr| {
+        if !ids.contains(&expr.id) {
+            return false;
+        }
+        let Some(path) = expression_path_string(program, expr.id) else {
+            return false;
+        };
+        let path = canonical_sibling_path(&derived.path, &path);
+        if path == derived.path {
+            return false;
+        }
+        program.derived_values.iter().any(|candidate| {
+            candidate.path == path && candidate.sources.iter().any(|cause| cause == source)
+        }) || program.possible_causes.iter().any(|candidate| {
+            candidate.target == path && candidate.sources.iter().any(|cause| cause == source)
+        })
+    })
 }
 
 fn source_event_then_continuation<'a>(
@@ -2330,7 +2453,12 @@ fn source_event_transform_default_expression_in_statement(
     statement: &AstStatement,
 ) -> Option<PlanRowExpression> {
     for child in &statement.children {
-        if source_event_transform_statement_mentions_source(program, child, &derived.sources) {
+        if source_event_transform_statement_mentions_source(
+            program,
+            derived,
+            child,
+            &derived.sources,
+        ) {
             if child.children.is_empty() {
                 continue;
             }
@@ -2366,21 +2494,15 @@ fn source_event_transform_default_expression_in_statement(
 
 fn source_event_transform_statement_mentions_source(
     program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
     statement: &AstStatement,
     sources: &[String],
 ) -> bool {
     let exprs = super::compiler_statement_ast_exprs(statement, &program.expressions);
-    exprs.iter().any(|expr| {
-        let path = match &expr.kind {
-            AstExprKind::Identifier(value) => value.clone(),
-            AstExprKind::Path(parts) => parts.join("."),
-            _ => return false,
-        };
-        sources.iter().any(|source| {
-            source_event_ref_variants(source)
-                .iter()
-                .any(|variant| source_suffix_after_variant(&path, variant).is_some())
-        })
+    statement.expr.is_some_and(|expr_id| {
+        sources
+            .iter()
+            .any(|source| expression_tree_reaches_source(program, derived, &exprs, expr_id, source))
     })
 }
 
@@ -3279,6 +3401,89 @@ fn lower_inline_row_select(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_row_when_statement(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    env: &mut BTreeMap<String, LoweredRowValue>,
+    expr_value_types: &BTreeMap<usize, PlanValueType>,
+    statement: &AstStatement,
+    expr_id: usize,
+) -> Option<LoweredRowValue> {
+    let expr = expr_by_id(program, expr_id)?;
+    let AstExprKind::When { input } = expr.kind else {
+        return None;
+    };
+    if statement.children.is_empty() {
+        return None;
+    }
+    let input = lower_row_expr(
+        program,
+        derived,
+        index,
+        constants,
+        inputs,
+        env,
+        expr_value_types,
+        input,
+    )
+    .and_then(lowered_scalar)?;
+    let mut arms = Vec::new();
+    for child in &statement.children {
+        let Some(child_expr) = child.expr else {
+            continue;
+        };
+        let arm = expr_by_id(program, child_expr)?;
+        let AstExprKind::MatchArm { pattern, output } = &arm.kind else {
+            continue;
+        };
+        let (pattern, binding) = row_select_pattern_and_binding(pattern)?;
+        let mut arm_env = env.clone();
+        if let Some(binding) = binding {
+            arm_env.insert(binding, LoweredRowValue::Scalar(input.clone()));
+        }
+        let output = output
+            .and_then(|output| {
+                lower_row_expr(
+                    program,
+                    derived,
+                    index,
+                    constants,
+                    inputs,
+                    &mut arm_env,
+                    expr_value_types,
+                    output,
+                )
+            })
+            .or_else(|| {
+                child.children.first().and_then(|output| {
+                    lower_row_statement_value(
+                        program,
+                        derived,
+                        index,
+                        constants,
+                        inputs,
+                        &mut arm_env,
+                        expr_value_types,
+                        output,
+                    )
+                })
+            })
+            .and_then(lowered_scalar)?;
+        arms.push(PlanRowSelectArm {
+            pattern,
+            value: output,
+        });
+    }
+    (!arms.is_empty()).then_some(LoweredRowValue::Scalar(PlanRowExpression::Select {
+        input: Box::new(input),
+        arms,
+    }))
+}
+
 fn lowered_scalar(value: LoweredRowValue) -> Option<PlanRowExpression> {
     match value {
         LoweredRowValue::Scalar(expression) => Some(expression),
@@ -3494,6 +3699,19 @@ fn lower_row_statement_value(
         ) {
             return Some(value);
         }
+        if let Some(value) = lower_row_when_statement(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            statement,
+            expr_id,
+        ) {
+            return Some(value);
+        }
         if matches!(
             expr_by_id(program, expr_id)?.kind,
             AstExprKind::ListLiteral { .. }
@@ -3594,8 +3812,9 @@ fn lower_row_pipeline_child_statement(
 ) -> Option<LoweredRowValue> {
     let expr_id = statement.expr?;
     let saved_previous = env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
-    let result = match &expr_by_id(program, expr_id)?.kind {
-        AstExprKind::Pipe { op, args, .. } if row_list_builtin(op) => lower_row_list_builtin(
+    let expr = expr_by_id(program, expr_id)?;
+    let result = match &expr.kind {
+        AstExprKind::Pipe { input, op, args } if row_list_builtin(op) => lower_row_list_builtin(
             program,
             derived,
             index,
@@ -3604,10 +3823,10 @@ fn lower_row_pipeline_child_statement(
             env,
             expr_value_types,
             op,
-            None,
+            Some(*input),
             args,
         ),
-        AstExprKind::Pipe { op, args, .. } if row_text_builtin(op) => lower_row_text_builtin(
+        AstExprKind::Pipe { input, op, args } if row_text_builtin(op) => lower_row_text_builtin(
             program,
             derived,
             index,
@@ -3616,10 +3835,10 @@ fn lower_row_pipeline_child_statement(
             env,
             expr_value_types,
             op,
-            None,
+            Some(*input),
             args,
         ),
-        AstExprKind::Pipe { op, args, .. } if row_generic_builtin(op) => lower_row_builtin_call(
+        AstExprKind::Pipe { input, op, args } if row_generic_builtin(op) => lower_row_builtin_call(
             program,
             derived,
             index,
@@ -3628,7 +3847,7 @@ fn lower_row_pipeline_child_statement(
             env,
             expr_value_types,
             op,
-            None,
+            Some(*input),
             args,
         ),
         _ => lower_row_statement_value(
@@ -3671,18 +3890,75 @@ fn lower_row_call_statement_with_field_args(
     if !args.is_empty() {
         return None;
     }
+    if let Some(value) = lower_row_list_find_statement(
+        program,
+        derived,
+        index,
+        constants,
+        inputs,
+        env,
+        expr_value_types,
+        function,
+        statement,
+    ) {
+        return Some(value);
+    }
     let mut call_args = Vec::new();
     for child in &statement.children {
-        let AstStatementKind::Field { name } = &child.kind else {
-            return None;
+        let name = match &child.kind {
+            AstStatementKind::Field { name } => Some(name.clone()),
+            AstStatementKind::Expression => None,
+            _ => return None,
         };
         let value = child.expr?;
         call_args.push(AstCallArg {
-            name: Some(name.clone()),
+            name,
             value,
             start: child.start,
             end: child.end,
         });
+    }
+    if row_list_builtin(function) {
+        return lower_row_list_builtin(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            function,
+            None,
+            &call_args,
+        );
+    }
+    if row_text_builtin(function) {
+        return lower_row_text_builtin(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            function,
+            None,
+            &call_args,
+        );
+    }
+    if row_generic_builtin(function) {
+        return lower_row_builtin_call(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            function,
+            None,
+            &call_args,
+        );
     }
     lower_row_function_call(
         program,
@@ -3695,6 +3971,80 @@ fn lower_row_call_statement_with_field_args(
         function,
         &call_args,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_row_list_find_statement(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    env: &mut BTreeMap<String, LoweredRowValue>,
+    expr_value_types: &BTreeMap<usize, PlanValueType>,
+    function: &str,
+    statement: &AstStatement,
+) -> Option<LoweredRowValue> {
+    if function != "List/find" && function != "List/find_value" {
+        return None;
+    }
+    let list_expr = statement
+        .children
+        .iter()
+        .find(|child| matches!(child.kind, AstStatementKind::Expression))?
+        .expr?;
+    let list_id = lower_row_list_ref(program, derived, index, inputs, list_expr)?;
+    let child_field = |name: &str| {
+        statement.children.iter().find(
+            |child| matches!(&child.kind, AstStatementKind::Field { name: field } if field == name),
+        )
+    };
+    let field_name = row_raw_symbol(program, child_field("field")?.expr?)?;
+    let field = row_field_id_for_list_id(program, list_id, &field_name)?;
+    let value = lower_row_statement_value(
+        program,
+        derived,
+        index,
+        constants,
+        inputs,
+        env,
+        expr_value_types,
+        child_field("value")?,
+    )
+    .and_then(lowered_scalar)?;
+    if function == "List/find" {
+        return Some(LoweredRowValue::ListFindRow {
+            list_id,
+            field,
+            value,
+        });
+    }
+    let target_name = row_raw_symbol(program, child_field("target")?.expr?)?;
+    let target = row_field_id_for_list_id(program, list_id, &target_name)?;
+    let fallback = if let Some(fallback) = child_field("fallback") {
+        Some(
+            lower_row_statement_value(
+                program,
+                derived,
+                index,
+                constants,
+                inputs,
+                env,
+                expr_value_types,
+                fallback,
+            )
+            .and_then(lowered_scalar)?,
+        )
+    } else {
+        None
+    };
+    Some(LoweredRowValue::Scalar(PlanRowExpression::ListFindValue {
+        list_id,
+        field,
+        value: Box::new(value),
+        target,
+        fallback: fallback.map(Box::new),
+    }))
 }
 
 fn lower_row_while_statement(
@@ -3931,6 +4281,21 @@ fn lower_row_match_arm_output(
     {
         return Some(value);
     }
+    if !arm_statement.children.is_empty()
+        && let Some(value) = lower_row_when_statement(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            arm_statement,
+            output,
+        )
+    {
+        return Some(value);
+    }
     lower_row_expr(
         program,
         derived,
@@ -4041,6 +4406,7 @@ fn row_list_builtin(function: &str) -> bool {
             | "List/find_value"
             | "List/range"
             | "List/map"
+            | "List/any"
             | "List/sum"
             | "List/count"
             | "List/length"
@@ -4247,7 +4613,7 @@ fn lower_row_list_builtin(
                 args: Vec::new(),
             }))
         }
-        "List/retain" => {
+        "List/retain" | "List/any" => {
             let input_expr = piped_input.or_else(|| positional_arg(args, 0).map(|arg| arg.value));
             let (input, implicit_input) = lower_row_list_input_expression(
                 program,
@@ -5321,6 +5687,9 @@ fn lower_row_function_body(
     let mut output = None;
     let mut object_fields = Vec::new();
     for child in &body.children {
+        if row_statement_is_empty_delimiter(child, program) {
+            continue;
+        }
         if let Some(previous) = output.clone() {
             env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
         } else {
@@ -5392,6 +5761,14 @@ fn lower_row_function_body(
         }));
     }
     output
+}
+
+fn row_statement_is_empty_delimiter(statement: &AstStatement, program: &TypedProgram) -> bool {
+    statement.children.is_empty()
+        && statement
+            .expr
+            .and_then(|id| program.expressions.get(id))
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter))
 }
 
 fn row_field_expression(
@@ -5890,11 +6267,11 @@ fn collect_update_expression_refs(
         UpdateExpression::MatchInfixConst {
             left, right, arms, ..
         } => {
-            let mut count =
-                collect_number_operand_ref(index, source, target, indexed, left, refs, unresolved)
-                    + collect_number_operand_ref(
-                        index, source, target, indexed, right, refs, unresolved,
-                    );
+            let mut count = collect_update_value_expression_refs(
+                index, source, target, indexed, left, refs, unresolved,
+            ) + collect_update_value_expression_refs(
+                index, source, target, indexed, right, refs, unresolved,
+            );
             for arm in arms {
                 count += collect_update_value_expression_refs(
                     index,
@@ -6378,14 +6755,14 @@ fn ordered_update_expression_inputs(
             arms,
         } => {
             let Some(left_ref) =
-                number_operand_value_ref(index, constants, source, target, indexed, left)
+                infix_operand_value_ref(index, constants, source, target, indexed, left)
             else {
                 return Vec::new();
             };
             let op_constant_id =
                 push_plan_constant(constants, PlanConstantValue::Text { value: op.clone() });
             let Some(right_ref) =
-                number_operand_value_ref(index, constants, source, target, indexed, right)
+                infix_operand_value_ref(index, constants, source, target, indexed, right)
             else {
                 return Vec::new();
             };
@@ -6592,6 +6969,37 @@ fn number_operand_value_ref(
         return Some(ValueRef::Constant(constant_id));
     }
     resolve_update_value_ref(index, source, target, indexed, operand)
+}
+
+fn infix_operand_value_ref(
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    source: &str,
+    target: &str,
+    indexed: bool,
+    expression: &UpdateValueExpression,
+) -> Option<ValueRef> {
+    match expression {
+        UpdateValueExpression::Const { value } => {
+            let value = match value.as_str() {
+                "True" => PlanConstantValue::Bool { value: true },
+                "False" => PlanConstantValue::Bool { value: false },
+                _ => value
+                    .parse::<i64>()
+                    .map(|value| PlanConstantValue::Number { value })
+                    .unwrap_or_else(|_| PlanConstantValue::Text {
+                        value: value.clone(),
+                    }),
+            };
+            Some(ValueRef::Constant(push_plan_constant(constants, value)))
+        }
+        UpdateValueExpression::ReadPath { path } => {
+            resolve_update_value_ref(index, source, target, indexed, path)
+        }
+        UpdateValueExpression::MatchConst { .. }
+        | UpdateValueExpression::NumberInfix { .. }
+        | UpdateValueExpression::MatchInfixConst { .. } => None,
+    }
 }
 
 fn update_value_expression_value_ref(

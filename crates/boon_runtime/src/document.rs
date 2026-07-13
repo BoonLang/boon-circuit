@@ -49,7 +49,7 @@ pub struct DocumentMaterializationStats {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DocumentRuntime {
-    plan: boon_plan::DocumentPlan,
+    machine_plan: Arc<MachinePlan>,
     expression_ops: Vec<Arc<DocumentExprOp>>,
     routes: BTreeMap<SourceId, String>,
     field_names: BTreeMap<FieldId, Vec<String>>,
@@ -93,10 +93,10 @@ impl std::error::Error for DocumentError {}
 
 impl DocumentRuntime {
     pub(crate) fn new(session: &mut Session) -> Result<Option<Self>, DocumentError> {
-        let Some(plan) = session.document_plan().cloned() else {
+        let machine = session.shared_plan();
+        let Some(plan) = machine.document_plan() else {
             return Ok(None);
         };
-        let machine = session.plan();
         let expression_ops = plan
             .expressions
             .iter()
@@ -107,8 +107,8 @@ impl DocumentRuntime {
             .iter()
             .map(|route| (route.source_id, route.path.clone()))
             .collect();
-        let field_names = field_name_index(machine);
-        let field_state_aliases = field_state_alias_index(machine);
+        let field_names = field_name_index(&machine);
+        let field_state_aliases = field_state_alias_index(&machine);
         let field_owners = machine
             .storage_layout
             .list_slots
@@ -140,7 +140,7 @@ impl DocumentRuntime {
                     sources
                 },
             );
-        let global_targets = global_target_index(machine);
+        let global_targets = global_target_index(&machine);
         let windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand> = plan
             .materializations
             .iter()
@@ -160,7 +160,7 @@ impl DocumentRuntime {
         let root = frame_node_id(plan.root.node.0, None);
         let last_nonempty_windows = windows.clone();
         let mut runtime = Self {
-            plan,
+            machine_plan: machine,
             expression_ops,
             routes,
             field_names,
@@ -194,6 +194,12 @@ impl DocumentRuntime {
         &self.frame
     }
 
+    fn plan(&self) -> &boon_plan::DocumentPlan {
+        self.machine_plan
+            .document_plan()
+            .expect("document runtime requires a document plan")
+    }
+
     pub(crate) fn stats(&self) -> DocumentMaterializationStats {
         DocumentMaterializationStats {
             full_evaluation_count: self.full_evaluation_count,
@@ -223,17 +229,26 @@ impl DocumentRuntime {
         mount_patches(&self.frame)
     }
 
-    fn resolve_row_source(&self, list: ListId, suffix: &str) -> Option<SourceId> {
-        let qualified_suffix = format!(".{suffix}");
-        let mut matches = self
-            .row_sources
-            .get(&list)?
-            .iter()
-            .filter_map(|(path, source)| {
-                (path == suffix || path.ends_with(&qualified_suffix)).then_some(*source)
-            });
-        let source = matches.next()?;
-        matches.next().is_none().then_some(source)
+    fn resolve_row_source(&self, list: ListId, suffix: &str) -> Option<EvalValue> {
+        let mut exact = None;
+        let mut group = BTreeMap::new();
+        for (path, source) in self.row_sources.get(&list)? {
+            let Some(remainder) = row_source_remainder(path, suffix) else {
+                continue;
+            };
+            if remainder.is_empty() {
+                if exact.replace(*source).is_some() {
+                    return None;
+                }
+            } else if !insert_row_source(&mut group, remainder, *source) {
+                return None;
+            }
+        }
+        match (exact, group.is_empty()) {
+            (Some(source), true) => Some(EvalValue::Source(source)),
+            (None, false) => Some(EvalValue::Record(group)),
+            _ => None,
+        }
     }
 
     pub(crate) fn apply_turn(
@@ -260,7 +275,7 @@ impl DocumentRuntime {
         demand: DocumentWindowDemand,
     ) -> Result<Vec<DocumentPatch>, DocumentError> {
         if !self
-            .plan
+            .plan()
             .materializations
             .iter()
             .any(|materialization| materialization.id == demand.materialization)
@@ -668,6 +683,10 @@ enum EvalValue {
     Bytes(Vec<u8>),
     Enum(String),
     Record(BTreeMap<String, EvalValue>),
+    MappedRow {
+        id: RowId,
+        fields: BTreeMap<String, EvalValue>,
+    },
     Tagged(String, BTreeMap<String, EvalValue>),
     List(Vec<EvalValue>),
     Row {
@@ -765,7 +784,7 @@ struct Evaluator<'a> {
 
 impl<'a> Evaluator<'a> {
     fn new(runtime: &'a DocumentRuntime, session: &'a mut Session) -> Self {
-        let root = frame_node_id(runtime.plan.root.node.0, None);
+        let root = frame_node_id(runtime.plan().root.node.0, None);
         Self {
             runtime,
             session,
@@ -787,10 +806,13 @@ impl<'a> Evaluator<'a> {
         let mut env = EvalEnv {
             passed: Some(EvalValue::Global),
             parent: Some(root.clone()),
-            instance: Arc::new(vec![format!("root-{}", self.runtime.plan.root.template.0)]),
+            instance: Arc::new(vec![format!(
+                "root-{}",
+                self.runtime.plan().root.template.0
+            )]),
             ..EvalEnv::default()
         };
-        let value = self.eval(self.runtime.plan.root.expression, &mut env)?;
+        let value = self.eval(self.runtime.plan().root.expression, &mut env)?;
         self.attach_nodes(&root, value);
         if let Some(root_node) = self.frame.nodes.get_mut(&root) {
             root_node
@@ -829,7 +851,7 @@ impl<'a> Evaluator<'a> {
         }
         let expression_plan = self
             .runtime
-            .plan
+            .plan()
             .expressions
             .get(expression.0)
             .ok_or_else(|| {
@@ -988,7 +1010,7 @@ impl<'a> Evaluator<'a> {
                 let input = self.eval(*input, env)?;
                 for arm in arms {
                     if self.pattern_matches(&input, arm.pattern.clone())? {
-                        let selector = self.runtime.plan.expressions[expression.0].compiler_id;
+                        let selector = self.runtime.plan().expressions[expression.0].compiler_id;
                         let previous = env.matched.insert(selector, input.clone());
                         let output = self.eval(arm.output, env);
                         if let Some(previous) = previous {
@@ -1045,7 +1067,7 @@ impl<'a> Evaluator<'a> {
     fn constant(&self, id: DocumentConstantId) -> Result<EvalValue, DocumentError> {
         let value = &self
             .runtime
-            .plan
+            .plan()
             .constants
             .get(id.0)
             .ok_or_else(|| DocumentError::InvalidPlan(format!("constant {} is missing", id.0)))?
@@ -1064,7 +1086,7 @@ impl<'a> Evaluator<'a> {
 
     fn name(&self, id: DocumentNameId) -> Result<&str, DocumentError> {
         self.runtime
-            .plan
+            .plan()
             .names
             .get(id.0)
             .map(String::as_str)
@@ -1101,10 +1123,10 @@ impl<'a> Evaluator<'a> {
                     .list_row_snapshots(list)
                     .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
                 Ok(EvalValue::List(
-                    rows.iter()
+                    rows.into_iter()
                         .map(|row| EvalValue::Row {
                             id: Some(row.id),
-                            fields: row.fields.clone(),
+                            fields: row.fields,
                         })
                         .collect(),
                 ))
@@ -1565,6 +1587,13 @@ impl<'a> Evaluator<'a> {
                     .map(|(name, value)| (name, self.value(value)))
                     .collect(),
             ),
+            Value::MappedRow { id, fields } => EvalValue::MappedRow {
+                id,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| (name, self.value(value)))
+                    .collect(),
+            },
             Value::Row { id, fields } => EvalValue::Row {
                 id: Some(id),
                 fields,
@@ -1574,7 +1603,12 @@ impl<'a> Evaluator<'a> {
     }
 
     fn project(&mut self, mut value: EvalValue, path: &[DocumentNameId]) -> EvalValue {
-        if let EvalValue::Row { id: Some(row), .. } = &value {
+        if let Some(row) = match &value {
+            EvalValue::Row { id: Some(row), .. } | EvalValue::MappedRow { id: row, .. } => {
+                Some(*row)
+            }
+            _ => None,
+        } {
             let names = path
                 .iter()
                 .filter_map(|name| self.name(*name).ok())
@@ -1584,7 +1618,7 @@ impl<'a> Evaluator<'a> {
             if !suffix.is_empty()
                 && let Some(source) = self.runtime.resolve_row_source(row.list, &suffix)
             {
-                return EvalValue::Source(source);
+                return source;
             }
         }
         for name in path {
@@ -1593,6 +1627,9 @@ impl<'a> Evaluator<'a> {
             };
             value = match value {
                 EvalValue::Record(mut fields) | EvalValue::Tagged(_, mut fields) => {
+                    fields.remove(&name).unwrap_or(EvalValue::Null)
+                }
+                EvalValue::MappedRow { mut fields, .. } => {
                     fields.remove(&name).unwrap_or(EvalValue::Null)
                 }
                 EvalValue::Row { id, fields } => {
@@ -1652,6 +1689,13 @@ impl<'a> Evaluator<'a> {
 
     fn project_field(&mut self, value: EvalValue, field: FieldId) -> EvalValue {
         match value {
+            EvalValue::MappedRow { mut fields, .. } => self
+                .runtime
+                .field_names
+                .get(&field)
+                .and_then(|names| names.last())
+                .and_then(|name| fields.remove(name))
+                .unwrap_or(EvalValue::Null),
             EvalValue::Row { id, fields } => id
                 .and_then(|row| self.read_target(ValueTarget::RowField { row, field }).ok())
                 .or_else(|| fields.get(&field).cloned().map(|value| self.value(value)))
@@ -1739,7 +1783,7 @@ impl<'a> Evaluator<'a> {
     ) -> Result<EvalValue, DocumentError> {
         let function = self
             .runtime
-            .plan
+            .plan()
             .functions
             .iter()
             .find(|candidate| candidate.id == function)
@@ -1781,7 +1825,7 @@ impl<'a> Evaluator<'a> {
     ) -> Result<EvalValue, DocumentError> {
         let materialization = self
             .runtime
-            .plan
+            .plan()
             .materializations
             .iter()
             .find(|candidate| candidate.id == id)
@@ -1891,10 +1935,10 @@ impl<'a> Evaluator<'a> {
                     .list_row_snapshots(list)
                     .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
                 Ok(EvalValue::List(
-                    rows.iter()
+                    rows.into_iter()
                         .map(|row| EvalValue::Row {
                             id: Some(row.id),
-                            fields: row.fields.clone(),
+                            fields: row.fields,
                         })
                         .collect(),
                 ))
@@ -1951,8 +1995,11 @@ impl<'a> Evaluator<'a> {
         item: &EvalValue,
         index: usize,
     ) -> Option<RowId> {
-        if let EvalValue::Row { id: Some(row), .. } = item {
-            return Some(*row);
+        match item {
+            EvalValue::Row { id: Some(row), .. } | EvalValue::MappedRow { id: row, .. } => {
+                return Some(*row);
+            }
+            _ => {}
         }
         match materialization.row_identity {
             boon_plan::DocumentRowIdentity::ListHiddenKeyAndGeneration { list } => {
@@ -1983,7 +2030,7 @@ impl<'a> Evaluator<'a> {
 
         let template_node = self
             .runtime
-            .plan
+            .plan()
             .templates
             .iter()
             .find(|candidate| candidate.id == template)
@@ -2000,7 +2047,7 @@ impl<'a> Evaluator<'a> {
             ) {
                 delayed.push(argument);
             } else {
-                let class = self.runtime.plan.expressions[argument.value.0].value_class;
+                let class = self.runtime.plan().expressions[argument.value.0].value_class;
                 let environment = env.clone();
                 let retain_scalar = class == boon_plan::DocumentValueClass::DynamicScalar
                     && retained_argument_role(argument.role)
@@ -2079,7 +2126,7 @@ impl<'a> Evaluator<'a> {
         child_env.parent = Some(id.clone());
         Arc::make_mut(&mut child_env.instance).push(format!("node-{template_node}"));
         for argument in delayed {
-            let class = self.runtime.plan.expressions[argument.value.0].value_class;
+            let class = self.runtime.plan().expressions[argument.value.0].value_class;
             let environment = child_env.clone();
             let retain_scalar = class == boon_plan::DocumentValueClass::DynamicScalar
                 && retained_argument_role(argument.role);
@@ -2302,7 +2349,7 @@ fn apply_argument(
     row: Option<RowId>,
 ) -> Result<(), DocumentError> {
     let name = runtime
-        .plan
+        .plan()
         .names
         .get(name.0)
         .map(String::as_str)
@@ -2362,6 +2409,10 @@ impl EvalValue {
                 .get("text")
                 .map(Self::text)
                 .unwrap_or_else(|| format_record(None, fields)),
+            Self::MappedRow { fields, .. } => fields
+                .get("text")
+                .map(Self::text)
+                .unwrap_or_else(|| format_record(None, fields)),
             Self::Tagged(tag, fields) => format_record(Some(tag), fields),
             Self::List(values) => values.iter().map(Self::text).collect::<Vec<_>>().join(""),
             Self::Row { .. } => String::new(),
@@ -2377,6 +2428,7 @@ impl EvalValue {
             Self::Text(value) | Self::Enum(value) => !value.is_empty(),
             Self::Bytes(value) => !value.is_empty(),
             Self::Record(value) | Self::Tagged(_, value) => !value.is_empty(),
+            Self::MappedRow { fields, .. } => !fields.is_empty(),
             Self::List(value) => !value.is_empty(),
             Self::Nodes(value) => !value.is_empty(),
             Self::Row { .. } => true,
@@ -2410,6 +2462,7 @@ fn inline_content_text(value: &EvalValue) -> Option<String> {
         | EvalValue::Enum(_) => Some(value.text()),
         EvalValue::Null
         | EvalValue::Record(_)
+        | EvalValue::MappedRow { .. }
         | EvalValue::Tagged(_, _)
         | EvalValue::List(_)
         | EvalValue::Row { .. }
@@ -2462,6 +2515,11 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
             .map(|(name, value)| Some((name.clone(), guard_value(value)?)))
             .collect::<Option<BTreeMap<_, _>>>()
             .map(Value::Record),
+        EvalValue::MappedRow { id, fields } => fields
+            .iter()
+            .map(|(name, value)| Some((name.clone(), guard_value(value)?)))
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(|fields| Value::MappedRow { id: *id, fields }),
         EvalValue::List(values) => values
             .iter()
             .map(guard_value)
@@ -2484,7 +2542,9 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
 
 fn spread_record(record: &mut BTreeMap<String, EvalValue>, value: EvalValue) {
     match value {
-        EvalValue::Record(fields) | EvalValue::Tagged(_, fields) => record.extend(fields),
+        EvalValue::Record(fields)
+        | EvalValue::MappedRow { fields, .. }
+        | EvalValue::Tagged(_, fields) => record.extend(fields),
         _ => {}
     }
 }
@@ -3189,7 +3249,9 @@ fn scalar_style_value(value: &EvalValue) -> Option<StyleValue> {
 
 fn record_fields(value: &EvalValue) -> Option<&BTreeMap<String, EvalValue>> {
     match value {
-        EvalValue::Record(fields) | EvalValue::Tagged(_, fields) => Some(fields),
+        EvalValue::Record(fields)
+        | EvalValue::MappedRow { fields, .. }
+        | EvalValue::Tagged(_, fields) => Some(fields),
         _ => None,
     }
 }
@@ -3242,7 +3304,9 @@ fn collect_sources(
         EvalValue::Source(source) if inherited_intent.is_some() || allow_unqualified => {
             sources.push((*source, inherited_intent.map(str::to_owned)));
         }
-        EvalValue::Record(fields) | EvalValue::Tagged(_, fields) => {
+        EvalValue::Record(fields)
+        | EvalValue::MappedRow { fields, .. }
+        | EvalValue::Tagged(_, fields) => {
             for (name, value) in fields {
                 let explicit_intent = host_source_intent(name).then_some(name.as_str());
                 let intent = explicit_intent.or(inherited_intent);
@@ -3261,6 +3325,43 @@ fn collect_sources(
         }
         _ => {}
     }
+}
+
+fn row_source_remainder<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    if path == suffix {
+        return Some("");
+    }
+    let qualified = format!(".{suffix}");
+    let offset = path.rfind(&qualified)?;
+    let remainder = &path[offset + qualified.len()..];
+    if remainder.is_empty() {
+        Some("")
+    } else {
+        remainder.strip_prefix('.')
+    }
+}
+
+fn insert_row_source(
+    fields: &mut BTreeMap<String, EvalValue>,
+    path: &str,
+    source: SourceId,
+) -> bool {
+    let mut parts = path.splitn(2, '.');
+    let Some(head) = parts.next().filter(|part| !part.is_empty()) else {
+        return false;
+    };
+    let Some(tail) = parts.next() else {
+        return fields
+            .insert(head.to_owned(), EvalValue::Source(source))
+            .is_none();
+    };
+    let value = fields
+        .entry(head.to_owned())
+        .or_insert_with(|| EvalValue::Record(BTreeMap::new()));
+    let EvalValue::Record(children) = value else {
+        return false;
+    };
+    insert_row_source(children, tail, source)
 }
 
 fn host_source_intent(value: &str) -> bool {

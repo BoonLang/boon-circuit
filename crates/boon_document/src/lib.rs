@@ -4779,6 +4779,17 @@ impl LayoutBuilder<'_, '_> {
         preferred_row_child_width_with_typed(node, typed_layout.as_ref(), self.text)
     }
 
+    fn constrain_row_child_width(&self, node: &DocumentNode, width: f32, fill_extent: f32) -> f32 {
+        let typed_layout = self.typed_layout_style(node);
+        constrain_layout_dimension(
+            width,
+            &node.style,
+            typed_layout.as_ref(),
+            "width",
+            fill_extent,
+        )
+    }
+
     fn layout_node(
         &mut self,
         id: &DocumentNodeId,
@@ -4937,46 +4948,62 @@ impl LayoutBuilder<'_, '_> {
                     } else {
                         0.0
                     };
-                    let fixed_child_width: f32 = if fill_child_count > 0 {
+                    let mut row_child_widths = vec![None; child_count];
+                    if fill_child_count > 0 {
                         let mut fixed_child_width = 0.0;
-                        for child in &node.children {
+                        let mut fill_children = Vec::with_capacity(fill_child_count);
+                        for (index, child) in node.children.iter().enumerate() {
                             let Some(child_node) = self.document.nodes.get(child).cloned() else {
                                 continue;
                             };
                             if self.node_layout_dimension_is_fill(&child_node, "width") {
+                                fill_children.push((index, child_node));
                                 continue;
                             }
-                            fixed_child_width +=
-                                self.preferred_row_child_width(&child_node).unwrap_or(0.0);
+                            let preferred =
+                                self.preferred_row_child_width(&child_node).unwrap_or(1.0);
+                            let width = self.constrain_row_child_width(
+                                &child_node,
+                                preferred,
+                                content_width,
+                            );
+                            row_child_widths[index] = Some(width);
+                            fixed_child_width += width;
                         }
-                        fixed_child_width
-                    } else {
-                        0.0
-                    };
-                    let fill_child_width = if fill_child_count > 0 {
-                        ((content_width - row_gap_total - fixed_child_width)
-                            / fill_child_count as f32)
-                            .max(1.0)
-                    } else {
-                        0.0
-                    };
+
+                        let mut remaining =
+                            (content_width - row_gap_total - fixed_child_width).max(1.0);
+                        while !fill_children.is_empty() {
+                            let share = (remaining / fill_children.len() as f32).max(1.0);
+                            let mut constrained_any = false;
+                            let mut next = Vec::with_capacity(fill_children.len());
+                            for (index, child_node) in fill_children {
+                                let width = self.constrain_row_child_width(
+                                    &child_node,
+                                    share,
+                                    content_width,
+                                );
+                                if (width - share).abs() > f32::EPSILON {
+                                    row_child_widths[index] = Some(width);
+                                    remaining -= width;
+                                    constrained_any = true;
+                                } else {
+                                    next.push((index, child_node));
+                                }
+                            }
+                            if !constrained_any {
+                                for (index, _) in next {
+                                    row_child_widths[index] = Some(share);
+                                }
+                                break;
+                            }
+                            fill_children = next;
+                        }
+                    }
                     let mut cursor_x = content_x;
                     let mut max_child_height: f32 = 0.0;
-                    for child in &node.children {
-                        let child_available_width = self
-                            .document
-                            .nodes
-                            .get(child)
-                            .cloned()
-                            .and_then(|child_node| {
-                                self.node_layout_dimension_is_fill(&child_node, "width")
-                                    .then_some(fill_child_width)
-                                    .or_else(|| {
-                                        (fill_child_count > 0)
-                                            .then(|| self.preferred_row_child_width(&child_node))
-                                            .flatten()
-                                    })
-                            })
+                    for (index, child) in node.children.iter().enumerate() {
+                        let child_available_width = row_child_widths[index]
                             .unwrap_or_else(|| (content_x + content_width - cursor_x).max(1.0))
                             .max(1.0);
                         let child_rect = self.layout_node(

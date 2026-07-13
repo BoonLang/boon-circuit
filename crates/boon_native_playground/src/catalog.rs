@@ -94,14 +94,24 @@ impl Catalog {
                         )
                     })
             })
-            .map(|(action_kind, action_text, action_key, event)| TestStep {
-                source_path: event.source,
-                action_kind,
-                target_text: event.target_text,
-                text: action_text,
-                key: action_key,
-                address: event.payload.address,
-                target_occurrence: event.target_occurrence.map(|value| value as u64),
+            .map(|(action_kind, action_text, action_key, event)| {
+                let pointer_x = payload_field_text(&event.payload, "pointer_x");
+                let pointer_y = payload_field_text(&event.payload, "pointer_y");
+                let pointer_width = payload_field_text(&event.payload, "pointer_width");
+                let pointer_height = payload_field_text(&event.payload, "pointer_height");
+                TestStep {
+                    source_path: event.source,
+                    action_kind,
+                    target_text: event.target_text,
+                    text: action_text,
+                    key: action_key,
+                    address: event.payload.address,
+                    target_occurrence: event.target_occurrence.map(|value| value as u64),
+                    pointer_x,
+                    pointer_y,
+                    pointer_width,
+                    pointer_height,
+                }
             })
             .collect();
         Ok(LoadedExample {
@@ -111,6 +121,14 @@ impl Catalog {
             test_steps,
         })
     }
+}
+
+fn payload_field_text(payload: &boon_runtime::SourcePayload, name: &str) -> Option<String> {
+    payload.fields.get(name).and_then(|value| match value {
+        boon_runtime::Value::Text(value) => Some(value.clone()),
+        boon_runtime::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    })
 }
 
 #[cfg(test)]

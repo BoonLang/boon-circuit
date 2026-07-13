@@ -52,6 +52,146 @@ fn unscoped_scenario_source_ignores_visual_target_text() {
 }
 
 #[test]
+fn novywave_panel_arrangement_toggles_once_per_source_event() {
+    let mut runtime = runtime_for_path("../../examples/novywave/RUN.bn");
+    assert_eq!(
+        runtime
+            .root_value_current("store.panel_arrangement")
+            .unwrap(),
+        Value::Text("Stacked".to_owned())
+    );
+
+    let event = runtime
+        .source_event(
+            1,
+            "store.elements.panels_toggle_arrangement",
+            None,
+            SourcePayload::default(),
+        )
+        .unwrap();
+    runtime.dispatch(event).unwrap();
+
+    assert_eq!(
+        runtime
+            .root_value_current("store.panel_arrangement")
+            .unwrap(),
+        Value::Text("Docked".to_owned())
+    );
+}
+
+#[test]
+fn novywave_signal_formats_remain_row_local() {
+    let mut runtime = runtime_for_path("../../examples/novywave/RUN.bn");
+    let formatters = runtime
+        .inspect_value_current("selected_signal.formatter", 32)
+        .unwrap();
+    let Value::List(formatters) = formatters else {
+        panic!("selected_signal.formatter inspection did not return a list");
+    };
+    assert_eq!(formatters.len(), 14);
+    let variable_formatters = formatters
+        .iter()
+        .filter_map(|row| match row {
+            Value::Record(fields) => fields.get("value"),
+            _ => None,
+        })
+        .filter(|value| **value != Value::Null)
+        .collect::<Vec<_>>();
+    assert_eq!(variable_formatters.len(), 13);
+    assert!(
+        variable_formatters
+            .iter()
+            .all(|value| **value == Value::Text("Hexadecimal".to_owned()))
+    );
+
+    let scenario = parse_scenario(Path::new("../../examples/novywave.scn")).unwrap();
+    let mut sequence = 1;
+    for step in scenario
+        .steps
+        .iter()
+        .take_while(|step| step.id != "select-temperature-analog")
+    {
+        if let Some(source) = &step.source_event {
+            let target = runtime.scenario_target(source).unwrap();
+            let event = runtime
+                .source_event(sequence, &source.source, target, source.payload.clone())
+                .unwrap();
+            runtime.dispatch(event).unwrap();
+            sequence += 1;
+        }
+        let formatters = runtime
+            .inspect_value_current("selected_signal.formatter", 32)
+            .unwrap();
+        let Value::List(formatters) = formatters else {
+            panic!("selected_signal.formatter inspection did not return a list");
+        };
+        let Value::Record(temperature) = &formatters[8] else {
+            panic!("temperature formatter inspection did not return a record");
+        };
+        assert_eq!(
+            temperature.get("value"),
+            Some(&Value::Text("Hexadecimal".to_owned())),
+            "temperature formatter changed after scenario step {}",
+            step.id
+        );
+        assert_eq!(
+            runtime.root_value_current("store.value_format").unwrap(),
+            Value::Text("Hexadecimal".to_owned()),
+            "global value format changed after scenario step {}",
+            step.id
+        );
+    }
+
+    let target = runtime
+        .row_target_for_source_text("signal.signal_elements.select_signal", "temperature", 0)
+        .unwrap()
+        .expect("temperature signal row exists");
+    let event = runtime
+        .source_event(
+            sequence,
+            "signal.signal_elements.select_signal",
+            Some(target),
+            SourcePayload::default(),
+        )
+        .unwrap();
+    runtime.dispatch(event).unwrap();
+
+    assert_eq!(
+        runtime.root_value_current("store.active_signal").unwrap(),
+        Value::Text("temperature".to_owned())
+    );
+    assert_eq!(
+        runtime.root_value_current("store.value_format").unwrap(),
+        Value::Text("Hexadecimal".to_owned())
+    );
+    let formatters = runtime
+        .inspect_value_current("selected_signal.formatter", 32)
+        .unwrap();
+    let Value::List(formatters) = formatters else {
+        panic!("selected_signal.formatter inspection did not return a list");
+    };
+    let Value::Record(temperature) = &formatters[8] else {
+        panic!("temperature formatter inspection did not return a record");
+    };
+    assert_eq!(
+        temperature.get("value"),
+        Some(&Value::Text("Hexadecimal".to_owned()))
+    );
+    assert_eq!(
+        runtime
+            .root_value_current("store.active_signal_format")
+            .unwrap(),
+        Value::Text("Hexadecimal".to_owned())
+    );
+    assert_eq!(
+        runtime
+            .root_value_current("store.temperature_rendered_value")
+            .unwrap(),
+        Value::Text("42.8 C".to_owned())
+    );
+}
+
+#[test]
 fn counter_mount_and_update_are_complete_typed_document_patches() {
     let mut runtime = LiveRuntime::from_source(
         "examples/counter.bn",

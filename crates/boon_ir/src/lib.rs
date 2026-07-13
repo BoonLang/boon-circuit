@@ -739,9 +739,9 @@ pub enum UpdateExpression {
         arms: Vec<UpdateValueMatchArm>,
     },
     MatchInfixConst {
-        left: String,
+        left: UpdateValueExpression,
         op: String,
-        right: String,
+        right: UpdateValueExpression,
         arms: Vec<UpdateValueMatchArm>,
     },
     ListFindValue {
@@ -989,8 +989,14 @@ fn lower_with_typecheck(
     let output_values_ms = lower_elapsed_ms(output_values_started);
     trace_phase("output_values", output_values_ms);
     let derived_values_started = Instant::now();
-    let derived_values =
-        derived_values(program, &row_scopes, &fields, &state_cells, &direct_sources);
+    let derived_values = derived_values(
+        program,
+        &row_scopes,
+        &fields,
+        &state_cells,
+        &direct_sources,
+        &mut candidate_sources,
+    );
     let derived_values_ms = lower_elapsed_ms(derived_values_started);
     trace_phase("derived_values", derived_values_ms);
     let view_bindings_started = Instant::now();
@@ -4560,12 +4566,8 @@ fn verify_scheduled_update_expression(
             arms,
         } => {
             require_supported_numeric_update_op(op, "match number infix")?;
-            if left.parse::<i64>().is_err() {
-                require_known_symbol("match number infix left", left, known_symbols)?;
-            }
-            if right.parse::<i64>().is_err() {
-                require_known_symbol("match number infix right", right, known_symbols)?;
-            }
+            verify_update_value_expression(left, known_symbols, "match infix left")?;
+            verify_update_value_expression(right, known_symbols, "match infix right")?;
             for arm in arms {
                 verify_update_value_expression(
                     &arm.output,
@@ -5238,8 +5240,8 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::MatchInfixConst {
             left, right, arms, ..
         } => {
-            reject_hidden_identity_identifier("match number infix left", left)?;
-            reject_hidden_identity_identifier("match number infix right", right)?;
+            reject_update_value_expression_identity(left)?;
+            reject_update_value_expression_identity(right)?;
             for arm in arms {
                 reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
                 reject_update_value_expression_identity(&arm.output)?;
@@ -6366,6 +6368,7 @@ fn derived_values(
     fields: &[FieldDef],
     state_cells: &[StateCell],
     direct_sources: &BTreeMap<String, Vec<String>>,
+    candidate_sources: &mut CandidateSourceIndex<'_>,
 ) -> Vec<DerivedValue> {
     fields
         .iter()
@@ -6383,8 +6386,22 @@ fn derived_values(
         })
         .enumerate()
         .map(|(id, field)| {
-            let sources = direct_sources_for_field(direct_sources, field)
+            let direct_sources = direct_sources_for_field(direct_sources, field)
                 .cloned()
+                .collect::<Vec<_>>();
+            let event_sources = (field.has_then_expr()
+                || field
+                    .ast_exprs
+                    .iter()
+                    .any(|expr| matches!(expr.kind, AstExprKind::Latest)))
+            .then(|| candidate_sources.candidate_sources(&field.path))
+            .unwrap_or_default();
+            let transform_sources = direct_sources
+                .iter()
+                .chain(&event_sources)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect::<Vec<_>>();
             let list_memory_view = field_is_derived_list_memory_view(field, program);
             let indexed = path_has_parsed_row_scope(program, &field.path);
@@ -6392,7 +6409,12 @@ fn derived_values(
             let kind = if list_memory_view {
                 DerivedValueKind::ListView
             } else {
-                derived_value_kind(field, &sources)
+                derived_value_kind(field, &transform_sources)
+            };
+            let sources = if kind == DerivedValueKind::SourceEventTransform {
+                transform_sources
+            } else {
+                direct_sources
             };
             DerivedValue {
                 id: FieldId(id),
@@ -7637,7 +7659,48 @@ fn list_append_fields(
     if !literal_fields.is_empty() {
         return literal_fields;
     }
+    let statement_fields = list_append_item_statement_fields(field, append_expr);
+    if !statement_fields.is_empty() {
+        return statement_fields;
+    }
     list_append_function_constructor_fields(field, program, fields, append_expr)
+}
+
+fn list_append_item_statement_fields(
+    field: &FieldDef,
+    append_expr: &AstExpr,
+) -> Vec<ListAppendField> {
+    statement_containing_expr(&field.statement, append_expr.id)
+        .or_else(|| statement_containing_span(&field.statement, append_expr.start, append_expr.end))
+        .and_then(|statement| list_append_statement_fields(field, statement))
+        .unwrap_or_default()
+}
+
+fn list_append_statement_fields(
+    field: &FieldDef,
+    statement: &AstStatement,
+) -> Option<Vec<ListAppendField>> {
+    let fields = statement
+        .children
+        .iter()
+        .filter_map(|child| {
+            let AstStatementKind::Field { name } = &child.kind else {
+                return None;
+            };
+            let value = list_append_record_field_value(field, child.expr?)?;
+            Some(ListAppendField {
+                name: name.clone(),
+                value,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !fields.is_empty() {
+        return Some(fields);
+    }
+    statement
+        .children
+        .iter()
+        .find_map(|child| list_append_statement_fields(field, child))
 }
 
 fn list_append_item_record_fields<'a>(
@@ -7646,12 +7709,42 @@ fn list_append_item_record_fields<'a>(
 ) -> Option<&'a [AstRecordField]> {
     let item_expr = list_append_item_expr(field, append_expr)?;
     append_item_record_fields_from_expr(field, item_expr.id).or_else(|| {
-        field
-            .ast_exprs
-            .iter()
-            .filter(|expr| expr.line >= item_expr.line)
-            .find_map(record_fields_from_expr)
+        let statement =
+            statement_containing_expr(&field.statement, append_expr.id).or_else(|| {
+                statement_containing_span(&field.statement, append_expr.start, append_expr.end)
+            })?;
+        append_item_record_fields_from_statement(field, statement)
     })
+}
+
+fn statement_containing_span(
+    statement: &AstStatement,
+    start: usize,
+    end: usize,
+) -> Option<&AstStatement> {
+    if start < statement.start || end > statement.end {
+        return None;
+    }
+    statement
+        .children
+        .iter()
+        .find_map(|child| statement_containing_span(child, start, end))
+        .or(Some(statement))
+}
+
+fn append_item_record_fields_from_statement<'a>(
+    field: &'a FieldDef,
+    statement: &AstStatement,
+) -> Option<&'a [AstRecordField]> {
+    statement
+        .expr
+        .and_then(|expr| append_item_record_fields_from_expr(field, expr))
+        .or_else(|| {
+            statement
+                .children
+                .iter()
+                .find_map(|child| append_item_record_fields_from_statement(field, child))
+        })
 }
 
 fn append_item_record_fields_from_expr(
@@ -9257,7 +9350,7 @@ fn guarded_then_function_match_update_expression(
         if !then_input_matches_source(field, input, source) {
             return None;
         }
-        let output = output.or_else(|| following_when_expr_id(field, expr.line))?;
+        let output = output.or_else(|| following_when_expr_id(field, expr))?;
         guarded_function_match_update_expression_from_expr(
             program, field, target, fields, output, source,
         )
@@ -9285,39 +9378,15 @@ fn guarded_function_match_update_expression_from_expr(
         && let AstExprKind::Infix { left, op, right } = &input_expr.kind
     {
         return Some(UpdateExpression::MatchInfixConst {
-            left: scalar_update_operand_for_source(field, target, fields, *left, source)?,
+            left: update_value_expression_from_expr(field, target, fields, *left, Some(source))?,
             op: op.clone(),
-            right: scalar_update_operand_for_source(field, target, fields, *right, source)?,
+            right: update_value_expression_from_expr(field, target, fields, *right, Some(source))?,
             arms,
         });
     }
     let raw_input = ast_argument_value(field, input)?;
     let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
     Some(UpdateExpression::MatchValueConst { input, arms })
-}
-
-fn scalar_update_operand_for_source(
-    field: &FieldDef,
-    target: &str,
-    fields: &[FieldDef],
-    expr_id: usize,
-    source: &str,
-) -> Option<String> {
-    let value = ast_argument_value(field, expr_id)?;
-    if value.parse::<i64>().is_ok() {
-        return Some(value);
-    }
-    if let Some((_, value_tail)) = value.split_once('.')
-        && let Some((target_parent, _)) = target.rsplit_once('.')
-    {
-        let sibling = format!("{target_parent}.{value_tail}");
-        if fields.iter().any(|candidate| candidate.path == sibling) {
-            return Some(sibling);
-        }
-    }
-    Some(canonical_scalar_update_path_for_source(
-        field, target, &value, fields, source,
-    ))
 }
 
 fn guarded_match_value_arms_after_when_expr(
@@ -9695,7 +9764,10 @@ fn match_const_update_expression(
         })
         .or_else(|| {
             branch.ast_exprs.iter().find_map(|expr| {
-                matches!(expr.kind, AstExprKind::When { .. })
+                let AstExprKind::When { input } = expr.kind else {
+                    return None;
+                };
+                expr_matches_source(field, input, source)
                     .then(|| {
                         match_const_update_expression_from_expr(
                             field,
@@ -9731,6 +9803,40 @@ fn match_const_update_expression(
             })
         })
         .or_else(|| following_match_const_update_expression(field, target, fields, source, branch))
+        .or_else(|| inline_match_value_update_expression(field, target, fields, source, branch))
+}
+
+fn inline_match_value_update_expression(
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    source: &str,
+    branch: &RoutedBranch,
+) -> Option<UpdateExpression> {
+    let when = branch
+        .ast_exprs
+        .iter()
+        .find(|expr| matches!(expr.kind, AstExprKind::When { .. }))?;
+    let AstExprKind::When { input } = when.kind else {
+        return None;
+    };
+    let arms = branch_inline_match_value_arms(field, target, fields, source, branch, when.line);
+    if arms.is_empty() {
+        return None;
+    }
+    if let Some(input_expr) = field_expr(field, input)
+        && let AstExprKind::Infix { left, op, right } = &input_expr.kind
+    {
+        return Some(UpdateExpression::MatchInfixConst {
+            left: update_value_expression_from_expr(field, target, fields, *left, Some(source))?,
+            op: op.clone(),
+            right: update_value_expression_from_expr(field, target, fields, *right, Some(source))?,
+            arms,
+        });
+    }
+    let raw_input = ast_argument_value(field, input)?;
+    let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
+    Some(UpdateExpression::MatchValueConst { input, arms })
 }
 
 fn then_input_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
@@ -9778,7 +9884,7 @@ fn match_const_update_expression_from_then_expr(
     let AstExprKind::Then { output, .. } = expr.kind else {
         return None;
     };
-    let output = output.or_else(|| following_when_expr_id(field, expr.line))?;
+    let output = output.or_else(|| following_when_expr_id(field, expr))?;
     match_const_update_expression_from_expr(field, target, fields, output, source)
 }
 
@@ -9800,14 +9906,51 @@ fn following_match_const_update_expression(
     })
 }
 
-fn following_when_expr_id(field: &FieldDef, line: usize) -> Option<usize> {
-    field
-        .ast_exprs
+fn following_when_expr_id(field: &FieldDef, parent: &AstExpr) -> Option<usize> {
+    nested_when_expr_id(&field.statement, parent.id, &field.ast_exprs).or_else(|| {
+        field
+            .ast_exprs
+            .iter()
+            .find(|candidate| {
+                candidate.id != parent.id
+                    && candidate.start >= parent.start
+                    && candidate.end <= parent.end
+                    && matches!(candidate.kind, AstExprKind::When { .. })
+            })
+            .map(|expr| expr.id)
+    })
+}
+
+fn nested_when_expr_id(
+    statement: &AstStatement,
+    parent_expr_id: usize,
+    exprs: &[AstExpr],
+) -> Option<usize> {
+    if statement.expr == Some(parent_expr_id) {
+        return statement
+            .children
+            .iter()
+            .find_map(|child| first_when_expr_id(child, exprs));
+    }
+    statement
+        .children
         .iter()
-        .find(|candidate| {
-            candidate.line > line && matches!(candidate.kind, AstExprKind::When { .. })
-        })
-        .map(|expr| expr.id)
+        .find_map(|child| nested_when_expr_id(child, parent_expr_id, exprs))
+}
+
+fn first_when_expr_id(statement: &AstStatement, exprs: &[AstExpr]) -> Option<usize> {
+    if let Some(expr_id) = statement.expr
+        && exprs
+            .iter()
+            .find(|expr| expr.id == expr_id)
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::When { .. }))
+    {
+        return Some(expr_id);
+    }
+    statement
+        .children
+        .iter()
+        .find_map(|child| first_when_expr_id(child, exprs))
 }
 
 fn match_const_update_expression_from_expr(
@@ -9890,8 +10033,8 @@ fn match_infix_const_update_expression_from_input(
     let AstExprKind::Infix { left, op, right } = &input.kind else {
         return None;
     };
-    let left = scalar_number_operand(field, *left, target)?;
-    let right = scalar_number_operand(field, *right, target)?;
+    let left = update_value_expression_from_expr(field, target, fields, *left, source)?;
+    let right = update_value_expression_from_expr(field, target, fields, *right, source)?;
     let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
     (!arms.is_empty()).then_some(UpdateExpression::MatchInfixConst {
         left,
@@ -10703,6 +10846,9 @@ impl<'a> CandidateSourceIndex<'a> {
             .cloned()
             .collect::<Vec<_>>();
         for dependency_index in self.dependencies_by_field[field_index].clone() {
+            if !field_dependency_is_event_cause(field, &self.fields[dependency_index]) {
+                continue;
+            }
             for source in self.candidate_sources_for_index(dependency_index, visiting) {
                 push_unique(&mut candidates, source);
             }
@@ -10711,6 +10857,89 @@ impl<'a> CandidateSourceIndex<'a> {
         self.cache.insert(path, candidates.clone());
         candidates
     }
+}
+
+fn field_dependency_is_event_cause(field: &FieldDef, dependency: &FieldDef) -> bool {
+    let references = field
+        .ast_exprs
+        .iter()
+        .filter(|expr| expression_references_field(field, expr, dependency))
+        .map(|expr| expr.id)
+        .collect::<Vec<_>>();
+    if references.is_empty() {
+        return false;
+    }
+    let then_inputs = field
+        .ast_exprs
+        .iter()
+        .filter_map(|expr| match expr.kind {
+            AstExprKind::Then { input, .. } => Some(input),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if then_inputs.is_empty() {
+        return true;
+    }
+    if references.iter().any(|reference| {
+        then_inputs
+            .iter()
+            .any(|input| expr_contains_expr_id_in_exprs(&field.ast_exprs, *input, *reference))
+    }) {
+        return true;
+    }
+    let sampled_outputs = field
+        .ast_exprs
+        .iter()
+        .filter_map(|expr| match expr.kind {
+            AstExprKind::Then {
+                output: Some(output),
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let dependency_is_event_stream = !dependency
+        .ast_exprs
+        .iter()
+        .any(|expr| matches!(expr.kind, AstExprKind::Hold { .. }))
+        && (dependency.has_then_expr()
+            || dependency
+                .ast_exprs
+                .iter()
+                .any(|expr| matches!(expr.kind, AstExprKind::Latest)));
+    dependency_is_event_stream
+        && references.into_iter().any(|reference| {
+            !sampled_outputs
+                .iter()
+                .any(|output| expr_contains_expr_id_in_exprs(&field.ast_exprs, *output, reference))
+        })
+}
+
+fn expression_references_field(field: &FieldDef, expr: &AstExpr, dependency: &FieldDef) -> bool {
+    let raw = match &expr.kind {
+        AstExprKind::Identifier(value) => value.as_str(),
+        AstExprKind::Path(parts) => {
+            return expression_path_references_field(field, parts, dependency);
+        }
+        _ => return false,
+    };
+    raw == dependency.path
+        || raw == dependency.local_name
+        || canonical_local_path(raw, &field.parent_path) == dependency.path
+}
+
+fn expression_path_references_field(
+    field: &FieldDef,
+    parts: &[String],
+    dependency: &FieldDef,
+) -> bool {
+    if parts.is_empty() {
+        return false;
+    }
+    let raw = parts.join(".");
+    raw == dependency.path
+        || (parts.len() == 1 && parts[0] == dependency.local_name)
+        || canonical_local_path(&raw, &field.parent_path) == dependency.path
 }
 
 #[derive(Clone, Debug)]

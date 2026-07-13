@@ -1285,7 +1285,10 @@ FUNCTION loading_state() {
 }
 
 FUNCTION left_panel() {
-    left_panel_base(panel_width: PASSED.store.files_panel_width, panel_height: Fill)
+    left_panel_base(
+        panel_width: [sizing: Fill, minimum: 220, maximum: PASSED.store.files_panel_width]
+        panel_height: Fill
+    )
 }
 
 FUNCTION left_panel_docked() {
@@ -1594,7 +1597,7 @@ FUNCTION file_tree_simple_scope_expanded_row(row) {
 FUNCTION file_tree_simple_scope_collapse_control(row) {
     Scene/Element/button(
         element: [event: [press: PASSED.store.elements.scope_cpu_collapse], hovered: PASSED.store.elements.scope_cpu_collapse]
-        style: [width: 6, height: 22, paint: False, spring_range: 3]
+        style: [width: 14, height: 22, paint: False, spring_range: 3]
         label: tree_scope_disclosure_row(selected: PASSED.store.active_scope == TEXT { simple_tb_s })
     )
 }
@@ -1613,8 +1616,8 @@ FUNCTION tree_scope_disclosure_row(selected) {
         style: [width: Fill, height: Fill, paint: False]
         label: Scene/Element/text(
             element: []
-            style: [width: Fill, height: Fill]
-            text: Text/empty()
+            style: [width: Fill, height: Fill, center: True]
+            text: TEXT { - }
         )
     )
 }
@@ -2127,7 +2130,6 @@ FUNCTION waveform_interaction_surface() {
                 key_down: PASSED.store.elements.keyboard_capture
             ]
             hovered: PASSED.store.elements.waveform_hover
-            target: TEXT { waveform canvas }
         ]
         style: [
             width: Fill
@@ -2135,6 +2137,7 @@ FUNCTION waveform_interaction_surface() {
             paint: False
         ]
         child: Scene/Element/text(element: [], style: [paint: False], text: Text/empty())
+        target: TEXT { waveform canvas }
     )
 }
 
@@ -2270,7 +2273,7 @@ FUNCTION selected_name_group_header_row(row) {
                             Light => TEXT { #172033 }
                         }
                     ]
-                    text: row.name
+                    text: PASSED.store.group_name
                 )
                 group_header_count_text(row: row)
                 group_header_rename_button()
@@ -2334,21 +2337,29 @@ FUNCTION selected_group_header_style(row_width) {
 FUNCTION group_header_chevron_button(row) {
     PASSED.store.group_header_collapsed |> WHEN {
         True => Scene/Element/button(
-            element: [event: [press: PASSED.store.elements.group_expand], hovered: PASSED.store.elements.group_expand]
+            element: [
+                event: [press: PASSED.store.elements.group_expand]
+                hovered: PASSED.store.elements.group_expand
+            ]
             style: row_remove_button_style(hovered: element.hovered)
             label: group_header_button_text(button_text: PASSED.store.group_header_chevron)
+            target: TEXT { Expand group }
         )
         False => Scene/Element/button(
-            element: [event: [press: PASSED.store.elements.group_toggle], hovered: PASSED.store.elements.group_toggle]
+            element: [
+                event: [press: PASSED.store.elements.group_toggle]
+                hovered: PASSED.store.elements.group_toggle
+            ]
             style: row_remove_button_style(hovered: element.hovered)
             label: group_header_button_text(button_text: PASSED.store.group_header_chevron)
+            target: TEXT { Collapse group }
         )
     }
 }
 
 FUNCTION group_header_rename_button() {
     Scene/Element/button(
-        element: [event: [press: PASSED.store.elements.group_create], hovered: PASSED.store.elements.group_create]
+        element: [event: [press: PASSED.store.elements.group_rename], hovered: PASSED.store.elements.group_rename]
         style: compact_button_style(button_width: 56, hovered: element.hovered)
         label: button_label(button_text: TEXT { Rename })
     )
@@ -3566,7 +3577,7 @@ FUNCTION selected_signal_remove_button(signal) {
         RemoveGhwCounter => selected_signal_remove_ghw_counter_button()
         RemoveGhwEnable => selected_signal_remove_ghw_enable_button()
         RemoveGhwState => selected_signal_remove_ghw_state_button()
-        __ => selected_signal_remove_data_button()
+        __ => selected_signal_remove_x_button(signal: signal)
     }
 }
 
@@ -4868,6 +4879,7 @@ FUNCTION inspector_strip() {
                     compact_inspector_row(row_label: TEXT { Request }, row_value: PASSED.store.bridge_request_compact_label, row_width: 118)
                     compact_inspector_row(row_label: TEXT { Response }, row_value: PASSED.store.bridge_response_compact_label, row_width: 104)
                     compact_inspector_row(row_label: TEXT { Match }, row_value: PASSED.store.bridge_response_status_compact_label, row_width: 82)
+                    stale_response_button()
                 }
             )
         }
@@ -4901,8 +4913,17 @@ FUNCTION inspector_panel() {
             inspector_row(row_label: TEXT { Cursor values }, row_value: PASSED.store.bridge_cursor_values_label)
             inspector_row(row_label: TEXT { Bridge policy }, row_value: PASSED.store.bridge_data_policy)
             inspector_row(row_label: TEXT { Payload bound }, row_value: PASSED.store.bridge_payload_bound_label)
+            stale_response_button()
             row_resize_controls()
         }
+    )
+}
+
+FUNCTION stale_response_button() {
+    Scene/Element/button(
+        element: [event: [press: PASSED.store.elements.stale_response_probe], hovered: PASSED.store.elements.stale_response_probe]
+        style: compact_button_style(button_width: 58, hovered: element.hovered)
+        label: button_label(button_text: TEXT { Stale })
     )
 }
 

@@ -229,3 +229,158 @@ fn event_press_pulse_is_not_payload_guard_field() {
         Some("key".to_owned())
     );
 }
+
+#[test]
+fn inline_match_over_event_derived_value_lowers_to_static_update() {
+    let source = r#"
+store: [
+    elements: [open: SOURCE, editor: SOURCE]
+    requested:
+        elements.open.event.press |> THEN { selected }
+    selected:
+        TEXT { none } |> HOLD selected {
+            elements.editor.text
+        }
+    dialog:
+        Open |> HOLD dialog {
+            requested |> WHEN { TEXT { none } => Open, __ => Closed }
+        }
+]
+"#;
+    let parsed = boon_parser::parse_source("inline-event-derived-match.bn", source).unwrap();
+    let ir = lower(&parsed).expect("inline event-derived matches must have a static schedule");
+
+    let requested = ir
+        .derived_values
+        .iter()
+        .find(|value| value.path == "store.requested")
+        .expect("request transform");
+    assert_eq!(
+        requested.sources,
+        vec!["store.elements.open"],
+        "state sampled by THEN must not become an event cause"
+    );
+    let dialog = ir
+        .possible_causes
+        .iter()
+        .find(|value| value.target == "store.dialog")
+        .expect("dialog causes");
+    assert_eq!(
+        dialog.sources,
+        vec!["store.elements.open"],
+        "transitive event transforms must preserve the original trigger only"
+    );
+
+    assert!(ir.update_branches.iter().any(|branch| {
+        branch.source == "store.elements.open"
+            && branch.target == "store.dialog"
+            && matches!(
+                &branch.expression,
+                UpdateExpression::MatchValueConst { input, arms }
+                    if input == "store.requested"
+                        && arms.iter().any(|arm| {
+                            arm.pattern == "__"
+                                && arm.output
+                                    == UpdateValueExpression::Const {
+                                        value: "Closed".to_owned(),
+                                    }
+                        })
+            )
+    }), "event-derived inline match was not lowered: {:#?}", ir.update_branches);
+}
+
+#[test]
+fn inline_text_comparison_match_preserves_literal_operand() {
+    let source = r#"
+store: [
+    elements: [remove: SOURCE]
+    key:
+        TEXT { clk } |> HOLD key {
+            elements.remove.text
+        }
+    selected:
+        True |> HOLD selected {
+            elements.remove.event.press |> THEN {
+                key == TEXT { clk } |> WHEN { True => False, False => selected }
+            }
+        }
+]
+"#;
+    let parsed = boon_parser::parse_source("inline-text-comparison-match.bn", source).unwrap();
+    let ir = lower(&parsed).expect("text comparison matches must have a static schedule");
+
+    assert!(ir.update_branches.iter().any(|branch| {
+        branch.source == "store.elements.remove"
+            && branch.target == "store.selected"
+            && matches!(
+                &branch.expression,
+                UpdateExpression::MatchInfixConst {
+                    left: UpdateValueExpression::ReadPath { path: left },
+                    op,
+                    right: UpdateValueExpression::Const { value: right },
+                    arms,
+                } if left == "store.key"
+                    && op == "=="
+                    && right == "clk"
+                    && arms.iter().any(|arm| {
+                        arm.pattern == "True"
+                            && arm.output == UpdateValueExpression::Const {
+                                value: "False".to_owned(),
+                            }
+                    })
+            )
+    }), "text comparison was not lowered as typed infix operands: {:#?}", ir.update_branches);
+}
+
+#[test]
+fn multiline_list_append_record_preserves_owned_fields() {
+    let source = r#"
+store: [
+    elements: [create: SOURCE]
+    group_to_create:
+        LATEST {
+            elements.create.event.press |> THEN { TEXT { core } }
+        }
+    groups:
+        LIST {}
+        |> List/append(item: group_to_create |> THEN {
+            [
+                name: group_to_create
+                members: TEXT { A, B }
+            ]
+        })
+        |> List/map(group, new: [name: group.name, members: group.members])
+]
+"#;
+    let parsed = boon_parser::parse_source("multiline-list-append.bn", source).unwrap();
+    let ir = lower(&parsed).expect("multiline append records must have a static schedule");
+    let append = ir
+        .list_operations
+        .iter()
+        .find(|operation| {
+            operation.list == "groups"
+                && matches!(operation.kind, ListOperationKind::Append { .. })
+        })
+        .expect("groups append operation");
+    let ListOperationKind::Append { trigger, fields } = &append.kind else {
+        unreachable!();
+    };
+    assert_eq!(trigger, "store.group_to_create");
+    assert_eq!(
+        fields,
+        &vec![
+            ListAppendField {
+                name: "name".to_owned(),
+                value: ListAppendFieldValue::Source {
+                    path: "store.group_to_create".to_owned(),
+                },
+            },
+            ListAppendField {
+                name: "members".to_owned(),
+                value: ListAppendFieldValue::Const {
+                    value: "A, B".to_owned(),
+                },
+            },
+        ]
+    );
+}

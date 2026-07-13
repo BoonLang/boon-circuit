@@ -178,6 +178,83 @@ FUNCTION new_row(item) {
 }
 
 #[test]
+fn source_event_transform_uses_the_branch_owned_by_each_source() {
+    let compiled = compile_source_text_to_machine_plan(
+        "source-event-branch-ownership.bn",
+        r#"
+store: [
+    sources: [
+        cycle: SOURCE
+        reset: SOURCE
+    ]
+    format:
+        LATEST {
+            Hexadecimal
+            sources.cycle.event.press |> THEN {
+                format |> WHEN {
+                    Hexadecimal => Binary
+                    __ => Hexadecimal
+                }
+            }
+            sources.reset.event.press |> THEN { Hexadecimal }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let field = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.format")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("format field");
+    let op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(field)))
+        .expect("format operation");
+    let PlanOpKind::DerivedValue {
+        expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+        ..
+    } = &op.kind
+    else {
+        panic!("format must lower as a source event transform: {op:#?}");
+    };
+    let reset = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.sources.reset")
+        .expect("reset source");
+    let reset_arm = arms
+        .iter()
+        .find(|arm| arm.source_id == reset.source_id)
+        .expect("reset arm");
+    let PlanRowExpression::Constant { constant_id } = &reset_arm.value else {
+        panic!("reset arm must remain a constant: {reset_arm:#?}");
+    };
+    let constant = compiled
+        .plan
+        .constants
+        .iter()
+        .find(|constant| constant.id == *constant_id)
+        .expect("reset constant");
+    assert_eq!(
+        constant.value,
+        boon_plan::PlanConstantValue::Enum {
+            value: "Hexadecimal".to_owned()
+        }
+    );
+}
+
+#[test]
 fn derived_list_input_wins_over_same_named_list_memory() {
     let compiled = compile_source_text_to_machine_plan(
         "derived-list-ownership.bn",
@@ -246,6 +323,132 @@ store: [
 }
 
 #[test]
+fn derived_list_map_lowers_record_returning_helper() {
+    let compiled = compile_source_text_to_machine_plan(
+        "derived-list-record-helper.bn",
+        r#"
+store: [
+    mode: Active
+    items: LIST {
+        [
+            id: TEXT { a }
+            value: 7
+        ]
+        [
+            id: TEXT { b }
+            value: 9
+        ]
+    }
+    mapped:
+        items
+        |> List/map(item, new: decorate(item: item))
+]
+
+FUNCTION decorate(item) {
+    [
+        label: item.id
+        details: [
+            value: item.value
+            state: store.mode |> WHEN {
+                Active => Enabled
+                __ => Disabled
+            }
+        ]
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let mapped = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.mapped")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("mapped field");
+    let mapped_op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(mapped)))
+        .expect("mapped operation");
+
+    assert!(matches!(
+        mapped_op.kind,
+        PlanOpKind::DerivedValue {
+            expression: Some(PlanDerivedExpression::RowExpression {
+                expression: PlanRowExpression::ListMap { .. },
+            }),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn derived_list_map_lowers_multiline_helper_pipeline() {
+    let compiled = compile_source_text_to_machine_plan(
+        "derived-list-pipeline-helper.bn",
+        r#"
+store: [
+    items: LIST {
+        [
+            id: TEXT { a }
+            family: TEXT { kept }
+        ]
+        [
+            id: TEXT { b }
+            family: TEXT { skipped }
+        ]
+    }
+    mapped: select_items(items: items)
+]
+
+FUNCTION select_items(items) {
+    items
+        |> List/filter_field_equal(field: "family", value: TEXT { kept })
+        |> List/map(item, new: [label: item.id])
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let mapped = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.mapped")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(boon_plan::FieldId)
+        .expect("mapped field");
+    let mapped_op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| op.output == Some(ValueRef::Field(mapped)))
+        .expect("mapped operation");
+
+    assert!(matches!(
+        mapped_op.kind,
+        PlanOpKind::DerivedValue {
+            expression: Some(PlanDerivedExpression::RowExpression {
+                expression: PlanRowExpression::ListMap { .. },
+            }),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn document_ids_are_stable_across_identical_compilation() {
     let path = example_path("examples/counter.bn");
     let first = compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();
@@ -257,6 +460,51 @@ fn document_ids_are_stable_across_identical_compilation() {
         plan_sha256(&first.plan).unwrap(),
         plan_sha256(&second.plan).unwrap()
     );
+}
+
+#[test]
+fn document_record_helper_ignores_nested_conditional_delimiters() {
+    let compiled = compile_source_text_to_machine_plan(
+        "document-style-helper.bn",
+        r#"
+store: [mode: Dark]
+
+FUNCTION divider_style() {
+    [
+        width: 4
+        height: Fill
+        background: [color: store.mode |> WHEN {
+            Dark => TEXT { #25344f }
+            Light => TEXT { #c9d7ea }
+        }]
+        __hover_gloss: 0.02
+    ]
+}
+
+document: Document/new(
+    root: Element/container(
+        element: []
+        style: divider_style()
+        child: Element/label(element: [], style: [], label: TEXT { Divider })
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert!(document.functions.iter().any(|function| {
+        let DocumentExprOp::Record { fields } = &document.expressions[function.body.0].op else {
+            return false;
+        };
+        let names = fields
+            .iter()
+            .filter_map(|field| field.name)
+            .map(|name| document.names[name.0].as_str())
+            .collect::<Vec<_>>();
+        names == ["width", "height", "background", "__hover_gloss"]
+    }));
 }
 
 #[test]

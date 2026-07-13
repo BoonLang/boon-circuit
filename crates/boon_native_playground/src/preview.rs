@@ -931,7 +931,8 @@ async fn run_test(
                     step.source_path, step.target_text
                 )
             })?;
-        for next in test_cursor_path(*cursor, (target.center_x, target.center_y)) {
+        let target_point = test_step_pointer_position(view, &target, step);
+        for next in test_cursor_path(*cursor, target_point) {
             *cursor = next;
             let hover_target = view.hit_target(cursor.0, cursor.1);
             let changed = runtime.handle_event(
@@ -963,7 +964,7 @@ async fn run_test(
             .await?;
         }
         let final_target = view
-            .hit_target(target.center_x, target.center_y)
+            .hit_target(target_point.0, target_point.1)
             .ok_or_else(|| format!("TEST cursor ended outside target `{}`", target.node))?;
         let same_source = target
             .source_path
@@ -973,7 +974,7 @@ async fn run_test(
         if !same_target {
             return Err(format!(
                 "TEST cursor resolved `{}` instead of `{}` at ({:.1}, {:.1})",
-                final_target.node, target.node, target.center_x, target.center_y
+                final_target.node, target.node, target_point.0, target_point.1
             )
             .into());
         }
@@ -1010,8 +1011,8 @@ async fn run_test(
             ] {
                 let event = HostEvent::Pointer(PointerEvent {
                     surface: surface.clone(),
-                    x: target.center_x,
-                    y: target.center_y,
+                    x: target_point.0,
+                    y: target_point.1,
                     phase,
                     button: Some(PointerButton::Primary),
                 });
@@ -1121,6 +1122,56 @@ async fn run_test(
         completed += 1;
     }
     Ok(completed)
+}
+
+pub(crate) fn test_step_pointer_position(
+    view: &RetainedView,
+    target: &HitTarget,
+    step: &TestStep,
+) -> (f32, f32) {
+    let Some(bounds) = view.node_bounds(&target.node) else {
+        return (target.center_x, target.center_y);
+    };
+    (
+        projected_test_coordinate(
+            step.pointer_x.as_deref(),
+            step.pointer_width.as_deref(),
+            bounds.x,
+            bounds.width,
+            target.center_x,
+        ),
+        projected_test_coordinate(
+            step.pointer_y.as_deref(),
+            step.pointer_height.as_deref(),
+            bounds.y,
+            bounds.height,
+            target.center_y,
+        ),
+    )
+}
+
+fn projected_test_coordinate(
+    value: Option<&str>,
+    source_span: Option<&str>,
+    target_start: f32,
+    target_span: f32,
+    fallback: f32,
+) -> f32 {
+    let Some(value) = value.and_then(|value| value.parse::<f32>().ok()) else {
+        return fallback;
+    };
+    let Some(source_span) = source_span
+        .and_then(|span| span.parse::<f32>().ok())
+        .filter(|span| span.is_finite() && *span > 0.0)
+    else {
+        return fallback;
+    };
+    if !value.is_finite() || !target_span.is_finite() || target_span <= 0.0 {
+        return fallback;
+    }
+    let inset = (target_span * 0.5).min(0.5);
+    let usable = (target_span - inset * 2.0).max(0.0);
+    target_start + inset + usable * (value / source_span).clamp(0.0, 1.0)
 }
 
 fn test_cursor_path(from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {

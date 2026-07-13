@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -53,6 +53,10 @@ pub struct TestStep {
     pub key: Option<String>,
     pub address: Option<String>,
     pub target_occurrence: Option<u64>,
+    pub pointer_x: Option<String>,
+    pub pointer_y: Option<String>,
+    pub pointer_width: Option<String>,
+    pub pointer_height: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -680,6 +684,10 @@ impl Encoder {
             self.optional_string(step.key.as_deref())?;
             self.optional_string(step.address.as_deref())?;
             self.optional_u64(step.target_occurrence);
+            self.optional_string(step.pointer_x.as_deref())?;
+            self.optional_string(step.pointer_y.as_deref())?;
+            self.optional_string(step.pointer_width.as_deref())?;
+            self.optional_string(step.pointer_height.as_deref())?;
         }
         Ok(())
     }
@@ -806,6 +814,10 @@ impl<'a> Decoder<'a> {
                     key: self.optional_string()?,
                     address: self.optional_string()?,
                     target_occurrence: self.optional_u64()?,
+                    pointer_x: self.optional_string()?,
+                    pointer_y: self.optional_string()?,
+                    pointer_width: self.optional_string()?,
+                    pointer_height: self.optional_string()?,
                 })
             })
             .collect()
@@ -916,6 +928,10 @@ mod tests {
                     key: None,
                     address: None,
                     target_occurrence: None,
+                    pointer_x: Some("216".to_owned()),
+                    pointer_y: Some("0".to_owned()),
+                    pointer_width: Some("360".to_owned()),
+                    pointer_height: Some("1".to_owned()),
                 }],
             },
             Message::Shutdown,

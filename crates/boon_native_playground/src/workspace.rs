@@ -33,6 +33,79 @@ pub struct StoredProject {
     pub units: Vec<SourceUnit>,
 }
 
+impl StoredProject {
+    pub fn add_file(&mut self, requested: &str) -> io::Result<usize> {
+        self.require_custom()?;
+        let name = normalized_custom_file_name(requested)?;
+        self.require_unique_file_name(&name, None)?;
+        self.units.push(SourceUnit {
+            path: format!("{CUSTOM_ROOT}/{}/{name}", self.id),
+            source: format!("-- {name}\n"),
+        });
+        Ok(self.units.len() - 1)
+    }
+
+    pub fn rename_file(&mut self, index: usize, requested: &str) -> io::Result<()> {
+        self.require_custom()?;
+        if index >= self.units.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source file index is out of bounds",
+            ));
+        }
+        let name = normalized_custom_file_name(requested)?;
+        self.require_unique_file_name(&name, Some(index))?;
+        self.units[index].path = format!("{CUSTOM_ROOT}/{}/{name}", self.id);
+        Ok(())
+    }
+
+    pub fn remove_file(&mut self, index: usize) -> io::Result<()> {
+        self.require_custom()?;
+        if self.units.len() <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a custom example must keep at least one source file",
+            ));
+        }
+        if index >= self.units.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source file index is out of bounds",
+            ));
+        }
+        self.units.remove(index);
+        Ok(())
+    }
+
+    fn require_custom(&self) -> io::Result<()> {
+        if self.origin == ProjectOrigin::Custom {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "versioned built-in project structure cannot be changed",
+            ))
+        }
+    }
+
+    fn require_unique_file_name(&self, name: &str, except: Option<usize>) -> io::Result<()> {
+        if self.units.iter().enumerate().any(|(index, unit)| {
+            Some(index) != except
+                && Path::new(&unit.path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(name))
+        }) {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("source file `{name}` already exists"),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct CustomManifest {
     id: String,
@@ -111,6 +184,11 @@ impl ProjectStore {
         }
         let directory = self.custom_root.join(&project.id);
         fs::create_dir_all(&directory)?;
+        let previous_files = fs::read_to_string(directory.join("example.toml"))
+            .ok()
+            .and_then(|manifest| toml::from_str::<CustomManifest>(&manifest).ok())
+            .map(|manifest| manifest.files)
+            .unwrap_or_default();
         let mut files = Vec::with_capacity(project.units.len());
         for unit in &project.units {
             let name = safe_file_name(&unit.path)?;
@@ -120,10 +198,21 @@ impl ProjectStore {
         let manifest = toml::to_string_pretty(&CustomManifest {
             id: project.id.clone(),
             label: project.label.clone(),
-            files,
+            files: files.clone(),
         })
         .map_err(io::Error::other)?;
-        atomic_write(&directory.join("example.toml"), manifest.as_bytes())
+        atomic_write(&directory.join("example.toml"), manifest.as_bytes())?;
+        for stale in previous_files
+            .into_iter()
+            .filter(|previous| !files.iter().any(|file| file == previous))
+        {
+            let stale = normalized_custom_file_name(&stale)?;
+            let path = directory.join(stale);
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn save_built_in(&self, project: &StoredProject) -> io::Result<()> {
@@ -319,6 +408,27 @@ fn safe_file_name(path: &str) -> io::Result<String> {
     Ok(name.to_owned())
 }
 
+pub fn normalized_custom_file_name(requested: &str) -> io::Result<String> {
+    let mut name = requested.trim().to_owned();
+    if !name.to_ascii_lowercase().ends_with(".bn") {
+        name.push_str(".bn");
+    }
+    if name.is_empty()
+        || name.len() > 64
+        || name == "example.toml"
+        || name.starts_with('.')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file name must use 1-64 letters, numbers, dots, dashes, or underscores and end in .bn",
+        ));
+    }
+    Ok(name)
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension(format!(
         "{}.tmp",
@@ -343,9 +453,52 @@ mod tests {
         ));
         fs::create_dir_all(root.join("examples")).unwrap();
         let store = ProjectStore::at(root.clone()).unwrap();
-        let project = store.create_custom(std::iter::empty());
+        let mut project = store.create_custom(std::iter::empty());
         store.save_custom(&project).unwrap();
+        assert_eq!(store.load_custom().unwrap(), vec![project.clone()]);
+        project.label = "Renamed example".to_owned();
+        let added = project.add_file("Model").unwrap();
+        assert_eq!(added, 1);
+        project.units[added].source = "model: []\n".to_owned();
+        store.save_custom(&project).unwrap();
+        assert!(
+            root.join("playground/custom_examples/custom-1/Model.bn")
+                .exists()
+        );
+        project.rename_file(added, "Store.bn").unwrap();
+        store.save_custom(&project).unwrap();
+        assert!(
+            !root
+                .join("playground/custom_examples/custom-1/Model.bn")
+                .exists()
+        );
+        assert!(
+            root.join("playground/custom_examples/custom-1/Store.bn")
+                .exists()
+        );
+        project.remove_file(added).unwrap();
+        store.save_custom(&project).unwrap();
+        assert!(
+            !root
+                .join("playground/custom_examples/custom-1/Store.bn")
+                .exists()
+        );
         assert_eq!(store.load_custom().unwrap(), vec![project]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_file_names_and_last_file_are_guarded() {
+        assert_eq!(normalized_custom_file_name("Model").unwrap(), "Model.bn");
+        assert!(normalized_custom_file_name("../Model.bn").is_err());
+        let store = ProjectStore::at(
+            std::env::temp_dir().join(format!("boon-custom-guards-{}", std::process::id())),
+        )
+        .unwrap();
+        let mut project = store.create_custom(std::iter::empty());
+        assert!(project.remove_file(0).is_err());
+        project.add_file("model").unwrap();
+        assert!(project.add_file("MODEL.BN").is_err());
+        let _ = fs::remove_dir_all(store.repo_root);
     }
 }

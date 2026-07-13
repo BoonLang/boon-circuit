@@ -17,7 +17,14 @@ pub const DEV_TEST: &str = "dev.test";
 pub const DEV_SAVE: &str = "dev.save";
 pub const DEV_FORMAT: &str = "dev.format";
 pub const DEV_NEW: &str = "dev.new";
+pub const DEV_RENAME: &str = "dev.rename";
+pub const DEV_RENAME_INPUT: &str = "dev.rename.input";
+pub const DEV_RENAME_SAVE: &str = "dev.rename.save";
+pub const DEV_RENAME_CANCEL: &str = "dev.rename.cancel";
 pub const DEV_REMOVE: &str = "dev.remove";
+pub const DEV_FILE_NEW: &str = "dev.file.new";
+pub const DEV_FILE_RENAME: &str = "dev.file.rename";
+pub const DEV_FILE_REMOVE: &str = "dev.file.remove";
 pub const DEV_EDITOR: &str = "dev.editor";
 
 const EDITOR_LINE_HEIGHT: f64 = 23.0;
@@ -55,6 +62,8 @@ pub struct DevFrameState<'a> {
     pub source_paths: &'a [String],
     pub active_file: usize,
     pub buffer: &'a Buffer,
+    pub rename_buffer: Option<&'a Buffer>,
+    pub rename_prompt: Option<&'a str>,
     pub editor_scroll: f32,
     pub language: Option<&'a LanguageSnapshot>,
     pub inspector: InspectorState<'a>,
@@ -90,12 +99,7 @@ fn add_header(frame: &mut DocumentFrame) {
         .insert("border_bottom_width".into(), number(1.0));
     add(frame, "dev.root", header);
 
-    let mut brand = label("dev.brand", "BOON", "dev.header");
-    brand.style.insert("width".into(), number(70.0));
-    brand.style.insert("font_size".into(), number(12.0));
-    brand.style.insert("font_weight".into(), text("700"));
-    brand.style.insert("color".into(), text(DEV_ACCENT));
-    add(frame, "dev.header", brand);
+    add_brand(frame);
 
     for (id, label, width, accent) in [
         (DEV_TEST, "TEST", 52.0, true),
@@ -114,11 +118,37 @@ fn add_header(frame: &mut DocumentFrame) {
     let mut spacer = label("dev.header.spacer", "", "dev.header");
     spacer.style.insert("width".into(), text("Fill"));
     add(frame, "dev.header", spacer);
-    add(
-        frame,
-        "dev.header",
-        button(DEV_NEW, "+", 32.0, "dev.header", true),
-    );
+}
+
+fn add_brand(frame: &mut DocumentFrame) {
+    let mut brand = node("dev.brand", DocumentNodeKind::Row, Some("dev.header"));
+    brand.style.insert("width".into(), number(96.0));
+    brand.style.insert("height".into(), number(32.0));
+    brand.style.insert("background".into(), text("#00000000"));
+    add(frame, "dev.header", brand);
+
+    for (id, value, color, underline) in [
+        ("dev.brand.boon", "Boon", "#6cb6ff", true),
+        ("dev.brand.slash", "/", "#d2691e", false),
+        ("dev.brand.play", "play", "#fcbf49", false),
+    ] {
+        let mut part = label(id, value, "dev.brand");
+        part.style.insert("width".into(), text("Auto"));
+        part.style.insert("height".into(), text("Fill"));
+        part.style.insert("auto_padding".into(), number(0.0));
+        part.style.insert("background".into(), text("#00000000"));
+        part.style.insert("font".into(), text("JetBrains Mono"));
+        part.style.insert("font_size".into(), number(16.0));
+        part.style.insert("font_weight".into(), text("700"));
+        part.style.insert("color".into(), text(color));
+        part.style.insert("vertical_align".into(), text("Center"));
+        if underline {
+            part.style
+                .insert("underline_if".into(), StyleValue::Bool(true));
+            part.style.insert("underline_color".into(), text(color));
+        }
+        add(frame, "dev.brand", part);
+    }
 }
 
 fn add_example_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
@@ -140,10 +170,39 @@ fn add_example_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
         "dev.examples",
         button(DEV_NEXT, ">", 30.0, "dev.examples", false),
     );
+    let mut new_example = button(DEV_NEW, "+ New", 64.0, "dev.examples", true);
+    new_example
+        .style
+        .insert("accessibility_label".into(), text("Create new example"));
+    add(frame, "dev.examples", new_example);
+    if state.origin == ProjectOrigin::Custom {
+        if let Some(rename) = state
+            .rename_buffer
+            .filter(|_| state.rename_prompt == Some("Example name"))
+        {
+            add_rename_controls(frame, "dev.examples", rename, "Example name");
+        } else if state.rename_buffer.is_none() {
+            let mut rename = button(DEV_RENAME, "Rename", 62.0, "dev.examples", false);
+            rename
+                .style
+                .insert("accessibility_label".into(), text("Rename custom example"));
+            add(frame, "dev.examples", rename);
+            let mut remove = button(DEV_REMOVE, "Remove", 58.0, "dev.examples", false);
+            remove
+                .style
+                .insert("accessibility_label".into(), text("Remove custom example"));
+            add(frame, "dev.examples", remove);
+        }
+    }
 
     for entry in state.catalog {
         let id = format!("dev.example.{}", entry.id);
         let mut tab = button(&id, &entry.label, 116.0, "dev.examples", false);
+        tab.style.insert("width".into(), text("Auto"));
+        tab.style.insert("min_width".into(), number(84.0));
+        tab.style.insert("auto_padding".into(), number(12.0));
+        tab.style
+            .insert("accessibility_label".into(), text(&entry.label));
         tab.style.insert("height".into(), number(32.0));
         if entry.id == state.active_id {
             tab.style
@@ -179,6 +238,9 @@ fn add_file_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
             .and_then(|name| name.to_str())
             .unwrap_or(path);
         let mut tab = button(&id, name, 126.0, "dev.files", false);
+        tab.style.insert("width".into(), text("Auto"));
+        tab.style.insert("min_width".into(), number(64.0));
+        tab.style.insert("auto_padding".into(), number(10.0));
         tab.style.insert("height".into(), number(30.0));
         if index == state.active_file {
             tab.style.insert("background".into(), text(DEV_BG));
@@ -188,26 +250,102 @@ fn add_file_tabs(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
         add(frame, "dev.files", tab);
     }
 
-    let identity_text = format!("{}  {}", state.example_label, state.origin.badge());
-    let mut identity = label("dev.identity", &identity_text, "dev.files");
-    identity.style.insert("width".into(), text("Fill"));
-    identity.style.insert("font_size".into(), number(11.0));
-    identity.style.insert(
-        "color".into(),
-        text(if state.origin == ProjectOrigin::BuiltIn {
-            DEV_ACCENT
-        } else {
-            "#d1a6ff"
-        }),
-    );
-    add(frame, "dev.files", identity);
     if state.origin == ProjectOrigin::Custom {
-        add(
-            frame,
-            "dev.files",
-            button(DEV_REMOVE, "Remove", 58.0, "dev.files", false),
-        );
+        if let Some(rename) = state
+            .rename_buffer
+            .filter(|_| state.rename_prompt != Some("Example name"))
+        {
+            add_rename_controls(
+                frame,
+                "dev.files",
+                rename,
+                state.rename_prompt.unwrap_or("Name"),
+            );
+        } else {
+            add(
+                frame,
+                "dev.files",
+                button(DEV_FILE_NEW, "+ File", 58.0, "dev.files", true),
+            );
+            add(
+                frame,
+                "dev.files",
+                button(DEV_FILE_RENAME, "Rename", 62.0, "dev.files", false),
+            );
+            if state.source_paths.len() > 1 {
+                add(
+                    frame,
+                    "dev.files",
+                    button(DEV_FILE_REMOVE, "Remove", 58.0, "dev.files", false),
+                );
+            }
+        }
     }
+}
+
+fn add_rename_controls(frame: &mut DocumentFrame, parent: &str, buffer: &Buffer, prompt: &str) {
+    let mut prompt_node = label("dev.rename.prompt", prompt, parent);
+    prompt_node.style.insert("width".into(), text("Auto"));
+    prompt_node.style.insert("height".into(), number(30.0));
+    prompt_node.style.insert("auto_padding".into(), number(6.0));
+    prompt_node
+        .style
+        .insert("vertical_align".into(), text("Center"));
+    prompt_node.style.insert("font_size".into(), number(11.0));
+    prompt_node
+        .style
+        .insert("color".into(), text(DEV_TEXT_MUTED));
+    add(frame, parent, prompt_node);
+    let mut input = node(DEV_RENAME_INPUT, DocumentNodeKind::TextInput, Some(parent));
+    input.text = Some(TextValue {
+        text: buffer.text(),
+    });
+    input.style.insert("width".into(), number(160.0));
+    input.style.insert("height".into(), number(30.0));
+    input.style.insert("background".into(), text(EDITOR_BG));
+    input.style.insert("border".into(), text(DEV_ACCENT));
+    input.style.insert("border_width".into(), number(1.0));
+    input.style.insert("color".into(), text(DEV_TEXT));
+    input.style.insert("font_size".into(), number(12.0));
+    input.style.insert("text_inset".into(), number(6.0));
+    input.style.insert("vertical_align".into(), text("Center"));
+    input
+        .style
+        .insert("caret_visible".into(), StyleValue::Bool(true));
+    input
+        .style
+        .insert("caret_column".into(), number(buffer.caret().column as f64));
+    let selection = buffer.selection();
+    if !selection.is_collapsed() {
+        let (start, end) = if selection.anchor <= selection.head {
+            (selection.anchor.column, selection.head.column)
+        } else {
+            (selection.head.column, selection.anchor.column)
+        };
+        input
+            .style
+            .insert("selection_start".into(), number(start as f64));
+        input
+            .style
+            .insert("selection_end".into(), number(end as f64));
+        input
+            .style
+            .insert("selection_color".into(), text("#528bff55"));
+    }
+    input
+        .source_bindings
+        .push(binding(DEV_RENAME_INPUT, "edit"));
+    add(frame, parent, input);
+    add(
+        frame,
+        parent,
+        button(DEV_RENAME_SAVE, "OK", 38.0, parent, true),
+    );
+    add(
+        frame,
+        parent,
+        button(DEV_RENAME_CANCEL, "Cancel", 54.0, parent, false),
+    );
 }
 
 fn add_workspace(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
@@ -244,6 +382,7 @@ fn add_workspace(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     );
     lines.style.insert("width".into(), text("Fill"));
     lines.style.insert("height".into(), text("Fit"));
+    lines.style.insert("background".into(), text(EDITOR_BG));
     lines.style.insert("padding_top".into(), number(8.0));
     lines.style.insert("padding_bottom".into(), number(18.0));
     add(frame, DEV_EDITOR, lines);
@@ -293,6 +432,7 @@ fn add_editor_line(
     gutter.style.insert("font_size".into(), number(13.0));
     gutter.style.insert("color".into(), text(EDITOR_GUTTER));
     gutter.style.insert("text_align".into(), text("Right"));
+    gutter.style.insert("vertical_align".into(), text("Center"));
     gutter.style.insert("padding_right".into(), number(10.0));
     gutter
         .source_bindings
@@ -309,6 +449,7 @@ fn add_editor_line(
     code.style.insert("font_size".into(), number(14.0));
     code.style
         .insert("line_height".into(), number(EDITOR_LINE_HEIGHT));
+    code.style.insert("vertical_align".into(), text("Center"));
     code.style.insert("color".into(), text(EDITOR_TEXT));
     code.style.insert("text_inset".into(), number(5.0));
     code.style
@@ -397,6 +538,7 @@ fn add_inspector(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     title.style.insert("font_size".into(), number(12.0));
     title.style.insert("font_weight".into(), text("700"));
     title.style.insert("color".into(), text(DEV_ACCENT));
+    title.style.insert("vertical_align".into(), text("Center"));
     add(frame, "dev.inspector", title);
     inspector_field(frame, "Symbol", state.inspector.symbol, 44.0, "symbol");
     inspector_field(
@@ -438,6 +580,9 @@ fn inspector_field(frame: &mut DocumentFrame, name: &str, value: &str, height: f
     heading.style.insert("font_size".into(), number(11.0));
     heading.style.insert("font_weight".into(), text("600"));
     heading.style.insert("color".into(), text(DEV_TEXT_MUTED));
+    heading
+        .style
+        .insert("vertical_align".into(), text("Center"));
     add(frame, "dev.inspector", heading);
     let max_lines = ((height - 14.0) / 16.0).floor().max(1.0) as usize;
     let bounded = bounded_panel_text(if value.is_empty() { "-" } else { value }, 31, max_lines);
@@ -506,6 +651,19 @@ fn add_footer(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
     footer.style.insert("border_top".into(), text(DEV_BORDER));
     footer.style.insert("border_top_width".into(), number(1.0));
     add(frame, "dev.root", footer);
+    let identity_text = format!("{}  {}", state.example_label, state.origin.badge());
+    let mut identity = footer_label("dev.identity", &identity_text);
+    identity.style.insert("width".into(), text("Auto"));
+    identity.style.insert("auto_padding".into(), number(4.0));
+    identity.style.insert(
+        "color".into(),
+        text(if state.origin == ProjectOrigin::BuiltIn {
+            DEV_ACCENT
+        } else {
+            "#d1a6ff"
+        }),
+    );
+    add(frame, "dev.footer", identity);
     add(
         frame,
         "dev.footer",
@@ -630,6 +788,8 @@ fn button(id: &str, label: &str, width: f64, parent: &str, accent: bool) -> Docu
     button.style.insert("color".into(), text(DEV_TEXT));
     button.style.insert("font_size".into(), number(12.0));
     button.style.insert("font_weight".into(), text("600"));
+    button.style.insert("vertical_align".into(), text("Center"));
+    button.style.insert("text_align".into(), text("Center"));
     button.source_bindings.push(binding(id, "press"));
     button
 }
@@ -640,6 +800,7 @@ fn footer_label(id: &str, value: &str) -> DocumentNode {
     node.style.insert("height".into(), number(18.0));
     node.style.insert("font_size".into(), number(11.0));
     node.style.insert("color".into(), text(DEV_TEXT_MUTED));
+    node.style.insert("vertical_align".into(), text("Center"));
     node
 }
 
@@ -709,6 +870,8 @@ mod tests {
             source_paths: &paths,
             active_file: 0,
             buffer: &buffer,
+            rename_buffer: None,
+            rename_prompt: None,
             editor_scroll: 0.0,
             language: None,
             inspector: InspectorState {
@@ -732,6 +895,22 @@ mod tests {
             frame
                 .nodes
                 .contains_key(&DocumentNodeId("dev.editor.code.0".to_owned()))
+        );
+        let brand = &frame.nodes[&DocumentNodeId("dev.brand".to_owned())];
+        assert_eq!(brand.kind, DocumentNodeKind::Row);
+        assert_eq!(
+            brand
+                .children
+                .iter()
+                .map(|id| frame.nodes[id].text.as_ref().unwrap().text.as_str())
+                .collect::<String>(),
+            "Boon/play"
+        );
+        assert_eq!(
+            frame.nodes[&DocumentNodeId("dev.brand.boon".to_owned())]
+                .style
+                .get("underline_if"),
+            Some(&StyleValue::Bool(true))
         );
     }
 
@@ -780,6 +959,8 @@ mod tests {
             source_paths: &paths,
             active_file: 0,
             buffer: &buffer,
+            rename_buffer: None,
+            rename_prompt: None,
             editor_scroll: 0.0,
             language: None,
             inspector: InspectorState {
@@ -803,11 +984,185 @@ mod tests {
             &mut columns,
         )
         .unwrap();
-        for id in [DEV_PREVIOUS, DEV_NEXT] {
+        for id in [DEV_PREVIOUS, DEV_NEXT, DEV_NEW] {
             let target = view.target_for_source(id, None).expect("navigation target");
             assert!(target.center_x > 0.0 && target.center_x < 508.0);
             assert!(target.center_y > 0.0 && target.center_y < 540.0);
             assert_eq!(view.hit(target.center_x, target.center_y), Some(id));
         }
+        let new_example = view
+            .target_for_source(DEV_NEW, None)
+            .expect("new-example target");
+        assert!(
+            new_example.center_y > 40.0,
+            "new-example action must stay below native titlebar controls"
+        );
+    }
+
+    #[test]
+    fn custom_examples_expose_rename_controls_and_a_real_text_input() {
+        let catalog = vec![CatalogItem {
+            id: "custom-1".to_owned(),
+            label: "My example".to_owned(),
+            custom: true,
+        }];
+        let paths = vec![
+            "playground/custom_examples/custom-1/RUN.bn".to_owned(),
+            "playground/custom_examples/custom-1/Model.bn".to_owned(),
+        ];
+        let source = Buffer::new("document: value\n");
+        let mut rename = Buffer::new("My example");
+        rename.apply(boon_editor::Command::SelectAll);
+        let state = |rename_buffer, rename_prompt| DevFrameState {
+            catalog: &catalog,
+            active_id: "custom-1",
+            example_label: "My example",
+            origin: ProjectOrigin::Custom,
+            source_paths: &paths,
+            active_file: 0,
+            buffer: &source,
+            rename_buffer,
+            rename_prompt,
+            editor_scroll: 0.0,
+            language: None,
+            inspector: InspectorState {
+                symbol: "",
+                static_type: "",
+                detail: "",
+                current_value: "",
+            },
+            status: "Ready",
+            perf: "Preview idle",
+        };
+        let normal = dev_frame(state(None, None));
+        assert!(
+            normal
+                .nodes
+                .contains_key(&DocumentNodeId(DEV_RENAME.into()))
+        );
+        assert!(
+            normal
+                .nodes
+                .contains_key(&DocumentNodeId(DEV_REMOVE.into()))
+        );
+        for action in [DEV_FILE_NEW, DEV_FILE_RENAME, DEV_FILE_REMOVE] {
+            assert!(normal.nodes.contains_key(&DocumentNodeId(action.into())));
+        }
+
+        let editing = dev_frame(state(Some(&rename), Some("Example name")));
+        let input = &editing.nodes[&DocumentNodeId(DEV_RENAME_INPUT.into())];
+        assert_eq!(input.kind, DocumentNodeKind::TextInput);
+        assert_eq!(input.text.as_ref().unwrap().text, "My example");
+        assert_eq!(input.parent.as_ref().unwrap().0, "dev.examples");
+        assert!(
+            editing
+                .nodes
+                .contains_key(&DocumentNodeId(DEV_RENAME_SAVE.into()))
+        );
+        assert!(
+            editing
+                .nodes
+                .contains_key(&DocumentNodeId(DEV_RENAME_CANCEL.into()))
+        );
+
+        let file_editing = dev_frame(state(Some(&rename), Some("File name")));
+        assert_eq!(
+            file_editing.nodes[&DocumentNodeId(DEV_RENAME_INPUT.into())]
+                .parent
+                .as_ref()
+                .unwrap()
+                .0,
+            "dev.files"
+        );
+    }
+
+    #[test]
+    fn example_tabs_use_measured_widths_for_complete_labels() {
+        let catalog = vec![CatalogItem {
+            id: "todo_mvc_physical".to_owned(),
+            label: "TodoMVC Physical".to_owned(),
+            custom: false,
+        }];
+        let paths = vec!["examples/todo_mvc_physical/RUN.bn".to_owned()];
+        let source = Buffer::new("document: value\n");
+        let frame = dev_frame(DevFrameState {
+            catalog: &catalog,
+            active_id: "todo_mvc_physical",
+            example_label: "TodoMVC Physical",
+            origin: ProjectOrigin::BuiltIn,
+            source_paths: &paths,
+            active_file: 0,
+            buffer: &source,
+            rename_buffer: None,
+            rename_prompt: None,
+            editor_scroll: 0.0,
+            language: None,
+            inspector: InspectorState {
+                symbol: "",
+                static_type: "",
+                detail: "",
+                current_value: "",
+            },
+            status: "Ready",
+            perf: "Preview idle",
+        });
+        let id = DocumentNodeId("dev.example.todo_mvc_physical".to_owned());
+        let tab = frame.nodes.get(&id).expect("physical TodoMVC tab");
+        assert_eq!(tab.style.get("width"), Some(&text("Auto")));
+        assert_eq!(
+            tab.style.get("accessibility_label"),
+            Some(&text("TodoMVC Physical"))
+        );
+
+        let mut columns = ApproximateTextColumnMeasurer;
+        let view = RetainedView::new(
+            frame,
+            Viewport {
+                surface: 1,
+                width: 508.0,
+                height: 540.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        let bounds = view
+            .node_bounds("dev.example.todo_mvc_physical")
+            .expect("physical TodoMVC tab bounds");
+        let run = view
+            .scene()
+            .text_runs
+            .iter()
+            .find(|run| run.node == id)
+            .expect("physical TodoMVC text run");
+        let editor_lines_fill = view
+            .scene()
+            .visual_primitives
+            .iter()
+            .find(|primitive| {
+                primitive.node == DocumentNodeId("dev.editor.lines".to_owned())
+                    && primitive.primitive
+                        == boon_document::render_scene::RenderVisualPrimitiveKind::Fill
+            })
+            .expect("editor lines fill");
+        let brand_underline = view
+            .scene()
+            .visual_primitives
+            .iter()
+            .find(|primitive| {
+                primitive.node == DocumentNodeId("dev.brand.boon".to_owned())
+                    && primitive.primitive
+                        == boon_document::render_scene::RenderVisualPrimitiveKind::Underline
+            })
+            .expect("Boon brand underline");
+        let measured_text_width = "TodoMVC Physical".chars().count() as f32 * 12.0 * 0.62;
+        assert_eq!(run.text, "TodoMVC Physical");
+        assert_eq!(editor_lines_fill.color, [40, 44, 52, 255]);
+        assert_eq!(brand_underline.color, [108, 182, 255, 255]);
+        assert!(
+            bounds.width >= measured_text_width + 20.0,
+            "tab width {} must contain measured label width {measured_text_width}",
+            bounds.width
+        );
     }
 }

@@ -26,6 +26,29 @@ pub enum ObserverRole {
     Dev = 2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TestPointerPhase {
+    Move = 1,
+    Hover = 2,
+    Down = 3,
+    Up = 4,
+    State = 5,
+}
+
+impl TestPointerPhase {
+    fn decode(value: u8) -> Result<Self, ObserverError> {
+        match value {
+            1 => Ok(Self::Move),
+            2 => Ok(Self::Hover),
+            3 => Ok(Self::Down),
+            4 => Ok(Self::Up),
+            5 => Ok(Self::State),
+            _ => Err(ObserverError::InvalidEnum("test pointer phase", value)),
+        }
+    }
+}
+
 impl ObserverRole {
     fn decode(value: u8) -> Result<Self, ObserverError> {
         match value {
@@ -219,6 +242,16 @@ pub enum ObserverEvent {
         completed_steps: u32,
         message: String,
     },
+    TestPointerFrame {
+        request_id: u64,
+        step_index: u32,
+        phase: TestPointerPhase,
+        x: f32,
+        y: f32,
+        target: Option<String>,
+        runtime_sequence: u64,
+        key: FrameEvidenceKey,
+    },
     ProofRequested {
         key: FrameEvidenceKey,
         snapshot_prepare_us: u64,
@@ -259,6 +292,7 @@ impl ObserverEvent {
             Self::ProofCompleted { .. } => 9,
             Self::RoleTarget { .. } => 10,
             Self::SourceFailed { .. } => 11,
+            Self::TestPointerFrame { .. } => 12,
         }
     }
 
@@ -365,6 +399,25 @@ impl ObserverEvent {
                 out.bool(*passed);
                 out.u32(*completed_steps);
                 out.string(message)?;
+            }
+            Self::TestPointerFrame {
+                request_id,
+                step_index,
+                phase,
+                x,
+                y,
+                target,
+                runtime_sequence,
+                key,
+            } => {
+                out.u64(*request_id);
+                out.u32(*step_index);
+                out.u8(*phase as u8);
+                out.f32(*x);
+                out.f32(*y);
+                out.optional_string(target.as_deref())?;
+                out.u64(*runtime_sequence);
+                key.encode(out);
             }
             Self::ProofRequested {
                 key,
@@ -546,6 +599,16 @@ impl ObserverEvent {
                 revision: input.u64()?,
                 stage: input.string()?,
                 message: input.string()?,
+            },
+            12 => Self::TestPointerFrame {
+                request_id: input.u64()?,
+                step_index: input.u32()?,
+                phase: TestPointerPhase::decode(input.u8()?)?,
+                x: input.f32()?,
+                y: input.f32()?,
+                target: input.optional_string()?,
+                runtime_sequence: input.u64()?,
+                key: FrameEvidenceKey::decode(input)?,
             },
             _ => return Err(ObserverError::UnknownEvent(tag)),
         };
@@ -985,6 +1048,16 @@ mod tests {
                 unique_rgba_values: 3,
             }),
             error: None,
+        });
+        roundtrip(ObserverEvent::TestPointerFrame {
+            request_id: 7,
+            step_index: 2,
+            phase: TestPointerPhase::Hover,
+            x: 120.5,
+            y: 88.25,
+            target: Some("counter.increment".to_owned()),
+            runtime_sequence: 3,
+            key: key(30),
         });
         roundtrip(ObserverEvent::SourceFailed {
             revision: 9,

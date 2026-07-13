@@ -1,0 +1,5 @@
+name = "hello world"
+source = "examples/hello_world.bn"
+
+[[step]]
+id = "initial"

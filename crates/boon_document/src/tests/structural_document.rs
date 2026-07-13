@@ -317,7 +317,7 @@ fn button_with_element_label_shrinks_to_label_child() {
         .find(|item| item.node.0 == "two-button")
         .expect("second button should be laid out");
 
-    assert_eq!(one_label.bounds.width, 42.0);
+    assert_eq!(one_label.bounds.width, 23.1);
     assert_eq!(one_button.bounds.width, one_label.bounds.width);
     assert_eq!(two_button.bounds.x, one_button.bounds.width + 10.0);
     assert!(two_button.bounds.x + two_button.bounds.width < 300.0);

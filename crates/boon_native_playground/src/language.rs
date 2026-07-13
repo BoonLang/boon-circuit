@@ -389,6 +389,7 @@ fn byte_offset_for_line(source: &str, line: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn syntax_spans_preserve_the_exact_source() {
@@ -411,5 +412,35 @@ mod tests {
                 .collect::<String>(),
             "-- note"
         );
+    }
+
+    #[test]
+    fn physical_todomvc_language_analysis_stays_interactive() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("todo_mvc_physical")
+            .unwrap();
+        let file_index = example
+            .units
+            .iter()
+            .position(|unit| unit.path.ends_with("/RUN.bn"))
+            .expect("physical TodoMVC RUN.bn");
+        let started = Instant::now();
+        let snapshot = analyze(AnalysisJob {
+            revision: 1,
+            file_index,
+            units: example.units,
+        });
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "physical TodoMVC language analysis exceeded the interactive regression ceiling"
+        );
+        assert!(
+            snapshot.diagnostics.is_empty(),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        assert!(!snapshot.inspector_hints.is_empty());
     }
 }

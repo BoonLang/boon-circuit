@@ -294,6 +294,7 @@ pub struct SourcePort {
     pub path: String,
     pub scoped: bool,
     pub scope_id: Option<ScopeId>,
+    pub interval_ms: Option<u64>,
     pub payload_schema: SourcePayloadSchema,
 }
 
@@ -888,6 +889,7 @@ fn lower_with_typecheck(
             id: SourceId(id),
             scoped: source.scoped,
             scope_id: scope_id_for_path(&row_scopes, &source.path),
+            interval_ms: source.interval_ms,
             payload_schema: source_payload_schema(program, &fields, &direct_sources, &source.path),
             path: source.path.clone(),
         })
@@ -1695,6 +1697,7 @@ pub fn document_view_bindings_with_typecheck(
             id: SourceId(id),
             scoped: source.scoped,
             scope_id: scope_id_for_path(&row_scopes, &source.path),
+            interval_ms: source.interval_ms,
             payload_schema: source_payload_schema(program, &fields, &direct_sources, &source.path),
             path: source.path.clone(),
         })
@@ -2399,20 +2402,17 @@ impl<'a> DocumentViewFunctionRegistry<'a> {
 
 #[derive(Clone, Default)]
 struct DocumentViewBindingContext {
-    arg_exprs: Vec<BTreeMap<String, usize>>,
-    source_bases: Vec<String>,
+    arg_exprs: BTreeMap<String, usize>,
+    source_base: Option<String>,
 }
 
 impl DocumentViewBindingContext {
     fn arg_expr(&self, name: &str) -> Option<usize> {
-        self.arg_exprs
-            .iter()
-            .rev()
-            .find_map(|scope| scope.get(name).copied())
+        self.arg_exprs.get(name).copied()
     }
 
     fn source_base(&self) -> Option<&str> {
-        self.source_bases.last().map(String::as_str)
+        self.source_base.as_deref()
     }
 
     fn with_function_call(
@@ -2448,7 +2448,7 @@ impl DocumentViewBindingContext {
             };
             scope.insert(name.to_owned(), arg.value);
         }
-        next.arg_exprs.push(scope);
+        next.arg_exprs.extend(scope);
         next
     }
 
@@ -2477,7 +2477,7 @@ impl DocumentViewBindingContext {
             };
             scope.insert(name.to_owned(), arg.value);
         }
-        next.arg_exprs.push(scope);
+        next.arg_exprs.extend(scope);
         next
     }
 
@@ -2489,42 +2489,37 @@ impl DocumentViewBindingContext {
         {
             scope.insert(first_formal.clone(), item_expr_id);
         }
-        next.arg_exprs.push(scope);
+        next.arg_exprs.extend(scope);
         next
     }
 
     fn with_local_scope(&self) -> Self {
-        let mut next = self.clone();
-        next.arg_exprs.push(BTreeMap::new());
-        next
+        self.clone()
     }
 
     fn insert_local_expr(&mut self, name: String, expr_id: usize) {
-        if let Some(scope) = self.arg_exprs.last_mut() {
-            scope.insert(name, expr_id);
-        }
+        self.arg_exprs.insert(name, expr_id);
     }
 
     fn with_source_base(&self, path: String) -> Self {
         let mut next = self.clone();
-        next.source_bases.push(path);
+        next.source_base = Some(path);
         next
     }
 
     fn cache_key(&self) -> String {
-        let mut parts = Vec::new();
-        for scope in &self.arg_exprs {
-            let scope_key = scope
-                .iter()
-                .map(|(name, expr_id)| format!("{name}:{expr_id}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            parts.push(format!("args[{scope_key}]"));
+        let mut key = self
+            .arg_exprs
+            .iter()
+            .map(|(name, expr_id)| format!("{name}:{expr_id}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        if let Some(source_base) = &self.source_base {
+            key.push_str("|source[");
+            key.push_str(source_base);
+            key.push(']');
         }
-        if !self.source_bases.is_empty() {
-            parts.push(format!("source[{}]", self.source_bases.join(">")));
-        }
-        parts.join("|")
+        key
     }
 }
 
@@ -2728,7 +2723,8 @@ fn statement_expr_can_contain_render(statement: &AstStatement) -> bool {
         AstStatementKind::Function { .. }
         | AstStatementKind::Hold { .. }
         | AstStatementKind::List { field: None, .. }
-        | AstStatementKind::Block => false,
+        | AstStatementKind::Block
+        | AstStatementKind::Spread => false,
     }
 }
 
@@ -2748,6 +2744,7 @@ fn statement_children_can_contain_render(statement: &AstStatement) -> bool {
         | AstStatementKind::Hold { .. }
         | AstStatementKind::List { field: None, .. }
         | AstStatementKind::Block
+        | AstStatementKind::Spread
         | AstStatementKind::Expression => true,
     }
 }
@@ -6376,6 +6373,10 @@ fn derived_values(
             let indexed_field = path_has_parsed_row_scope(program, &field.path);
             let list_memory_path = field_is_list_memory_path(field, program);
             !state_cells.iter().any(|cell| cell.path == field.path)
+                && !program
+                    .source_ports
+                    .iter()
+                    .any(|source| source.path == field.path)
                 && (indexed_field
                     || !list_memory_path
                     || field_is_derived_list_memory_view(field, program))
@@ -12743,6 +12744,7 @@ fn gather_field_defs_from_statements(
                 }
             }
             AstStatementKind::Block
+            | AstStatementKind::Spread
             | AstStatementKind::Expression
             | AstStatementKind::Hold { .. }
             | AstStatementKind::List { field: None, .. }
@@ -12939,7 +12941,8 @@ fn statement_is_record_constructor_block(
 fn statement_is_record_field(statement: &AstStatement) -> bool {
     matches!(
         statement.kind,
-        AstStatementKind::Field { .. }
+        AstStatementKind::Spread
+            | AstStatementKind::Field { .. }
             | AstStatementKind::Source { .. }
             | AstStatementKind::Hold { field: Some(_), .. }
             | AstStatementKind::List { field: Some(_), .. }

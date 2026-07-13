@@ -826,6 +826,7 @@ impl<'a> Checker<'a> {
             );
         }
         if !self.collect_type_hints && matches!(statement.kind, AstStatementKind::Function { .. }) {
+            self.collect_runtime_document_contracts(statement, false);
             return;
         }
         let next_in_document = in_document
@@ -891,6 +892,26 @@ impl<'a> Checker<'a> {
         }
         if let Some(saved) = saved_name_bindings {
             self.name_bindings = saved;
+        }
+    }
+
+    fn collect_runtime_document_contracts(&mut self, statement: &AstStatement, in_document: bool) {
+        let next_in_document = in_document
+            || statement_field(statement).as_deref() == Some("document")
+            || statement_field(statement).as_deref() == Some("scene")
+            || self.statement_enters_render_context(statement);
+        if next_in_document
+            && matches!(
+                statement_field(statement).as_deref(),
+                Some("root" | "child" | "items" | "children")
+            )
+        {
+            let diagnostic_count = self.diagnostics.len();
+            self.check_render_slot(statement);
+            self.diagnostics.truncate(diagnostic_count);
+        }
+        for child in &statement.children {
+            self.collect_runtime_document_contracts(child, next_in_document);
         }
     }
 
@@ -2845,13 +2866,11 @@ impl<'a> Checker<'a> {
         function: &str,
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
-        let cacheable = active_functions.is_empty();
-        if cacheable
-            && let Some(cached) = self
-                .function_return_type_cache
-                .borrow()
-                .get(function)
-                .cloned()
+        if let Some(cached) = self
+            .function_return_type_cache
+            .borrow()
+            .get(function)
+            .cloned()
         {
             return cached;
         }
@@ -2866,11 +2885,9 @@ impl<'a> Checker<'a> {
                 self.function_body_return_type(function, statement, active_functions)
             });
         active_functions.remove(function);
-        if cacheable {
-            self.function_return_type_cache
-                .borrow_mut()
-                .insert(function.to_owned(), result.clone());
-        }
+        self.function_return_type_cache
+            .borrow_mut()
+            .insert(function.to_owned(), result.clone());
         result
     }
 
@@ -5045,6 +5062,7 @@ impl Default for BuiltinSignatureRegistry {
                 .collect(),
             open_object_functions: [
                 "WHILE",
+                "Timer/interval",
                 "Widget/table",
                 "Widget/selected",
                 "Widget/rows",
@@ -8748,7 +8766,7 @@ fn collect_statement_type_hints(
                     }
                 }
             }
-            AstStatementKind::Block | AstStatementKind::Expression => {}
+            AstStatementKind::Block | AstStatementKind::Spread | AstStatementKind::Expression => {}
         }
         collect_statement_type_hints(
             program,
@@ -8938,6 +8956,7 @@ fn statement_expression_child_expr_ids(statement: &AstStatement) -> Vec<usize> {
             matches!(
                 child.kind,
                 AstStatementKind::Expression
+                    | AstStatementKind::Spread
                     | AstStatementKind::Hold { .. }
                     | AstStatementKind::List { field: None, .. }
             )

@@ -1,0 +1,28 @@
+name = "flow operators"
+source = "examples/flow_operators.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.result" = "29"
+
+[[step]]
+id = "subtract"
+user_action = { kind = "button_press", target = "subtract button", target_text = "A - B" }
+expected_source_event = { source = "store.sources.subtraction", target_text = "A - B" }
+  [step.expect_root_text]
+  "store.result" = "13"
+
+[[step]]
+id = "hide-details"
+user_action = { kind = "button_press", target = "toggle details button", target_text = "Toggle details" }
+expected_source_event = { source = "store.sources.toggle_details", target_text = "Toggle details" }
+  [step.expect_root_text]
+  "store.details" = "Details hidden"
+
+[[step]]
+id = "add"
+user_action = { kind = "button_press", target = "addition button", target_text = "A + B" }
+expected_source_event = { source = "store.sources.addition", target_text = "A + B" }
+  [step.expect_root_text]
+  "store.result" = "29"

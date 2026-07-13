@@ -1,6 +1,8 @@
 use boon_document::{
-    DocumentFrame, DocumentNodeId, DocumentNodeKind, DocumentState, LayoutDemand, StyleValue,
+    DocumentFrame, DocumentNodeId, DocumentNodeKind, DocumentState, LayoutDemand, StylePatch,
+    StyleValue, TextValue,
 };
+use boon_editor::{Buffer, Command, Position};
 use boon_host::{HostEvent, PointerButton, PointerPhase};
 use boon_runtime::{
     DocumentPatch, DocumentPatchStatus, LiveRuntime, RowId, RuntimePhaseTimings, RuntimeTurn,
@@ -13,20 +15,66 @@ use crate::view::HitTarget;
 type ViewResult<T> = Result<T, String>;
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+
+struct ScheduledSource {
+    path: String,
+    interval: Duration,
+    next: Instant,
+}
+
+struct TextInputState {
+    buffer: Buffer,
+    caret_visible: bool,
+    next_blink_at: Option<Instant>,
+}
+
+impl TextInputState {
+    fn new(text: &str) -> Self {
+        Self {
+            buffer: Buffer::new(text),
+            caret_visible: true,
+            next_blink_at: None,
+        }
+    }
+
+    fn reset(&mut self, text: &str, column: usize) {
+        self.buffer = Buffer::new(text);
+        self.buffer.set_caret(Position { line: 0, column }, false);
+        self.reset_blink();
+    }
+
+    fn reset_blink(&mut self) {
+        self.caret_visible = true;
+        self.next_blink_at = Some(Instant::now() + CARET_BLINK_INTERVAL);
+    }
+}
+
+#[derive(Default)]
+struct InputModifiers {
+    shift: bool,
+    control: bool,
+    alt: bool,
+    meta: bool,
+}
 
 pub struct RuntimeView {
     runtime: LiveRuntime,
     hovered: Option<String>,
     pressed: Option<String>,
     focused: Option<String>,
-    text_inputs: std::collections::BTreeMap<String, String>,
+    text_inputs: std::collections::BTreeMap<String, TextInputState>,
+    text_drag: Option<String>,
+    modifiers: InputModifiers,
     scroll_offsets: std::collections::BTreeMap<String, boon_document_model::ScrollState>,
     materialization_overscan: std::collections::BTreeMap<u64, std::ops::Range<u64>>,
     pending_patches: Vec<DocumentPatch>,
     sequence: u64,
     last_dispatched_source: Option<String>,
+    pending_external_url: Option<String>,
     last_primary_click: Option<(String, Instant)>,
     last_runtime_phase: RuntimePhaseTimings,
+    scheduled_sources: Vec<ScheduledSource>,
 }
 
 impl RuntimeView {
@@ -38,6 +86,17 @@ impl RuntimeView {
         let frame = runtime
             .document_frame()
             .ok_or_else(|| "mounted runtime has no document frame".to_owned())?;
+        if let Some(source) = runtime
+            .source_inventory()
+            .sources
+            .iter()
+            .find(|source| source.interval_ms == Some(0))
+        {
+            return Err(format!(
+                "scheduled source `{}` has a zero interval",
+                source.path
+            ));
+        }
         debug_assert_eq!(mounted.frame(), frame);
         let text_inputs = frame
             .nodes
@@ -46,11 +105,27 @@ impl RuntimeView {
             .map(|node| {
                 (
                     node.id.0.clone(),
-                    node.text
-                        .as_ref()
-                        .map(|text| text.text.clone())
-                        .unwrap_or_default(),
+                    TextInputState::new(
+                        node.text
+                            .as_ref()
+                            .map(|text| text.text.as_str())
+                            .unwrap_or_default(),
+                    ),
                 )
+            })
+            .collect();
+        let now = Instant::now();
+        let scheduled_sources = runtime
+            .source_inventory()
+            .sources
+            .iter()
+            .filter_map(|source| {
+                let interval = Duration::from_millis(source.interval_ms?);
+                Some(ScheduledSource {
+                    path: source.path.clone(),
+                    interval,
+                    next: now + interval,
+                })
             })
             .collect();
         Ok(Self {
@@ -59,13 +134,17 @@ impl RuntimeView {
             pressed: None,
             focused: None,
             text_inputs,
+            text_drag: None,
+            modifiers: InputModifiers::default(),
             scroll_offsets: std::collections::BTreeMap::new(),
             materialization_overscan: std::collections::BTreeMap::new(),
             pending_patches: Vec::new(),
             sequence: 0,
             last_dispatched_source: None,
+            pending_external_url: None,
             last_primary_click: None,
             last_runtime_phase: RuntimePhaseTimings::default(),
+            scheduled_sources,
         })
     }
 
@@ -99,8 +178,38 @@ impl RuntimeView {
         self.last_dispatched_source.as_deref()
     }
 
+    pub fn take_external_url(&mut self) -> Option<String> {
+        self.pending_external_url.take()
+    }
+
     pub fn last_runtime_phase(&self) -> RuntimePhaseTimings {
         self.last_runtime_phase
+    }
+
+    pub fn scheduled_source_deadline(&self) -> Option<Instant> {
+        self.scheduled_sources
+            .iter()
+            .map(|source| source.next)
+            .min()
+    }
+
+    pub fn advance_scheduled_sources(&mut self, now: Instant) -> ViewResult<bool> {
+        let mut due = Vec::new();
+        for source in &mut self.scheduled_sources {
+            if source.next > now {
+                continue;
+            }
+            due.push(source.path.clone());
+            source.next += source.interval;
+            if source.next <= now {
+                source.next = now + source.interval;
+            }
+        }
+        let mut changed = false;
+        for path in due {
+            changed |= self.dispatch_source(&path, None, SourcePayload::default())?;
+        }
+        Ok(changed)
     }
 
     pub fn inspect_root_current(&mut self, path: &str) -> ViewResult<String> {
@@ -185,12 +294,24 @@ impl RuntimeView {
         match event {
             HostEvent::Pointer(pointer) => match pointer.phase {
                 PointerPhase::Move => {
-                    let next = target.map(|target| target.node);
-                    let changed = next != self.hovered;
+                    let next = target.as_ref().map(|target| target.node.clone());
+                    let hover_changed = next != self.hovered;
                     self.hovered = next;
-                    Ok(changed)
+                    let selection_changed = if let (Some(drag), Some(target)) =
+                        (self.text_drag.clone(), target.as_ref())
+                        && target.node == drag
+                        && let Some(column) = target.text_column
+                    {
+                        self.set_text_input_caret(&drag, column, true)
+                    } else {
+                        false
+                    };
+                    Ok(hover_changed || selection_changed)
                 }
-                PointerPhase::Leave => Ok(self.hovered.take().is_some()),
+                PointerPhase::Leave => {
+                    self.text_drag = None;
+                    Ok(self.hovered.take().is_some())
+                }
                 PointerPhase::Down if pointer.button == Some(PointerButton::Primary) => {
                     let focus_requires_immediate_present = target
                         .as_ref()
@@ -205,17 +326,32 @@ impl RuntimeView {
                             &["blur", "source"],
                             SourcePayload::default(),
                         )?;
-                        self.text_inputs.remove(&previous);
+                        self.sync_text_input_from_document(&previous, None);
+                        self.queue_text_input_overlay(&previous);
                     }
                     self.focused = next_focus;
-                    self.sync_focused_text_from_document();
-                    Ok(dirty || (changed && focus_requires_immediate_present))
+                    if let Some(target) = target.as_ref().filter(|target| {
+                        self.focused.as_deref() == Some(target.node.as_str())
+                            && self.target_is_text_input(target)
+                    }) {
+                        self.sync_text_input_from_document(&target.node, target.text_column);
+                        self.text_drag = Some(target.node.clone());
+                        self.queue_text_input_overlay(&target.node);
+                    } else {
+                        self.text_drag = None;
+                    }
+                    Ok(dirty || focus_requires_immediate_present || changed)
                 }
                 PointerPhase::Up if pointer.button == Some(PointerButton::Primary) => {
+                    self.text_drag = None;
                     let matches = self.pressed.take().as_deref()
                         == target.as_ref().map(|target| target.node.as_str());
                     if matches {
                         if let Some(target) = target {
+                            if let Some(url) = self.external_url_for_node(&target.node) {
+                                self.pending_external_url = Some(url);
+                                return Ok(true);
+                            }
                             if target.source_intent.as_deref() == Some("double_click") {
                                 let now = Instant::now();
                                 let is_double_click =
@@ -266,60 +402,23 @@ impl RuntimeView {
                 Ok(true)
             }
             HostEvent::TextInput(text) => {
-                self.set_focused_text(text.text.clone());
-                self.dispatch_focused(
-                    &["change", "text", "input", "source"],
-                    SourcePayload {
-                        text: Some(text.text.clone()),
-                        ..SourcePayload::default()
-                    },
-                )
+                self.edit_focused_text(Command::InsertPlain(single_line_text(&text.text)))
             }
-            HostEvent::Ime(ime) => {
-                if let boon_host::ImeInputKind::Commit { text } = &ime.kind {
-                    self.set_focused_text(text.clone());
-                    self.dispatch_focused(
-                        &["change", "text", "input", "source"],
-                        SourcePayload {
-                            text: Some(text.clone()),
-                            ..SourcePayload::default()
-                        },
-                    )
-                } else {
-                    Ok(false)
+            HostEvent::Ime(ime) => match &ime.kind {
+                boon_host::ImeInputKind::Commit { text } => {
+                    self.edit_focused_text(Command::InsertPlain(single_line_text(text)))
                 }
-            }
-            HostEvent::Keyboard(key) if key.pressed => {
-                let value = match &key.logical_key {
-                    boon_host::LogicalKey::Character(value)
-                    | boon_host::LogicalKey::Named(value) => value.clone(),
-                    boon_host::LogicalKey::Dead(Some(value)) => value.to_string(),
-                    boon_host::LogicalKey::Dead(None) | boon_host::LogicalKey::Unidentified => {
-                        return Ok(false);
-                    }
-                };
-                let intents: &[&str] = if value == "Enter" {
-                    &["commit", "submit", "key_down", "source"]
-                } else if value == "Escape" {
-                    &["cancel", "escape", "key_down", "source"]
-                } else {
-                    &["key_down", "source"]
-                };
-                let clear_text = matches!(value.as_str(), "Enter" | "Escape");
-                let changed = self.dispatch_focused(
-                    intents,
-                    SourcePayload {
-                        key: Some(value),
-                        ..SourcePayload::default()
-                    },
-                )?;
-                if clear_text && let Some(focused) = self.focused.as_ref() {
-                    self.text_inputs.remove(focused);
-                }
-                Ok(changed)
-            }
+                boon_host::ImeInputKind::DeleteSurrounding {
+                    before_bytes,
+                    after_bytes,
+                } => self.delete_surrounding(*before_bytes, *after_bytes),
+                _ => Ok(false),
+            },
+            HostEvent::Keyboard(key) => self.handle_keyboard(key),
             HostEvent::Focus { focused: false, .. } => {
                 let previous = self.focused.take();
+                self.text_drag = None;
+                self.modifiers = InputModifiers::default();
                 let Some(previous) = previous else {
                     return Ok(false);
                 };
@@ -328,18 +427,12 @@ impl RuntimeView {
                     &["blur", "source"],
                     SourcePayload::default(),
                 )?;
-                self.text_inputs.remove(&previous);
+                self.sync_text_input_from_document(&previous, None);
+                self.queue_text_input_overlay(&previous);
                 Ok(true)
             }
             _ => Ok(false),
         }
-    }
-
-    fn dispatch_focused(&mut self, intents: &[&str], payload: SourcePayload) -> ViewResult<bool> {
-        let Some(focused) = self.focused.clone() else {
-            return Ok(false);
-        };
-        self.dispatch_node_intent(&focused, intents, payload)
     }
 
     fn dispatch_node_intent(
@@ -374,6 +467,7 @@ impl RuntimeView {
             scroll_root: None,
             center_x: 0.0,
             center_y: 0.0,
+            text_column: None,
         };
         if payload.text.is_none()
             && (matches!(binding.intent.as_str(), "commit" | "submit" | "blur")
@@ -383,7 +477,7 @@ impl RuntimeView {
             payload.text = self
                 .text_inputs
                 .get(node_id)
-                .cloned()
+                .map(|state| state.buffer.text())
                 .or_else(|| node.text.as_ref().map(|text| text.text.clone()));
         }
         self.dispatch_target(&target, payload)
@@ -398,6 +492,20 @@ impl RuntimeView {
             .document_frame()
             .and_then(|frame| frame.nodes.get(&DocumentNodeId(target.node.clone())))
             .is_some_and(|node| node.kind == DocumentNodeKind::TextInput)
+    }
+
+    fn external_url_for_node(&self, node_id: &str) -> Option<String> {
+        let value = self
+            .runtime
+            .document_frame()?
+            .nodes
+            .get(&DocumentNodeId(node_id.to_owned()))?
+            .style
+            .get("to")?;
+        let StyleValue::Text(url) = value else {
+            return None;
+        };
+        (url.starts_with("https://") || url.starts_with("http://")).then(|| url.clone())
     }
 
     fn dispatch_target(
@@ -429,8 +537,17 @@ impl RuntimeView {
                 }
             }
         }
-        self.sequence = self.sequence.saturating_add(1);
         let row = self.row_target(path, target.row_key, target.row_generation)?;
+        self.dispatch_source(path, row, payload)
+    }
+
+    fn dispatch_source(
+        &mut self,
+        path: &str,
+        row: Option<RowId>,
+        payload: SourcePayload,
+    ) -> ViewResult<bool> {
+        self.sequence = self.sequence.saturating_add(1);
         let event = self
             .runtime
             .source_event(self.sequence, path, row, payload)
@@ -450,40 +567,288 @@ impl RuntimeView {
         Ok(changed)
     }
 
-    fn set_focused_text(&mut self, text: String) {
-        let Some(focused) = self.focused.as_ref() else {
-            return;
-        };
-        if self
-            .runtime
-            .document_frame()
-            .and_then(|frame| frame.nodes.get(&DocumentNodeId(focused.clone())))
-            .is_some_and(|node| node.kind == DocumentNodeKind::TextInput)
-        {
-            self.text_inputs.insert(focused.clone(), text);
-        }
+    pub fn caret_blink_deadline(&self) -> Option<Instant> {
+        self.focused
+            .as_ref()
+            .and_then(|focused| self.text_inputs.get(focused))
+            .and_then(|state| state.next_blink_at)
     }
 
-    fn sync_focused_text_from_document(&mut self) {
-        let Some(focused) = self.focused.as_ref() else {
-            return;
+    pub fn advance_caret_blink(&mut self, now: Instant) -> bool {
+        let Some(focused) = self.focused.clone() else {
+            return false;
         };
-        let Some(node) = self
+        let Some(state) = self.text_inputs.get_mut(&focused) else {
+            return false;
+        };
+        if state.next_blink_at.is_none_or(|deadline| deadline > now) {
+            return false;
+        }
+        state.caret_visible = !state.caret_visible;
+        state.next_blink_at = Some(now + CARET_BLINK_INTERVAL);
+        self.queue_text_input_style(&focused);
+        true
+    }
+
+    fn set_text_input_caret(&mut self, id: &str, column: usize, extend: bool) -> bool {
+        let Some(state) = self.text_inputs.get_mut(id) else {
+            return false;
+        };
+        let changed = state.buffer.set_caret(Position { line: 0, column }, extend);
+        state.reset_blink();
+        self.queue_text_input_style(id);
+        let _ = changed;
+        true
+    }
+
+    fn edit_focused_text(&mut self, command: Command) -> ViewResult<bool> {
+        let Some(focused) = self.focused.clone() else {
+            return Ok(false);
+        };
+        let Some(state) = self.text_inputs.get_mut(&focused) else {
+            return Ok(false);
+        };
+        if !state.buffer.apply(command) {
+            return Ok(false);
+        }
+        state.reset_blink();
+        self.finish_focused_edit(&focused)
+    }
+
+    fn finish_focused_edit(&mut self, focused: &str) -> ViewResult<bool> {
+        let text = self
+            .text_inputs
+            .get(focused)
+            .map(|state| state.buffer.text())
+            .unwrap_or_default();
+        let runtime_changed = self.dispatch_node_intent(
+            focused,
+            &["change", "text", "input", "source"],
+            SourcePayload {
+                text: Some(text),
+                ..SourcePayload::default()
+            },
+        )?;
+        self.queue_text_input_overlay(focused);
+        let _ = runtime_changed;
+        Ok(true)
+    }
+
+    fn delete_surrounding(&mut self, before_bytes: u32, after_bytes: u32) -> ViewResult<bool> {
+        let Some(focused) = self.focused.clone() else {
+            return Ok(false);
+        };
+        let Some(state) = self.text_inputs.get_mut(&focused) else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        for _ in 0..before_bytes {
+            changed |= state.buffer.apply(Command::DeleteBackward);
+        }
+        for _ in 0..after_bytes {
+            changed |= state.buffer.apply(Command::DeleteForward);
+        }
+        if !changed {
+            return Ok(false);
+        }
+        state.reset_blink();
+        self.finish_focused_edit(&focused)
+    }
+
+    fn handle_keyboard(&mut self, key: &boon_host::KeyEvent) -> ViewResult<bool> {
+        let value = logical_key_text(&key.logical_key);
+        if update_modifier(&mut self.modifiers, &value, key.pressed) {
+            return Ok(false);
+        }
+        if !key.pressed {
+            return Ok(false);
+        }
+        let Some(focused) = self.focused.clone() else {
+            return Ok(false);
+        };
+        if !self.text_inputs.contains_key(&focused) {
+            return self.dispatch_node_intent(
+                &focused,
+                &["key_down", "source"],
+                SourcePayload {
+                    key: Some(value),
+                    ..SourcePayload::default()
+                },
+            );
+        }
+
+        let normalized = normalize_key(&value);
+        if self.modifiers.control || self.modifiers.meta {
+            match normalized.as_str() {
+                "a" => {
+                    let state = self.text_inputs.get_mut(&focused).expect("focused input");
+                    let changed = state.buffer.apply(Command::SelectAll);
+                    state.reset_blink();
+                    self.queue_text_input_style(&focused);
+                    let _ = changed;
+                    return Ok(true);
+                }
+                "c" => {
+                    self.copy_selection_to_clipboard(&focused, false)?;
+                    return Ok(false);
+                }
+                "x" => return self.copy_selection_to_clipboard(&focused, true),
+                "v" => {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new()
+                        && let Ok(text) = clipboard.get_text()
+                    {
+                        return self
+                            .edit_focused_text(Command::InsertPlain(single_line_text(&text)));
+                    }
+                    return Ok(false);
+                }
+                "z" if self.modifiers.shift => {
+                    return self.edit_focused_text(Command::Redo);
+                }
+                "z" => return self.edit_focused_text(Command::Undo),
+                "y" => return self.edit_focused_text(Command::Redo),
+                _ => return Ok(false),
+            }
+        }
+
+        let extend = self.modifiers.shift;
+        let command = match normalized.as_str() {
+            "left" => Some(Command::MoveLeft { extend }),
+            "right" => Some(Command::MoveRight { extend }),
+            "home" => Some(Command::MoveHome { extend }),
+            "end" => Some(Command::MoveEnd { extend }),
+            "backspace" => Some(Command::DeleteBackward),
+            "delete" => Some(Command::DeleteForward),
+            _ => None,
+        };
+        if let Some(command) = command {
+            if matches!(&command, Command::DeleteBackward | Command::DeleteForward) {
+                return self.edit_focused_text(command);
+            }
+            let state = self.text_inputs.get_mut(&focused).expect("focused input");
+            let changed = state.buffer.apply(command);
+            state.reset_blink();
+            self.queue_text_input_style(&focused);
+            let _ = changed;
+            return Ok(true);
+        }
+
+        if normalized == "enter" {
+            let changed = self.dispatch_node_intent(
+                &focused,
+                &["commit", "submit", "key_down", "source"],
+                SourcePayload {
+                    key: Some("Enter".to_owned()),
+                    ..SourcePayload::default()
+                },
+            )?;
+            self.sync_text_input_from_document(&focused, None);
+            self.queue_text_input_overlay(&focused);
+            let _ = changed;
+            return Ok(true);
+        }
+        if normalized == "escape" {
+            let changed = self.dispatch_node_intent(
+                &focused,
+                &["cancel", "escape", "key_down", "source"],
+                SourcePayload {
+                    key: Some("Escape".to_owned()),
+                    ..SourcePayload::default()
+                },
+            )?;
+            self.sync_text_input_from_document(&focused, None);
+            self.queue_text_input_overlay(&focused);
+            let _ = changed;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn copy_selection_to_clipboard(&mut self, focused: &str, cut: bool) -> ViewResult<bool> {
+        let Some(state) = self.text_inputs.get_mut(focused) else {
+            return Ok(false);
+        };
+        let selected = state.buffer.selected_text();
+        if selected.is_empty() {
+            return Ok(false);
+        }
+        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+            let _ = clipboard.set_text(selected);
+        }
+        if !cut || !state.buffer.apply(Command::InsertPlain(String::new())) {
+            return Ok(false);
+        }
+        state.reset_blink();
+        self.finish_focused_edit(focused)
+    }
+
+    fn sync_text_input_from_document(&mut self, id: &str, column: Option<usize>) {
+        let Some(text) = self
             .runtime
             .document_frame()
-            .and_then(|frame| frame.nodes.get(&DocumentNodeId(focused.clone())))
-        else {
-            return;
-        };
-        if node.kind == DocumentNodeKind::TextInput {
-            self.text_inputs.insert(
-                focused.clone(),
+            .and_then(|frame| frame.nodes.get(&DocumentNodeId(id.to_owned())))
+            .filter(|node| node.kind == DocumentNodeKind::TextInput)
+            .map(|node| {
                 node.text
                     .as_ref()
                     .map(|text| text.text.clone())
-                    .unwrap_or_default(),
-            );
-        }
+                    .unwrap_or_default()
+            })
+        else {
+            return;
+        };
+        let state = self
+            .text_inputs
+            .entry(id.to_owned())
+            .or_insert_with(|| TextInputState::new(&text));
+        state.reset(&text, column.unwrap_or(usize::MAX));
+    }
+
+    fn queue_text_input_overlay(&mut self, id: &str) {
+        let Some(state) = self.text_inputs.get(id) else {
+            return;
+        };
+        self.pending_patches.push(DocumentPatch::SetText {
+            id: DocumentNodeId(id.to_owned()),
+            text: TextValue {
+                text: state.buffer.text(),
+            },
+        });
+        self.queue_text_input_style(id);
+    }
+
+    fn queue_text_input_style(&mut self, id: &str) {
+        let Some(state) = self.text_inputs.get(id) else {
+            return;
+        };
+        let focused = self.focused.as_deref() == Some(id);
+        let selection = state.buffer.selection();
+        let (start, end) = if selection.anchor <= selection.head {
+            (selection.anchor.column, selection.head.column)
+        } else {
+            (selection.head.column, selection.anchor.column)
+        };
+        let mut patch = StylePatch::new();
+        patch.insert(
+            "caret_visible".to_owned(),
+            Some(StyleValue::Bool(focused && state.caret_visible)),
+        );
+        patch.insert(
+            "caret_column".to_owned(),
+            Some(StyleValue::Number(state.buffer.caret().column as f64)),
+        );
+        patch.insert(
+            "selection_start".to_owned(),
+            (focused && start != end).then_some(StyleValue::Number(start as f64)),
+        );
+        patch.insert(
+            "selection_end".to_owned(),
+            (focused && start != end).then_some(StyleValue::Number(end as f64)),
+        );
+        self.pending_patches.push(DocumentPatch::SetStyle {
+            id: DocumentNodeId(id.to_owned()),
+            patch,
+        });
     }
 
     fn sync_text_input_patch(&mut self, patch: &DocumentPatch) {
@@ -492,17 +857,20 @@ impl RuntimeView {
                 if self.focused.as_deref() != Some(node.id.0.as_str()) {
                     self.text_inputs.insert(
                         node.id.0.clone(),
-                        node.text
-                            .as_ref()
-                            .map(|text| text.text.clone())
-                            .unwrap_or_default(),
+                        TextInputState::new(
+                            node.text
+                                .as_ref()
+                                .map(|text| text.text.as_str())
+                                .unwrap_or_default(),
+                        ),
                     );
                 }
             }
             DocumentPatch::SetText { id, text }
                 if self.focused.as_deref() != Some(id.0.as_str()) =>
             {
-                self.text_inputs.insert(id.0.clone(), text.text.clone());
+                self.text_inputs
+                    .insert(id.0.clone(), TextInputState::new(&text.text));
             }
             DocumentPatch::RemoveNode { id } => {
                 self.text_inputs.remove(&id.0);
@@ -536,6 +904,57 @@ impl RuntimeView {
             .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
             .map(Some)
             .map_err(|error| error.to_string())
+    }
+}
+
+fn single_line_text(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
+}
+
+fn logical_key_text(key: &boon_host::LogicalKey) -> String {
+    match key {
+        boon_host::LogicalKey::Character(value) | boon_host::LogicalKey::Named(value) => {
+            value.clone()
+        }
+        boon_host::LogicalKey::Dead(Some(value)) => value.to_string(),
+        boon_host::LogicalKey::Dead(None) | boon_host::LogicalKey::Unidentified => String::new(),
+    }
+}
+
+fn normalize_key(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "arrowleft" | "leftarrow" => "left".to_owned(),
+        "arrowright" | "rightarrow" => "right".to_owned(),
+        "back_space" => "backspace".to_owned(),
+        "return" | "kp_enter" => "enter".to_owned(),
+        value => value.to_owned(),
+    }
+}
+
+fn update_modifier(modifiers: &mut InputModifiers, value: &str, pressed: bool) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let target = if normalized == "shift" || normalized.starts_with("shift_") {
+        Some(&mut modifiers.shift)
+    } else if matches!(normalized.as_str(), "control" | "ctrl")
+        || normalized.starts_with("control_")
+        || normalized.starts_with("ctrl_")
+    {
+        Some(&mut modifiers.control)
+    } else if normalized == "alt" || normalized.starts_with("alt_") {
+        Some(&mut modifiers.alt)
+    } else if matches!(normalized.as_str(), "meta" | "super")
+        || normalized.starts_with("meta_")
+        || normalized.starts_with("super_")
+    {
+        Some(&mut modifiers.meta)
+    } else {
+        None
+    };
+    if let Some(target) = target {
+        *target = pressed;
+        true
+    } else {
+        false
     }
 }
 
@@ -800,6 +1219,189 @@ mod tests {
         assert!(!model.apply_layout_demands(view.demands()).unwrap());
     }
 
+    #[test]
+    fn text_input_supports_caret_editing_selection_cancel_and_blink() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("cells")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/cells.bn", &units).unwrap();
+        let mount = runtime.mount();
+        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 510.0,
+                height: 540.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        converge_test_demands(&mut model, &mut view, &mut columns);
+
+        let surface = SurfaceId("preview".to_owned());
+        let mut target = view
+            .target_for_source("cell.sources.editor.change", None)
+            .expect("formula text input");
+        target.text_column = Some(0);
+        let mut focused_dirty = false;
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            focused_dirty |= model
+                .handle_event(
+                    &HostEvent::Pointer(PointerEvent {
+                        surface: surface.clone(),
+                        x: target.center_x,
+                        y: target.center_y,
+                        phase,
+                        button: Some(PointerButton::Primary),
+                    }),
+                    Some(target.clone()),
+                )
+                .unwrap();
+        }
+        assert!(focused_dirty);
+        view.apply_patches(model.take_patches(), &mut columns)
+            .unwrap();
+        view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
+            .unwrap();
+        let focused = model.focused().unwrap().to_owned();
+        assert_eq!(model.text_inputs[&focused].buffer.caret().column, 0);
+        assert!(
+            view.frame().nodes[&DocumentNodeId(focused.clone())]
+                .style
+                .get("caret_visible")
+                .is_some_and(|value| value == &StyleValue::Bool(true))
+        );
+
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: surface.clone(),
+                        text: "=".to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), "=5");
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::Keyboard(KeyEvent {
+                        surface: surface.clone(),
+                        physical_key: None,
+                        logical_key: LogicalKey::Named("BackSpace".to_owned()),
+                        pressed: true,
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), "5");
+
+        for (logical_key, pressed) in [
+            (LogicalKey::Named("Control_L".to_owned()), true),
+            (LogicalKey::Character("a".to_owned()), true),
+            (LogicalKey::Character("a".to_owned()), false),
+            (LogicalKey::Named("Control_L".to_owned()), false),
+        ] {
+            model
+                .handle_event(
+                    &HostEvent::Keyboard(KeyEvent {
+                        surface: surface.clone(),
+                        physical_key: None,
+                        logical_key,
+                        pressed,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+        assert!(
+            !model.text_inputs[&focused]
+                .buffer
+                .selection()
+                .is_collapsed()
+        );
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: surface.clone(),
+                        text: "=A1+1".to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), "=A1+1");
+
+        let blink_at = model.caret_blink_deadline().unwrap();
+        assert!(model.advance_caret_blink(blink_at + Duration::from_millis(1)));
+        view.apply_patches(model.take_patches(), &mut columns)
+            .unwrap();
+        assert!(
+            view.frame().nodes[&DocumentNodeId(focused.clone())]
+                .style
+                .get("caret_visible")
+                .is_some_and(|value| value == &StyleValue::Bool(false))
+        );
+
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::Keyboard(KeyEvent {
+                        surface: surface.clone(),
+                        physical_key: None,
+                        logical_key: LogicalKey::Named("Escape".to_owned()),
+                        pressed: true,
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), "5");
+
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: surface.clone(),
+                        text: "9".to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), "59");
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::Keyboard(KeyEvent {
+                        surface,
+                        physical_key: None,
+                        logical_key: LogicalKey::Named("Return".to_owned()),
+                        pressed: true,
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), "59");
+    }
+
     fn drive_scenario_step(
         model: &mut RuntimeView,
         view: &mut crate::view::RetainedView,
@@ -895,6 +1497,24 @@ mod tests {
             }
         }
         if let Some(text) = &step.text {
+            for (logical_key, pressed) in [
+                (LogicalKey::Named("Control_L".to_owned()), true),
+                (LogicalKey::Character("a".to_owned()), true),
+                (LogicalKey::Character("a".to_owned()), false),
+                (LogicalKey::Named("Control_L".to_owned()), false),
+            ] {
+                dirty |= model
+                    .handle_event(
+                        &HostEvent::Keyboard(KeyEvent {
+                            surface: surface.clone(),
+                            physical_key: None,
+                            logical_key,
+                            pressed,
+                        }),
+                        None,
+                    )
+                    .unwrap();
+            }
             dirty |= model
                 .handle_event(
                     &HostEvent::TextInput(TextInputEvent {
@@ -1100,6 +1720,73 @@ mod tests {
     }
 
     #[test]
+    fn basic_examples_mount_render_and_schedule_real_intervals() {
+        let catalog = crate::catalog::Catalog::load().unwrap();
+        for (example_id, expected_text) in [
+            ("minimal", "Minimal"),
+            ("hello_world", "Hello, world!"),
+            ("counter_latest", "Counter without HOLD"),
+            ("fibonacci", "Position 10 is 55"),
+            ("interval_latest", "Interval without HOLD"),
+            ("interval_hold", "Interval with HOLD"),
+            ("flow_operators", "LATEST, THEN, WHEN, WHILE"),
+            ("layers", "Front layer"),
+            ("pages", "Pages"),
+        ] {
+            let example = catalog.open(example_id).unwrap();
+            let units = example
+                .units
+                .iter()
+                .map(|unit| RuntimeSourceUnit {
+                    path: unit.path.clone(),
+                    source: unit.source.clone(),
+                })
+                .collect::<Vec<_>>();
+            let runtime =
+                LiveRuntime::from_project(&format!("examples/{example_id}.bn"), &units).unwrap();
+            let mount = runtime.mount();
+            let mut model = RuntimeView::mount(runtime, mount).unwrap();
+            let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+            let mut view = crate::view::RetainedView::new(
+                model.frame(),
+                boon_host::Viewport {
+                    surface: 1,
+                    width: 980.0,
+                    height: 760.0,
+                    scale: 1.0,
+                },
+                &mut columns,
+            )
+            .unwrap();
+            converge_test_demands(&mut model, &mut view, &mut columns);
+            assert!(
+                view.scene()
+                    .text_runs
+                    .iter()
+                    .any(|run| run.text == expected_text),
+                "{example_id} did not render {expected_text:?}; runs={:?}",
+                view.scene()
+                    .text_runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            if example_id.starts_with("interval_") {
+                let deadline = model
+                    .scheduled_source_deadline()
+                    .expect("interval example must expose a scheduled source");
+                assert!(model.advance_scheduled_sources(deadline).unwrap());
+                assert_eq!(model.inspect_root_current("store.count").unwrap(), "1");
+                view.apply_patches(model.take_patches(), &mut columns)
+                    .unwrap();
+            } else {
+                assert!(model.scheduled_source_deadline().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn counter_public_pointer_sequence_crosses_zero_without_rebuilding() {
         let example = crate::catalog::Catalog::load()
             .unwrap()
@@ -1130,7 +1817,12 @@ mod tests {
         .unwrap();
         let initial_full_lowers = view.retained_stats().full_lower_count;
 
-        for step in &example.test_steps {
+        assert_eq!(example.test_steps.len(), 6);
+        for (step, expected_count) in example
+            .test_steps
+            .iter()
+            .zip(["1", "2", "1", "0", "-1", "0"])
+        {
             let target = view
                 .target_for_source(&step.source_path, step.target_text.as_deref())
                 .unwrap_or_else(|| panic!("missing target {}", step.source_path));
@@ -1154,8 +1846,573 @@ mod tests {
                         .unwrap();
                 }
             }
+            assert_eq!(
+                model.inspect_root_current("store.count").unwrap(),
+                expected_count
+            );
+            assert_eq!(
+                model.inspect_root_current("count").unwrap(),
+                expected_count,
+                "the HOLD state name and qualified field must expose the same current value"
+            );
         }
 
         assert_eq!(view.retained_stats().full_lower_count, initial_full_lowers);
+    }
+
+    #[test]
+    fn todomvc_physical_mounts_complete_visual_structure_and_one_inline_editor() {
+        let mount_started = Instant::now();
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("todo_mvc_physical")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime =
+            LiveRuntime::from_project("examples/todo_mvc_physical/RUN.bn", &units).unwrap();
+        let mount = runtime.mount();
+        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 510.0,
+                height: 540.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        assert!(
+            mount_started.elapsed() < Duration::from_secs(10),
+            "physical TodoMVC compile, mount, and retained layout exceeded the switch regression ceiling"
+        );
+        let text_values = || {
+            view.frame()
+                .nodes
+                .values()
+                .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+                .collect::<Vec<_>>()
+        };
+        let texts = text_values();
+        assert!(
+            view.scene()
+                .text_runs
+                .iter()
+                .all(|run| run.text.parse::<f64>().is_err()),
+            "layout and material scalars must not become visual child text"
+        );
+        for expected in [
+            "todos",
+            "Read documentation",
+            "Finish TodoMVC renderer",
+            "Walk the dog",
+            "Buy groceries",
+            "3 items left",
+            "All",
+            "Active",
+            "Completed",
+            "Double-click to edit a todo",
+            "Created by",
+            "Martin Kavík",
+            "Part of",
+            "TodoMVC",
+        ] {
+            assert!(
+                texts.contains(&expected),
+                "missing mounted text `{expected}`"
+            );
+        }
+        {
+            let uniquely_visible = [
+                "todos",
+                "Read documentation",
+                "Finish TodoMVC renderer",
+                "Walk the dog",
+                "Buy groceries",
+                "3 items left",
+                "All",
+                "Active",
+                "Completed",
+                "Double-click to edit a todo",
+                "Created by",
+                "Martin Kavík",
+                "Part of",
+                "TodoMVC",
+                "Classic",
+                "Professional",
+                "Glass",
+                "Brutalist",
+                "Neumorphic",
+                "Dark mode",
+            ];
+            for expected in uniquely_visible {
+                let runs = view
+                    .scene()
+                    .text_runs
+                    .iter()
+                    .filter(|run| run.text == expected)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    runs.len(),
+                    1,
+                    "`{expected}` must produce exactly one visible text run, got {runs:?}"
+                );
+                let bounds = runs[0].bounds;
+                assert!(
+                    bounds.x >= -0.5
+                        && bounds.y >= -0.5
+                        && bounds.x + bounds.width <= 510.5
+                        && bounds.y + bounds.height <= 540.5,
+                    "`{expected}` is clipped outside the 510x540 preview: {bounds:?}"
+                );
+            }
+
+            let run = |text: &str| {
+                view.scene()
+                    .text_runs
+                    .iter()
+                    .find(|run| run.text == text)
+                    .expect("unique visible text run")
+            };
+            let todo_titles = [
+                run("Read documentation"),
+                run("Finish TodoMVC renderer"),
+                run("Walk the dog"),
+                run("Buy groceries"),
+            ];
+            for pair in todo_titles.windows(2) {
+                assert!(
+                    pair[0].bounds.y + pair[0].bounds.height <= pair[1].bounds.y + 1.0,
+                    "todo labels overlap: {:?} and {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            for pair in [
+                [run("3 items left"), run("All")],
+                [run("All"), run("Active")],
+                [run("Active"), run("Completed")],
+            ] {
+                assert!(
+                    pair[0].bounds.x + pair[0].bounds.width <= pair[1].bounds.x + 1.0,
+                    "panel footer labels overlap: {:?} and {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            assert!(
+                run("Double-click to edit a todo").bounds.y
+                    > run("3 items left").bounds.y + run("3 items left").bounds.height,
+                "instructions must be below the panel footer"
+            );
+            assert!(
+                run("Classic").bounds.y > run("TodoMVC").bounds.y + run("TodoMVC").bounds.height,
+                "theme controls must be below the reference footer"
+            );
+        }
+        assert_eq!(
+            view.frame()
+                .nodes
+                .values()
+                .filter(|node| node.kind == DocumentNodeKind::TextInput)
+                .count(),
+            1,
+            "only the new-todo input is visible before editing"
+        );
+        assert!(
+            view.scene()
+                .text_runs
+                .iter()
+                .all(|run| !run.text.contains("Reference[")),
+            "checkbox accessibility labels must not render as visual text"
+        );
+        assert!(
+            view.scene().text_runs.iter().all(|run| {
+                view.frame()
+                    .nodes
+                    .get(&run.owner_node)
+                    .is_none_or(|node| node.kind != DocumentNodeKind::Checkbox)
+            }),
+            "checkbox semantics must never become painted label text"
+        );
+        assert_eq!(
+            view.scene()
+                .visual_primitives
+                .iter()
+                .filter(|primitive| primitive.primitive
+                    == boon_document::RenderVisualPrimitiveKind::Checkbox)
+                .count(),
+            4,
+            "each todo must produce one checkbox primitive"
+        );
+        assert_eq!(
+            view.scene()
+                .visual_primitives
+                .iter()
+                .filter(|primitive| primitive.primitive
+                    == boon_document::RenderVisualPrimitiveKind::CheckboxCheckmark)
+                .count(),
+            1,
+            "the initially completed todo must produce one checkmark"
+        );
+        let bounded_content = view
+            .frame()
+            .nodes
+            .values()
+            .find(|node| {
+                node.style.get("width") == Some(&StyleValue::Text("Fill".to_owned()))
+                    && node.style.get("min_width") == Some(&StyleValue::Number(230.0))
+                    && node.style.get("max_width") == Some(&StyleValue::Number(552.0))
+            })
+            .expect("bounded TodoMVC content column");
+        let bounded_content_rect = view.node_bounds(&bounded_content.id.0).unwrap();
+        assert_eq!(bounded_content_rect.x, 16.0);
+        assert_eq!(bounded_content_rect.width, 478.0);
+
+        let node_with_text = |text: &str| {
+            view.frame()
+                .nodes
+                .values()
+                .find(|node| node.text.as_ref().is_some_and(|value| value.text == text))
+                .expect("mounted text node")
+        };
+        let title = node_with_text("Read documentation");
+        let title_label = view
+            .frame()
+            .nodes
+            .get(title.parent.as_ref().unwrap())
+            .unwrap();
+        let todo_row = view
+            .frame()
+            .nodes
+            .get(title_label.parent.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(
+            todo_row.style.get("height"),
+            Some(&StyleValue::Number(50.0))
+        );
+        assert_eq!(view.node_bounds(&todo_row.id.0).unwrap().height, 50.0);
+
+        let new_input = view
+            .frame()
+            .nodes
+            .values()
+            .find(|node| {
+                node.kind == DocumentNodeKind::TextInput
+                    && node.style.get("placeholder")
+                        == Some(&StyleValue::Text("What needs to be done?".to_owned()))
+            })
+            .expect("new todo input");
+        let new_todo_row = view
+            .frame()
+            .nodes
+            .get(new_input.parent.as_ref().unwrap())
+            .unwrap();
+        let new_todo_row_id = new_todo_row.id.clone();
+        assert_eq!(
+            new_todo_row.style.get("height"),
+            Some(&StyleValue::Number(56.0))
+        );
+        assert_eq!(view.node_bounds(&new_todo_row.id.0).unwrap().height, 56.0);
+        let all_label = node_with_text("All");
+        let all_button = view
+            .frame()
+            .nodes
+            .get(all_label.parent.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(
+            all_button.style.get("border_width"),
+            Some(&StyleValue::Number(1.0))
+        );
+        assert!(view.scene().visual_primitives.iter().any(|primitive| {
+            primitive.node == all_button.id
+                && primitive.primitive == boon_document::RenderVisualPrimitiveKind::Border
+        }));
+
+        let author = node_with_text("Martin Kavík");
+        let author_line = view
+            .frame()
+            .nodes
+            .get(author.parent.as_ref().unwrap())
+            .unwrap();
+        let author_parts = author_line
+            .children
+            .iter()
+            .filter_map(|child| view.frame().nodes.get(child)?.text.as_ref())
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(author_parts, ["Created by", " ", "Martin Kavík"]);
+
+        let links = view
+            .frame()
+            .nodes
+            .values()
+            .filter(|node| node.style.get("link") == Some(&StyleValue::Bool(true)))
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|link| {
+            matches!(link.style.get("to"), Some(StyleValue::Text(url)) if url.starts_with("http"))
+                && link.style.get("cursor") == Some(&StyleValue::Text("pointer".to_owned()))
+        }));
+        let link = links[0];
+        let link_bounds = view.node_bounds(&link.id.0).unwrap();
+        let link_target = HitTarget {
+            node: link.id.0.clone(),
+            source_path: None,
+            source_intent: None,
+            row_key: None,
+            row_generation: None,
+            scroll_root: None,
+            center_x: link_bounds.x + link_bounds.width / 2.0,
+            center_y: link_bounds.y + link_bounds.height / 2.0,
+            text_column: None,
+        };
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            model
+                .handle_event(
+                    &HostEvent::Pointer(PointerEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        x: link_target.center_x,
+                        y: link_target.center_y,
+                        phase,
+                        button: Some(PointerButton::Primary),
+                    }),
+                    Some(link_target.clone()),
+                )
+                .unwrap();
+        }
+        assert!(model.take_external_url().is_some());
+
+        let title_source = view
+            .frame()
+            .nodes
+            .values()
+            .flat_map(|node| &node.source_bindings)
+            .find(|binding| binding.intent == "double_click")
+            .map(|binding| binding.source_path.clone())
+            .expect("todo title double-click source");
+        let target = view
+            .target_for_source(&title_source, Some("Read documentation"))
+            .expect("first todo title target");
+        for _ in 0..2 {
+            for phase in [PointerPhase::Down, PointerPhase::Up] {
+                let changed = model
+                    .handle_event(
+                        &HostEvent::Pointer(PointerEvent {
+                            surface: SurfaceId("preview".to_owned()),
+                            x: target.center_x,
+                            y: target.center_y,
+                            phase,
+                            button: Some(PointerButton::Primary),
+                        }),
+                        Some(target.clone()),
+                    )
+                    .unwrap();
+                if changed {
+                    view.apply_patches(model.take_patches(), &mut columns)
+                        .unwrap();
+                    view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
+                        .unwrap();
+                }
+            }
+        }
+
+        let editing_inputs = view
+            .frame()
+            .nodes
+            .values()
+            .filter(|node| node.kind == DocumentNodeKind::TextInput)
+            .collect::<Vec<_>>();
+        assert_eq!(editing_inputs.len(), 2, "one row editor plus the new input");
+        assert_eq!(
+            editing_inputs
+                .iter()
+                .filter(|node| node
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.text == "Read documentation"))
+                .count(),
+            1,
+            "the double-clicked title is the only row editor"
+        );
+        assert_eq!(
+            view.frame()
+                .nodes
+                .values()
+                .filter(|node| {
+                    node.kind == DocumentNodeKind::Text
+                        && node
+                            .text
+                            .as_ref()
+                            .is_some_and(|text| text.text == "Read documentation")
+                })
+                .count(),
+            0,
+            "the editor replaces the title instead of rendering beside it"
+        );
+
+        let theme_source = view
+            .frame()
+            .nodes
+            .values()
+            .flat_map(|node| &node.source_bindings)
+            .find(|binding| binding.source_path.ends_with("theme_switcher.neumorphism"))
+            .map(|binding| binding.source_path.clone())
+            .expect("neumorphism theme source");
+        let theme_target = view
+            .target_for_source(&theme_source, None)
+            .expect("neumorphism theme target");
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            let changed = model
+                .handle_event(
+                    &HostEvent::Pointer(PointerEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        x: theme_target.center_x,
+                        y: theme_target.center_y,
+                        phase,
+                        button: Some(PointerButton::Primary),
+                    }),
+                    Some(theme_target.clone()),
+                )
+                .unwrap();
+            if changed {
+                view.apply_patches(model.take_patches(), &mut columns)
+                    .unwrap();
+                view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
+                    .unwrap();
+            }
+        }
+        let new_todo_row = view.frame().nodes.get(&new_todo_row_id).unwrap();
+        assert_eq!(
+            new_todo_row.style.get("height"),
+            Some(&StyleValue::Number(56.0))
+        );
+        assert_eq!(view.node_bounds(&new_todo_row.id.0).unwrap().height, 56.0);
+        for expected in [
+            "Read documentation",
+            "Finish TodoMVC renderer",
+            "Walk the dog",
+            "Buy groceries",
+            "All",
+            "Active",
+            "Completed",
+        ] {
+            assert_eq!(
+                view.scene()
+                    .text_runs
+                    .iter()
+                    .filter(|run| run.text == expected)
+                    .count(),
+                1,
+                "theme updates must not duplicate `{expected}`"
+            );
+        }
+        let author = view
+            .frame()
+            .nodes
+            .values()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text == "Martin Kavík")
+            })
+            .unwrap();
+        assert_eq!(author.style.get("size"), Some(&StyleValue::Number(11.0)));
+        assert!(author.style.contains_key("color"));
+        let title_run = view
+            .scene()
+            .text_runs
+            .iter()
+            .find(|run| run.text == "todos")
+            .expect("theme switch must retain the visible title text run");
+        assert!(
+            title_run.color[3] > 0,
+            "title text must not become transparent"
+        );
+        assert!(
+            title_run.bounds.y < 540.0,
+            "title text must remain in the viewport"
+        );
+
+        let created = view
+            .frame()
+            .nodes
+            .values()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text == "Created by")
+            })
+            .unwrap();
+        let created_bounds = view.node_bounds(&created.id.0).unwrap();
+        let author_bounds = view.node_bounds(&author.id.0).unwrap();
+        let inline_gap = author_bounds.x - (created_bounds.x + created_bounds.width);
+        assert!(
+            inline_gap <= 12.0,
+            "inline paragraph gap is {inline_gap}, created={created_bounds:?}, author={author_bounds:?}"
+        );
+
+        let mode_source = view
+            .frame()
+            .nodes
+            .values()
+            .flat_map(|node| &node.source_bindings)
+            .find(|binding| binding.source_path.ends_with("theme_switcher.mode_toggle"))
+            .map(|binding| binding.source_path.clone())
+            .expect("theme mode source");
+        let mode_target = view
+            .target_for_source(&mode_source, None)
+            .expect("theme mode target");
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            let changed = model
+                .handle_event(
+                    &HostEvent::Pointer(PointerEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        x: mode_target.center_x,
+                        y: mode_target.center_y,
+                        phase,
+                        button: Some(PointerButton::Primary),
+                    }),
+                    Some(mode_target.clone()),
+                )
+                .unwrap();
+            if changed {
+                view.apply_patches(model.take_patches(), &mut columns)
+                    .unwrap();
+                view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
+                    .unwrap();
+            }
+        }
+        let dark_title_run = view
+            .scene()
+            .text_runs
+            .iter()
+            .find(|run| run.text == "todos")
+            .expect("dark mode must retain the visible title text run");
+        assert!(
+            dark_title_run.color[..3]
+                .iter()
+                .map(|channel| u16::from(*channel))
+                .sum::<u16>()
+                > 300,
+            "dark-mode title color is too dark: {:?}",
+            dark_title_run.color
+        );
+        assert_eq!(
+            view.frame()
+                .nodes
+                .get(&new_todo_row_id)
+                .and_then(|node| node.style.get("height")),
+            Some(&StyleValue::Number(56.0))
+        );
     }
 }

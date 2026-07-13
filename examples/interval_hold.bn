@@ -1,0 +1,26 @@
+store: [
+    tick: Duration[seconds: 1] |> Timer/interval()
+
+    count:
+        0 |> HOLD count {
+            tick |> THEN { count + 1 }
+        }
+]
+
+document: Document/new(
+    root: Element/container(
+        element: []
+        style: [width: Fill, height: Fill, align: [row: Center], background: [color: Oklch[lightness:0.97]]]
+        child: Element/stripe(
+            element: []
+            direction: Column
+            gap: 12
+            style: [width: 440, height: 220, padding: 24, align: [row: Center], background: [color: Oklch[lightness:1]], border: [color: Oklch[lightness:0.84]]]
+            items: LIST {
+                Element/label(element: [], style: [height: 34, font: [size: 23, color: Oklch[lightness:0.23]]], label: TEXT { Interval with HOLD })
+                Element/label(element: [], style: [height: 74, font: [size: 58, color: Oklch[lightness:0.36,chroma:0.14,hue:35]]], label: TEXT { {store.count} })
+                Element/label(element: [], style: [height: 26, font: [size: 14, color: Oklch[lightness:0.48]]], label: TEXT { Explicit state, one tick per second })
+            }
+        )
+    )
+)

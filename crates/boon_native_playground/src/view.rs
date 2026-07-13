@@ -16,6 +16,7 @@ pub struct HitTarget {
     pub scroll_root: Option<String>,
     pub center_x: f32,
     pub center_y: f32,
+    pub text_column: Option<usize>,
 }
 
 pub struct RetainedView {
@@ -104,46 +105,77 @@ impl RetainedView {
             font_id: 0,
             pseudo_state_id: 0,
         };
-        for (ordinal, bounds) in [
+        let pointer_parts = [
             Rect {
-                x: x - 1.0,
-                y: y - 10.0,
+                x,
+                y,
                 width: 2.0,
-                height: 20.0,
+                height: 14.0,
             },
             Rect {
-                x: x - 10.0,
-                y: y - 1.0,
-                width: 20.0,
-                height: 2.0,
+                x: x + 2.0,
+                y: y + 2.0,
+                width: 2.0,
+                height: 12.0,
             },
             Rect {
-                x: x - 3.0,
-                y: y - 3.0,
-                width: 6.0,
-                height: 6.0,
+                x: x + 4.0,
+                y: y + 4.0,
+                width: 2.0,
+                height: 10.0,
             },
-        ]
-        .into_iter()
-        .enumerate()
+            Rect {
+                x: x + 6.0,
+                y: y + 6.0,
+                width: 2.0,
+                height: 8.0,
+            },
+            Rect {
+                x: x + 8.0,
+                y: y + 8.0,
+                width: 2.0,
+                height: 4.0,
+            },
+            Rect {
+                x: x + 5.0,
+                y: y + 11.0,
+                width: 3.0,
+                height: 9.0,
+            },
+        ];
+        for (layer, color) in [[255, 255, 255, 255], [24, 28, 36, 255]]
+            .into_iter()
+            .enumerate()
         {
-            scene.visual_primitives.push(RenderVisualPrimitive {
-                node: DocumentNodeId("operator.cursor".to_owned()),
-                retained_chunk_id: format!("operator-cursor-{ordinal}"),
-                source_kind: DocumentNodeKind::Root,
-                primitive: RenderVisualPrimitiveKind::Fill,
-                bounds,
-                clip: Some(scene.viewport),
-                radius: if ordinal == 2 { 3.0 } else { 0.0 },
-                stroke_width: 0.0,
-                color: [26, 115, 232, 255],
-                secondary_color: [255, 255, 255, 255],
-                antialias: 1.0,
-                control_points: Vec::new(),
-                texture: RenderTextureRef::Solid,
-                style_identity: identity,
-                dependency_set: vec!["operator-cursor".to_owned()],
-            });
+            for (part, bounds) in pointer_parts.into_iter().enumerate() {
+                let bounds = if layer == 0 {
+                    Rect {
+                        x: bounds.x - 1.0,
+                        y: bounds.y - 1.0,
+                        width: bounds.width + 2.0,
+                        height: bounds.height + 2.0,
+                    }
+                } else {
+                    bounds
+                };
+                scene.visual_primitives.push(RenderVisualPrimitive {
+                    node: DocumentNodeId("operator.cursor".to_owned()),
+                    retained_chunk_id: format!("operator-cursor-{layer}-{part}"),
+                    source_kind: DocumentNodeKind::Root,
+                    primitive: RenderVisualPrimitiveKind::Fill,
+                    bounds,
+                    clip: Some(scene.viewport),
+                    radius: 0.5,
+                    stroke_width: 0.0,
+                    color,
+                    secondary_color: [255, 255, 255, 255],
+                    antialias: 1.0,
+                    control_points: Vec::new(),
+                    texture: RenderTextureRef::Solid,
+                    style_identity: identity,
+                    dependency_set: vec!["operator-cursor".to_owned()],
+                });
+            }
         }
         scene.metrics.visual_primitive_count =
             scene.visual_primitives.len().try_into().unwrap_or(u32::MAX);
@@ -159,6 +191,23 @@ impl RetainedView {
 
     pub fn hit_target(&self, x: f32, y: f32) -> Option<HitTarget> {
         self.retained.hits().hit_test(x, y).map(hit_target)
+    }
+
+    pub fn hit_target_with_text_column(
+        &self,
+        x: f32,
+        y: f32,
+        columns: &mut impl RenderTextColumnMeasurer,
+    ) -> Option<HitTarget> {
+        let mut target = self.hit_target(x, y)?;
+        target.text_column = self
+            .retained
+            .layout()
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == target.node && item.kind == DocumentNodeKind::TextInput)
+            .map(|item| boon_document::render_scene::text_column_at(item, x, columns));
+        Some(target)
     }
 
     pub fn wheel_target(&self, x: f32, y: f32, delta_x: f32, delta_y: f32) -> Option<HitTarget> {
@@ -181,6 +230,7 @@ impl RetainedView {
                     scroll_root: Some(root),
                     center_x: x,
                     center_y: y,
+                    text_column: None,
                 });
             }
             _ => {}
@@ -383,6 +433,7 @@ fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
         scroll_root: entry.scroll_root.as_ref().map(|root| root.0.clone()),
         center_x: entry.bounds.x + entry.bounds.width * 0.5,
         center_y: entry.bounds.y + entry.bounds.height * 0.5,
+        text_column: None,
     }
 }
 
@@ -534,5 +585,44 @@ mod tests {
         assert_eq!(view.revisions(), (1, 2, 2));
         view.replace(document, viewport, &mut columns).unwrap();
         assert_eq!(view.revisions(), (2, 3, 3));
+    }
+
+    #[test]
+    fn scenario_cursor_is_a_high_contrast_pointer_with_a_stable_hotspot() {
+        let document = DocumentFrame::empty("root");
+        let viewport = Viewport {
+            surface: 1,
+            width: 320.0,
+            height: 240.0,
+            scale: 1.0,
+        };
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let view = RetainedView::new(document, viewport, &mut columns).unwrap();
+        let scene = view.scene_with_cursor(40.0, 50.0);
+        let cursor = scene
+            .visual_primitives
+            .iter()
+            .filter(|primitive| primitive.node.0 == "operator.cursor")
+            .collect::<Vec<_>>();
+        assert_eq!(cursor.len(), 12);
+        assert!(cursor.iter().all(|primitive| {
+            primitive.dependency_set == ["operator-cursor"]
+                && primitive.clip == Some(scene.viewport)
+        }));
+        assert!(
+            cursor
+                .iter()
+                .any(|primitive| primitive.color == [255, 255, 255, 255])
+        );
+        assert!(
+            cursor
+                .iter()
+                .any(|primitive| primitive.color == [24, 28, 36, 255])
+        );
+        assert!(cursor.iter().any(|primitive| {
+            primitive.color == [24, 28, 36, 255]
+                && primitive.bounds.x == 40.0
+                && primitive.bounds.y == 50.0
+        }));
     }
 }

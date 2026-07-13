@@ -1,0 +1,70 @@
+store: [
+    increment: SOURCE
+    reset: SOURCE
+
+    -- LATEST keeps the newest value. An initial arm makes this field stateful,
+    -- so this counter does not need an explicit HOLD block.
+    count:
+        LATEST {
+            0
+            increment |> THEN { count + 1 }
+            reset |> THEN { 0 }
+        }
+]
+
+document: Document/new(root: counter_app())
+
+FUNCTION counter_app() {
+    Element/container(
+        element: []
+        style: [
+            width: Fill
+            height: Fill
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.97]]
+        ]
+        child: Element/stripe(
+            element: []
+            direction: Column
+            gap: 14
+            style: [
+                width: 420
+                height: 250
+                padding: 24
+                align: [row: Center]
+                background: [color: Oklch[lightness:1]]
+                border: [color: Oklch[lightness:0.86]]
+            ]
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: [height: 32, font: [size: 22, color: Oklch[lightness:0.24]]]
+                    label: TEXT { Counter without HOLD }
+                )
+                Element/label(
+                    element: []
+                    style: [height: 72, font: [size: 58, color: Oklch[lightness:0.36,chroma:0.16,hue:145]]]
+                    label: store.count
+                )
+                Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 10
+                    style: [width: Fill, height: 42, align: [row: Center]]
+                    items: LIST {
+                        Element/button(
+                            element: [events: [press: store.reset]]
+                            style: [width: 110, height: 40, background: [color: Oklch[lightness:0.95]], border: [color: Oklch[lightness:0.78]]]
+                            label: TEXT { Reset }
+                        )
+                        Element/button(
+                            element: [events: [press: store.increment]]
+                            style: [width: 110, height: 40, background: [color: Oklch[lightness:0.90,chroma:0.06,hue:145]], border: [color: Oklch[lightness:0.62,chroma:0.12,hue:145]]]
+                            label: TEXT { Add one }
+                        )
+                    }
+                )
+            }
+        )
+    )
+}

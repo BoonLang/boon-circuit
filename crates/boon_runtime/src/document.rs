@@ -634,6 +634,14 @@ impl DocumentRuntime {
                 .entry("cursor".to_owned())
                 .or_insert_with(|| StyleValue::Text("pointer".to_owned()));
         }
+        if node.style.contains_key("to") {
+            if let Some(url) = node.style.get("to").cloned() {
+                node.style.insert("href".to_owned(), url);
+            }
+            node.style
+                .insert("cursor".to_owned(), StyleValue::Text("pointer".to_owned()));
+            node.style.insert("link".to_owned(), StyleValue::Bool(true));
+        }
         node.children = previous.children.clone();
         node.scroll = previous.scroll;
         node.materialized = previous.materialized.clone();
@@ -676,6 +684,7 @@ struct EvalEnv {
     parameters: Arc<BTreeMap<boon_plan::DocumentParameterId, EvalValue>>,
     locals: Arc<BTreeMap<boon_plan::DocumentLocalId, EvalValue>>,
     passed: Option<EvalValue>,
+    matched: BTreeMap<usize, EvalValue>,
     rows: Arc<BTreeMap<ScopeId, RowId>>,
     active_row: Option<RowId>,
     parent: Option<FrameNodeId>,
@@ -979,7 +988,15 @@ impl<'a> Evaluator<'a> {
                 let input = self.eval(*input, env)?;
                 for arm in arms {
                     if self.pattern_matches(&input, arm.pattern.clone())? {
-                        return self.eval(arm.output, env);
+                        let selector = self.runtime.plan.expressions[expression.0].compiler_id;
+                        let previous = env.matched.insert(selector, input.clone());
+                        let output = self.eval(arm.output, env);
+                        if let Some(previous) = previous {
+                            env.matched.insert(selector, previous);
+                        } else {
+                            env.matched.remove(&selector);
+                        }
+                        return output;
                     }
                 }
                 Ok(EvalValue::Null)
@@ -1114,6 +1131,16 @@ impl<'a> Evaluator<'a> {
                     Ok(self.project(env.passed.clone().unwrap_or(EvalValue::Null), &projection))
                 }
             }
+            DocumentRead::Matched {
+                selector,
+                projection,
+            } => Ok(self.project(
+                env.matched
+                    .get(&selector)
+                    .cloned()
+                    .unwrap_or(EvalValue::Null),
+                &projection,
+            )),
             DocumentRead::Row {
                 scope,
                 field,
@@ -1421,6 +1448,7 @@ impl<'a> Evaluator<'a> {
             | DocumentRead::Parameter { .. }
             | DocumentRead::Local { .. }
             | DocumentRead::Passed { .. }
+            | DocumentRead::Matched { .. }
             | DocumentRead::Row { field: None, .. }
             | DocumentRead::ElementState { .. } => None,
         }
@@ -1451,6 +1479,7 @@ impl<'a> Evaluator<'a> {
             DocumentExprOp::Read { read } => match read {
                 DocumentRead::Parameter { .. }
                 | DocumentRead::Local { .. }
+                | DocumentRead::Matched { .. }
                 | DocumentRead::ElementState { .. } => true,
                 DocumentRead::Passed { .. } => {
                     !matches!(env.passed, None | Some(EvalValue::Global))
@@ -1965,16 +1994,13 @@ impl<'a> Evaluator<'a> {
         let mut evaluated = Vec::new();
         let mut delayed = Vec::new();
         for argument in arguments {
-            let class = self.runtime.plan.expressions[argument.value.0].value_class;
             if matches!(
                 argument.role,
                 DocumentArgumentRole::Child | DocumentArgumentRole::Children
-            ) || matches!(
-                class,
-                boon_plan::DocumentValueClass::Render | boon_plan::DocumentValueClass::ChildList
             ) {
                 delayed.push(argument);
             } else {
+                let class = self.runtime.plan.expressions[argument.value.0].value_class;
                 let environment = env.clone();
                 let retain_scalar = class == boon_plan::DocumentValueClass::DynamicScalar
                     && retained_argument_role(argument.role)
@@ -2039,6 +2065,14 @@ impl<'a> Evaluator<'a> {
             node.style
                 .entry("cursor".to_owned())
                 .or_insert_with(|| StyleValue::Text("pointer".to_owned()));
+        }
+        if node.style.contains_key("to") {
+            if let Some(url) = node.style.get("to").cloned() {
+                node.style.insert("href".to_owned(), url);
+            }
+            node.style
+                .insert("cursor".to_owned(), StyleValue::Text("pointer".to_owned()));
+            node.style.insert("link".to_owned(), StyleValue::Bool(true));
         }
         self.add_node(node);
         let mut child_env = env.clone();
@@ -2154,25 +2188,61 @@ impl<'a> Evaluator<'a> {
     }
 
     fn attach_nodes(&mut self, parent: &FrameNodeId, value: EvalValue) {
-        for child in value.node_ids() {
-            if let Some(previous_parent) = self
-                .frame
-                .nodes
-                .get(&child)
-                .and_then(|node| node.parent.clone())
-                && previous_parent != *parent
-                && let Some(previous) = self.frame.nodes.get_mut(&previous_parent)
-            {
-                previous.children.retain(|candidate| candidate != &child);
+        let mut inline_ordinal = 0usize;
+        self.attach_content(parent, value, &mut inline_ordinal);
+    }
+
+    fn attach_content(
+        &mut self,
+        parent: &FrameNodeId,
+        value: EvalValue,
+        inline_ordinal: &mut usize,
+    ) {
+        match value {
+            EvalValue::Nodes(children) => {
+                for child in children {
+                    self.attach_existing_node(parent, child);
+                }
             }
-            if let Some(node) = self.frame.nodes.get_mut(&child) {
+            EvalValue::List(values) => {
+                for value in values {
+                    self.attach_content(parent, value, inline_ordinal);
+                }
+            }
+            value => {
+                let Some(text) = inline_content_text(&value).filter(|text| !text.is_empty()) else {
+                    return;
+                };
+                let child = FrameNodeId(format!("{}:inline-{inline_ordinal}", parent.0));
+                *inline_ordinal = inline_ordinal.saturating_add(1);
+                let mut node = DocumentNode::new(child.0.clone(), DocumentNodeKind::Text);
                 node.parent = Some(parent.clone());
+                node.text = Some(TextValue { text });
+                if let Some(parent_node) = self.frame.nodes.get(parent) {
+                    inherit_inline_text_style(&parent_node.style, &mut node.style);
+                }
+                self.add_node(node);
             }
-            if let Some(parent_node) = self.frame.nodes.get_mut(parent)
-                && !parent_node.children.contains(&child)
-            {
-                parent_node.children.push(child);
-            }
+        }
+    }
+
+    fn attach_existing_node(&mut self, parent: &FrameNodeId, child: FrameNodeId) {
+        if let Some(previous_parent) = self
+            .frame
+            .nodes
+            .get(&child)
+            .and_then(|node| node.parent.clone())
+            && let Some(previous) = self.frame.nodes.get_mut(&previous_parent)
+        {
+            previous.children.retain(|candidate| candidate != &child);
+        }
+        if let Some(node) = self.frame.nodes.get_mut(&child) {
+            node.parent = Some(parent.clone());
+        }
+        if let Some(parent_node) = self.frame.nodes.get_mut(parent)
+            && !parent_node.children.contains(&child)
+        {
+            parent_node.children.push(child);
         }
     }
 
@@ -2331,6 +2401,47 @@ impl EvalValue {
     }
 }
 
+fn inline_content_text(value: &EvalValue) -> Option<String> {
+    match value {
+        EvalValue::Bool(_)
+        | EvalValue::Number(_)
+        | EvalValue::Text(_)
+        | EvalValue::Bytes(_)
+        | EvalValue::Enum(_) => Some(value.text()),
+        EvalValue::Null
+        | EvalValue::Record(_)
+        | EvalValue::Tagged(_, _)
+        | EvalValue::List(_)
+        | EvalValue::Row { .. }
+        | EvalValue::Source(_)
+        | EvalValue::Nodes(_)
+        | EvalValue::Global => None,
+    }
+}
+
+fn inherit_inline_text_style(parent: &StyleMap, child: &mut StyleMap) {
+    for key in [
+        "font",
+        "font_style",
+        "font_features",
+        "weight",
+        "size",
+        "color",
+        "line_height",
+        "letter_spacing",
+        "text_clip_padding",
+        "vertical_align",
+    ] {
+        if let Some(value) = parent.get(key) {
+            child.insert(key.to_owned(), value.clone());
+        }
+    }
+    child.insert("width".to_owned(), StyleValue::Text("Auto".to_owned()));
+    child.insert("height".to_owned(), StyleValue::Text("Fill".to_owned()));
+    child.insert("auto_padding".to_owned(), StyleValue::Number(0.0));
+    child.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+}
+
 fn guard_value(value: &EvalValue) -> Option<Value> {
     match value {
         EvalValue::Null => Some(Value::Null),
@@ -2479,6 +2590,7 @@ fn eval_builtin(
     input: Option<EvalValue>,
     arguments: Vec<(Option<String>, EvalValue)>,
 ) -> EvalValue {
+    let has_input = input.is_some();
     let mut values = input
         .into_iter()
         .chain(arguments.iter().map(|(_, value)| value.clone()));
@@ -2637,12 +2749,20 @@ fn eval_builtin(
                     .all(|character| allowed.contains(character)),
             )
         }
-        DocumentBuiltin::TextConcat => EvalValue::Text(
-            std::iter::once(first)
-                .chain(values)
-                .map(|value| value.text())
-                .collect(),
-        ),
+        DocumentBuiltin::TextConcat => {
+            let separator = named_value(&arguments, "separator")
+                .map(EvalValue::text)
+                .unwrap_or_default();
+            let mut parts = vec![first.text()];
+            parts.extend(
+                arguments
+                    .iter()
+                    .skip(usize::from(!has_input))
+                    .filter(|(name, _)| name.as_deref() != Some("separator"))
+                    .map(|(_, value)| value.text()),
+            );
+            EvalValue::Text(parts.join(&separator))
+        }
         DocumentBuiltin::TextContains => EvalValue::Bool(
             first
                 .text()
@@ -2709,13 +2829,14 @@ fn constructor_kind(constructor: DocumentConstructor, direction: Option<&str>) -
                 DocumentNodeKind::Stack
             }
         }
+        DocumentConstructor::ElementParagraph | DocumentConstructor::SceneElementParagraph => {
+            DocumentNodeKind::Row
+        }
         DocumentConstructor::ElementText
         | DocumentConstructor::ElementLabel
-        | DocumentConstructor::ElementParagraph
         | DocumentConstructor::ElementLink
         | DocumentConstructor::SceneElementText
         | DocumentConstructor::SceneElementLabel
-        | DocumentConstructor::SceneElementParagraph
         | DocumentConstructor::SceneElementLink => DocumentNodeKind::Text,
         DocumentConstructor::ElementButton | DocumentConstructor::SceneElementButton => {
             DocumentNodeKind::Button
@@ -2791,6 +2912,7 @@ fn lower_style_record(record: &BTreeMap<String, EvalValue>, style: &mut StyleMap
                 }
             }
             "font" => lower_font(value, style),
+            "line" => lower_line(value, style),
             "align" => lower_align(value, style),
             "padding" | "move" => lower_spacing(name, value, style),
             "border" | "outline" => {
@@ -2809,6 +2931,7 @@ fn lower_style_record(record: &BTreeMap<String, EvalValue>, style: &mut StyleMap
                     style.insert("border_radius".to_owned(), value);
                 }
             }
+            "width" | "height" => lower_dimension(name, value, style),
             "material" => lower_material(value, style),
             "shadows" => lower_shadows(value, style),
             "glow" => lower_glow(value, style),
@@ -2844,6 +2967,29 @@ fn lower_style_record(record: &BTreeMap<String, EvalValue>, style: &mut StyleMap
     }
 }
 
+fn lower_dimension(name: &str, value: &EvalValue, style: &mut StyleMap) {
+    if let Some(value) = scalar_style_value(value) {
+        style.insert(name.to_owned(), value);
+        return;
+    }
+    let Some(fields) = record_fields(value) else {
+        return;
+    };
+    for (field, key) in [
+        ("sizing", name.to_owned()),
+        ("minimum", format!("min_{name}")),
+        ("maximum", format!("max_{name}")),
+    ] {
+        let Some(mut value) = fields.get(field).and_then(scalar_style_value) else {
+            continue;
+        };
+        if value == StyleValue::Text("Screen".to_owned()) {
+            value = StyleValue::Text("Fill".to_owned());
+        }
+        style.insert(key, value);
+    }
+}
+
 fn node_kind_hint(_style: &StyleMap) -> Option<DocumentNodeKind> {
     None
 }
@@ -2874,6 +3020,19 @@ fn lower_font(value: &EvalValue, style: &mut StyleMap) {
         if let Some(value) = scalar_style_value(value) {
             style.insert(key.to_owned(), value);
         }
+    }
+}
+
+fn lower_line(value: &EvalValue, style: &mut StyleMap) {
+    let Some(line) = record_fields(value) else {
+        return;
+    };
+    if let Some(value) = line.get("strike").and_then(scalar_style_value) {
+        style.insert("strikethrough".to_owned(), value);
+    }
+    if let Some(value) = line.get("underline").and_then(scalar_style_value) {
+        style.insert("underline_if".to_owned(), value.clone());
+        style.insert("__hover_underline_if".to_owned(), value);
     }
 }
 
@@ -3494,4 +3653,51 @@ fn diff_style(previous: &StyleMap, next: &StyleMap) -> StylePatch {
         .filter(|name| previous.get(*name) != next.get(*name))
         .map(|name| (name.clone(), next.get(name).cloned()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_concat_uses_separator_between_values_only() {
+        assert_eq!(
+            eval_builtin(
+                DocumentBuiltin::TextConcat,
+                Some(EvalValue::Number(3.0)),
+                vec![
+                    (
+                        Some("with".to_owned()),
+                        EvalValue::Text("items left".to_owned())
+                    ),
+                    (
+                        Some("separator".to_owned()),
+                        EvalValue::Text(" ".to_owned())
+                    ),
+                ],
+            ),
+            EvalValue::Text("3 items left".to_owned())
+        );
+    }
+
+    #[test]
+    fn structured_dimensions_lower_to_layout_constraints() {
+        let mut style = StyleMap::new();
+        lower_dimension(
+            "width",
+            &EvalValue::Record(BTreeMap::from([
+                ("sizing".to_owned(), EvalValue::Enum("Fill".to_owned())),
+                ("minimum".to_owned(), EvalValue::Number(230.0)),
+                ("maximum".to_owned(), EvalValue::Number(552.0)),
+            ])),
+            &mut style,
+        );
+
+        assert_eq!(
+            style.get("width"),
+            Some(&StyleValue::Text("Fill".to_owned()))
+        );
+        assert_eq!(style.get("min_width"), Some(&StyleValue::Number(230.0)));
+        assert_eq!(style.get("max_width"), Some(&StyleValue::Number(552.0)));
+    }
 }

@@ -519,8 +519,18 @@ fn semantic_node_from_document_node(
         || semantic_style_bool(&node.style, "focus") == Some(true);
     let source_binding = node.primary_source_binding();
     let source_intent = source_binding.map(|binding| binding.intent.clone());
-    let role = semantic_role_for_document_kind(&node.kind);
-    let actions = semantic_actions_for_node(&node.kind, source_intent.as_deref());
+    let link = semantic_style_bool(&node.style, "link") == Some(true)
+        || semantic_style_text_any(&node.style, &["href", "to", "url"]).is_some();
+    let role = if link {
+        SemanticRole::Link
+    } else {
+        semantic_role_for_document_kind(&node.kind)
+    };
+    let mut actions = semantic_actions_for_node(&node.kind, source_intent.as_deref());
+    if link {
+        actions.focus = true;
+        actions.press = true;
+    }
     let value = semantic_value_for_node(node, item);
     SemanticNode {
         id,
@@ -561,7 +571,7 @@ fn semantic_node_from_document_node(
                 .ok()
                 .filter(|value| (1..=6).contains(value))
         }),
-        href: semantic_style_text_any(&node.style, &["href", "url"]),
+        href: semantic_style_text_any(&node.style, &["href", "to", "url"]),
         source_binding_id: source_binding.map(|binding| binding.id.clone()),
         source_path: source_binding.map(|binding| binding.source_path.clone()),
         source_intent,
@@ -1097,6 +1107,9 @@ impl SemanticDomNode {
         if let Some(level) = node.heading_level {
             attributes.insert("aria-level".to_owned(), level.to_string());
         }
+        if let Some(href) = &node.href {
+            attributes.insert("href".to_owned(), href.clone());
+        }
 
         let (tag, role, text) = semantic_dom_shape(node, &mut attributes);
         Self {
@@ -1150,6 +1163,7 @@ fn semantic_dom_shape(
         ),
         SemanticRole::Row => ("div".to_owned(), Some("row".to_owned()), node.name.clone()),
         SemanticRole::Text => ("span".to_owned(), None, semantic_text_value(node)),
+        SemanticRole::Link => ("a".to_owned(), None, semantic_text_value(node)),
         SemanticRole::Button => ("button".to_owned(), None, node.name.clone()),
         SemanticRole::Checkbox => {
             attributes.insert("type".to_owned(), "checkbox".to_owned());
@@ -5588,7 +5602,22 @@ pub struct SimpleTextMeasurer;
 impl TextMeasurer for SimpleTextMeasurer {
     fn measure(&mut self, text: &str, font_size: f32) -> TextMetrics {
         TextMetrics {
-            width: text.chars().count() as f32 * font_size,
+            width: text.chars().count() as f32 * font_size * 0.55,
+            height: font_size * 1.4,
+        }
+    }
+
+    fn measure_styled(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        style: &BTreeMap<String, StyleValue>,
+    ) -> TextMetrics {
+        let width_factor = style_text(style, "font")
+            .filter(|family| family.to_ascii_lowercase().contains("mono"))
+            .map_or(0.55, |_| 0.62);
+        TextMetrics {
+            width: text.chars().count() as f32 * font_size * width_factor,
             height: font_size * 1.4,
         }
     }

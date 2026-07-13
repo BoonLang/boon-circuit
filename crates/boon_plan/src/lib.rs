@@ -178,6 +178,8 @@ pub struct SourceRoute {
     pub path: String,
     pub scoped: bool,
     pub scope_id: Option<ScopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<u64>,
     pub payload_schema: SourcePayloadSchema,
 }
 
@@ -953,6 +955,20 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
             .enumerate()
             .all(|(index, route)| route.id.0 == index),
         detail: format!("{} source routes", plan.source_routes.len()),
+    });
+    checks.push(PlanCheck {
+        id: "scheduled-source-intervals-positive".to_owned(),
+        pass: plan
+            .source_routes
+            .iter()
+            .all(|route| route.interval_ms.is_none_or(|interval| interval > 0)),
+        detail: format!(
+            "{} scheduled source routes",
+            plan.source_routes
+                .iter()
+                .filter(|route| route.interval_ms.is_some())
+                .count()
+        ),
     });
     checks.push(PlanCheck {
         id: "storage-slots-unique".to_owned(),

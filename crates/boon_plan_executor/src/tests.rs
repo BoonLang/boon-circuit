@@ -118,6 +118,7 @@ fn route(source: usize, scope: Option<usize>) -> SourceRoute {
         path: format!("source.{source}"),
         scoped: scope.is_some(),
         scope_id: scope.map(ScopeId),
+        interval_ms: None,
         payload_schema: SourcePayloadSchema {
             fields: Vec::new(),
             typed_fields: Vec::new(),

@@ -83,14 +83,16 @@ impl Catalog {
             .steps
             .into_iter()
             .filter_map(|step| {
-                step.source_event.map(|event| {
-                    (
-                        step.user_action_kind,
-                        step.user_action_text,
-                        step.user_action_key,
-                        event,
-                    )
-                })
+                step.user_action_kind
+                    .zip(step.source_event)
+                    .map(|(action_kind, event)| {
+                        (
+                            Some(action_kind),
+                            step.user_action_text,
+                            step.user_action_key,
+                            event,
+                        )
+                    })
             })
             .map(|(action_kind, action_text, action_key, event)| TestStep {
                 source_path: event.source,
@@ -139,5 +141,25 @@ mod tests {
                 .last()
                 .is_some_and(|unit| unit.path.ends_with("novywave/RUN.bn"))
         );
+
+        let items = catalog.items();
+        for (id, label) in [
+            ("minimal", "Minimal"),
+            ("hello_world", "Hello World"),
+            ("counter_latest", "Counter without HOLD"),
+            ("fibonacci", "Fibonacci"),
+            ("interval_latest", "Interval without HOLD"),
+            ("interval_hold", "Interval"),
+            ("flow_operators", "LATEST, THEN, WHEN, WHILE"),
+            ("layers", "Layers"),
+            ("pages", "Pages"),
+        ] {
+            assert!(
+                items
+                    .iter()
+                    .any(|item| item.id == id && item.label == label),
+                "missing built-in catalog entry {id:?}"
+            );
+        }
     }
 }

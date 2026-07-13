@@ -1,0 +1,42 @@
+document: Document/new(
+    root: Element/container(
+        element: []
+        style: [width: Fill, height: Fill, padding: 24, align: [row: Center], background: [color: Oklch[lightness:0.955]]]
+        child: Element/container(
+            element: []
+            style: [
+                width: 440
+                height: 320
+                padding: 20
+                overlay_children: True
+                background: [color: Oklch[lightness:0.16]]
+                rounded_corners: 6
+            ]
+            children: LIST {
+                layer_card(label: TEXT { Back layer }, top: 20, left: 20, hue: 25)
+                layer_card(label: TEXT { Middle layer }, top: 78, left: 82, hue: 150)
+                layer_card(label: TEXT { Front layer }, top: 136, left: 144, hue: 250)
+            }
+        )
+    )
+)
+
+FUNCTION layer_card(label, top, left, hue) {
+    Element/container(
+        element: []
+        style: [width: Fill, height: Fill, padding: [top: top, left: left]]
+        child: Element/container(
+            element: []
+            style: [
+                width: 220
+                height: 120
+                padding: 16
+                background: [color: Oklch[lightness:0.58,chroma:0.17,hue:hue]]
+                border: [color: Oklch[lightness:0.78,chroma:0.08,hue:hue]]
+                rounded_corners: 6
+                font: [size: 17, color: Oklch[lightness:0.98]]
+            ]
+            child: Element/label(element: [], style: [height: 28], label: label)
+        )
+    )
+}

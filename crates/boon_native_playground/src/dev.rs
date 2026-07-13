@@ -9,7 +9,7 @@ use boon_native_app_window::{NativeRoleResult, NativeSurfaceHost};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt, pin_mut, select};
 
-use crate::dev_state::{ClipboardAction, DevAction, DevChange, DevState};
+use crate::dev_state::{ClipboardAction, DevAction, DevChange, DevState, NameEditTarget};
 use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, input_kind,
     pointer_button_pressed,
@@ -20,9 +20,10 @@ use crate::protocol::{
     CatalogItem, Connection, FrameMode, Message, PreviewStats, ProofMode, Role, SourceUnit,
 };
 use crate::ui::{
-    DEV_EDITOR, DEV_FORMAT, DEV_NEW, DEV_NEXT, DEV_PREVIOUS, DEV_REMOVE, DEV_RESET, DEV_RUN,
-    DEV_SAVE, DEV_TEST, DevFrameState, InspectorState, dev_frame, editor_first_line,
-    editor_line_from_target,
+    DEV_EDITOR, DEV_FILE_NEW, DEV_FILE_REMOVE, DEV_FILE_RENAME, DEV_FORMAT, DEV_NEW, DEV_NEXT,
+    DEV_PREVIOUS, DEV_REMOVE, DEV_RENAME, DEV_RENAME_CANCEL, DEV_RENAME_INPUT, DEV_RENAME_SAVE,
+    DEV_RESET, DEV_RUN, DEV_SAVE, DEV_TEST, DevFrameState, InspectorState, dev_frame,
+    editor_first_line, editor_line_from_target,
 };
 use crate::view::RetainedView;
 use crate::workspace::{
@@ -42,7 +43,8 @@ struct DevModel {
     request_id: u64,
     inspect_request_id: u64,
     pending_inspection: Option<(u64, u64, String)>,
-    runtime_value_path: Option<(u64, String)>,
+    runtime_sequence: Option<(u64, u64)>,
+    runtime_value_path: Option<(u64, u64, String)>,
     language: Option<LanguageSnapshot>,
     perf: String,
     runtime_value: String,
@@ -67,6 +69,7 @@ impl DevModel {
             request_id: 0,
             inspect_request_id: 0,
             pending_inspection: None,
+            runtime_sequence: None,
             runtime_value_path: None,
             language: None,
             perf: "Preview mode idle, proof off".to_owned(),
@@ -128,6 +131,13 @@ struct InspectorOwned {
     static_type: String,
     detail: String,
     current_value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InspectionResultDisposition {
+    Ignored,
+    Applied,
+    Retry,
 }
 
 pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeRoleResult {
@@ -216,7 +226,10 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         interaction_changed |= result.change == DevChange::Interaction;
                         frame_changed |= matches!(
                             result.change,
-                            DevChange::EditorText | DevChange::EditorSelection | DevChange::Scroll
+                            DevChange::EditorText
+                                | DevChange::EditorSelection
+                                | DevChange::Rename
+                                | DevChange::Scroll
                         );
                         if result.change == DevChange::EditorText {
                             model.sync_editor(&state);
@@ -314,6 +327,9 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         };
                         model.active_file = model.active.units.len().saturating_sub(1);
                         model.revision = revision;
+                        model.pending_inspection = None;
+                        model.runtime_sequence = None;
+                        model.runtime_value_path = None;
                         model.language = None;
                         model.runtime_value = "Compiling preview...".to_owned();
                         state.replace_source(model.source());
@@ -347,20 +363,42 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         }
                         frame_changed = true;
                     }
+                    Message::PreviewRuntimeChanged {
+                        revision,
+                        runtime_sequence,
+                    } => {
+                        let inspection_active = model.pending_inspection.is_some()
+                            || model.runtime_value_path.is_some();
+                        if note_runtime_change(&mut model, revision, runtime_sequence)
+                            && inspection_active
+                        {
+                            request_inspection(&mut model, &state, &mut writer)?;
+                            frame_changed = true;
+                        }
+                    }
                     Message::PreviewInspectResult {
                         request_id,
                         revision,
+                        runtime_sequence,
                         path,
                         ok,
                         value,
                     } => {
-                        if model.pending_inspection.as_ref()
-                            == Some(&(request_id, revision, path.clone()))
-                        {
-                            model.runtime_value = if ok { value } else { value };
-                            model.runtime_value_path = Some((revision, path));
-                            model.pending_inspection = None;
-                            frame_changed = true;
+                        match apply_inspection_result(
+                            &mut model,
+                            request_id,
+                            revision,
+                            runtime_sequence,
+                            path,
+                            ok,
+                            value,
+                        ) {
+                            InspectionResultDisposition::Ignored => {}
+                            InspectionResultDisposition::Applied => frame_changed = true,
+                            InspectionResultDisposition::Retry => {
+                                request_inspection(&mut model, &state, &mut writer)?;
+                                frame_changed = true;
+                            }
                         }
                     }
                     Message::PreviewTestResult {
@@ -423,11 +461,8 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
             }
         }
         if interaction_changed || frame_changed {
-            let update = view.set_interaction_state(
-                state.hovered(),
-                state.editor_focused().then_some(DEV_EDITOR),
-                &mut columns,
-            )?;
+            let update =
+                view.set_interaction_state(state.hovered(), state.focused_target(), &mut columns)?;
             render_changed |= update.layout_changed || update.render_changed;
         }
         if render_changed {
@@ -482,12 +517,102 @@ fn handle_action(
             model.revision = model.revision.saturating_add(1);
             model.language = None;
             state.replace_source(model.source());
+            state.begin_rename(&model.active.label);
             language.submit(model.revision, 0, model.active.units.clone());
             writer.send(&Message::DevRun {
                 revision: model.revision,
                 units: model.active.units.clone(),
             })?;
-            state.set_status("Created local custom example");
+            state.set_status("Created local custom example; enter its name");
+        }
+        DevAction::NewFile if model.active.origin == ProjectOrigin::Custom => {
+            model.sync_editor(state);
+            let name = next_custom_file_name(&model.active);
+            state.begin_new_file(&name);
+            state.set_status("Enter a name for the new source file");
+        }
+        DevAction::NewFile => {}
+        DevAction::BeginRename if model.active.origin == ProjectOrigin::Custom => {
+            state.begin_rename(&model.active.label);
+            state.set_status("Rename custom example");
+        }
+        DevAction::BeginRename => {}
+        DevAction::BeginFileRename if model.active.origin == ProjectOrigin::Custom => {
+            let name = model
+                .active
+                .units
+                .get(model.active_file)
+                .and_then(|unit| Path::new(&unit.path).file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("RUN.bn")
+                .to_owned();
+            state.begin_file_rename(model.active_file, &name);
+            state.set_status("Rename source file");
+        }
+        DevAction::BeginFileRename => {}
+        DevAction::CommitRename if model.active.origin == ProjectOrigin::Custom => {
+            let requested = state.rename_text().unwrap_or_default();
+            match state.name_edit_target() {
+                Some(NameEditTarget::Project) => match normalized_custom_label(&requested) {
+                    Ok(label)
+                        if !model.catalog.iter().any(|entry| {
+                            entry.id != model.active.id && entry.label.eq_ignore_ascii_case(&label)
+                        }) =>
+                    {
+                        model.sync_editor(state);
+                        model.active.label.clone_from(&label);
+                        model
+                            .custom
+                            .insert(model.active.id.clone(), model.active.clone());
+                        model.upsert_custom_catalog(&model.active.clone());
+                        persistence.submit(PersistRequest::Save(model.active.clone()))?;
+                        state.finish_rename();
+                        state.set_status(format!("Renamed custom example to {label}"));
+                    }
+                    Ok(_) => state.set_status("An example with that name already exists"),
+                    Err(error) => state.set_status(error),
+                },
+                Some(NameEditTarget::NewFile) => {
+                    model.sync_editor(state);
+                    match model.active.add_file(&requested) {
+                        Ok(index) => {
+                            model.active_file = index;
+                            commit_custom_file_change(
+                                model,
+                                state,
+                                persistence,
+                                language,
+                                writer,
+                                "Created source file",
+                            )?;
+                        }
+                        Err(error) => state.set_status(format!("Cannot create file: {error}")),
+                    }
+                }
+                Some(NameEditTarget::File(index)) => {
+                    model.sync_editor(state);
+                    match model.active.rename_file(index, &requested) {
+                        Ok(()) => {
+                            model.active_file = index;
+                            commit_custom_file_change(
+                                model,
+                                state,
+                                persistence,
+                                language,
+                                writer,
+                                "Renamed source file",
+                            )?;
+                        }
+                        Err(error) => state.set_status(format!("Cannot rename file: {error}")),
+                    }
+                }
+                None => state.finish_rename(),
+            }
+        }
+        DevAction::CommitRename => state.finish_rename(),
+        DevAction::CancelRename => {
+            state.finish_rename();
+            state.set_status("Rename cancelled");
         }
         DevAction::RemoveProject if model.active.origin == ProjectOrigin::Custom => {
             let removed = model.active.id.clone();
@@ -502,6 +627,26 @@ fn handle_action(
             state.set_status("Removed local custom example");
         }
         DevAction::RemoveProject => {}
+        DevAction::RemoveFile if model.active.origin == ProjectOrigin::Custom => {
+            model.sync_editor(state);
+            match model.active.remove_file(model.active_file) {
+                Ok(()) => {
+                    model.active_file = model
+                        .active_file
+                        .min(model.active.units.len().saturating_sub(1));
+                    commit_custom_file_change(
+                        model,
+                        state,
+                        persistence,
+                        language,
+                        writer,
+                        "Removed source file",
+                    )?;
+                }
+                Err(error) => state.set_status(format!("Cannot remove file: {error}")),
+            }
+        }
+        DevAction::RemoveFile => {}
         DevAction::Run => {
             model.sync_editor(state);
             model.revision = model.revision.saturating_add(1);
@@ -661,6 +806,8 @@ fn build_frame(model: &DevModel, state: &DevState) -> boon_document::DocumentFra
         source_paths: &paths,
         active_file: model.active_file,
         buffer: state.buffer(),
+        rename_buffer: state.rename_buffer(),
+        rename_prompt: state.rename_prompt(),
         editor_scroll: state.editor_scroll(),
         language: model.language.as_ref(),
         inspector: InspectorState {
@@ -718,6 +865,13 @@ fn request_inspection(
     state: &DevState,
     writer: &mut Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(message) = prepare_inspection_request(model, state) {
+        writer.send(&message)?;
+    }
+    Ok(())
+}
+
+fn prepare_inspection_request(model: &mut DevModel, state: &DevState) -> Option<Message> {
     let byte = state
         .buffer()
         .byte_for_position(state.inspection_position());
@@ -727,32 +881,91 @@ fn request_inspection(
         model.pending_inspection = None;
         model.runtime_value_path = None;
         model.runtime_value = literal;
-        return Ok(());
+        return None;
     }
     if !is_runtime_path(&path) {
         model.pending_inspection = None;
         model.runtime_value_path = None;
         model.runtime_value = "No runtime binding at this position".to_owned();
-        return Ok(());
+        return None;
     }
+    let desired_sequence = desired_runtime_sequence(model);
     if model
         .pending_inspection
         .as_ref()
         .is_some_and(|(_, revision, pending)| *revision == model.revision && pending == &path)
-        || model.runtime_value_path.as_ref() == Some(&(model.revision, path.clone()))
+        || model
+            .runtime_value_path
+            .as_ref()
+            .is_some_and(|(revision, runtime_sequence, current)| {
+                *revision == model.revision
+                    && *runtime_sequence >= desired_sequence
+                    && current == &path
+            })
     {
-        return Ok(());
+        return None;
     }
+    let preserve_current_value = model
+        .runtime_value_path
+        .as_ref()
+        .is_some_and(|(revision, _, current)| *revision == model.revision && current == &path);
     model.inspect_request_id = model.inspect_request_id.saturating_add(1);
     let request_id = model.inspect_request_id;
     model.pending_inspection = Some((request_id, model.revision, path.clone()));
-    model.runtime_value = "Reading current value...".to_owned();
-    writer.send(&Message::DevInspect {
+    if !preserve_current_value {
+        model.runtime_value = "Reading current value...".to_owned();
+    }
+    Some(Message::DevInspect {
         request_id,
         revision: model.revision,
         path,
-    })?;
-    Ok(())
+    })
+}
+
+fn desired_runtime_sequence(model: &DevModel) -> u64 {
+    model
+        .runtime_sequence
+        .filter(|(revision, _)| *revision == model.revision)
+        .map_or(0, |(_, runtime_sequence)| runtime_sequence)
+}
+
+fn note_runtime_change(model: &mut DevModel, revision: u64, runtime_sequence: u64) -> bool {
+    if revision != model.revision
+        || model
+            .runtime_sequence
+            .is_some_and(|(current_revision, current_sequence)| {
+                current_revision == revision && current_sequence >= runtime_sequence
+            })
+    {
+        return false;
+    }
+    model.runtime_sequence = Some((revision, runtime_sequence));
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_inspection_result(
+    model: &mut DevModel,
+    request_id: u64,
+    revision: u64,
+    runtime_sequence: u64,
+    path: String,
+    ok: bool,
+    value: String,
+) -> InspectionResultDisposition {
+    if model.pending_inspection.as_ref() != Some(&(request_id, revision, path.clone())) {
+        return InspectionResultDisposition::Ignored;
+    }
+    model.pending_inspection = None;
+    if revision != model.revision {
+        return InspectionResultDisposition::Ignored;
+    }
+    if runtime_sequence < desired_runtime_sequence(model) {
+        return InspectionResultDisposition::Retry;
+    }
+    model.runtime_value = value;
+    model.runtime_value_path = ok.then_some((revision, runtime_sequence, path));
+    InspectionResultDisposition::Applied
 }
 
 fn is_runtime_path(path: &str) -> bool {
@@ -819,6 +1032,13 @@ fn emit_dev_targets(
         DEV_FORMAT,
         DEV_NEW,
         DEV_REMOVE,
+        DEV_RENAME,
+        DEV_FILE_NEW,
+        DEV_FILE_RENAME,
+        DEV_FILE_REMOVE,
+        DEV_RENAME_INPUT,
+        DEV_RENAME_SAVE,
+        DEV_RENAME_CANCEL,
         DEV_EDITOR,
     ] {
         let Some(target) = view.target_for_source(node, None) else {
@@ -845,10 +1065,8 @@ fn native_target_name(view: &RetainedView, event: &HostEvent, state: &DevState) 
     match event {
         HostEvent::Pointer(pointer) => view.hit(pointer.x, pointer.y).map(str::to_owned),
         HostEvent::Wheel(wheel) => view.hit(wheel.x, wheel.y).map(str::to_owned),
-        HostEvent::Keyboard(_) | HostEvent::TextInput(_) | HostEvent::Ime(_)
-            if state.editor_focused() =>
-        {
-            Some(DEV_EDITOR.to_owned())
+        HostEvent::Keyboard(_) | HostEvent::TextInput(_) | HostEvent::Ime(_) => {
+            state.focused_target().map(str::to_owned)
         }
         _ => None,
     }
@@ -927,6 +1145,68 @@ fn adjacent_id(entries: &[CatalogItem], active: &str, next: bool) -> Option<Stri
     entries.get(index).map(|entry| entry.id.clone())
 }
 
+fn next_custom_file_name(project: &StoredProject) -> String {
+    for ordinal in 1_u64.. {
+        let candidate = if ordinal == 1 {
+            "Module.bn".to_owned()
+        } else {
+            format!("Module{ordinal}.bn")
+        };
+        if !project.units.iter().any(|unit| {
+            Path::new(&unit.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case(&candidate))
+        }) {
+            return candidate;
+        }
+    }
+    unreachable!("custom source file name space exhausted")
+}
+
+fn commit_custom_file_change(
+    model: &mut DevModel,
+    state: &mut DevState,
+    persistence: &PersistenceWorker,
+    language: &LanguageWorker,
+    writer: &mut Connection,
+    status: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    model
+        .custom
+        .insert(model.active.id.clone(), model.active.clone());
+    persistence.submit(PersistRequest::Save(model.active.clone()))?;
+    model.revision = model.revision.saturating_add(1);
+    model.language = None;
+    state.replace_source(model.source());
+    language.submit(
+        model.revision,
+        model.active_file,
+        model.active.units.clone(),
+    );
+    writer.send(&Message::DevRun {
+        revision: model.revision,
+        units: model.active.units.clone(),
+    })?;
+    state.set_status(status);
+    Ok(())
+}
+
+fn normalized_custom_label(value: &str) -> Result<String, String> {
+    let label = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(64)
+        .collect::<String>();
+    if label.is_empty() {
+        Err("Custom example name cannot be empty".to_owned())
+    } else {
+        Ok(label)
+    }
+}
+
 fn perf_line(stats: &PreviewStats) -> String {
     let mode = match stats.frame_mode {
         FrameMode::Idle => "idle",
@@ -983,5 +1263,107 @@ mod tests {
         assert!(!is_runtime_path("42"));
         assert!(!is_runtime_path("Document/new"));
         assert_eq!(literal_value("42").as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn inspector_refreshes_after_runtime_turn_and_rejects_stale_results() {
+        let source = "text: store.count";
+        let mut state = DevState::new(source.to_owned());
+        state.set_caret(
+            Position {
+                line: 0,
+                column: source.chars().count(),
+            },
+            false,
+        );
+        let mut model = DevModel::waiting();
+        model.revision = 7;
+
+        let first = prepare_inspection_request(&mut model, &state).expect("initial inspection");
+        let Message::DevInspect {
+            request_id,
+            revision,
+            path,
+        } = first
+        else {
+            panic!("unexpected inspection message")
+        };
+        assert_eq!((revision, path.as_str()), (7, "store.count"));
+        assert_eq!(
+            apply_inspection_result(
+                &mut model,
+                request_id,
+                revision,
+                0,
+                path,
+                true,
+                "0".to_owned(),
+            ),
+            InspectionResultDisposition::Applied
+        );
+        assert_eq!(model.runtime_value, "0");
+        assert!(prepare_inspection_request(&mut model, &state).is_none());
+
+        assert!(note_runtime_change(&mut model, 7, 1));
+        let second = prepare_inspection_request(&mut model, &state).expect("turn refresh");
+        assert_eq!(
+            model.runtime_value, "0",
+            "the last current value remains visible while refresh is in flight"
+        );
+        let Message::DevInspect {
+            request_id,
+            revision,
+            path,
+        } = second
+        else {
+            panic!("unexpected refresh message")
+        };
+        assert_eq!(
+            apply_inspection_result(
+                &mut model,
+                request_id,
+                revision,
+                0,
+                path,
+                true,
+                "0".to_owned(),
+            ),
+            InspectionResultDisposition::Retry
+        );
+
+        let retry = prepare_inspection_request(&mut model, &state).expect("stale result retry");
+        let Message::DevInspect {
+            request_id,
+            revision,
+            path,
+        } = retry
+        else {
+            panic!("unexpected retry message")
+        };
+        assert_eq!(
+            apply_inspection_result(
+                &mut model,
+                request_id,
+                revision,
+                1,
+                path,
+                true,
+                "1".to_owned(),
+            ),
+            InspectionResultDisposition::Applied
+        );
+        assert_eq!(model.runtime_value, "1");
+        assert!(!note_runtime_change(&mut model, 7, 1));
+        assert!(prepare_inspection_request(&mut model, &state).is_none());
+    }
+
+    #[test]
+    fn custom_labels_are_trimmed_bounded_and_non_empty() {
+        assert_eq!(
+            normalized_custom_label("  My   example  ").unwrap(),
+            "My example"
+        );
+        assert_eq!(normalized_custom_label(&"x".repeat(80)).unwrap().len(), 64);
+        assert!(normalized_custom_label(" \n\t ").is_err());
     }
 }

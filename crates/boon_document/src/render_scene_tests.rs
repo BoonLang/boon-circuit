@@ -738,6 +738,8 @@ fn render_visual_primitives_lower_text_overlays_before_gpu() {
     input_style.insert("text_inset".to_owned(), StyleValue::Number(4.0));
     input_style.insert("caret_visible".to_owned(), StyleValue::Bool(true));
     input_style.insert("caret_column".to_owned(), StyleValue::Number(1.0));
+    input_style.insert("selection_start".to_owned(), StyleValue::Number(0.0));
+    input_style.insert("selection_end".to_owned(), StyleValue::Number(1.0));
     let input = DisplayItem {
         node: DocumentNodeId("input".to_owned()),
         kind: DocumentNodeKind::TextInput,
@@ -772,6 +774,7 @@ fn render_visual_primitives_lower_text_overlays_before_gpu() {
     assert!(has(RenderVisualPrimitiveKind::EditorSelection));
     assert!(has(RenderVisualPrimitiveKind::EditorBracketHighlight));
     assert!(has(RenderVisualPrimitiveKind::EditorCaret));
+    assert!(has(RenderVisualPrimitiveKind::TextInputSelection));
     assert!(has(RenderVisualPrimitiveKind::Underline));
     assert!(has(RenderVisualPrimitiveKind::Strikethrough));
     assert!(has(RenderVisualPrimitiveKind::TextInputCaret));
@@ -1170,6 +1173,51 @@ fn render_text_runs_honor_public_text_align_style() {
 
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].align, RenderTextAlign::Center);
+}
+
+#[test]
+fn render_text_runs_treat_public_center_style_as_text_alignment() {
+    let mut style = StyleMap::new();
+    style.insert("center".to_owned(), StyleValue::Bool(true));
+    let frame = frame_with_item(DisplayItem {
+        node: DocumentNodeId("footer-line".to_owned()),
+        kind: DocumentNodeKind::Text,
+        bounds: Rect {
+            x: 0.0,
+            y: 20.0,
+            width: 300.0,
+            height: 20.0,
+        },
+        style,
+        text: Some("Centered footer".to_owned()),
+        focused: false,
+        style_identity: identity(),
+    });
+    let mut columns = ApproximateTextColumnMeasurer;
+    let runs = render_text_runs(&frame, 320, 200, &mut columns);
+
+    assert_eq!(runs[0].align, RenderTextAlign::Center);
+}
+
+#[test]
+fn checkbox_accessibility_label_is_not_a_visual_text_run() {
+    let frame = frame_with_item(DisplayItem {
+        node: DocumentNodeId("checkbox".to_owned()),
+        kind: DocumentNodeKind::Checkbox,
+        bounds: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 40.0,
+            height: 40.0,
+        },
+        style: StyleMap::new(),
+        text: Some("Reference[element:todo-title]".to_owned()),
+        focused: false,
+        style_identity: identity(),
+    });
+    let mut columns = ApproximateTextColumnMeasurer;
+
+    assert!(render_text_runs(&frame, 80, 80, &mut columns).is_empty());
 }
 
 #[test]

@@ -58,6 +58,12 @@ Compilation produces one `MachinePlan` containing:
 - one typed `DocumentPlan` with stable templates, expressions, bindings, and
   visible-range materialization points.
 
+`Duration[...] |> Timer/interval()` lowers to an ordinary source route with a
+positive static `interval_ms`. The native preview waits on the earliest
+scheduled source or caret deadline, dispatches through the same typed source
+route as any other event, and coalesces missed timer deadlines instead of
+creating a catch-up burst. Timer routing must never depend on an example id.
+
 `Session` owns:
 
 - scalar and row values;

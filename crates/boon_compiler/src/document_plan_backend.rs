@@ -47,6 +47,7 @@ struct CompileContext {
     owner_name: Option<String>,
     parameters: BTreeMap<String, DocumentParameterId>,
     locals: BTreeMap<String, DocumentLocalId>,
+    pattern_bindings: BTreeMap<String, usize>,
     row_aliases: BTreeMap<String, ScopeId>,
 }
 
@@ -358,6 +359,14 @@ impl<'a> DocumentCompiler<'a> {
                 AstStatementKind::Expression | AstStatementKind::Source { .. }
             )
         });
+        if statements.len() > 1
+            && statements.iter().all(statement_is_record_entry)
+            && statements
+                .iter()
+                .any(|statement| matches!(statement.kind, AstStatementKind::Spread))
+        {
+            return self.compile_record_children(statements, context, compiler_id);
+        }
         if !has_expression_result
             && statements.iter().all(statement_has_named_field)
             && statements.len() > 1
@@ -599,7 +608,9 @@ impl<'a> DocumentCompiler<'a> {
             }
             AstExprKind::MatchArm { output, .. } => {
                 if let Some(output) = output {
-                    if self.expr_is_empty_list(output) && !children.is_empty() {
+                    if self.expr_is_block_keyword(output) && !children.is_empty() {
+                        self.compile_block(children, context, expr_id)
+                    } else if self.expr_is_empty_list(output) && !children.is_empty() {
                         self.compile_list_children(children, context, expr_id)
                     } else {
                         self.compile_expr_with_children(output, children, context, None)
@@ -1035,7 +1046,7 @@ impl<'a> DocumentCompiler<'a> {
                 }
             },
             "child" | "root" => DocumentArgumentRole::Child,
-            "items" | "children" => DocumentArgumentRole::Children,
+            "items" | "children" | "contents" => DocumentArgumentRole::Children,
             "element" | "events" => DocumentArgumentRole::EventBindings,
             _ => DocumentArgumentRole::Value,
         };
@@ -1212,8 +1223,14 @@ impl<'a> DocumentCompiler<'a> {
                 )));
             };
             let pattern = pattern.clone();
+            let mut arm_context = context.clone();
+            arm_context.pattern_bindings.extend(
+                pattern_binding_names(&pattern)
+                    .into_iter()
+                    .map(|name| (name, expr_id)),
+            );
             let output =
-                self.compile_expr_with_children(arm_expr, &child.children, context, None)?;
+                self.compile_expr_with_children(arm_expr, &child.children, &arm_context, None)?;
             arms.push(DocumentSelectArm {
                 pattern: self.compile_pattern(&pattern)?,
                 output,
@@ -1224,9 +1241,11 @@ impl<'a> DocumentCompiler<'a> {
                 "conditional expression {expr_id} has no typed arms"
             )));
         }
-        let class = arms
-            .iter()
-            .map(|arm| self.expressions[arm.output.0].value_class)
+        let class = std::iter::once(self.expressions[input.0].value_class)
+            .chain(
+                arms.iter()
+                    .map(|arm| self.expressions[arm.output.0].value_class),
+            )
             .max_by_key(|class| value_class_rank(*class))
             .unwrap_or(DocumentValueClass::DynamicScalar);
         Ok(self.push_expr(expr_id, class, DocumentExprOp::Select { input, arms }))
@@ -1491,7 +1510,74 @@ impl<'a> DocumentCompiler<'a> {
                 "document expression {expr_id} has an empty path"
             )));
         }
+        let explicit_passed = parts.first() == Some(&"PASSED");
         let stripped = parts.strip_prefix(&["PASSED"]).unwrap_or(parts.as_slice());
+        if !explicit_passed && stripped.len() == 1 {
+            let name = stripped[0];
+            if let Some(scope) = context.row_aliases.get(name).copied() {
+                let expression = self.push_expr(
+                    expr_id,
+                    DocumentValueClass::DynamicScalar,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Row {
+                            scope,
+                            field: None,
+                            projection: Vec::new(),
+                        },
+                    },
+                );
+                self.record_compiled_path(context, path, expression);
+                return Ok(expression);
+            }
+            if let Some(parameter) = context.parameters.get(name).copied() {
+                let expression = self.push_expr(
+                    expr_id,
+                    DocumentValueClass::DynamicScalar,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Parameter {
+                            parameter,
+                            projection: Vec::new(),
+                        },
+                    },
+                );
+                self.record_compiled_path(context, path, expression);
+                return Ok(expression);
+            }
+            if let Some(local) = context.locals.get(name).copied() {
+                let expression = self.push_expr(
+                    expr_id,
+                    DocumentValueClass::DynamicScalar,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Local {
+                            local,
+                            projection: Vec::new(),
+                        },
+                    },
+                );
+                self.record_compiled_path(context, path, expression);
+                return Ok(expression);
+            }
+        }
+        if !explicit_passed
+            && let Some(selector) = context
+                .pattern_bindings
+                .get(stripped.first().copied().unwrap_or_default())
+                .copied()
+        {
+            let projection = stripped.iter().map(|part| self.intern_name(part)).collect();
+            let expression = self.push_expr(
+                expr_id,
+                DocumentValueClass::DynamicScalar,
+                DocumentExprOp::Read {
+                    read: DocumentRead::Matched {
+                        selector,
+                        projection,
+                    },
+                },
+            );
+            self.record_compiled_path(context, path, expression);
+            return Ok(expression);
+        }
         if let Some(source) = self.resolve_source_alias(stripped) {
             let expression = self.push_expr(
                 expr_id,
@@ -1617,8 +1703,14 @@ impl<'a> DocumentCompiler<'a> {
             self.record_compiled_path(context, path, expression);
             return Ok(expression);
         }
+        let line = self
+            .program
+            .expressions
+            .get(expr_id)
+            .map(|expression| expression.line)
+            .unwrap_or_default();
         Err(PlanError::new(format!(
-            "unresolved executable document path `{path}` at expression {expr_id}"
+            "unresolved executable document path `{path}` at expression {expr_id} (line {line})"
         )))
     }
 
@@ -1870,6 +1962,13 @@ impl<'a> DocumentCompiler<'a> {
         )
     }
 
+    fn expr_is_block_keyword(&self, id: usize) -> bool {
+        matches!(
+            self.expr_kind(id),
+            Ok(AstExprKind::Identifier(value) | AstExprKind::Enum(value)) if value == "BLOCK"
+        )
+    }
+
     fn expr_is_conditional(&self, id: usize) -> bool {
         match self.expr_kind(id) {
             Ok(AstExprKind::When { .. }) => true,
@@ -2040,6 +2139,27 @@ fn stable_compiler_identity(
     Ok((u64::from(kind) << 56) | ((owner as u64) << 32) | compiler_id as u64)
 }
 
+fn pattern_binding_names(tokens: &[String]) -> Vec<String> {
+    let Some(open) = tokens.iter().position(|token| token == "[") else {
+        return Vec::new();
+    };
+    tokens
+        .iter()
+        .skip(open + 1)
+        .take_while(|token| token.as_str() != "]")
+        .filter(|token| {
+            token
+                .chars()
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                && token
+                    .chars()
+                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        })
+        .cloned()
+        .collect()
+}
+
 fn insert_unique_alias<T: Copy + Eq>(
     aliases: &mut BTreeMap<String, Option<T>>,
     alias: String,
@@ -2108,6 +2228,10 @@ fn statement_field_name(statement: &AstStatement) -> Option<String> {
 
 fn statement_has_named_field(statement: &AstStatement) -> bool {
     statement_field_name(statement).is_some()
+}
+
+fn statement_is_record_entry(statement: &AstStatement) -> bool {
+    statement_has_named_field(statement) || matches!(statement.kind, AstStatementKind::Spread)
 }
 
 fn is_child_list_field(name: &str) -> bool {

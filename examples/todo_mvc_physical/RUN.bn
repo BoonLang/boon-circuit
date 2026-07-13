@@ -236,8 +236,8 @@ FUNCTION todo_title_text(completed) {
             False => Theme/font(of: Body).color
         }
         line: [strike: completed]
-        width: Theme/sizing(of: EditingInputWidth)
-        height: 42
+        width: Fill
+        height: Fill
         text_inset: 0
         depth: Theme/depth(of: Detail)
         move: [further: Theme/elevation(of: TodoItem)]
@@ -330,6 +330,8 @@ FUNCTION root_element() {
             width: Fill
             height: [sizing: Fill, minimum: Screen]
             align: [row: Center]
+            scroll: True
+            scrollbars: False
             material: Theme/material(of: Background)
         ]
         items: LIST { content_element() }
@@ -351,7 +353,6 @@ FUNCTION content_element() {
             paint: False
         ]
         items: LIST {
-            window_controls()
             reference_content()
             theme_gap(of: SwitcherBottomPush)
             theme_switcher()
@@ -367,7 +368,7 @@ FUNCTION reference_content() {
         gap: Theme/spacing(of: None)
         style: [
             width: Fill
-            padding: [right: 34]
+            padding: [row: 16]
             align: [row: Center]
             paint: False
         ]
@@ -406,69 +407,12 @@ FUNCTION theme_gap(of) {
     )
 }
 
-------------------------------------------------------------------------
--- HEADER
-------------------------------------------------------------------------
-
-FUNCTION window_controls() {
-    Scene/Element/stripe(
-        element: []
-        direction: Row
-        gap: 22
-        style: [
-            width: Fill
-            height: 46
-            padding: [top: 14, right: 13]
-            paint: False
-        ]
-        items: LIST {
-            Scene/Element/block(
-                element: []
-                style: [
-                    width: Fill
-                    height: 24
-                    paint: False
-                ]
-                child: Scene/Element/text(
-                    element: []
-                    style: [paint: False]
-                    text: Text/empty()
-                )
-            )
-            window_control_label(label: TEXT { – })
-            window_control_label(label: TEXT { □ })
-            window_control_label(label: TEXT { × })
-        }
-    )
-}
-
-FUNCTION window_control_label(label) {
-    Scene/Element/text(
-        element: []
-        style: [
-            family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
-            size: 20
-            color: PASSED.theme_options.mode |> WHEN {
-                Light => Oklch[lightness: 0.78, chroma: 0.08, hue: 25]
-                Dark => Oklch[lightness: 0.86]
-            }
-            weight: Light
-            width: 22
-            height: 24
-            line_height: 20
-            center: True
-            vertical_align: Center
-        ]
-        text: label
-    )
-}
-
 FUNCTION header() {
     Scene/Element/block(
         element: [tag: Header]
         style: [
             align: [row: Center]
-            height: 84
+            height: 72
             paint: False
         ]
         child: Scene/Element/text(
@@ -476,8 +420,9 @@ FUNCTION header() {
             style: [
                 ...Theme/text(of: Hero)
                 material: hero_title_material()
+                size: 64
                 width: 320
-                height: 84
+                height: 72
                 center: True
                 vertical_align: Center
                 rounded_corners: Theme/corners(of: Comfort)
@@ -532,6 +477,7 @@ FUNCTION new_todo_entry() {
             width: Fill
             material: [color: TEXT { #00000000 }]
             ...Theme/material(of: NewTodoRowFrame)
+            height: 56
         ]
         items: LIST {
             toggle_all_checkbox()
@@ -597,6 +543,7 @@ FUNCTION todos_element() {
             width: Fill
             material: Theme/material(of: SurfaceVariant)
             ...Theme/material(of: TodoListFrame)
+            height: [sizing: Fit, maximum: 200]
         ]
         items: visible_todos
             |> List/map(old, new: old |> todo_element())
@@ -620,9 +567,12 @@ FUNCTION todo_element(todo) {
             move: [closer: Theme/elevation(of: TodoItem)]
             material: Theme/material(of: Interactive[hovered: element.hovered])
             ...Theme/material(of: TodoRowFrame)
+            height: 50
+            padding: 5
         ]
         items: todo.editing |> WHILE {
             True => LIST {
+                editing_todo_leading_spacer()
                 editing_todo_title_element(todo: todo)
                     |> SOURCE { todo.todo_elements.editing_todo_title_element }
             }
@@ -696,19 +646,39 @@ FUNCTION editing_todo_title_element(todo) {
             ]
         ]
         style: [
-            width: Theme/sizing(of: EditingInputWidth)
-            padding: [row: 17, top: 17, bottom: 16]
-            align: Right
+            width: Fill
+            height: Fill
+            padding: [left: 16, right: 16]
+            text_inset: 16
             font: Theme/font(of: Input)
             depth: Theme/depth(of: Element)
             rounded_corners: Theme/corners(of: Touch)
             move: [closer: Theme/elevation(of: EditingFocus)]
-            material: Theme/material(of: InteractiveRecessed[focus: True])
+            material: [
+                ...Theme/material(of: InteractiveRecessed[focus: True])
+                ...Theme/material(of: PrimarySubtle)
+            ]
         ]
         label: Hidden[text: TEXT { selected todo title }]
         text: todo.edited_title
         placeholder: []
         focus: True
+    )
+}
+
+FUNCTION editing_todo_leading_spacer() {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: Theme/sizing(of: TouchTarget)
+            height: Fill
+            paint: False
+        ]
+        child: Scene/Element/text(
+            element: []
+            style: [paint: False]
+            text: Text/empty()
+        )
     )
 }
 
@@ -791,56 +761,20 @@ FUNCTION panel_footer() {
         style: [
             width: Fill
             gap: Theme/spacing(of: Standard)
-            padding: [top: 10, right: 15, bottom: 10, left: 15]
+            padding: [top: 9, right: 15, bottom: 9, left: 15]
             material: Theme/material(of: SurfaceElevated)
             ...Theme/material(of: PanelFooterFrame)
+            height: 44
         ]
         items: LIST {
             active_items_count_text()
-            filters_leading_spacer()
             filters_element()
-            clear_button_spacer()
             store.has_completed |> WHILE {
                 True => remove_completed_button()
                         |> SOURCE { PASSED.store.elements.remove_completed_button }
                 False => NoElement
                 }
         }
-    )
-}
-
-FUNCTION filters_leading_spacer() {
-    Scene/Element/block(
-        element: []
-        style: [
-            width: 17
-            height: 25.2
-            paint: False
-        ]
-        child: Scene/Element/text(
-            element: []
-            style: [paint: False]
-            text: Text/empty()
-        )
-    )
-}
-
-FUNCTION clear_button_spacer() {
-    Scene/Element/block(
-        element: []
-        style: [
-            width: PASSED.theme_options.name |> WHEN {
-                Neobrutalism => 23
-                __ => 33
-            }
-            height: 25.2
-            paint: False
-        ]
-        child: Scene/Element/text(
-            element: []
-            style: [paint: False]
-            text: Text/empty()
-        )
     )
 }
 
@@ -853,7 +787,7 @@ FUNCTION active_items_count_text() {
         element: []
         style: [
             ...Theme/text(of: BodySecondary)
-            width: 130
+            width: 92
             height: 25.2
             line_height: 19.6
             text_inset: 0
@@ -945,10 +879,7 @@ FUNCTION remove_completed_button() {
         ]
         style: [
             align: Right
-            width: PASSED.theme_options.name |> WHEN {
-                Neobrutalism => 128
-                __ => 118
-            }
+            width: 110
             height: 25.2
             padding: [row: 0, column: 0]
             line_height: 19.6
@@ -960,10 +891,9 @@ FUNCTION remove_completed_button() {
             spring_range: Theme/spring_range(of: Button)
             material: Theme/material(of: Interactive[hovered: element.hovered])
         ]
-        label: Scene/Element/text(
+            label: Scene/Element/text(
             style: [
                 ...clear_button_text(hovered: element.hovered)
-                font: [line: [underline: element.hovered]]
                 width: Fill
                 height: Fill
                 text_inset: 0
@@ -1065,7 +995,6 @@ FUNCTION footer_link(label, to) {
         element: [hovered: SOURCE]
         style: [
             ...small_flat_text(of: SmallLink[hovered: element.hovered])
-            font: [line: [underline: element.hovered]]
             width: Auto
             auto_padding: 0
             height: 15

@@ -178,6 +178,10 @@ pub enum Message {
         ok: bool,
         message: String,
     },
+    PreviewRuntimeChanged {
+        revision: u64,
+        runtime_sequence: u64,
+    },
     PreviewTestResult {
         request_id: u64,
         passed: bool,
@@ -196,6 +200,7 @@ pub enum Message {
     PreviewInspectResult {
         request_id: u64,
         revision: u64,
+        runtime_sequence: u64,
         path: String,
         ok: bool,
         value: String,
@@ -223,6 +228,7 @@ impl Message {
             Self::DevInspect { .. } => 15,
             Self::PreviewInspect { .. } => 16,
             Self::PreviewInspectResult { .. } => 17,
+            Self::PreviewRuntimeChanged { .. } => 18,
         }
     }
 
@@ -298,6 +304,13 @@ impl Message {
                 out.bool(*ok);
                 out.string(message)?;
             }
+            Self::PreviewRuntimeChanged {
+                revision,
+                runtime_sequence,
+            } => {
+                out.u64(*revision);
+                out.u64(*runtime_sequence);
+            }
             Self::PreviewTestResult {
                 request_id,
                 passed,
@@ -324,12 +337,14 @@ impl Message {
             Self::PreviewInspectResult {
                 request_id,
                 revision,
+                runtime_sequence,
                 path,
                 ok,
                 value,
             } => {
                 out.u64(*request_id);
                 out.u64(*revision);
+                out.u64(*runtime_sequence);
                 out.string(path)?;
                 out.bool(*ok);
                 out.string(value)?;
@@ -419,9 +434,14 @@ impl Message {
             17 => Self::PreviewInspectResult {
                 request_id: input.u64()?,
                 revision: input.u64()?,
+                runtime_sequence: input.u64()?,
                 path: input.string()?,
                 ok: input.bool()?,
                 value: input.string()?,
+            },
+            18 => Self::PreviewRuntimeChanged {
+                revision: input.u64()?,
+                runtime_sequence: input.u64()?,
             },
             _ => return Err(ProtocolError::UnknownMessage(tag)),
         };
@@ -869,6 +889,7 @@ mod tests {
             Message::PreviewInspectResult {
                 request_id: 9,
                 revision: 7,
+                runtime_sequence: 3,
                 path: "store.count".to_owned(),
                 ok: true,
                 value: "3".to_owned(),
@@ -923,6 +944,10 @@ mod tests {
             revision: 19,
             ok: false,
             message: "compile failed on line 3".to_owned(),
+        });
+        roundtrip(Message::PreviewRuntimeChanged {
+            revision: 19,
+            runtime_sequence: 8,
         });
         roundtrip(Message::PreviewTestResult {
             request_id: 4,

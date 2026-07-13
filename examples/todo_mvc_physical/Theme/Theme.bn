@@ -51,10 +51,10 @@ FUNCTION sizing(of) {
 
 FUNCTION spacing(of) {
     of |> WHEN {
-        TitlePanelGap => get(from: Spacing, of: of)
+        TitlePanelGap => 0
         NewTodoInputInset => get(from: Spacing, of: of)
-        Section => 61
-        SwitcherBottomPush => 260
+        Section => 10
+        SwitcherBottomPush => 0
         __ => get(from: Spacing, of: of)
     }
 }

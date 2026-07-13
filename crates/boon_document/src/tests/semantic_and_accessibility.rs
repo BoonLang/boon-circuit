@@ -40,16 +40,28 @@ fn semantic_scene_derives_stable_roles_bounds_actions_and_patch() {
     );
     frame.focus = Some(input.id.clone());
 
+    let mut link = node("docs", DocumentNodeKind::Text, Some("root"));
+    link.text = Some(TextValue {
+        text: "Documentation".to_owned(),
+    });
+    link.style.insert("link".to_owned(), StyleValue::Bool(true));
+    link.style.insert(
+        "href".to_owned(),
+        StyleValue::Text("https://example.com/docs".to_owned()),
+    );
+
     frame.nodes.get_mut(&frame.root).unwrap().children.extend([
         title.id.clone(),
         button.id.clone(),
         checkbox.id.clone(),
         input.id.clone(),
+        link.id.clone(),
     ]);
     frame.nodes.insert(title.id.clone(), title);
     frame.nodes.insert(button.id.clone(), button);
     frame.nodes.insert(checkbox.id.clone(), checkbox);
     frame.nodes.insert(input.id.clone(), input);
+    frame.nodes.insert(link.id.clone(), link);
 
     let mut text = SimpleTextMeasurer;
     let layout = layout(LayoutInput {
@@ -109,6 +121,14 @@ fn semantic_scene_derives_stable_roles_bounds_actions_and_patch() {
         .expect("text semantic node should exist");
     assert_eq!(title_semantic.role, SemanticRole::Text);
     assert_eq!(title_semantic.heading_level, Some(2));
+
+    let link_semantic = scene
+        .nodes
+        .get(&SemanticId("semantic:docs".to_owned()))
+        .expect("link semantic node should exist");
+    assert_eq!(link_semantic.role, SemanticRole::Link);
+    assert_eq!(link_semantic.href.as_deref(), Some("https://example.com/docs"));
+    assert!(link_semantic.actions.press);
 
     let mut next = scene.clone();
     next.nodes.remove(&SemanticId("semantic:done".to_owned()));

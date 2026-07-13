@@ -1,0 +1,28 @@
+name = "counter without HOLD"
+source = "examples/counter_latest.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.count" = "0"
+
+[[step]]
+id = "add-one"
+user_action = { kind = "button_press", target = "add one button", target_text = "Add one" }
+expected_source_event = { source = "store.increment", target_text = "Add one" }
+  [step.expect_root_text]
+  "store.count" = "1"
+
+[[step]]
+id = "add-one-again"
+user_action = { kind = "button_press", target = "add one button", target_text = "Add one" }
+expected_source_event = { source = "store.increment", target_text = "Add one" }
+  [step.expect_root_text]
+  "store.count" = "2"
+
+[[step]]
+id = "reset"
+user_action = { kind = "button_press", target = "reset button", target_text = "Reset" }
+expected_source_event = { source = "store.reset", target_text = "Reset" }
+  [step.expect_root_text]
+  "store.count" = "0"

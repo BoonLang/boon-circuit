@@ -1,0 +1,77 @@
+store: [
+    sources: [
+        home: SOURCE
+        syntax: SOURCE
+        runtime: SOURCE
+    ]
+
+    page:
+        Home |> HOLD page {
+            LATEST {
+                sources.home |> THEN { Home }
+                sources.syntax |> THEN { Syntax }
+                sources.runtime |> THEN { Runtime }
+            }
+        }
+
+    page_title:
+        page |> WHILE {
+            Home => TEXT { Pages }
+            Syntax => TEXT { Syntax page }
+            Runtime => TEXT { Runtime page }
+        }
+
+    page_body:
+        page |> WHILE {
+            Home => TEXT { A tiny multi-page app driven by ordinary Boon state. }
+            Syntax => TEXT { LATEST chooses navigation events; THEN names the next page. }
+            Runtime => TEXT { Only the selected page subtree is rendered. }
+        }
+]
+
+document: Document/new(root: pages_app())
+
+FUNCTION pages_app() {
+    Element/container(
+        element: []
+        style: [width: Fill, height: Fill, padding: 24, align: [row: Center], background: [color: Oklch[lightness:0.965]]]
+        child: Element/stripe(
+            element: []
+            direction: Column
+            gap: 0
+            style: [width: 600, height: 360, background: [color: Oklch[lightness:1]], border: [color: Oklch[lightness:0.82]]]
+            items: LIST {
+                Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 8
+                    style: [width: Fill, height: 62, padding: 12, background: [color: Oklch[lightness:0.19]]]
+                    items: LIST {
+                        nav_button(label: TEXT { Home }, source: store.sources.home)
+                        nav_button(label: TEXT { Syntax }, source: store.sources.syntax)
+                        nav_button(label: TEXT { Runtime }, source: store.sources.runtime)
+                    }
+                )
+                Element/stripe(
+                    element: []
+                    direction: Column
+                    gap: 16
+                    style: [width: Fill, height: Fill, padding: 30]
+                    items: LIST {
+                        Element/label(element: [], style: [height: 48, font: [size: 32, color: Oklch[lightness:0.20]]], label: store.page_title)
+                        Element/label(element: [], style: [width: Fill, height: 70, font: [size: 16, color: Oklch[lightness:0.42]]], label: store.page_body)
+                        Element/label(element: [], style: [height: 28, font: [size: 13, color: Oklch[lightness:0.58]]], label: TEXT { Current tag: {store.page} })
+                    }
+                )
+            }
+        )
+    )
+}
+
+FUNCTION nav_button(label, source) {
+    Element/button(
+        element: [events: [press: source]]
+        style: [width: 110, height: 38, background: [color: Oklch[lightness:0.29]], border: [color: Oklch[lightness:0.42]], font: [size: 14, color: Oklch[lightness:0.95]]]
+        label: label
+    )
+}

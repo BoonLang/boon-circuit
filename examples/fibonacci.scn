@@ -1,0 +1,5 @@
+name = "fibonacci"
+source = "examples/fibonacci.bn"
+
+[[step]]
+id = "initial"

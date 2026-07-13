@@ -16,6 +16,22 @@ pub trait RenderTextColumnMeasurer {
     fn column_edges(&mut self, text: &str, style: &StyleMap, line_height: f32) -> Vec<f32>;
 }
 
+pub fn text_column_at(
+    item: &DisplayItem,
+    x: f32,
+    columns: &mut impl RenderTextColumnMeasurer,
+) -> usize {
+    let text = item.text.as_deref().unwrap_or_default();
+    let font_size = style_number(&item.style, "size").unwrap_or(14.0);
+    let line_height = style_line_height(&item.style, font_size);
+    let edges = columns.column_edges(text, &item.style, line_height);
+    let local_x = x - text_left_for_width(item, edges.last().copied().unwrap_or_default());
+    edges
+        .windows(2)
+        .position(|edge| local_x < (edge[0] + edge[1]) * 0.5)
+        .unwrap_or_else(|| edges.len().saturating_sub(1))
+}
+
 #[derive(Default)]
 pub struct ApproximateTextColumnMeasurer;
 
@@ -531,6 +547,7 @@ pub enum RenderVisualPrimitiveKind {
     EditorSelection,
     EditorBracketHighlight,
     EditorCaret,
+    TextInputSelection,
     TextInputCaret,
     Underline,
     Strikethrough,
@@ -1947,7 +1964,6 @@ fn text_overlay_primitives(
     }
     if matches!(item.kind, DocumentNodeKind::TextInput)
         && (item.focused || style_bool(&item.style, "focus") == Some(true))
-        && style_bool(&item.style, "caret_visible") == Some(true)
     {
         let text_bounds = text_content_bounds_for_item(item);
         let font_size = style_number(&item.style, "size").unwrap_or(14.0);
@@ -1956,20 +1972,42 @@ fn text_overlay_primitives(
         let line_height =
             style_line_height(&item.style, font_size).min(text_bounds.height.max(1.0));
         let line_top = text_top_for_parts(text_bounds, line_height, text_inset, vertical_align);
-        let caret_column = style_number(&item.style, "caret_column").unwrap_or(0.0);
-        primitives.push(text_overlay_primitive(
-            item,
-            RenderVisualPrimitiveKind::TextInputCaret,
-            Rect {
-                x: x_for_column(caret_column.max(0.0)),
-                y: line_top,
-                width: 2.0,
-                height: line_height,
-            },
-            style_color_u8(&item.style, "caret_color")
-                .or_else(|| style_color_u8(&item.style, "color"))
-                .unwrap_or([56, 56, 56, 255]),
-        ));
+        if let (Some(start), Some(end)) = (
+            style_number(&item.style, "selection_start"),
+            style_number(&item.style, "selection_end"),
+        ) {
+            let start = start.max(0.0);
+            let end = end.max(start);
+            let start_x = x_for_column(start);
+            let end_x = x_for_column(end);
+            primitives.push(text_overlay_primitive(
+                item,
+                RenderVisualPrimitiveKind::TextInputSelection,
+                Rect {
+                    x: start_x,
+                    y: line_top,
+                    width: (end_x - start_x).max(2.0),
+                    height: line_height,
+                },
+                style_color_u8(&item.style, "selection_color").unwrap_or([82, 139, 255, 72]),
+            ));
+        }
+        if style_bool(&item.style, "caret_visible") == Some(true) {
+            let caret_column = style_number(&item.style, "caret_column").unwrap_or(0.0);
+            primitives.push(text_overlay_primitive(
+                item,
+                RenderVisualPrimitiveKind::TextInputCaret,
+                Rect {
+                    x: x_for_column(caret_column.max(0.0)),
+                    y: line_top,
+                    width: 2.0,
+                    height: line_height,
+                },
+                style_color_u8(&item.style, "caret_color")
+                    .or_else(|| style_color_u8(&item.style, "color"))
+                    .unwrap_or([56, 56, 56, 255]),
+            ));
+        }
     }
     primitives
 }
@@ -2007,6 +2045,7 @@ fn text_overlay_dependency_name(primitive: RenderVisualPrimitiveKind) -> &'stati
         RenderVisualPrimitiveKind::EditorSelection => "editor-selection",
         RenderVisualPrimitiveKind::EditorBracketHighlight => "editor-bracket-highlight",
         RenderVisualPrimitiveKind::EditorCaret => "editor-caret",
+        RenderVisualPrimitiveKind::TextInputSelection => "text-input-selection",
         RenderVisualPrimitiveKind::TextInputCaret => "text-input-caret",
         RenderVisualPrimitiveKind::Underline => "underline",
         RenderVisualPrimitiveKind::Strikethrough => "strikethrough",
@@ -2089,6 +2128,9 @@ fn render_text_runs_for_nodes(
             || (style_bool(&item.style, "__hover_visible") == Some(true)
                 && style_bool(&item.style, "__hover_paint") != Some(true))
         {
+            continue;
+        }
+        if matches!(item.kind, DocumentNodeKind::Checkbox) {
             continue;
         }
         let checked = style_bool(&item.style, "checked") == Some(true);
@@ -2403,6 +2445,8 @@ fn text_align(kind: &DocumentNodeKind, style: &StyleMap) -> RenderTextAlign {
     } else if align.eq_ignore_ascii_case("right") {
         RenderTextAlign::Right
     } else if align.eq_ignore_ascii_case("center") {
+        RenderTextAlign::Center
+    } else if style_bool(style, "center") == Some(true) {
         RenderTextAlign::Center
     } else if matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox) {
         RenderTextAlign::Center

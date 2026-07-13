@@ -1,0 +1,38 @@
+document: Document/new(
+    root: Element/container(
+        element: []
+        style: [
+            width: Fill
+            height: Fill
+            padding: 32
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.96,chroma:0.015,hue:210]]
+        ]
+        child: Element/stripe(
+            element: []
+            direction: Column
+            gap: 8
+            style: [
+                width: 440
+                height: 150
+                padding: 24
+                align: [row: Center]
+                background: [color: Oklch[lightness:1]]
+                border: [color: Oklch[lightness:0.86]]
+                rounded_corners: 6
+            ]
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: [height: 52, font: [size: 34, color: Oklch[lightness:0.20]]]
+                    label: TEXT { Hello, world! }
+                )
+                Element/label(
+                    element: []
+                    style: [height: 28, font: [size: 14, color: Oklch[lightness:0.48]]]
+                    label: TEXT { A document, a stripe, and two labels. }
+                )
+            }
+        )
+    )
+)

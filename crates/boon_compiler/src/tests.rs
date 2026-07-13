@@ -1,8 +1,39 @@
 use super::*;
+
+#[test]
+fn timer_interval_lowers_once_as_a_scheduled_source_route() {
+    let compiled = compile_source_text_to_machine_plan(
+        "timer-interval.bn",
+        r#"
+store: [
+    tick: Duration[milliseconds: 250] |> Timer/interval()
+    count: 0 |> HOLD count {
+        tick |> THEN { count + 1 }
+    }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(compiled.plan.source_routes.len(), 1);
+    assert_eq!(compiled.plan.source_routes[0].path, "store.tick");
+    assert_eq!(compiled.plan.source_routes[0].interval_ms, Some(250));
+    assert!(
+        compiled
+            .plan
+            .debug_map
+            .derived_values
+            .iter()
+            .all(|field| field.label != "store.tick"),
+        "scheduled source must not also lower as a derived field"
+    );
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+}
 use boon_plan::{
     DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
-    PLAN_MAJOR_VERSION, PlanDerivedExpression, PlanOpKind, PlanRowExpression, RootOutputDemand,
-    ValueRef, plan_sha256,
+    DocumentValueClass, PLAN_MAJOR_VERSION, PlanDerivedExpression, PlanOpKind, PlanRowExpression,
+    RootOutputDemand, ValueRef, plan_sha256,
 };
 
 fn example_path(path: &str) -> PathBuf {
@@ -226,6 +257,126 @@ fn document_ids_are_stable_across_identical_compilation() {
         plan_sha256(&first.plan).unwrap(),
         plan_sha256(&second.plan).unwrap()
     );
+}
+
+#[test]
+fn document_row_alias_arguments_remain_rows_and_selects_follow_dynamic_inputs() {
+    let compiled = compile_source_text_to_machine_plan(
+        "document-row-argument.bn",
+        r#"
+store: [
+    rows:
+        LIST {
+            [title: TEXT { First }, kind: First]
+            [title: TEXT { Second }, kind: Second]
+        }
+        |> List/map(row, new: new_row(title: row.title, kind: row.kind))
+]
+
+FUNCTION new_row(title, kind) {
+    [
+        controls: [select: SOURCE]
+        selected:
+            False |> HOLD selected {
+                LATEST { controls.select |> THEN { True } }
+            }
+        title: title
+        kind: kind
+    ]
+}
+
+FUNCTION render_row(row) {
+    render_title(row: row)
+}
+
+FUNCTION render_title(row) {
+    Element/label(
+        element: []
+        style: merge_style(
+            base: [width: 200]
+            extra: conditional_style(kind: row.kind)
+        )
+        label: row.kind |> WHEN {
+            First => TEXT { First row }
+            Second => TEXT { Second row }
+        }
+    )
+}
+
+FUNCTION merge_style(base, extra) {
+    [
+        ...base
+        ...extra
+    ]
+}
+
+FUNCTION conditional_style(kind) {
+    kind |> WHEN {
+        Compact => [height: 20]
+        __ => BLOCK {
+            height: 40
+            [height: height]
+        }
+    }
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: store.rows
+            |> List/map(row, new: render_row(row: row))
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert!(document.expressions.iter().any(|expression| {
+        let DocumentExprOp::FunctionCall { arguments, .. } = &expression.op else {
+            return false;
+        };
+        arguments.iter().any(|argument| {
+            matches!(
+                document.expressions[argument.value.0].op,
+                DocumentExprOp::Read {
+                    read: DocumentRead::Parameter {
+                        ref projection,
+                        ..
+                    }
+                } if projection.is_empty()
+            )
+        })
+    }));
+    assert!(document.expressions.iter().any(|expression| {
+        let DocumentExprOp::Select { arms, .. } = &expression.op else {
+            return false;
+        };
+        arms.iter().any(|arm| {
+            matches!(
+                document.expressions[arm.output.0].op,
+                DocumentExprOp::LocalBlock { .. }
+            )
+        })
+    }));
+    assert!(document.expressions.iter().any(|expression| {
+        matches!(
+            &expression.op,
+            DocumentExprOp::Record { fields }
+                if fields.len() == 2 && fields.iter().all(|field| field.spread)
+        )
+    }));
+    for expression in &document.expressions {
+        let DocumentExprOp::Select { input, .. } = expression.op else {
+            continue;
+        };
+        if document.expressions[input.0].value_class != DocumentValueClass::Static {
+            assert_ne!(expression.value_class, DocumentValueClass::Static);
+        }
+    }
 }
 
 #[test]

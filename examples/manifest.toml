@@ -434,3 +434,93 @@ performance_thresholds = [
   "preview-interaction-p95-frame-ms <= 16.7",
   "preview-interaction-p99-frame-ms <= 25.0",
 ]
+
+[[example]]
+id = "minimal"
+label = "Minimal"
+source = "examples/minimal.bn"
+scenario = "examples/minimal.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 40
+shown_by_default = true
+
+[[example]]
+id = "hello_world"
+label = "Hello World"
+source = "examples/hello_world.bn"
+scenario = "examples/hello_world.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 41
+shown_by_default = true
+
+[[example]]
+id = "counter_latest"
+label = "Counter without HOLD"
+source = "examples/counter_latest.bn"
+scenario = "examples/counter_latest.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 42
+shown_by_default = true
+
+[[example]]
+id = "fibonacci"
+label = "Fibonacci"
+source = "examples/fibonacci.bn"
+scenario = "examples/fibonacci.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 43
+shown_by_default = true
+
+[[example]]
+id = "interval_latest"
+label = "Interval without HOLD"
+source = "examples/interval_latest.bn"
+scenario = "examples/interval_latest.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 44
+shown_by_default = true
+
+[[example]]
+id = "interval_hold"
+label = "Interval"
+source = "examples/interval_hold.bn"
+scenario = "examples/interval_hold.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 45
+shown_by_default = true
+
+[[example]]
+id = "flow_operators"
+label = "LATEST, THEN, WHEN, WHILE"
+source = "examples/flow_operators.bn"
+scenario = "examples/flow_operators.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 46
+shown_by_default = true
+
+[[example]]
+id = "layers"
+label = "Layers"
+source = "examples/layers.bn"
+scenario = "examples/layers.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 47
+shown_by_default = true
+
+[[example]]
+id = "pages"
+label = "Pages"
+source = "examples/pages.bn"
+scenario = "examples/pages.scn"
+budget = "examples/basic_examples.budget.toml"
+category = "basic"
+order = 48
+shown_by_default = true

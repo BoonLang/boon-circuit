@@ -1,0 +1,28 @@
+name = "pages"
+source = "examples/pages.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.page_title" = "Pages"
+
+[[step]]
+id = "syntax-page"
+user_action = { kind = "button_press", target = "syntax navigation", target_text = "Syntax" }
+expected_source_event = { source = "store.sources.syntax", target_text = "Syntax" }
+  [step.expect_root_text]
+  "store.page_title" = "Syntax page"
+
+[[step]]
+id = "runtime-page"
+user_action = { kind = "button_press", target = "runtime navigation", target_text = "Runtime" }
+expected_source_event = { source = "store.sources.runtime", target_text = "Runtime" }
+  [step.expect_root_text]
+  "store.page_title" = "Runtime page"
+
+[[step]]
+id = "home-page"
+user_action = { kind = "button_press", target = "home navigation", target_text = "Home" }
+expected_source_event = { source = "store.sources.home", target_text = "Home" }
+  [step.expect_root_text]
+  "store.page_title" = "Pages"

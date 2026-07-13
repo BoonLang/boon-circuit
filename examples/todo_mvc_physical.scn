@@ -161,3 +161,15 @@ expect_root_text = { "theme_options.name" = "Neumorphism" }
 id = "toggle-light-dark-mode"
 user_action = { kind = "click", target = "theme mode toggle" }
 expected_source_event = { source = "store.elements.theme_switcher.mode_toggle" }
+
+[[step]]
+id = "restore-light-mode"
+user_action = { kind = "click", target = "theme mode toggle" }
+expected_source_event = { source = "store.elements.theme_switcher.mode_toggle" }
+expect_root_text = { "theme_options.mode" = "Light" }
+
+[[step]]
+id = "restore-classic-theme"
+user_action = { kind = "click", target = "theme classic" }
+expected_source_event = { source = "store.elements.theme_switcher.classic" }
+expect_root_text = { "theme_options.name" = "Classic" }

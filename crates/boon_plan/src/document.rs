@@ -211,6 +211,10 @@ pub enum DocumentRead {
     Passed {
         projection: Vec<DocumentNameId>,
     },
+    Matched {
+        selector: usize,
+        projection: Vec<DocumentNameId>,
+    },
     Row {
         scope: ScopeId,
         field: Option<FieldId>,

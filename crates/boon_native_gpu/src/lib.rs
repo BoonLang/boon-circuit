@@ -3129,6 +3129,7 @@ fn quad_batches_from_visual_primitives_iter<'a>(
             | RenderVisualPrimitiveKind::EditorSelection
             | RenderVisualPrimitiveKind::EditorBracketHighlight
             | RenderVisualPrimitiveKind::EditorCaret
+            | RenderVisualPrimitiveKind::TextInputSelection
             | RenderVisualPrimitiveKind::TextInputCaret
             | RenderVisualPrimitiveKind::Underline
             | RenderVisualPrimitiveKind::Strikethrough

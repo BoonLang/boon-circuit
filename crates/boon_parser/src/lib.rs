@@ -168,6 +168,7 @@ pub enum AstStatementKind {
         capacity: Option<usize>,
     },
     Block,
+    Spread,
     Expression,
 }
 
@@ -298,6 +299,7 @@ pub struct ParsedSourcePort {
     pub path: String,
     pub line: usize,
     pub scoped: bool,
+    pub interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -401,7 +403,6 @@ fn parse_combined_source(
     namespace_project_modules(&mut ast, &files);
     validate_source_syntax(&path, &ast)?;
     validate_balanced_brackets(&path, &ast)?;
-    validate_required_constructs(&path, &ast)?;
     validate_list_capacities(&path, &ast)?;
     validate_no_reducer_style_update(&path, &ast)?;
     let kind = detect_program_kind();
@@ -1252,6 +1253,11 @@ fn ast_statement(
     } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "(" | "]" | "}" | ")"))
     {
         AstStatementKind::Block
+    } else if item
+        .symbols
+        .starts_with(&[".".to_owned(), ".".to_owned(), ".".to_owned()])
+    {
+        AstStatementKind::Spread
     } else {
         AstStatementKind::Expression
     };
@@ -2526,18 +2532,6 @@ fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseE
     }
 }
 
-fn validate_required_constructs(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
-    for required in ["SOURCE", "HOLD", "LATEST"] {
-        if !ast_has_lexeme(ast, required) {
-            return Err(ParseError {
-                path: path.to_owned(),
-                message: format!("required construct `{required}` is missing"),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn validate_list_capacities(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
     for line in ast.semantic_parser_lines() {
         let Some(list_index) = line.symbols.iter().position(|lexeme| lexeme == "LIST") else {
@@ -2770,6 +2764,7 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "Bool/not"
             | "Bool/and"
             | "Bool/toggle"
+            | "Timer/interval"
             | "Router/route"
             | "Router/go_to"
             | "Ulid/generate"
@@ -2786,10 +2781,6 @@ fn collect_named_statements(ast: &AstProgram, needle: &str) -> Vec<String> {
         .filter(|item| item.has_lexeme(needle))
         .map(parser_item_summary)
         .collect()
-}
-
-fn ast_has_lexeme(ast: &AstProgram, lexeme: &str) -> bool {
-    ast.semantic_tokens().any(|token| token.lexeme == lexeme)
 }
 
 fn ast_token_for_parser_line_symbol<'a>(
@@ -3041,6 +3032,7 @@ fn collect_list_memory_name_statements(
             | AstStatementKind::Source { .. }
             | AstStatementKind::Hold { .. }
             | AstStatementKind::Block
+            | AstStatementKind::Spread
             | AstStatementKind::Expression => {
                 collect_list_memory_name_statements(ast, &statement.children, scope, names);
             }
@@ -3189,6 +3181,7 @@ fn derive_structure_from_statements(
                             path,
                             line: statement.line,
                             scoped: source_scope_is_scoped(scope, row_scopes),
+                            interval_ms: None,
                         },
                     );
                 }
@@ -3258,7 +3251,7 @@ fn derive_structure_from_statements(
                     tables,
                 );
             }
-            AstStatementKind::Block | AstStatementKind::Expression => {
+            AstStatementKind::Block | AstStatementKind::Spread | AstStatementKind::Expression => {
                 derive_structure_from_statements(
                     &statement.children,
                     expressions,
@@ -3564,7 +3557,8 @@ fn statement_is_record_constructor_block(statement: &AstStatement, lines: &[Pars
 fn statement_is_record_field(statement: &AstStatement) -> bool {
     matches!(
         statement.kind,
-        AstStatementKind::Field { .. }
+        AstStatementKind::Spread
+            | AstStatementKind::Field { .. }
             | AstStatementKind::Source { .. }
             | AstStatementKind::Hold { field: Some(_), .. }
             | AstStatementKind::List { field: Some(_), .. }
@@ -3774,9 +3768,28 @@ fn collect_source_ports_from_expr(
         AstExprKind::Source => {
             let source_scope = source_scope_without_events(scope);
             if let Some(path) = scope_path(&source_scope) {
-                tables
-                    .source_ports
-                    .push(ParsedSourcePort { path, line, scoped });
+                tables.source_ports.push(ParsedSourcePort {
+                    path,
+                    line,
+                    scoped,
+                    interval_ms: None,
+                });
+            }
+        }
+        AstExprKind::Pipe { input, op, .. } if op == "Timer/interval" => {
+            if let (Some(path), Some(interval_ms)) = (
+                scope_path(scope),
+                duration_milliseconds(*input, expressions),
+            ) {
+                push_source_port(
+                    tables,
+                    ParsedSourcePort {
+                        path,
+                        line,
+                        scoped,
+                        interval_ms: Some(interval_ms),
+                    },
+                );
             }
         }
         AstExprKind::Object(fields)
@@ -3797,6 +3810,29 @@ fn collect_source_ports_from_expr(
         }
         _ => {}
     }
+}
+
+fn duration_milliseconds(expr_id: usize, expressions: &[AstExpr]) -> Option<u64> {
+    let AstExprKind::TaggedObject { tag, fields } = &expressions.get(expr_id)?.kind else {
+        return None;
+    };
+    if tag != "Duration" {
+        return None;
+    }
+    let (scale, value) = fields.iter().find_map(|field| {
+        let scale = match field.name.as_str() {
+            "milliseconds" => 1.0,
+            "seconds" => 1_000.0,
+            _ => return None,
+        };
+        let AstExprKind::Number(value) = &expressions.get(field.value)?.kind else {
+            return None;
+        };
+        Some((scale, value.parse::<f64>().ok()?))
+    })?;
+    let milliseconds = value * scale;
+    (milliseconds.is_finite() && milliseconds >= 1.0 && milliseconds <= u64::MAX as f64)
+        .then_some(milliseconds.round() as u64)
 }
 
 fn collect_row_scope_statements(
@@ -3884,6 +3920,7 @@ fn collect_row_scope_statements(
                 scope.pop();
             }
             AstStatementKind::Block
+            | AstStatementKind::Spread
             | AstStatementKind::Expression
             | AstStatementKind::Hold { .. }
             | AstStatementKind::List { field: None, .. }

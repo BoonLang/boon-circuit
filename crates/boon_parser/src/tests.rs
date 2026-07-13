@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn timer_intervals_are_typed_as_scheduled_source_ports() {
+    let program = parse_source(
+        "timer-sources.bn",
+        r#"
+fast: Duration[milliseconds: 250] |> Timer/interval()
+slow: Duration[seconds: 2] |> Timer/interval()
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        program
+            .source_ports
+            .iter()
+            .map(|source| (source.path.as_str(), source.interval_ms))
+            .collect::<Vec<_>>(),
+        [("fast", Some(250)), ("slow", Some(2_000))]
+    );
+}
+
+#[test]
 fn formatter_keeps_todomvc_source_declarations_in_designed_compact_shape() {
     let source = include_str!("../../../examples/todomvc.bn");
     let formatted = format_source("examples/todomvc.bn", source).unwrap();
@@ -16,13 +37,8 @@ fn formatter_keeps_todomvc_source_declarations_in_designed_compact_shape() {
 #[test]
 fn formatter_accepts_manifest_entry_file_as_source_unit() {
     let source = include_str!("../../../examples/cells.bn");
-    let full_source_error = format_source("examples/cells.bn", source)
-        .expect_err("entry file alone should still fail full source validation");
-    assert!(
-        full_source_error
-            .to_string()
-            .contains("required construct `SOURCE` is missing")
-    );
+    let standalone = format_source("examples/cells.bn", source).unwrap();
+    assert!(standalone.contains("cells_app()"));
 
     let formatted = format_source_unit("examples/cells.bn", source).unwrap();
     assert!(formatted.contains("cells_app()"));
@@ -992,6 +1008,13 @@ b: 2
 "#,
     )
     .unwrap();
+    assert!(
+        program
+            .ast
+            .statements
+            .iter()
+            .any(|statement| matches!(statement.kind, AstStatementKind::Spread))
+    );
     assert!(!program.ast.expressions.iter().any(|expr| {
         matches!(&expr.kind, AstExprKind::Call { function, .. } if function.starts_with("..."))
     }));

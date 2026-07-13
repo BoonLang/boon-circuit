@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,7 +19,9 @@ use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, input_kind,
     pointer_button_pressed, role_message_frame,
 };
-use crate::observer::{InputAccepted, ObserverClient, ObserverEvent, ObserverRole};
+use crate::observer::{
+    InputAccepted, ObserverClient, ObserverEvent, ObserverRole, TestPointerPhase,
+};
 use crate::proof::{ProofConfig, ProofRequest, ProofResult, ProofWorker};
 use crate::protocol::{
     Connection, FrameMode, Message, PreviewIntent, PreviewStats, ProofMode, Role, TestStep,
@@ -30,11 +33,87 @@ pub(crate) const TEST_STEP_LIMIT: usize = 24;
 const RUNTIME_VIEW_CACHE_LIMIT: usize = 8;
 const OUTBOUND_QUEUE_DEPTH: usize = 8;
 const STATS_INTERVAL: Duration = Duration::from_millis(100);
+const TEST_CURSOR_FRAME: Duration = Duration::from_millis(16);
+const TEST_CURSOR_PIXELS_PER_FRAME: f32 = 36.0;
+const TEST_CURSOR_MAX_MOVE_FRAMES: usize = 12;
 
 struct PreviewOutput {
     sender: Option<SyncSender<Message>>,
     error: Arc<Mutex<Option<String>>>,
     writer: Option<thread::JoinHandle<()>>,
+}
+
+struct DeadlineScheduler {
+    commands: Option<std::sync::mpsc::Sender<Option<Instant>>>,
+    ticks: mpsc::UnboundedReceiver<()>,
+    worker: Option<thread::JoinHandle<()>>,
+    scheduled: Option<Option<Instant>>,
+}
+
+impl DeadlineScheduler {
+    fn start() -> Result<Self, String> {
+        let (commands, receiver) = std::sync::mpsc::channel::<Option<Instant>>();
+        let (tick_sender, ticks) = mpsc::unbounded();
+        let worker = thread::Builder::new()
+            .name("boon-preview-deadline".to_owned())
+            .spawn(move || {
+                let mut deadline = None::<Instant>;
+                loop {
+                    let command = match deadline {
+                        Some(at) => match receiver
+                            .recv_timeout(at.saturating_duration_since(Instant::now()))
+                        {
+                            Ok(command) => Some(command),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if tick_sender.unbounded_send(()).is_err() {
+                                    break;
+                                }
+                                deadline = None;
+                                None
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        },
+                        None => match receiver.recv() {
+                            Ok(command) => Some(command),
+                            Err(_) => break,
+                        },
+                    };
+                    if let Some(command) = command {
+                        deadline = receiver.try_iter().last().unwrap_or(command);
+                    }
+                }
+            })
+            .map_err(|error| format!("spawn preview deadline scheduler: {error}"))?;
+        Ok(Self {
+            commands: Some(commands),
+            ticks,
+            worker: Some(worker),
+            scheduled: None,
+        })
+    }
+
+    fn schedule(&mut self, deadline: Option<Instant>) {
+        if self.scheduled == Some(deadline) {
+            return;
+        }
+        self.scheduled = Some(deadline);
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(deadline);
+        }
+    }
+
+    fn fired(&mut self) {
+        self.scheduled = None;
+    }
+}
+
+impl Drop for DeadlineScheduler {
+    fn drop(&mut self) {
+        self.commands.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 impl PreviewOutput {
@@ -162,13 +241,24 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
     let mut proof_eligible_ordinal = 0u64;
     let mut proof_requested = false;
     let mut last_stats_sent = None::<Instant>;
+    let mut deadline_scheduler = DeadlineScheduler::start()?;
 
     loop {
+        deadline_scheduler.schedule(runtime.as_ref().and_then(|runtime| {
+            [
+                runtime.caret_blink_deadline(),
+                runtime.scheduled_source_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+        }));
         enum Wake {
             Native(Result<HostEventEnvelope, boon_native_app_window::NativeHostError>),
             Ipc(Option<Result<Message, String>>),
             Compiled(Option<crate::compile::CompileOutcome>),
             Proof(Option<ProofResult>),
+            Scheduled(Option<()>),
         }
         let wake = {
             let native = host.next_event().fuse();
@@ -181,18 +271,21 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 }
             }
             .fuse();
-            pin_mut!(native, command, result, proof_result);
+            let scheduled = deadline_scheduler.ticks.next().fuse();
+            pin_mut!(native, command, result, proof_result, scheduled);
             select! {
                 value = native => Wake::Native(value),
                 value = command => Wake::Ipc(value),
                 value = result => Wake::Compiled(value),
                 value = proof_result => Wake::Proof(value),
+                value = scheduled => Wake::Scheduled(value),
             }
         };
 
         match wake {
             Wake::Native(event) => {
                 let mut transaction = NativeFrameTransaction::default();
+                let mut latest_runtime_sequence = None;
                 for accepted in drain_native_events(&mut host, event).await? {
                     let envelope = &accepted.envelope;
                     if matches!(envelope.event, HostEvent::CloseRequested { .. }) {
@@ -200,7 +293,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         let _ = output.send(Message::Shutdown);
                         return Ok(());
                     }
-                    let target = event_target(&view, &envelope.event);
+                    let target = event_target(&view, &envelope.event, &mut columns);
                     let target_name = target.as_ref().map(|target| target.node.clone());
                     let target_source_path = target
                         .as_ref()
@@ -216,7 +309,15 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         true
                     } else if let Some(model) = runtime.as_mut() {
                         let started = Instant::now();
+                        let sequence_before = model.event_sequence();
                         let changed = model.handle_event(&envelope.event, target)?;
+                        let sequence_after = model.event_sequence();
+                        if sequence_after > sequence_before {
+                            latest_runtime_sequence = Some(sequence_after);
+                        }
+                        if let Some(url) = model.take_external_url() {
+                            let _ = Command::new("xdg-open").arg(url).spawn();
+                        }
                         event_dispatch_us = duration_us(started.elapsed());
                         let phase = model.last_runtime_phase();
                         executor_us = phase.executor_us;
@@ -266,6 +367,12 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         &mut last_stats_sent,
                         false,
                     )?;
+                }
+                if let Some(runtime_sequence) = latest_runtime_sequence {
+                    output.send(Message::PreviewRuntimeChanged {
+                        revision: source_revision,
+                        runtime_sequence,
+                    })?;
                 }
             }
             Wake::Ipc(message) => {
@@ -380,6 +487,10 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         revision,
                         path,
                     } => {
+                        let runtime_sequence = runtime
+                            .as_ref()
+                            .map(RuntimeView::event_sequence)
+                            .unwrap_or(0);
                         let result = if revision != source_revision {
                             Err(format!(
                                 "preview revision {source_revision} is not editor revision {revision}"
@@ -400,6 +511,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         output.send(Message::PreviewInspectResult {
                             request_id,
                             revision,
+                            runtime_sequence,
                             path,
                             ok,
                             value,
@@ -456,6 +568,10 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 })?;
                                 if test {
                                     let result = run_test(
+                                        &observer,
+                                        &output,
+                                        request_id,
+                                        source_revision,
                                         runtime.as_mut().expect("mounted runtime"),
                                         &mut view,
                                         &mut product,
@@ -581,6 +697,39 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         worker.result_drop_count(),
                     ),
                 );
+            }
+            Wake::Scheduled(tick) => {
+                tick.ok_or("preview deadline scheduler stopped")?;
+                deadline_scheduler.fired();
+                if let Some(runtime) = runtime.as_mut() {
+                    let now = Instant::now();
+                    let sequence_before = runtime.event_sequence();
+                    let timer_changed = runtime.advance_scheduled_sources(now)?;
+                    let caret_changed = runtime.advance_caret_blink(now);
+                    if timer_changed || caret_changed {
+                        apply_runtime_update(runtime, &mut view, &mut columns)?;
+                    }
+                    if timer_changed || caret_changed {
+                        if let Some(presented) = product.present(&mut host, &view).await? {
+                            emit_presented(&observer, &presented);
+                        }
+                        send_stats(
+                            &output,
+                            &product,
+                            source_revision,
+                            FrameMode::Burst,
+                            compiler.replaced_count(),
+                            &mut last_stats_sent,
+                            false,
+                        )?;
+                    }
+                    if runtime.event_sequence() > sequence_before {
+                        output.send(Message::PreviewRuntimeChanged {
+                            revision: source_revision,
+                            runtime_sequence: runtime.event_sequence(),
+                        })?;
+                    }
+                }
             }
         }
     }
@@ -743,6 +892,10 @@ fn first_test_target(
 }
 
 async fn run_test(
+    observer: &Option<ObserverClient>,
+    output: &PreviewOutput,
+    request_id: u64,
+    source_revision: u64,
     runtime: &mut RuntimeView,
     view: &mut RetainedView,
     product: &mut ProductFrame,
@@ -756,7 +909,7 @@ async fn run_test(
     }
     let surface = host.ids().surface.clone();
     let mut completed = 0usize;
-    for step in steps.iter().take(TEST_STEP_LIMIT) {
+    for (step_index, step) in steps.iter().take(TEST_STEP_LIMIT).enumerate() {
         let sequence_before = runtime.event_sequence();
         let target_row = runtime.scenario_target_row(
             &step.source_path,
@@ -778,30 +931,135 @@ async fn run_test(
                     step.source_path, step.target_text
                 )
             })?;
-        cursor.0 = target.center_x;
-        cursor.1 = target.center_y;
-        let mut dirty = false;
+        for next in test_cursor_path(*cursor, (target.center_x, target.center_y)) {
+            *cursor = next;
+            let hover_target = view.hit_target(cursor.0, cursor.1);
+            let changed = runtime.handle_event(
+                &HostEvent::Pointer(PointerEvent {
+                    surface: surface.clone(),
+                    x: cursor.0,
+                    y: cursor.1,
+                    phase: PointerPhase::Move,
+                    button: None,
+                }),
+                hover_target.clone(),
+            )?;
+            if changed {
+                apply_runtime_update(runtime, view, columns)?;
+            }
+            present_test_cursor_frame(
+                observer,
+                request_id,
+                step_index,
+                TestPointerPhase::Move,
+                hover_target.as_ref().map(|target| target.node.as_str()),
+                runtime.event_sequence(),
+                product,
+                host,
+                view,
+                *cursor,
+                1,
+            )
+            .await?;
+        }
+        let final_target = view
+            .hit_target(target.center_x, target.center_y)
+            .ok_or_else(|| format!("TEST cursor ended outside target `{}`", target.node))?;
+        let same_source = target
+            .source_path
+            .as_ref()
+            .is_some_and(|source| final_target.source_path.as_ref() == Some(source));
+        let same_target = final_target.node == target.node || same_source;
+        if !same_target {
+            return Err(format!(
+                "TEST cursor resolved `{}` instead of `{}` at ({:.1}, {:.1})",
+                final_target.node, target.node, target.center_x, target.center_y
+            )
+            .into());
+        }
+        if runtime.hovered() != Some(final_target.node.as_str()) {
+            return Err(format!(
+                "TEST cursor reached `{}` without entering its hover state",
+                final_target.node
+            )
+            .into());
+        }
+        present_test_cursor_frame(
+            observer,
+            request_id,
+            step_index,
+            TestPointerPhase::Hover,
+            Some(&final_target.node),
+            runtime.event_sequence(),
+            product,
+            host,
+            view,
+            *cursor,
+            3,
+        )
+        .await?;
+
         let pointer_cycles = usize::from(
             step.action_kind.as_deref() == Some("double_click")
                 || target.source_intent.as_deref() == Some("double_click"),
         ) + 1;
         for _ in 0..pointer_cycles {
-            for phase in [PointerPhase::Move, PointerPhase::Down, PointerPhase::Up] {
+            for (phase, playback_phase, dwell_frames) in [
+                (PointerPhase::Down, TestPointerPhase::Down, 2),
+                (PointerPhase::Up, TestPointerPhase::Up, 3),
+            ] {
                 let event = HostEvent::Pointer(PointerEvent {
                     surface: surface.clone(),
                     x: target.center_x,
                     y: target.center_y,
                     phase,
-                    button: if phase == PointerPhase::Move {
-                        None
-                    } else {
-                        Some(PointerButton::Primary)
-                    },
+                    button: Some(PointerButton::Primary),
                 });
-                dirty |= runtime.handle_event(&event, Some(target.clone()))?;
+                let changed = runtime.handle_event(&event, Some(final_target.clone()))?;
+                if phase == PointerPhase::Down
+                    && runtime.focused() != Some(final_target.node.as_str())
+                {
+                    return Err(
+                        format!("TEST pointer down did not focus `{}`", final_target.node).into(),
+                    );
+                }
+                if changed {
+                    apply_runtime_update(runtime, view, columns)?;
+                }
+                present_test_cursor_frame(
+                    observer,
+                    request_id,
+                    step_index,
+                    playback_phase,
+                    Some(&final_target.node),
+                    runtime.event_sequence(),
+                    product,
+                    host,
+                    view,
+                    *cursor,
+                    dwell_frames,
+                )
+                .await?;
             }
         }
+        let mut dirty = false;
         if let Some(text) = &step.text {
+            for (logical_key, pressed) in [
+                (LogicalKey::Named("Control_L".to_owned()), true),
+                (LogicalKey::Character("a".to_owned()), true),
+                (LogicalKey::Character("a".to_owned()), false),
+                (LogicalKey::Named("Control_L".to_owned()), false),
+            ] {
+                dirty |= runtime.handle_event(
+                    &HostEvent::Keyboard(KeyEvent {
+                        surface: surface.clone(),
+                        physical_key: None,
+                        logical_key,
+                        pressed,
+                    }),
+                    None,
+                )?;
+            }
             let event = HostEvent::TextInput(TextInputEvent {
                 surface: surface.clone(),
                 text: text.clone(),
@@ -842,13 +1100,84 @@ async fn run_test(
         if dirty {
             apply_runtime_update(runtime, view, columns)?;
         }
-        let _ = product
-            .present_cursor(host, view, cursor.0, cursor.1)
-            .await?;
-        thread::sleep(Duration::from_millis(16));
+        present_test_cursor_frame(
+            observer,
+            request_id,
+            step_index,
+            TestPointerPhase::State,
+            Some(&final_target.node),
+            runtime.event_sequence(),
+            product,
+            host,
+            view,
+            *cursor,
+            4,
+        )
+        .await?;
+        output.send(Message::PreviewRuntimeChanged {
+            revision: source_revision,
+            runtime_sequence: runtime.event_sequence(),
+        })?;
         completed += 1;
     }
     Ok(completed)
+}
+
+fn test_cursor_path(from: (f32, f32), to: (f32, f32)) -> Vec<(f32, f32)> {
+    let distance = (to.0 - from.0).hypot(to.1 - from.1);
+    let frames = ((distance / TEST_CURSOR_PIXELS_PER_FRAME).ceil() as usize)
+        .clamp(1, TEST_CURSOR_MAX_MOVE_FRAMES);
+    (1..=frames)
+        .map(|frame| {
+            let linear = frame as f32 / frames as f32;
+            let eased = linear * linear * (3.0 - 2.0 * linear);
+            (
+                from.0 + (to.0 - from.0) * eased,
+                from.1 + (to.1 - from.1) * eased,
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn present_test_cursor_frame(
+    observer: &Option<ObserverClient>,
+    request_id: u64,
+    step_index: usize,
+    phase: TestPointerPhase,
+    target: Option<&str>,
+    runtime_sequence: u64,
+    product: &mut ProductFrame,
+    host: &mut NativeSurfaceHost,
+    view: &RetainedView,
+    cursor: (f32, f32),
+    dwell_frames: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for _ in 0..3 {
+        if let Some(presented) = product
+            .present_cursor(host, view, cursor.0, cursor.1)
+            .await?
+        {
+            emit_presented(observer, &presented);
+            emit(
+                observer,
+                ObserverEvent::TestPointerFrame {
+                    request_id,
+                    step_index: step_index.try_into().unwrap_or(u32::MAX),
+                    phase,
+                    x: cursor.0,
+                    y: cursor.1,
+                    target: target.map(str::to_owned),
+                    runtime_sequence,
+                    key: presented.key,
+                },
+            );
+            thread::sleep(TEST_CURSOR_FRAME.saturating_mul(dwell_frames));
+            return Ok(());
+        }
+        thread::sleep(TEST_CURSOR_FRAME);
+    }
+    Err("TEST cursor frame could not be presented after three attempts".into())
 }
 
 fn apply_runtime_update(
@@ -932,9 +1261,15 @@ fn emit(observer: &Option<ObserverClient>, event: ObserverEvent) {
     }
 }
 
-fn event_target(view: &RetainedView, event: &HostEvent) -> Option<HitTarget> {
+fn event_target(
+    view: &RetainedView,
+    event: &HostEvent,
+    columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
+) -> Option<HitTarget> {
     match event {
-        HostEvent::Pointer(pointer) => view.hit_target(pointer.x, pointer.y),
+        HostEvent::Pointer(pointer) => {
+            view.hit_target_with_text_column(pointer.x, pointer.y, columns)
+        }
         HostEvent::Wheel(wheel) => {
             view.wheel_target(wheel.x, wheel.y, wheel.delta_x, wheel.delta_y)
         }
@@ -994,4 +1329,21 @@ fn saturating_u32(value: u64) -> u32 {
 
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cursor_path_moves_smoothly_and_finishes_on_the_hit_target() {
+        let path = test_cursor_path((24.0, 24.0), (384.0, 264.0));
+        assert!(path.len() > 2);
+        assert!(path.len() <= TEST_CURSOR_MAX_MOVE_FRAMES);
+        assert_eq!(path.last().copied(), Some((384.0, 264.0)));
+        assert!(path.windows(2).all(|pair| {
+            pair[0].0 <= pair[1].0 && pair[0].1 <= pair[1].1 && pair[0] != pair[1]
+        }));
+        assert_eq!(test_cursor_path((80.0, 40.0), (80.0, 40.0)), [(80.0, 40.0)]);
+    }
 }

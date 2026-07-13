@@ -248,6 +248,7 @@ pub fn compile_typed_program(
             path: source.path.clone(),
             scoped: source.scoped,
             scope_id: plan_scope_id(source.scope_id),
+            interval_ms: source.interval_ms,
             payload_schema: source_payload_schema_from_ir(&source.payload_schema),
         })
         .collect::<Vec<_>>();

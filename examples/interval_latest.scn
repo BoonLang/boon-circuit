@@ -1,0 +1,13 @@
+name = "interval without HOLD"
+source = "examples/interval_latest.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.count" = "0"
+
+[[step]]
+id = "timer-tick"
+expected_source_event = { source = "store.tick" }
+  [step.expect_root_text]
+  "store.count" = "1"

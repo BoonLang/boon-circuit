@@ -241,6 +241,7 @@ pub enum SemanticRole {
     Group,
     Row,
     Text,
+    Link,
     Button,
     Checkbox,
     TextInput,

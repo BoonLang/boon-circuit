@@ -217,6 +217,44 @@ FUNCTION bound_checkbox() {
 }
 
 #[test]
+fn document_match_arm_reads_tagged_pattern_fields_without_type_hint_fallbacks() {
+    let runtime = LiveRuntime::from_source(
+        "tagged-pattern-document.bn",
+        r#"
+events: SOURCE
+value: 0 |> HOLD value { LATEST { events |> THEN { value } } }
+document: Document/new(root: app())
+
+FUNCTION app() {
+    BLOCK {
+        choice: Choice[value: TEXT { selected }]
+
+        Element/text(
+            element: []
+            style: [width: 100, height: 20]
+            text: choice |> WHEN {
+                Choice[value] => Status[active: True] |> WHEN {
+                    Status[active] => value
+                }
+            }
+        )
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let texts = runtime
+        .document_frame()
+        .unwrap()
+        .nodes
+        .values()
+        .filter_map(|node| node.text.as_ref().map(|text| text.text.clone()))
+        .collect::<Vec<_>>();
+    assert!(texts.iter().any(|text| text == "selected"), "{texts:?}");
+}
+
+#[test]
 fn source_turn_rebuilds_a_function_returned_conditional_subtree() {
     let mut runtime = LiveRuntime::from_source(
         "conditional-subtree.bn",

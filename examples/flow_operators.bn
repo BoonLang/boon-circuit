@@ -1,0 +1,70 @@
+store: [
+    sources: [
+        addition: SOURCE
+        subtraction: SOURCE
+        toggle_details: SOURCE
+    ]
+
+    operation:
+        Addition |> HOLD operation {
+            LATEST {
+                sources.addition |> THEN { Addition }
+                sources.subtraction |> THEN { Subtraction }
+            }
+        }
+
+    details_visible:
+        True |> HOLD details_visible {
+            sources.toggle_details |> THEN { store.details_visible |> Bool/not() }
+        }
+
+    input_a: 21
+    input_b: 8
+
+    -- WHILE selects a live branch. The selected expression continues to
+    -- follow any values it reads.
+    result:
+        operation |> WHILE {
+            Addition => input_a + input_b
+            Subtraction => input_a - input_b
+        }
+
+    -- WHEN selects a value when its input changes.
+    details:
+        details_visible |> WHEN {
+            True => TEXT { LATEST chose {operation}; THEN produced {result}. }
+            False => TEXT { Details hidden }
+        }
+]
+
+document: Document/new(root: flow_app())
+
+FUNCTION flow_app() {
+    Element/container(
+        element: []
+        style: [width: Fill, height: Fill, padding: 24, align: [row: Center], background: [color: Oklch[lightness:0.965]]]
+        child: Element/stripe(
+            element: []
+            direction: Column
+            gap: 14
+            style: [width: 520, height: 330, padding: 24, align: [row: Center], background: [color: Oklch[lightness:1]], border: [color: Oklch[lightness:0.84]]]
+            items: LIST {
+                Element/label(element: [], style: [height: 34, font: [size: 24, color: Oklch[lightness:0.22]]], label: TEXT { LATEST, THEN, WHEN, WHILE })
+                Element/label(element: [], style: [height: 28, font: [size: 15, color: Oklch[lightness:0.45]]], label: TEXT { A = {store.input_a}, B = {store.input_b} })
+                Element/label(element: [], style: [height: 66, font: [size: 52, color: Oklch[lightness:0.38,chroma:0.15,hue:285]]], label: store.result)
+                Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 8
+                    style: [width: Fill, height: 42, align: [row: Center]]
+                    items: LIST {
+                        Element/button(element: [events: [press: store.sources.addition]], style: [width: 105, height: 38, background: [color: Oklch[lightness:0.94]], border: [color: Oklch[lightness:0.76]]], label: TEXT { A + B })
+                        Element/button(element: [events: [press: store.sources.subtraction]], style: [width: 105, height: 38, background: [color: Oklch[lightness:0.94]], border: [color: Oklch[lightness:0.76]]], label: TEXT { A - B })
+                        Element/button(element: [events: [press: store.sources.toggle_details]], style: [width: 130, height: 38, background: [color: Oklch[lightness:0.94]], border: [color: Oklch[lightness:0.76]]], label: TEXT { Toggle details })
+                    }
+                )
+                Element/label(element: [], style: [width: Fill, height: 42, font: [size: 14, color: Oklch[lightness:0.38]]], label: store.details)
+            }
+        )
+    )
+}

@@ -1,0 +1,5 @@
+name = "minimal"
+source = "examples/minimal.bn"
+
+[[step]]
+id = "initial"

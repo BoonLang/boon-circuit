@@ -26,7 +26,7 @@ use serde::Serialize;
 use crate::observer::{
     FrameEvidenceKey, FramePresented, InputAccepted, InputKind, OBSERVER_SOCKET_ENV, ObserverEvent,
     ObserverRole, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV, PROOF_SAMPLE_ORDINAL_ENV, ProofArtifact,
-    RoleMetadata, read_event,
+    RoleMetadata, TestPointerPhase, read_event,
 };
 #[cfg(target_os = "linux")]
 use crate::{native_input::NativeInput, ui::DEV_EDITOR, workspace_control::WorkspaceGuard};
@@ -1200,6 +1200,129 @@ impl ProductSamples {
 }
 
 #[cfg(target_os = "linux")]
+fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
+    let Some((request_id, completed_steps)) = events.iter().rev().find_map(|event| match event {
+        ObserverEvent::TestCompleted {
+            request_id,
+            passed: true,
+            completed_steps,
+            ..
+        } => Some((*request_id, *completed_steps)),
+        _ => None,
+    }) else {
+        return (false, "no passing TEST playback was observed".to_owned());
+    };
+    let frames = events
+        .iter()
+        .filter_map(|event| match event {
+            ObserverEvent::TestPointerFrame {
+                request_id: frame_request,
+                step_index,
+                phase,
+                x,
+                y,
+                target,
+                runtime_sequence,
+                key,
+            } if *frame_request == request_id => Some((
+                *step_index,
+                *phase,
+                *x,
+                *y,
+                target.as_deref(),
+                *runtime_sequence,
+                key,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if frames.is_empty() {
+        return (
+            false,
+            format!("TEST #{request_id} completed without any presented pointer frames"),
+        );
+    }
+    if frames
+        .windows(2)
+        .any(|pair| pair[0].6.frame_id >= pair[1].6.frame_id)
+        || frames.iter().any(|frame| !frame.6.is_complete())
+    {
+        return (
+            false,
+            format!("TEST #{request_id} pointer frames lack strict presented-frame identity"),
+        );
+    }
+    let unique_positions = frames
+        .iter()
+        .filter(|frame| frame.1 == TestPointerPhase::Move)
+        .map(|frame| (frame.2.round() as i32, frame.3.round() as i32))
+        .collect::<BTreeSet<_>>();
+    if unique_positions.len() < 2 {
+        return (
+            false,
+            format!("TEST #{request_id} cursor never visibly moved between distinct positions"),
+        );
+    }
+    for step_index in 0..completed_steps {
+        let step_frames = frames
+            .iter()
+            .filter(|frame| frame.0 == step_index)
+            .collect::<Vec<_>>();
+        for required in [
+            TestPointerPhase::Move,
+            TestPointerPhase::Hover,
+            TestPointerPhase::Down,
+            TestPointerPhase::Up,
+            TestPointerPhase::State,
+        ] {
+            if !step_frames.iter().any(|frame| frame.1 == required) {
+                return (
+                    false,
+                    format!(
+                        "TEST #{request_id} step {step_index} has no presented {required:?} frame"
+                    ),
+                );
+            }
+        }
+        let interactive_targets = step_frames
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame.1,
+                    TestPointerPhase::Hover | TestPointerPhase::Down | TestPointerPhase::Up
+                )
+            })
+            .filter_map(|frame| frame.4)
+            .collect::<BTreeSet<_>>();
+        if interactive_targets.len() != 1 {
+            return (
+                false,
+                format!(
+                    "TEST #{request_id} step {step_index} hover/down/up did not retain one hit target: {interactive_targets:?}"
+                ),
+            );
+        }
+        let first_sequence = step_frames.first().map_or(0, |frame| frame.5);
+        let final_sequence = step_frames.last().map_or(0, |frame| frame.5);
+        if final_sequence <= first_sequence {
+            return (
+                false,
+                format!(
+                    "TEST #{request_id} step {step_index} did not change runtime sequence after pointer playback"
+                ),
+            );
+        }
+    }
+    (
+        true,
+        format!(
+            "TEST #{request_id} presented {} cursor frames across {completed_steps} steps with move, hover, down, up, and resulting state",
+            frames.len()
+        ),
+    )
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct Capture {
     checks: Vec<Check>,
@@ -1242,6 +1365,13 @@ impl Capture {
             real_test && test_passed,
             "real Wayland pointer input clicked dev TEST and the preview scenario completed",
             "dev TEST was not both clicked through real app_window input and completed in preview",
+        ));
+        let (playback_valid, playback_detail) = test_pointer_playback_summary(&self.events);
+        self.checks.push(check_result(
+            "visible-test-pointer-playback",
+            playback_valid,
+            playback_detail.clone(),
+            playback_detail,
         ));
 
         let real_dev_keyboard = self.events.iter().any(|event| {

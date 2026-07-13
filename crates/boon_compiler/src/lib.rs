@@ -308,7 +308,13 @@ pub fn compile_source_path_to_machine_plan(
     let parse_started = Instant::now();
     let parsed = parse_source_path_or_manifest_project(source_path)?;
     let parse_ms = elapsed_ms(parse_started);
-    compile_parsed_to_machine_plan(parsed, parse_ms, total_started, target_profile)
+    compile_parsed_to_machine_plan(
+        parsed,
+        parse_ms,
+        total_started,
+        target_profile,
+        LoweringMode::Full,
+    )
 }
 
 pub fn compile_source_text_to_machine_plan(
@@ -320,7 +326,31 @@ pub fn compile_source_text_to_machine_plan(
     let parse_started = Instant::now();
     let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
     let parse_ms = elapsed_ms(parse_started);
-    compile_parsed_to_machine_plan(parsed, parse_ms, total_started, target_profile)
+    compile_parsed_to_machine_plan(
+        parsed,
+        parse_ms,
+        total_started,
+        target_profile,
+        LoweringMode::Full,
+    )
+}
+
+pub fn compile_runtime_source_text_to_machine_plan(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let total_started = Instant::now();
+    let parse_started = Instant::now();
+    let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
+    let parse_ms = elapsed_ms(parse_started);
+    compile_parsed_to_machine_plan(
+        parsed,
+        parse_ms,
+        total_started,
+        target_profile,
+        LoweringMode::Runtime,
+    )
 }
 
 pub fn compile_source_units_to_machine_plan(
@@ -332,14 +362,50 @@ pub fn compile_source_units_to_machine_plan(
     let parse_started = Instant::now();
     let parsed = parse_source_units(source_label, units)?;
     let parse_ms = elapsed_ms(parse_started);
-    compile_parsed_to_machine_plan(parsed, parse_ms, total_started, target_profile)
+    compile_parsed_to_machine_plan(
+        parsed,
+        parse_ms,
+        total_started,
+        target_profile,
+        LoweringMode::Full,
+    )
+}
+
+pub fn compile_runtime_source_units_to_machine_plan(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let total_started = Instant::now();
+    let parse_started = Instant::now();
+    let parsed = parse_source_units(source_label, units)?;
+    let parse_ms = elapsed_ms(parse_started);
+    compile_parsed_to_machine_plan(
+        parsed,
+        parse_ms,
+        total_started,
+        target_profile,
+        LoweringMode::Runtime,
+    )
 }
 
 pub fn compile_parsed_program_to_machine_plan(
     parsed: ParsedProgram,
     target_profile: TargetProfile,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    compile_parsed_to_machine_plan(parsed, 0.0, Instant::now(), target_profile)
+    compile_parsed_to_machine_plan(
+        parsed,
+        0.0,
+        Instant::now(),
+        target_profile,
+        LoweringMode::Full,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum LoweringMode {
+    Full,
+    Runtime,
 }
 
 fn compile_parsed_to_machine_plan(
@@ -347,9 +413,13 @@ fn compile_parsed_to_machine_plan(
     parse_ms: f64,
     total_started: Instant,
     target_profile: TargetProfile,
+    lowering_mode: LoweringMode,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let lower_started = Instant::now();
-    let ir = boon_ir::lower(&parsed)?;
+    let ir = match lowering_mode {
+        LoweringMode::Full => boon_ir::lower(&parsed),
+        LoweringMode::Runtime => boon_ir::lower_runtime(&parsed),
+    }?;
     let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();
     verify_hidden_identity(&ir)?;

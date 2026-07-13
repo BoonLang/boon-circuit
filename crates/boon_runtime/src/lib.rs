@@ -1,6 +1,6 @@
 use boon_compiler::{
-    CompileProfile, CompilerSourceUnit, compile_source_text_to_machine_plan,
-    compile_source_units_to_machine_plan, compiler_source_text_for_path,
+    CompileProfile, CompilerSourceUnit, compile_runtime_source_text_to_machine_plan,
+    compile_runtime_source_units_to_machine_plan, compiler_source_text_for_path,
     compiler_source_units_for_manifest_source, compiler_source_units_for_path,
 };
 pub use boon_document_model::{DocumentFrame, DocumentPatch};
@@ -42,6 +42,7 @@ pub struct SourceDescriptor {
     pub id: SourceId,
     pub path: String,
     pub scoped: bool,
+    pub interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -106,7 +107,7 @@ impl LiveRuntime {
                 Some(cached) => (cached, true),
                 None => {
                     drop(cache);
-                    let compiled = compile_source_text_to_machine_plan(
+                    let compiled = compile_runtime_source_text_to_machine_plan(
                         source_label,
                         source,
                         TargetProfile::SoftwareDefault,
@@ -122,7 +123,7 @@ impl LiveRuntime {
                 }
             },
             Err(_) => {
-                let compiled = compile_source_text_to_machine_plan(
+                let compiled = compile_runtime_source_text_to_machine_plan(
                     source_label,
                     source,
                     TargetProfile::SoftwareDefault,
@@ -167,7 +168,7 @@ impl LiveRuntime {
                             source: unit.source.clone(),
                         })
                         .collect::<Vec<_>>();
-                    let compiled = compile_source_units_to_machine_plan(
+                    let compiled = compile_runtime_source_units_to_machine_plan(
                         source_label,
                         &compiler_units,
                         TargetProfile::SoftwareDefault,
@@ -190,7 +191,7 @@ impl LiveRuntime {
                         source: unit.source.clone(),
                     })
                     .collect::<Vec<_>>();
-                let compiled = compile_source_units_to_machine_plan(
+                let compiled = compile_runtime_source_units_to_machine_plan(
                     source_label,
                     &compiler_units,
                     TargetProfile::SoftwareDefault,
@@ -848,6 +849,7 @@ fn source_inventory(plan: &MachinePlan) -> SourceInventory {
                 id: route.source_id,
                 path: route.path.clone(),
                 scoped: route.scoped,
+                interval_ms: route.interval_ms,
             })
             .collect(),
     }

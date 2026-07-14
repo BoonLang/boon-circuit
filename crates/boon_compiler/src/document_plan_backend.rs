@@ -569,7 +569,15 @@ impl<'a> DocumentCompiler<'a> {
                 }
                 let input = if self.expr_is_delimiter(input) {
                     input_override.ok_or_else(|| {
-                        PlanError::new(format!("pipeline expression {expr_id} has no typed input"))
+                        let line = self
+                            .program
+                            .expressions
+                            .get(expr_id)
+                            .map(|expression| expression.line)
+                            .unwrap_or_default();
+                        PlanError::new(format!(
+                            "pipeline expression {expr_id} has no typed input (line {line})"
+                        ))
                     })?
                 } else {
                     self.compile_expr_with_children(input, &[], context, input_override)?
@@ -1244,7 +1252,8 @@ impl<'a> DocumentCompiler<'a> {
         children: &[AstStatement],
         context: &CompileContext,
     ) -> Result<DocumentExprId, PlanError> {
-        let mut arms = Vec::new();
+        let mut arms = Vec::<DocumentSelectArm>::new();
+        let mut last_arm_context = None::<CompileContext>;
         for child in children {
             let arm_expr = child.expr.ok_or_else(|| {
                 PlanError::new(format!(
@@ -1252,6 +1261,21 @@ impl<'a> DocumentCompiler<'a> {
                 ))
             })?;
             let AstExprKind::MatchArm { pattern, .. } = self.expr_kind(arm_expr)? else {
+                if child_is_pipeline_continuation(child, self.program) {
+                    let previous = arms.last_mut().ok_or_else(|| {
+                        PlanError::new(format!(
+                            "conditional expression {expr_id} starts with a pipeline continuation"
+                        ))
+                    })?;
+                    let arm_context = last_arm_context.as_ref().ok_or_else(|| {
+                        PlanError::new(format!(
+                            "conditional expression {expr_id} has no context for its pipeline continuation"
+                        ))
+                    })?;
+                    previous.output =
+                        self.compile_statement_value(child, arm_context, Some(previous.output))?;
+                    continue;
+                }
                 return Err(PlanError::new(format!(
                     "conditional expression {expr_id} contains a non-arm statement {}",
                     child.id
@@ -1270,6 +1294,7 @@ impl<'a> DocumentCompiler<'a> {
                 pattern: self.compile_pattern(&pattern)?,
                 output,
             });
+            last_arm_context = Some(arm_context);
         }
         if arms.is_empty() {
             return Err(PlanError::new(format!(
@@ -1413,16 +1438,23 @@ impl<'a> DocumentCompiler<'a> {
         context: &CompileContext,
         compiler_id: usize,
     ) -> Result<DocumentExprId, PlanError> {
-        let items = children
-            .iter()
-            .map(|child| {
-                self.compile_statement_value(child, context, None)
-                    .map(|value| DocumentListItem {
-                        value,
-                        spread: false,
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut items = Vec::<DocumentListItem>::new();
+        for child in children {
+            if child_is_pipeline_continuation(child, self.program) {
+                let previous = items.last_mut().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "document list {compiler_id} starts with a pipeline continuation"
+                    ))
+                })?;
+                previous.value =
+                    self.compile_statement_value(child, context, Some(previous.value))?;
+                continue;
+            }
+            items.push(DocumentListItem {
+                value: self.compile_statement_value(child, context, None)?,
+                spread: false,
+            });
+        }
         let class = list_value_class(&items, &self.expressions);
         Ok(self.push_expr(compiler_id, class, DocumentExprOp::List { items }))
     }

@@ -1,0 +1,10 @@
+FUNCTION main_scene() {
+    Scene/new(
+        root: Shell/root(PASS: [store: PASSED.store])
+        lights: [
+            key: [x: -0.4, y: -0.8, z: 1.0, intensity: 0.42]
+            rim: [x: 0.7, y: 0.2, z: 0.5, intensity: 0.12]
+        ]
+        geometry: [depth_scale: 0.3]
+    )
+}

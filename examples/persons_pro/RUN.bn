@@ -1,0 +1,106 @@
+-- Persons.pro local-first publishing workspace.
+--
+-- This first slice owns the product shell and authoritative workspace state in
+-- Boon. The generic restricted child-program host is the next implementation
+-- slice; `implementation_stage` keeps that boundary observable in tests.
+
+store: [
+    elements: [
+        profile_name: SOURCE
+        profile_introduction: SOURCE
+        profile_location: SOURCE
+        show_code: SOURCE
+        show_preview: SOURCE
+        protect_workspace: SOURCE
+        add_passkey: SOURCE
+        sign_out: SOURCE
+        sign_in: SOURCE
+        publish: SOURCE
+        theme_toggle: SOURCE
+    ]
+
+    workspace_id: TEXT { 019f-persons-local-first }
+    workspace_path: TEXT { persons.pro/p/019f-persons-local-first }
+    implementation_stage: Shell
+
+    profile_name:
+        TEXT { Your name } |> HOLD profile_name {
+            elements.profile_name.event.change.text
+        }
+
+    profile_introduction:
+        TEXT { I build useful things with Boon. } |> HOLD profile_introduction {
+            elements.profile_introduction.event.change.text
+        }
+
+    profile_location:
+        TEXT { Trondheim, Norway } |> HOLD profile_location {
+            elements.profile_location.event.change.text
+        }
+
+    draft_revision:
+        1 |> HOLD draft_revision {
+            LATEST {
+                elements.profile_name.event.change |> THEN { draft_revision + 1 }
+                elements.profile_introduction.event.change |> THEN { draft_revision + 1 }
+                elements.profile_location.event.change |> THEN { draft_revision + 1 }
+            }
+        }
+
+    active_view:
+        Code |> HOLD active_view {
+            LATEST {
+                elements.show_code.event.press |> THEN { Code }
+                elements.show_preview.event.press |> THEN { Preview }
+            }
+        }
+
+    account_state:
+        Anonymous |> HOLD account_state {
+            LATEST {
+                elements.protect_workspace.event.press |> THEN { OnePasskey }
+                elements.add_passkey.event.press |> THEN { TwoPasskeys }
+                elements.sign_out.event.press |> THEN { SignedOut }
+                elements.sign_in.event.press |> THEN { TwoPasskeys }
+            }
+        }
+
+    publish_state:
+        Draft |> HOLD publish_state {
+            LATEST {
+                elements.profile_name.event.change |> THEN { Draft }
+                elements.profile_introduction.event.change |> THEN { Draft }
+                elements.profile_location.event.change |> THEN { Draft }
+                elements.publish.event.press |> THEN { Published }
+            }
+        }
+
+    published_name:
+        TEXT { Not published } |> HOLD published_name {
+            elements.publish.event.press |> THEN { profile_name }
+        }
+
+    published_revision:
+        0 |> HOLD published_revision {
+            elements.publish.event.press |> THEN { draft_revision }
+        }
+
+    mode:
+        Light |> HOLD mode {
+            elements.theme_toggle.event.press |> THEN {
+                mode |> WHEN {
+                    Light => Dark
+                    Dark => Light
+                }
+            }
+        }
+
+    source_summary:
+        Profile/summary(
+            name: profile_name
+            introduction: profile_introduction
+            location: profile_location
+        )
+]
+
+scene: App/main_scene(PASS: [store: store])

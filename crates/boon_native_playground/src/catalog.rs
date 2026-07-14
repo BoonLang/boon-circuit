@@ -346,6 +346,20 @@ mod tests {
                 .is_some_and(|unit| unit.path.ends_with("novywave/RUN.bn"))
         );
 
+        let persons = catalog.open("persons_pro").expect("Persons.pro sources");
+        assert_eq!(persons.label, "Persons.pro");
+        assert_eq!(
+            persons.application.package_id,
+            "dev.boon.example.persons_pro"
+        );
+        assert!(
+            persons
+                .units
+                .last()
+                .is_some_and(|unit| unit.path.ends_with("persons_pro/RUN.bn"))
+        );
+        assert_eq!(persons.test_steps.len(), 9);
+
         let items = catalog.items();
         for (id, label) in [
             ("minimal", "Minimal"),

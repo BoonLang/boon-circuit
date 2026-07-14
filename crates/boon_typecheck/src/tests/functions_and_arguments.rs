@@ -1,6 +1,49 @@
 // Included by `../tests.rs`; kept in the parent test module for private typechecker helper access.
 
 #[test]
+fn cross_module_text_function_is_accepted_as_a_style_color() {
+    let parsed = boon_parser::parse_project(
+        "RUN.bn",
+        [
+            (
+                "Theme.bn".to_owned(),
+                r#"
+FUNCTION accent() {
+    TEXT { #2f6c4f }
+}
+"#
+                .to_owned(),
+            ),
+            (
+                "View.bn".to_owned(),
+                r#"
+FUNCTION root() {
+    Scene/Element/text(
+        element: []
+        style: [color: Theme/accent()]
+        text: TEXT { Semantic color }
+    )
+}
+"#
+                .to_owned(),
+            ),
+            (
+                "RUN.bn".to_owned(),
+                "document: Document/new(root: View/root())\n".to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
 fn todomvc_completed_hints_use_widened_true_false_shape() {
     let source = include_str!("../../../../examples/todomvc.bn");
     let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();

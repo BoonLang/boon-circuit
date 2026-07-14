@@ -1,0 +1,184 @@
+FUNCTION root() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            ...PersonsTheme/page(mode: PASSED.store.mode)
+            scroll_y: True
+            scrollbars: True
+        ]
+        items: LIST {
+            header()
+            desktop_workspace()
+            mobile_workspace()
+        }
+    )
+}
+
+FUNCTION header() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 12
+        style: [
+            width: Fill
+            height: 68
+            padding: [left: 20, right: 20, top: 14, bottom: 14]
+            background: [color: PersonsTheme/header_background(mode: PASSED.store.mode)]
+            border: [color: PersonsTheme/header_border()]
+            border_width: 1
+        ]
+        items: LIST {
+            brand()
+            header_spacer()
+            header_desktop_actions()
+            theme_button()
+                |> SOURCE { PASSED.store.elements.theme_toggle }
+        }
+    )
+}
+
+FUNCTION brand() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [width: 220, height: 40, paint: False]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    font: [family: TEXT { Nimbus Sans }, size: 22, weight: 700]
+                    width: Fill
+                    height: 25
+                    color: PersonsTheme/brand_text()
+                ]
+                text: TEXT { persons.pro }
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    font: [family: TEXT { Nimbus Sans }, size: 11, weight: 500]
+                    width: Fill
+                    height: 15
+                    color: PersonsTheme/brand_path()
+                ]
+                text: TEXT { {PASSED.store.workspace_path} }
+            )
+        }
+    )
+}
+
+FUNCTION header_spacer() {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: 1, paint: False]
+        child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())
+    )
+}
+
+FUNCTION header_desktop_actions() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [width: Auto, visible_min_width: 860, paint: False]
+        items: LIST {
+            Publish/controls(PASS: [store: PASSED.store])
+            Auth/controls(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION theme_button() {
+    Components/button(
+        PASS: [store: PASSED.store]
+        label: PASSED.store.mode |> WHEN {
+            Dark => TEXT { Light }
+            Light => TEXT { Dark }
+        }
+        tone: Neutral
+        selected: False
+    )
+}
+
+FUNCTION desktop_workspace() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 14
+        style: [
+            width: Fill
+            height: 700
+            visible_min_width: 860
+            padding: 14
+            paint: False
+        ]
+        items: LIST {
+            Editor/root(PASS: [store: PASSED.store])
+            Preview/root(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION mobile_workspace() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [
+            width: Fill
+            visible_max_width: 859
+            padding: 10
+            paint: False
+        ]
+        items: LIST {
+            mobile_actions()
+            mobile_tabs()
+            PASSED.store.active_view |> WHEN {
+                Code => Editor/root(PASS: [store: PASSED.store])
+                Preview => Preview/root(PASS: [store: PASSED.store])
+                __ => Editor/root(PASS: [store: PASSED.store])
+            }
+        }
+    )
+}
+
+FUNCTION mobile_actions() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 8
+        style: [width: Fill, paint: False]
+        items: LIST {
+            Publish/controls(PASS: [store: PASSED.store])
+            Auth/controls(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION mobile_tabs() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Fill, height: 40, paint: False]
+        items: LIST {
+            Components/button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Code }
+                tone: Neutral
+                selected: PASSED.store.active_view == Code
+            )
+                |> SOURCE { PASSED.store.elements.show_code }
+            Components/button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Preview }
+                tone: Neutral
+                selected: PASSED.store.active_view == Preview
+            )
+                |> SOURCE { PASSED.store.elements.show_preview }
+        }
+    )
+}

@@ -1,0 +1,46 @@
+FUNCTION controls() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 7
+        style: [width: Auto, paint: False]
+        items: LIST {
+            Components/status(
+                PASS: [store: PASSED.store]
+                label: Account/status_label(state: PASSED.store.account_state)
+                tone: Account/status_tone(state: PASSED.store.account_state)
+            )
+            PASSED.store.account_state |> WHEN {
+                Anonymous => Components/button(
+                    PASS: [store: PASSED.store]
+                    label: TEXT { Protect workspace }
+                    tone: Primary
+                    selected: False
+                )
+                    |> SOURCE { PASSED.store.elements.protect_workspace }
+                OnePasskey => Components/button(
+                    PASS: [store: PASSED.store]
+                    label: TEXT { Add passkey }
+                    tone: Warning
+                    selected: False
+                )
+                    |> SOURCE { PASSED.store.elements.add_passkey }
+                TwoPasskeys => Components/button(
+                    PASS: [store: PASSED.store]
+                    label: TEXT { Sign out }
+                    tone: Neutral
+                    selected: False
+                )
+                    |> SOURCE { PASSED.store.elements.sign_out }
+                SignedOut => Components/button(
+                    PASS: [store: PASSED.store]
+                    label: TEXT { Sign in }
+                    tone: Primary
+                    selected: False
+                )
+                    |> SOURCE { PASSED.store.elements.sign_in }
+                __ => NoElement
+            }
+        }
+    )
+}

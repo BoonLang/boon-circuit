@@ -2334,7 +2334,9 @@ impl<'a> Checker<'a> {
             return ty;
         }
         if self.program.functions.iter().any(|name| name == function) {
-            open_object_type()
+            self.user_function_return_type(function, &mut BTreeSet::new())
+                .filter(is_specific_type)
+                .unwrap_or_else(open_object_type)
         } else {
             Type::Unknown
         }
@@ -4229,7 +4231,10 @@ impl<'a> Checker<'a> {
         if !style_color_accepts_type(&ty) {
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
-                format!("style field `{field_name}` must be `Oklch[...]` or CSS hex text"),
+                format!(
+                    "style field `{field_name}` must be `Oklch[...]` or CSS hex text, found `{}`",
+                    boon_facing_type_label(&ty)
+                ),
             ));
         }
     }

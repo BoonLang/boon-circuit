@@ -1,0 +1,18 @@
+FUNCTION status_label(state) {
+    state |> WHEN {
+        Anonymous => TEXT { Anonymous device }
+        OnePasskey => TEXT { 1 passkey }
+        TwoPasskeys => TEXT { 2 passkeys }
+        SignedOut => TEXT { Signed out }
+        __ => TEXT { Anonymous device }
+    }
+}
+
+FUNCTION status_tone(state) {
+    state |> WHEN {
+        OnePasskey => Warning
+        TwoPasskeys => Success
+        SignedOut => Neutral
+        __ => Neutral
+    }
+}

@@ -1,0 +1,140 @@
+FUNCTION root() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: [
+            ...PersonsTheme/panel(mode: PASSED.store.mode)
+            width: Fill
+            height: Fill
+        ]
+        items: LIST {
+            browser_bar()
+            profile_page()
+        }
+    )
+}
+
+FUNCTION browser_bar() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [
+            width: Fill
+            height: 44
+            padding: [left: 12, right: 12, top: 8, bottom: 8]
+            background: [color: PersonsTheme/browser_chrome(mode: PASSED.store.mode)]
+            border: [color: PersonsTheme/divider(mode: PASSED.store.mode)]
+            border_width: 1
+        ]
+        items: LIST {
+            Components/status(PASS: [store: PASSED.store], label: TEXT { Draft preview }, tone: Neutral)
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...PersonsTheme/muted(mode: PASSED.store.mode)
+                    width: Fill
+                    height: 28
+                    vertical_align: Center
+                    size: 12
+                ]
+                text: PASSED.store.workspace_path
+            )
+        }
+    )
+}
+
+FUNCTION profile_page() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 18
+        style: [
+            width: Fill
+            height: Fill
+            padding: [left: 34, right: 34, top: 38, bottom: 30]
+            background: [color: PersonsTheme/profile_surface(mode: PASSED.store.mode)]
+            scroll_y: True
+            scrollbars: True
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: [tag: Heading]
+                style: [
+                    ...PersonsTheme/heading(mode: PASSED.store.mode, size: 38)
+                    width: Fill
+                    text_wrap: True
+                ]
+                text: PASSED.store.profile_name
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...PersonsTheme/body(mode: PASSED.store.mode)
+                    width: Fill
+                    text_wrap: True
+                    size: 19
+                    line_height: 28
+                ]
+                text: PASSED.store.profile_introduction
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...PersonsTheme/muted(mode: PASSED.store.mode)
+                    width: Fill
+                    height: 24
+                ]
+                text: PASSED.store.profile_location
+            )
+            divider()
+            Components/text(PASS: [store: PASSED.store], value: TEXT { Projects }, of: Heading)
+            project_row()
+            divider()
+            Components/text(
+                PASS: [store: PASSED.store]
+                value: Workspace/public_label(
+                    state: PASSED.store.publish_state
+                    name: PASSED.store.published_name
+                )
+                of: Muted
+            )
+        }
+    )
+}
+
+FUNCTION project_row() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 7
+        style: [
+            width: Fill
+            padding: [top: 12, bottom: 12]
+            border: [color: PersonsTheme/divider(mode: PASSED.store.mode)]
+            border_width: 1
+            paint: False
+        ]
+        items: LIST {
+            Components/text(PASS: [store: PASSED.store], value: TEXT { First Boon project }, of: SmallHeading)
+            Components/text(
+                PASS: [store: PASSED.store]
+                value: TEXT { A small public page compiled from Boon source. }
+                of: Muted
+            )
+        }
+    )
+}
+
+FUNCTION divider() {
+    Scene/Element/block(
+        element: []
+        style: [
+            width: Fill
+            height: 1
+            background: [color: PersonsTheme/divider(mode: PASSED.store.mode)]
+        ]
+        child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())
+    )
+}

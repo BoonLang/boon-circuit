@@ -1,0 +1,114 @@
+FUNCTION text(value, of) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...of |> WHEN {
+                Title => PersonsTheme/heading(mode: PASSED.store.mode, size: 26)
+                Heading => PersonsTheme/heading(mode: PASSED.store.mode, size: 19)
+                SmallHeading => PersonsTheme/heading(mode: PASSED.store.mode, size: 15)
+                Muted => PersonsTheme/muted(mode: PASSED.store.mode)
+                Code => PersonsTheme/code(mode: PASSED.store.mode)
+                __ => PersonsTheme/body(mode: PASSED.store.mode)
+            }
+            width: Fill
+            text_wrap: True
+        ]
+        text: value
+    )
+}
+
+FUNCTION button(label, tone, selected) {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            width: Auto
+            auto_padding: 24
+            height: 38
+            padding: [left: 12, right: 12, top: 7, bottom: 7]
+            rounded_corners: 5
+            background: [color: PersonsTheme/button_background(
+                mode: PASSED.store.mode
+                tone: tone
+                selected: selected
+                hovered: element.hovered
+            )]
+            border: [color: PersonsTheme/button_border(mode: PASSED.store.mode, tone: tone)]
+            border_width: 1
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...PersonsTheme/body(mode: PASSED.store.mode)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                size: 14
+                weight: 600
+                color: PersonsTheme/button_text(mode: PASSED.store.mode, tone: tone)
+            ]
+            text: label
+        )
+    )
+}
+
+FUNCTION status(label, tone) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...PersonsTheme/body(mode: PASSED.store.mode)
+            width: Auto
+            auto_padding: 22
+            height: 28
+            padding: [left: 9, right: 9, top: 4, bottom: 4]
+            vertical_align: Center
+            size: 12
+            weight: 600
+            rounded_corners: 5
+            background: [color: PersonsTheme/status_background(mode: PASSED.store.mode, tone: tone)]
+            color: PersonsTheme/status_text(mode: PASSED.store.mode, tone: tone)
+        ]
+        text: label
+    )
+}
+
+FUNCTION field(label, value, placeholder) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 5
+        style: [width: Fill, paint: False]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...PersonsTheme/muted(mode: PASSED.store.mode)
+                    width: Fill
+                    height: 20
+                    size: 12
+                    weight: 600
+                ]
+                text: label
+            )
+            Scene/Element/text_input(
+                element: [event: [change: SOURCE]]
+                style: [
+                    ...PersonsTheme/inset(mode: PASSED.store.mode)
+                    ...PersonsTheme/body(mode: PASSED.store.mode)
+                    width: Fill
+                    height: 40
+                    padding: [left: 10, right: 10]
+                    text_inset: 5
+                    input_live_change: True
+                    __focus_border: PersonsTheme/focus_border()
+                ]
+                label: label
+                text: value
+                placeholder: [text: placeholder]
+            )
+        }
+    )
+}

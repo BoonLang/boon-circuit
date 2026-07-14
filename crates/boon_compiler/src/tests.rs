@@ -1531,6 +1531,130 @@ document: Document/new(
 }
 
 #[test]
+fn document_list_binds_multiline_cross_module_source_continuation_to_previous_item() {
+    let units = [
+        CompilerSourceUnit {
+            path: "Components.bn".to_owned(),
+            source: r#"
+FUNCTION action_button(label) {
+    Element/button(
+        element: [event: [press: SOURCE]]
+        style: [width: 120, height: 36]
+        label: label
+    )
+}
+"#
+            .to_owned(),
+        },
+        CompilerSourceUnit {
+            path: "View.bn".to_owned(),
+            source: r#"
+FUNCTION root() {
+    Element/stripe(
+        element: []
+        direction: Row
+        style: [width: Fill]
+        items: LIST {
+            Components/action_button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Publish }
+            )
+                |> SOURCE { PASSED.store.controls.publish }
+            Element/label(element: [], style: [], label: TEXT { Status })
+        }
+    )
+}
+"#
+            .to_owned(),
+        },
+        CompilerSourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: r#"
+store: [controls: [publish: SOURCE]]
+document: Document/new(root: View/root(PASS: [store: store]))
+"#
+            .to_owned(),
+        },
+    ];
+
+    let compiled =
+        compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
+            .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert!(document.view_bindings.iter().any(|binding| {
+        binding.kind == boon_plan::DocumentBindingKind::Source
+            && matches!(
+                binding.target,
+                boon_plan::DocumentBindingTarget::Source { .. }
+            )
+    }));
+}
+
+#[test]
+fn document_select_binds_multiline_cross_module_source_continuation_to_its_arm() {
+    let units = [
+        CompilerSourceUnit {
+            path: "Components.bn".to_owned(),
+            source: r#"
+FUNCTION action_button(label) {
+    Element/button(
+        element: [event: [press: SOURCE]]
+        style: [width: 120, height: 36]
+        label: label
+    )
+}
+"#
+            .to_owned(),
+        },
+        CompilerSourceUnit {
+            path: "View.bn".to_owned(),
+            source: r#"
+FUNCTION root() {
+    Element/stripe(
+        element: []
+        direction: Row
+        style: [width: Fill]
+        items: LIST {
+            Edit |> WHEN {
+                Edit => Components/action_button(
+                    PASS: [store: PASSED.store]
+                    label: TEXT { Publish }
+                )
+                    |> SOURCE { PASSED.store.controls.publish }
+                __ => NoElement
+            }
+        }
+    )
+}
+"#
+            .to_owned(),
+        },
+        CompilerSourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: r#"
+store: [mode: Edit, controls: [publish: SOURCE]]
+document: Document/new(root: View/root(PASS: [store: store]))
+"#
+            .to_owned(),
+        },
+    ];
+
+    let compiled =
+        compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
+            .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert!(document.view_bindings.iter().any(|binding| {
+        binding.kind == boon_plan::DocumentBindingKind::Source
+            && matches!(
+                binding.target,
+                boon_plan::DocumentBindingTarget::Source { .. }
+            )
+    }));
+}
+
+#[test]
 fn document_row_alias_arguments_remain_rows_and_selects_follow_dynamic_inputs() {
     let compiled = compile_source_text_to_machine_plan(
         "document-row-argument.bn",

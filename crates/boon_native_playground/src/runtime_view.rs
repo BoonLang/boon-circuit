@@ -1996,6 +1996,84 @@ document: Document/new(
     }
 
     #[test]
+    fn persons_pro_constructs_a_responsive_retained_document() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let model = RuntimeView::open_in_memory(runtime).unwrap();
+        assert!(
+            model
+                .retained_frame()
+                .nodes
+                .values()
+                .filter(|node| node.primary_source_binding().is_some())
+                .count()
+                >= 10,
+            "Persons.pro shell should retain its editor, publish, account, view, and theme bindings"
+        );
+
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1280.0,
+                height: 800.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        let desktop_text = view
+            .scene()
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>();
+        for expected in ["persons.pro", "Profile source", "Draft preview", "Publish"] {
+            assert!(
+                desktop_text.contains(&expected),
+                "missing desktop text {expected:?}: {desktop_text:?}"
+            );
+        }
+        assert_scene_has_no_horizontal_overflow(view.scene(), 1280.0);
+
+        view.resize(
+            boon_host::Viewport {
+                surface: 1,
+                width: 390.0,
+                height: 844.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        let mobile_text = view
+            .scene()
+            .text_runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<Vec<_>>();
+        for expected in ["persons.pro", "Code", "Preview", "Profile source"] {
+            assert!(
+                mobile_text.contains(&expected),
+                "missing mobile text {expected:?}: {mobile_text:?}"
+            );
+        }
+        assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
+    }
+
+    #[test]
     fn kavik_portfolio_reflows_without_horizontal_overflow() {
         let example = crate::catalog::Catalog::load()
             .unwrap()

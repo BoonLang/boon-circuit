@@ -1,0 +1,3 @@
+FUNCTION summary(name, introduction, location) {
+    TEXT { profile: {name} / {introduction} / {location} }
+}

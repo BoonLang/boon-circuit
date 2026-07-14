@@ -1,0 +1,256 @@
+FUNCTION page(mode) {
+    [
+        width: Fill
+        height: [sizing: Fill, minimum: Screen]
+        background: [color: mode |> WHEN {
+            Dark => TEXT { #101512 }
+            Light => TEXT { #f1f4ef }
+        }]
+        material: [color: mode |> WHEN {
+            Dark => TEXT { #101512 }
+            Light => TEXT { #f1f4ef }
+        }]
+    ]
+}
+
+FUNCTION body(mode) {
+    [
+        font: [family: TEXT { Nimbus Sans }, size: 15, weight: 400]
+        line_height: 22
+        color: mode |> WHEN {
+            Dark => TEXT { #d9e1dc }
+            Light => TEXT { #27332d }
+        }
+    ]
+}
+
+FUNCTION muted(mode) {
+    [
+        ...body(mode: mode)
+        color: mode |> WHEN {
+            Dark => TEXT { #94a39b }
+            Light => TEXT { #66736c }
+        }
+    ]
+}
+
+FUNCTION heading(mode, size) {
+    [
+        font: [family: TEXT { Nimbus Sans }, size: size, weight: 700]
+        line_height: size * 1.16
+        color: mode |> WHEN {
+            Dark => TEXT { #f2f7f4 }
+            Light => TEXT { #17231f }
+        }
+    ]
+}
+
+FUNCTION panel(mode) {
+    [
+        background: [color: mode |> WHEN {
+            Dark => TEXT { #19211d }
+            Light => TEXT { #ffffff }
+        }]
+        border: [color: mode |> WHEN {
+            Dark => TEXT { #35433b }
+            Light => TEXT { #d7ded9 }
+        }]
+        border_width: 1
+        rounded_corners: 6
+        material: [
+            color: mode |> WHEN {
+                Dark => TEXT { #19211d }
+                Light => TEXT { #ffffff }
+            }
+            gloss: 0.015
+        ]
+    ]
+}
+
+FUNCTION inset(mode) {
+    [
+        background: [color: mode |> WHEN {
+            Dark => TEXT { #111714 }
+            Light => TEXT { #f7f9f6 }
+        }]
+        border: [color: mode |> WHEN {
+            Dark => TEXT { #2d3932 }
+            Light => TEXT { #d7ded9 }
+        }]
+        border_width: 1
+        rounded_corners: 5
+    ]
+}
+
+FUNCTION code(mode) {
+    [
+        font: [family: TEXT { DejaVu Sans Mono }, size: 13, weight: 400]
+        line_height: 20
+        color: mode |> WHEN {
+            Dark => TEXT { #d8e8df }
+            Light => TEXT { #21352b }
+        }
+    ]
+}
+
+FUNCTION accent() {
+    TEXT { #2f6c4f }
+}
+
+FUNCTION accent_hover() {
+    TEXT { #285d45 }
+}
+
+FUNCTION warning() {
+    TEXT { #c48a20 }
+}
+
+FUNCTION warning_hover() {
+    TEXT { #aa741a }
+}
+
+FUNCTION focus_border() {
+    accent()
+}
+
+FUNCTION button_background(mode, tone, selected, hovered) {
+    tone |> WHEN {
+        Primary => hovered |> WHEN {
+            True => accent_hover()
+            False => accent()
+        }
+        Warning => hovered |> WHEN {
+            True => warning_hover()
+            False => warning()
+        }
+        __ => selected |> WHEN {
+            True => mode |> WHEN {
+                Dark => TEXT { #34453b }
+                Light => TEXT { #dfe9e2 }
+            }
+            False => hovered |> WHEN {
+                True => mode |> WHEN {
+                    Dark => TEXT { #2b3831 }
+                    Light => TEXT { #e8ede9 }
+                }
+                False => TEXT { #00000000 }
+            }
+        }
+    }
+}
+
+FUNCTION button_border(mode, tone) {
+    tone |> WHEN {
+        Primary => TEXT { #427d61 }
+        Warning => TEXT { #d5a64e }
+        __ => mode |> WHEN {
+            Dark => TEXT { #46564d }
+            Light => TEXT { #c6d0ca }
+        }
+    }
+}
+
+FUNCTION button_text(mode, tone) {
+    tone |> WHEN {
+        Primary => TEXT { #ffffff }
+        Warning => TEXT { #ffffff }
+        __ => mode |> WHEN {
+            Dark => TEXT { #e5ece8 }
+            Light => TEXT { #27332d }
+        }
+    }
+}
+
+FUNCTION status_background(mode, tone) {
+    tone |> WHEN {
+        Success => mode |> WHEN {
+            Dark => TEXT { #173729 }
+            Light => TEXT { #ddf0e4 }
+        }
+        Warning => mode |> WHEN {
+            Dark => TEXT { #3a2c15 }
+            Light => TEXT { #f7e9c9 }
+        }
+        __ => mode |> WHEN {
+            Dark => TEXT { #29322d }
+            Light => TEXT { #e7ebe8 }
+        }
+    }
+}
+
+FUNCTION status_text(mode, tone) {
+    tone |> WHEN {
+        Success => mode |> WHEN {
+            Dark => TEXT { #92ddb1 }
+            Light => TEXT { #275c40 }
+        }
+        Warning => mode |> WHEN {
+            Dark => TEXT { #efc46f }
+            Light => TEXT { #795414 }
+        }
+        __ => mode |> WHEN {
+            Dark => TEXT { #b6c2bb }
+            Light => TEXT { #59655e }
+        }
+    }
+}
+
+FUNCTION code_line(mode, tone) {
+    tone |> WHEN {
+        Keyword => mode |> WHEN {
+            Dark => TEXT { #82c6a1 }
+            Light => accent()
+        }
+        __ => mode |> WHEN {
+            Dark => TEXT { #d8e8df }
+            Light => TEXT { #27332d }
+        }
+    }
+}
+
+FUNCTION code_value(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #efc46f }
+        Light => TEXT { #9a6412 }
+    }
+}
+
+FUNCTION header_background(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #17201b }
+        Light => TEXT { #17231f }
+    }
+}
+
+FUNCTION header_border() {
+    TEXT { #33443a }
+}
+
+FUNCTION brand_text() {
+    TEXT { #f3f7f4 }
+}
+
+FUNCTION brand_path() {
+    TEXT { #9bb3a5 }
+}
+
+FUNCTION browser_chrome(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #222b26 }
+        Light => TEXT { #eef2ee }
+    }
+}
+
+FUNCTION divider(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #35433b }
+        Light => TEXT { #d7ded9 }
+    }
+}
+
+FUNCTION profile_surface(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #141a17 }
+        Light => TEXT { #ffffff }
+    }
+}

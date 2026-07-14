@@ -1,0 +1,21 @@
+FUNCTION publish_label(state, revision) {
+    state |> WHEN {
+        Draft => TEXT { Draft r{revision} }
+        Published => TEXT { Published r{revision} }
+        __ => TEXT { Draft }
+    }
+}
+
+FUNCTION publish_tone(state) {
+    state |> WHEN {
+        Published => Success
+        __ => Warning
+    }
+}
+
+FUNCTION public_label(state, name) {
+    state |> WHEN {
+        Published => TEXT { Public revision: {name} }
+        __ => TEXT { No public revision yet }
+    }
+}

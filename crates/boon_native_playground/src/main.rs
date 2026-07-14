@@ -21,6 +21,11 @@ mod workspace_control;
 
 use std::path::PathBuf;
 
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
 use boon_host::{LogicalSize, RoleId, SurfaceId, WindowId};
 use boon_native_app_window::{
     NativeHostIds, NativeWindowConfig, WindowPosition, run_native_role_process,
@@ -28,6 +33,10 @@ use boon_native_app_window::{
 use protocol::VERIFY_BOUNDED_WINDOWS_ENV;
 
 fn main() {
+    if let Err(error) = redirect_role_log_from_env() {
+        eprintln!("boon_native_playground: {error}");
+        std::process::exit(1);
+    }
     let args = std::env::args().collect::<Vec<_>>();
     let role = argument(&args, "--role").unwrap_or("desktop");
     let result = match role {
@@ -45,6 +54,38 @@ fn main() {
         eprintln!("boon_native_playground: {error}");
         std::process::exit(1);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn redirect_role_log_from_env() -> Result<(), String> {
+    let Some(path) = std::env::var_os("BOON_NATIVE_ROLE_LOG") else {
+        return Ok(());
+    };
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| {
+            format!(
+                "open native role log {}: {error}",
+                PathBuf::from(&path).display()
+            )
+        })?;
+    for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if unsafe { libc::dup2(log.as_raw_fd(), target) } < 0 {
+            return Err(format!(
+                "redirect native role log {}: {}",
+                PathBuf::from(&path).display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn redirect_role_log_from_env() -> Result<(), String> {
+    Ok(())
 }
 
 fn run_preview(args: &[String]) -> Result<(), String> {

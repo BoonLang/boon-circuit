@@ -1,0 +1,283 @@
+name = "counter-migration-lifecycle"
+
+[[step]]
+id = "start-v1"
+action = { kind = "start", stage = "v1", namespace = "counter-touched" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.count"
+  value = 0
+  touched = false
+
+[[step]]
+id = "increment-v1"
+action = { kind = "dispatch", public_source = "store.sources.increment_button.press" }
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.count"
+  value = 1
+  touched = true
+
+[[step]]
+id = "inject-before-checkpoint-fault"
+action = { kind = "inject_fault", point = "before_checkpoint" }
+
+[[step]]
+id = "reject-before-checkpoint"
+action = { kind = "checkpoint" }
+expect_failure = { code = "before_checkpoint_failed", current_unchanged = true, durable_unchanged = true }
+
+[[step]]
+id = "clear-before-checkpoint-fault"
+action = { kind = "clear_fault" }
+
+[[step]]
+id = "inject-during-checkpoint-fault"
+action = { kind = "inject_fault", point = "during_checkpoint" }
+
+[[step]]
+id = "reject-during-checkpoint"
+action = { kind = "checkpoint" }
+expect_failure = { code = "during_checkpoint_failed", current_unchanged = true, durable_unchanged = true }
+
+[[step]]
+id = "clear-during-checkpoint-fault"
+action = { kind = "clear_fault" }
+
+[[step]]
+id = "inject-after-checkpoint-acknowledgement-fault"
+action = { kind = "inject_fault", point = "after_checkpoint_acknowledgement" }
+
+[[step]]
+id = "fail-after-checkpoint-acknowledgement"
+action = { kind = "checkpoint" }
+expect_failure = { code = "after_checkpoint_acknowledgement_failed", current_unchanged = true, durable_unchanged = false }
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.count"
+  value = 1
+  touched = true
+
+[[step]]
+id = "clear-after-checkpoint-acknowledgement-fault"
+action = { kind = "clear_fault" }
+
+[[step]]
+id = "touch-equal-default-v1"
+action = { kind = "dispatch", public_source = "store.sources.reset_button.press" }
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.count"
+  value = 0
+  touched = true
+
+[[step]]
+id = "checkpoint-touched-zero-v1"
+action = { kind = "checkpoint" }
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.count"
+  value = 0
+  touched = true
+
+[[step]]
+id = "restart-touched-zero-v1"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.count"
+  value = 0
+  touched = true
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.count"
+  value = 0
+  touched = true
+
+[[step]]
+id = "inject-v2-preview-fault"
+action = { kind = "inject_fault", point = "candidate_settle" }
+
+[[step]]
+id = "reject-v2-preview"
+action = { kind = "preview", stage = "v2" }
+expect_failure = { code = "candidate_settle_failed", current_unchanged = true, durable_unchanged = true }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+
+[[step]]
+id = "clear-v2-preview-fault"
+action = { kind = "clear_fault" }
+
+[[step]]
+id = "preview-v2"
+action = { kind = "preview", stage = "v2" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+  preview_stage = "v2"
+
+[[step]]
+id = "inject-before-v2-activation-fault"
+action = { kind = "inject_fault", point = "before_activation_commit" }
+
+[[step]]
+id = "reject-before-v2-activation"
+action = { kind = "activate", stage = "v2", mode = "incremental" }
+expect_failure = { code = "before_activation_commit_failed", current_unchanged = true, durable_unchanged = true }
+
+[[step]]
+id = "clear-before-v2-activation-fault"
+action = { kind = "clear_fault" }
+
+[[step]]
+id = "inject-during-v2-activation-fault"
+action = { kind = "inject_fault", point = "during_activation_commit" }
+
+[[step]]
+id = "reject-during-v2-activation"
+action = { kind = "activate", stage = "v2", mode = "incremental" }
+expect_failure = { code = "during_activation_commit_failed", current_unchanged = true, durable_unchanged = true }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+
+[[step]]
+id = "clear-during-v2-activation-fault"
+action = { kind = "clear_fault" }
+
+[[step]]
+id = "preview-v2-after-transaction-fault"
+action = { kind = "preview", stage = "v2" }
+
+[[step]]
+id = "inject-after-v2-activation-fault"
+action = { kind = "inject_fault", point = "after_activation_commit" }
+
+[[step]]
+id = "activate-v2-then-report-post-commit-fault"
+action = { kind = "activate", stage = "v2", mode = "incremental" }
+expect_failure = { code = "after_activation_commit_failed", current_unchanged = false, durable_unchanged = false, schema_unchanged = false }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v2"
+  durable_stage = "v2"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v1"
+  to_stage = "v2"
+  applied = [{ from_stage = "v1", to_stage = "v2" }]
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.click_count"
+  value = 0
+  touched = true
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.click_count"
+  value = 0
+  touched = true
+
+[[step]]
+id = "clear-after-v2-activation-fault"
+action = { kind = "clear_fault" }
+
+[[step]]
+id = "restart-v2"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.click_count"
+  value = 0
+  touched = true
+
+[[step]]
+id = "preview-v3"
+action = { kind = "preview", stage = "v3" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v2"
+  durable_stage = "v2"
+  preview_stage = "v3"
+
+[[step]]
+id = "activate-v3"
+action = { kind = "activate", stage = "v3", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v3"
+  durable_stage = "v3"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v2"
+  to_stage = "v3"
+  applied = [{ from_stage = "v2", to_stage = "v3" }]
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.click_count"
+  value = 0
+  touched = true
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.click_count"
+  value = 0
+  touched = true
+
+[[step]]
+id = "restart-v3-touched"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.click_count"
+  value = 0
+  touched = true
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.click_count"
+  value = 0
+  touched = true
+
+[[step]]
+id = "start-over-v3"
+action = { kind = "start_over", stage = "v3" }
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.click_count"
+  value = 10
+  touched = false
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.click_count"
+  value = 10
+  touched = false
+
+[[step]]
+id = "start-fresh-v3-namespace"
+action = { kind = "start", stage = "v3", namespace = "counter-fresh" }
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.click_count"
+  value = 10
+  touched = false
+  [[step.assert]]
+  kind = "namespace_isolation"
+  namespace = "counter-touched"
+  unchanged_since = "start-over-v3"
+  [[step.assert]]
+  kind = "namespace_equivalent"
+  namespace = "counter-touched"
+  other_namespace = "counter-fresh"

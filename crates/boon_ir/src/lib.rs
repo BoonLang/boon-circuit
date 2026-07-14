@@ -5,7 +5,14 @@ use boon_parser::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
+mod semantic_migration;
+
+pub use semantic_migration::*;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TypedProgram {
@@ -20,6 +27,10 @@ pub struct TypedProgram {
     pub sources: Vec<SourcePort>,
     pub state_cells: Vec<StateCell>,
     pub lists: Vec<ListMemory>,
+    #[serde(default)]
+    pub semantic_memory: Vec<SemanticMemory>,
+    #[serde(default)]
+    pub migration_edges: Vec<MigrationEdge>,
     pub output_values: Vec<OutputRootValue>,
     pub derived_values: Vec<DerivedValue>,
     pub dependencies: Vec<DependencyEdge>,
@@ -69,6 +80,7 @@ typed_usize_ids!(
     FunctionId,
     DiagnosticSpanId,
     SemanticSymbolId,
+    SemanticMemoryId,
 );
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -94,11 +106,47 @@ pub struct SemanticIndex {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticOutputRootEntry {
     pub root: String,
-    pub output_kind: String,
+    pub contract: SemanticOutputContractKind,
+    pub demand: SemanticOutputDemandPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<SemanticDataType>,
     pub statement_id: usize,
     pub line: usize,
     pub typed_contract_known: bool,
-    pub generic_output_port: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticOutputContractKind {
+    RetainedVisual { kind: SemanticRetainedVisualKind },
+    HostValue,
+}
+
+impl SemanticOutputContractKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RetainedVisual {
+                kind: SemanticRetainedVisualKind::Document,
+            } => "retained_visual_document",
+            Self::RetainedVisual {
+                kind: SemanticRetainedVisualKind::Scene,
+            } => "retained_visual_scene",
+            Self::HostValue => "host_value",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRetainedVisualKind {
+    Document,
+    Scene,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticOutputDemandPolicy {
+    HostDemanded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -476,11 +524,14 @@ pub struct DerivedValue {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputRootValue {
     pub root: String,
-    pub output_kind: String,
+    pub value_path: String,
+    pub contract: SemanticOutputContractKind,
+    pub demand: SemanticOutputDemandPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type: Option<SemanticDataType>,
     pub statement_id: usize,
     pub line: usize,
     pub typed_contract_known: bool,
-    pub generic_output_port: bool,
     pub statement: AstStatement,
 }
 
@@ -951,6 +1002,7 @@ fn lower_with_typecheck(
     let lists = program
         .list_memories
         .iter()
+        .filter(|list| !is_output_registry_value_path(&list.name))
         .enumerate()
         .map(|(id, list)| ListMemory {
             id: ListId(id),
@@ -1049,6 +1101,17 @@ fn lower_with_typecheck(
     );
     let semantic_index_ms = lower_elapsed_ms(semantic_index_started);
     trace_phase("semantic_index", semantic_index_ms);
+    let semantic_migration_started = Instant::now();
+    let (semantic_memory, migration_edges) = lower_semantic_memory_and_migrations(
+        program,
+        &fields,
+        &row_scopes,
+        &state_cells,
+        &lists,
+        &typecheck_report,
+    )?;
+    let semantic_migration_ms = lower_elapsed_ms(semantic_migration_started);
+    trace_phase("semantic_memory_and_migrations", semantic_migration_ms);
     let typed = TypedProgram {
         kind: program.kind,
         expression_count: program.expressions.len(),
@@ -1071,6 +1134,8 @@ fn lower_with_typecheck(
         derived_values,
         state_cells,
         lists,
+        semantic_memory,
+        migration_edges,
         hidden_identity_verified: true,
         static_schedule_verified: true,
     };
@@ -1085,6 +1150,7 @@ fn lower_with_typecheck(
     Ok(typed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn semantic_index(
     program: &ParsedProgram,
     fields: &[FieldDef],
@@ -1269,32 +1335,16 @@ fn semantic_output_roots(
     program: &ParsedProgram,
     typecheck_report: &boon_typecheck::TypeCheckReport,
 ) -> Vec<SemanticOutputRootEntry> {
-    program
-        .ast
-        .statements
-        .iter()
-        .filter_map(|statement| {
-            let AstStatementKind::Field { name } = &statement.kind else {
-                return None;
-            };
-            let output_kind = match name.as_str() {
-                "document" => "document",
-                "scene" => "scene",
-                _ => return None,
-            };
-            Some(SemanticOutputRootEntry {
-                root: name.clone(),
-                output_kind: output_kind.to_owned(),
-                statement_id: statement.id,
-                line: statement.line,
-                typed_contract_known: output_root_typed_contract_known(
-                    name,
-                    statement,
-                    program,
-                    typecheck_report,
-                ),
-                generic_output_port: name == "document",
-            })
+    output_root_declarations(program, typecheck_report)
+        .into_iter()
+        .map(|declaration| SemanticOutputRootEntry {
+            root: declaration.root,
+            contract: declaration.contract,
+            demand: SemanticOutputDemandPolicy::HostDemanded,
+            data_type: declaration.data_type,
+            statement_id: declaration.statement.id,
+            line: declaration.statement.line,
+            typed_contract_known: declaration.typed_contract_known,
         })
         .collect()
 }
@@ -1303,39 +1353,93 @@ fn output_root_values(
     program: &ParsedProgram,
     typecheck_report: &boon_typecheck::TypeCheckReport,
 ) -> Vec<OutputRootValue> {
-    program
-        .ast
-        .statements
-        .iter()
-        .filter_map(|statement| {
-            let AstStatementKind::Field { name } = &statement.kind else {
-                return None;
-            };
-            let output_kind = match name.as_str() {
-                "document" => "document",
-                "scene" => "scene",
-                _ => return None,
-            };
-            Some(OutputRootValue {
-                root: name.clone(),
-                output_kind: output_kind.to_owned(),
-                statement_id: statement.id,
-                line: statement.line,
-                typed_contract_known: output_root_typed_contract_known(
-                    name,
-                    statement,
-                    program,
-                    typecheck_report,
-                ),
-                generic_output_port: name == "document",
-                statement: statement.clone(),
-            })
+    output_root_declarations(program, typecheck_report)
+        .into_iter()
+        .map(|declaration| OutputRootValue {
+            root: declaration.root,
+            value_path: declaration.value_path,
+            contract: declaration.contract,
+            demand: SemanticOutputDemandPolicy::HostDemanded,
+            data_type: declaration.data_type,
+            statement_id: declaration.statement.id,
+            line: declaration.statement.line,
+            typed_contract_known: declaration.typed_contract_known,
+            statement: declaration.statement.clone(),
         })
         .collect()
 }
 
-fn output_root_typed_contract_known(
-    root: &str,
+struct OutputRootDeclaration<'a> {
+    root: String,
+    value_path: String,
+    contract: SemanticOutputContractKind,
+    data_type: Option<SemanticDataType>,
+    typed_contract_known: bool,
+    statement: &'a AstStatement,
+}
+
+fn output_root_declarations<'a>(
+    program: &'a ParsedProgram,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Vec<OutputRootDeclaration<'a>> {
+    let mut declarations = Vec::new();
+    for statement in &program.ast.statements {
+        let AstStatementKind::Field { name } = &statement.kind else {
+            continue;
+        };
+        let visual_kind = match name.as_str() {
+            "document" => Some(SemanticRetainedVisualKind::Document),
+            "scene" => Some(SemanticRetainedVisualKind::Scene),
+            _ => None,
+        };
+        if let Some(kind) = visual_kind {
+            declarations.push(OutputRootDeclaration {
+                root: name.clone(),
+                value_path: name.clone(),
+                contract: SemanticOutputContractKind::RetainedVisual { kind },
+                data_type: None,
+                typed_contract_known: retained_visual_contract_known(
+                    kind,
+                    statement,
+                    program,
+                    typecheck_report,
+                ),
+                statement,
+            });
+            continue;
+        }
+        if name != "outputs" {
+            continue;
+        }
+        for output in &statement.children {
+            let name = match &output.kind {
+                AstStatementKind::Field { name }
+                | AstStatementKind::List {
+                    field: Some(name), ..
+                } => name,
+                _ => continue,
+            };
+            let data_type = typecheck_report
+                .output_root_types
+                .iter()
+                .find(|entry| entry.statement_id == output.id && entry.name == *name)
+                .map(|entry| semantic_data_type(&entry.ty));
+            declarations.push(OutputRootDeclaration {
+                root: name.clone(),
+                value_path: format!("outputs.{name}"),
+                contract: SemanticOutputContractKind::HostValue,
+                typed_contract_known: data_type.as_ref().is_some_and(semantic_data_type_is_closed),
+                data_type,
+                statement: output,
+            });
+        }
+    }
+    declarations.sort_by(|left, right| left.root.cmp(&right.root));
+    declarations
+}
+
+fn retained_visual_contract_known(
+    kind: SemanticRetainedVisualKind,
     statement: &AstStatement,
     program: &ParsedProgram,
     typecheck_report: &boon_typecheck::TypeCheckReport,
@@ -1343,13 +1447,40 @@ fn output_root_typed_contract_known(
     if typecheck_report.has_errors() {
         return false;
     }
-    match root {
-        "document" => {
+    match kind {
+        SemanticRetainedVisualKind::Document => {
             statement_contains_constructor(statement, program, "Document/")
                 || statement_contains_constructor(statement, program, "Element/")
         }
-        "scene" => statement_contains_constructor(statement, program, "Scene/"),
-        _ => false,
+        SemanticRetainedVisualKind::Scene => {
+            statement_contains_constructor(statement, program, "Scene/")
+        }
+    }
+}
+
+fn semantic_data_type_is_closed(data_type: &SemanticDataType) -> bool {
+    match data_type {
+        SemanticDataType::Unknown { .. } => false,
+        SemanticDataType::Record { fields, open } => {
+            !open
+                && fields
+                    .iter()
+                    .all(|field| semantic_data_type_is_closed(&field.data_type))
+        }
+        SemanticDataType::Variant { variants } => variants.iter().all(|variant| {
+            !variant.open
+                && variant
+                    .fields
+                    .iter()
+                    .all(|field| semantic_data_type_is_closed(&field.data_type))
+        }),
+        SemanticDataType::List { item } => semantic_data_type_is_closed(item),
+        SemanticDataType::Null
+        | SemanticDataType::Bool
+        | SemanticDataType::Number
+        | SemanticDataType::Byte
+        | SemanticDataType::Text
+        | SemanticDataType::Bytes { .. } => true,
     }
 }
 
@@ -1371,6 +1502,7 @@ fn statement_contains_constructor(
             .any(|child| statement_contains_constructor(child, program, prefix))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn semantic_symbols(
     program: &ParsedProgram,
     output_roots: &[SemanticOutputRootEntry],
@@ -1390,7 +1522,7 @@ fn semantic_symbols(
     }
     for root in output_roots {
         table.intern("output_root", &root.root);
-        table.intern("output_kind", &root.output_kind);
+        table.intern("output_kind", root.contract.as_str());
     }
     for source in sources {
         table.intern("source_label", &source.path);
@@ -1664,13 +1796,13 @@ fn row_scope_ambiguity_reasons(program: &ParsedProgram) -> Vec<String> {
     let mut seen = BTreeMap::<&str, &str>::new();
     let mut reasons = Vec::new();
     for scope in &program.row_scope_functions {
-        if let Some(existing_list) = seen.insert(scope.row_scope.as_str(), scope.list.as_str()) {
-            if existing_list != scope.list {
-                reasons.push(format!(
-                    "row scope `{}` is shared by lists `{}` and `{}`",
-                    scope.row_scope, existing_list, scope.list
-                ));
-            }
+        if let Some(existing_list) = seen.insert(scope.row_scope.as_str(), scope.list.as_str())
+            && existing_list != scope.list
+        {
+            reasons.push(format!(
+                "row scope `{}` is shared by lists `{}` and `{}`",
+                scope.row_scope, existing_list, scope.list
+            ));
         }
     }
     reasons
@@ -2160,15 +2292,13 @@ fn source_row_lookup_field(
     fields: &[FieldDef],
     source: &str,
 ) -> Option<String> {
-    let Some(source_scope) = source.split('.').next() else {
-        return None;
-    };
+    let source_scope = source.split('.').next()?;
     let scope = program
         .row_scope_functions
         .iter()
         .find(|scope| scope.row_scope == source_scope);
-    if let Some(scope) = scope {
-        if let Some(explicit_address) = fields.iter().find_map(|field| {
+    if let Some(scope) = scope
+        && let Some(explicit_address) = fields.iter().find_map(|field| {
             field
                 .path
                 .strip_prefix(&format!("{}.", scope.row_scope))
@@ -2180,9 +2310,9 @@ fn source_row_lookup_field(
                         .and_then(|(_, lookup)| (lookup == "address").then_some(lookup))
                 })
                 .map(str::to_owned)
-        }) {
-            return Some(explicit_address);
-        }
+        })
+    {
+        return Some(explicit_address);
     }
     let mut candidates = Vec::new();
     for field in fields {
@@ -2804,6 +2934,7 @@ fn expr_is_source_pipe_continuation(expr_id: usize, expressions: &[AstExpr]) -> 
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_document_function_body_view_bindings(
     function_statement: &AstStatement,
     source_text: &str,
@@ -2848,6 +2979,7 @@ fn collect_document_function_body_view_bindings(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_document_view_bindings(
     statements: &[AstStatement],
     source_text: &str,
@@ -3050,6 +3182,7 @@ fn collect_document_view_bindings(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_document_statement_source_bindings(
     statement: &AstStatement,
     source_text: &str,
@@ -3095,6 +3228,7 @@ fn collect_document_statement_source_bindings(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_document_expr_view_bindings(
     expr_id: usize,
     source_text: &str,
@@ -3328,7 +3462,9 @@ fn collect_document_expr_view_bindings(
                 }
             }
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             collect_document_expr_view_bindings(
                 *initial,
                 source_text,
@@ -3470,6 +3606,7 @@ fn collect_document_expr_view_bindings(
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
@@ -5612,6 +5749,7 @@ fn expression_ir_node_kind(expr: &AstExpr) -> Option<IrNodeKind> {
             expression_operator_node_kind(std::slice::from_ref(function))
                 .or(Some(IrNodeKind::PureCall))
         }
+        AstExprKind::Drain { .. } | AstExprKind::Draining { .. } => None,
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::StringLiteral(_)
@@ -5683,6 +5821,8 @@ fn ast_expr_label(expr: &AstExpr) -> String {
         AstExprKind::Unknown(tokens) => tokens.join("_"),
         AstExprKind::Delimiter => "delimiter".to_owned(),
         AstExprKind::Path(parts) => parts.join("."),
+        AstExprKind::Drain { .. } => "drain".to_owned(),
+        AstExprKind::Draining { .. } => "draining".to_owned(),
         AstExprKind::StringLiteral(_) => "string_literal".to_owned(),
         AstExprKind::TextLiteral(_) => "text_literal".to_owned(),
         AstExprKind::ByteLiteral { value, .. } => format!("byte_{value}"),
@@ -5805,7 +5945,7 @@ fn update_branches(
                 resolved_constants,
             ));
             branches.extend(derived_then_empty_update_branches(
-                &fields,
+                fields,
                 field,
                 cell,
                 direct_sources,
@@ -5815,6 +5955,7 @@ fn update_branches(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derived_dependency_update_branches(
     program: &ParsedProgram,
     fields: &[FieldDef],
@@ -6191,7 +6332,7 @@ fn canonical_row_scope_for_materialized_list(
 ) -> Option<String> {
     let from_list = singular_row_scope_for_list(list);
     match row_scope_for_list(program, list) {
-        Some(scope) if matches!(scope, "item" | "row" | "old" | "new") => from_list,
+        Some("item" | "row" | "old" | "new") => from_list,
         Some(scope) => Some(scope.to_owned()),
         None => from_list,
     }
@@ -6394,7 +6535,8 @@ fn derived_values(
         .iter()
         .filter(|field| {
             let indexed_field = path_has_parsed_row_scope(program, &field.path);
-            let list_memory_path = field_is_list_memory_path(field, program);
+            let list_memory_path = field_is_list_memory_path(field, program)
+                && !is_output_registry_value_path(&field.path);
             !state_cells.iter().any(|cell| cell.path == field.path)
                 && !program
                     .source_ports
@@ -6409,13 +6551,16 @@ fn derived_values(
             let direct_sources = direct_sources_for_field(direct_sources, field)
                 .cloned()
                 .collect::<Vec<_>>();
-            let event_sources = (field.has_then_expr()
+            let event_sources = if field.has_then_expr()
                 || field
                     .ast_exprs
                     .iter()
-                    .any(|expr| matches!(expr.kind, AstExprKind::Latest)))
-            .then(|| candidate_sources.candidate_sources(&field.path))
-            .unwrap_or_default();
+                    .any(|expr| matches!(expr.kind, AstExprKind::Latest))
+            {
+                candidate_sources.candidate_sources(&field.path)
+            } else {
+                Default::default()
+            };
             let transform_sources = direct_sources
                 .iter()
                 .chain(&event_sources)
@@ -6448,6 +6593,11 @@ fn derived_values(
             }
         })
         .collect()
+}
+
+fn is_output_registry_value_path(path: &str) -> bool {
+    path.strip_prefix("outputs.")
+        .is_some_and(|name| !name.is_empty() && !name.contains('.'))
 }
 
 fn derived_value_startup_recompute(kind: &DerivedValueKind) -> bool {
@@ -6551,13 +6701,9 @@ fn collect_function_definitions(
 fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind {
     if field.has_operator("List/count") || field.has_operator("List/every") {
         DerivedValueKind::Aggregate
-    } else if field.has_operator("List/latest") {
-        if !sources.is_empty() || field.has_then_expr() {
-            DerivedValueKind::SourceEventTransform
-        } else {
-            DerivedValueKind::Pure
-        }
-    } else if field_terminal_pipeline_operator(field).is_some_and(list_scalar_reducer_operator) {
+    } else if field.has_operator("List/latest")
+        || field_terminal_pipeline_operator(field).is_some_and(list_scalar_reducer_operator)
+    {
         if !sources.is_empty() || field.has_then_expr() {
             DerivedValueKind::SourceEventTransform
         } else {
@@ -6646,7 +6792,18 @@ fn field_initial_expr(field: &FieldDef) -> Option<&AstExpr> {
         AstExprKind::Pipe { input, ref op, .. } if op == "HOLD" => Some(input),
         _ => None,
     }) {
-        field.ast_exprs.iter().find(|expr| expr.id == initial)
+        let candidate = field.ast_exprs.iter().find(|expr| expr.id == initial)?;
+        if !matches!(candidate.kind, AstExprKind::Delimiter) {
+            return Some(candidate);
+        }
+        field.ast_exprs.iter().rev().find(|expr| {
+            expr.id < initial
+                && !matches!(
+                    expr.kind,
+                    AstExprKind::Delimiter | AstExprKind::Latest | AstExprKind::Hold { .. }
+                )
+                && !ast_expr_is_block_marker(expr)
+        })
     } else {
         field.ast_exprs.iter().find(|expr| {
             !matches!(expr.kind, AstExprKind::Latest) && !ast_expr_is_block_marker(expr)
@@ -7178,6 +7335,8 @@ fn ast_argument_value_in_exprs(exprs: &[AstExpr], expr_id: usize) -> Option<Stri
         AstExprKind::Unknown(tokens) => tokens_to_path(tokens),
         AstExprKind::Delimiter => String::new(),
         AstExprKind::Source
+        | AstExprKind::Drain { .. }
+        | AstExprKind::Draining { .. }
         | AstExprKind::Call { .. }
         | AstExprKind::Pipe { .. }
         | AstExprKind::Hold { .. }
@@ -7287,7 +7446,7 @@ fn file_write_bytes_path_arg_in_exprs(
     let arg = args
         .iter()
         .find(|arg| arg.name.as_deref() == Some("path"))
-        .or_else(|| args.iter().filter(|arg| arg.name.is_none()).next())?;
+        .or_else(|| args.iter().find(|arg| arg.name.is_none()))?;
     if let Some(path) = ast_static_text_literal_in_exprs(exprs, arg.value) {
         return Some(FileBytesPath::StaticText(path));
     }
@@ -7781,7 +7940,9 @@ fn append_item_record_fields_from_expr(
         AstExprKind::Pipe { args, .. } | AstExprKind::Call { args, .. } => args
             .iter()
             .find_map(|arg| append_item_record_fields_from_expr(field, arg.value)),
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             append_item_record_fields_from_expr(field, *initial)
         }
         AstExprKind::Infix { left, right, .. } => append_item_record_fields_from_expr(field, *left)
@@ -8952,6 +9113,7 @@ fn non_skip_literal_match_patterns_from_symbols(symbols: &[String]) -> Vec<Strin
     values
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_expression_for_routed_branch(
     program: &ParsedProgram,
     target: &str,
@@ -9122,7 +9284,7 @@ fn update_expression_for_routed_branch(
     ) {
         return expression;
     }
-    if let Some(expression) = branch.then_prefix_payload_concat_expression(&variants) {
+    if let Some(expression) = branch.then_prefix_payload_concat_expression(variants) {
         return expression;
     }
     if let Some(expression) = branch.then_prefix_root_concat_expression(field, target, fields) {
@@ -9461,7 +9623,7 @@ fn guarded_match_value_arm_expr(
     let output =
         guarded_update_value_expression_from_expr(program, field, target, fields, *output, source)?;
     let pattern = match_const_pattern_label(pattern)?;
-    (!pattern.is_empty()).then(|| UpdateValueMatchArm { pattern, output })
+    (!pattern.is_empty()).then_some(UpdateValueMatchArm { pattern, output })
 }
 
 fn guarded_update_value_expression_from_expr(
@@ -9547,8 +9709,7 @@ fn list_find_value_update_expression_from_expr(
     }
     let list = args
         .iter()
-        .filter(|arg| arg.name.is_none())
-        .next()
+        .find(|arg| arg.name.is_none())
         .and_then(|arg| ast_argument_value(field, arg.value))
         .map(|path| {
             canonical_scalar_update_path_for_source(field, target, &path, fields, source)
@@ -9621,8 +9782,8 @@ fn function_match_const_update_expression(
     })
 }
 
-fn function_definition_for_call<'a>(
-    program: &'a ParsedProgram,
+fn function_definition_for_call(
+    program: &ParsedProgram,
     function: &str,
 ) -> Option<FunctionDefinition> {
     let definitions = function_definitions(program);
@@ -9681,7 +9842,9 @@ fn collect_expr_ids_recursive(expr_id: usize, expressions: &[AstExpr], ids: &mut
                 push_child(arg.value, ids);
             }
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             push_child(*initial, ids);
         }
         AstExprKind::Then {
@@ -9714,6 +9877,7 @@ fn collect_expr_ids_recursive(expr_id: usize, expressions: &[AstExpr], ids: &mut
         | AstExprKind::BytesLiteral { .. }
         | AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
@@ -10363,7 +10527,7 @@ fn match_value_arm_expr(
     };
     let output = update_value_expression_from_expr(field, target, fields, *output, source)?;
     let pattern = match_const_pattern_label(pattern)?;
-    (!pattern.is_empty()).then(|| UpdateValueMatchArm { pattern, output })
+    (!pattern.is_empty()).then_some(UpdateValueMatchArm { pattern, output })
 }
 
 fn update_value_expression_from_expr(
@@ -10450,7 +10614,7 @@ fn match_const_arm_expr_in_exprs(exprs: &[AstExpr], expr: &AstExpr) -> Option<Up
     };
     let output = ast_simple_update_value_in_exprs(exprs, *output)?;
     let pattern = match_const_pattern_label(pattern)?;
-    (!pattern.is_empty()).then(|| UpdateMatchArm { pattern, output })
+    (!pattern.is_empty()).then_some(UpdateMatchArm { pattern, output })
 }
 
 fn match_const_pattern_label(pattern: &[String]) -> Option<String> {
@@ -10494,7 +10658,9 @@ fn expr_contains_expr_id_in_exprs_seen(
                     .iter()
                     .any(|arg| expr_contains_expr_id_in_exprs_seen(exprs, arg.value, needle, seen))
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             expr_contains_expr_id_in_exprs_seen(exprs, *initial, needle, seen)
         }
         AstExprKind::Then {
@@ -10527,6 +10693,7 @@ fn expr_contains_expr_id_in_exprs_seen(
         AstExprKind::ListLiteral { .. }
         | AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
@@ -10571,7 +10738,9 @@ fn expr_contains_expr_id_seen(
                     .iter()
                     .any(|arg| expr_contains_expr_id_seen(field, arg.value, needle, seen))
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             expr_contains_expr_id_seen(field, *initial, needle, seen)
         }
         AstExprKind::Then {
@@ -10604,6 +10773,7 @@ fn expr_contains_expr_id_seen(
         AstExprKind::ListLiteral { .. }
         | AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
@@ -12346,9 +12516,7 @@ fn prefix_payload_concat_update_expression_from_items(
             .unwrap_or_default()
             .trim()
             .to_owned();
-        if source_payload_field_from_path(&payload_path, source_variants).is_none() {
-            return None;
-        }
+        source_payload_field_from_path(&payload_path, source_variants)?;
         let separator = summary
             .split_once("separator:")
             .map(|(_, tail)| tail.trim())
@@ -12410,9 +12578,7 @@ fn prefix_payload_concat_update_expression(
         .find(|arg| arg.name.as_deref() == Some("with"))
         .or_else(|| args.iter().find(|arg| arg.name.is_none()))
         .and_then(|arg| ast_argument_value_in_exprs(exprs, arg.value))?;
-    if source_payload_field_from_path(&payload_path, source_variants).is_none() {
-        return None;
-    }
+    source_payload_field_from_path(&payload_path, source_variants)?;
     let separator = args
         .iter()
         .find(|arg| arg.name.as_deref() == Some("separator"))
@@ -12875,9 +13041,7 @@ fn typed_field_defs(program: &ParsedProgram) -> Vec<FieldDef> {
     fields
 }
 
-fn field_function_body_index<'a>(
-    statements: &'a [AstStatement],
-) -> BTreeMap<&'a str, &'a [AstStatement]> {
+fn field_function_body_index(statements: &[AstStatement]) -> BTreeMap<&str, &[AstStatement]> {
     let mut functions = BTreeMap::new();
     collect_field_function_body_index(statements, &mut functions);
     functions
@@ -13222,7 +13386,9 @@ fn collect_field_called_functions(
                 collect_field_called_functions(arg.value, expressions, calls);
             }
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             collect_field_called_functions(*initial, expressions, calls);
         }
         AstExprKind::Then { input, output } => {
@@ -13262,6 +13428,7 @@ fn collect_field_called_functions(
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
@@ -13359,7 +13526,9 @@ fn collect_expr_tree(
                 collect_expr_tree(arg.value, program, seen, exprs);
             }
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             collect_expr_tree(*initial, program, seen, exprs);
         }
         AstExprKind::Then { input, output } => {
@@ -13394,6 +13563,7 @@ fn collect_expr_tree(
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }

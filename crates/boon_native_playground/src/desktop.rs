@@ -1,5 +1,8 @@
 use crate::catalog::{Catalog, LoadedExample};
-use crate::protocol::{Connection, Message, PreviewIntent, Role, SourceUnit, TestStep};
+use crate::protocol::{
+    ApplicationIdentity, Connection, Message, MigrationStatus, PreviewIntent, Role, SourceUnit,
+    TestStep,
+};
 use std::fs;
 use std::io;
 use std::os::unix::net::UnixListener;
@@ -181,25 +184,61 @@ impl DesktopSupervisor {
             (Role::Dev, Message::DevSelectExample { example_id }) => {
                 self.select_example(&example_id)
             }
-            (Role::Dev, Message::DevSourceChanged { revision, units }) => {
-                self.accept_source(revision, units).and_then(|accepted| {
+            (
+                Role::Dev,
+                Message::DevSourceChanged {
+                    application,
+                    revision,
+                    units,
+                },
+            ) => self
+                .accept_source(revision, application, units)
+                .and_then(|accepted| {
                     if accepted {
                         self.send_preview(PreviewIntent::Replace, None)
                     } else {
                         Ok(())
                     }
-                })
-            }
-            (Role::Dev, Message::DevRun { revision, units }) => {
-                self.accept_source(revision, units).and_then(|accepted| {
+                }),
+            (
+                Role::Dev,
+                Message::DevRun {
+                    application,
+                    revision,
+                    units,
+                },
+            ) => self
+                .accept_source(revision, application, units)
+                .and_then(|accepted| {
                     if accepted {
                         self.send_preview(PreviewIntent::Run, None)
                     } else {
                         Ok(())
                     }
-                })
-            }
+                }),
             (Role::Dev, Message::DevReset) => self.reset_source(),
+            (
+                Role::Dev,
+                Message::DevMigrationCommand {
+                    request_id,
+                    revision,
+                    command,
+                },
+            ) => {
+                if revision != self.source.revision || self.source.active.migration.is_none() {
+                    self.dev.send(&Message::PreviewStatus {
+                        revision,
+                        ok: false,
+                        message: "migration command does not match the active source".to_owned(),
+                    })
+                } else {
+                    self.preview.send(&Message::PreviewMigrationCommand {
+                        request_id,
+                        revision,
+                        command,
+                    })
+                }
+            }
             (
                 Role::Dev,
                 Message::DevInspect {
@@ -216,21 +255,41 @@ impl DesktopSupervisor {
                 Role::Dev,
                 Message::DevTest {
                     request_id,
+                    application,
                     revision,
                     units,
                 },
-            ) => self.accept_source(revision, units).and_then(|accepted| {
-                if accepted {
-                    self.send_preview(PreviewIntent::Test, Some(request_id))
-                } else {
-                    Ok(())
-                }
+            ) => self
+                .accept_source(revision, application, units)
+                .and_then(|accepted| {
+                    if accepted {
+                        self.send_preview(PreviewIntent::Test, Some(request_id))
+                    } else {
+                        Ok(())
+                    }
+                }),
+            (Role::Preview, Message::PreviewMigrationStatus(status)) => {
+                self.accept_migration_status(status)
+            }
+            (
+                Role::Dev,
+                Message::DevPersistenceCommand {
+                    request_id,
+                    revision,
+                    command,
+                },
+            ) => self.preview.send(&Message::PreviewPersistenceCommand {
+                request_id,
+                revision,
+                command,
             }),
             (Role::Preview, message @ Message::PreviewStats(_))
             | (Role::Preview, message @ Message::PreviewStatus { .. })
             | (Role::Preview, message @ Message::PreviewRuntimeChanged { .. })
             | (Role::Preview, message @ Message::PreviewTestResult { .. })
-            | (Role::Preview, message @ Message::PreviewInspectResult { .. }) => {
+            | (Role::Preview, message @ Message::PreviewInspectResult { .. })
+            | (Role::Preview, message @ Message::PreviewPersistenceSnapshot(_))
+            | (Role::Preview, message @ Message::PreviewPersistenceArtifact { .. }) => {
                 self.dev.send(&message)
             }
             (_, Message::Shutdown) => return Some(Ok(())),
@@ -255,7 +314,12 @@ impl DesktopSupervisor {
         self.send_preview(PreviewIntent::Replace, None)
     }
 
-    fn accept_source(&mut self, revision: u64, units: Vec<SourceUnit>) -> DesktopResult<bool> {
+    fn accept_source(
+        &mut self,
+        revision: u64,
+        application: ApplicationIdentity,
+        units: Vec<SourceUnit>,
+    ) -> DesktopResult<bool> {
         validate_units(&units)?;
         if revision < self.source.revision {
             self.dev.send(&Message::PreviewStatus {
@@ -268,6 +332,7 @@ impl DesktopSupervisor {
             })?;
             return Ok(false);
         }
+        self.source.application = application;
         self.source.revision = revision;
         self.source.working_units = units;
         Ok(true)
@@ -286,8 +351,11 @@ impl DesktopSupervisor {
         self.dev.send(&Message::OpenEditor {
             example_id: self.source.active.id.clone(),
             label: self.source.active.label.clone(),
+            application: self.source.application.clone(),
             revision: self.source.revision,
             units: self.source.working_units.clone(),
+            migration: self.source.active.migration.clone(),
+            migration_stage: self.source.migration_stage.clone(),
         })?;
         Ok(())
     }
@@ -300,6 +368,7 @@ impl DesktopSupervisor {
         self.preview.send(&Message::PreviewApply {
             intent,
             request_id,
+            application: self.source.application.clone(),
             revision: self.source.revision,
             units: self.source.working_units.clone(),
             test_steps: if intent == PreviewIntent::Test {
@@ -307,8 +376,20 @@ impl DesktopSupervisor {
             } else {
                 Vec::new()
             },
+            migration: self.source.active.migration.clone(),
+            migration_stage: self.source.migration_stage.clone(),
         })?;
         Ok(())
+    }
+
+    fn accept_migration_status(&mut self, status: MigrationStatus) -> DesktopResult<()> {
+        if status.revision == self.source.revision
+            && self.source.migration_stage.as_deref() != Some(status.active_stage.as_str())
+        {
+            self.source.activate_migration_stage(&status.active_stage)?;
+            self.send_open_editor()?;
+        }
+        self.dev.send(&Message::PreviewMigrationStatus(status))
     }
 
     fn send_preview_assets(&mut self) -> DesktopResult<()> {
@@ -344,8 +425,10 @@ impl Drop for DesktopSupervisor {
 
 struct SourceState {
     active: LoadedExample,
+    application: ApplicationIdentity,
     baseline_units: Vec<SourceUnit>,
     working_units: Vec<SourceUnit>,
+    migration_stage: Option<String>,
     revision: u64,
     test_steps: Vec<TestStep>,
 }
@@ -354,9 +437,16 @@ impl SourceState {
     fn new(active: LoadedExample) -> Self {
         let baseline_units = active.units.clone();
         let test_steps = active.test_steps.clone();
+        let application = active.application.clone();
+        let migration_stage = active
+            .migration
+            .as_ref()
+            .map(|migration| migration.initial_stage.clone());
         Self {
             working_units: baseline_units.clone(),
             active,
+            application,
+            migration_stage,
             baseline_units,
             revision: 1,
             test_steps,
@@ -367,8 +457,26 @@ impl SourceState {
         self.revision = self.revision.saturating_add(1);
         self.baseline_units = active.units.clone();
         self.working_units = active.units.clone();
+        self.application = active.application.clone();
+        self.migration_stage = active
+            .migration
+            .as_ref()
+            .map(|migration| migration.initial_stage.clone());
         self.active = active;
         self.test_steps = self.active.test_steps.clone();
+    }
+
+    fn activate_migration_stage(&mut self, stage_id: &str) -> DesktopResult<()> {
+        let stage = self
+            .active
+            .migration
+            .as_ref()
+            .and_then(|migration| migration.stage(stage_id))
+            .ok_or_else(|| format!("migration stage `{stage_id}` is not in the active catalog"))?;
+        self.baseline_units.clone_from(&stage.units);
+        self.working_units.clone_from(&stage.units);
+        self.migration_stage = Some(stage_id.to_owned());
+        Ok(())
     }
 }
 
@@ -420,6 +528,7 @@ impl ChildRole {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Inbound {
     Message(Role, Message),
     Closed(Role, Result<(), String>),

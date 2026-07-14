@@ -1,8 +1,8 @@
 use boon_plan::{
-    FieldId, InitialValueKind, ListId, ListInitializerKind, ListStorageSlot, MachinePlan,
-    PlanConstantId, PlanConstantValue, PlanDerivedExpression, PlanDerivedKind, PlanExpressionKind,
-    PlanListOperationKind, PlanListProjection, PlanListRemovePredicate, PlanOp, PlanOpId,
-    PlanOpKind, PlanRowCallArg, PlanRowExpression, PlanRowSelectPattern, PlanSourceGuard,
+    EffectInvocationId, FieldId, InitialValueKind, ListId, ListInitializerKind, ListStorageSlot,
+    MachinePlan, PlanConstantId, PlanConstantValue, PlanDerivedExpression, PlanDerivedKind,
+    PlanExpressionKind, PlanListOperationKind, PlanListProjection, PlanListRemovePredicate, PlanOp,
+    PlanOpId, PlanOpKind, PlanRowCallArg, PlanRowExpression, PlanRowSelectPattern, PlanSourceGuard,
     RootOutputDemand, ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute,
     StateId, ValueRef,
 };
@@ -92,6 +92,32 @@ pub enum Delta {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuthorityDelta {
+    SetRoot {
+        state: StateId,
+        value: Value,
+    },
+    SetRowField {
+        row: RowId,
+        field: FieldId,
+        value: Value,
+    },
+    ReplaceList {
+        list_id: ListId,
+        authority: ListAuthority,
+    },
+    InsertRow {
+        row: RowAuthority,
+        index: u64,
+        next_key: u64,
+    },
+    RemoveRow {
+        row: RowId,
+        next_key: u64,
+    },
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TurnMetrics {
     pub dirty_state_count: usize,
@@ -108,7 +134,11 @@ pub struct TurnMetrics {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Turn {
     pub sequence: u64,
+    pub source_sequence: Option<u64>,
     pub deltas: Vec<Delta>,
+    pub authority_deltas: Vec<AuthorityDelta>,
+    pub durable_changes: Vec<boon_persistence::DurableChange>,
+    pub outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
     pub metrics: TurnMetrics,
 }
 
@@ -117,6 +147,42 @@ pub struct Snapshot {
     pub states: BTreeMap<StateId, Value>,
     pub fields: BTreeMap<FieldId, Value>,
     pub lists: BTreeMap<ListId, Vec<RowSnapshot>>,
+}
+
+/// Authoritative scalar state as distinct from a derived inspection value.
+///
+/// `touched` is persisted even when `value` equals the current program default.
+/// This prevents a later default change from overwriting an explicit user choice.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarAuthority {
+    pub touched: bool,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowAuthority {
+    pub id: RowId,
+    pub fields: BTreeMap<FieldId, Value>,
+    pub touched_fields: BTreeSet<FieldId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListAuthority {
+    pub touched: bool,
+    pub next_key: u64,
+    pub rows: Vec<RowAuthority>,
+}
+
+/// Runtime-ID authority image used at the Session boundary.
+///
+/// Durable storage translates the runtime IDs through `MachinePlan::persistence`;
+/// derived values, indexes, source bindings, and currentness caches never enter
+/// this image.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AuthoritySnapshot {
+    pub through_turn_sequence: u64,
+    pub states: BTreeMap<StateId, ScalarAuthority>,
+    pub lists: BTreeMap<ListId, ListAuthority>,
 }
 
 impl Snapshot {
@@ -877,28 +943,245 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
     }
 }
 
+fn stable_list_fields(
+    list: &boon_plan::ListMemoryPlan,
+) -> Result<BTreeMap<FieldId, boon_plan::MemoryLeafId>, Error> {
+    let mut fields = BTreeMap::new();
+    for leaf in &list.row_fields {
+        let field = leaf.runtime_field_id.ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "persistence list {} leaf {} has no runtime FieldId",
+                list.memory_id, leaf.leaf_id
+            ))
+        })?;
+        if fields.insert(field, leaf.leaf_id).is_some() {
+            return Err(Error::InvalidPlan(format!(
+                "persistence list {} repeats runtime field {}",
+                list.memory_id, field.0
+            )));
+        }
+    }
+    Ok(fields)
+}
+
+fn stored_list(
+    memory: &boon_plan::ListMemoryPlan,
+    authority: &ListAuthority,
+    touched_only: bool,
+) -> Result<boon_persistence::StoredList, Error> {
+    let rows = authority
+        .rows
+        .iter()
+        .filter(|row| !touched_only || !row.touched_fields.is_empty())
+        .map(|row| stored_row(memory, row, touched_only))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(boon_persistence::StoredList {
+        touched: authority.touched,
+        next_key: if authority.touched {
+            authority.next_key
+        } else {
+            0
+        },
+        rows,
+    })
+}
+
+fn stored_row(
+    memory: &boon_plan::ListMemoryPlan,
+    row: &RowAuthority,
+    touched_only: bool,
+) -> Result<boon_persistence::StoredRow, Error> {
+    let stable_fields = stable_list_fields(memory)?;
+    let fields = row
+        .fields
+        .iter()
+        .filter(|(field, _)| !touched_only || row.touched_fields.contains(field))
+        .map(|(field, value)| {
+            let stable = stable_fields.get(field).copied().ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "persistence list {} has no stable identity for field {}",
+                    memory.memory_id, field.0
+                ))
+            })?;
+            Ok((stable, stored_value(value)?))
+        })
+        .collect::<Result<BTreeMap<_, _>, Error>>()?;
+    let touched_fields = row
+        .touched_fields
+        .iter()
+        .map(|field| {
+            stable_fields.get(field).copied().ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "persistence list {} has no stable identity for touched field {}",
+                    memory.memory_id, field.0
+                ))
+            })
+        })
+        .collect::<Result<BTreeSet<_>, Error>>()?;
+    Ok(boon_persistence::StoredRow {
+        key: row.id.key,
+        generation: row.id.generation,
+        fields,
+        touched_fields,
+    })
+}
+
+pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValue, Error> {
+    match value {
+        Value::Null => Ok(boon_persistence::StoredValue::Null),
+        Value::Bool(value) => Ok(boon_persistence::StoredValue::Bool(*value)),
+        Value::Number(value) => Ok(boon_persistence::StoredValue::Number(*value)),
+        Value::Text(value) => Ok(boon_persistence::StoredValue::Text(value.clone())),
+        Value::Bytes(value) => Ok(boon_persistence::StoredValue::Bytes(value.clone())),
+        Value::List(values) => values
+            .iter()
+            .map(stored_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(boon_persistence::StoredValue::List),
+        Value::Record(fields) => {
+            let mut stored = fields
+                .iter()
+                .filter(|(name, _)| name.as_str() != "$tag")
+                .map(|(name, value)| Ok((name.clone(), stored_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, Error>>()?;
+            match fields.get("$tag") {
+                Some(Value::Text(tag)) => Ok(boon_persistence::StoredValue::Variant {
+                    tag: tag.clone(),
+                    fields: std::mem::take(&mut stored),
+                }),
+                Some(_) => Err(Error::Evaluation(
+                    "tagged runtime record has a non-text `$tag` field".to_owned(),
+                )),
+                None => Ok(boon_persistence::StoredValue::Record(stored)),
+            }
+        }
+        Value::Error { code } => Ok(boon_persistence::StoredValue::Error {
+            code: code.clone(),
+            fields: BTreeMap::new(),
+        }),
+        Value::MappedRow { .. } | Value::Row { .. } => Err(Error::Evaluation(
+            "row handles and derived mapped rows are not durable authority".to_owned(),
+        )),
+    }
+}
+
+pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Value, Error> {
+    match value {
+        boon_persistence::StoredValue::Null => Ok(Value::Null),
+        boon_persistence::StoredValue::Bool(value) => Ok(Value::Bool(value)),
+        boon_persistence::StoredValue::Number(value) => Ok(Value::Number(value)),
+        boon_persistence::StoredValue::Text(value) => Ok(Value::Text(value)),
+        boon_persistence::StoredValue::Bytes(value) => Ok(Value::Bytes(value)),
+        boon_persistence::StoredValue::List(values) => values
+            .into_iter()
+            .map(runtime_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        boon_persistence::StoredValue::Record(fields) => fields
+            .into_iter()
+            .map(|(name, value)| Ok((name, runtime_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(Value::Record),
+        boon_persistence::StoredValue::Variant { tag, fields } if fields.is_empty() => {
+            Ok(Value::Text(tag))
+        }
+        boon_persistence::StoredValue::Variant { tag, mut fields } => {
+            if fields
+                .insert("$tag".to_owned(), boon_persistence::StoredValue::Text(tag))
+                .is_some()
+            {
+                return Err(Error::Evaluation(
+                    "stored variant contains reserved `$tag` field".to_owned(),
+                ));
+            }
+            runtime_value(boon_persistence::StoredValue::Record(fields))
+        }
+        boon_persistence::StoredValue::Error { code, fields } => {
+            if fields.is_empty() {
+                Ok(Value::Error { code })
+            } else {
+                Err(Error::Evaluation(
+                    "runtime cannot restore structured error authority".to_owned(),
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum AuthorityUndo {
+    RootState {
+        state: StateId,
+        value: Option<Value>,
+        touched: bool,
+    },
+    RowField {
+        row: RowId,
+        field: FieldId,
+        value: Option<Value>,
+        touched_field: bool,
+        touched_list: bool,
+    },
+    AppendRow {
+        row: RowId,
+        previous_next_key: u64,
+        touched_list: bool,
+    },
+    RemoveRow {
+        row: RowId,
+        value: Row,
+        order_index: usize,
+        previous_next_key: u64,
+        touched_list: bool,
+        touched_fields: BTreeSet<FieldId>,
+    },
+}
+
 #[derive(Clone, Default)]
 struct Work {
     emit: bool,
     deltas: Vec<Delta>,
+    authority_deltas: Vec<AuthorityDelta>,
+    outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
     metrics: TurnMetrics,
     dirty_states: HashSet<StateId>,
     dirty_consumers: HashSet<Consumer>,
     changed_rows: HashSet<RowId>,
     suppress_row_deltas: HashSet<RowId>,
     recomputed_targets: HashSet<ValueTarget>,
+    authority_undo: Vec<AuthorityUndo>,
+    undo_root_states: HashSet<StateId>,
+    undo_row_fields: HashSet<(RowId, FieldId)>,
+    pending_settle: bool,
+    previous_last_sequence: Option<u64>,
+    previous_turn_sequence: u64,
 }
 
 impl Work {
-    fn begin_turn(&mut self) {
+    fn begin_turn(&mut self, last_sequence: Option<u64>, turn_sequence: u64) {
         self.emit = true;
         self.deltas.clear();
+        self.authority_deltas.clear();
+        self.outbox_changes.clear();
         self.metrics = TurnMetrics::default();
         self.dirty_states.clear();
         self.dirty_consumers.clear();
         self.changed_rows.clear();
         self.suppress_row_deltas.clear();
         self.recomputed_targets.clear();
+        self.authority_undo.clear();
+        self.undo_root_states.clear();
+        self.undo_row_fields.clear();
+        self.pending_settle = false;
+        self.previous_last_sequence = last_sequence;
+        self.previous_turn_sequence = turn_sequence;
+    }
+
+    fn settle(&mut self) {
+        self.authority_undo.clear();
+        self.undo_root_states.clear();
+        self.undo_row_fields.clear();
+        self.pending_settle = false;
     }
 
     fn finish_metrics(&mut self) {
@@ -936,11 +1219,20 @@ pub struct Session {
     indexes: BTreeMap<IndexKey, BTreeSet<RowId>>,
     dynamic_dependencies: DynamicDependencies,
     last_sequence: Option<u64>,
+    turn_sequence: u64,
     next_binding_id: u64,
+    touched_root_states: BTreeSet<StateId>,
+    touched_lists: BTreeSet<ListId>,
+    touched_row_fields: BTreeSet<(RowId, FieldId)>,
     turn_work: Work,
 }
 
-impl Session {
+pub struct SessionBuilder {
+    session: Session,
+    authority: Option<AuthoritySnapshot>,
+}
+
+impl SessionBuilder {
     pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
         Self::new_shared(Arc::new(plan), options)
     }
@@ -953,22 +1245,57 @@ impl Session {
             )));
         }
         let metadata = Arc::new(Metadata::new(&plan)?);
-        let mut session = Self {
-            plan,
-            options,
-            metadata,
-            root_states: BTreeMap::new(),
-            root_fields: BTreeMap::new(),
-            lists: BTreeMap::new(),
-            indexes: BTreeMap::new(),
-            dynamic_dependencies: DynamicDependencies::default(),
-            last_sequence: None,
-            next_binding_id: 1,
-            turn_work: Work::default(),
-        };
+        Ok(Self {
+            session: Session {
+                plan,
+                options,
+                metadata,
+                root_states: BTreeMap::new(),
+                root_fields: BTreeMap::new(),
+                lists: BTreeMap::new(),
+                indexes: BTreeMap::new(),
+                dynamic_dependencies: DynamicDependencies::default(),
+                last_sequence: None,
+                turn_sequence: 0,
+                next_binding_id: 1,
+                touched_root_states: BTreeSet::new(),
+                touched_lists: BTreeSet::new(),
+                touched_row_fields: BTreeSet::new(),
+                turn_work: Work::default(),
+            },
+            authority: None,
+        })
+    }
+
+    pub fn restore(mut self, authority: AuthoritySnapshot) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    pub fn restore_durable(mut self, image: boon_persistence::RestoreImage) -> Result<Self, Error> {
+        self.authority = Some(self.session.authority_from_durable(image)?);
+        Ok(self)
+    }
+
+    pub fn build(mut self) -> Result<Session, Error> {
         let mut work = Work::default();
-        session.initialize(&mut work)?;
-        Ok(session)
+        self.session.initialize_storage_defaults(&mut work)?;
+        if let Some(authority) = self.authority.take() {
+            self.session.install_authority(authority, &mut work)?;
+        }
+        self.session.initialize_root_field_defaults(&mut work)?;
+        self.session.ensure_published_current(None, &mut work)?;
+        Ok(self.session)
+    }
+}
+
+impl Session {
+    pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
+        SessionBuilder::new(plan, options)?.build()
+    }
+
+    pub fn new_shared(plan: Arc<MachinePlan>, options: SessionOptions) -> Result<Self, Error> {
+        SessionBuilder::new_shared(plan, options)?.build()
     }
 
     pub fn plan(&self) -> &MachinePlan {
@@ -1155,6 +1482,512 @@ impl Session {
         Ok(snapshot)
     }
 
+    pub fn authority_snapshot(&self) -> Result<AuthoritySnapshot, Error> {
+        let states = self
+            .plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .filter(|slot| !slot.indexed)
+            .map(|slot| {
+                let value = self
+                    .root_states
+                    .get(&slot.state_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Evaluation(format!(
+                            "authoritative state {} has no value",
+                            slot.state_id.0
+                        ))
+                    })?;
+                Ok((
+                    slot.state_id,
+                    ScalarAuthority {
+                        touched: self.touched_root_states.contains(&slot.state_id),
+                        value,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+
+        let mut lists = BTreeMap::new();
+        for slot in &self.plan.storage_layout.list_slots {
+            lists.insert(slot.list_id, self.list_authority(slot.list_id)?);
+        }
+
+        Ok(AuthoritySnapshot {
+            through_turn_sequence: self.turn_sequence,
+            states,
+            lists,
+        })
+    }
+
+    fn list_authority(&self, list_id: ListId) -> Result<ListAuthority, Error> {
+        let state = self.lists.get(&list_id).ok_or_else(|| {
+            Error::Evaluation(format!("authoritative list {} is missing", list_id.0))
+        })?;
+        let authority_fields = self.authority_fields_for_list(list_id);
+        let rows = state
+            .order
+            .iter()
+            .map(|row_id| {
+                let row = state.rows.get(row_id).ok_or_else(|| {
+                    Error::Evaluation(format!(
+                        "list {} order contains missing row {}:{}",
+                        list_id.0, row_id.key, row_id.generation
+                    ))
+                })?;
+                let fields = authority_fields
+                    .iter()
+                    .filter_map(|field| row.fields.get(field).cloned().map(|value| (*field, value)))
+                    .collect();
+                let touched_fields = authority_fields
+                    .iter()
+                    .filter(|field| self.touched_row_fields.contains(&(*row_id, **field)))
+                    .copied()
+                    .collect();
+                Ok(RowAuthority {
+                    id: *row_id,
+                    fields,
+                    touched_fields,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(ListAuthority {
+            touched: self.touched_lists.contains(&list_id),
+            next_key: state.next_key,
+            rows,
+        })
+    }
+
+    pub fn durable_restore_image(
+        &self,
+        epoch: u64,
+        completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
+    ) -> Result<boon_persistence::RestoreImage, Error> {
+        let authority = self.authority_snapshot()?;
+        let mut scalars = BTreeMap::new();
+        for memory in self
+            .plan
+            .persistence
+            .memory
+            .iter()
+            .filter(|memory| memory.kind == boon_plan::MemoryKind::Scalar)
+        {
+            let slot = self
+                .plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.id == memory.runtime_slot && !slot.indexed)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "persistence scalar {} has no root runtime slot",
+                        memory.memory_id
+                    ))
+                })?;
+            let scalar = authority.states.get(&slot.state_id).ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "persistence scalar {} has no authority value",
+                    memory.memory_id
+                ))
+            })?;
+            if scalar.touched {
+                scalars.insert(
+                    memory.memory_id,
+                    boon_persistence::StoredScalar {
+                        touched: true,
+                        value: stored_value(&scalar.value)?,
+                    },
+                );
+            }
+        }
+
+        let mut lists = BTreeMap::new();
+        for list_memory in &self.plan.persistence.lists {
+            let slot = self
+                .plan
+                .storage_layout
+                .list_slots
+                .iter()
+                .find(|slot| slot.id == list_memory.runtime_slot)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "persistence list {} has no runtime slot",
+                        list_memory.memory_id
+                    ))
+                })?;
+            let list = authority.lists.get(&slot.list_id).ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "persistence list {} has no authority value",
+                    list_memory.memory_id
+                ))
+            })?;
+            let field_ids = stable_list_fields(list_memory)?;
+            let rows = list
+                .rows
+                .iter()
+                .filter(|row| list.touched || !row.touched_fields.is_empty())
+                .map(|row| {
+                    let fields = row
+                        .fields
+                        .iter()
+                        .filter(|(field, _)| list.touched || row.touched_fields.contains(field))
+                        .map(|(field, value)| {
+                            let stable = field_ids.get(field).ok_or_else(|| {
+                                Error::InvalidPlan(format!(
+                                    "list {} authority field {} has no stable leaf ID",
+                                    slot.list_id.0, field.0
+                                ))
+                            })?;
+                            Ok((*stable, stored_value(value)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?;
+                    let touched_fields = row
+                        .touched_fields
+                        .iter()
+                        .map(|field| {
+                            field_ids.get(field).copied().ok_or_else(|| {
+                                Error::InvalidPlan(format!(
+                                    "list {} touched field {} has no stable leaf ID",
+                                    slot.list_id.0, field.0
+                                ))
+                            })
+                        })
+                        .collect::<Result<BTreeSet<_>, Error>>()?;
+                    Ok(boon_persistence::StoredRow {
+                        key: row.id.key,
+                        generation: row.id.generation,
+                        fields,
+                        touched_fields,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            if !list.touched && rows.is_empty() {
+                continue;
+            }
+            lists.insert(
+                list_memory.memory_id,
+                boon_persistence::StoredList {
+                    touched: list.touched,
+                    next_key: if list.touched { list.next_key } else { 0 },
+                    rows,
+                },
+            );
+        }
+
+        Ok(boon_persistence::RestoreImage {
+            application: self.plan.application.identity.clone(),
+            schema_version: self.plan.persistence.schema_version,
+            schema_hash: self.plan.persistence.schema_hash,
+            epoch,
+            through_turn_sequence: authority.through_turn_sequence,
+            scalars,
+            lists,
+            completed_migration_edges,
+            outbox: BTreeMap::new(),
+        })
+    }
+
+    pub fn durable_changes(
+        &self,
+        deltas: &[AuthorityDelta],
+    ) -> Result<Vec<boon_persistence::DurableChange>, Error> {
+        deltas
+            .iter()
+            .map(|delta| match delta {
+                AuthorityDelta::SetRoot { state, value } => {
+                    let memory = self
+                        .plan
+                        .persistence
+                        .memory
+                        .iter()
+                        .filter(|memory| memory.kind == boon_plan::MemoryKind::Scalar)
+                        .find(|memory| {
+                            self.plan.storage_layout.scalar_slots.iter().any(|slot| {
+                                slot.id == memory.runtime_slot
+                                    && !slot.indexed
+                                    && slot.state_id == *state
+                            })
+                        })
+                        .ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "root state {} has no stable persistence identity",
+                                state.0
+                            ))
+                        })?;
+                    Ok(boon_persistence::DurableChange::SetScalar {
+                        memory_id: memory.memory_id,
+                        value: boon_persistence::StoredScalar {
+                            touched: true,
+                            value: stored_value(value)?,
+                        },
+                    })
+                }
+                AuthorityDelta::SetRowField { row, field, value } => {
+                    let memory = self.persistence_list(row.list)?;
+                    let fields = stable_list_fields(memory)?;
+                    let field_id = fields.get(field).copied().ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "list {} field {} has no stable persistence identity",
+                            row.list.0, field.0
+                        ))
+                    })?;
+                    Ok(boon_persistence::DurableChange::SetRowField {
+                        memory_id: memory.memory_id,
+                        row_key: row.key,
+                        row_generation: row.generation,
+                        field_id,
+                        value: stored_value(value)?,
+                    })
+                }
+                AuthorityDelta::ReplaceList { list_id, authority } => {
+                    let memory = self.persistence_list(*list_id)?;
+                    if !authority.touched {
+                        return Err(Error::InvalidPlan(format!(
+                            "replacement authority for list {} is not structurally touched",
+                            list_id.0
+                        )));
+                    }
+                    Ok(boon_persistence::DurableChange::SetList {
+                        memory_id: memory.memory_id,
+                        value: stored_list(memory, authority, false)?,
+                    })
+                }
+                AuthorityDelta::InsertRow {
+                    row,
+                    index,
+                    next_key,
+                } => {
+                    let memory = self.persistence_list(row.id.list)?;
+                    Ok(boon_persistence::DurableChange::InsertRow {
+                        memory_id: memory.memory_id,
+                        index: *index,
+                        row: stored_row(memory, row, false)?,
+                        next_key: *next_key,
+                    })
+                }
+                AuthorityDelta::RemoveRow { row, next_key } => {
+                    let memory = self.persistence_list(row.list)?;
+                    Ok(boon_persistence::DurableChange::RemoveRow {
+                        memory_id: memory.memory_id,
+                        row_key: row.key,
+                        row_generation: row.generation,
+                        next_key: *next_key,
+                    })
+                }
+            })
+            .collect()
+    }
+
+    fn persistence_list(&self, list_id: ListId) -> Result<&boon_plan::ListMemoryPlan, Error> {
+        self.plan
+            .persistence
+            .lists
+            .iter()
+            .find(|memory| {
+                self.plan
+                    .storage_layout
+                    .list_slots
+                    .iter()
+                    .any(|slot| slot.id == memory.runtime_slot && slot.list_id == list_id)
+            })
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "list {} has no stable persistence identity",
+                    list_id.0
+                ))
+            })
+    }
+
+    fn authority_from_durable(
+        &self,
+        image: boon_persistence::RestoreImage,
+    ) -> Result<AuthoritySnapshot, Error> {
+        if image.application != self.plan.application.identity {
+            return Err(Error::InvalidPlan(
+                "restore image application identity does not match MachinePlan".to_owned(),
+            ));
+        }
+        if image.schema_version != self.plan.persistence.schema_version
+            || image.schema_hash != self.plan.persistence.schema_hash
+        {
+            return Err(Error::InvalidPlan(
+                "restore image schema does not match MachinePlan; migration activation is required"
+                    .to_owned(),
+            ));
+        }
+
+        let scalar_by_memory = self
+            .plan
+            .persistence
+            .memory
+            .iter()
+            .filter(|memory| memory.kind == boon_plan::MemoryKind::Scalar)
+            .map(|memory| (memory.memory_id, memory))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(memory) = image
+            .scalars
+            .keys()
+            .find(|memory| !scalar_by_memory.contains_key(memory))
+        {
+            return Err(Error::InvalidPlan(format!(
+                "restore image contains unknown scalar memory {memory}"
+            )));
+        }
+        let mut states = BTreeMap::new();
+        for (memory_id, scalar) in image.scalars {
+            let memory = scalar_by_memory[&memory_id];
+            let slot = self
+                .plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.id == memory.runtime_slot && !slot.indexed)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "restore scalar {memory_id} has no root runtime slot"
+                    ))
+                })?;
+            if !scalar.touched {
+                return Err(Error::InvalidPlan(format!(
+                    "sparse restore scalar {memory_id} is present but not touched"
+                )));
+            }
+            states.insert(
+                slot.state_id,
+                ScalarAuthority {
+                    touched: true,
+                    value: runtime_value(scalar.value)?,
+                },
+            );
+        }
+
+        let list_by_memory = self
+            .plan
+            .persistence
+            .lists
+            .iter()
+            .map(|list| (list.memory_id, list))
+            .collect::<BTreeMap<_, _>>();
+        if let Some(memory) = image
+            .lists
+            .keys()
+            .find(|memory| !list_by_memory.contains_key(memory))
+        {
+            return Err(Error::InvalidPlan(format!(
+                "restore image contains unknown list memory {memory}"
+            )));
+        }
+        let mut lists = BTreeMap::new();
+        for (memory_id, stored) in image.lists {
+            let memory = list_by_memory[&memory_id];
+            let slot = self
+                .plan
+                .storage_layout
+                .list_slots
+                .iter()
+                .find(|slot| slot.id == memory.runtime_slot)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!("restore list {memory_id} has no runtime slot"))
+                })?;
+            let structurally_touched = stored.touched;
+            if !structurally_touched && stored.next_key != 0 {
+                return Err(Error::InvalidPlan(format!(
+                    "sparse row overrides for list {memory_id} must not replace its allocator"
+                )));
+            }
+            let stable_fields = stable_list_fields(memory)?;
+            let runtime_fields = stable_fields
+                .into_iter()
+                .map(|(field, stable)| (stable, field))
+                .collect::<BTreeMap<_, _>>();
+            let rows = stored
+                .rows
+                .into_iter()
+                .map(|row| {
+                    if !structurally_touched
+                        && (row.touched_fields.is_empty()
+                            || row
+                                .fields
+                                .keys()
+                                .any(|field| !row.touched_fields.contains(field)))
+                    {
+                        return Err(Error::InvalidPlan(format!(
+                            "sparse restore list {memory_id} contains non-override row data"
+                        )));
+                    }
+                    let fields = row
+                        .fields
+                        .into_iter()
+                        .map(|(stable, value)| {
+                            let field = runtime_fields.get(&stable).copied().ok_or_else(|| {
+                                Error::InvalidPlan(format!(
+                                    "restore list {memory_id} contains unknown row leaf {stable}"
+                                ))
+                            })?;
+                            Ok((field, runtime_value(value)?))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, Error>>()?;
+                    let touched_fields = row
+                        .touched_fields
+                        .into_iter()
+                        .map(|stable| {
+                            runtime_fields.get(&stable).copied().ok_or_else(|| {
+                                Error::InvalidPlan(format!(
+                                    "restore list {memory_id} touches unknown row leaf {stable}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<BTreeSet<_>, Error>>()?;
+                    Ok(RowAuthority {
+                        id: RowId {
+                            list: slot.list_id,
+                            key: row.key,
+                            generation: row.generation,
+                        },
+                        fields,
+                        touched_fields,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            lists.insert(
+                slot.list_id,
+                ListAuthority {
+                    touched: structurally_touched,
+                    next_key: stored.next_key,
+                    rows,
+                },
+            );
+        }
+
+        Ok(AuthoritySnapshot {
+            through_turn_sequence: image.through_turn_sequence,
+            states,
+            lists,
+        })
+    }
+
+    fn authority_fields_for_list(&self, list: ListId) -> BTreeSet<FieldId> {
+        let indexed = self
+            .metadata
+            .indexed_state_field
+            .iter()
+            .filter_map(|(state, field)| {
+                (self.metadata.indexed_state_owner.get(state) == Some(&list)).then_some(*field)
+            });
+        let constructor = self
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.list_id == list)
+            .into_iter()
+            .flat_map(|slot| slot.row_field_ids.iter().copied())
+            .filter(|field| !self.metadata.row_computations.contains_key(field));
+        constructor.chain(indexed).collect()
+    }
+
     pub fn project_current(
         &mut self,
         targets: &[ValueTarget],
@@ -1185,6 +2018,13 @@ impl Session {
         Ok(values)
     }
 
+    /// Establishes a currentness barrier for an already-owned demand set
+    /// without cloning its values. Hosts use this after rollback/restore before
+    /// exposing retained output state again.
+    pub fn ensure_current(&mut self, targets: &[ValueTarget]) -> Result<(), Error> {
+        self.ensure_demanded_current(targets, None, &mut Work::default())
+    }
+
     pub fn root_value_current(&mut self, name: &str) -> Result<Value, Error> {
         if self.metadata.root_field_by_name.contains_key(name)
             || self
@@ -1200,6 +2040,72 @@ impl Session {
             .get(&state)
             .cloned()
             .ok_or_else(|| Error::Evaluation(format!("root state `{name}` has no value")))
+    }
+
+    /// Reconstructs one host-owned non-visual output after establishing its
+    /// currentness barrier. Output values are derived cache entries, never
+    /// authority included in snapshots or durable storage.
+    pub fn output_value_current(&mut self, name: &str) -> Result<Value, Error> {
+        let output = self
+            .plan
+            .output_root(name)
+            .cloned()
+            .ok_or_else(|| Error::Evaluation(format!("output root `{name}` does not exist")))?;
+        let boon_plan::OutputContractKind::HostValue { data_type } = output.contract else {
+            return Err(Error::Evaluation(format!(
+                "output root `{name}` is retained visual content, not a host data value"
+            )));
+        };
+        let boon_plan::OutputValueRef::RuntimeValue { value } = output.value else {
+            return Err(Error::InvalidPlan(format!(
+                "host output root `{name}` has no runtime value reference"
+            )));
+        };
+        if let (ValueRef::List(list), boon_plan::DataTypePlan::List { item }) = (&value, &data_type)
+        {
+            return self.output_list_current(*list, item);
+        }
+        let mut work = Work::default();
+        let evaluated = self.eval_value_ref(&value, None, None, None, None, &mut work)?;
+        let value = self.materialize_eval(evaluated)?;
+        normalize_host_output_value(value)
+    }
+
+    fn output_list_current(
+        &mut self,
+        list: ListId,
+        item_type: &boon_plan::DataTypePlan,
+    ) -> Result<Value, Error> {
+        let boon_plan::DataTypePlan::Record {
+            fields,
+            open: false,
+        } = item_type
+        else {
+            return Err(Error::Evaluation(format!(
+                "list output {} must expose a closed record item type",
+                list.0
+            )));
+        };
+        let rows = self.list_row_ids(list);
+        let mut values = Vec::with_capacity(rows.len());
+        let mut work = Work::default();
+        for row in rows {
+            let mut record = BTreeMap::new();
+            for output_field in fields {
+                let field = self.metadata.list_storage_field(list, &output_field.name)?;
+                let value = if self.metadata.row_computations.contains_key(&field) {
+                    self.ensure_row_field(row, field, None, &mut work)?
+                } else {
+                    self.row_value(row, field)?
+                };
+                record.insert(
+                    output_field.name.clone(),
+                    normalize_host_output_value(value)?,
+                );
+            }
+            values.push(Value::Record(record));
+        }
+        Ok(Value::List(values))
     }
 
     pub fn inspect_value_current(&mut self, name: &str, max_rows: usize) -> Result<Value, Error> {
@@ -1303,7 +2209,7 @@ impl Session {
         self.row_target_for_source(source, key, generation)
     }
 
-    fn initialize(&mut self, work: &mut Work) -> Result<(), Error> {
+    fn initialize_storage_defaults(&mut self, work: &mut Work) -> Result<(), Error> {
         for field in self.metadata.root_computations.keys() {
             self.root_fields.insert(*field, DerivedCell::default());
         }
@@ -1323,9 +2229,13 @@ impl Session {
             .flat_map(|list| list.order.iter().copied())
             .collect::<Vec<_>>();
         for row in initial_rows {
-            self.initialize_indexed_states(row, work)?;
+            self.initialize_missing_indexed_states(row, work)?;
         }
 
+        Ok(())
+    }
+
+    fn initialize_root_field_defaults(&mut self, work: &mut Work) -> Result<(), Error> {
         let root_initial_slots = self
             .plan
             .storage_layout
@@ -1344,13 +2254,253 @@ impl Session {
                 ))
             })?;
             let field = self.metadata.root_field(source)?;
-            let value = self.ensure_root_field(field, None, work)?;
-            self.root_states.insert(slot.state_id, value);
+            if !self.root_states.contains_key(&slot.state_id) {
+                let value = self.ensure_root_field(field, None, work)?;
+                self.root_states.insert(slot.state_id, value);
+            }
+        }
+        Ok(())
+    }
+
+    fn install_authority(
+        &mut self,
+        authority: AuthoritySnapshot,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        self.turn_sequence = authority.through_turn_sequence;
+        self.touched_root_states.clear();
+        for (state, scalar) in authority.states {
+            if !self
+                .plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .any(|slot| !slot.indexed && slot.state_id == state)
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "restore image contains unknown root state {}",
+                    state.0
+                )));
+            }
+            if scalar.touched {
+                self.root_states.insert(state, scalar.value);
+                self.touched_root_states.insert(state);
+            }
         }
 
-        let demanded = self.metadata.published.iter().copied().collect::<Vec<_>>();
-        for field in demanded {
-            self.ensure_root_field(field, None, work)?;
+        for (list_id, restored) in authority.lists {
+            let slot = self
+                .plan
+                .storage_layout
+                .list_slots
+                .iter()
+                .find(|slot| slot.list_id == list_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!("restore image contains unknown list {}", list_id.0))
+                })?;
+            let allowed_fields = self.authority_fields_for_list(list_id);
+            if !restored.touched {
+                if restored.next_key != 0 {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore row overrides for list {} replace allocator state",
+                        list_id.0
+                    )));
+                }
+                let mut seen = BTreeSet::new();
+                for restored_row in restored.rows {
+                    if restored_row.id.list != list_id || !seen.insert(restored_row.id) {
+                        return Err(Error::InvalidPlan(format!(
+                            "restore image contains invalid or repeated row {}:{}:{}",
+                            restored_row.id.list.0, restored_row.id.key, restored_row.id.generation
+                        )));
+                    }
+                    if restored_row.touched_fields.is_empty()
+                        || restored_row.fields.keys().any(|field| {
+                            !allowed_fields.contains(field)
+                                || !restored_row.touched_fields.contains(field)
+                        })
+                        || restored_row
+                            .touched_fields
+                            .iter()
+                            .any(|field| !restored_row.fields.contains_key(field))
+                    {
+                        return Err(Error::InvalidPlan(format!(
+                            "restore row override {}:{} contains non-authoritative or untouched data",
+                            restored_row.id.key, restored_row.id.generation
+                        )));
+                    }
+                    let row = self
+                        .lists
+                        .get_mut(&list_id)
+                        .and_then(|list| list.rows.get_mut(&restored_row.id))
+                        .ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "restore row override {}:{} does not exist in current defaults",
+                                restored_row.id.key, restored_row.id.generation
+                            ))
+                        })?;
+                    for (field, value) in restored_row.fields {
+                        row.fields.insert(field, value);
+                        self.touched_row_fields.insert((restored_row.id, field));
+                    }
+                }
+                continue;
+            }
+            let mut rows = BTreeMap::new();
+            let mut order = Vec::with_capacity(restored.rows.len());
+            let mut seen = BTreeSet::new();
+            for restored_row in restored.rows {
+                if restored_row.id.list != list_id {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore row {}:{} belongs to list {}, expected {}",
+                        restored_row.id.key,
+                        restored_row.id.generation,
+                        restored_row.id.list.0,
+                        list_id.0
+                    )));
+                }
+                if !seen.insert(restored_row.id) {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore image repeats row {}:{}:{}",
+                        list_id.0, restored_row.id.key, restored_row.id.generation
+                    )));
+                }
+                if let Some(field) = restored_row
+                    .fields
+                    .keys()
+                    .find(|field| !allowed_fields.contains(field))
+                {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore row {}:{} contains non-authoritative field {}",
+                        list_id.0, restored_row.id.key, field.0
+                    )));
+                }
+                if restored_row
+                    .touched_fields
+                    .iter()
+                    .any(|field| !restored_row.fields.contains_key(field))
+                {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore row {}:{} touches a field without a value",
+                        list_id.0, restored_row.id.key
+                    )));
+                }
+                let mut row = Row {
+                    fields: restored_row.fields,
+                    ..Row::default()
+                };
+                for field in self.metadata.row_computations.keys() {
+                    if self.metadata.row_field_owner.get(field) == Some(&list_id) {
+                        row.derived.insert(*field, Currentness::Dirty);
+                    }
+                }
+                self.touched_row_fields.extend(
+                    restored_row
+                        .touched_fields
+                        .into_iter()
+                        .map(|field| (restored_row.id, field)),
+                );
+                order.push(restored_row.id);
+                rows.insert(restored_row.id, row);
+            }
+            let minimum_next = order
+                .iter()
+                .map(|row| row.key.saturating_add(1))
+                .max()
+                .unwrap_or(1);
+            if restored.next_key < minimum_next {
+                return Err(Error::InvalidPlan(format!(
+                    "restore list {} next key {} is below required {}",
+                    list_id.0, restored.next_key, minimum_next
+                )));
+            }
+            self.lists.insert(
+                list_id,
+                ListState {
+                    rows,
+                    order,
+                    next_key: restored.next_key,
+                },
+            );
+            self.touched_lists.insert(list_id);
+
+            for row in self.list_row_ids(list_id) {
+                self.initialize_missing_indexed_states(row, work)?;
+            }
+            let _ = slot;
+        }
+
+        self.rebuild_runtime_state()?;
+        Ok(())
+    }
+
+    fn initialize_missing_indexed_states(
+        &mut self,
+        row: RowId,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let existing = self
+            .lists
+            .get(&row.list)
+            .and_then(|list| list.rows.get(&row))
+            .map(|row| row.fields.keys().copied().collect::<BTreeSet<_>>())
+            .unwrap_or_default();
+        let slots = self
+            .plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .filter(|slot| self.metadata.indexed_state_owner.get(&slot.state_id) == Some(&row.list))
+            .filter(|slot| {
+                self.metadata
+                    .indexed_state_field
+                    .get(&slot.state_id)
+                    .is_none_or(|field| !existing.contains(field))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for slot in slots {
+            self.initialize_indexed_state(row, &slot, work)?;
+        }
+        Ok(())
+    }
+
+    fn rebuild_runtime_state(&mut self) -> Result<(), Error> {
+        self.indexes.clear();
+        self.dynamic_dependencies = DynamicDependencies::default();
+        self.next_binding_id = 1;
+        let rows = self
+            .lists
+            .iter()
+            .flat_map(|(list, state)| state.order.iter().map(|row| (*list, *row)))
+            .collect::<Vec<_>>();
+        for (_, row) in &rows {
+            if let Some(state) = self
+                .lists
+                .get_mut(&row.list)
+                .and_then(|list| list.rows.get_mut(row))
+            {
+                state.bindings.clear();
+                for currentness in state.derived.values_mut() {
+                    *currentness = Currentness::Dirty;
+                }
+            }
+        }
+        for (_, row) in rows {
+            self.index_row(row)?;
+            let scope = self
+                .plan
+                .storage_layout
+                .list_slots
+                .iter()
+                .find(|slot| slot.list_id == row.list)
+                .and_then(|slot| slot.scope_id);
+            self.bind_row_sources(row, scope)?;
+        }
+        for cell in self.root_fields.values_mut() {
+            cell.currentness = Currentness::Dirty;
+            cell.value = None;
         }
         Ok(())
     }
@@ -1436,45 +2586,55 @@ impl Session {
             .cloned()
             .collect::<Vec<_>>();
         for slot in slots {
-            let target = *self
-                .metadata
-                .indexed_state_field
-                .get(&slot.state_id)
-                .ok_or_else(|| {
-                    Error::InvalidPlan(format!(
-                        "indexed state {} has no row field",
-                        slot.state_id.0
-                    ))
-                })?;
-            let value = match slot.initial_value_kind {
-                InitialValueKind::RowInitialField => {
-                    if let Some(expression) = &slot.initial_row_expression {
-                        let mut bindings = BTreeMap::new();
-                        let evaluated = self.eval_row_expression(
-                            expression,
-                            Some(row),
-                            None,
-                            Some(target),
-                            None,
-                            &mut bindings,
-                            work,
-                        )?;
-                        self.materialize_eval(evaluated, None, work)?
-                    } else {
-                        let source = slot.initial_row_field_path.as_deref().ok_or_else(|| {
-                            Error::InvalidPlan(format!(
-                                "indexed state {} has no row initial source",
-                                slot.state_id.0
-                            ))
-                        })?;
-                        let source = self.metadata.list_field(row.list, source)?;
-                        self.ensure_row_field(row, source, None, work)?
-                    }
-                }
-                _ => self.initial_slot_value(&slot)?,
-            };
-            self.set_row_field(row, target, value, work)?;
+            self.initialize_indexed_state(row, &slot, work)?;
         }
+        Ok(())
+    }
+
+    fn initialize_indexed_state(
+        &mut self,
+        row: RowId,
+        slot: &ScalarStorageSlot,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let target = *self
+            .metadata
+            .indexed_state_field
+            .get(&slot.state_id)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "indexed state {} has no row field",
+                    slot.state_id.0
+                ))
+            })?;
+        let value = match slot.initial_value_kind {
+            InitialValueKind::RowInitialField => {
+                if let Some(expression) = &slot.initial_row_expression {
+                    let mut bindings = BTreeMap::new();
+                    let evaluated = self.eval_row_expression(
+                        expression,
+                        Some(row),
+                        None,
+                        Some(target),
+                        None,
+                        &mut bindings,
+                        work,
+                    )?;
+                    self.materialize_eval(evaluated)?
+                } else {
+                    let source = slot.initial_row_field_path.as_deref().ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "indexed state {} has no row initial source",
+                            slot.state_id.0
+                        ))
+                    })?;
+                    let source = self.metadata.list_field(row.list, source)?;
+                    self.ensure_row_field(row, source, None, work)?
+                }
+            }
+            _ => self.initial_slot_value(slot)?,
+        };
+        self.set_row_field(row, target, value, work)?;
         Ok(())
     }
 
@@ -1504,10 +2664,517 @@ impl Session {
         demanded_targets: &[ValueTarget],
     ) -> Result<Turn, Error> {
         let mut work = std::mem::take(&mut self.turn_work);
-        work.begin_turn();
+        if work.pending_settle {
+            work.settle();
+        }
+        work.begin_turn(self.last_sequence, self.turn_sequence);
         let result = self.apply_with_work(event, demanded_targets, &mut work);
+        let result = match result {
+            Ok(turn) => {
+                work.pending_settle = true;
+                Ok(turn)
+            }
+            Err(error) => match self.rollback_turn(&mut work) {
+                Ok(()) => {
+                    self.last_sequence = work.previous_last_sequence;
+                    self.turn_sequence = work.previous_turn_sequence;
+                    work.pending_settle = false;
+                    Err(error)
+                }
+                Err(rollback) => Err(Error::Evaluation(format!(
+                    "turn failed with `{error}` and rollback failed with `{rollback}`"
+                ))),
+            },
+        };
         self.turn_work = work;
         result
+    }
+
+    pub fn begin_effect_dispatch(
+        &mut self,
+        item: &boon_persistence::DurableOutboxItem,
+    ) -> Result<Turn, Error> {
+        let attempt = match item.state {
+            boon_persistence::DurableOutboxState::Pending => 1,
+            boon_persistence::DurableOutboxState::ReconciliationRequired { attempt } => attempt
+                .checked_add(1)
+                .ok_or_else(|| Error::Evaluation("effect attempt overflow".to_owned()))?,
+            _ => {
+                return Err(Error::Evaluation(format!(
+                    "outbox item {} is not ready for dispatch",
+                    item.item_id
+                )));
+            }
+        };
+        let sequence = self.next_internal_turn_sequence()?;
+        self.finish_outbox_only_turn(boon_persistence::DurableOutboxChange::BeginDispatch {
+            item_id: item.item_id,
+            expected_revision: item.revision,
+            next_revision: item
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| Error::Evaluation("outbox item revision overflow".to_owned()))?,
+            attempt,
+            turn_sequence: sequence,
+        })
+    }
+
+    pub fn require_effect_reconciliation(
+        &mut self,
+        item: &boon_persistence::DurableOutboxItem,
+    ) -> Result<Turn, Error> {
+        let boon_persistence::DurableOutboxState::Dispatching { attempt } = item.state else {
+            return Err(Error::Evaluation(format!(
+                "outbox item {} is not dispatching",
+                item.item_id
+            )));
+        };
+        let sequence = self.next_internal_turn_sequence()?;
+        self.finish_outbox_only_turn(
+            boon_persistence::DurableOutboxChange::RequireReconciliation {
+                item_id: item.item_id,
+                expected_revision: item.revision,
+                next_revision: item
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Evaluation("outbox item revision overflow".to_owned()))?,
+                attempt,
+                turn_sequence: sequence,
+            },
+        )
+    }
+
+    pub fn complete_effect(
+        &mut self,
+        item: &boon_persistence::DurableOutboxItem,
+        outcome: boon_persistence::StoredValue,
+    ) -> Result<Turn, Error> {
+        let attempt = match item.state {
+            boon_persistence::DurableOutboxState::Dispatching { attempt }
+            | boon_persistence::DurableOutboxState::ReconciliationRequired { attempt } => attempt,
+            _ => {
+                return Err(Error::Evaluation(format!(
+                    "outbox item {} is not awaiting an outcome",
+                    item.item_id
+                )));
+            }
+        };
+        let (op, effect) = self.effect_invocation(item.invocation_id)?;
+        if effect.effect_id != item.effect_id {
+            return Err(Error::InvalidPlan(format!(
+                "outbox item {} effect does not match invocation {}",
+                item.item_id, item.invocation_id
+            )));
+        }
+        let mut completed = item.clone();
+        completed.revision = item
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::Evaluation("outbox item revision overflow".to_owned()))?;
+        completed.state = boon_persistence::DurableOutboxState::Completed {
+            attempt,
+            outcome: outcome.clone(),
+        };
+        let sequence = self.next_internal_turn_sequence()?;
+        completed.updated_turn_sequence = sequence;
+        let schema = self
+            .plan
+            .persistence
+            .effect_outbox
+            .iter()
+            .find(|schema| schema.effect_id == item.effect_id)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "effect {} has no durable outbox schema",
+                    item.effect_id
+                ))
+            })?;
+        boon_persistence::validate_outbox_item_schema(&completed, schema)
+            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+
+        let mut work = self.take_internal_turn_work();
+        let result = (|| {
+            let row = self.runtime_row_for_effect(item.target_row)?;
+            let value = runtime_value(outcome.clone())?;
+            self.apply_effect_result(&op, &effect.result.target, row, value, &mut work)?;
+            let durable_changes = self.durable_changes(&work.authority_deltas)?;
+            work.outbox_changes
+                .push(boon_persistence::DurableOutboxChange::Complete {
+                    item_id: item.item_id,
+                    expected_revision: item.revision,
+                    next_revision: completed.revision,
+                    attempt,
+                    outcome,
+                    turn_sequence: sequence,
+                });
+            self.turn_sequence = sequence;
+            work.finish_metrics();
+            let turn = Turn {
+                sequence,
+                source_sequence: None,
+                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: std::mem::take(&mut work.authority_deltas),
+                durable_changes,
+                outbox_changes: std::mem::take(&mut work.outbox_changes),
+                metrics: std::mem::take(&mut work.metrics),
+            };
+            work.pending_settle = true;
+            Ok(turn)
+        })();
+        self.finish_internal_turn_work(work, result)
+    }
+
+    fn next_internal_turn_sequence(&self) -> Result<u64, Error> {
+        self.turn_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))
+    }
+
+    fn finish_outbox_only_turn(
+        &mut self,
+        change: boon_persistence::DurableOutboxChange,
+    ) -> Result<Turn, Error> {
+        let sequence = self.next_internal_turn_sequence()?;
+        let mut work = self.take_internal_turn_work();
+        work.outbox_changes.push(change);
+        self.turn_sequence = sequence;
+        work.finish_metrics();
+        let turn = Turn {
+            sequence,
+            source_sequence: None,
+            deltas: Vec::new(),
+            authority_deltas: Vec::new(),
+            durable_changes: Vec::new(),
+            outbox_changes: std::mem::take(&mut work.outbox_changes),
+            metrics: std::mem::take(&mut work.metrics),
+        };
+        work.pending_settle = true;
+        self.turn_work = work;
+        Ok(turn)
+    }
+
+    fn take_internal_turn_work(&mut self) -> Work {
+        let mut work = std::mem::take(&mut self.turn_work);
+        if work.pending_settle {
+            work.settle();
+        }
+        work.begin_turn(self.last_sequence, self.turn_sequence);
+        work
+    }
+
+    fn finish_internal_turn_work(
+        &mut self,
+        mut work: Work,
+        result: Result<Turn, Error>,
+    ) -> Result<Turn, Error> {
+        let result = match result {
+            Ok(turn) => Ok(turn),
+            Err(error) => match self.rollback_turn(&mut work) {
+                Ok(()) => {
+                    self.last_sequence = work.previous_last_sequence;
+                    self.turn_sequence = work.previous_turn_sequence;
+                    work.pending_settle = false;
+                    Err(error)
+                }
+                Err(rollback) => Err(Error::Evaluation(format!(
+                    "effect outcome failed with `{error}` and rollback failed with `{rollback}`"
+                ))),
+            },
+        };
+        self.turn_work = work;
+        result
+    }
+
+    fn effect_invocation(
+        &self,
+        invocation_id: EffectInvocationId,
+    ) -> Result<(PlanOp, boon_plan::EffectInvocationPlan), Error> {
+        self.plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .find_map(|op| {
+                let PlanOpKind::UpdateBranch {
+                    effect: Some(effect),
+                    ..
+                } = &op.kind
+                else {
+                    return None;
+                };
+                (effect.invocation_id == invocation_id).then(|| (op.clone(), effect.clone()))
+            })
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "outbox invocation {invocation_id} is absent from the active plan"
+                ))
+            })
+    }
+
+    fn runtime_row_for_effect(
+        &self,
+        target: Option<boon_persistence::DurableEffectRow>,
+    ) -> Result<Option<RowId>, Error> {
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        let memory = self
+            .plan
+            .persistence
+            .lists
+            .iter()
+            .find(|memory| memory.memory_id == target.list_memory_id)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "effect target list {} is absent from the active plan",
+                    target.list_memory_id
+                ))
+            })?;
+        let slot = self
+            .plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.id == memory.runtime_slot)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "effect target list {} has no runtime slot",
+                    target.list_memory_id
+                ))
+            })?;
+        let row = RowId {
+            list: slot.list_id,
+            key: target.row_key,
+            generation: target.row_generation,
+        };
+        if !self
+            .lists
+            .get(&row.list)
+            .is_some_and(|list| list.rows.contains_key(&row))
+        {
+            return Err(Error::Evaluation(format!(
+                "effect target row {}:{}:{} no longer exists",
+                row.list.0, row.key, row.generation
+            )));
+        }
+        Ok(Some(row))
+    }
+
+    fn apply_effect_result(
+        &mut self,
+        op: &PlanOp,
+        target: &ValueRef,
+        row: Option<RowId>,
+        value: Value,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let ValueRef::State(state) = target else {
+            return Err(Error::InvalidPlan(format!(
+                "effect invocation {} has a non-state result target",
+                op.id.0
+            )));
+        };
+        if op.indexed {
+            let row = row.ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "indexed effect invocation {} has no durable row target",
+                    op.id.0
+                ))
+            })?;
+            let field = *self
+                .metadata
+                .indexed_state_field
+                .get(state)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!("indexed state {} has no FieldId", state.0))
+                })?;
+            self.record_row_field_undo(row, field, work);
+            self.touched_row_fields.insert((row, field));
+            work.authority_deltas.push(AuthorityDelta::SetRowField {
+                row,
+                field,
+                value: value.clone(),
+            });
+            self.set_row_field(row, field, value, work)?;
+        } else {
+            if row.is_some() {
+                return Err(Error::InvalidPlan(format!(
+                    "root effect invocation {} unexpectedly carries a row target",
+                    op.id.0
+                )));
+            }
+            self.record_root_undo(*state, work);
+            self.touched_root_states.insert(*state);
+            work.authority_deltas.push(AuthorityDelta::SetRoot {
+                state: *state,
+                value: value.clone(),
+            });
+            self.set_root_state(*state, value, work);
+        }
+        Ok(())
+    }
+
+    pub fn settle_turn(&mut self) {
+        self.turn_work.settle();
+    }
+
+    pub fn rollback_unsettled_turn(&mut self) -> Result<(), Error> {
+        if !self.turn_work.pending_settle {
+            return Ok(());
+        }
+        let mut work = std::mem::take(&mut self.turn_work);
+        let previous_last_sequence = work.previous_last_sequence;
+        let previous_turn_sequence = work.previous_turn_sequence;
+        let result = self.rollback_turn(&mut work);
+        if result.is_ok() {
+            self.last_sequence = previous_last_sequence;
+            self.turn_sequence = previous_turn_sequence;
+            work.pending_settle = false;
+        }
+        self.turn_work = work;
+        result
+    }
+
+    fn record_root_undo(&self, state: StateId, work: &mut Work) {
+        if work.undo_root_states.insert(state) {
+            work.authority_undo.push(AuthorityUndo::RootState {
+                state,
+                value: self.root_states.get(&state).cloned(),
+                touched: self.touched_root_states.contains(&state),
+            });
+        }
+    }
+
+    fn record_row_field_undo(&self, row: RowId, field: FieldId, work: &mut Work) {
+        if work.undo_row_fields.insert((row, field)) {
+            work.authority_undo.push(AuthorityUndo::RowField {
+                row,
+                field,
+                value: self
+                    .lists
+                    .get(&row.list)
+                    .and_then(|list| list.rows.get(&row))
+                    .and_then(|row| row.fields.get(&field))
+                    .cloned(),
+                touched_field: self.touched_row_fields.contains(&(row, field)),
+                touched_list: self.touched_lists.contains(&row.list),
+            });
+        }
+    }
+
+    fn rollback_turn(&mut self, work: &mut Work) -> Result<(), Error> {
+        for undo in work.authority_undo.drain(..).rev() {
+            match undo {
+                AuthorityUndo::RootState {
+                    state,
+                    value,
+                    touched,
+                } => {
+                    match value {
+                        Some(value) => {
+                            self.root_states.insert(state, value);
+                        }
+                        None => {
+                            self.root_states.remove(&state);
+                        }
+                    }
+                    if touched {
+                        self.touched_root_states.insert(state);
+                    } else {
+                        self.touched_root_states.remove(&state);
+                    }
+                }
+                AuthorityUndo::RowField {
+                    row,
+                    field,
+                    value,
+                    touched_field,
+                    touched_list,
+                } => {
+                    let fields = &mut self
+                        .lists
+                        .get_mut(&row.list)
+                        .and_then(|list| list.rows.get_mut(&row))
+                        .ok_or_else(|| {
+                            Error::Evaluation(format!(
+                                "rollback cannot find row {}:{}:{}",
+                                row.list.0, row.key, row.generation
+                            ))
+                        })?
+                        .fields;
+                    match value {
+                        Some(value) => {
+                            fields.insert(field, value);
+                        }
+                        None => {
+                            fields.remove(&field);
+                        }
+                    }
+                    if touched_field {
+                        self.touched_row_fields.insert((row, field));
+                    } else {
+                        self.touched_row_fields.remove(&(row, field));
+                    }
+                    if touched_list {
+                        self.touched_lists.insert(row.list);
+                    } else {
+                        self.touched_lists.remove(&row.list);
+                    }
+                }
+                AuthorityUndo::AppendRow {
+                    row,
+                    previous_next_key,
+                    touched_list,
+                } => {
+                    let list = self.lists.get_mut(&row.list).ok_or_else(|| {
+                        Error::Evaluation(format!("rollback list {} is missing", row.list.0))
+                    })?;
+                    list.order.retain(|candidate| *candidate != row);
+                    list.rows.remove(&row);
+                    list.next_key = previous_next_key;
+                    self.touched_row_fields
+                        .retain(|(candidate, _)| *candidate != row);
+                    if touched_list {
+                        self.touched_lists.insert(row.list);
+                    } else {
+                        self.touched_lists.remove(&row.list);
+                    }
+                }
+                AuthorityUndo::RemoveRow {
+                    row,
+                    value,
+                    order_index,
+                    previous_next_key,
+                    touched_list,
+                    touched_fields,
+                } => {
+                    let list = self.lists.get_mut(&row.list).ok_or_else(|| {
+                        Error::Evaluation(format!("rollback list {} is missing", row.list.0))
+                    })?;
+                    let index = order_index.min(list.order.len());
+                    list.order.insert(index, row);
+                    list.rows.insert(row, value);
+                    list.next_key = previous_next_key;
+                    self.touched_row_fields
+                        .retain(|(candidate, _)| *candidate != row);
+                    self.touched_row_fields
+                        .extend(touched_fields.into_iter().map(|field| (row, field)));
+                    if touched_list {
+                        self.touched_lists.insert(row.list);
+                    } else {
+                        self.touched_lists.remove(&row.list);
+                    }
+                }
+            }
+        }
+        work.undo_root_states.clear();
+        work.undo_row_fields.clear();
+        work.deltas.clear();
+        work.authority_deltas.clear();
+        work.outbox_changes.clear();
+        work.emit = false;
+        self.rebuild_runtime_state()?;
+        self.ensure_published_current(None, work)?;
+        Ok(())
     }
 
     fn apply_with_work(
@@ -1551,12 +3218,21 @@ impl Session {
         }
 
         self.ensure_demanded_current(demanded_targets, Some(&event), work)?;
+        let durable_changes = self.durable_changes(&work.authority_deltas)?;
 
         self.last_sequence = Some(event.sequence);
+        self.turn_sequence = self
+            .turn_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
         work.finish_metrics();
         Ok(Turn {
-            sequence: event.sequence,
+            sequence: self.turn_sequence,
+            source_sequence: Some(event.sequence),
             deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
+            authority_deltas: std::mem::take(&mut work.authority_deltas),
+            durable_changes,
+            outbox_changes: std::mem::take(&mut work.outbox_changes),
             metrics: std::mem::take(&mut work.metrics),
         })
     }
@@ -1710,6 +3386,15 @@ impl Session {
         if !self.source_guard_matches(source_guard.as_ref(), event)? {
             return Ok(());
         }
+        if matches!(
+            &op.kind,
+            PlanOpKind::UpdateBranch {
+                effect: Some(_),
+                ..
+            }
+        ) {
+            return self.stage_effect_invocation(op, row, event, work);
+        }
         let Some(value) = self.evaluate_update(op, row, event, work)? else {
             return Ok(());
         };
@@ -1730,8 +3415,21 @@ impl Session {
                 .ok_or_else(|| {
                     Error::InvalidPlan(format!("indexed state {} has no FieldId", state.0))
                 })?;
+            self.record_row_field_undo(row, field, work);
+            self.touched_row_fields.insert((row, field));
+            work.authority_deltas.push(AuthorityDelta::SetRowField {
+                row,
+                field,
+                value: value.clone(),
+            });
             self.set_row_field(row, field, value, work)?;
         } else {
+            self.record_root_undo(state, work);
+            self.touched_root_states.insert(state);
+            work.authority_deltas.push(AuthorityDelta::SetRoot {
+                state,
+                value: value.clone(),
+            });
             self.set_root_state(state, value, work);
         }
         Ok(())
@@ -1751,6 +3449,18 @@ impl Session {
             )));
         };
         if !self.source_guard_matches(source_guard.as_ref(), event)? {
+            return Ok(());
+        }
+        if matches!(
+            &op.kind,
+            PlanOpKind::UpdateBranch {
+                effect: Some(_),
+                ..
+            }
+        ) {
+            for row in rows {
+                self.stage_effect_invocation(op, Some(*row), event, work)?;
+            }
             return Ok(());
         }
         let Some(ValueRef::State(state)) = op.output else {
@@ -1773,8 +3483,104 @@ impl Session {
             }
         }
         for (row, value) in pending {
+            self.record_row_field_undo(row, field, work);
+            self.touched_row_fields.insert((row, field));
+            work.authority_deltas.push(AuthorityDelta::SetRowField {
+                row,
+                field,
+                value: value.clone(),
+            });
             self.set_row_field(row, field, value, work)?;
         }
+        Ok(())
+    }
+
+    fn stage_effect_invocation(
+        &mut self,
+        op: &PlanOp,
+        row: Option<RowId>,
+        event: &SourceEvent,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let PlanOpKind::UpdateBranch {
+            expression_kind,
+            effect: Some(effect),
+            ..
+        } = &op.kind
+        else {
+            return Err(Error::InvalidPlan(format!(
+                "update op {} has no effect invocation plan",
+                op.id.0
+            )));
+        };
+        let values = effect
+            .intent_inputs
+            .iter()
+            .map(|input| self.eval_update_ref(input, row, event, work))
+            .collect::<Result<Vec<_>, _>>()?;
+        let intent = match expression_kind {
+            PlanExpressionKind::FileWriteBytes => {
+                let [bytes, path] = values.as_slice() else {
+                    return Err(Error::InvalidPlan(format!(
+                        "FileWriteBytes effect {} requires bytes and path inputs",
+                        effect.invocation_id
+                    )));
+                };
+                boon_persistence::StoredValue::Record(BTreeMap::from([
+                    (
+                        "bytes".to_owned(),
+                        boon_persistence::StoredValue::Bytes(value_to_bytes(bytes)?),
+                    ),
+                    (
+                        "path".to_owned(),
+                        boon_persistence::StoredValue::Text(value_to_text(path)?),
+                    ),
+                ]))
+            }
+            other => {
+                return Err(Error::Unsupported {
+                    op: op.id,
+                    detail: format!("effect intent lowering is not implemented for {other:?}"),
+                });
+            }
+        };
+        let target_row = row
+            .map(|row| {
+                Ok(boon_persistence::DurableEffectRow {
+                    list_memory_id: self.persistence_list(row.list)?.memory_id,
+                    row_key: row.key,
+                    row_generation: row.generation,
+                })
+            })
+            .transpose()?;
+        let sequence = self
+            .turn_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
+        let item = boon_persistence::DurableOutboxItem::pending(
+            effect.invocation_id,
+            effect.effect_id,
+            boon_persistence::canonical_intent_key(&intent),
+            intent,
+            target_row,
+            sequence,
+        );
+        let schema = self
+            .plan
+            .persistence
+            .effect_outbox
+            .iter()
+            .find(|schema| schema.effect_id == effect.effect_id)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "effect {} has no durable outbox schema",
+                    effect.effect_id
+                ))
+            })?;
+        boon_persistence::validate_outbox_item_schema(&item, schema)
+            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+        work.outbox_changes
+            .push(boon_persistence::DurableOutboxChange::Enqueue { item });
         Ok(())
     }
 
@@ -2004,7 +3810,7 @@ impl Session {
             .cloned()
             .ok_or_else(|| Error::InvalidPlan(format!("row field {} has no plan op", field.0)))?;
         let evaluated = self.evaluate_derived_op(&op, Some(row), event, work);
-        let value = match evaluated.and_then(|value| self.materialize_eval(value, event, work)) {
+        let value = match evaluated.and_then(|value| self.materialize_eval(value)) {
             Ok(value) => value,
             Err(error) => {
                 self.set_row_currentness(row, field, Currentness::Dirty)?;
@@ -2052,7 +3858,7 @@ impl Session {
         let value = match &op.kind {
             PlanOpKind::DerivedValue { .. } => {
                 let value = self.evaluate_derived_op(op, None, event, work)?;
-                self.materialize_eval(value, event, work)?
+                self.materialize_eval(value)?
             }
             PlanOpKind::ListProjection { projection } => {
                 self.evaluate_projection(field, op.id, projection, event, work)?
@@ -2117,17 +3923,24 @@ impl Session {
 
 impl Session {
     fn row_value(&self, row: RowId, field: FieldId) -> Result<Value, Error> {
-        self.lists
+        let value = self
+            .lists
             .get(&row.list)
             .and_then(|list| list.rows.get(&row))
             .and_then(|row| row.fields.get(&field))
-            .cloned()
-            .ok_or_else(|| {
-                Error::Evaluation(format!(
-                    "row {}:{}:{} has no field {}",
-                    row.list.0, row.key, row.generation, field.0
-                ))
-            })
+            .cloned();
+        value.ok_or_else(|| {
+            let available = self
+                .lists
+                .get(&row.list)
+                .and_then(|list| list.rows.get(&row))
+                .map(|row| row.fields.keys().map(|field| field.0).collect::<Vec<_>>())
+                .unwrap_or_default();
+            Error::Evaluation(format!(
+                "row {}:{}:{} has no field {}; available fields are {:?}",
+                row.list.0, row.key, row.generation, field.0, available
+            ))
+        })
     }
 
     fn set_row_currentness(
@@ -2565,28 +4378,23 @@ impl Session {
         }
     }
 
-    fn materialize_eval(
-        &mut self,
-        value: EvalValue,
-        event: Option<&SourceEvent>,
-        work: &mut Work,
-    ) -> Result<Value, Error> {
+    fn materialize_eval(&mut self, value: EvalValue) -> Result<Value, Error> {
         match value {
             EvalValue::Value(value) => Ok(value),
             EvalValue::Row(row) => Ok(row_identity_value(row)),
             EvalValue::List(values) => values
                 .into_iter()
-                .map(|value| self.materialize_eval(value, event, work))
+                .map(|value| self.materialize_eval(value))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Value::List),
             EvalValue::Record(values) => values
                 .into_iter()
-                .map(|(name, value)| Ok((name, self.materialize_eval(value, event, work)?)))
+                .map(|(name, value)| Ok((name, self.materialize_eval(value)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()
                 .map(Value::Record),
             EvalValue::MappedRow { id, fields } => fields
                 .into_iter()
-                .map(|(name, value)| Ok((name, self.materialize_eval(value, event, work)?)))
+                .map(|(name, value)| Ok((name, self.materialize_eval(value)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()
                 .map(|fields| Value::MappedRow { id, fields }),
         }
@@ -3230,7 +5038,7 @@ impl Session {
             } => {
                 let key =
                     self.eval_row_expression(value, row, event, output, consumer, bindings, work)?;
-                let key = self.materialize_eval(key, event, work)?;
+                let key = self.materialize_eval(key)?;
                 let candidates = self.lookup_index(*list_id, *field, &key, consumer, work)?;
                 if let Some(found) = candidates.first().copied() {
                     if self.register_row_dependency(consumer, found, *target) {
@@ -3364,7 +5172,7 @@ impl Session {
             PlanRowExpression::Select { input, arms } => {
                 let input =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                let input_value = self.materialize_eval(input, event, work)?;
+                let input_value = self.materialize_eval(input)?;
                 for arm in arms {
                     if select_pattern_matches(&arm.pattern, &input_value) {
                         return self.eval_row_expression(
@@ -3871,13 +5679,13 @@ impl Session {
                 let expected = self
                     .eval_named_arg(args, "value", row, event, output, consumer, bindings, work)?
                     .ok_or_else(|| Error::Evaluation(format!("{function} requires `value`")))?;
-                let expected = self.materialize_eval(expected, event, work)?;
+                let expected = self.materialize_eval(expected)?;
                 let retain_equal = function == "List/filter_field_equal";
                 let mut filtered = Vec::new();
                 for item in eval_to_list(input)? {
                     let actual =
                         self.eval_object_field(item.clone(), &field, event, consumer, work)?;
-                    let actual = self.materialize_eval(actual, event, work)?;
+                    let actual = self.materialize_eval(actual)?;
                     if (actual == expected) == retain_equal {
                         filtered.push(item);
                     }
@@ -4476,7 +6284,7 @@ impl Session {
         work: &mut Work,
     ) -> Result<Value, Error> {
         let value = self.eval_value_ref(value_ref, row, Some(event), None, None, work)?;
-        self.materialize_eval(value, Some(event), work)
+        self.materialize_eval(value)
     }
 
     fn single_update_input(&self, op: &PlanOp) -> Result<ValueRef, Error> {
@@ -4954,6 +6762,17 @@ impl Session {
                 row.derived.insert(*field, Currentness::Dirty);
             }
         }
+        let previous_next_key = self
+            .lists
+            .get(&list_id)
+            .map(|list| list.next_key)
+            .ok_or_else(|| Error::Evaluation(format!("list {} is missing", list_id.0)))?;
+        let was_structurally_touched = self.touched_lists.contains(&list_id);
+        work.authority_undo.push(AuthorityUndo::AppendRow {
+            row: row_id,
+            previous_next_key,
+            touched_list: was_structurally_touched,
+        });
         let list = self
             .lists
             .get_mut(&list_id)
@@ -4961,10 +6780,57 @@ impl Session {
         list.next_key = key.saturating_add(1);
         list.order.push(row_id);
         list.rows.insert(row_id, row);
+        self.touched_lists.insert(list_id);
         self.index_row(row_id)?;
         work.suppress_row_deltas.insert(row_id);
         self.initialize_indexed_states(row_id, work)?;
         work.suppress_row_deltas.remove(&row_id);
+
+        let authority_fields = self.authority_fields_for_list(list_id);
+        let row_authority = self
+            .lists
+            .get(&list_id)
+            .and_then(|list| list.rows.get(&row_id))
+            .ok_or_else(|| Error::Evaluation("appended row disappeared".to_owned()))?;
+        let fields = authority_fields
+            .iter()
+            .filter_map(|field| {
+                row_authority
+                    .fields
+                    .get(field)
+                    .cloned()
+                    .map(|value| (*field, value))
+            })
+            .collect();
+        let next_key = self
+            .lists
+            .get(&list_id)
+            .map(|list| list.next_key)
+            .unwrap_or(row_id.key.saturating_add(1));
+        if was_structurally_touched {
+            work.authority_deltas.push(AuthorityDelta::InsertRow {
+                row: RowAuthority {
+                    id: row_id,
+                    fields,
+                    touched_fields: BTreeSet::new(),
+                },
+                index: self
+                    .lists
+                    .get(&list_id)
+                    .map(|list| list.order.len().saturating_sub(1))
+                    .unwrap_or(0)
+                    .try_into()
+                    .map_err(|_| {
+                        Error::Evaluation("list insertion index exceeds u64".to_owned())
+                    })?,
+                next_key,
+            });
+        } else {
+            work.authority_deltas.push(AuthorityDelta::ReplaceList {
+                list_id,
+                authority: self.list_authority(list_id)?,
+            });
+        }
 
         self.bind_row_sources(row_id, slot.scope_id)?;
         work.changed_rows.insert(row_id);
@@ -5016,6 +6882,36 @@ impl Session {
     }
 
     fn remove_row(&mut self, row: RowId, work: &mut Work) -> Result<(), Error> {
+        let (removed_value, order_index, previous_next_key) = self
+            .lists
+            .get(&row.list)
+            .and_then(|list| {
+                Some((
+                    list.rows.get(&row)?.clone(),
+                    list.order.iter().position(|candidate| *candidate == row)?,
+                    list.next_key,
+                ))
+            })
+            .ok_or_else(|| {
+                Error::Evaluation(format!(
+                    "cannot remove missing row {}:{}:{}",
+                    row.list.0, row.key, row.generation
+                ))
+            })?;
+        let touched_fields = self
+            .touched_row_fields
+            .iter()
+            .filter_map(|(candidate, field)| (*candidate == row).then_some(*field))
+            .collect();
+        let was_structurally_touched = self.touched_lists.contains(&row.list);
+        work.authority_undo.push(AuthorityUndo::RemoveRow {
+            row,
+            value: removed_value,
+            order_index,
+            previous_next_key,
+            touched_list: was_structurally_touched,
+            touched_fields,
+        });
         let removed = self
             .lists
             .get_mut(&row.list)
@@ -5029,6 +6925,20 @@ impl Session {
                     row.list.0, row.key, row.generation
                 ))
             })?;
+        self.touched_lists.insert(row.list);
+        self.touched_row_fields
+            .retain(|(candidate, _)| *candidate != row);
+        if was_structurally_touched {
+            work.authority_deltas.push(AuthorityDelta::RemoveRow {
+                row,
+                next_key: previous_next_key,
+            });
+        } else {
+            work.authority_deltas.push(AuthorityDelta::ReplaceList {
+                list_id: row.list,
+                authority: self.list_authority(row.list)?,
+            });
+        }
         for (field, value) in &removed.fields {
             self.remove_index_value(row, *field, value);
             self.invalidate_row_field(row, *field, Some(value), None, work);
@@ -5170,7 +7080,7 @@ impl Session {
                 let field = self.metadata.list_field(*source_list, field)?;
                 let selector =
                     self.eval_value_ref(value, None, event, Some(output), consumer, work)?;
-                let selector = self.materialize_eval(selector, event, work)?;
+                let selector = self.materialize_eval(selector)?;
                 let candidates =
                     self.lookup_index(*source_list, field, &selector, consumer, work)?;
                 match candidates.first().copied() {
@@ -5222,7 +7132,7 @@ impl Session {
                 }
                 let source =
                     self.eval_value_ref(source, None, event, Some(output), consumer, work)?;
-                let source = self.materialize_eval(source, event, work)?;
+                let source = self.materialize_eval(source)?;
                 let Value::List(rows) = source else {
                     return Err(Error::Evaluation(format!(
                         "chunk-value projection {} source is not a list",
@@ -5267,6 +7177,36 @@ fn row_identity_value(row: RowId) -> Value {
     Value::Row {
         id: row,
         fields: BTreeMap::new(),
+    }
+}
+
+fn normalize_host_output_value(value: Value) -> Result<Value, Error> {
+    match value {
+        Value::List(values) => values
+            .into_iter()
+            .map(normalize_host_output_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        Value::Record(fields) => fields
+            .into_iter()
+            .map(|(name, value)| Ok((name, normalize_host_output_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(Value::Record),
+        Value::MappedRow { fields, .. } => fields
+            .into_iter()
+            .map(|(name, value)| Ok((name, normalize_host_output_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(Value::Record),
+        Value::Row { .. } => Err(Error::Evaluation(
+            "host list output exposes an unprojected runtime row; map it to explicit data fields"
+                .to_owned(),
+        )),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::Text(_)
+        | Value::Bytes(_)
+        | Value::Error { .. } => Ok(value),
     }
 }
 
@@ -5589,7 +7529,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 fn decode_hex(text: &str) -> Result<Vec<u8>, Error> {
     let text = text.trim();
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(Error::Evaluation(
             "hex input has an odd number of digits".to_owned(),
         ));
@@ -5641,7 +7581,7 @@ fn encode_base64(bytes: &[u8]) -> String {
 
 fn decode_base64(text: &str) -> Result<Vec<u8>, Error> {
     let bytes = text.trim().as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(Error::Evaluation(
             "base64 input length is not divisible by four".to_owned(),
         ));

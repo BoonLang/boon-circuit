@@ -1,12 +1,15 @@
 use boon_parser::{
-    AstCallArg, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
+    AstCallArg, AstDrainPath, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
     BytesSizeSyntax, ParsedProgram,
 };
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Type {
@@ -387,6 +390,8 @@ pub struct TypeCheckReport {
     pub full_document_typecheck_coverage: bool,
     pub list_map_binding_count_runtime_value: usize,
     pub list_map_binding_count_render_slot_materialization: usize,
+    #[serde(default)]
+    pub output_root_types: Vec<OutputRootTypeEntry>,
     pub expr_type_table: ExprTypeTable,
     pub function_type_table: FunctionTypeTable,
     pub type_hint_table: TypeHintTable,
@@ -396,6 +401,14 @@ pub struct TypeCheckReport {
     pub list_map_bindings: Vec<ListMapBinding>,
     pub constraints: Vec<Constraint>,
     pub diagnostics: Vec<TypeDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputRootTypeEntry {
+    pub name: String,
+    pub statement_id: usize,
+    pub value_expr_id: Option<usize>,
+    pub ty: Type,
 }
 
 impl TypeCheckReport {
@@ -752,6 +765,7 @@ impl<'a> Checker<'a> {
             eprintln!("boon_typecheck resolved_constant_table:start");
         }
         let resolved_constant_table = resolved_constant_table(self.program);
+        let output_root_types = self.check_output_roots();
         let assemble_report_started = Instant::now();
         if trace_typecheck {
             eprintln!("boon_typecheck assemble_report:start");
@@ -778,6 +792,7 @@ impl<'a> Checker<'a> {
             }),
             list_map_binding_count_runtime_value,
             list_map_binding_count_render_slot_materialization,
+            output_root_types,
             expr_type_table: std::mem::take(&mut self.expr_type_table),
             function_type_table: std::mem::take(&mut self.function_type_table),
             type_hint_table,
@@ -894,6 +909,105 @@ impl<'a> Checker<'a> {
         if let Some(saved) = saved_name_bindings {
             self.name_bindings = saved;
         }
+    }
+
+    fn check_output_roots(&mut self) -> Vec<OutputRootTypeEntry> {
+        let containers = self
+            .program
+            .ast
+            .statements
+            .iter()
+            .filter(|statement| {
+                matches!(&statement.kind, AstStatementKind::Field { name } if name == "outputs")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if containers.len() > 1 {
+            self.diagnostics.push(diagnostic_for_statement(
+                containers.get(1),
+                "Boon source may declare only one top-level `outputs` registry".to_owned(),
+            ));
+        }
+        let Some(container) = containers.first() else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        let mut names = BTreeSet::new();
+        for child in &container.children {
+            if let AstStatementKind::Hold {
+                field: Some(name), ..
+            }
+            | AstStatementKind::Source {
+                field: Some(name), ..
+            } = &child.kind
+            {
+                self.diagnostics.push(diagnostic_for_statement(
+                    Some(child),
+                    format!(
+                        "output root `{name}` declares SOURCE or HOLD authority; outputs must be reconstructed from existing current values"
+                    ),
+                ));
+                continue;
+            }
+            let name = match &child.kind {
+                AstStatementKind::Field { name }
+                | AstStatementKind::List {
+                    field: Some(name), ..
+                } => name,
+                _ => {
+                    if !statement_is_empty_delimiter(child, &self.program.expressions) {
+                        self.diagnostics.push(diagnostic_for_statement(
+                            Some(child),
+                            "`outputs` accepts only named output fields".to_owned(),
+                        ));
+                    }
+                    continue;
+                }
+            };
+            if !names.insert(name.clone()) {
+                self.diagnostics.push(diagnostic_for_statement(
+                    Some(child),
+                    format!("duplicate output root `{name}`"),
+                ));
+                continue;
+            }
+            if statement_contains_output_authority(child) {
+                self.diagnostics.push(diagnostic_for_statement(
+                    Some(child),
+                    format!(
+                        "output root `{name}` declares SOURCE or HOLD authority; outputs must be reconstructed from existing current values"
+                    ),
+                ));
+            }
+            let ty = direct_statement_value_expr_id(child, &self.program.expressions)
+                .map(|expr_id| self.ensure_expr(expr_id).ty)
+                .filter(is_specific_type)
+                .or_else(|| self.static_statement_type(child, &mut BTreeSet::new()))
+                .unwrap_or(Type::Unknown);
+            if !host_output_type_is_closed(&ty) {
+                self.diagnostics.push(diagnostic_for_statement(
+                    Some(child),
+                    format!(
+                        "output root `{name}` must have a closed scalar, record, or list host-value type; found {}",
+                        boon_facing_type_label(&ty)
+                    ),
+                ));
+            }
+            entries.push(OutputRootTypeEntry {
+                name: name.clone(),
+                statement_id: child.id,
+                value_expr_id: direct_statement_value_expr_id(child, &self.program.expressions),
+                ty,
+            });
+        }
+        if entries.is_empty() {
+            self.diagnostics.push(diagnostic_for_statement(
+                Some(container),
+                "`outputs` must declare at least one named output root".to_owned(),
+            ));
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        entries
     }
 
     fn collect_runtime_document_contracts(&mut self, statement: &AstStatement, in_document: bool) {
@@ -1302,6 +1416,7 @@ impl<'a> Checker<'a> {
             AstExprKind::Record(fields) | AstExprKind::Object(fields) => {
                 Type::Object(self.infer_record_shape(fields))
             }
+            AstExprKind::Drain { path } => self.type_for_path(expr.id, &drain_path_parts(path)),
             AstExprKind::ListLiteral { .. } => Type::List(Box::new(open_object_type())),
             AstExprKind::Call { function, args } => {
                 for arg in args {
@@ -1373,9 +1488,7 @@ impl<'a> Checker<'a> {
                     }
                     self.record_runtime_list_map(expr.id, *input, args);
                     Type::List(Box::new(self.list_map_result_item_type(args)))
-                } else if op == "List/every" {
-                    true_false_type()
-                } else if matches!(op.as_str(), "List/any" | "List/is_not_empty") {
+                } else if matches!(op.as_str(), "List/every" | "List/any" | "List/is_not_empty") {
                     true_false_type()
                 } else if op == "List/latest" {
                     if input_is_placeholder {
@@ -1441,7 +1554,24 @@ impl<'a> Checker<'a> {
                     self.type_for_call_expr(expr.id, op)
                 }
             }
-            AstExprKind::Hold { initial, .. } => self.hold_result_type(expr.id, *initial),
+            AstExprKind::Draining { input } => {
+                let input = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr.id,
+                    *input,
+                    &self.program.expressions,
+                );
+                self.ensure_expr(input).ty
+            }
+            AstExprKind::Hold { initial, .. } => {
+                let initial = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr.id,
+                    *initial,
+                    &self.program.expressions,
+                );
+                self.hold_result_type(expr.id, initial)
+            }
             AstExprKind::Latest => self
                 .latest_result_type(expr.id)
                 .unwrap_or_else(exact_empty_object_type),
@@ -1980,7 +2110,7 @@ impl<'a> Checker<'a> {
         count: i128,
     ) {
         let end = offset.checked_add(count);
-        if offset < 0 || count < 0 || !end.is_some_and(|end| end <= len) {
+        if offset < 0 || count < 0 || end.is_none_or(|end| end > len) {
             let range_end = end
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "overflow".to_owned());
@@ -2130,10 +2260,9 @@ impl<'a> Checker<'a> {
         }
         if let Some(base) = parts.first().and_then(|part| self.name_bindings.get(part))
             && parts.len() > 1
+            && let Some(ty) = type_for_nested_path(base, &parts[1..])
         {
-            if let Some(ty) = type_for_nested_path(base, &parts[1..]) {
-                return ty;
-            }
+            return ty;
         }
         if parts.len() >= 2
             && let Some(shape) = self.object_bindings.get(&parts[0])
@@ -2162,6 +2291,39 @@ impl<'a> Checker<'a> {
         self.diagnostics
             .push(self.diagnostic_for_expr(expr_id, format!("unknown path `{}`", parts.join("."))));
         self.expr_type_var(expr_id)
+    }
+
+    fn static_type_for_path(&self, parts: &[String]) -> Option<Type> {
+        let path = parts.join(".");
+        if let Some(access) = self.source_payload_lookup.access_for_parts(parts) {
+            return match access {
+                SourcePayloadAccess::Direct(source_path) => {
+                    source_payload_type_for_path(&self.source_payload_types, &source_path)
+                }
+                SourcePayloadAccess::Field(field) => Some(source_payload_field_type(&field)),
+                SourcePayloadAccess::UnknownField(_) => None,
+            };
+        }
+        self.name_bindings.get(&path).cloned().or_else(|| {
+            if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
+                let passed_path = parts[1..].join(".");
+                if let Some(ty) = self.name_bindings.get(&passed_path) {
+                    return Some(ty.clone());
+                }
+                if let Some(base) = parts.get(1).and_then(|part| self.name_bindings.get(part))
+                    && parts.len() > 2
+                {
+                    return type_for_nested_path(base, &parts[2..]);
+                }
+                if let Some(ty) = parts.last().and_then(|field| self.name_bindings.get(field)) {
+                    return Some(ty.clone());
+                }
+            }
+            parts
+                .first()
+                .and_then(|base| self.name_bindings.get(base))
+                .and_then(|base| type_for_nested_path(base, &parts[1..]))
+        })
     }
 
     fn type_for_call(&self, function: &str) -> Type {
@@ -2425,11 +2587,10 @@ impl<'a> Checker<'a> {
     }
 
     fn expr_type_var_key(&mut self, expr_id: usize) -> TypeVar {
-        let var = *self
+        *self
             .expr_type_vars
             .entry(expr_id)
-            .or_insert_with(|| self.vars.new_var());
-        var
+            .or_insert_with(|| self.vars.new_var())
     }
 
     fn list_map_result_item_type(&self, args: &[AstCallArg]) -> Type {
@@ -2638,46 +2799,8 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::ListLiteral { .. } => Some(Type::List(Box::new(open_object_type()))),
             AstExprKind::Identifier(value) => self.name_bindings.get(value).cloned(),
-            AstExprKind::Path(parts) => {
-                let path = parts.join(".");
-                if let Some(access) = self.source_payload_lookup.access_for_parts(parts) {
-                    match access {
-                        SourcePayloadAccess::Direct(source_path) => {
-                            return source_payload_type_for_path(
-                                &self.source_payload_types,
-                                &source_path,
-                            );
-                        }
-                        SourcePayloadAccess::Field(field) => {
-                            return Some(source_payload_field_type(&field));
-                        }
-                        SourcePayloadAccess::UnknownField(_) => return None,
-                    }
-                }
-                self.name_bindings.get(&path).cloned().or_else(|| {
-                    if parts.first().is_some_and(|part| part == "PASSED") && parts.len() > 1 {
-                        let passed_path = parts[1..].join(".");
-                        if let Some(ty) = self.name_bindings.get(&passed_path) {
-                            return Some(ty.clone());
-                        }
-                        if let Some(base) =
-                            parts.get(1).and_then(|part| self.name_bindings.get(part))
-                            && parts.len() > 2
-                        {
-                            return type_for_nested_path(base, &parts[2..]);
-                        }
-                        if let Some(ty) =
-                            parts.last().and_then(|field| self.name_bindings.get(field))
-                        {
-                            return Some(ty.clone());
-                        }
-                    }
-                    parts
-                        .first()
-                        .and_then(|base| self.name_bindings.get(base))
-                        .and_then(|base| type_for_nested_path(base, &parts[1..]))
-                })
-            }
+            AstExprKind::Path(parts) => self.static_type_for_path(parts),
+            AstExprKind::Drain { path } => self.static_type_for_path(&drain_path_parts(path)),
             AstExprKind::Infix { op, .. }
                 if matches!(op.as_str(), "==" | ">" | "<" | ">=" | "<=") =>
             {
@@ -2685,10 +2808,16 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::Infix { .. } => Some(Type::Number),
             AstExprKind::Hold { initial, .. } => {
+                let initial = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr.id,
+                    *initial,
+                    &self.program.expressions,
+                );
                 let mut ty = self
                     .program
                     .expressions
-                    .get(*initial)
+                    .get(initial)
                     .and_then(|expr| self.static_expr_type(expr, active_functions))?;
                 for update_expr_id in hold_update_exprs_for_expr(
                     &self.program.ast.statements,
@@ -2719,6 +2848,18 @@ impl<'a> Checker<'a> {
                 .or(Some(*input))
                 .and_then(|expr_id| self.program.expressions.get(expr_id))
                 .and_then(|expr| self.static_expr_type(expr, active_functions)),
+            AstExprKind::Draining { input } => {
+                let input = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr.id,
+                    *input,
+                    &self.program.expressions,
+                );
+                self.program
+                    .expressions
+                    .get(input)
+                    .and_then(|expr| self.static_expr_type(expr, active_functions))
+            }
             AstExprKind::MatchArm {
                 output: Some(output),
                 ..
@@ -3105,7 +3246,14 @@ impl<'a> Checker<'a> {
                     ))
                 }),
             AstStatementKind::List { .. } => {
-                self.static_list_statement_type(statement, active_functions)
+                statement_pipeline_final_expr_id(statement, &self.program.expressions)
+                    .or_else(|| {
+                        direct_statement_value_expr_id(statement, &self.program.expressions)
+                    })
+                    .and_then(|expr_id| self.program.expressions.get(expr_id))
+                    .and_then(|expr| self.static_expr_type(expr, active_functions))
+                    .filter(is_specific_type)
+                    .or_else(|| self.static_list_statement_type(statement, active_functions))
             }
             _ => statement_pipeline_final_expr_id(statement, &self.program.expressions)
                 .or_else(|| direct_statement_value_expr_id(statement, &self.program.expressions))
@@ -3142,6 +3290,15 @@ impl<'a> Checker<'a> {
         let (first, rest) = expr_ids.split_first()?;
         let mut ty = self.static_expr_type_for_pipeline_expr(*first, active_functions, bindings)?;
         for expr_id in rest {
+            if matches!(
+                self.program
+                    .expressions
+                    .get(*expr_id)
+                    .map(|expr| &expr.kind),
+                Some(AstExprKind::Draining { .. } | AstExprKind::Hold { .. })
+            ) {
+                continue;
+            }
             let Some(AstExpr {
                 kind: AstExprKind::Pipe { op, args, .. },
                 ..
@@ -3325,6 +3482,14 @@ impl<'a> Checker<'a> {
                     FlowMode::Continuous
                 }
             }
+            AstExprKind::Drain { path } => {
+                let parts = drain_path_parts(path);
+                let path = parts.join(".");
+                self.flow_bindings
+                    .get(&path)
+                    .copied()
+                    .unwrap_or(FlowMode::Continuous)
+            }
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
             AstExprKind::Call { args, .. } => args
                 .iter()
@@ -3343,6 +3508,12 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::When { input } => self.flow_mode_for_expr_id(*input),
+            AstExprKind::Draining { input } => self.flow_mode_for_expr_id(pipeline_source_expr_id(
+                &self.program.ast.statements,
+                expr.id,
+                *input,
+                &self.program.expressions,
+            )),
             AstExprKind::Hold { .. } => FlowMode::Continuous,
             AstExprKind::MatchArm { output, .. }
                 if output.is_none_or(|output| {
@@ -3760,11 +3931,17 @@ impl<'a> Checker<'a> {
         else {
             return;
         };
-        let initial_type = self.ensure_expr(*initial).ty;
+        let initial = pipeline_source_expr_id(
+            &self.program.ast.statements,
+            expr_id,
+            *initial,
+            &self.program.expressions,
+        );
+        let initial_type = self.ensure_expr(initial).ty;
         if matches!(initial_type, Type::Skip) {
             self.diagnostics.push(
                 self.diagnostic_for_expr(
-                    *initial,
+                    initial,
                     "`SKIP` cannot initialize a held value".to_owned(),
                 ),
             );
@@ -4104,6 +4281,43 @@ fn diagnostic_for_statement(statement: Option<&AstStatement>, message: String) -
     }
 }
 
+fn statement_is_empty_delimiter(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement.children.is_empty()
+        && statement
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Delimiter))
+}
+
+fn statement_contains_output_authority(statement: &AstStatement) -> bool {
+    matches!(
+        statement.kind,
+        AstStatementKind::Hold { .. } | AstStatementKind::Source { .. }
+    ) || statement
+        .children
+        .iter()
+        .any(statement_contains_output_authority)
+}
+
+fn host_output_type_is_closed(ty: &Type) -> bool {
+    match ty {
+        Type::Text | Type::Number | Type::Byte | Type::Bytes(_) | Type::Skip => true,
+        Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
+            Variant::Tag(_) => true,
+            Variant::Tagged { fields, .. } => {
+                !fields.open && fields.fields.values().all(host_output_type_is_closed)
+            }
+        }),
+        Type::Object(shape) => !shape.open && shape.fields.values().all(host_output_type_is_closed),
+        Type::List(item) => host_output_type_is_closed(item),
+        Type::RenderContract
+        | Type::Function { .. }
+        | Type::UnresolvedShape { .. }
+        | Type::Var(_)
+        | Type::Unknown => false,
+    }
+}
+
 fn is_deleted_public_style_field(field_name: &str) -> bool {
     field_name.starts_with("shadow1_")
         || field_name.starts_with("shadow2_")
@@ -4277,7 +4491,9 @@ fn expr_contains_list_map_seen(
         AstExprKind::Call { args, .. } => args
             .iter()
             .any(|arg| expr_contains_list_map_seen(arg.value, expressions, seen)),
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             expr_contains_list_map_seen(*initial, expressions, seen)
         }
         AstExprKind::Then { input, output } => {
@@ -4439,7 +4655,9 @@ fn collect_expr_user_function_calls(
                 collect_expr_user_function_calls(arg.value, expressions, user_functions, calls);
             }
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             collect_expr_user_function_calls(*initial, expressions, user_functions, calls);
         }
         AstExprKind::Then { input, output } => {
@@ -4470,6 +4688,7 @@ fn collect_expr_user_function_calls(
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
@@ -4600,7 +4819,9 @@ fn expr_is_pipeline_continuation(expr_id: usize, expressions: &[AstExpr]) -> boo
     let input = match expressions.get(expr_id).map(|expr| &expr.kind) {
         Some(AstExprKind::Pipe { input, .. })
         | Some(AstExprKind::Then { input, .. })
-        | Some(AstExprKind::When { input }) => *input,
+        | Some(AstExprKind::When { input })
+        | Some(AstExprKind::Draining { input })
+        | Some(AstExprKind::Hold { initial: input, .. }) => *input,
         _ => return false,
     };
     expr_chain_starts_with_pipe_placeholder(input, expressions)
@@ -4615,11 +4836,56 @@ fn expr_chain_starts_with_pipe_placeholder(expr_id: usize, expressions: &[AstExp
         AstExprKind::Unknown(tokens) => !unknown_tokens_are_quoted_text(tokens),
         AstExprKind::Pipe { input, .. }
         | AstExprKind::Then { input, .. }
-        | AstExprKind::When { input } => {
+        | AstExprKind::When { input }
+        | AstExprKind::Draining { input }
+        | AstExprKind::Hold { initial: input, .. } => {
             expr_chain_starts_with_pipe_placeholder(*input, expressions)
         }
         _ => false,
     }
+}
+
+fn pipeline_source_expr_id(
+    statements: &[AstStatement],
+    marker_expr_id: usize,
+    input_expr_id: usize,
+    expressions: &[AstExpr],
+) -> usize {
+    if !expressions
+        .get(input_expr_id)
+        .is_some_and(expr_is_pipe_placeholder)
+    {
+        return input_expr_id;
+    }
+    previous_pipeline_expr_id(statements, marker_expr_id, expressions).unwrap_or(input_expr_id)
+}
+
+fn previous_pipeline_expr_id(
+    statements: &[AstStatement],
+    marker_expr_id: usize,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    let mut previous = None;
+    for statement in statements {
+        if let Some(expr_ids) = statement_pipeline_expr_ids(statement, expressions)
+            && let Some(position) = expr_ids
+                .iter()
+                .position(|expr_id| *expr_id == marker_expr_id)
+            && position > 0
+        {
+            return expr_ids.get(position - 1).copied();
+        }
+        if statement.expr == Some(marker_expr_id) {
+            return previous;
+        }
+        if let Some(found) =
+            previous_pipeline_expr_id(&statement.children, marker_expr_id, expressions)
+        {
+            return Some(found);
+        }
+        previous = statement_pipeline_final_expr_id(statement, expressions).or(statement.expr);
+    }
+    None
 }
 
 fn expr_is_pipe_placeholder(expr: &AstExpr) -> bool {
@@ -4981,6 +5247,8 @@ impl Default for BuiltinSignatureRegistry {
                 "Bytes/to_base64",
                 "File/read_text",
                 "File/write_bytes",
+                "Log/error",
+                "Log/info",
             ]
             .into_iter()
             .collect(),
@@ -5089,11 +5357,13 @@ impl BuiltinSignatureRegistry {
             Type::Bytes(BytesType::Dynamic)
         } else if self.true_false_functions.contains(function) {
             true_false_type()
+        } else if function == "List/range" {
+            Type::List(Box::new(Type::Number))
         } else if self.list_functions.contains(function) {
             Type::List(Box::new(open_object_type()))
-        } else if self.list_item_functions.contains(function) {
-            open_object_type()
-        } else if self.open_object_functions.contains(function) {
+        } else if self.list_item_functions.contains(function)
+            || self.open_object_functions.contains(function)
+        {
             open_object_type()
         } else if function == "Error/new" {
             Type::VariantSet(vec![Variant::Tagged {
@@ -5942,20 +6212,56 @@ fn when_arm_statements<'a>(
     expr_id: usize,
     expressions: &[AstExpr],
 ) -> Vec<&'a AstStatement> {
+    if let Some(statement) = exact_expression_statement(statements, expr_id) {
+        return statement.children.iter().collect();
+    }
     for statement in statements {
-        if statement.expr == Some(expr_id)
-            || statement.expr.is_some_and(|statement_expr_id| {
-                expr_contains_expr_id(statement_expr_id, expr_id, expressions)
-            })
-        {
-            return statement.children.iter().collect();
+        let nested = containing_expression_statement(&statement.children, expr_id, expressions);
+        if let Some(nested) = nested {
+            return nested.children.iter().collect();
         }
-        let nested = when_arm_statements(&statement.children, expr_id, expressions);
-        if !nested.is_empty() {
-            return nested;
+        if statement.expr.is_some_and(|statement_expr_id| {
+            expr_contains_expr_id(statement_expr_id, expr_id, expressions)
+        }) {
+            return statement.children.iter().collect();
         }
     }
     Vec::new()
+}
+
+fn exact_expression_statement(
+    statements: &[AstStatement],
+    expr_id: usize,
+) -> Option<&AstStatement> {
+    for statement in statements {
+        if statement.expr == Some(expr_id) {
+            return Some(statement);
+        }
+        if let Some(found) = exact_expression_statement(&statement.children, expr_id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn containing_expression_statement<'a>(
+    statements: &'a [AstStatement],
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> Option<&'a AstStatement> {
+    for statement in statements {
+        if let Some(found) =
+            containing_expression_statement(&statement.children, expr_id, expressions)
+        {
+            return Some(found);
+        }
+        if statement.expr.is_some_and(|statement_expr_id| {
+            expr_contains_expr_id(statement_expr_id, expr_id, expressions)
+        }) {
+            return Some(statement);
+        }
+    }
+    None
 }
 
 fn statement_pipeline_final_expr_id_containing_expr(
@@ -6055,7 +6361,9 @@ fn expr_contains_expr_id_seen(
                     .iter()
                     .any(|arg| expr_contains_expr_id_seen(arg.value, needle, expressions, seen))
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             expr_contains_expr_id_seen(*initial, needle, expressions, seen)
         }
         AstExprKind::Then {
@@ -6292,6 +6600,9 @@ fn simple_list_statement_type(statement: &AstStatement, expressions: &[AstExpr])
 }
 
 fn simple_statement_value_type(statement: &AstStatement, expressions: &[AstExpr]) -> Option<Type> {
+    if let Some(ty) = simple_statement_pipeline_type(statement, expressions) {
+        return Some(ty);
+    }
     let expr_id = direct_statement_value_expr_id(statement, expressions)?;
     let expr = expressions.get(expr_id)?;
     Some(match &expr.kind {
@@ -6305,6 +6616,68 @@ fn simple_statement_value_type(statement: &AstStatement, expressions: &[AstExpr]
         }
         _ => simple_expr_type(expr, expressions),
     })
+}
+
+fn simple_statement_pipeline_type(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<Type> {
+    let mut expr_ids = statement.expr.into_iter().collect::<Vec<_>>();
+    expr_ids.extend(statement_expression_child_expr_ids(statement));
+    if !expression_sequence_is_pipeline(&expr_ids, expressions) {
+        return None;
+    }
+    let (first, rest) = expr_ids.split_first()?;
+    let mut ty = simple_expr_type(expressions.get(*first)?, expressions);
+    for expr_id in rest {
+        let expr = expressions.get(*expr_id)?;
+        if matches!(
+            expr.kind,
+            AstExprKind::Draining { .. } | AstExprKind::Hold { .. }
+        ) {
+            continue;
+        }
+        let next = simple_expr_type(expr, expressions);
+        if is_specific_type(&next) {
+            ty = next;
+        }
+    }
+    Some(ty)
+}
+
+fn statement_value_type_from_bindings(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    bindings: &BTreeMap<String, Type>,
+) -> Option<Type> {
+    let mut expr_ids = statement.expr.into_iter().collect::<Vec<_>>();
+    expr_ids.extend(statement_expression_child_expr_ids(statement));
+    if expression_sequence_is_pipeline(&expr_ids, expressions) {
+        let (first, rest) = expr_ids.split_first()?;
+        let first = expressions.get(*first)?;
+        let mut ty = static_expr_type_from_bindings(first, expressions, bindings)
+            .unwrap_or_else(|| simple_expr_type(first, expressions));
+        for expr_id in rest {
+            let expr = expressions.get(*expr_id)?;
+            if matches!(
+                expr.kind,
+                AstExprKind::Draining { .. } | AstExprKind::Hold { .. }
+            ) {
+                continue;
+            }
+            if let Some(next) =
+                static_expr_type_from_bindings(expr, expressions, bindings).or_else(|| {
+                    let ty = simple_expr_type(expr, expressions);
+                    is_specific_type(&ty).then_some(ty)
+                })
+            {
+                ty = next;
+            }
+        }
+        return Some(ty);
+    }
+    let expr_id = direct_statement_value_expr_id(statement, expressions)?;
+    static_expr_type_from_bindings(expressions.get(expr_id)?, expressions, bindings)
 }
 
 fn statement_for_expr(statement: &AstStatement, expr_id: usize) -> Option<&AstStatement> {
@@ -6358,7 +6731,7 @@ where
     let mut known_len = 0usize;
     let mut all_fixed = true;
     for item in items {
-        match expressions.get(*item).and_then(|expr| type_for_expr(expr)) {
+        match expressions.get(*item).and_then(&mut type_for_expr) {
             Some(Type::Byte) => known_len += 1,
             Some(Type::Bytes(BytesType::Fixed(len))) => known_len += len,
             Some(Type::Bytes(BytesType::Dynamic)) | None => all_fixed = false,
@@ -6455,8 +6828,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                         output_name("items", "items"),
                         Type::List(Box::new(open_object_type())),
                     ),
-                ]
-                .into_iter(),
+                ],
                 true,
             ))))
         }
@@ -6484,6 +6856,10 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         AstExprKind::Then { input, output } => output
             .or(Some(*input))
             .and_then(|expr_id| expressions.get(expr_id))
+            .map(|expr| simple_expr_type(expr, expressions))
+            .unwrap_or_else(open_object_type),
+        AstExprKind::Draining { input } => expressions
+            .get(*input)
             .map(|expr| simple_expr_type(expr, expressions))
             .unwrap_or_else(open_object_type),
         AstExprKind::Pipe { input, op, .. } if op == "HOLD" || op == "WHILE" => expressions
@@ -6627,7 +7003,9 @@ fn expr_contains_render_constructor_seen(
                     .iter()
                     .any(|arg| expr_contains_render_constructor_seen(arg.value, expressions, seen))
         }
-        AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
             expr_contains_render_constructor_seen(*initial, expressions, seen)
         }
         AstExprKind::Then { input, output } => {
@@ -6655,6 +7033,7 @@ fn expr_contains_render_constructor_seen(
         AstExprKind::ListLiteral { .. }
         | AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
@@ -6693,6 +7072,22 @@ fn collect_param_requirements_expr(
                 object_type_for_path_requirement(&parts[1..], expected),
             );
         }
+        AstExprKind::Drain { path } => {
+            let parts = drain_path_parts(path);
+            if let Some(root) = parts.first().filter(|root| params.contains(*root)) {
+                if parts.len() == 1 {
+                    if let Some(expected) = expected {
+                        add_param_requirement(requirements, root, expected);
+                    }
+                } else {
+                    add_param_requirement(
+                        requirements,
+                        root,
+                        object_type_for_path_requirement(&parts[1..], expected),
+                    );
+                }
+            }
+        }
         AstExprKind::Call { function, args } => {
             for arg in args {
                 let expected = builtin_argument_expected_type(function, arg.name.as_deref(), false);
@@ -6725,7 +7120,7 @@ fn collect_param_requirements_expr(
                 );
             }
         }
-        AstExprKind::Hold { initial, .. } => {
+        AstExprKind::Hold { initial, .. } | AstExprKind::Draining { input: initial } => {
             collect_param_requirements_expr(*initial, expressions, params, requirements, expected);
         }
         AstExprKind::When { input } => {
@@ -6816,7 +7211,7 @@ fn object_type_for_path_requirement(parts: &[String], leaf_type: Option<Type>) -
         object_type_for_path_requirement(rest, leaf_type)
     };
     Type::Object(ObjectShape::from_ordered_fields(
-        [(field.clone(), field_type)].into_iter(),
+        [(field.clone(), field_type)],
         true,
     ))
 }
@@ -6834,9 +7229,10 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
         )
     {
         Some(Type::List(Box::new(open_object_type())))
-    } else if function == "Text/to_bytes" {
-        Some(Type::Text)
-    } else if matches!(function, "File/read_bytes" | "File/read_text") {
+    } else if matches!(
+        function,
+        "Text/to_bytes" | "File/read_bytes" | "File/read_text" | "Log/error" | "Log/info"
+    ) {
         Some(Type::Text)
     } else if function == "File/write_bytes" {
         Some(Type::Bytes(BytesType::Dynamic))
@@ -6883,10 +7279,9 @@ fn argument_expected_type(function: &str) -> Option<Type> {
         None
     } else if matches!(
         function,
-        "File/read_bytes" | "File/read_text" | "File/write_bytes"
-    ) {
-        Some(Type::Text)
-    } else if function.starts_with("Text/") {
+        "File/read_bytes" | "File/read_text" | "File/write_bytes" | "Log/error" | "Log/info"
+    ) || function.starts_with("Text/")
+    {
         Some(Type::Text)
     } else if function.starts_with("Number/") {
         Some(Type::Number)
@@ -7202,7 +7597,7 @@ fn static_hex_decoded_len(text: &str) -> Option<usize> {
         }
         digits = digits.checked_add(1)?;
     }
-    (digits % 2 == 0).then_some(digits / 2)
+    digits.is_multiple_of(2).then_some(digits / 2)
 }
 
 fn static_base64_decoded_len(text: &str) -> Option<usize> {
@@ -7382,15 +7777,13 @@ fn static_expr_type_from_bindings(
             )))
         }
         AstExprKind::Identifier(name) => bindings.get(name).cloned(),
-        AstExprKind::Path(parts) => {
-            let path = parts.join(".");
-            bindings.get(&path).cloned().or_else(|| {
-                parts
-                    .first()
-                    .and_then(|base| bindings.get(base))
-                    .and_then(|base| type_for_nested_path(base, &parts[1..]))
-            })
+        AstExprKind::Path(parts) => static_path_type_from_bindings(parts, bindings),
+        AstExprKind::Drain { path } => {
+            static_path_type_from_bindings(&drain_path_parts(path), bindings)
         }
+        AstExprKind::Draining { input } => expressions
+            .get(*input)
+            .and_then(|expr| static_expr_type_from_bindings(expr, expressions, bindings)),
         AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
         AstExprKind::Number(_) => Some(Type::Number),
         AstExprKind::ByteLiteral { .. } => Some(Type::Byte),
@@ -7407,6 +7800,19 @@ fn static_expr_type_from_bindings(
         }
         _ => None,
     }
+}
+
+fn static_path_type_from_bindings(
+    parts: &[String],
+    bindings: &BTreeMap<String, Type>,
+) -> Option<Type> {
+    let path = parts.join(".");
+    bindings.get(&path).cloned().or_else(|| {
+        parts
+            .first()
+            .and_then(|base| bindings.get(base))
+            .and_then(|base| type_for_nested_path(base, &parts[1..]))
+    })
 }
 
 fn flow_bindings(program: &ParsedProgram) -> BTreeMap<String, FlowMode> {
@@ -7467,6 +7873,10 @@ fn simple_flow_mode(expr: &AstExpr, expressions: &[AstExpr]) -> FlowMode {
             .get(*input)
             .map(|expr| simple_flow_mode(expr, expressions))
             .unwrap_or(FlowMode::Continuous),
+        AstExprKind::Draining { input } => expressions
+            .get(*input)
+            .map(|expr| simple_flow_mode(expr, expressions))
+            .unwrap_or(FlowMode::Continuous),
         _ => FlowMode::Continuous,
     }
 }
@@ -7484,9 +7894,11 @@ fn collect_name_bindings(
             AstStatementKind::Field { name } if name == "document" => continue,
             AstStatementKind::Field { name } => {
                 let path = scoped_path(scope, name);
-                let ty = simple_statement_value_type(statement, expressions).unwrap_or_else(|| {
-                    Type::Object(object_shape_for_statement(statement, expressions))
-                });
+                let ty = statement_value_type_from_bindings(statement, expressions, bindings)
+                    .or_else(|| simple_statement_value_type(statement, expressions))
+                    .unwrap_or_else(|| {
+                        Type::Object(object_shape_for_statement(statement, expressions))
+                    });
                 insert_simple_binding_preserving_renderable(bindings, name, ty.clone());
                 if path != *name {
                     bindings.insert(path, ty);
@@ -7505,7 +7917,10 @@ fn collect_name_bindings(
             AstStatementKind::Hold {
                 name: Some(name), ..
             } => {
-                if let Some(ty) = simple_statement_value_type(statement, expressions) {
+                if let Some(ty) =
+                    statement_value_type_from_bindings(statement, expressions, bindings)
+                        .or_else(|| simple_statement_value_type(statement, expressions))
+                {
                     bindings.insert(name.clone(), ty);
                 }
                 collect_name_bindings(
@@ -7761,6 +8176,13 @@ fn row_binding_requirement_for_expr(
         AstExprKind::Path(parts) if parts.first().is_some_and(|part| part == binding) => {
             Some(object_type_for_path_requirement(&parts[1..], expected))
         }
+        AstExprKind::Drain { path } => {
+            let parts = drain_path_parts(path);
+            parts
+                .first()
+                .filter(|part| part.as_str() == binding)
+                .map(|_| object_type_for_path_requirement(&parts[1..], expected))
+        }
         AstExprKind::Pipe { input, op, args } => {
             let input_expected = pipe_input_expected_type(op);
             let mut requirement =
@@ -7811,7 +8233,9 @@ fn row_binding_requirement_for_expr(
                 (None, None) => None,
             }
         }
-        AstExprKind::When { input } | AstExprKind::Hold { initial: input, .. } => {
+        AstExprKind::When { input }
+        | AstExprKind::Hold { initial: input, .. }
+        | AstExprKind::Draining { input } => {
             row_binding_requirement_for_expr(program, *input, binding, expected)
         }
         AstExprKind::Then { input, output } => {
@@ -7843,6 +8267,7 @@ fn row_binding_requirement_for_expr(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonical_row_scope_type(
     program: &ParsedProgram,
     bindings: &BTreeMap<String, Type>,
@@ -7867,6 +8292,7 @@ fn canonical_row_scope_type(
                 Type::List(item) => Some((**item).clone()),
                 _ => None,
             })
+            .filter(type_has_known_user_shape)
             .or_else(|| list_item_shape(program, list).map(Type::Object))
     });
 
@@ -7935,7 +8361,13 @@ fn list_map_input_item_type_for_function_param(
         {
             continue;
         }
-        let Some(found) = list_item_type_for_expr_id(program, *input, bindings) else {
+        let input = pipeline_source_expr_id(
+            &program.ast.statements,
+            expr.id,
+            *input,
+            &program.expressions,
+        );
+        let Some(found) = list_item_type_for_expr_id(program, input, bindings) else {
             continue;
         };
         item_type = Some(match item_type {
@@ -7962,6 +8394,16 @@ fn list_item_type_for_expr_id(
     bindings: &BTreeMap<String, Type>,
 ) -> Option<Type> {
     let expr = program.expressions.get(expr_id)?;
+    if let AstExprKind::ListLiteral { items, .. } = &expr.kind {
+        let item_type = items
+            .iter()
+            .filter_map(|item| program.expressions.get(*item))
+            .map(|item| simple_expr_type(item, &program.expressions))
+            .reduce(|left, right| merge_canonical_row_type(&left, &right));
+        if item_type.as_ref().is_some_and(type_has_known_user_shape) {
+            return item_type;
+        }
+    }
     let static_item_type = static_expr_type_from_bindings(expr, &program.expressions, bindings)
         .and_then(|ty| list_item_type_from_list_type(&ty));
     if static_item_type
@@ -7978,7 +8420,7 @@ fn list_item_type_for_expr_id(
                 .filter(|ty| !is_open_object_type(ty))
                 .or_else(|| list_item_shape(program, &path).map(Type::Object))
         })
-        .or(static_item_type)
+        .or_else(|| static_item_type.filter(type_has_known_user_shape))
 }
 
 fn type_has_known_user_shape(ty: &Type) -> bool {
@@ -8144,10 +8586,13 @@ fn semantic_block_return_statement(statements: &[AstStatement]) -> Option<&AstSt
 }
 
 fn list_item_shape(program: &ParsedProgram, list_name: &str) -> Option<ObjectShape> {
-    if let Some(shape) = list_item_shape_from_field(program, list_name) {
+    if let Some(shape) = list_item_shape_from_field(program, list_name)
+        && !shape.fields.is_empty()
+    {
         return Some(shape);
     }
-    let list = find_list_statement(&program.ast.statements, list_name)?;
+    let field_name = list_name.rsplit('.').next().unwrap_or(list_name);
+    let list = find_list_statement(&program.ast.statements, field_name)?;
     let mut fields = BTreeMap::new();
     let mut field_order = Vec::new();
     for child in &list.children {
@@ -8289,10 +8734,10 @@ fn object_field_order_for_widened_shapes(left: &ObjectShape, right: &ObjectShape
     let mut order = Vec::new();
     let mut seen = BTreeSet::new();
     for field in left.field_order.iter().chain(right.field_order.iter()) {
-        if left.fields.contains_key(field) || right.fields.contains_key(field) {
-            if seen.insert(field.as_str()) {
-                order.push(field.clone());
-            }
+        if (left.fields.contains_key(field) || right.fields.contains_key(field))
+            && seen.insert(field.as_str())
+        {
+            order.push(field.clone());
         }
     }
     for field in left.fields.keys().chain(right.fields.keys()) {
@@ -8356,6 +8801,18 @@ fn type_for_nested_path(base: &Type, parts: &[String]) -> Option<Type> {
         }
         Type::UnresolvedShape { .. } | Type::Unknown | Type::Var(_) => Some(base.clone()),
         _ => None,
+    }
+}
+
+fn drain_path_parts(path: &AstDrainPath) -> Vec<String> {
+    match path {
+        AstDrainPath::Binding { name } => vec![name.clone()],
+        AstDrainPath::Field { binding, fields } => std::iter::once(binding.clone())
+            .chain(fields.iter().cloned())
+            .collect(),
+        AstDrainPath::Passed { fields } => std::iter::once("PASSED".to_owned())
+            .chain(fields.iter().cloned())
+            .collect(),
     }
 }
 
@@ -8463,7 +8920,7 @@ fn source_payload_shape_table(
     collect_payload_pattern_fields(
         &program.ast.statements,
         &program.expressions,
-        &source_lookup,
+        source_lookup,
         &mut fields_by_source,
     );
     program
@@ -8582,6 +9039,7 @@ fn type_hint_entry_for_range(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn type_hint_entry_for_labels(
     program: &ParsedProgram,
     expr_id: Option<usize>,
@@ -8864,7 +9322,7 @@ fn source_statement_value_type(
         AstStatementKind::Source {
             event: Some(event), ..
         } => Type::Object(ObjectShape::from_ordered_fields(
-            [(event.clone(), payload)].into_iter(),
+            [(event.clone(), payload)],
             false,
         )),
         _ => payload,
@@ -8904,6 +9362,12 @@ fn statement_pipeline_hint_type(
     let (first, rest) = expr_ids.split_first()?;
     let mut ty = hint_type_for_expr_id(program, *first, expr_types, name_bindings)?;
     for expr_id in rest {
+        if matches!(
+            program.expressions.get(*expr_id).map(|expr| &expr.kind),
+            Some(AstExprKind::Draining { .. } | AstExprKind::Hold { .. })
+        ) {
+            continue;
+        }
         let Some(AstExpr {
             kind: AstExprKind::Pipe { op, args, .. },
             ..

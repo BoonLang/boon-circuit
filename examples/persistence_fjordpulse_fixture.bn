@@ -1,0 +1,139 @@
+-- Persistence fixture shaped like a connected monitoring application.
+-- Durable values are ordinary semantic memory; live source events and
+-- connection machinery are reconstructed after restart.
+
+store: [
+    sources: [
+        locale_button: [events: [press: SOURCE]]
+        basemap_button: [events: [press: SOURCE]]
+        station_input: [events: [change: SOURCE]]
+        snapshot: [events: [receive: SOURCE]]
+        stale_timer: [events: [tick: SOURCE]]
+        reconnect_button: [events: [press: SOURCE]]
+        connected: [events: [receive: SOURCE]]
+    ]
+
+    locale:
+        TEXT { en-US }
+        |> HOLD locale {
+            LATEST {
+                sources.locale_button.events.press |> THEN {
+                    locale |> WHEN {
+                        TEXT { en-US } => TEXT { nb-NO }
+                        TEXT { nb-NO } => TEXT { en-US }
+                    }
+                }
+            }
+        }
+
+    basemap:
+        Street
+        |> HOLD basemap {
+            LATEST {
+                sources.basemap_button.events.press |> THEN {
+                    basemap |> WHEN {
+                        Street => Satellite
+                        Satellite => Street
+                    }
+                }
+            }
+        }
+
+    selected_station:
+        TEXT { station-oslo }
+        |> HOLD selected_station {
+            LATEST {
+                sources.station_input.events.change.text
+            }
+        }
+
+    watch_descriptor:
+        TEXT { station-oslo:temperature }
+        |> HOLD watch_descriptor {
+            LATEST {
+                sources.station_input.events.change.text
+            }
+        }
+
+    last_known_snapshot:
+        TEXT { unavailable }
+        |> HOLD last_known_snapshot {
+            LATEST {
+                sources.snapshot.events.receive.text
+            }
+        }
+
+    connection_status:
+        Offline
+        |> HOLD connection_status {
+            LATEST {
+                sources.reconnect_button.events.press |> THEN { Connecting }
+                sources.connected.events.receive |> THEN { Online }
+            }
+        }
+
+    snapshot_stale:
+        True
+        |> HOLD snapshot_stale {
+            LATEST {
+                sources.snapshot.events.receive |> THEN { False }
+                sources.stale_timer.events.tick |> THEN { True }
+            }
+        }
+]
+
+document: Document/new(root: fjordpulse_fixture())
+
+FUNCTION fjordpulse_fixture() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 10
+        style: [
+            width: Fill
+            height: Fill
+            padding: 20
+            background: [color: Oklch[lightness:0.97]]
+            font: [size: 15, color: Oklch[lightness:0.18]]
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [width: Fill, height: 34, font: [size: 24]]
+                label: TEXT { FjordPulse persistence fixture }
+            )
+            Element/text_input(
+                element: [events: store.sources.station_input.events]
+                style: [width: Fill, height: 38]
+                text: store.selected_station
+            )
+            fixture_label(label: store.watch_descriptor)
+            fixture_label(label: store.last_known_snapshot)
+            fixture_label(label: connection_text(status: store.connection_status))
+            fixture_label(label: stale_text(stale: store.snapshot_stale))
+        }
+    )
+}
+
+FUNCTION fixture_label(label) {
+    Element/label(
+        element: []
+        style: [width: Fill, height: 30]
+        label: label
+    )
+}
+
+FUNCTION connection_text(status) {
+    status |> WHEN {
+        Offline => TEXT { Offline }
+        Connecting => TEXT { Connecting }
+        Online => TEXT { Online }
+    }
+}
+
+FUNCTION stale_text(stale) {
+    stale |> WHEN {
+        True => TEXT { Snapshot stale }
+        False => TEXT { Snapshot current }
+    }
+}

@@ -29,7 +29,9 @@ use crate::observer::{
     RoleMetadata, TestPointerPhase, read_event,
 };
 #[cfg(target_os = "linux")]
-use crate::{native_input::NativeInput, ui::DEV_EDITOR, workspace_control::WorkspaceGuard};
+use crate::{
+    native_input::NativeInput, ui::DEV_EDITOR_INPUT_TARGET, workspace_control::WorkspaceGuard,
+};
 
 const FORMAT_VERSION: u16 = 2;
 const PROTOCOL: &str = "boon-gate-evidence-v2";
@@ -321,40 +323,21 @@ fn exercise_native_roles(
         &mut placements,
         ObserverRole::Dev,
     )?;
-    let dev_test_center = wait_for_value(observer, events, EVENT_TIMEOUT, 0, |event| match event {
-        ObserverEvent::RoleTarget {
-            role: ObserverRole::Dev,
-            node,
-            x,
-            y,
-        } if node == "dev.test" => Some((*x, *y)),
-        _ => None,
-    })
-    .map_err(|error| format!("dev TEST target was not published: {error}"))?;
+    drain_events(observer, events, INPUT_CALIBRATION_QUIET);
+    let dev_test_center = observed_role_target(events, ObserverRole::Dev, "dev.test")
+        .ok_or("dev TEST target was not published")?;
     let dev_editor_center =
-        wait_for_value(observer, events, EVENT_TIMEOUT, 0, |event| match event {
-            ObserverEvent::RoleTarget {
-                role: ObserverRole::Dev,
-                node,
-                x,
-                y,
-            } if node == DEV_EDITOR => Some((*x, *y)),
-            _ => None,
-        })
-        .map_err(|error| format!("dev editor target was not published: {error}"))?;
+        observed_role_target(events, ObserverRole::Dev, DEV_EDITOR_INPUT_TARGET)
+            .ok_or("dev editor target was not published")?;
 
     let editor_point = locate_target(
         session,
         observer,
         events,
         ObserverRole::Dev,
-        DEV_EDITOR,
+        DEV_EDITOR_INPUT_TARGET,
         dev_editor_center,
-        translated_target_candidates(
-            dev_placement.origin,
-            dev_editor_center.0,
-            dev_editor_center.1,
-        ),
+        translated_target_candidates(dev_placement, dev_editor_center.0, dev_editor_center.1),
     )?;
     let dev_input_start = events.len();
     session.run_driver(&[
@@ -389,7 +372,7 @@ fn exercise_native_roles(
         ObserverRole::Dev,
         "dev.test",
         dev_test_center,
-        translated_target_candidates(dev_placement.origin, dev_test_center.0, dev_test_center.1),
+        translated_target_candidates(dev_placement, dev_test_center.0, dev_test_center.1),
     )
     .map_err(|error| format!("{error}; calibrated_dev={dev_placement:?}"))?;
     let before_test = events.len();
@@ -481,7 +464,7 @@ fn exercise_native_roles(
     drain_events(observer, events, Duration::from_millis(250));
 
     let preview_candidates =
-        translated_target_candidates(preview_placement.origin, test_target.3, test_target.4);
+        translated_target_candidates(preview_placement, test_target.3, test_target.4);
     let preview_point = locate_target(
         session,
         observer,
@@ -625,7 +608,7 @@ fn exercise_native_roles(
                 ObserverRole::Dev,
                 target,
                 center,
-                translated_target_candidates(dev_placement.origin, center.0, center.1),
+                translated_target_candidates(dev_placement, center.0, center.1),
             )?;
             let start = events.len();
             session.run_driver(&["click", "left"])?;
@@ -830,10 +813,9 @@ fn activate_window(
     expected: ObserverRole,
 ) -> Result<WindowPlacement, String> {
     let placement = match placements.get(&expected).copied() {
-        Some(placement)
-            if role_at_point(session, observer, events, placement.visible_point)? == expected =>
-        {
-            placement
+        Some(placement) => {
+            refresh_window_placement(session, observer, events, placement.visible_point, expected)
+                .or_else(|_| stable_window_placement(session, observer, events, expected))?
         }
         _ => stable_window_placement(session, observer, events, expected)?,
     };
@@ -842,23 +824,40 @@ fn activate_window(
 }
 
 #[cfg(target_os = "linux")]
-fn role_at_point(
+fn refresh_window_placement(
     session: &mut NativeSession,
     observer: &mut ObserverServer,
     events: &mut Vec<ObserverEvent>,
     point: (i32, i32),
-) -> Result<ObserverRole, String> {
-    move_with_marker(session, observer, events, point, Duration::from_millis(400))
-        .or_else(|_| {
-            move_with_marker(
-                session,
-                observer,
-                events,
-                (point.0.saturating_add(1), point.1),
-                Duration::from_millis(400),
-            )
-        })
-        .map(|(_, input)| input.role)
+    expected: ObserverRole,
+) -> Result<WindowPlacement, String> {
+    let (actual, input) =
+        move_with_marker(session, observer, events, point, Duration::from_millis(400)).or_else(
+            |_| {
+                move_with_marker(
+                    session,
+                    observer,
+                    events,
+                    (point.0.saturating_add(1), point.1),
+                    Duration::from_millis(400),
+                )
+            },
+        )?;
+    if input.role != expected {
+        return Err(format!(
+            "expected {expected:?} at {point:?}, observed {:?}",
+            input.role
+        ));
+    }
+    let local_x = input.pointer_x.expect("filtered pointer x");
+    let local_y = input.pointer_y.expect("filtered pointer y");
+    Ok(WindowPlacement {
+        origin: (
+            actual.0 - local_x.round() as i32,
+            actual.1 - local_y.round() as i32,
+        ),
+        visible_point: actual,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1032,6 +1031,20 @@ fn locate_target(
             actual.1 + (target_center.1 - local_y).round() as i32,
         );
         if corrected != actual {
+            let quarter = (
+                actual.0 + ((target_center.0 - local_x) * 0.25).round() as i32,
+                actual.1 + ((target_center.1 - local_y) * 0.25).round() as i32,
+            );
+            if quarter != actual && quarter != corrected {
+                candidates.push_front(quarter);
+            }
+            let halfway = (
+                actual.0 + ((target_center.0 - local_x) * 0.5).round() as i32,
+                actual.1 + ((target_center.1 - local_y) * 0.5).round() as i32,
+            );
+            if halfway != actual && halfway != corrected {
+                candidates.push_front(halfway);
+            }
             candidates.push_front(corrected);
         }
     }
@@ -1074,10 +1087,17 @@ fn locate_different_preview_target(
 }
 
 #[cfg(target_os = "linux")]
-fn translated_target_candidates(origin: (i32, i32), x: f32, y: f32) -> Vec<(i32, i32)> {
-    let base_x = origin.0 + x.round() as i32;
-    let base_y = origin.1 + y.round() as i32;
-    let mut candidates = Vec::new();
+fn translated_target_candidates(placement: WindowPlacement, x: f32, y: f32) -> Vec<(i32, i32)> {
+    let base_x = placement.origin.0 + x.round() as i32;
+    let base_y = placement.origin.1 + y.round() as i32;
+    let visible = placement.visible_point;
+    let mut candidates = vec![
+        visible,
+        (visible.0.saturating_add(1), visible.1),
+        (visible.0.saturating_sub(1), visible.1),
+        (visible.0, visible.1.saturating_add(1)),
+        (visible.0, visible.1.saturating_sub(1)),
+    ];
     for dy in [0, 24, 32, -8, 40, -16] {
         for dx in [0, -8, 8, -16, 16, -24, 24] {
             candidates.push((base_x + dx, base_y + dy));
@@ -1570,14 +1590,11 @@ impl Capture {
                 16_700,
                 33_400,
             );
-            let final_values = switch_final_samples(&self.events)
-                .into_iter()
-                .map(|sample| sample.elapsed_us)
-                .collect::<Vec<_>>();
-            add_switch_budget_check(
+            add_switch_final_budget_check(
                 &mut self.checks,
                 "switch-final-budget",
-                &final_values,
+                &switch_final_samples(&self.events),
+                &self.events,
                 3,
                 20,
                 250_000,
@@ -1947,6 +1964,8 @@ fn switch_ack_samples(events: &[ObserverEvent]) -> Vec<u64> {
 struct SwitchFinalSample {
     revision: u64,
     elapsed_us: u64,
+    compile_us: u64,
+    post_compile_us: u64,
     key: FrameEvidenceKey,
 }
 
@@ -1958,10 +1977,14 @@ fn switch_final_samples(events: &[ObserverEvent]) -> Vec<SwitchFinalSample> {
             ObserverEvent::SourceSwitchFinal {
                 revision,
                 elapsed_us,
+                compile_us,
+                post_compile_us,
                 key,
             } => Some(SwitchFinalSample {
                 revision: *revision,
                 elapsed_us: *elapsed_us,
+                compile_us: *compile_us,
+                post_compile_us: *post_compile_us,
                 key: key.clone(),
             }),
             _ => None,
@@ -2204,6 +2227,69 @@ fn add_switch_budget_check(
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
+fn add_switch_final_budget_check(
+    checks: &mut Vec<Check>,
+    id: &'static str,
+    samples: &[SwitchFinalSample],
+    events: &[ObserverEvent],
+    warmup: usize,
+    minimum: usize,
+    p95_limit: u64,
+    max_limit: u64,
+) {
+    let values = samples
+        .iter()
+        .skip(warmup)
+        .map(|sample| sample.elapsed_us)
+        .collect::<Vec<_>>();
+    add_summary_check(
+        checks,
+        id,
+        &values,
+        minimum,
+        Some(p95_limit),
+        None,
+        max_limit,
+    );
+    if values.len() < minimum {
+        return;
+    }
+    let Some((ordinal, worst)) = samples
+        .iter()
+        .enumerate()
+        .skip(warmup)
+        .max_by_key(|(_, sample)| sample.elapsed_us)
+    else {
+        return;
+    };
+    let frame = events.iter().find_map(|event| match event {
+        ObserverEvent::FramePresented(frame) if frame.key == worst.key => Some(frame),
+        _ => None,
+    });
+    if let Some(check) = checks.last_mut() {
+        let frame_detail = frame.map_or_else(
+            || "frame unavailable".to_owned(),
+            |frame| {
+                format!(
+                    "frame={}us render={}us submit={}us present={}us",
+                    frame.frame_us, frame.render_us, frame.submit_us, frame.present_us
+                )
+            },
+        );
+        check.detail = bounded_detail(format!(
+            "{}; worst ordinal={} revision={} total={}us compile={}us post_compile={}us {frame_detail}",
+            check.detail,
+            ordinal + 1,
+            worst.revision,
+            worst.elapsed_us,
+            worst.compile_us,
+            worst.post_compile_us,
+        ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn add_summary_check(
     checks: &mut Vec<Check>,
     id: &'static str,
@@ -2379,6 +2465,7 @@ impl Drop for ScratchDir {
 struct NativeSession {
     desktop_pid: u32,
     launch_id: String,
+    workspace_name: String,
     isolated_seat_name: String,
     observed_roles: Vec<u32>,
     input: Option<NativeInput>,
@@ -2399,6 +2486,15 @@ impl NativeSession {
     ) -> Result<Self, String> {
         let ipc = runtime_dir.join("desktop.sock");
         let launch_log = runtime_dir.join("desktop-launch.log");
+        let role_log = runtime_dir.join("native-roles.log");
+        let workspace_name = format!(
+            "{NATIVE_WORKSPACE}-verify-{}-{:x}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
         let environment = [
             (
                 OBSERVER_SOCKET_ENV,
@@ -2411,17 +2507,17 @@ impl NativeSession {
             ),
             (PROOF_SAMPLE_ORDINAL_ENV, "64".to_owned()),
             (crate::protocol::VERIFY_BOUNDED_WINDOWS_ENV, "1".to_owned()),
+            (
+                "BOON_NATIVE_ROLE_LOG",
+                role_log.to_string_lossy().into_owned(),
+            ),
         ];
         let mut launcher = Command::new("cosmic-background-launch");
-        launcher.current_dir(workspace).args([
-            "--workspace",
-            NATIVE_WORKSPACE,
-            "--frame-pacing",
-            "demand",
-            "--isolated-input",
-            "--",
-            "env",
-        ]);
+        launcher
+            .current_dir(workspace)
+            .arg("--workspace")
+            .arg(&workspace_name)
+            .args(["--frame-pacing", "demand", "--isolated-input", "--", "env"]);
         for (name, value) in environment {
             launcher.arg(format!("{name}={value}"));
         }
@@ -2479,6 +2575,7 @@ impl NativeSession {
         Ok(Self {
             desktop_pid,
             launch_id,
+            workspace_name,
             isolated_seat_name,
             observed_roles: Vec::new(),
             input: Some(input),
@@ -2494,7 +2591,7 @@ impl NativeSession {
 
     fn prepare_background_workspace(&mut self, executable: &Path) -> Result<(), String> {
         self.reconcile_background_layout()?;
-        let workspace = WorkspaceGuard::start(executable, NATIVE_WORKSPACE)?;
+        let workspace = WorkspaceGuard::start(executable, &self.workspace_name)?;
         let (width, height) = workspace.output_size();
         let input = self
             .input
@@ -2738,9 +2835,9 @@ impl IsolationStatus {
     fn require_layout(&self, expected_windows: usize) -> Result<(), String> {
         if !self.tiling_enabled
             || self.floating_window_count != 0
-            || self.tiled_window_count < expected_windows
+            || self.tiled_window_count != expected_windows
             || self.maximized_window_count != 0
-            || self.mapped_surface_count < expected_windows
+            || self.mapped_surface_count != expected_windows
         {
             return Err(format!(
                 "isolated workspace layout is not independently tiled: mapped={}, tiled={}, \
@@ -3364,6 +3461,28 @@ mod tests {
             candidates
                 .iter()
                 .all(|(x, y)| (0..5_120).contains(x) && (0..1_440).contains(y))
+        );
+    }
+
+    #[test]
+    fn retained_target_lookup_uses_the_latest_configured_center() {
+        let events = vec![
+            ObserverEvent::RoleTarget {
+                role: ObserverRole::Dev,
+                node: DEV_EDITOR_INPUT_TARGET.to_owned(),
+                x: 0.5,
+                y: 184.0,
+            },
+            ObserverEvent::RoleTarget {
+                role: ObserverRole::Dev,
+                node: DEV_EDITOR_INPUT_TARGET.to_owned(),
+                x: 520.0,
+                y: 420.0,
+            },
+        ];
+        assert_eq!(
+            observed_role_target(&events, ObserverRole::Dev, DEV_EDITOR_INPUT_TARGET),
+            Some((520.0, 420.0))
         );
     }
 }

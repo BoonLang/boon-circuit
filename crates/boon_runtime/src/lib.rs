@@ -1,27 +1,57 @@
 use boon_compiler::{
-    CompileProfile, CompilerSourceUnit, compile_runtime_source_text_to_machine_plan,
-    compile_runtime_source_units_to_machine_plan, compiler_source_text_for_path,
+    CompileProfile, CompiledMachinePlanFromSource, CompilerSourceUnit,
+    compile_runtime_source_text_to_machine_plan_with_identity,
+    compile_runtime_source_units_to_machine_plan_with_identity, compiler_source_text_for_path,
     compiler_source_units_for_manifest_source, compiler_source_units_for_path,
 };
 pub use boon_document_model::{DocumentFrame, DocumentPatch};
-use boon_plan::{MachinePlan, SourceId, TargetProfile};
-pub use boon_plan_executor::{
-    Delta, RowId, RowSnapshot, SessionOptions, Snapshot, SourceEvent, SourcePayload, TurnMetrics,
-    Value, ValueTarget,
+use boon_example_manifest::ExampleManifest;
+pub use boon_example_manifest::{
+    ExampleEntry as ExampleManifestEntry, MigrationScenario, MigrationSequence,
 };
-use boon_plan_executor::{Session, Turn};
+pub use boon_persistence::{DurableChange, RestoreImage};
+pub use boon_plan::{ApplicationIdentity, MachinePlan};
+use boon_plan::{MigrationEdgeId, OutputContractKind, OutputRootPlan, SourceId, TargetProfile};
+pub use boon_plan_executor::{
+    AuthorityDelta, Delta, RowId, RowSnapshot, SessionOptions, Snapshot, SourceEvent,
+    SourcePayload, TurnMetrics, Value, ValueTarget,
+};
+use boon_plan_executor::{Session, SessionBuilder, Turn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 mod document;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod persistent;
+
+#[cfg(target_arch = "wasm32")]
+mod web_persistent;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod effects;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod migration_scenario;
+
 pub use document::{DocumentMaterializationStats, DocumentWindowDemand};
+#[cfg(not(target_arch = "wasm32"))]
+pub use effects::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use migration_scenario::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use persistent::*;
+#[cfg(target_arch = "wasm32")]
+pub use web_persistent::*;
 
 pub type RuntimeResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -58,7 +88,11 @@ pub enum DocumentPatchStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RuntimeTurn {
     pub sequence: u64,
+    pub source_sequence: Option<u64>,
     pub deltas: Vec<Delta>,
+    pub authority_deltas: Vec<AuthorityDelta>,
+    pub durable_changes: Vec<DurableChange>,
+    pub outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
     pub document_patches: Vec<DocumentPatch>,
     pub document_patch_status: DocumentPatchStatus,
     pub metrics: TurnMetrics,
@@ -70,12 +104,13 @@ pub struct RuntimeTurn {
 pub struct RuntimePhaseTimings {
     pub executor_us: u64,
     pub document_us: u64,
+    pub persistence_enqueue_us: u64,
 }
 
-#[derive(Clone)]
 pub struct LiveRuntime {
     session: Session,
     document: Option<document::DocumentRuntime>,
+    pending_document_rollback: Option<document::DocumentRollback>,
     source_inventory: SourceInventory,
     source_ids_by_path: BTreeMap<String, SourceId>,
 }
@@ -86,56 +121,89 @@ struct CachedPlan {
     compile: CompileProfile,
 }
 
-fn plan_cache() -> &'static Mutex<BTreeMap<String, CachedPlan>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<String, CachedPlan>>> = OnceLock::new();
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RuntimeSourceCacheKey {
+    SourceText(String),
+    SourceUnits(String),
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RuntimePlanCacheKey {
+    source: RuntimeSourceCacheKey,
+    application: ApplicationIdentity,
+}
+
+fn plan_cache() -> &'static Mutex<BTreeMap<RuntimePlanCacheKey, CachedPlan>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<RuntimePlanCacheKey, CachedPlan>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn cached_plan(
+    key: RuntimePlanCacheKey,
+    compile: impl FnOnce() -> RuntimeResult<CompiledMachinePlanFromSource>,
+) -> RuntimeResult<(CachedPlan, bool)> {
+    if let Ok(cache) = plan_cache().lock()
+        && let Some(cached) = cache.get(&key).cloned()
+    {
+        return Ok((cached, true));
+    }
+
+    let compiled = compile()?;
+    let cached = CachedPlan {
+        plan: Arc::new(compiled.plan),
+        compile: compiled.profile,
+    };
+    if let Ok(mut cache) = plan_cache().lock() {
+        cache.insert(key, cached.clone());
+    }
+    Ok((cached, false))
 }
 
 impl LiveRuntime {
     pub fn from_source(source_label: &str, source: &str) -> RuntimeResult<Self> {
-        Ok(Self::from_source_profiled(source_label, source)?.0)
+        Self::from_source_with_identity(
+            source_label,
+            source,
+            ApplicationIdentity::compiler_default(),
+        )
+    }
+
+    pub fn from_source_with_identity(
+        source_label: &str,
+        source: &str,
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<Self> {
+        Ok(Self::from_source_profiled_with_identity(source_label, source, application)?.0)
     }
 
     pub fn from_source_profiled(
         source_label: &str,
         source: &str,
     ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
-        let key = sha256_bytes(source.as_bytes());
-        let (cached, cache_hit) = match plan_cache().lock() {
-            Ok(cache) => match cache.get(&key).cloned() {
-                Some(cached) => (cached, true),
-                None => {
-                    drop(cache);
-                    let compiled = compile_runtime_source_text_to_machine_plan(
-                        source_label,
-                        source,
-                        TargetProfile::SoftwareDefault,
-                    )?;
-                    let cached = CachedPlan {
-                        plan: Arc::new(compiled.plan),
-                        compile: compiled.profile,
-                    };
-                    if let Ok(mut cache) = plan_cache().lock() {
-                        cache.insert(key, cached.clone());
-                    }
-                    (cached, false)
-                }
-            },
-            Err(_) => {
-                let compiled = compile_runtime_source_text_to_machine_plan(
-                    source_label,
-                    source,
-                    TargetProfile::SoftwareDefault,
-                )?;
-                (
-                    CachedPlan {
-                        plan: Arc::new(compiled.plan),
-                        compile: compiled.profile,
-                    },
-                    false,
-                )
-            }
+        Self::from_source_profiled_with_identity(
+            source_label,
+            source,
+            ApplicationIdentity::compiler_default(),
+        )
+    }
+
+    pub fn from_source_profiled_with_identity(
+        source_label: &str,
+        source: &str,
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+        let key = RuntimePlanCacheKey {
+            source: RuntimeSourceCacheKey::SourceText(sha256_bytes(source.as_bytes())),
+            application: application.clone(),
         };
+        let (cached, cache_hit) = cached_plan(key, || {
+            compile_runtime_source_text_to_machine_plan_with_identity(
+                source_label,
+                source,
+                TargetProfile::SoftwareDefault,
+                application,
+            )
+        })?;
         let runtime = Self::from_cached_plan(cached.clone())?;
         Ok((
             runtime,
@@ -147,63 +215,56 @@ impl LiveRuntime {
     }
 
     pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
-        Ok(Self::from_project_profiled(source_label, units)?.0)
+        Self::from_project_with_identity(
+            source_label,
+            units,
+            ApplicationIdentity::compiler_default(),
+        )
+    }
+
+    pub fn from_project_with_identity(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<Self> {
+        Ok(Self::from_project_profiled_with_identity(source_label, units, application)?.0)
     }
 
     pub fn from_project_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
     ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
-        let key = source_units_hash(units);
-        let (cached, cache_hit) = match plan_cache().lock() {
-            Ok(cache) => match cache.get(&key).cloned() {
-                Some(cached) => (cached, true),
-                None => {
-                    drop(cache);
-                    let compiler_units = units
-                        .iter()
-                        .map(|unit| CompilerSourceUnit {
-                            path: unit.path.clone(),
-                            source: unit.source.clone(),
-                        })
-                        .collect::<Vec<_>>();
-                    let compiled = compile_runtime_source_units_to_machine_plan(
-                        source_label,
-                        &compiler_units,
-                        TargetProfile::SoftwareDefault,
-                    )?;
-                    let cached = CachedPlan {
-                        plan: Arc::new(compiled.plan),
-                        compile: compiled.profile,
-                    };
-                    if let Ok(mut cache) = plan_cache().lock() {
-                        cache.insert(key, cached.clone());
-                    }
-                    (cached, false)
-                }
-            },
-            Err(_) => {
-                let compiler_units = units
-                    .iter()
-                    .map(|unit| CompilerSourceUnit {
-                        path: unit.path.clone(),
-                        source: unit.source.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let compiled = compile_runtime_source_units_to_machine_plan(
-                    source_label,
-                    &compiler_units,
-                    TargetProfile::SoftwareDefault,
-                )?;
-                (
-                    CachedPlan {
-                        plan: Arc::new(compiled.plan),
-                        compile: compiled.profile,
-                    },
-                    false,
-                )
-            }
+        Self::from_project_profiled_with_identity(
+            source_label,
+            units,
+            ApplicationIdentity::compiler_default(),
+        )
+    }
+
+    pub fn from_project_profiled_with_identity(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+        let key = RuntimePlanCacheKey {
+            source: RuntimeSourceCacheKey::SourceUnits(source_units_hash(units)),
+            application: application.clone(),
         };
+        let compiler_units = units
+            .iter()
+            .map(|unit| CompilerSourceUnit {
+                path: unit.path.clone(),
+                source: unit.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (cached, cache_hit) = cached_plan(key, || {
+            compile_runtime_source_units_to_machine_plan_with_identity(
+                source_label,
+                &compiler_units,
+                TargetProfile::SoftwareDefault,
+                application,
+            )
+        })?;
         let runtime = Self::from_cached_plan(cached.clone())?;
         Ok((
             runtime,
@@ -215,12 +276,28 @@ impl LiveRuntime {
     }
 
     pub fn from_machine_plan(plan: MachinePlan, options: SessionOptions) -> RuntimeResult<Self> {
-        Self::from_shared_machine_plan(Arc::new(plan), options)
+        Self::from_machine_plan_with_restore(plan, options, None)
     }
 
-    fn from_shared_machine_plan(
+    pub fn from_machine_plan_with_restore(
+        plan: MachinePlan,
+        options: SessionOptions,
+        restore: Option<RestoreImage>,
+    ) -> RuntimeResult<Self> {
+        Self::from_shared_machine_plan_with_restore(Arc::new(plan), options, restore)
+    }
+
+    pub fn from_shared_machine_plan(
         plan: Arc<MachinePlan>,
         options: SessionOptions,
+    ) -> RuntimeResult<Self> {
+        Self::from_shared_machine_plan_with_restore(plan, options, None)
+    }
+
+    pub fn from_shared_machine_plan_with_restore(
+        plan: Arc<MachinePlan>,
+        options: SessionOptions,
+        restore: Option<RestoreImage>,
     ) -> RuntimeResult<Self> {
         let source_inventory = source_inventory(&plan);
         let source_ids_by_path = source_inventory
@@ -228,11 +305,17 @@ impl LiveRuntime {
             .iter()
             .map(|source| (source.path.clone(), source.id))
             .collect();
-        let mut session = Session::new_shared(plan, options)?;
+        let builder = SessionBuilder::new_shared(plan, options)?;
+        let mut session = match restore {
+            Some(image) => builder.restore_durable(image)?,
+            None => builder,
+        }
+        .build()?;
         let document = document::DocumentRuntime::new(&mut session)?;
         Ok(Self {
             session,
             document,
+            pending_document_rollback: None,
             source_inventory,
             source_ids_by_path,
         })
@@ -245,7 +328,11 @@ impl LiveRuntime {
     pub fn mount(&self) -> RuntimeTurn {
         RuntimeTurn {
             sequence: 0,
+            source_sequence: None,
             deltas: Vec::new(),
+            authority_deltas: Vec::new(),
+            durable_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             document_patches: self
                 .document
                 .as_ref()
@@ -263,6 +350,15 @@ impl LiveRuntime {
     }
 
     pub fn dispatch(&mut self, event: SourceEvent) -> RuntimeResult<RuntimeTurn> {
+        let turn = self.dispatch_unsettled(event)?;
+        self.settle_turn();
+        Ok(turn)
+    }
+
+    pub fn dispatch_unsettled(&mut self, event: SourceEvent) -> RuntimeResult<RuntimeTurn> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
         let demanded = self
             .document
             .as_ref()
@@ -272,6 +368,62 @@ impl LiveRuntime {
         let turn = self.session.apply_with_demand(event, &demanded)?;
         let executor_us = duration_us(started.elapsed());
         self.runtime_turn(turn, executor_us)
+    }
+
+    pub fn begin_effect_dispatch_unsettled(
+        &mut self,
+        item: &boon_persistence::DurableOutboxItem,
+    ) -> RuntimeResult<RuntimeTurn> {
+        self.effect_turn(|session| session.begin_effect_dispatch(item))
+    }
+
+    pub fn require_effect_reconciliation_unsettled(
+        &mut self,
+        item: &boon_persistence::DurableOutboxItem,
+    ) -> RuntimeResult<RuntimeTurn> {
+        self.effect_turn(|session| session.require_effect_reconciliation(item))
+    }
+
+    pub fn complete_effect_unsettled(
+        &mut self,
+        item: &boon_persistence::DurableOutboxItem,
+        outcome: boon_persistence::StoredValue,
+    ) -> RuntimeResult<RuntimeTurn> {
+        self.effect_turn(|session| session.complete_effect(item, outcome))
+    }
+
+    fn effect_turn(
+        &mut self,
+        build: impl FnOnce(&mut Session) -> Result<Turn, boon_plan_executor::Error>,
+    ) -> RuntimeResult<RuntimeTurn> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        let turn = build(&mut self.session)?;
+        self.runtime_turn(turn, duration_us(started.elapsed()))
+    }
+
+    pub fn settle_turn(&mut self) {
+        self.session.settle_turn();
+        self.pending_document_rollback = None;
+    }
+
+    pub fn rollback_unsettled_turn(&mut self) -> RuntimeResult<()> {
+        let Some(rollback) = self.pending_document_rollback.take() else {
+            return Ok(());
+        };
+        let demanded = if let Some(document) = self.document.as_mut() {
+            document.rollback_turn(rollback);
+            document.demanded_targets()
+        } else if !rollback.is_unchanged() {
+            return Err("document rollback exists without a retained document runtime".into());
+        } else {
+            Vec::new()
+        };
+        self.session.rollback_unsettled_turn()?;
+        self.session.ensure_current(&demanded)?;
+        Ok(())
     }
 
     pub fn source_event(
@@ -298,8 +450,30 @@ impl LiveRuntime {
         Ok(self.session.snapshot()?)
     }
 
+    pub fn machine_plan(&self) -> &MachinePlan {
+        self.session.plan()
+    }
+
+    pub fn shared_machine_plan(&self) -> Arc<MachinePlan> {
+        self.session.shared_plan()
+    }
+
+    pub fn durable_restore_image(
+        &self,
+        epoch: u64,
+        completed_migration_edges: BTreeSet<MigrationEdgeId>,
+    ) -> RuntimeResult<RestoreImage> {
+        Ok(self
+            .session
+            .durable_restore_image(epoch, completed_migration_edges)?)
+    }
+
     pub fn root_value_current(&mut self, name: &str) -> RuntimeResult<Value> {
         Ok(self.session.root_value_current(name)?)
+    }
+
+    pub fn output_value_current(&mut self, name: &str) -> RuntimeResult<Value> {
+        Ok(self.session.output_value_current(name)?)
     }
 
     pub fn inspect_value_current(&mut self, name: &str, max_rows: usize) -> RuntimeResult<Value> {
@@ -308,6 +482,46 @@ impl LiveRuntime {
 
     pub fn document_frame(&self) -> Option<&DocumentFrame> {
         self.document.as_ref().map(document::DocumentRuntime::frame)
+    }
+
+    pub fn output_roots(&self) -> &[OutputRootPlan] {
+        &self.session.plan().outputs
+    }
+
+    pub fn retained_output_frame(&self, name: &str) -> RuntimeResult<&DocumentFrame> {
+        let output = self
+            .session
+            .plan()
+            .outputs
+            .iter()
+            .find(|output| output.name == name)
+            .ok_or_else(|| format!("MachinePlan has no output root `{name}`"))?;
+        if !matches!(
+            output.contract,
+            OutputContractKind::Document | OutputContractKind::Scene
+        ) {
+            return Err(format!("output root `{name}` is not a retained visual output").into());
+        }
+        self.document
+            .as_ref()
+            .map(document::DocumentRuntime::frame)
+            .ok_or_else(|| format!("output root `{name}` has no retained frame").into())
+    }
+
+    pub fn primary_retained_output_frame(&self) -> RuntimeResult<&DocumentFrame> {
+        let output = self
+            .session
+            .plan()
+            .outputs
+            .iter()
+            .find(|output| {
+                matches!(
+                    output.contract,
+                    OutputContractKind::Document | OutputContractKind::Scene
+                )
+            })
+            .ok_or("MachinePlan has no retained visual output root")?;
+        self.retained_output_frame(&output.name)
     }
 
     pub fn document_materialization_stats(&self) -> DocumentMaterializationStats {
@@ -826,13 +1040,29 @@ impl LiveRuntime {
 
     fn runtime_turn(&mut self, turn: Turn, executor_us: u64) -> RuntimeResult<RuntimeTurn> {
         let document_started = Instant::now();
-        let document_patches = match self.document.as_mut() {
-            Some(document) => document.apply_turn(&mut self.session, &turn.deltas)?,
-            None => Vec::new(),
+        let (document_patches, document_rollback) = match self.document.as_mut() {
+            Some(document) => match document.apply_turn(&mut self.session, &turn.deltas) {
+                Ok(applied) => applied,
+                Err(error) => {
+                    if let Err(rollback) = self.session.rollback_unsettled_turn() {
+                        return Err(format!(
+                            "document settle failed with `{error}` and authority rollback failed with `{rollback}`"
+                        )
+                        .into());
+                    }
+                    return Err(error.into());
+                }
+            },
+            None => (Vec::new(), document::DocumentRollback::unchanged()),
         };
+        self.pending_document_rollback = Some(document_rollback);
         Ok(RuntimeTurn {
             sequence: turn.sequence,
+            source_sequence: turn.source_sequence,
             deltas: turn.deltas,
+            authority_deltas: turn.authority_deltas,
+            durable_changes: turn.durable_changes,
+            outbox_changes: turn.outbox_changes,
             document_patches,
             document_patch_status: DocumentPatchStatus::Complete,
             metrics: turn.metrics,
@@ -844,6 +1074,7 @@ impl LiveRuntime {
             phase_timings: RuntimePhaseTimings {
                 executor_us,
                 document_us: duration_us(document_started.elapsed()),
+                persistence_enqueue_us: 0,
             },
         })
     }
@@ -1238,30 +1469,9 @@ fn scenario_value_text(value: &Value) -> RuntimeResult<String> {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ExampleManifestEntry {
-    pub id: String,
-    pub label: String,
-    pub source: String,
-    #[serde(default)]
-    pub source_files: Vec<String>,
-    #[serde(default)]
-    pub asset_files: Vec<String>,
-    #[serde(default)]
-    pub asset_directories: Vec<String>,
-    pub scenario: String,
-    pub budget: String,
-}
-
-#[derive(Deserialize)]
-struct ExampleManifest {
-    #[serde(default)]
-    example: Vec<ExampleManifestEntry>,
-}
-
 pub fn example_manifest_entries() -> RuntimeResult<Vec<ExampleManifestEntry>> {
     let path = resolve_repo_file("examples/manifest.toml");
-    let manifest: ExampleManifest = toml::from_str(&fs::read_to_string(path)?)?;
+    let manifest = ExampleManifest::from_path(path)?;
     Ok(manifest.example)
 }
 
@@ -1288,6 +1498,20 @@ pub fn source_units_for_entry(
             .map(runtime_source_unit)
             .collect(),
     )
+}
+
+pub fn migration_sequence_for_entry(
+    entry: &ExampleManifestEntry,
+) -> RuntimeResult<Option<(MigrationSequence, MigrationScenario)>> {
+    let Some(sequence_path) = entry.migration_sequence.as_deref() else {
+        return Ok(None);
+    };
+    let sequence = MigrationSequence::from_path(
+        resolve_repo_file(sequence_path),
+        resolve_repo_file("examples"),
+    )?;
+    let scenario = MigrationScenario::from_path(resolve_repo_file(&sequence.scenario), &sequence)?;
+    Ok(Some((sequence, scenario)))
 }
 
 pub fn source_text_for_path(path: &Path) -> RuntimeResult<String> {

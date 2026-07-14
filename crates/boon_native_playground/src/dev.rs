@@ -17,13 +17,16 @@ use crate::frame::{
 use crate::language::{LanguageSnapshot, LanguageWorker};
 use crate::observer::{InputAccepted, ObserverClient, ObserverEvent, ObserverRole};
 use crate::protocol::{
-    CatalogItem, Connection, FrameMode, Message, PreviewStats, ProofMode, Role, SourceUnit,
+    ApplicationIdentity, AuthoritySelection, CanonicalStateArtifact, CatalogItem, Connection,
+    FrameMode, Message, MigrationBundle, MigrationCommand, MigrationOperation, MigrationStatus,
+    PersistenceCommand, PersistenceSnapshot, PreviewStats, ProofMode, Role, SourceUnit,
 };
 use crate::ui::{
-    DEV_EDITOR, DEV_FILE_NEW, DEV_FILE_REMOVE, DEV_FILE_RENAME, DEV_FORMAT, DEV_NEW, DEV_NEXT,
-    DEV_PREVIOUS, DEV_REMOVE, DEV_RENAME, DEV_RENAME_CANCEL, DEV_RENAME_INPUT, DEV_RENAME_SAVE,
-    DEV_RESET, DEV_RUN, DEV_SAVE, DEV_TEST, DevFrameState, InspectorState, dev_frame,
-    editor_first_line, editor_line_from_target,
+    DEV_EDITOR, DEV_EDITOR_INPUT_TARGET, DEV_FILE_NEW, DEV_FILE_REMOVE, DEV_FILE_RENAME,
+    DEV_FORMAT, DEV_NEW, DEV_NEXT, DEV_PREVIOUS, DEV_REMOVE, DEV_RENAME, DEV_RENAME_CANCEL,
+    DEV_RENAME_INPUT, DEV_RENAME_SAVE, DEV_RESET, DEV_RUN, DEV_SAVE, DEV_TEST, DevFrameState,
+    InspectorMode, InspectorState, MigrationUiState, OUTBOX_WINDOW_ROWS, PersistenceUiState,
+    dev_frame, editor_first_line, editor_line_from_target,
 };
 use crate::view::RetainedView;
 use crate::workspace::{
@@ -46,6 +49,19 @@ struct DevModel {
     runtime_sequence: Option<(u64, u64)>,
     runtime_value_path: Option<(u64, u64, String)>,
     language: Option<LanguageSnapshot>,
+    source_publication_revision: Option<u64>,
+    migration: Option<MigrationBundle>,
+    active_migration_stage: Option<String>,
+    selected_migration_stage: Option<String>,
+    migration_status: Option<MigrationStatus>,
+    start_over_armed: bool,
+    persistence_snapshot: Option<PersistenceSnapshot>,
+    inspector_mode: InspectorMode,
+    outbox_offset: usize,
+    clear_all_armed: bool,
+    clear_selected_armed: bool,
+    selected_authority: Option<AuthoritySelection>,
+    state_artifact: Option<CanonicalStateArtifact>,
     perf: String,
     runtime_value: String,
 }
@@ -59,6 +75,7 @@ impl DevModel {
                 id: "waiting".to_owned(),
                 label: "Boon".to_owned(),
                 origin: ProjectOrigin::BuiltIn,
+                application: ApplicationIdentity::compiler_default(),
                 units: vec![SourceUnit {
                     path: "no source".to_owned(),
                     source: String::new(),
@@ -72,7 +89,20 @@ impl DevModel {
             runtime_sequence: None,
             runtime_value_path: None,
             language: None,
-            perf: "Preview mode idle, proof off".to_owned(),
+            source_publication_revision: None,
+            migration: None,
+            active_migration_stage: None,
+            selected_migration_stage: None,
+            migration_status: None,
+            start_over_armed: false,
+            persistence_snapshot: None,
+            inspector_mode: InspectorMode::Value,
+            outbox_offset: 0,
+            clear_all_armed: false,
+            clear_selected_armed: false,
+            selected_authority: None,
+            state_artifact: None,
+            perf: "Preview idle, state waiting, proof off".to_owned(),
             runtime_value: "Waiting for preview".to_owned(),
         }
     }
@@ -84,6 +114,15 @@ impl DevModel {
         if self.active.origin == ProjectOrigin::Custom {
             self.custom
                 .insert(self.active.id.clone(), self.active.clone());
+        }
+    }
+
+    fn take_source_publication(&mut self, revision: u64) -> bool {
+        if self.source_publication_revision == Some(revision) {
+            self.source_publication_revision = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -123,6 +162,63 @@ impl DevModel {
                 custom: true,
             });
         }
+    }
+
+    fn install_migration(
+        &mut self,
+        migration: Option<MigrationBundle>,
+        active_stage: Option<String>,
+    ) {
+        self.migration = migration;
+        self.active_migration_stage = active_stage;
+        self.selected_migration_stage = self
+            .migration
+            .as_ref()
+            .zip(self.active_migration_stage.as_deref())
+            .and_then(|(migration, active)| next_migration_stage(migration, active));
+        self.migration_status = None;
+        self.start_over_armed = false;
+    }
+
+    fn migration_status_text(&self) -> String {
+        self.migration_status.as_ref().map_or_else(
+            || {
+                self.active_migration_stage.as_ref().map_or_else(
+                    || "No migration sequence".to_owned(),
+                    |stage| format!("Active {stage}; select a forward target"),
+                )
+            },
+            |status| status.message.clone(),
+        )
+    }
+
+    fn clear_persistence_cache(&mut self) {
+        self.persistence_snapshot = None;
+        self.outbox_offset = 0;
+        self.clear_all_armed = false;
+        self.clear_selected_armed = false;
+        self.selected_authority = None;
+        self.state_artifact = None;
+    }
+
+    fn apply_persistence_snapshot(&mut self, snapshot: PersistenceSnapshot) -> bool {
+        if snapshot.revision != self.revision
+            || snapshot.application != self.active.application
+            || self
+                .persistence_snapshot
+                .as_ref()
+                .is_some_and(|current| current.snapshot_sequence >= snapshot.snapshot_sequence)
+        {
+            return false;
+        }
+        let sample_count = snapshot.outbox.samples.len();
+        self.outbox_offset = self
+            .outbox_offset
+            .min(sample_count.saturating_sub(OUTBOX_WINDOW_ROWS));
+        self.clear_all_armed = false;
+        self.clear_selected_armed = false;
+        self.persistence_snapshot = Some(snapshot);
+        true
     }
 }
 
@@ -234,6 +330,7 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         if result.change == DevChange::EditorText {
                             model.sync_editor(&state);
                             model.revision = model.revision.saturating_add(1);
+                            model.source_publication_revision = Some(model.revision);
                             language_worker.submit(
                                 model.revision,
                                 model.active_file,
@@ -315,14 +412,18 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                     Message::OpenEditor {
                         example_id,
                         label,
+                        application,
                         revision,
                         units,
+                        migration,
+                        migration_stage,
                     } => {
                         model.sync_editor(&state);
                         model.active = StoredProject {
                             id: example_id,
                             label,
                             origin: ProjectOrigin::BuiltIn,
+                            application,
                             units,
                         };
                         model.active_file = model.active.units.len().saturating_sub(1);
@@ -331,6 +432,9 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         model.runtime_sequence = None;
                         model.runtime_value_path = None;
                         model.language = None;
+                        model.source_publication_revision = None;
+                        model.install_migration(migration, migration_stage);
+                        model.clear_persistence_cache();
                         model.runtime_value = "Compiling preview...".to_owned();
                         state.replace_source(model.source());
                         language_worker.submit(
@@ -383,6 +487,7 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         path,
                         ok,
                         value,
+                        authority,
                     } => {
                         match apply_inspection_result(
                             &mut model,
@@ -392,6 +497,7 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                             path,
                             ok,
                             value,
+                            authority,
                         ) {
                             InspectionResultDisposition::Ignored => {}
                             InspectionResultDisposition::Applied => frame_changed = true,
@@ -412,6 +518,35 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         ));
                         frame_changed = true;
                     }
+                    Message::PreviewMigrationStatus(status) => {
+                        if apply_migration_status(&mut model, status) {
+                            state.set_status(model.migration_status_text());
+                            frame_changed = true;
+                        }
+                    }
+                    Message::PreviewPersistenceSnapshot(snapshot) => {
+                        let operation = snapshot.last_operation.clone();
+                        if model.apply_persistence_snapshot(*snapshot) {
+                            if let Some(operation) = operation {
+                                state.set_status(operation.message);
+                            }
+                            frame_changed = true;
+                        }
+                    }
+                    Message::PreviewPersistenceArtifact {
+                        request_id: _,
+                        revision,
+                        artifact,
+                    } => {
+                        if revision == model.revision {
+                            state.set_status(format!(
+                                "Cached {} bytes of canonical CBOR for Import Preview",
+                                artifact.bytes.len()
+                            ));
+                            model.state_artifact = Some(artifact);
+                            frame_changed = true;
+                        }
+                    }
                     Message::Ready {
                         role: Role::Preview,
                     } => {
@@ -426,6 +561,7 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
             }
             Wake::Language(Some(snapshot)) => {
                 if snapshot.revision == model.revision && snapshot.file_index == model.active_file {
+                    let snapshot_revision = snapshot.revision;
                     model.language = Some(snapshot);
                     model.sync_editor(&state);
                     if model.active.origin == ProjectOrigin::Custom {
@@ -433,10 +569,13 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                             .submit(PersistRequest::Save(model.active.clone()))
                             .map_err(|error| format!("custom autosave failed: {error}"))?;
                     }
-                    writer.send(&Message::DevSourceChanged {
-                        revision: model.revision,
-                        units: model.active.units.clone(),
-                    })?;
+                    if model.take_source_publication(snapshot_revision) {
+                        writer.send(&Message::DevSourceChanged {
+                            application: model.active.application.clone(),
+                            revision: model.revision,
+                            units: model.active.units.clone(),
+                        })?;
+                    }
                     frame_changed = true;
                 }
             }
@@ -486,6 +625,15 @@ fn handle_action(
     writer: &mut Connection,
     clipboard: &mut Option<arboard::Clipboard>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !matches!(&action, DevAction::MigrationStartOver) {
+        model.start_over_armed = false;
+    }
+    if !matches!(&action, DevAction::PersistenceClearAll) {
+        model.clear_all_armed = false;
+    }
+    if !matches!(&action, DevAction::PersistenceClearSelected) {
+        model.clear_selected_armed = false;
+    }
     match action {
         DevAction::None => {}
         DevAction::Previous | DevAction::Next => {
@@ -502,10 +650,22 @@ fn handle_action(
             model.sync_editor(state);
             model.active_file = index;
             model.language = None;
+            model.source_publication_revision = None;
             state.replace_source(model.source());
             language.submit(model.revision, index, model.active.units.clone());
         }
         DevAction::SelectFile(_) => {}
+        DevAction::SelectMigrationStage(stage_id) => {
+            if model.migration.as_ref().is_some_and(|migration| {
+                model
+                    .active_migration_stage
+                    .as_deref()
+                    .is_some_and(|active| is_forward_migration_stage(migration, active, &stage_id))
+            }) {
+                model.selected_migration_stage = Some(stage_id.clone());
+                state.set_status(format!("Selected migration target {stage_id}"));
+            }
+        }
         DevAction::NewProject => {
             model.sync_editor(state);
             let project = store.create_custom(model.catalog.iter().map(|entry| entry.id.clone()));
@@ -513,13 +673,16 @@ fn handle_action(
             model.custom.insert(project.id.clone(), project.clone());
             model.upsert_custom_catalog(&project);
             model.active = project;
+            model.install_migration(None, None);
             model.active_file = 0;
             model.revision = model.revision.saturating_add(1);
             model.language = None;
+            model.source_publication_revision = None;
             state.replace_source(model.source());
             state.begin_rename(&model.active.label);
             language.submit(model.revision, 0, model.active.units.clone());
             writer.send(&Message::DevRun {
+                application: model.active.application.clone(),
                 revision: model.revision,
                 units: model.active.units.clone(),
             })?;
@@ -650,7 +813,9 @@ fn handle_action(
         DevAction::Run => {
             model.sync_editor(state);
             model.revision = model.revision.saturating_add(1);
+            model.source_publication_revision = None;
             writer.send(&Message::DevRun {
+                application: model.active.application.clone(),
                 revision: model.revision,
                 units: model.active.units.clone(),
             })?;
@@ -674,14 +839,182 @@ fn handle_action(
         }
         DevAction::Test => {
             model.sync_editor(state);
-            model.revision = model.revision.saturating_add(1);
+            if model.migration.is_none() {
+                model.revision = model.revision.saturating_add(1);
+            }
+            model.source_publication_revision = None;
             model.request_id = model.request_id.saturating_add(1);
             writer.send(&Message::DevTest {
                 request_id: model.request_id,
+                application: model.active.application.clone(),
                 revision: model.revision,
                 units: model.active.units.clone(),
             })?;
             state.set_status("TEST running in preview...");
+        }
+        DevAction::MigrationPreview => {
+            let Some(stage_id) = model.selected_migration_stage.clone() else {
+                state.set_status("Select a forward migration stage");
+                return Ok(());
+            };
+            send_migration_command(
+                model,
+                writer,
+                MigrationCommand::Preview {
+                    stage_id: stage_id.clone(),
+                },
+            )?;
+            state.set_status(format!("Previewing migration to {stage_id}..."));
+        }
+        DevAction::MigrationActivate => {
+            let Some(stage_id) = model.selected_migration_stage.clone() else {
+                state.set_status("Select a forward migration stage");
+                return Ok(());
+            };
+            if model
+                .migration_status
+                .as_ref()
+                .and_then(|status| status.previewed_stage.as_deref())
+                != Some(stage_id.as_str())
+            {
+                state.set_status("Preview this exact stage before activation");
+                return Ok(());
+            }
+            send_migration_command(
+                model,
+                writer,
+                MigrationCommand::Activate {
+                    stage_id: stage_id.clone(),
+                },
+            )?;
+            state.set_status(format!("Activating migration to {stage_id}..."));
+        }
+        DevAction::MigrationRestart => {
+            send_migration_command(model, writer, MigrationCommand::Restart)?;
+            state.set_status("Restarting from durable state...");
+        }
+        DevAction::MigrationStartOver => {
+            if model.start_over_armed {
+                model.start_over_armed = false;
+                send_migration_command(
+                    model,
+                    writer,
+                    MigrationCommand::StartOver { confirmed: true },
+                )?;
+                state.set_status("Starting over from current stage defaults...");
+            } else {
+                model.start_over_armed = true;
+                state.set_status("Start Over deletes this namespace's authority; confirm again");
+            }
+        }
+        DevAction::SelectInspector(mode) => {
+            model.inspector_mode = mode;
+            if mode == InspectorMode::Outbox {
+                model.outbox_offset = model.outbox_offset.min(
+                    model
+                        .persistence_snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.outbox.samples.len())
+                        .saturating_sub(OUTBOX_WINDOW_ROWS),
+                );
+            }
+        }
+        DevAction::PersistenceFlush => {
+            send_persistence_command(model, writer, PersistenceCommand::Flush)?;
+            state.set_status("Flushing pending durable state...");
+        }
+        DevAction::PersistenceCompact => {
+            send_persistence_command(model, writer, PersistenceCommand::Compact)?;
+            state.set_status("Running persistence maintenance...");
+        }
+        DevAction::PersistenceClearAll => {
+            if model.clear_all_armed {
+                model.clear_all_armed = false;
+                send_persistence_command(
+                    model,
+                    writer,
+                    PersistenceCommand::ClearAll { confirmed: true },
+                )?;
+                state.set_status("Clearing all application authority and outbox state...");
+            } else {
+                model.clear_all_armed = true;
+                state.set_status(
+                    "Clear All deletes this application's authority and outbox; confirm again",
+                );
+            }
+        }
+        DevAction::PersistenceClearSelected => {
+            let Some(selection) = model.selected_authority.clone() else {
+                state.set_status("Select an authoritative memory or list first");
+                return Ok(());
+            };
+            if model.clear_selected_armed {
+                model.clear_selected_armed = false;
+                send_persistence_command(
+                    model,
+                    writer,
+                    PersistenceCommand::ClearSelected {
+                        selection,
+                        confirmed: true,
+                    },
+                )?;
+                state.set_status("Clearing the selected stored authority...");
+            } else {
+                model.clear_selected_armed = true;
+                state.set_status(format!(
+                    "Clear `{}` stored authority; confirm again",
+                    selection.semantic_path
+                ));
+            }
+        }
+        DevAction::PersistenceExport => {
+            send_persistence_command(model, writer, PersistenceCommand::ExportState)?;
+            state.set_status("Exporting bounded canonical CBOR state...");
+        }
+        DevAction::PersistenceImportPreview => {
+            let Some(artifact) = model.state_artifact.clone() else {
+                state.set_status("Export or load a bounded state artifact before Import Preview");
+                return Ok(());
+            };
+            send_persistence_command(
+                model,
+                writer,
+                PersistenceCommand::ImportPreview { artifact },
+            )?;
+            state.set_status("Settling imported state in an isolated preview...");
+        }
+        DevAction::PersistenceActivateImport => {
+            let Some(preview_id) = model
+                .persistence_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.import_preview.as_ref())
+                .map(|preview| preview.preview_id)
+            else {
+                state.set_status("Run Import Preview before activation");
+                return Ok(());
+            };
+            send_persistence_command(
+                model,
+                writer,
+                PersistenceCommand::ActivateImport { preview_id },
+            )?;
+            state.set_status(format!(
+                "Activating Import Preview #{preview_id} durably..."
+            ));
+        }
+        DevAction::OutboxPrevious => {
+            model.outbox_offset = model.outbox_offset.saturating_sub(OUTBOX_WINDOW_ROWS);
+        }
+        DevAction::OutboxNext => {
+            let max_offset = model
+                .persistence_snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.outbox.samples.len())
+                .saturating_sub(OUTBOX_WINDOW_ROWS);
+            model.outbox_offset = model
+                .outbox_offset
+                .saturating_add(OUTBOX_WINDOW_ROWS)
+                .min(max_offset);
         }
         DevAction::Save => {
             model.sync_editor(state);
@@ -703,6 +1036,7 @@ fn handle_action(
                     state.format(source);
                     model.sync_editor(state);
                     model.revision = model.revision.saturating_add(1);
+                    model.source_publication_revision = Some(model.revision);
                     language.submit(
                         model.revision,
                         model.active_file,
@@ -737,6 +1071,7 @@ fn handle_action(
             if edited {
                 model.sync_editor(state);
                 model.revision = model.revision.saturating_add(1);
+                model.source_publication_revision = Some(model.revision);
                 language.submit(
                     model.revision,
                     model.active_file,
@@ -765,9 +1100,11 @@ fn select_project(
     }
     if let Some(project) = model.custom.get(&id).cloned() {
         model.active = project;
+        model.install_migration(None, None);
         model.active_file = model.active.units.len().saturating_sub(1);
         model.revision = model.revision.saturating_add(1);
         model.language = None;
+        model.source_publication_revision = None;
         state.replace_source(model.source());
         language.submit(
             model.revision,
@@ -775,6 +1112,7 @@ fn select_project(
             model.active.units.clone(),
         );
         writer.send(&Message::DevRun {
+            application: model.active.application.clone(),
             revision: model.revision,
             units: model.active.units.clone(),
         })?;
@@ -784,6 +1122,103 @@ fn select_project(
         state.set_status("Opening versioned example...");
     }
     Ok(())
+}
+
+fn send_migration_command(
+    model: &mut DevModel,
+    writer: &mut Connection,
+    command: MigrationCommand,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    model.request_id = model.request_id.saturating_add(1);
+    writer.send(&Message::DevMigrationCommand {
+        request_id: model.request_id,
+        revision: model.revision,
+        command,
+    })?;
+    Ok(())
+}
+
+fn send_persistence_command(
+    model: &mut DevModel,
+    writer: &mut Connection,
+    command: PersistenceCommand,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    model.request_id = model.request_id.saturating_add(1);
+    writer.send(&Message::DevPersistenceCommand {
+        request_id: model.request_id,
+        revision: model.revision,
+        command,
+    })?;
+    Ok(())
+}
+
+fn apply_migration_status(model: &mut DevModel, status: MigrationStatus) -> bool {
+    if status.revision != model.revision {
+        return false;
+    }
+    let Some(migration) = model.migration.as_ref() else {
+        return false;
+    };
+    if migration.stage(&status.active_stage).is_none() {
+        return false;
+    }
+    model.active_migration_stage = Some(status.active_stage.clone());
+    match status.operation {
+        MigrationOperation::Activated => {
+            model.selected_migration_stage = next_migration_stage(migration, &status.active_stage);
+        }
+        MigrationOperation::Previewed => {
+            if let Some(target) = status.target_stage.as_ref()
+                && is_forward_migration_stage(migration, &status.active_stage, target)
+            {
+                model.selected_migration_stage = Some(target.clone());
+            }
+        }
+        MigrationOperation::Opened => {
+            let selected_is_forward =
+                model
+                    .selected_migration_stage
+                    .as_deref()
+                    .is_some_and(|selected| {
+                        is_forward_migration_stage(migration, &status.active_stage, selected)
+                    });
+            if !selected_is_forward {
+                model.selected_migration_stage =
+                    next_migration_stage(migration, &status.active_stage);
+            }
+        }
+        MigrationOperation::Restarted
+        | MigrationOperation::StartedOver
+        | MigrationOperation::Failed => {}
+    }
+    model.start_over_armed = false;
+    model.migration_status = Some(status);
+    true
+}
+
+fn next_migration_stage(migration: &MigrationBundle, active_stage: &str) -> Option<String> {
+    migration
+        .stages
+        .iter()
+        .position(|stage| stage.id == active_stage)
+        .and_then(|index| migration.stages.get(index + 1))
+        .map(|stage| stage.id.clone())
+}
+
+fn is_forward_migration_stage(
+    migration: &MigrationBundle,
+    active_stage: &str,
+    target_stage: &str,
+) -> bool {
+    let active = migration
+        .stages
+        .iter()
+        .position(|stage| stage.id == active_stage);
+    let target = migration
+        .stages
+        .iter()
+        .position(|stage| stage.id == target_stage);
+    matches!((active, target), (Some(active), Some(target)) if target > active)
 }
 
 fn clipboard_instance(
@@ -798,6 +1233,25 @@ fn clipboard_instance(
 fn build_frame(model: &DevModel, state: &DevState) -> boon_document::DocumentFrame {
     let inspector = inspector(model, state);
     let paths = model.source_paths();
+    let migration_status = model.migration_status_text();
+    let migration = model
+        .migration
+        .as_ref()
+        .zip(model.active_migration_stage.as_deref())
+        .map(|(migration, active_stage)| MigrationUiState {
+            stages: &migration.stages,
+            active_stage,
+            selected_stage: model
+                .selected_migration_stage
+                .as_deref()
+                .unwrap_or(active_stage),
+            previewed_stage: model
+                .migration_status
+                .as_ref()
+                .and_then(|status| status.previewed_stage.as_deref()),
+            status: &migration_status,
+            start_over_armed: model.start_over_armed,
+        });
     dev_frame(DevFrameState {
         catalog: &model.catalog,
         active_id: &model.active.id,
@@ -810,11 +1264,21 @@ fn build_frame(model: &DevModel, state: &DevState) -> boon_document::DocumentFra
         rename_prompt: state.rename_prompt(),
         editor_scroll: state.editor_scroll(),
         language: model.language.as_ref(),
+        migration,
         inspector: InspectorState {
             symbol: &inspector.symbol,
             static_type: &inspector.static_type,
             detail: &inspector.detail,
             current_value: &inspector.current_value,
+        },
+        persistence: PersistenceUiState {
+            snapshot: model.persistence_snapshot.as_ref(),
+            mode: model.inspector_mode,
+            outbox_offset: model.outbox_offset,
+            clear_all_armed: model.clear_all_armed,
+            clear_selected_armed: model.clear_selected_armed,
+            selected_authority: model.selected_authority.as_ref(),
+            has_state_artifact: model.state_artifact.is_some(),
         },
         status: state.status(),
         perf: &model.perf,
@@ -880,12 +1344,16 @@ fn prepare_inspection_request(model: &mut DevModel, state: &DevState) -> Option<
     if let Some(literal) = literal_value(&path) {
         model.pending_inspection = None;
         model.runtime_value_path = None;
+        model.selected_authority = None;
+        model.clear_selected_armed = false;
         model.runtime_value = literal;
         return None;
     }
     if !is_runtime_path(&path) {
         model.pending_inspection = None;
         model.runtime_value_path = None;
+        model.selected_authority = None;
+        model.clear_selected_armed = false;
         model.runtime_value = "No runtime binding at this position".to_owned();
         return None;
     }
@@ -914,6 +1382,8 @@ fn prepare_inspection_request(model: &mut DevModel, state: &DevState) -> Option<
     model.pending_inspection = Some((request_id, model.revision, path.clone()));
     if !preserve_current_value {
         model.runtime_value = "Reading current value...".to_owned();
+        model.selected_authority = None;
+        model.clear_selected_armed = false;
     }
     Some(Message::DevInspect {
         request_id,
@@ -952,6 +1422,7 @@ fn apply_inspection_result(
     path: String,
     ok: bool,
     value: String,
+    authority: Option<AuthoritySelection>,
 ) -> InspectionResultDisposition {
     if model.pending_inspection.as_ref() != Some(&(request_id, revision, path.clone())) {
         return InspectionResultDisposition::Ignored;
@@ -964,6 +1435,8 @@ fn apply_inspection_result(
         return InspectionResultDisposition::Retry;
     }
     model.runtime_value = value;
+    model.selected_authority = ok.then_some(authority).flatten();
+    model.clear_selected_armed = false;
     model.runtime_value_path = ok.then_some((revision, runtime_sequence, path));
     InspectionResultDisposition::Applied
 }
@@ -1040,6 +1513,7 @@ fn emit_dev_targets(
         DEV_RENAME_SAVE,
         DEV_RENAME_CANCEL,
         DEV_EDITOR,
+        DEV_EDITOR_INPUT_TARGET,
     ] {
         let Some(target) = view.target_for_source(node, None) else {
             continue;
@@ -1178,6 +1652,7 @@ fn commit_custom_file_change(
     persistence.submit(PersistRequest::Save(model.active.clone()))?;
     model.revision = model.revision.saturating_add(1);
     model.language = None;
+    model.source_publication_revision = None;
     state.replace_source(model.source());
     language.submit(
         model.revision,
@@ -1185,6 +1660,7 @@ fn commit_custom_file_change(
         model.active.units.clone(),
     );
     writer.send(&Message::DevRun {
+        application: model.active.application.clone(),
         revision: model.revision,
         units: model.active.units.clone(),
     })?;
@@ -1218,13 +1694,32 @@ fn perf_line(stats: &PreviewStats) -> String {
         ProofMode::Trace => "trace",
         ProofMode::Readback => "readback",
     };
+    let persistence = if !stats.persistence_worker_alive {
+        "state unavailable".to_owned()
+    } else if !stats.persistence_error.is_empty() {
+        "state error".to_owned()
+    } else {
+        format!(
+            "state v{} e{}/t{} pending {} q{}{}",
+            stats.persistence_schema_version,
+            stats.persistence_durable_epoch,
+            stats.persistence_durable_turn,
+            stats.persistence_pending_turns,
+            stats.persistence_queue_depth,
+            if stats.persistence_accepting {
+                ""
+            } else {
+                " paused"
+            },
+        )
+    };
     format!(
-        "Preview {mode}, last {:.2}ms, render {:.2}ms, age {}ms, proof {proof}, misses {}, drops {}",
+        "Preview {mode}, last {:.2}ms, render {:.2}ms, {persistence}, proof {proof}, misses {}, drops {}, age {}ms",
         f64::from(stats.input_to_present_micros) / 1000.0,
         f64::from(stats.render_micros) / 1000.0,
-        stats.sample_age_millis,
         stats.missed_frames,
         stats.dropped_snapshots,
+        stats.sample_age_millis,
     )
 }
 
@@ -1248,6 +1743,15 @@ mod tests {
         ];
         assert_eq!(adjacent_id(&entries, "a", false).as_deref(), Some("b"));
         assert_eq!(adjacent_id(&entries, "b", true).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn edited_source_publication_is_revision_bound_and_one_shot() {
+        let mut model = DevModel::waiting();
+        model.source_publication_revision = Some(7);
+        assert!(!model.take_source_publication(6));
+        assert!(model.take_source_publication(7));
+        assert!(!model.take_source_publication(7));
     }
 
     #[test]
@@ -1298,6 +1802,7 @@ mod tests {
                 path,
                 true,
                 "0".to_owned(),
+                None,
             ),
             InspectionResultDisposition::Applied
         );
@@ -1327,6 +1832,7 @@ mod tests {
                 path,
                 true,
                 "0".to_owned(),
+                None,
             ),
             InspectionResultDisposition::Retry
         );
@@ -1349,6 +1855,7 @@ mod tests {
                 path,
                 true,
                 "1".to_owned(),
+                None,
             ),
             InspectionResultDisposition::Applied
         );
@@ -1365,5 +1872,56 @@ mod tests {
         );
         assert_eq!(normalized_custom_label(&"x".repeat(80)).unwrap().len(), 64);
         assert!(normalized_custom_label(" \n\t ").is_err());
+    }
+
+    #[test]
+    fn migration_status_is_cached_and_drives_forward_only_controls() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("counter_migration")
+            .unwrap();
+        let migration = example.migration.expect("migration bundle");
+        let mut model = DevModel::waiting();
+        model.revision = 7;
+        model.install_migration(Some(migration), Some("v1".to_owned()));
+        let previewed = MigrationStatus {
+            request_id: Some(1),
+            revision: 7,
+            operation: MigrationOperation::Previewed,
+            ok: true,
+            active_stage: "v1".to_owned(),
+            previewed_stage: Some("v2".to_owned()),
+            target_stage: Some("v2".to_owned()),
+            target_schema_version: 2,
+            migration_step_count: 1,
+            deleted_memory_count: 0,
+            message: "candidate ready".to_owned(),
+        };
+        assert!(apply_migration_status(&mut model, previewed.clone()));
+        assert_eq!(model.selected_migration_stage.as_deref(), Some("v2"));
+        assert_eq!(model.migration_status.as_ref(), Some(&previewed));
+
+        let state = DevState::new(model.source());
+        let frame = build_frame(&model, &state);
+        for control in [
+            "dev.migration.preview",
+            "dev.migration.activate",
+            "dev.migration.restart",
+            "dev.migration.start_over",
+            "dev.migration.stage.v2",
+        ] {
+            assert!(
+                frame
+                    .nodes
+                    .contains_key(&boon_document::DocumentNodeId(control.to_owned())),
+                "cached migration UI omitted {control}"
+            );
+        }
+
+        let mut stale = previewed;
+        stale.revision = 6;
+        stale.message = "stale".to_owned();
+        assert!(!apply_migration_status(&mut model, stale));
+        assert_eq!(model.migration_status_text(), "candidate ready");
     }
 }

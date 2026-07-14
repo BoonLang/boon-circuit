@@ -1,5 +1,80 @@
 // Included by `../tests.rs`; kept in the parent test module for private IR helper access.
 
+fn parsed_cells_project() -> boon_parser::ParsedProgram {
+    boon_parser::parse_project(
+        "examples/cells.bn",
+        [
+            (
+                "examples/cells/defaults.bn".to_owned(),
+                include_str!("../../../../examples/cells/defaults.bn").to_owned(),
+            ),
+            (
+                "examples/cells/formula.bn".to_owned(),
+                include_str!("../../../../examples/cells/formula.bn").to_owned(),
+            ),
+            (
+                "examples/cells/cell.bn".to_owned(),
+                include_str!("../../../../examples/cells/cell.bn").to_owned(),
+            ),
+            (
+                "examples/cells/model.bn".to_owned(),
+                include_str!("../../../../examples/cells/model.bn").to_owned(),
+            ),
+            (
+                "examples/cells/columns.bn".to_owned(),
+                include_str!("../../../../examples/cells/columns.bn").to_owned(),
+            ),
+            (
+                "examples/cells/store.bn".to_owned(),
+                include_str!("../../../../examples/cells/store.bn").to_owned(),
+            ),
+            (
+                "examples/cells/view.bn".to_owned(),
+                include_str!("../../../../examples/cells/view.bn").to_owned(),
+            ),
+            (
+                "examples/cells.bn".to_owned(),
+                include_str!("../../../../examples/cells.bn").to_owned(),
+            ),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn mapped_record_list_keeps_its_runtime_result_schema() {
+    let parsed = parsed_cells_project();
+    let report = boon_typecheck::check(&parsed);
+    assert!(
+        report.list_map_bindings.iter().any(|binding| {
+            matches!(
+                (&binding.result_kind, &binding.result_type),
+                (
+                    boon_typecheck::ListMapResultKind::RuntimeValue,
+                    boon_typecheck::Type::List(item)
+                ) if matches!(item.as_ref(), boon_typecheck::Type::Object(shape) if !shape.open)
+            )
+        }),
+        "Cells runtime List/map must expose a closed record result: {:#?}",
+        report.list_map_bindings
+    );
+
+    let ir = lower(&parsed).unwrap();
+    let cells = ir
+        .semantic_memory
+        .iter()
+        .find(|memory| memory.identity.semantic_path == "cells")
+        .expect("Cells owns semantic list memory");
+    assert!(
+        matches!(
+            &cells.data_type,
+            SemanticDataType::List { item }
+                if matches!(item.as_ref(), SemanticDataType::Record { open: false, .. })
+        ),
+        "mapped list semantic memory must use the mapped record schema: {cells:#?}",
+    );
+}
+
 #[test]
 fn novywave_project_lowers_source_wrapped_controls() {
     let parsed = boon_parser::parse_project(

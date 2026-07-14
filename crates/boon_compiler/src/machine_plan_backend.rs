@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use boon_ir::{
     self as ir, BytesScalarArg, DerivedValueKind, FileBytesPath, InitialValue,
     ListAppendFieldValue, ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind,
@@ -52,6 +54,194 @@ fn demand_plan(program: &TypedProgram) -> DemandPlan {
     DemandPlan {
         root_derived_outputs: RootOutputDemand::Selected(field_ids),
     }
+}
+
+fn effect_contracts(program: &TypedProgram) -> Result<Vec<EffectContract>, PlanError> {
+    let mut effects = BTreeMap::new();
+    for expression in &program.expressions {
+        let host_operation = match &expression.kind {
+            AstExprKind::Call { function, .. } => function.as_str(),
+            AstExprKind::Pipe { op, .. } => op.as_str(),
+            _ => continue,
+        };
+        let Some(contract) = builtin_effect_contract(host_operation)? else {
+            continue;
+        };
+        if let Err(error) = contract.validate() {
+            return Err(PlanError::new(format!(
+                "host effect `{host_operation}` has no safe durable replay contract: {error}"
+            )));
+        }
+        if let Some(existing) = effects.insert(contract.effect_id, contract.clone())
+            && existing != contract
+        {
+            return Err(PlanError::new(format!(
+                "host effect `{host_operation}` has conflicting centralized contracts"
+            )));
+        }
+    }
+    Ok(effects.into_values().collect())
+}
+
+fn effect_outbox_schemas(effects: &[EffectContract]) -> Result<Vec<EffectOutboxSchema>, PlanError> {
+    let mut schemas = Vec::new();
+    for contract in effects {
+        let EffectReplay::Idempotent { key_type } = &contract.replay else {
+            continue;
+        };
+        let (intent_type, result_type) = match contract.host_operation.as_str() {
+            "File/write_bytes" => (
+                DataTypePlan::Record {
+                    fields: vec![
+                        DataTypeFieldPlan {
+                            name: "bytes".to_owned(),
+                            data_type: DataTypePlan::Bytes { fixed_len: None },
+                        },
+                        DataTypeFieldPlan {
+                            name: "path".to_owned(),
+                            data_type: DataTypePlan::Text,
+                        },
+                    ],
+                    open: false,
+                },
+                DataTypePlan::Text,
+            ),
+            other => {
+                return Err(PlanError::new(format!(
+                    "idempotent host effect `{other}` is missing a centralized intent/result outbox schema"
+                )));
+            }
+        };
+        schemas.push(EffectOutboxSchema::new(
+            contract.effect_id,
+            intent_type,
+            key_type.clone(),
+            result_type,
+        )?);
+    }
+    schemas.sort_by_key(|schema| schema.effect_id);
+    Ok(schemas)
+}
+
+fn effect_invocation_for_branch(
+    branch: &boon_ir::UpdateBranch,
+    expression_kind: PlanExpressionKind,
+    ordered_inputs: &[ValueRef],
+    output: Option<ValueRef>,
+) -> Result<Option<EffectInvocationPlan>, PlanError> {
+    let host_operation = match expression_kind {
+        PlanExpressionKind::FileWriteBytes => "File/write_bytes",
+        _ => return Ok(None),
+    };
+    let contract = builtin_effect_contract(host_operation)?.ok_or_else(|| {
+        PlanError::new(format!(
+            "effectful update has no centralized contract for `{host_operation}`"
+        ))
+    })?;
+    contract.validate()?;
+    let target = output.ok_or_else(|| {
+        PlanError::new(format!(
+            "effectful update `{}` has no result target",
+            branch.target
+        ))
+    })?;
+    Ok(Some(EffectInvocationPlan {
+        invocation_id: EffectInvocationId::from_semantic_route(
+            contract.effect_id,
+            &branch.source,
+            &branch.target,
+        )?,
+        effect_id: contract.effect_id,
+        intent_inputs: ordered_inputs.to_vec(),
+        idempotency_key: EffectIdempotencyKeyPlan::CanonicalIntentSha256,
+        result: EffectResultRoute {
+            target,
+            policy: contract.result_policy,
+        },
+        barrier: contract.barrier,
+    }))
+}
+
+fn output_root_plans(
+    program: &TypedProgram,
+    document: Option<&DocumentPlan>,
+    index: &ValueIndex,
+) -> Result<Vec<OutputRootPlan>, PlanError> {
+    let mut outputs = Vec::with_capacity(program.output_values.len());
+    for output in &program.output_values {
+        let demand = match output.demand {
+            ir::SemanticOutputDemandPolicy::HostDemanded => OutputDemandPolicy::HostDemanded,
+        };
+        let (contract, value) = match output.contract {
+            ir::SemanticOutputContractKind::RetainedVisual { kind } => {
+                let document = document.ok_or_else(|| {
+                    PlanError::new(format!(
+                        "retained visual output root `{}` has no compiled document value",
+                        output.root
+                    ))
+                })?;
+                let contract = match kind {
+                    ir::SemanticRetainedVisualKind::Document => OutputContractKind::Document,
+                    ir::SemanticRetainedVisualKind::Scene => OutputContractKind::Scene,
+                };
+                let expected = match document.root.kind {
+                    DocumentRootKind::Document => OutputContractKind::Document,
+                    DocumentRootKind::Scene => OutputContractKind::Scene,
+                };
+                if contract != expected {
+                    return Err(PlanError::new(format!(
+                        "retained visual output root `{}` does not match its document value",
+                        output.root
+                    )));
+                }
+                (
+                    contract,
+                    OutputValueRef::RetainedVisual {
+                        expression: document.root.expression,
+                    },
+                )
+            }
+            ir::SemanticOutputContractKind::HostValue => {
+                let data_type = output.data_type.as_ref().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "host output root `{}` has no closed inferred data type",
+                        output.root
+                    ))
+                })?;
+                let value = direct_statement_value_expr_id(&output.statement)
+                    .and_then(|expr_id| expression_path_string(program, expr_id))
+                    .and_then(|path| {
+                        path.strip_prefix("store.")
+                            .and_then(|local| index.resolve(local))
+                            .or_else(|| index.resolve(&path))
+                    })
+                    .or_else(|| index.resolve(&output.value_path))
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "host output root `{}` has no executable current value `{}`",
+                            output.root, output.value_path
+                        ))
+                    })?;
+                (
+                    OutputContractKind::HostValue {
+                        data_type: semantic_data_type_plan(data_type),
+                    },
+                    OutputValueRef::RuntimeValue { value },
+                )
+            }
+        };
+        outputs.push(OutputRootPlan::new(
+            output.root.clone(),
+            contract,
+            demand,
+            value,
+        )?);
+    }
+    outputs.sort_by(|left, right| left.name.cmp(&right.name));
+    if outputs.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(PlanError::new("typed output root names must be unique"));
+    }
+    Ok(outputs)
 }
 
 fn statement_is_source_group(program: &TypedProgram, statement: &AstStatement) -> bool {
@@ -228,10 +418,2044 @@ fn plan_derived_kind_from_ir(value: &DerivedValueKind) -> PlanDerivedKind {
     }
 }
 
+fn state_initial_provenance(slot: &ScalarStorageSlot) -> InitialProvenance {
+    match slot.initial_value_kind {
+        InitialValueKind::Unknown => InitialProvenance::MaterializedAuthority,
+        InitialValueKind::Text
+        | InitialValueKind::Number
+        | InitialValueKind::Byte
+        | InitialValueKind::Bool
+        | InitialValueKind::Bytes
+        | InitialValueKind::Enum
+        | InitialValueKind::RootInitialField
+        | InitialValueKind::RowInitialField => InitialProvenance::ReconstructableDefault,
+    }
+}
+
+#[derive(Clone)]
+struct MigrationStorageDefault {
+    value_type: PlanValueType,
+    initial_value_kind: InitialValueKind,
+    constant: Option<PlanConstantValue>,
+    indexed_edge: Option<ir::MigrationEdge>,
+}
+
+fn plan_value_type_from_semantic_data_type(data_type: &DataTypePlan) -> PlanValueType {
+    match data_type {
+        DataTypePlan::Text => PlanValueType::Text,
+        DataTypePlan::Number => PlanValueType::Number,
+        DataTypePlan::Byte => PlanValueType::Byte,
+        DataTypePlan::Bool => PlanValueType::Bool,
+        DataTypePlan::Bytes { fixed_len } => PlanValueType::Bytes {
+            fixed_len: *fixed_len,
+        },
+        DataTypePlan::Variant { .. } => PlanValueType::Enum,
+        DataTypePlan::Null
+        | DataTypePlan::Record { .. }
+        | DataTypePlan::List { .. }
+        | DataTypePlan::Error { .. }
+        | DataTypePlan::Unknown => PlanValueType::Unknown,
+    }
+}
+
+fn initial_value_kind_from_plan_type(value_type: PlanValueType) -> InitialValueKind {
+    match value_type {
+        PlanValueType::Text => InitialValueKind::Text,
+        PlanValueType::Number => InitialValueKind::Number,
+        PlanValueType::Byte => InitialValueKind::Byte,
+        PlanValueType::Bool => InitialValueKind::Bool,
+        PlanValueType::Bytes { .. } => InitialValueKind::Bytes,
+        PlanValueType::Enum => InitialValueKind::Enum,
+        PlanValueType::RootInitialField => InitialValueKind::RootInitialField,
+        PlanValueType::RowInitialField => InitialValueKind::RowInitialField,
+        PlanValueType::Unknown => InitialValueKind::Unknown,
+    }
+}
+
+fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstantValue> {
+    match data_type {
+        DataTypePlan::Text => Some(PlanConstantValue::Text {
+            value: String::new(),
+        }),
+        DataTypePlan::Number => Some(PlanConstantValue::Number { value: 0 }),
+        DataTypePlan::Byte => Some(PlanConstantValue::Byte { value: 0 }),
+        DataTypePlan::Bool => Some(PlanConstantValue::Bool { value: false }),
+        DataTypePlan::Bytes {
+            fixed_len: None | Some(0),
+        } => {
+            let mut hasher = Sha256::new();
+            hasher.update([]);
+            Some(PlanConstantValue::Bytes {
+                byte_len: 0,
+                sha256: format!("{:x}", hasher.finalize()),
+                inline_bytes: Some(Vec::new()),
+            })
+        }
+        DataTypePlan::Variant { variants } => {
+            variants.first().map(|variant| PlanConstantValue::Enum {
+                value: variant.tag.clone(),
+            })
+        }
+        DataTypePlan::Null
+        | DataTypePlan::Bytes { fixed_len: Some(_) }
+        | DataTypePlan::Record { .. }
+        | DataTypePlan::List { .. }
+        | DataTypePlan::Error { .. }
+        | DataTypePlan::Unknown => None,
+    }
+}
+
+fn semantic_memory_for_state<'a>(
+    program: &'a TypedProgram,
+    state: &ir::StateCell,
+) -> Option<&'a ir::SemanticMemory> {
+    program.semantic_memory.iter().find(|memory| {
+        semantic_memory_is_runtime_active(program, memory)
+            && matches!(
+                memory.runtime_backing,
+                ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
+                    | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. }
+                    if state_id == state.id
+            )
+    })
+}
+
+fn state_has_active_semantic_memory(program: &TypedProgram, state: &ir::StateCell) -> bool {
+    semantic_memory_for_state(program, state).is_some()
+}
+
+fn list_has_active_semantic_memory(program: &TypedProgram, list: &ir::ListMemory) -> bool {
+    program.semantic_memory.iter().any(|memory| {
+        semantic_memory_is_active(memory)
+            && matches!(
+                memory.runtime_backing,
+                ir::SemanticMemoryRuntimeBacking::List { list_id, .. } if list_id == list.id
+            )
+    })
+}
+
+struct MigrationListStorageDefault {
+    initializer_kind: ListInitializerKind,
+    range: Option<PlanRangeInitializer>,
+    initial_rows: Vec<PlanInitialListRow>,
+}
+
+fn migration_list_storage_default(
+    program: &TypedProgram,
+    list: &ir::ListMemory,
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+) -> Result<Option<MigrationListStorageDefault>, PlanError> {
+    let Some(destination_memory) = program.semantic_memory.iter().find(|memory| {
+        semantic_memory_is_active(memory)
+            && matches!(
+                memory.runtime_backing,
+                ir::SemanticMemoryRuntimeBacking::List { list_id, .. } if list_id == list.id
+            )
+    }) else {
+        return Ok(None);
+    };
+    let Some(edge) = program.migration_edges.iter().find(|edge| {
+        edge.transfer_kind == ir::MigrationTransferKind::List
+            && edge.destination.memory_id == destination_memory.id
+    }) else {
+        return Ok(None);
+    };
+    if edge.transform != ir::MigrationTransform::Identity || edge.source_leaves.len() != 1 {
+        return Err(PlanError::new(
+            "whole-list migration default requires one identity source",
+        ));
+    }
+    let source_memory = program
+        .semantic_memory
+        .get(edge.source_leaves[0].memory_id.as_usize())
+        .ok_or_else(|| PlanError::new("whole-list migration default source memory is absent"))?;
+    let source_list_id = match source_memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::List { list_id, .. } => list_id,
+        _ => {
+            return Err(PlanError::new(
+                "whole-list migration default source is not a list",
+            ));
+        }
+    };
+    let source_list = program
+        .lists
+        .iter()
+        .find(|source| source.id == source_list_id)
+        .ok_or_else(|| PlanError::new("whole-list migration default source list is absent"))?;
+    if matches!(source_list.initializer, ListInitializer::Unknown { .. }) {
+        return Err(PlanError::new(format!(
+            "whole-list migration from `{}` cannot reconstruct sparse default rows",
+            source_memory.identity.semantic_path
+        )));
+    }
+    let initial_rows = plan_initial_list_rows(
+        program,
+        list,
+        &source_list.initializer,
+        synthetic_initial_field_ids,
+    );
+    if initial_rows
+        .iter()
+        .flat_map(|row| &row.fields)
+        .any(|field| field.field_id.is_none())
+    {
+        return Err(PlanError::new(format!(
+            "whole-list migration from `{}` cannot map a default row field into `{}`",
+            source_memory.identity.semantic_path, destination_memory.identity.semantic_path
+        )));
+    }
+    Ok(Some(MigrationListStorageDefault {
+        initializer_kind: list_initializer_kind_from_ir(&source_list.initializer),
+        range: plan_range_initializer(&source_list.initializer),
+        initial_rows,
+    }))
+}
+
+fn compiled_list_storage_slot(
+    program: &TypedProgram,
+    list: &ir::ListMemory,
+    id: PlanStorageId,
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+) -> Result<ListStorageSlot, PlanError> {
+    let migration_default =
+        migration_list_storage_default(program, list, synthetic_initial_field_ids)?;
+    Ok(ListStorageSlot {
+        id,
+        list_id: plan_list_id(list.id),
+        scope_id: plan_scope_id(list.row_scope_id),
+        row_field_ids: list_row_field_ids(program, list, synthetic_initial_field_ids),
+        capacity: list.capacity,
+        hidden_key_type: list.hidden_key_type.clone(),
+        has_generation: list.has_generation,
+        initializer_kind: migration_default.as_ref().map_or_else(
+            || list_initializer_kind_from_ir(&list.initializer),
+            |value| value.initializer_kind,
+        ),
+        range: migration_default.as_ref().map_or_else(
+            || plan_range_initializer(&list.initializer),
+            |value| value.range,
+        ),
+        initial_rows: migration_default.map_or_else(
+            || {
+                plan_initial_list_rows(
+                    program,
+                    list,
+                    &list.initializer,
+                    synthetic_initial_field_ids,
+                )
+            },
+            |value| value.initial_rows,
+        ),
+    })
+}
+
+fn migration_identity_source_constant(
+    program: &TypedProgram,
+    edge: &ir::MigrationEdge,
+) -> Option<PlanConstantValue> {
+    if edge.transform != ir::MigrationTransform::Identity || edge.source_leaves.len() != 1 {
+        return None;
+    }
+    let source_memory = program
+        .semantic_memory
+        .get(edge.source_leaves[0].memory_id.as_usize())?;
+    let source_state_id = match source_memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
+        | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => state_id,
+        ir::SemanticMemoryRuntimeBacking::List { .. } => return None,
+    };
+    let source_state = program
+        .state_cells
+        .iter()
+        .find(|state| state.id == source_state_id)?;
+    initial_constant_value(&source_state.initial_value)
+}
+
+fn migration_storage_default(
+    program: &TypedProgram,
+    state: &ir::StateCell,
+) -> Option<MigrationStorageDefault> {
+    let memory = semantic_memory_for_state(program, state)?;
+    let edge = program
+        .migration_edges
+        .iter()
+        .find(|edge| edge.destination.memory_id == memory.id)?;
+    let data_type = semantic_data_type_plan(&memory.data_type).canonicalized();
+    let value_type = plan_value_type_from_semantic_data_type(&data_type);
+    if value_type == PlanValueType::Unknown {
+        return None;
+    }
+    if state.indexed && edge.transfer_kind == ir::MigrationTransferKind::IndexedField {
+        return Some(MigrationStorageDefault {
+            value_type,
+            initial_value_kind: InitialValueKind::RowInitialField,
+            constant: None,
+            indexed_edge: Some(edge.clone()),
+        });
+    }
+    let constant = migration_identity_source_constant(program, edge)
+        .or_else(|| deterministic_fresh_constant(&data_type))?;
+    Some(MigrationStorageDefault {
+        value_type,
+        initial_value_kind: initial_value_kind_from_plan_type(value_type),
+        constant: Some(constant),
+        indexed_edge: None,
+    })
+}
+
+fn list_initial_provenance(slot: &ListStorageSlot) -> InitialProvenance {
+    match slot.initializer_kind {
+        ListInitializerKind::Unknown => InitialProvenance::MaterializedAuthority,
+        ListInitializerKind::RecordLiteral
+        | ListInitializerKind::Range
+        | ListInitializerKind::Empty => InitialProvenance::ReconstructableDefault,
+    }
+}
+
+fn semantic_data_type_plan(value: &ir::SemanticDataType) -> DataTypePlan {
+    match value {
+        ir::SemanticDataType::Null => DataTypePlan::Null,
+        ir::SemanticDataType::Bool => DataTypePlan::Bool,
+        ir::SemanticDataType::Number => DataTypePlan::Number,
+        ir::SemanticDataType::Byte => DataTypePlan::Byte,
+        ir::SemanticDataType::Text => DataTypePlan::Text,
+        ir::SemanticDataType::Bytes { fixed_len } => DataTypePlan::Bytes {
+            fixed_len: fixed_len.map(|len| len as u64),
+        },
+        ir::SemanticDataType::Variant { variants } => DataTypePlan::Variant {
+            variants: variants
+                .iter()
+                .map(|variant| DataVariantPlan {
+                    tag: variant.tag.clone(),
+                    fields: variant
+                        .fields
+                        .iter()
+                        .map(|field| DataTypeFieldPlan {
+                            name: field.name.clone(),
+                            data_type: semantic_data_type_plan(&field.data_type),
+                        })
+                        .collect(),
+                    open: variant.open,
+                })
+                .collect(),
+        }
+        .canonicalized(),
+        ir::SemanticDataType::Record { fields, open } => DataTypePlan::Record {
+            fields: fields
+                .iter()
+                .map(|field| DataTypeFieldPlan {
+                    name: field.name.clone(),
+                    data_type: semantic_data_type_plan(&field.data_type),
+                })
+                .collect(),
+            open: *open,
+        }
+        .canonicalized(),
+        ir::SemanticDataType::List { item } => DataTypePlan::List {
+            item: Box::new(semantic_data_type_plan(item)),
+        },
+        ir::SemanticDataType::Unknown { .. } => DataTypePlan::Unknown,
+    }
+}
+
+fn semantic_memory_kind(kind: ir::SemanticMemoryKind) -> MemoryKind {
+    match kind {
+        ir::SemanticMemoryKind::RootScalar => MemoryKind::Scalar,
+        ir::SemanticMemoryKind::IndexedField => MemoryKind::IndexedField,
+        ir::SemanticMemoryKind::ListOwner => MemoryKind::List,
+    }
+}
+
+fn semantic_memory_owner(memory: &ir::SemanticMemory) -> MemoryOwnerPath {
+    MemoryOwnerPath {
+        canonical_module: memory.identity.canonical_module.clone(),
+        named_owner_path: memory.identity.owner_path.clone(),
+    }
+}
+
+fn semantic_memory_id(memory: &ir::SemanticMemory) -> Result<MemoryId, PlanError> {
+    MemoryId::from_identity(
+        &semantic_memory_owner(memory),
+        &memory.identity.semantic_path,
+        semantic_memory_kind(memory.identity.kind),
+    )
+}
+
+fn semantic_memory_is_active(memory: &ir::SemanticMemory) -> bool {
+    matches!(memory.status, ir::SemanticMemoryStatus::Active)
+}
+
+fn semantic_memory_is_runtime_active(program: &TypedProgram, memory: &ir::SemanticMemory) -> bool {
+    if !semantic_memory_is_active(memory) {
+        return false;
+    }
+    let ir::SemanticMemoryRuntimeBacking::IndexedState {
+        list_id: Some(list_id),
+        ..
+    } = memory.runtime_backing
+    else {
+        return true;
+    };
+    program.semantic_memory.iter().any(|candidate| {
+        semantic_memory_is_active(candidate)
+            && matches!(
+                candidate.runtime_backing,
+                ir::SemanticMemoryRuntimeBacking::List {
+                    list_id: candidate_list_id,
+                    ..
+                } if candidate_list_id == list_id
+            )
+    })
+}
+
+fn state_for_semantic_memory<'a>(
+    program: &'a TypedProgram,
+    memory: &ir::SemanticMemory,
+) -> Result<&'a ir::StateCell, PlanError> {
+    let state_id = match memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
+        | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => state_id,
+        ir::SemanticMemoryRuntimeBacking::List { .. } => {
+            return Err(PlanError::new(format!(
+                "semantic memory `{}` has list backing where state backing is required",
+                memory.identity.semantic_path
+            )));
+        }
+    };
+    program
+        .state_cells
+        .iter()
+        .find(|state| state.id == state_id)
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "semantic memory `{}` references missing state backing {}",
+                memory.identity.semantic_path, state_id.0
+            ))
+        })
+}
+
+fn scalar_slot_for_semantic_memory<'a>(
+    memory: &ir::SemanticMemory,
+    scalar_slots: &'a [ScalarStorageSlot],
+) -> Result<&'a ScalarStorageSlot, PlanError> {
+    let state_id = match memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
+        | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => state_id,
+        ir::SemanticMemoryRuntimeBacking::List { .. } => {
+            return Err(PlanError::new(format!(
+                "semantic memory `{}` has no scalar runtime backing",
+                memory.identity.semantic_path
+            )));
+        }
+    };
+    scalar_slots
+        .iter()
+        .find(|slot| slot.state_id == plan_state_id(state_id))
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "semantic memory `{}` cannot resolve state slot {}",
+                memory.identity.semantic_path, state_id.0
+            ))
+        })
+}
+
+fn semantic_scalar_memory_plan(
+    program: &TypedProgram,
+    memory: &ir::SemanticMemory,
+    scalar_slots: &[ScalarStorageSlot],
+) -> Result<MemoryPlan, PlanError> {
+    let slot = scalar_slot_for_semantic_memory(memory, scalar_slots)?;
+    let state = state_for_semantic_memory(program, memory)?;
+    if memory.identity.semantic_path == format!("hold_{}", state.source_line) {
+        return Err(PlanError::new(format!(
+            "persistence identity cannot use anonymous line-based state `{}` at line {}; name the state under a stable semantic owner",
+            memory.identity.semantic_path, state.source_line
+        )));
+    }
+    let kind = semantic_memory_kind(memory.identity.kind);
+    if kind == MemoryKind::List {
+        return Err(PlanError::new(
+            "list semantic memory cannot use scalar plan",
+        ));
+    }
+    if slot.indexed != (kind == MemoryKind::IndexedField) {
+        return Err(PlanError::new(format!(
+            "semantic memory `{}` kind disagrees with runtime backing",
+            memory.identity.semantic_path
+        )));
+    }
+    let owner = semantic_memory_owner(memory);
+    let memory_id = semantic_memory_id(memory)?;
+    let data_type = semantic_data_type_plan(&memory.data_type).canonicalized();
+    let mut leaves = memory
+        .leaves
+        .iter()
+        .map(|leaf| {
+            MemoryLeafPlan::new(
+                memory_id,
+                None,
+                leaf.semantic_path.clone(),
+                semantic_data_type_plan(&leaf.data_type),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    leaves.sort_by_key(|leaf| leaf.leaf_id);
+    if leaves.is_empty() {
+        return Err(PlanError::new(format!(
+            "semantic memory `{}` has no durable leaves",
+            memory.identity.semantic_path
+        )));
+    }
+    Ok(MemoryPlan {
+        runtime_slot: slot.id,
+        memory_id,
+        kind,
+        semantic_path: memory.identity.semantic_path.clone(),
+        type_fingerprint: data_type_fingerprint(&data_type)?,
+        data_type,
+        initial_provenance: state_initial_provenance(slot),
+        owner,
+        leaves,
+    })
+}
+
+fn semantic_list_memory_plan(
+    program: &TypedProgram,
+    memory: &ir::SemanticMemory,
+    list_slots: &[ListStorageSlot],
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+    include_draining_fields: bool,
+) -> Result<ListMemoryPlan, PlanError> {
+    let list_id = match memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::List { list_id, .. } => list_id,
+        _ => {
+            return Err(PlanError::new(format!(
+                "semantic list `{}` has no list runtime backing",
+                memory.identity.semantic_path
+            )));
+        }
+    };
+    let list = program
+        .lists
+        .iter()
+        .find(|list| list.id == list_id)
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "semantic list `{}` references missing list backing {}",
+                memory.identity.semantic_path, list_id.0
+            ))
+        })?;
+    let slot = list_slots
+        .iter()
+        .find(|slot| slot.list_id == plan_list_id(list_id))
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "semantic list `{}` cannot resolve runtime slot {}",
+                memory.identity.semantic_path, list_id.0
+            ))
+        })?;
+    let owner = semantic_memory_owner(memory);
+    let memory_id = semantic_memory_id(memory)?;
+    let indexed_memory = program
+        .semantic_memory
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.runtime_backing,
+                ir::SemanticMemoryRuntimeBacking::IndexedState {
+                    list_id: Some(candidate_list),
+                    ..
+                } if candidate_list == list_id
+            )
+        })
+        .collect::<Vec<_>>();
+    let has_indexed_memory = !indexed_memory.is_empty();
+    let semantic_list_type = semantic_data_type_plan(&memory.data_type).canonicalized();
+    let DataTypePlan::List { item } = semantic_list_type.clone() else {
+        return Err(PlanError::new(format!(
+            "semantic list `{}` does not have a list data type",
+            memory.identity.semantic_path
+        )));
+    };
+    let DataTypePlan::Record {
+        fields: semantic_row_fields,
+        ..
+    } = *item
+    else {
+        return Err(PlanError::new(format!(
+            "semantic list `{}` does not have a record row type",
+            memory.identity.semantic_path
+        )));
+    };
+    let mut row_fields = Vec::new();
+    if !has_indexed_memory {
+        for field in semantic_row_fields {
+            let runtime_field_id = storage_input_field_id(
+                program,
+                &list.name,
+                &field.name,
+                synthetic_initial_field_ids,
+            )
+            .filter(|field_id| slot.row_field_ids.contains(field_id));
+            let Some(runtime_field_id) = runtime_field_id else {
+                continue;
+            };
+            row_fields.push(MemoryLeafPlan::new(
+                memory_id,
+                Some(runtime_field_id),
+                format!("{}.{}", memory.identity.semantic_path, field.name),
+                field.data_type,
+            )?);
+        }
+    } else {
+        for ((_, field_name), runtime_field_id) in
+            synthetic_initial_field_ids
+                .iter()
+                .filter(|((list_name, _), field_id)| {
+                    list_name == &list.name && slot.row_field_ids.contains(field_id)
+                })
+        {
+            let field_type = semantic_row_fields
+                .iter()
+                .find(|field| field.name == *field_name)
+                .map(|field| field.data_type.clone())
+                .or_else(|| match &list.initializer {
+                    ListInitializer::Range { .. } if matches!(field_name.as_str(), "index" | "value") => {
+                        Some(DataTypePlan::Number)
+                    }
+                    ListInitializer::RecordLiteral { rows } => rows
+                        .iter()
+                        .flat_map(|row| &row.fields)
+                        .find(|field| field.name == *field_name)
+                        .and_then(|field| data_type_plan_from_initial_value(&field.value)),
+                    ListInitializer::Empty | ListInitializer::Unknown { .. } => None,
+                    ListInitializer::Range { .. } => None,
+                })
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "authoritative constructor field `{}.{field_name}` has no canonical row type",
+                        list.name
+                    ))
+                })?;
+            row_fields.push(MemoryLeafPlan::new(
+                memory_id,
+                Some(*runtime_field_id),
+                format!("{}.$input${field_name}", memory.identity.semantic_path),
+                field_type,
+            )?);
+        }
+        for field_memory in indexed_memory.into_iter().filter(|field| {
+            include_draining_fields || semantic_memory_is_runtime_active(program, field)
+        }) {
+            let field_id = match field_memory.runtime_backing {
+                ir::SemanticMemoryRuntimeBacking::IndexedState {
+                    field_id: Some(field_id),
+                    ..
+                } => plan_field_id(field_id),
+                _ => {
+                    return Err(PlanError::new(format!(
+                        "indexed semantic memory `{}` has no runtime field backing",
+                        field_memory.identity.semantic_path
+                    )));
+                }
+            };
+            if !slot.row_field_ids.contains(&field_id) {
+                return Err(PlanError::new(format!(
+                    "indexed semantic memory `{}` field {} is absent from list slot",
+                    field_memory.identity.semantic_path, field_id.0
+                )));
+            }
+            row_fields.push(MemoryLeafPlan::new(
+                memory_id,
+                Some(field_id),
+                field_memory.identity.semantic_path.clone(),
+                semantic_data_type_plan(&field_memory.data_type),
+            )?);
+        }
+    }
+    let mut runtime_field_ids = BTreeSet::new();
+    if row_fields.iter().any(|field| {
+        field
+            .runtime_field_id
+            .is_none_or(|field_id| !runtime_field_ids.insert(field_id))
+    }) {
+        return Err(PlanError::new(format!(
+            "semantic list `{}` has duplicate or missing authoritative row field identities",
+            memory.identity.semantic_path
+        )));
+    }
+    row_fields.sort_by_key(|field| field.leaf_id);
+    let row_type = DataTypePlan::Record {
+        fields: row_fields
+            .iter()
+            .map(|field| DataTypeFieldPlan {
+                name: field
+                    .semantic_path
+                    .rsplit_once('.')
+                    .map_or_else(|| field.semantic_path.clone(), |(_, name)| name.to_owned()),
+                data_type: field.data_type.clone(),
+            })
+            .collect(),
+        open: false,
+    }
+    .canonicalized();
+    let data_type = if has_indexed_memory || !row_fields.is_empty() {
+        DataTypePlan::List {
+            item: Box::new(row_type),
+        }
+    } else {
+        semantic_list_type
+    };
+    ListMemoryPlan::new(
+        slot.id,
+        memory.identity.semantic_path.clone(),
+        data_type,
+        list_initial_provenance(slot),
+        owner,
+        list.hidden_key_type.clone(),
+        list.has_generation,
+        row_fields,
+    )
+}
+
+fn data_type_plan_from_initial_value(value: &InitialValue) -> Option<DataTypePlan> {
+    Some(match value {
+        InitialValue::Text { .. } => DataTypePlan::Text,
+        InitialValue::Number { .. } => DataTypePlan::Number,
+        InitialValue::Byte { .. } => DataTypePlan::Byte,
+        InitialValue::Bool { .. } => DataTypePlan::Bool,
+        InitialValue::Bytes { fixed_len, .. } => DataTypePlan::Bytes {
+            fixed_len: fixed_len.map(|len| len as u64),
+        },
+        InitialValue::Enum { value } => DataTypePlan::Variant {
+            variants: vec![DataVariantPlan {
+                tag: value.clone(),
+                fields: Vec::new(),
+                open: false,
+            }],
+        },
+        InitialValue::RootInitialField { .. }
+        | InitialValue::RowInitialField { .. }
+        | InitialValue::Unknown { .. } => return None,
+    })
+}
+
+fn migration_leaf_ref(
+    program: &TypedProgram,
+    source: &ir::MigrationSourceLeaf,
+    indexed_list_owner: Option<&MigrationListOwnerPlan>,
+    data_type: DataTypePlan,
+) -> Result<MigrationLeafRefPlan, PlanError> {
+    let memory = program
+        .semantic_memory
+        .get(source.memory_id.as_usize())
+        .ok_or_else(|| PlanError::new("migration source references missing semantic memory"))?;
+    MigrationLeafRefPlan::new(
+        indexed_list_owner.map_or(semantic_memory_id(memory), |owner| Ok(owner.memory_id))?,
+        source.semantic_path.clone(),
+        data_type,
+    )
+}
+
+fn migration_indexed_list_owner(
+    program: &TypedProgram,
+    memory: &ir::SemanticMemory,
+) -> Result<MigrationListOwnerPlan, PlanError> {
+    let list_id = match memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::IndexedState {
+            list_id: Some(list_id),
+            ..
+        } => list_id,
+        _ => {
+            return Err(PlanError::new(format!(
+                "indexed migration authority `{}` has no owning list backing",
+                memory.identity.semantic_path
+            )));
+        }
+    };
+    let list_memory = program
+        .semantic_memory
+        .iter()
+        .find(|candidate| {
+            matches!(
+                candidate.runtime_backing,
+                ir::SemanticMemoryRuntimeBacking::List {
+                    list_id: candidate_list_id,
+                    ..
+                } if candidate_list_id == list_id
+            )
+        })
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "indexed migration authority `{}` cannot resolve owning list {}",
+                memory.identity.semantic_path, list_id.0
+            ))
+        })?;
+    MigrationListOwnerPlan::new(
+        semantic_memory_owner(list_memory),
+        list_memory.identity.semantic_path.clone(),
+    )
+}
+
+fn migration_input_data_type(
+    program: &TypedProgram,
+    sources: &[&ir::MigrationSourceLeaf],
+    leaves: &[MigrationLeafRefPlan],
+) -> Result<DataTypePlan, PlanError> {
+    let first = sources
+        .first()
+        .ok_or_else(|| PlanError::new("migration input has no source leaves"))?;
+    if sources
+        .iter()
+        .any(|source| source.memory_id != first.memory_id)
+    {
+        return Err(PlanError::new(
+            "one DRAIN input cannot span multiple semantic memories",
+        ));
+    }
+    if sources.len() == 1 {
+        return Ok(leaves[0].data_type.clone());
+    }
+    let memory = program
+        .semantic_memory
+        .get(first.memory_id.as_usize())
+        .ok_or_else(|| PlanError::new("migration input references missing semantic memory"))?;
+    Ok(semantic_data_type_plan(&memory.data_type))
+}
+
+fn durable_migration_source_list_plan(
+    program: &TypedProgram,
+    source: &ir::MigrationSourceLeaf,
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+) -> Result<ListMemoryPlan, PlanError> {
+    let memory = program
+        .semantic_memory
+        .get(source.memory_id.as_usize())
+        .ok_or_else(|| PlanError::new("migration source references missing semantic memory"))?;
+    if memory.identity.kind != ir::SemanticMemoryKind::ListOwner {
+        return Err(PlanError::new(format!(
+            "migration source `{}` is not a list authority",
+            memory.identity.semantic_path
+        )));
+    }
+    let list_id = match memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::List { list_id, .. } => list_id,
+        _ => unreachable!("list-owner memory must have list backing"),
+    };
+    let list = program
+        .lists
+        .iter()
+        .find(|list| list.id == list_id)
+        .ok_or_else(|| PlanError::new("migration source list backing is absent"))?;
+    let catalog_slot =
+        compiled_list_storage_slot(program, list, PlanStorageId(0), synthetic_initial_field_ids)?;
+    semantic_list_memory_plan(
+        program,
+        memory,
+        std::slice::from_ref(&catalog_slot),
+        synthetic_initial_field_ids,
+        true,
+    )
+}
+
+fn durable_migration_source_type(
+    program: &TypedProgram,
+    source: &ir::MigrationSourceLeaf,
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+) -> Result<DataTypePlan, PlanError> {
+    let memory = program
+        .semantic_memory
+        .get(source.memory_id.as_usize())
+        .ok_or_else(|| PlanError::new("migration source references missing semantic memory"))?;
+    if memory.identity.kind == ir::SemanticMemoryKind::ListOwner {
+        return Ok(durable_migration_source_list_plan(
+            program,
+            source,
+            synthetic_initial_field_ids,
+        )?
+        .data_type);
+    }
+    Ok(semantic_data_type_plan(&source.data_type))
+}
+
+fn durable_migration_destination_type(
+    edge: &ir::MigrationEdge,
+    memory_id: MemoryId,
+    memory: &[MemoryPlan],
+    lists: &[ListMemoryPlan],
+) -> Result<DataTypePlan, PlanError> {
+    match edge.transfer_kind {
+        ir::MigrationTransferKind::List => lists
+            .iter()
+            .find(|list| list.memory_id == memory_id)
+            .map(|list| list.data_type.clone())
+            .ok_or_else(|| {
+                PlanError::new("migration destination list is absent from target schema")
+            }),
+        ir::MigrationTransferKind::Scalar | ir::MigrationTransferKind::IndexedField => {
+            let target = memory
+                .iter()
+                .find(|target| target.memory_id == memory_id)
+                .ok_or_else(|| {
+                    PlanError::new("migration destination memory is absent from target schema")
+                })?;
+            if target.semantic_path == edge.destination.semantic_path {
+                return Ok(target.data_type.clone());
+            }
+            target
+                .leaves
+                .iter()
+                .find(|leaf| leaf.semantic_path == edge.destination.semantic_path)
+                .map(|leaf| leaf.data_type.clone())
+                .ok_or_else(|| {
+                    PlanError::new("migration destination leaf is absent from target schema")
+                })
+        }
+    }
+}
+
+fn migration_row_field_key(semantic_path: &str) -> &str {
+    semantic_path
+        .rsplit_once('.')
+        .map_or(semantic_path, |(_, field)| field)
+}
+
+fn migration_row_fields_by_key(
+    list: &ListMemoryPlan,
+) -> Result<BTreeMap<String, &MemoryLeafPlan>, PlanError> {
+    let mut fields = BTreeMap::new();
+    for field in &list.row_fields {
+        let key = migration_row_field_key(&field.semantic_path).to_owned();
+        if fields.insert(key.clone(), field).is_some() {
+            return Err(PlanError::new(format!(
+                "whole-list migration row schema has duplicate durable field `{key}`"
+            )));
+        }
+    }
+    Ok(fields)
+}
+
+fn migration_list_row_fields(
+    program: &TypedProgram,
+    edge: &ir::MigrationEdge,
+    destination_memory_id: MemoryId,
+    target_lists: &[ListMemoryPlan],
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+) -> Result<Vec<MigrationListRowFieldPlan>, PlanError> {
+    if edge.transfer_kind != ir::MigrationTransferKind::List {
+        return Ok(Vec::new());
+    }
+    if edge.transform != ir::MigrationTransform::Identity || edge.source_leaves.len() != 1 {
+        return Err(PlanError::new(
+            "whole-list migration must be one identity transfer",
+        ));
+    }
+    let source = durable_migration_source_list_plan(
+        program,
+        &edge.source_leaves[0],
+        synthetic_initial_field_ids,
+    )?;
+    let destination = target_lists
+        .iter()
+        .find(|list| list.memory_id == destination_memory_id)
+        .ok_or_else(|| PlanError::new("migration destination list is absent from target schema"))?;
+    if source.has_generation != destination.has_generation {
+        return Err(PlanError::new(
+            "whole-list identity migration changes hidden row identity schema",
+        ));
+    }
+
+    let source_fields = migration_row_fields_by_key(&source)?;
+    let destination_fields = migration_row_fields_by_key(destination)?;
+    if destination_fields
+        .keys()
+        .any(|field| !source_fields.contains_key(field))
+        || source_fields
+            .keys()
+            .any(|field| !destination_fields.contains_key(field) && !field.starts_with("$input$"))
+    {
+        return Err(PlanError::new(format!(
+            "whole-list identity migration from `{}` to `{}` changes durable row fields (source={:?}, destination={:?}); migrate changed row fields explicitly",
+            source.semantic_path,
+            destination.semantic_path,
+            source_fields.keys().collect::<Vec<_>>(),
+            destination_fields.keys().collect::<Vec<_>>()
+        )));
+    }
+
+    source_fields
+        .into_iter()
+        .map(|(key, source_field)| {
+            let destination = destination_fields
+                .get(&key)
+                .map(|destination_field| {
+                    if source_field.data_type != destination_field.data_type
+                        || source_field.type_fingerprint != destination_field.type_fingerprint
+                    {
+                        return Err(PlanError::new(format!(
+                            "whole-list identity migration changes durable row field `{key}` type"
+                        )));
+                    }
+                    MigrationDestinationPlan::new(
+                        destination.memory_id,
+                        destination_field.semantic_path.clone(),
+                        destination_field.data_type.clone(),
+                    )
+                })
+                .transpose()?;
+            Ok(MigrationListRowFieldPlan {
+                source: MigrationLeafRefPlan::new(
+                    source.memory_id,
+                    source_field.semantic_path.clone(),
+                    source_field.data_type.clone(),
+                )?,
+                destination,
+            })
+        })
+        .collect()
+}
+
+type MigrationEnvironment = BTreeMap<String, MigrationExpressionPlan>;
+
+struct MigrationExpressionLowerer<'a> {
+    program: &'a TypedProgram,
+    drain_inputs: BTreeMap<usize, MigrationInputId>,
+    active_functions: Vec<String>,
+}
+
+impl MigrationExpressionLowerer<'_> {
+    fn lower_pipeline(
+        &mut self,
+        pipeline: &[ir::ExprId],
+    ) -> Result<MigrationExpressionPlan, PlanError> {
+        let mut previous = None;
+        let environment = MigrationEnvironment::new();
+        for expr_id in pipeline {
+            previous = Some(self.lower_expr(expr_id.as_usize(), previous, &environment)?);
+        }
+        previous.ok_or_else(|| PlanError::new("migration expression pipeline is empty"))
+    }
+
+    fn lower_expr(
+        &mut self,
+        expr_id: usize,
+        pipeline_input: Option<MigrationExpressionPlan>,
+        environment: &MigrationEnvironment,
+    ) -> Result<MigrationExpressionPlan, PlanError> {
+        let expr = self.program.expressions.get(expr_id).ok_or_else(|| {
+            PlanError::new(format!(
+                "migration recipe references missing expression {expr_id}"
+            ))
+        })?;
+        match &expr.kind {
+            AstExprKind::Drain { .. } => self
+                .drain_inputs
+                .get(&expr_id)
+                .copied()
+                .map(|input_id| MigrationExpressionPlan::Input { input_id })
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "migration expression {expr_id} references an unbound DRAIN input"
+                    ))
+                }),
+            AstExprKind::Delimiter => pipeline_input.ok_or_else(|| {
+                PlanError::new(format!(
+                    "migration expression {expr_id} has a pipeline placeholder without input"
+                ))
+            }),
+            AstExprKind::Identifier(name) => environment.get(name).cloned().ok_or_else(|| {
+                PlanError::new(format!(
+                    "migration expression reads unbound identifier `{name}`"
+                ))
+            }),
+            AstExprKind::Path(parts) => {
+                let (root, fields) = parts
+                    .split_first()
+                    .ok_or_else(|| PlanError::new("migration expression contains an empty path"))?;
+                let input = environment.get(root).cloned().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "migration expression reads unbound path `{}`",
+                        parts.join(".")
+                    ))
+                })?;
+                if fields.is_empty() {
+                    Ok(input)
+                } else {
+                    Ok(MigrationExpressionPlan::Project {
+                        input: Box::new(input),
+                        fields: fields.to_vec(),
+                    })
+                }
+            }
+            AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+                Ok(MigrationExpressionPlan::Text {
+                    value: value.clone(),
+                })
+            }
+            AstExprKind::Number(value) => Ok(MigrationExpressionPlan::Number {
+                value: value.parse::<i64>().map_err(|_| {
+                    PlanError::new(format!(
+                        "migration numeric literal `{value}` is not a target-neutral integer"
+                    ))
+                })?,
+            }),
+            AstExprKind::ByteLiteral { value, .. } => {
+                Ok(MigrationExpressionPlan::Byte { value: *value })
+            }
+            AstExprKind::Bool(value) => Ok(MigrationExpressionPlan::Bool { value: *value }),
+            AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
+                Ok(MigrationExpressionPlan::Variant { tag: tag.clone() })
+            }
+            AstExprKind::TaggedObject { tag, fields } => Ok(MigrationExpressionPlan::Tagged {
+                tag: tag.clone(),
+                fields: self.lower_fields(fields, environment)?,
+            }),
+            AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+                Ok(MigrationExpressionPlan::Record {
+                    fields: self.lower_fields(fields, environment)?,
+                })
+            }
+            AstExprKind::ListLiteral { items, .. } => Ok(MigrationExpressionPlan::List {
+                items: items
+                    .iter()
+                    .map(|item| self.lower_expr(*item, None, environment))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            AstExprKind::BytesLiteral { items, .. } => Ok(MigrationExpressionPlan::Bytes {
+                items: items
+                    .iter()
+                    .map(|item| self.lower_expr(*item, None, environment))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            AstExprKind::Infix { left, op, right } => Ok(MigrationExpressionPlan::Infix {
+                operator: op.clone(),
+                left: Box::new(self.lower_expr(*left, None, environment)?),
+                right: Box::new(self.lower_expr(*right, None, environment)?),
+            }),
+            AstExprKind::Call { function, args } => {
+                self.lower_call(function, None, args, environment)
+            }
+            AstExprKind::Pipe { input, op, args } => {
+                let input = self.lower_expr(*input, pipeline_input, environment)?;
+                self.lower_call(op, Some(input), args, environment)
+            }
+            AstExprKind::When { input } => {
+                let input = self.lower_expr(*input, pipeline_input, environment)?;
+                let arms = self.lower_match_arms(expr_id, environment)?;
+                Ok(MigrationExpressionPlan::Match {
+                    input: Box::new(input),
+                    arms,
+                })
+            }
+            AstExprKind::Source
+            | AstExprKind::Draining { .. }
+            | AstExprKind::Hold { .. }
+            | AstExprKind::Latest
+            | AstExprKind::Then { .. }
+            | AstExprKind::MatchArm { .. }
+            | AstExprKind::Unknown(_) => Err(PlanError::new(format!(
+                "expression {expr_id} is not legal in a target-neutral migration recipe"
+            ))),
+        }
+    }
+
+    fn lower_fields(
+        &mut self,
+        fields: &[boon_parser::AstRecordField],
+        environment: &MigrationEnvironment,
+    ) -> Result<Vec<MigrationObjectFieldPlan>, PlanError> {
+        fields
+            .iter()
+            .map(|field| {
+                if field.spread {
+                    return Err(PlanError::new(
+                        "migration record spread is not a closed target-neutral recipe",
+                    ));
+                }
+                Ok(MigrationObjectFieldPlan {
+                    name: field.name.clone(),
+                    value: self.lower_expr(field.value, None, environment)?,
+                })
+            })
+            .collect()
+    }
+
+    fn lower_call(
+        &mut self,
+        function: &str,
+        input: Option<MigrationExpressionPlan>,
+        args: &[AstCallArg],
+        environment: &MigrationEnvironment,
+    ) -> Result<MigrationExpressionPlan, PlanError> {
+        if let Some(definition) = self
+            .program
+            .functions
+            .iter()
+            .find(|definition| definition.name == function)
+        {
+            return self.inline_function(definition, input, args, environment);
+        }
+        if !migration_call_is_supported(function) {
+            return Err(PlanError::new(format!(
+                "pure migration call `{function}` is outside the target-neutral recipe VM"
+            )));
+        }
+
+        let binding = matches!(function, "List/map" | "List/retain")
+            .then(|| args.first())
+            .flatten()
+            .filter(|argument| argument.name.is_none())
+            .and_then(|argument| self.program.expressions.get(argument.value))
+            .and_then(|expr| match &expr.kind {
+                AstExprKind::Identifier(name) => Some(name.clone()),
+                _ => None,
+            });
+        let mut arguments = Vec::new();
+        for (index, argument) in args.iter().enumerate() {
+            if index == 0 && binding.is_some() && argument.name.is_none() {
+                continue;
+            }
+            let value = if let Some(binding) = &binding {
+                let mut lambda_environment = environment
+                    .iter()
+                    .map(|(name, value)| (name.clone(), shift_migration_parameters(value, 1)))
+                    .collect::<MigrationEnvironment>();
+                lambda_environment.insert(
+                    binding.clone(),
+                    MigrationExpressionPlan::Parameter { index: 0 },
+                );
+                MigrationArgumentValuePlan::Lambda {
+                    parameter_count: 1,
+                    body: Box::new(self.lower_expr(argument.value, None, &lambda_environment)?),
+                }
+            } else {
+                MigrationArgumentValuePlan::Expression {
+                    value: Box::new(self.lower_expr(argument.value, None, environment)?),
+                }
+            };
+            arguments.push(MigrationCallArgumentPlan {
+                name: argument.name.clone(),
+                value,
+            });
+        }
+        Ok(MigrationExpressionPlan::Call {
+            function: function.to_owned(),
+            input: input.map(Box::new),
+            arguments,
+        })
+    }
+
+    fn inline_function(
+        &mut self,
+        definition: &ir::FunctionDefinition,
+        input: Option<MigrationExpressionPlan>,
+        args: &[AstCallArg],
+        environment: &MigrationEnvironment,
+    ) -> Result<MigrationExpressionPlan, PlanError> {
+        if self
+            .active_functions
+            .iter()
+            .any(|active| active == &definition.name)
+        {
+            return Err(PlanError::new(format!(
+                "recursive migration function `{}` cannot be canonicalized",
+                definition.name
+            )));
+        }
+        let mut values = BTreeMap::<String, MigrationExpressionPlan>::new();
+        let mut positional = args.iter().filter(|argument| argument.name.is_none());
+        if let Some(input) = input {
+            let first = definition.args.first().ok_or_else(|| {
+                PlanError::new(format!(
+                    "piped migration function `{}` has no input parameter",
+                    definition.name
+                ))
+            })?;
+            values.insert(first.clone(), input);
+        }
+        for parameter in definition.args.iter().skip(values.len()) {
+            let argument = args
+                .iter()
+                .find(|argument| argument.name.as_deref() == Some(parameter.as_str()))
+                .or_else(|| positional.next())
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "migration function `{}` is missing argument `{parameter}`",
+                        definition.name
+                    ))
+                })?;
+            values.insert(
+                parameter.clone(),
+                self.lower_expr(argument.value, None, environment)?,
+            );
+        }
+        if values.len() != definition.args.len() {
+            return Err(PlanError::new(format!(
+                "migration function `{}` arguments cannot be bound canonically",
+                definition.name
+            )));
+        }
+        let result_expr = function_result_expr(&definition.statement).ok_or_else(|| {
+            PlanError::new(format!(
+                "migration function `{}` has no expression result",
+                definition.name
+            ))
+        })?;
+        self.active_functions.push(definition.name.clone());
+        let result = self.lower_expr(result_expr, None, &values);
+        self.active_functions.pop();
+        result
+    }
+
+    fn lower_match_arms(
+        &mut self,
+        when_expr_id: usize,
+        environment: &MigrationEnvironment,
+    ) -> Result<Vec<MigrationMatchArmPlan>, PlanError> {
+        let arm_ids = statement_for_expression(self.program, when_expr_id)
+            .map(match_arm_ids_from_statement)
+            .filter(|arms| !arms.is_empty())
+            .unwrap_or_else(|| fallback_match_arm_ids(self.program, when_expr_id));
+        if arm_ids.is_empty() {
+            return Err(PlanError::new(format!(
+                "migration WHEN expression {when_expr_id} has no canonical MatchArm children"
+            )));
+        }
+        arm_ids
+            .into_iter()
+            .map(|arm_id| {
+                let arm = self.program.expressions.get(arm_id).ok_or_else(|| {
+                    PlanError::new("migration match arm references a missing expression")
+                })?;
+                let AstExprKind::MatchArm { pattern, output } = &arm.kind else {
+                    return Err(PlanError::new(
+                        "migration match child is not a MatchArm expression",
+                    ));
+                };
+                let output = output
+                    .ok_or_else(|| PlanError::new("migration match arm must produce a value"))?;
+                Ok(MigrationMatchArmPlan {
+                    pattern: pattern.clone(),
+                    output: self.lower_expr(output, None, environment)?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn shift_migration_parameters(
+    expression: &MigrationExpressionPlan,
+    amount: u16,
+) -> MigrationExpressionPlan {
+    let mut shifted = expression.clone();
+    shift_migration_parameters_in_place(&mut shifted, amount);
+    shifted
+}
+
+fn shift_migration_parameters_in_place(expression: &mut MigrationExpressionPlan, amount: u16) {
+    match expression {
+        MigrationExpressionPlan::Parameter { index } => *index += amount,
+        MigrationExpressionPlan::Tagged { fields, .. }
+        | MigrationExpressionPlan::Record { fields } => {
+            for field in fields {
+                shift_migration_parameters_in_place(&mut field.value, amount);
+            }
+        }
+        MigrationExpressionPlan::Project { input, .. } => {
+            shift_migration_parameters_in_place(input, amount)
+        }
+        MigrationExpressionPlan::Call {
+            input, arguments, ..
+        } => {
+            if let Some(input) = input {
+                shift_migration_parameters_in_place(input, amount);
+            }
+            for argument in arguments {
+                match &mut argument.value {
+                    MigrationArgumentValuePlan::Expression { value } => {
+                        shift_migration_parameters_in_place(value, amount)
+                    }
+                    MigrationArgumentValuePlan::Lambda { body, .. } => {
+                        shift_migration_parameters_in_place(body, amount)
+                    }
+                }
+            }
+        }
+        MigrationExpressionPlan::Infix { left, right, .. } => {
+            shift_migration_parameters_in_place(left, amount);
+            shift_migration_parameters_in_place(right, amount);
+        }
+        MigrationExpressionPlan::List { items } | MigrationExpressionPlan::Bytes { items } => {
+            for item in items {
+                shift_migration_parameters_in_place(item, amount);
+            }
+        }
+        MigrationExpressionPlan::Match { input, arms } => {
+            shift_migration_parameters_in_place(input, amount);
+            for arm in arms {
+                shift_migration_parameters_in_place(&mut arm.output, amount);
+            }
+        }
+        MigrationExpressionPlan::Input { .. }
+        | MigrationExpressionPlan::Text { .. }
+        | MigrationExpressionPlan::Number { .. }
+        | MigrationExpressionPlan::Byte { .. }
+        | MigrationExpressionPlan::Bool { .. }
+        | MigrationExpressionPlan::Variant { .. } => {}
+    }
+}
+
+fn function_result_expr(statement: &AstStatement) -> Option<usize> {
+    statement.expr.or_else(|| {
+        statement
+            .children
+            .iter()
+            .find_map(|child| child.expr.or_else(|| function_result_expr(child)))
+    })
+}
+
+fn statement_for_expression(program: &TypedProgram, expr_id: usize) -> Option<&AstStatement> {
+    program
+        .functions
+        .iter()
+        .find_map(|function| statement_with_expression(&function.statement, expr_id))
+        .or_else(|| {
+            program
+                .derived_values
+                .iter()
+                .find_map(|value| statement_with_expression(&value.statement, expr_id))
+        })
+        .or_else(|| {
+            program
+                .output_values
+                .iter()
+                .find_map(|value| statement_with_expression(&value.statement, expr_id))
+        })
+}
+
+fn statement_with_expression(statement: &AstStatement, expr_id: usize) -> Option<&AstStatement> {
+    if statement.expr == Some(expr_id) {
+        return Some(statement);
+    }
+    statement
+        .children
+        .iter()
+        .find_map(|child| statement_with_expression(child, expr_id))
+}
+
+fn match_arm_ids_from_statement(statement: &AstStatement) -> Vec<usize> {
+    statement
+        .children
+        .iter()
+        .filter_map(|child| child.expr)
+        .collect()
+}
+
+fn fallback_match_arm_ids(program: &TypedProgram, when_expr_id: usize) -> Vec<usize> {
+    let mut arms = Vec::new();
+    for expression in program.expressions.iter().skip(when_expr_id + 1) {
+        match expression.kind {
+            AstExprKind::Delimiter | AstExprKind::Hold { .. } | AstExprKind::Draining { .. }
+                if !arms.is_empty() =>
+            {
+                break;
+            }
+            AstExprKind::MatchArm { .. } => arms.push(expression.id),
+            _ => {}
+        }
+    }
+    arms
+}
+
+fn migration_recipe(
+    program: &TypedProgram,
+    target_memory: &[MemoryPlan],
+    target_lists: &[ListMemoryPlan],
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+) -> Result<Option<MigrationRecipePlan>, PlanError> {
+    if program.migration_edges.is_empty() {
+        return Ok(None);
+    }
+    let mut transfers = Vec::with_capacity(program.migration_edges.len());
+    for edge in &program.migration_edges {
+        let destination_memory = program
+            .semantic_memory
+            .get(edge.destination.memory_id.as_usize())
+            .ok_or_else(|| {
+                PlanError::new("migration destination references missing semantic memory")
+            })?;
+        if !semantic_memory_is_active(destination_memory) {
+            return Err(PlanError::new(format!(
+                "migration destination `{}` is not active target authority",
+                destination_memory.identity.semantic_path
+            )));
+        }
+        let indexed_list_owner = if edge.transfer_kind == ir::MigrationTransferKind::IndexedField {
+            let owner = migration_indexed_list_owner(program, destination_memory)?;
+            for source in &edge.source_leaves {
+                let source_memory = program
+                    .semantic_memory
+                    .get(source.memory_id.as_usize())
+                    .ok_or_else(|| {
+                        PlanError::new(
+                            "indexed migration source references missing semantic memory",
+                        )
+                    })?;
+                if migration_indexed_list_owner(program, source_memory)? != owner {
+                    return Err(PlanError::new(format!(
+                        "indexed migration `{}` crosses stable list owners",
+                        edge.destination.semantic_path
+                    )));
+                }
+            }
+            Some(owner)
+        } else {
+            None
+        };
+        let mut grouped_sources = BTreeMap::<usize, Vec<&ir::MigrationSourceLeaf>>::new();
+        for source in &edge.source_leaves {
+            grouped_sources
+                .entry(source.drain_expr_id.as_usize())
+                .or_default()
+                .push(source);
+        }
+        let mut drain_inputs = BTreeMap::new();
+        let mut inputs = Vec::with_capacity(grouped_sources.len());
+        for (drain_expr_id, sources) in grouped_sources {
+            let leaves = sources
+                .iter()
+                .map(|source| {
+                    migration_leaf_ref(
+                        program,
+                        source,
+                        indexed_list_owner.as_ref(),
+                        durable_migration_source_type(
+                            program,
+                            source,
+                            synthetic_initial_field_ids,
+                        )?,
+                    )
+                })
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            let input = MigrationInputPlan::new(
+                leaves.clone(),
+                migration_input_data_type(program, &sources, &leaves)?,
+            )?;
+            drain_inputs.insert(drain_expr_id, input.input_id);
+            inputs.push(input);
+        }
+        let transform = match &edge.transform {
+            ir::MigrationTransform::Identity => {
+                let input_id = inputs
+                    .first()
+                    .filter(|_| inputs.len() == 1)
+                    .map(|input| input.input_id)
+                    .ok_or_else(|| {
+                        PlanError::new("identity migration must have exactly one DRAIN input")
+                    })?;
+                MigrationTransformPlan::Identity { input_id }
+            }
+            ir::MigrationTransform::PureExpression { pipeline, .. } => {
+                let mut lowerer = MigrationExpressionLowerer {
+                    program,
+                    drain_inputs,
+                    active_functions: Vec::new(),
+                };
+                MigrationTransformPlan::Expression {
+                    root: lowerer.lower_pipeline(pipeline)?,
+                }
+            }
+        };
+        let semantic_destination_memory_id = semantic_memory_id(destination_memory)?;
+        let list_row_fields = migration_list_row_fields(
+            program,
+            edge,
+            semantic_destination_memory_id,
+            target_lists,
+            synthetic_initial_field_ids,
+        )?;
+        let destination_memory_id = indexed_list_owner
+            .as_ref()
+            .map_or(semantic_destination_memory_id, |owner| owner.memory_id);
+        transfers.push(MigrationTransferPlan {
+            transfer_kind: match edge.transfer_kind {
+                ir::MigrationTransferKind::Scalar => MigrationTransferKindPlan::Scalar,
+                ir::MigrationTransferKind::List => MigrationTransferKindPlan::List,
+                ir::MigrationTransferKind::IndexedField => {
+                    MigrationTransferKindPlan::IndexedRowField
+                }
+            },
+            indexed_list_owner,
+            list_row_fields,
+            inputs,
+            destination: MigrationDestinationPlan::new(
+                destination_memory_id,
+                edge.destination.semantic_path.clone(),
+                durable_migration_destination_type(
+                    edge,
+                    semantic_destination_memory_id,
+                    target_memory,
+                    target_lists,
+                )?,
+            )?,
+            transform,
+        });
+    }
+    Ok(Some(MigrationRecipePlan::new(transfers)?))
+}
+
+fn validate_predecessor_binding(
+    application: &ApplicationPlan,
+    target_schema_version: u64,
+    predecessor: &MigrationPredecessorBinding,
+) -> Result<(), PlanError> {
+    let canonical_application = ApplicationPlan::new(predecessor.application.identity.clone())?;
+    if predecessor.application != canonical_application {
+        return Err(PlanError::new(
+            "migration predecessor application identity hash is invalid",
+        ));
+    }
+    if predecessor.application.identity != application.identity {
+        return Err(PlanError::new(
+            "migration predecessor belongs to a different application identity",
+        ));
+    }
+    predecessor
+        .persistence
+        .validate_for_application(&predecessor.application)?;
+    if predecessor.persistence.schema_version >= target_schema_version {
+        return Err(PlanError::new(format!(
+            "migration predecessor schema version {} must precede target version {target_schema_version}",
+            predecessor.persistence.schema_version
+        )));
+    }
+    Ok(())
+}
+
+fn memory_kind_at_semantic_path(
+    memory: &[MemoryPlan],
+    lists: &[ListMemoryPlan],
+    owner: &MemoryOwnerPath,
+    semantic_path: &str,
+) -> Option<MemoryKind> {
+    memory
+        .iter()
+        .find(|candidate| candidate.owner == *owner && candidate.semantic_path == semantic_path)
+        .map(|candidate| candidate.kind)
+        .or_else(|| {
+            lists
+                .iter()
+                .find(|candidate| {
+                    candidate.owner == *owner && candidate.semantic_path == semantic_path
+                })
+                .map(|_| MemoryKind::List)
+        })
+}
+
+fn prove_compatible_without_drain(
+    predecessor: &PersistencePlan,
+    target_memory: &[MemoryPlan],
+    target_lists: &[ListMemoryPlan],
+) -> Result<(), PlanError> {
+    for source in &predecessor.memory {
+        if let Some(target_kind) = memory_kind_at_semantic_path(
+            target_memory,
+            target_lists,
+            &source.owner,
+            &source.semantic_path,
+        ) && target_kind != source.kind
+        {
+            return Err(PlanError::new(format!(
+                "persistent memory `{}` changes kind without DRAIN",
+                source.semantic_path
+            )));
+        }
+        let Some(target) = target_memory
+            .iter()
+            .find(|target| target.memory_id == source.memory_id)
+        else {
+            continue;
+        };
+        if target.kind != source.kind
+            || target.owner != source.owner
+            || target.semantic_path != source.semantic_path
+            || target.type_fingerprint != source.type_fingerprint
+            || target.data_type != source.data_type
+        {
+            return Err(PlanError::new(format!(
+                "persistent memory `{}` changes type or identity without DRAIN",
+                source.semantic_path
+            )));
+        }
+        for source_leaf in &source.leaves {
+            if let Some(target_leaf) = target
+                .leaves
+                .iter()
+                .find(|target_leaf| target_leaf.leaf_id == source_leaf.leaf_id)
+                && (target_leaf.semantic_path != source_leaf.semantic_path
+                    || target_leaf.type_fingerprint != source_leaf.type_fingerprint
+                    || target_leaf.data_type != source_leaf.data_type)
+            {
+                return Err(PlanError::new(format!(
+                    "persistent leaf `{}` changes type without DRAIN",
+                    source_leaf.semantic_path
+                )));
+            }
+        }
+    }
+
+    for source in &predecessor.lists {
+        if let Some(target_kind) = memory_kind_at_semantic_path(
+            target_memory,
+            target_lists,
+            &source.owner,
+            &source.semantic_path,
+        ) && target_kind != MemoryKind::List
+        {
+            return Err(PlanError::new(format!(
+                "persistent list `{}` changes kind without DRAIN",
+                source.semantic_path
+            )));
+        }
+        let Some(target) = target_lists
+            .iter()
+            .find(|target| target.memory_id == source.memory_id)
+        else {
+            continue;
+        };
+        if target.owner != source.owner
+            || target.semantic_path != source.semantic_path
+            || target.hidden_key_type != source.hidden_key_type
+            || target.has_generation != source.has_generation
+        {
+            return Err(PlanError::new(format!(
+                "persistent list `{}` changes row identity without DRAIN",
+                source.semantic_path
+            )));
+        }
+        if source.row_fields.is_empty()
+            && target.row_fields.is_empty()
+            && (target.type_fingerprint != source.type_fingerprint
+                || target.data_type != source.data_type)
+        {
+            return Err(PlanError::new(format!(
+                "persistent list `{}` changes item type without DRAIN",
+                source.semantic_path
+            )));
+        }
+        for source_leaf in &source.row_fields {
+            if let Some(target_leaf) = target
+                .row_fields
+                .iter()
+                .find(|target_leaf| target_leaf.leaf_id == source_leaf.leaf_id)
+                && (target_leaf.semantic_path != source_leaf.semantic_path
+                    || target_leaf.type_fingerprint != source_leaf.type_fingerprint
+                    || target_leaf.data_type != source_leaf.data_type)
+            {
+                return Err(PlanError::new(format!(
+                    "persistent row field `{}` changes type without DRAIN",
+                    source_leaf.semantic_path
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_contains_migration_leaf(
+    predecessor: &PersistencePlan,
+    leaf: &MigrationLeafRefPlan,
+) -> bool {
+    predecessor.memory.iter().any(|memory| {
+        memory.memory_id == leaf.memory_id
+            && memory.leaves.iter().any(|candidate| {
+                candidate.leaf_id == leaf.leaf_id
+                    && candidate.semantic_path == leaf.semantic_path
+                    && candidate.type_fingerprint == leaf.type_fingerprint
+                    && candidate.data_type == leaf.data_type
+            })
+    }) || predecessor.lists.iter().any(|list| {
+        list.memory_id == leaf.memory_id
+            && ((MemoryLeafId::from_memory_path(list.memory_id, &list.semantic_path).is_ok_and(
+                |leaf_id| {
+                    leaf_id == leaf.leaf_id
+                        && list.semantic_path == leaf.semantic_path
+                        && list.type_fingerprint == leaf.type_fingerprint
+                        && list.data_type == leaf.data_type
+                },
+            )) || list.row_fields.iter().any(|candidate| {
+                candidate.leaf_id == leaf.leaf_id
+                    && candidate.semantic_path == leaf.semantic_path
+                    && candidate.type_fingerprint == leaf.type_fingerprint
+                    && candidate.data_type == leaf.data_type
+            }))
+    })
+}
+
+fn migration_source_candidates(
+    predecessor: &PersistencePlan,
+    leaf: &MigrationLeafRefPlan,
+) -> Vec<String> {
+    predecessor
+        .memory
+        .iter()
+        .flat_map(|memory| &memory.leaves)
+        .chain(predecessor.lists.iter().flat_map(|list| &list.row_fields))
+        .filter(|candidate| candidate.semantic_path == leaf.semantic_path)
+        .map(|candidate| {
+            format!(
+                "leaf_id_match={}, type={:?}",
+                candidate.leaf_id == leaf.leaf_id,
+                candidate.data_type
+            )
+        })
+        .chain(
+            predecessor
+                .lists
+                .iter()
+                .filter(|list| list.semantic_path == leaf.semantic_path)
+                .map(|list| {
+                    format!(
+                        "list_memory_id_match={}, type={:?}",
+                        list.memory_id == leaf.memory_id,
+                        list.data_type
+                    )
+                }),
+        )
+        .collect()
+}
+
+fn contains_migration_list_owner(lists: &[ListMemoryPlan], owner: &MigrationListOwnerPlan) -> bool {
+    lists.iter().any(|list| {
+        list.memory_id == owner.memory_id
+            && list.semantic_path == owner.semantic_path
+            && list.owner == owner.owner
+    })
+}
+
+fn prove_recipe_sources_exist(
+    predecessor: &PersistencePlan,
+    recipe: &MigrationRecipePlan,
+) -> Result<(), PlanError> {
+    for transfer in &recipe.transfers {
+        if let Some(owner) = &transfer.indexed_list_owner
+            && !contains_migration_list_owner(&predecessor.lists, owner)
+        {
+            return Err(PlanError::new(format!(
+                "indexed migration list owner `{}` is absent in predecessor schema {}",
+                owner.semantic_path, predecessor.schema_version
+            )));
+        }
+        for leaf in transfer.inputs.iter().flat_map(|input| &input.leaves) {
+            if !source_contains_migration_leaf(predecessor, leaf) {
+                let candidates = migration_source_candidates(predecessor, leaf);
+                return Err(PlanError::new(format!(
+                    "migration source `{}` is absent or has a different type in predecessor schema {}; expected {:?}, candidates: {}",
+                    leaf.semantic_path,
+                    predecessor.schema_version,
+                    leaf.data_type,
+                    if candidates.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        candidates.join("; ")
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prove_recipe_destinations_exist(
+    memory: &[MemoryPlan],
+    lists: &[ListMemoryPlan],
+    recipe: &MigrationRecipePlan,
+) -> Result<(), PlanError> {
+    for transfer in &recipe.transfers {
+        if let Some(owner) = &transfer.indexed_list_owner
+            && !contains_migration_list_owner(lists, owner)
+        {
+            return Err(PlanError::new(format!(
+                "indexed migration list owner `{}` is absent in target schema",
+                owner.semantic_path
+            )));
+        }
+        let destination = &transfer.destination;
+        let present = match transfer.transfer_kind {
+            MigrationTransferKindPlan::Scalar => memory.iter().any(|candidate| {
+                candidate.memory_id == destination.memory_id
+                    && candidate.kind == MemoryKind::Scalar
+                    && ((candidate.semantic_path == destination.semantic_path
+                        && candidate.type_fingerprint == destination.type_fingerprint
+                        && candidate.data_type == destination.data_type)
+                        || candidate.leaves.iter().any(|leaf| {
+                            leaf.leaf_id == destination.leaf_id
+                                && leaf.semantic_path == destination.semantic_path
+                                && leaf.type_fingerprint == destination.type_fingerprint
+                                && leaf.data_type == destination.data_type
+                        }))
+            }),
+            MigrationTransferKindPlan::IndexedRowField => lists.iter().any(|list| {
+                list.memory_id == destination.memory_id
+                    && list.row_fields.iter().any(|leaf| {
+                        leaf.leaf_id == destination.leaf_id
+                            && leaf.semantic_path == destination.semantic_path
+                            && leaf.type_fingerprint == destination.type_fingerprint
+                            && leaf.data_type == destination.data_type
+                    })
+            }),
+            MigrationTransferKindPlan::List => lists.iter().any(|candidate| {
+                candidate.memory_id == destination.memory_id
+                    && candidate.semantic_path == destination.semantic_path
+                    && candidate.type_fingerprint == destination.type_fingerprint
+                    && candidate.data_type == destination.data_type
+            }),
+        };
+        if !present {
+            return Err(PlanError::new(format!(
+                "migration destination `{}` is absent or has a different type in target schema",
+                destination.semantic_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn merge_migration_catalog(
+    predecessors: &[MigrationPredecessorBinding],
+    current_recipe: Option<&MigrationRecipePlan>,
+    target_schema_version: u64,
+) -> Result<(Vec<MigrationRecipePlan>, Vec<MigrationEdgePlan>), PlanError> {
+    let mut recipes = BTreeMap::<MigrationRecipeId, MigrationRecipePlan>::new();
+    let mut edges = BTreeMap::<MigrationEdgeId, MigrationEdgePlan>::new();
+    for predecessor in predecessors {
+        for recipe in &predecessor.persistence.migration_recipes {
+            if let Some(existing) = recipes.insert(recipe.migration_recipe_id, recipe.clone())
+                && existing != *recipe
+            {
+                return Err(PlanError::new(
+                    "predecessor catalogs disagree on migration recipe content",
+                ));
+            }
+        }
+        for edge in &predecessor.persistence.migration_edges {
+            if let Some(existing) = edges.insert(edge.migration_edge_id, edge.clone())
+                && existing != *edge
+            {
+                return Err(PlanError::new(
+                    "predecessor catalogs disagree on migration edge content",
+                ));
+            }
+        }
+    }
+    if let Some(recipe) = current_recipe {
+        if let Some(existing) = recipes.insert(recipe.migration_recipe_id, recipe.clone())
+            && existing != *recipe
+        {
+            return Err(PlanError::new(
+                "current migration recipe ID conflicts with inherited content",
+            ));
+        }
+        for predecessor in predecessors {
+            let edge = MigrationEdgePlan::new(
+                predecessor.source_schema_version(),
+                target_schema_version,
+                predecessor.source_schema_hash(),
+                recipe.migration_recipe_id,
+            )?;
+            if let Some(existing) = edges.insert(edge.migration_edge_id, edge.clone())
+                && existing != edge
+            {
+                return Err(PlanError::new(
+                    "current predecessor binding conflicts with inherited edge content",
+                ));
+            }
+        }
+    }
+    Ok((
+        recipes.into_values().collect(),
+        edges.into_values().collect(),
+    ))
+}
+
+fn persistence_plan(
+    program: &TypedProgram,
+    application: &ApplicationPlan,
+    schema_version: u64,
+    scalar_slots: &[ScalarStorageSlot],
+    list_slots: &[ListStorageSlot],
+    synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
+    effect_outbox: Vec<EffectOutboxSchema>,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> Result<PersistencePlan, PlanError> {
+    let mut memory = Vec::new();
+    let mut lists = Vec::new();
+    for semantic_memory in program
+        .semantic_memory
+        .iter()
+        .filter(|memory| semantic_memory_is_runtime_active(program, memory))
+    {
+        match semantic_memory.identity.kind {
+            ir::SemanticMemoryKind::RootScalar | ir::SemanticMemoryKind::IndexedField => {
+                memory.push(semantic_scalar_memory_plan(
+                    program,
+                    semantic_memory,
+                    scalar_slots,
+                )?);
+            }
+            ir::SemanticMemoryKind::ListOwner => lists.push(semantic_list_memory_plan(
+                program,
+                semantic_memory,
+                list_slots,
+                synthetic_initial_field_ids,
+                false,
+            )?),
+        }
+    }
+    for predecessor in migration_predecessors {
+        validate_predecessor_binding(application, schema_version, predecessor)?;
+    }
+    let explicit_recipe = migration_recipe(program, &memory, &lists, synthetic_initial_field_ids)?;
+    if let Some(recipe) = &explicit_recipe {
+        prove_recipe_destinations_exist(&memory, &lists, recipe)?;
+        for predecessor in migration_predecessors {
+            prove_recipe_sources_exist(&predecessor.persistence, recipe)?;
+        }
+    } else {
+        for predecessor in migration_predecessors {
+            prove_compatible_without_drain(&predecessor.persistence, &memory, &lists)?;
+        }
+    }
+    let compatible_recipe = if explicit_recipe.is_none() && !migration_predecessors.is_empty() {
+        Some(MigrationRecipePlan::new(Vec::new())?)
+    } else {
+        None
+    };
+    let current_recipe = explicit_recipe.as_ref().or(compatible_recipe.as_ref());
+    let current_migration_recipe_id = current_recipe.map(|recipe| recipe.migration_recipe_id);
+    let (migration_recipes, migration_edges) =
+        merge_migration_catalog(migration_predecessors, current_recipe, schema_version)?;
+    PersistencePlan::new_with_migrations_and_effect_outbox(
+        application,
+        schema_version,
+        memory,
+        lists,
+        effect_outbox,
+        migration_recipes,
+        current_migration_recipe_id,
+        migration_edges,
+    )
+}
+
 pub fn compile_typed_program(
     program: &TypedProgram,
     target_profile: TargetProfile,
+    application_identity: &ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
 ) -> Result<MachinePlan, PlanError> {
+    let effects = effect_contracts(program)?;
+    let effect_outbox = effect_outbox_schemas(&effects)?;
     let row_initial_field_types = row_initial_field_value_types(program);
     let root_initial_field_types = root_initial_field_value_types(program);
     let synthetic_initial_field_ids = synthetic_initial_list_field_ids(program);
@@ -255,38 +2479,89 @@ pub fn compile_typed_program(
         .collect::<Vec<_>>();
 
     let mut constants = Vec::new();
+    let migration_storage_defaults = program
+        .state_cells
+        .iter()
+        .map(|state| migration_storage_default(program, state))
+        .collect::<Vec<_>>();
     let initial_constant_ids = program
         .state_cells
         .iter()
-        .map(|state| {
+        .enumerate()
+        .map(|(state_index, state)| {
             initial_constant_value(&state.initial_value)
+                .or_else(|| {
+                    migration_storage_defaults[state_index]
+                        .as_ref()
+                        .and_then(|default| default.constant.clone())
+                })
                 .map(|value| push_plan_constant(&mut constants, value))
+        })
+        .collect::<Vec<_>>();
+    let effective_initial_value_kinds = program
+        .state_cells
+        .iter()
+        .enumerate()
+        .map(|(state_index, state)| {
+            migration_storage_defaults[state_index]
+                .as_ref()
+                .map_or_else(
+                    || initial_value_kind_from_ir(&state.initial_value),
+                    |default| default.initial_value_kind,
+                )
         })
         .collect::<Vec<_>>();
 
     let mut scalar_slots = Vec::with_capacity(program.state_cells.len());
-    for (slot_id, state) in program.state_cells.iter().enumerate() {
-        let initial_row_expression = initial_row_expression(
-            program,
-            state,
-            &index,
-            &synthetic_initial_field_ids,
-            &mut constants,
-        );
+    for state in program
+        .state_cells
+        .iter()
+        .filter(|state| state_has_active_semantic_memory(program, state))
+    {
+        let state_index = state.id.as_usize();
+        let slot_id = scalar_slots.len();
+        let initial_row_expression = if let Some(edge) = migration_storage_defaults[state_index]
+            .as_ref()
+            .and_then(|default| default.indexed_edge.as_ref())
+        {
+            Some(migration_indexed_default_expression(
+                program,
+                state,
+                edge,
+                &index,
+                &synthetic_initial_field_ids,
+                &mut constants,
+            )?)
+        } else {
+            initial_row_expression(
+                program,
+                state,
+                &index,
+                &synthetic_initial_field_ids,
+                &mut constants,
+            )
+        };
         scalar_slots.push(ScalarStorageSlot {
             id: PlanStorageId(slot_id),
             state_id: plan_state_id(state.id),
-            value_type: plan_value_type_from_initial_with_root_and_row_fields(
-                &state.path,
-                &state.initial_value,
-                plan_scope_id(state.scope_id),
-                &root_initial_field_types,
-                &row_initial_field_types,
-            ),
+            value_type: migration_storage_defaults[state_index]
+                .as_ref()
+                .map_or_else(
+                    || {
+                        plan_value_type_from_initial_with_root_and_row_fields(
+                            &state.path,
+                            &state.initial_value,
+                            plan_scope_id(state.scope_id),
+                            &root_initial_field_types,
+                            &row_initial_field_types,
+                        )
+                    },
+                    |default| default.value_type,
+                ),
             scope_id: plan_scope_id(state.scope_id),
             indexed: state.indexed,
-            initial_value_kind: initial_value_kind_from_ir(&state.initial_value),
-            initial_constant_id: initial_constant_ids[slot_id],
+            initial_value_kind: effective_initial_value_kinds[state_index],
+            initial_constant_id: initial_constant_ids[state_index],
             initial_root_field_path: initial_root_field_path(&state.initial_value),
             initial_row_field_path: initial_row_field_path(&state.initial_value),
             initial_row_expression,
@@ -297,25 +2572,17 @@ pub fn compile_typed_program(
     let list_slots = program
         .lists
         .iter()
+        .filter(|list| list_has_active_semantic_memory(program, list))
         .enumerate()
-        .map(|(slot_index, list)| ListStorageSlot {
-            id: PlanStorageId(list_slot_offset + slot_index),
-            list_id: plan_list_id(list.id),
-            scope_id: plan_scope_id(list.row_scope_id),
-            row_field_ids: list_row_field_ids(program, list, &synthetic_initial_field_ids),
-            capacity: list.capacity,
-            hidden_key_type: list.hidden_key_type.clone(),
-            has_generation: list.has_generation,
-            initializer_kind: list_initializer_kind_from_ir(&list.initializer),
-            range: plan_range_initializer(&list.initializer),
-            initial_rows: plan_initial_list_rows(
+        .map(|(slot_index, list)| {
+            compiled_list_storage_slot(
                 program,
                 list,
-                &list.initializer,
+                PlanStorageId(list_slot_offset + slot_index),
                 &synthetic_initial_field_ids,
-            ),
+            )
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, PlanError>>()?;
     let byte_bank_offset = scalar_slots.len() + list_slots.len();
     let byte_banks = scalar_slots
         .iter()
@@ -358,12 +2625,13 @@ pub fn compile_typed_program(
     let state_ops = program
         .state_cells
         .iter()
-        .enumerate()
-        .map(|(state_index, state)| {
+        .filter(|state| state_has_active_semantic_memory(program, state))
+        .map(|state| {
+            let state_index = state.id.as_usize();
             op(
                 &mut next_op,
                 PlanOpKind::StateInitialize {
-                    initial_value_kind: initial_value_kind_from_ir(&state.initial_value),
+                    initial_value_kind: effective_initial_value_kinds[state_index],
                     initial_constant_id: initial_constant_ids[state_index],
                 },
                 Vec::new(),
@@ -429,24 +2697,32 @@ pub fn compile_typed_program(
                 unresolved += 1;
                 unresolved_refs.insert(branch.target.clone());
             }
-            op(
+            let expression_kind = update_expression_kind_for_branch(
+                &index,
+                &branch.source,
+                &branch.target,
+                branch.indexed,
+                &branch.expression,
+            );
+            let ordered_inputs = ordered_update_expression_inputs(
+                &index,
+                &mut constants,
+                &branch.source,
+                &branch.target,
+                branch.indexed,
+                &branch.expression,
+            );
+            let effect = effect_invocation_for_branch(
+                branch,
+                expression_kind,
+                &ordered_inputs,
+                output.clone(),
+            )?;
+            Ok(op(
                 &mut next_op,
                 PlanOpKind::UpdateBranch {
-                    expression_kind: update_expression_kind_for_branch(
-                        &index,
-                        &branch.source,
-                        &branch.target,
-                        branch.indexed,
-                        &branch.expression,
-                    ),
-                    ordered_inputs: ordered_update_expression_inputs(
-                        &index,
-                        &mut constants,
-                        &branch.source,
-                        &branch.target,
-                        branch.indexed,
-                        &branch.expression,
-                    ),
+                    expression_kind,
+                    ordered_inputs,
                     source_payload_field: source_payload_field_for_branch(
                         &index,
                         &branch.source,
@@ -461,14 +2737,15 @@ pub fn compile_typed_program(
                         &branch.expression,
                     ),
                     source_guard,
+                    effect,
                 },
                 unique_value_refs(inputs),
                 output,
                 branch.indexed,
                 unresolved,
-            )
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, PlanError>>()?;
 
     let list_ops = program
         .list_operations
@@ -759,6 +3036,7 @@ pub fn compile_typed_program(
         .collect::<BTreeSet<_>>();
     let document =
         super::document_plan_backend::compile_document_plan(program, &executable_fields)?;
+    let outputs = output_root_plans(program, document.as_ref(), &index)?;
 
     let operation_count = regions.iter().map(|region| region.ops.len()).sum::<usize>();
     let unresolved_executable_ref_count = regions
@@ -793,16 +3071,34 @@ pub fn compile_typed_program(
         .max()
         .unwrap_or_default();
     let constant_count = constants.len();
+    let source_route_count = source_routes.len();
+    let scalar_storage_count = scalar_slots.len();
+    let list_storage_count = list_slots.len();
     let typed_lowering_executable =
         unresolved_executable_ref_count == 0 && unknown_plan_op_count == 0;
     let cpu_plan_executor_unsupported_op_count =
         cpu_plan_executor_unsupported_op_count(&regions, &list_slots, &scalar_slots, &constants);
     let cpu_plan_executor_complete =
         typed_lowering_executable && cpu_plan_executor_unsupported_op_count == 0;
+    let application = ApplicationPlan::new(application_identity.clone())?;
+    let persistence = persistence_plan(
+        program,
+        &application,
+        schema_version,
+        &scalar_slots,
+        &list_slots,
+        &synthetic_initial_field_ids,
+        effect_outbox,
+        migration_predecessors,
+    )?;
 
     let mut plan = MachinePlan {
         version: PlanVersion::default(),
         target_profile,
+        application,
+        persistence,
+        effects,
+        outputs,
         demand: demand_plan(program),
         document,
         constants,
@@ -836,9 +3132,9 @@ pub fn compile_typed_program(
             typed_lowering_executable,
             cpu_plan_executor_complete,
             constant_count,
-            source_route_count: program.sources.len(),
-            scalar_storage_count: program.state_cells.len(),
-            list_storage_count: program.lists.len(),
+            source_route_count,
+            scalar_storage_count,
+            list_storage_count,
             byte_bank_storage_count,
             operation_count,
             typed_value_ref_count,
@@ -919,11 +3215,11 @@ pub fn compile_typed_program(
         },
         regions,
     };
-    include_document_root_demand(&mut plan);
+    include_output_root_demand(&mut plan);
     Ok(plan)
 }
 
-fn include_document_root_demand(plan: &mut MachinePlan) {
+fn include_output_root_demand(plan: &mut MachinePlan) {
     let indexed = plan
         .storage_layout
         .list_slots
@@ -1016,6 +3312,198 @@ fn initial_row_field_path(value: &InitialValue) -> Option<String> {
     }
 }
 
+fn migration_drain_environment_key(expr_id: usize) -> String {
+    format!("$boon$migration_drain:{expr_id}")
+}
+
+fn row_lowering_context(state: &ir::StateCell) -> ir::DerivedValue {
+    ir::DerivedValue {
+        id: ir::FieldId(state.id.0),
+        path: state.path.clone(),
+        kind: DerivedValueKind::Pure,
+        sources: Vec::new(),
+        indexed: state.indexed,
+        scope_id: state.scope_id,
+        startup_recompute: false,
+        statement: AstStatement {
+            id: usize::MAX.saturating_sub(state.id.as_usize()),
+            line: state.source_line,
+            indent: 0,
+            start: 0,
+            end: 0,
+            kind: AstStatementKind::Expression,
+            expr: state.initial_expr_id.map(|expr| expr.as_usize()),
+            children: Vec::new(),
+        },
+    }
+}
+
+fn migration_source_row_default_expression(
+    program: &TypedProgram,
+    source: &ir::MigrationSourceLeaf,
+    target_list: &ir::ListMemory,
+    index: &ValueIndex,
+    synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
+    constants: &mut Vec<PlanConstant>,
+) -> Result<PlanRowExpression, PlanError> {
+    let memory = program
+        .semantic_memory
+        .get(source.memory_id.as_usize())
+        .ok_or_else(|| PlanError::new("indexed migration default source memory is absent"))?;
+    let source_state = state_for_semantic_memory(program, memory)?;
+    if let Some(constant) = initial_constant_value(&source_state.initial_value) {
+        return Ok(PlanRowExpression::Constant {
+            constant_id: push_plan_constant(constants, constant),
+        });
+    }
+    if let InitialValue::RowInitialField { path } = &source_state.initial_value {
+        let field = storage_input_field_id(
+            program,
+            &target_list.name,
+            path.rsplit('.').next().unwrap_or(path),
+            synthetic_field_ids,
+        )
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "indexed migration default `{}` cannot resolve source row field `{path}`",
+                source.semantic_path
+            ))
+        })?;
+        return Ok(PlanRowExpression::Field {
+            input: ValueRef::Field(field),
+        });
+    }
+    initial_row_expression(program, source_state, index, synthetic_field_ids, constants).ok_or_else(
+        || {
+            PlanError::new(format!(
+                "indexed migration default `{}` is not reconstructable",
+                source.semantic_path
+            ))
+        },
+    )
+}
+
+fn migration_indexed_default_expression(
+    program: &TypedProgram,
+    state: &ir::StateCell,
+    edge: &ir::MigrationEdge,
+    index: &ValueIndex,
+    synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
+    constants: &mut Vec<PlanConstant>,
+) -> Result<PlanRowExpression, PlanError> {
+    let scope_id = state
+        .scope_id
+        .ok_or_else(|| PlanError::new("indexed migration default has no row scope"))?;
+    let target_list = program
+        .lists
+        .iter()
+        .find(|list| list.row_scope_id == Some(scope_id))
+        .ok_or_else(|| PlanError::new("indexed migration default has no target list"))?;
+    let mut grouped = BTreeMap::<usize, Vec<&ir::MigrationSourceLeaf>>::new();
+    for source in &edge.source_leaves {
+        grouped
+            .entry(source.drain_expr_id.as_usize())
+            .or_default()
+            .push(source);
+    }
+    let mut drain_values = BTreeMap::new();
+    for (drain_expr_id, sources) in grouped {
+        let mut fields = Vec::with_capacity(sources.len());
+        for source in sources {
+            fields.push((
+                source
+                    .semantic_path
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned(),
+                migration_source_row_default_expression(
+                    program,
+                    source,
+                    target_list,
+                    index,
+                    synthetic_field_ids,
+                    constants,
+                )?,
+            ));
+        }
+        let value = if fields.len() == 1 {
+            fields.pop().expect("one migration source exists").1
+        } else {
+            PlanRowExpression::Object {
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| PlanRowObjectField { name, value })
+                    .collect(),
+            }
+        };
+        drain_values.insert(drain_expr_id, LoweredRowValue::Scalar(value));
+    }
+    if edge.transform == ir::MigrationTransform::Identity {
+        if drain_values.len() != 1 {
+            return Err(PlanError::new(
+                "identity indexed migration default is ambiguous",
+            ));
+        }
+        return drain_values
+            .into_values()
+            .next()
+            .and_then(lowered_scalar)
+            .ok_or_else(|| PlanError::new("identity indexed migration default is not scalar"));
+    }
+    let ir::MigrationTransform::PureExpression { pipeline, .. } = &edge.transform else {
+        return Err(PlanError::new(
+            "indexed migration default has an unsupported transform",
+        ));
+    };
+    let context = row_lowering_context(state);
+    let mut env = drain_values
+        .into_iter()
+        .map(|(expr_id, value)| (migration_drain_environment_key(expr_id), value))
+        .collect::<BTreeMap<_, _>>();
+    let mut inputs = Vec::new();
+    let expression_types = expression_value_type_lookup(program);
+    let mut current = None;
+    for expr_id in pipeline {
+        if let Some(previous) = current.clone() {
+            env.insert(ROW_PREVIOUS_BINDING.to_owned(), previous);
+        }
+        current = if let Some(statement) = statement_for_expression(program, expr_id.as_usize()) {
+            lower_row_statement_value(
+                program,
+                &context,
+                index,
+                constants,
+                &mut inputs,
+                &mut env,
+                &expression_types,
+                statement,
+            )
+        } else {
+            lower_row_expr(
+                program,
+                &context,
+                index,
+                constants,
+                &mut inputs,
+                &mut env,
+                &expression_types,
+                expr_id.as_usize(),
+            )
+        };
+        if current.is_none() {
+            return Err(PlanError::new(format!(
+                "indexed migration default `{}` could not lower expression {}",
+                state.path,
+                expr_id.as_usize()
+            )));
+        }
+    }
+    current
+        .and_then(lowered_scalar)
+        .ok_or_else(|| PlanError::new("indexed migration default did not produce a scalar"))
+}
+
 fn initial_row_expression(
     program: &TypedProgram,
     state: &boon_ir::StateCell,
@@ -1023,7 +3511,7 @@ fn initial_row_expression(
     synthetic_field_ids: &BTreeMap<(String, String), FieldId>,
     constants: &mut Vec<PlanConstant>,
 ) -> Option<PlanRowExpression> {
-    let InitialValue::RowInitialField { .. } = &state.initial_value else {
+    let InitialValue::RowInitialField { path } = &state.initial_value else {
         return None;
     };
     let initial_expr = state.initial_expr_id?.0;
@@ -1036,6 +3524,16 @@ fn initial_row_expression(
         .lists
         .iter()
         .find(|list| list.row_scope_id == Some(scope_id))?;
+    if let Some(field) = storage_input_field_id(
+        program,
+        &list.name,
+        path.rsplit('.').next().unwrap_or(path),
+        synthetic_field_ids,
+    ) {
+        return Some(PlanRowExpression::Field {
+            input: ValueRef::Field(field),
+        });
+    }
     let binding = program
         .typecheck_report
         .list_map_bindings
@@ -1057,10 +3555,7 @@ fn initial_row_expression(
             || scope.function.ends_with(&format!("/{}", function.name))
     })?;
 
-    let mut context = program.derived_values.first()?.clone();
-    context.path = state.path.clone();
-    context.scope_id = state.scope_id;
-    context.kind = DerivedValueKind::Pure;
+    let context = row_lowering_context(state);
 
     let mut input_names = match &list.initializer {
         ListInitializer::RecordLiteral { rows } => rows
@@ -1304,7 +3799,8 @@ fn update_expression_output_type_for_root_initial(
         | UpdateExpression::TextTrimOrPrevious { .. }
         | UpdateExpression::BytesToHex { .. }
         | UpdateExpression::BytesToBase64 { .. }
-        | UpdateExpression::BytesToText { .. } => Some(PlanValueType::Text),
+        | UpdateExpression::BytesToText { .. }
+        | UpdateExpression::FileWriteBytes { .. } => Some(PlanValueType::Text),
         UpdateExpression::BoolNot { .. }
         | UpdateExpression::BytesIsEmpty { .. }
         | UpdateExpression::BytesEqual { .. }
@@ -1328,8 +3824,7 @@ fn update_expression_output_type_for_root_initial(
         | UpdateExpression::BytesConcat { .. }
         | UpdateExpression::BytesWriteUnsigned { .. }
         | UpdateExpression::BytesWriteSigned { .. }
-        | UpdateExpression::FileReadBytes { .. }
-        | UpdateExpression::FileWriteBytes { .. } => Some(PlanValueType::Bytes { fixed_len: None }),
+        | UpdateExpression::FileReadBytes { .. } => Some(PlanValueType::Bytes { fixed_len: None }),
         UpdateExpression::PreviousValue { .. }
         | UpdateExpression::MatchConst { .. }
         | UpdateExpression::MatchValueConst { .. }
@@ -2047,9 +4542,7 @@ fn source_event_transform_expression(
                 source,
             )
         });
-        let Some(value) = value else {
-            return None;
-        };
+        let value = value?;
         if !local_inputs.contains(&ValueRef::Source(source_id)) {
             local_inputs.push(ValueRef::Source(source_id));
         }
@@ -2180,16 +4673,32 @@ fn source_event_transform_arm_expression(
         AstExprKind::Then {
             output: Some(output),
             ..
-        } => lower_row_expr(
-            program,
-            derived,
-            index,
-            constants,
-            inputs,
-            &mut env,
-            expr_value_types,
-            *output,
-        ),
+        } => statement_with_expression(arm, *output)
+            .filter(|statement| !statement.children.is_empty())
+            .and_then(|statement| {
+                lower_row_statement_value(
+                    program,
+                    derived,
+                    index,
+                    constants,
+                    inputs,
+                    &mut env,
+                    expr_value_types,
+                    statement,
+                )
+            })
+            .or_else(|| {
+                lower_row_expr(
+                    program,
+                    derived,
+                    index,
+                    constants,
+                    inputs,
+                    &mut env,
+                    expr_value_types,
+                    *output,
+                )
+            }),
         AstExprKind::Then { output: None, .. } => lower_row_function_body(
             program,
             derived,
@@ -2221,6 +4730,11 @@ fn source_event_transform_arm_statement<'a>(
     source: &str,
     statement: &'a AstStatement,
 ) -> Option<&'a AstStatement> {
+    if let Some(arm) =
+        source_event_transform_direct_arm_statement(program, exprs, source, statement)
+    {
+        return Some(arm);
+    }
     if let Some(arm) = statement.children.iter().find_map(|child| {
         source_event_transform_arm_statement(program, derived, exprs, source, child)
     }) {
@@ -2232,6 +4746,22 @@ fn source_event_transform_arm_statement<'a>(
         return source_event_then_continuation(program, statement).or(Some(statement));
     }
     None
+}
+
+fn source_event_transform_direct_arm_statement<'a>(
+    program: &TypedProgram,
+    exprs: &[AstExpr],
+    source: &str,
+    statement: &'a AstStatement,
+) -> Option<&'a AstStatement> {
+    if let Some(arm) = statement.children.iter().find_map(|child| {
+        source_event_transform_direct_arm_statement(program, exprs, source, child)
+    }) {
+        return Some(arm);
+    }
+    let expr_id = statement.expr?;
+    super::expr_tree_mentions_source(exprs, expr_id, source)
+        .then(|| source_event_then_continuation(program, statement).unwrap_or(statement))
 }
 
 fn expression_tree_reaches_source(
@@ -2350,17 +4880,16 @@ fn source_event_transform_text_path_expression(
         source_id: payload_source_id,
         field,
     } = &input
-    {
-        if let Some(backing_state) = source_payload_backing_row_state(
+        && let Some(backing_state) = source_payload_backing_row_state(
             program,
             index,
             source,
             *payload_source_id,
             field,
             derived.indexed,
-        ) {
-            input = backing_state;
-        }
+        )
+    {
+        input = backing_state;
     }
     if !inputs.contains(&input) {
         inputs.push(input.clone());
@@ -2907,6 +5436,7 @@ fn lower_row_expr(
     let expr = expr_by_id(program, expr_id)?;
     match &expr.kind {
         AstExprKind::Delimiter => env.get(ROW_PREVIOUS_BINDING).cloned(),
+        AstExprKind::Drain { .. } => env.get(&migration_drain_environment_key(expr_id)).cloned(),
         AstExprKind::Identifier(name) => env
             .get(name)
             .cloned()
@@ -3594,32 +6124,32 @@ fn lower_row_number_expr(
             },
         ));
     }
-    if let AstExprKind::Infix { left, op, right } = &expr.kind {
-        if matches!(op.as_str(), "+" | "-" | "*" | "/" | "%") {
-            return Some(PlanRowExpression::NumberInfix {
-                op: op.clone(),
-                left: Box::new(lower_row_number_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    *left,
-                )?),
-                right: Box::new(lower_row_number_expr(
-                    program,
-                    derived,
-                    index,
-                    constants,
-                    inputs,
-                    env,
-                    expr_value_types,
-                    *right,
-                )?),
-            });
-        }
+    if let AstExprKind::Infix { left, op, right } = &expr.kind
+        && matches!(op.as_str(), "+" | "-" | "*" | "/" | "%")
+    {
+        return Some(PlanRowExpression::NumberInfix {
+            op: op.clone(),
+            left: Box::new(lower_row_number_expr(
+                program,
+                derived,
+                index,
+                constants,
+                inputs,
+                env,
+                expr_value_types,
+                *left,
+            )?),
+            right: Box::new(lower_row_number_expr(
+                program,
+                derived,
+                index,
+                constants,
+                inputs,
+                env,
+                expr_value_types,
+                *right,
+            )?),
+        });
     }
     lower_row_expr(
         program,
@@ -4360,7 +6890,7 @@ fn row_select_pattern_and_binding(
                 row_binding_pattern_name(&label)
                     .map(|binding| (PlanRowSelectPattern::Wildcard, Some(binding)))
             })
-            .or_else(|| Some((PlanRowSelectPattern::Text { value: label }, None))),
+            .or(Some((PlanRowSelectPattern::Text { value: label }, None))),
     }
 }
 
@@ -5206,7 +7736,7 @@ fn row_call_arg_value(args: &[PlanRowCallArg], names: &[&str]) -> Option<PlanRow
         .find(|arg| {
             arg.name
                 .as_deref()
-                .is_some_and(|name| names.iter().any(|candidate| *candidate == name))
+                .is_some_and(|name| names.contains(&name))
         })
         .map(|arg| arg.value.clone())
 }
@@ -7198,9 +9728,7 @@ fn source_guard_for_update_guard(
     unresolved_refs: &mut BTreeSet<String>,
     unresolved: &mut usize,
 ) -> Option<PlanSourceGuard> {
-    let Some(guard) = guard else {
-        return None;
-    };
+    let guard = guard?;
     let Some(ValueRef::Source(source_id)) = index.resolve(source) else {
         unresolved_refs.insert(source.to_owned());
         *unresolved += 1;
@@ -7373,11 +9901,11 @@ fn source_field_payload_aliases_from_program(
         for (target, refs) in &pure_latest_refs {
             let source_aliases = aliases
                 .iter()
-                .filter_map(|((source, path), field)| {
+                .filter(|((_source, path), _field)| {
                     refs.iter()
-                        .any(|reference| reference == path)
-                        .then(|| (source.clone(), field.clone()))
+                        .any(|reference| reference.as_str() == path.as_str())
                 })
+                .map(|((source, _path), field)| (source.clone(), field.clone()))
                 .collect::<Vec<_>>();
             for (source, field) in source_aliases {
                 if aliases.insert((source, target.clone()), field).is_none() {
@@ -7518,7 +10046,7 @@ fn source_payload_field_from_path(
     allow_bare_field: bool,
 ) -> Option<SourcePayloadField> {
     if allow_bare_field && !path.is_empty() && !path.contains('.') {
-        return Some(source_payload_field_from_suffix(path)?);
+        return source_payload_field_from_suffix(path);
     }
     source_event_ref_variants(source)
         .into_iter()
@@ -7784,12 +10312,17 @@ impl ValueIndex {
             by_path.insert(state.path.clone(), ValueRef::State(plan_state_id(state.id)));
             state_value_types.insert(
                 state.path.clone(),
-                plan_value_type_from_initial_with_root_and_row_fields(
-                    &state.path,
-                    &state.initial_value,
-                    plan_scope_id(state.scope_id),
-                    root_field_types,
-                    row_field_types,
+                migration_storage_default(program, state).map_or_else(
+                    || {
+                        plan_value_type_from_initial_with_root_and_row_fields(
+                            &state.path,
+                            &state.initial_value,
+                            plan_scope_id(state.scope_id),
+                            root_field_types,
+                            row_field_types,
+                        )
+                    },
+                    |default| default.value_type,
                 ),
             );
         }
@@ -7830,18 +10363,18 @@ impl ValueIndex {
         }
         for derived in &program.derived_values {
             let output_ref = derived_output_ref(program, derived);
-            if let ValueRef::Field(field_id) = &output_ref {
-                if let Some(expr_id) = direct_statement_value_expr_id(&derived.statement) {
-                    let expr_value_types = expression_value_type_lookup(program);
-                    if let Some(value_type) =
-                        inferred_expression_value_type(program, expr_id, &expr_value_types)
-                    {
-                        insert_field_value_type_if_absent(
-                            &mut field_value_types,
-                            *field_id,
-                            value_type,
-                        );
-                    }
+            if let ValueRef::Field(field_id) = &output_ref
+                && let Some(expr_id) = direct_statement_value_expr_id(&derived.statement)
+            {
+                let expr_value_types = expression_value_type_lookup(program);
+                if let Some(value_type) =
+                    inferred_expression_value_type(program, expr_id, &expr_value_types)
+                {
+                    insert_field_value_type_if_absent(
+                        &mut field_value_types,
+                        *field_id,
+                        value_type,
+                    );
                 }
             }
             by_path.insert(derived.path.clone(), output_ref);

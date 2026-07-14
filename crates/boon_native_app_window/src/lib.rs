@@ -7,6 +7,7 @@
 mod error;
 mod event;
 mod runner;
+mod sensitive_input;
 mod surface;
 
 pub use error::{
@@ -14,6 +15,7 @@ pub use error::{
 };
 pub use event::NativeEventCapabilities;
 pub use runner::{NativeRoleError, NativeRoleResult, run_native_role_process};
+pub use sensitive_input::{MAX_SENSITIVE_INPUT_BYTES, SensitiveInputError, SensitiveInputTarget};
 pub use surface::{
     NativeHostIds, NativeSurfaceBinding, NativeSurfaceFrame, NativeSurfaceHost,
     NativeSurfaceLifecycle, NativeThreadContract, NativeThreadStrategy, NativeViewport,

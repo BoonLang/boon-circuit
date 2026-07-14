@@ -7,3 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 boon_plan.workspace = true
+boon_persistence.workspace = true
+
+[dev-dependencies]
+boon_compiler.workspace = true

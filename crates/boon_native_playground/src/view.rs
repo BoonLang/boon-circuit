@@ -247,16 +247,11 @@ impl RetainedView {
     }
 
     pub fn first_visible_hit_target(&self) -> Option<HitTarget> {
-        let hits = self.retained.hits();
-        hits.entries.iter().find_map(|entry| {
-            let target = hit_target(entry);
-            (target.center_x.is_finite()
-                && target.center_y.is_finite()
-                && hits
-                    .hit_test(target.center_x, target.center_y)
-                    .is_some_and(|hit| hit.node == entry.node))
-            .then_some(target)
-        })
+        self.retained
+            .hits()
+            .entries
+            .iter()
+            .find_map(|entry| self.visible_hit_target(entry))
     }
 
     pub fn target_for_source(
@@ -309,23 +304,45 @@ impl RetainedView {
                         return None;
                     }
                 }
-            } else if let Some(expected) = target_text {
-                if !entry_matches_row_text(self.retained.frame(), entry, expected) {
-                    return None;
-                }
+            } else if let Some(expected) = target_text
+                && !entry_matches_row_text(self.retained.frame(), entry, expected)
+            {
+                return None;
             }
             if target_row.is_none()
                 && let Some(expected) = address
+                && node_semantic_identity(node) != Some(expected)
             {
-                if node_semantic_identity(node) != Some(expected) {
-                    return None;
-                }
+                return None;
             }
-            let mut target = hit_target(entry);
+            let mut target = self.visible_hit_target(entry)?;
             target.source_path = Some(route.source_path.clone());
             target.source_intent = Some(route.intent.clone());
             Some(target)
         })
+    }
+
+    fn visible_hit_target(&self, entry: &boon_document::HitSideTableEntry) -> Option<HitTarget> {
+        let viewport = self.retained.scene().viewport;
+        let left = entry.bounds.x.max(viewport.x);
+        let top = entry.bounds.y.max(viewport.y);
+        let right = (entry.bounds.x + entry.bounds.width).min(viewport.x + viewport.width);
+        let bottom = (entry.bounds.y + entry.bounds.height).min(viewport.y + viewport.height);
+        if right <= left || bottom <= top {
+            return None;
+        }
+        let mut target = hit_target(entry);
+        target.bounds_x = left;
+        target.bounds_y = top;
+        target.bounds_width = right - left;
+        target.bounds_height = bottom - top;
+        target.center_x = left + target.bounds_width * 0.5;
+        target.center_y = top + target.bounds_height * 0.5;
+        self.retained
+            .hits()
+            .hit_test(target.center_x, target.center_y)
+            .is_some_and(|hit| hit.node == entry.node)
+            .then_some(target)
     }
 
     pub fn revisions(&self) -> (u64, u64, u64) {

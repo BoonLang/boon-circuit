@@ -10,3 +10,6 @@ boon_host.workspace = true
 app_window.workspace = true
 futures.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

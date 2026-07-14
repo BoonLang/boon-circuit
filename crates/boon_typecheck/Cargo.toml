@@ -9,3 +9,6 @@ rust-version.workspace = true
 boon_parser.workspace = true
 ena.workspace = true
 serde.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time.workspace = true

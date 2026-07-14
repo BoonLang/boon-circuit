@@ -72,6 +72,7 @@ pub enum InputKind {
     Resize = 8,
     Accessibility = 9,
     Close = 10,
+    Sensitive = 11,
 }
 
 impl InputKind {
@@ -87,6 +88,7 @@ impl InputKind {
             8 => Ok(Self::Resize),
             9 => Ok(Self::Accessibility),
             10 => Ok(Self::Close),
+            11 => Ok(Self::Sensitive),
             _ => Err(ObserverError::InvalidEnum("input kind", value)),
         }
     }
@@ -227,6 +229,8 @@ pub enum ObserverEvent {
     SourceSwitchFinal {
         revision: u64,
         elapsed_us: u64,
+        compile_us: u64,
+        post_compile_us: u64,
         key: FrameEvidenceKey,
     },
     TestTarget {
@@ -370,10 +374,14 @@ impl ObserverEvent {
             Self::SourceSwitchFinal {
                 revision,
                 elapsed_us,
+                compile_us,
+                post_compile_us,
                 key,
             } => {
                 out.u64(*revision);
                 out.u64(*elapsed_us);
+                out.u64(*compile_us);
+                out.u64(*post_compile_us);
                 key.encode(out);
             }
             Self::TestTarget {
@@ -542,6 +550,8 @@ impl ObserverEvent {
             5 => Self::SourceSwitchFinal {
                 revision: input.u64()?,
                 elapsed_us: input.u64()?,
+                compile_us: input.u64()?,
+                post_compile_us: input.u64()?,
                 key: FrameEvidenceKey::decode(input)?,
             },
             6 => Self::TestTarget {
@@ -1033,6 +1043,13 @@ mod tests {
             frame_us: 10,
             observer_drop_count: 0,
         }));
+        roundtrip(ObserverEvent::SourceSwitchFinal {
+            revision: 11,
+            elapsed_us: 12_345,
+            compile_us: 2_345,
+            post_compile_us: 9_500,
+            key: key(11),
+        });
         roundtrip(ObserverEvent::ProofCompleted {
             key: key(20),
             completed_after_frame_id: 22,

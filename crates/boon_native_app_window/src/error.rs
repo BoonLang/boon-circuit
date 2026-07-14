@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+use crate::sensitive_input::SensitiveInputError;
+
 #[derive(Debug)]
 pub enum NativeHostError {
     InvalidConfig(&'static str),
@@ -29,6 +31,7 @@ pub enum NativeHostError {
     RequestAdapter(String),
     SurfaceUnsupported,
     SurfaceCapabilitiesChanged,
+    SensitiveInput(SensitiveInputError),
     UnknownWindowEvent,
 }
 
@@ -86,6 +89,7 @@ impl Display for NativeHostError {
             Self::SurfaceCapabilitiesChanged => formatter.write_str(
                 "recreated surface no longer supports the configured format, mode, alpha, or usage",
             ),
+            Self::SensitiveInput(error) => Display::fmt(error, formatter),
             Self::UnknownWindowEvent => {
                 formatter.write_str("app_window produced an unknown window event")
             }
@@ -94,6 +98,12 @@ impl Display for NativeHostError {
 }
 
 impl Error for NativeHostError {}
+
+impl From<SensitiveInputError> for NativeHostError {
+    fn from(error: SensitiveInputError) -> Self {
+        Self::SensitiveInput(error)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SurfaceReconfigureReason {

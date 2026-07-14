@@ -515,6 +515,7 @@ pub fn input_kind(event: &HostEvent) -> InputKind {
         HostEvent::Wheel(_) => InputKind::Wheel,
         HostEvent::Keyboard(_) => InputKind::Keyboard,
         HostEvent::TextInput(_) => InputKind::Text,
+        HostEvent::SensitiveInput(_) => InputKind::Sensitive,
         HostEvent::Ime(_) => InputKind::Ime,
         HostEvent::Focus { .. } => InputKind::Focus,
         HostEvent::Resize(_) => InputKind::Resize,

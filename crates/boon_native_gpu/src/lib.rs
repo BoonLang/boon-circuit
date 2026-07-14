@@ -911,7 +911,7 @@ impl QuadUploadRing {
             self.generation = self.generation.saturating_add(1);
             stats.staging_wrap_count = stats.staging_wrap_count.saturating_add(1);
             stats.invalidated_cached_ranges = true;
-            if let Some(quad_buffers) = quad_buffers.as_deref_mut() {
+            if let Some(quad_buffers) = quad_buffers {
                 stats.cache_eviction_count = stats
                     .cache_eviction_count
                     .saturating_add(quad_buffers.len() as u32);
@@ -1014,7 +1014,7 @@ fn quad_upload_reservation_size(byte_count: u64) -> u64 {
 fn upload_range_is_valid(range: &std::ops::Range<u64>, vertex_count: u32, capacity: u64) -> bool {
     range.start <= range.end
         && range.end <= capacity
-        && range.start % QUAD_UPLOAD_RING_ALIGNMENT == 0
+        && range.start.is_multiple_of(QUAD_UPLOAD_RING_ALIGNMENT)
         && range.end.saturating_sub(range.start)
             == u64::from(vertex_count).saturating_mul(NATIVE_GPU_QUAD_VERTEX_STRIDE)
 }
@@ -1659,6 +1659,7 @@ fn evict_internal_scene_cache_if_needed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_render_scene_to_surface_with_pipeline(
     request: SurfaceRenderSceneRequest<'_>,
     pipeline: &wgpu::RenderPipeline,
@@ -2367,7 +2368,7 @@ fn encode_internal_scene_to_surface(
                     } else {
                         let rect_vertices_started = Instant::now();
                         let (quad_batches, rect_metrics) =
-                            rect_vertices_from_scene(&scene, width as f32, height as f32);
+                            rect_vertices_from_scene(scene, width as f32, height as f32);
                         rect_vertices_ms += rect_vertices_started.elapsed().as_secs_f64() * 1000.0;
                         let asset_prepare_started = Instant::now();
                         let asset_metrics = textures.prepare_assets(
@@ -3061,8 +3062,8 @@ fn render_scene_from_document_scene_cached(
         width: scene.viewport.width.min(width as f32).max(1.0),
         height: scene.viewport.height.min(height as f32).max(1.0),
     };
-    let items = retain_metric_items
-        .then(|| {
+    let items = if retain_metric_items {
+        {
             scene
                 .items
                 .iter()
@@ -3079,8 +3080,10 @@ fn render_scene_from_document_scene_cached(
                     estimated_vertex_count: item.estimated_vertex_count,
                 })
                 .collect()
-        })
-        .unwrap_or_default();
+        }
+    } else {
+        Default::default()
+    };
     let quad_batches = if scene.quad_batches.is_empty() {
         if use_retained_quad_cache {
             cached_quad_batches_from_visual_primitives(
@@ -3113,9 +3116,11 @@ fn render_scene_from_document_scene_cached(
             cap_hit: scene.metrics.cap_hit,
         },
         quad_batches,
-        text_runs: retain_metric_items
-            .then(|| scene.text_runs.clone())
-            .unwrap_or_default(),
+        text_runs: if retain_metric_items {
+            scene.text_runs.clone()
+        } else {
+            Default::default()
+        },
     }
 }
 
@@ -4046,6 +4051,7 @@ impl GlyphonTextState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render(
         &mut self,
         device: &wgpu::Device,
@@ -4502,7 +4508,7 @@ fn text_attrs<'a>(
 
 fn resolved_font_family(value: &str) -> &str {
     value
-        .split(|ch| ch == ',' || ch == '|')
+        .split([',', '|'])
         .map(str::trim)
         .find(|family| !family.is_empty())
         .unwrap_or(value)
@@ -4909,9 +4915,9 @@ fn apply_glyph_edges(text: &str, edges: &mut [Option<f32>], glyph: &LayoutGlyph)
     let glyph_left = glyph.x;
     let glyph_right = glyph.x + glyph.w;
     let span = (end - start) as f32;
-    for column in start..=end {
+    for (column, edge) in edges.iter_mut().enumerate().take(end + 1).skip(start) {
         let fraction = (column - start) as f32 / span;
-        edges[column] = Some(glyph_left + (glyph_right - glyph_left) * fraction);
+        *edge = Some(glyph_left + (glyph_right - glyph_left) * fraction);
     }
 }
 
@@ -4926,9 +4932,9 @@ fn fill_missing_column_edges(edges: &mut [Option<f32>], line_width: f32) {
     } else {
         0.0
     };
-    for index in 0..edges.len() {
-        if edges[index].is_none() {
-            edges[index] = Some(index as f32 * fallback_advance);
+    for (index, edge) in edges.iter_mut().enumerate() {
+        if edge.is_none() {
+            *edge = Some(index as f32 * fallback_advance);
         }
     }
     let mut previous = 0.0;
@@ -5647,7 +5653,7 @@ fn push_checkbox_circle_raster(
     ring_color: [f32; 4],
     inner_color: [f32; 4],
 ) {
-    let outer_radius = (radius + aa.max(0.0).min(2.0) * 0.25).max(0.5);
+    let outer_radius = (radius + aa.clamp(0.0, 2.0) * 0.25).max(0.5);
     let border_width = border_width.max(0.0);
     if border_width <= 0.001 {
         push_circle_fan(

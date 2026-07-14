@@ -4,8 +4,12 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use serde::Serialize;
+
+pub use boon_runtime::{ApplicationIdentity, MigrationScenario, MigrationSequence};
+
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 5;
+const VERSION: u16 = 9;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -14,6 +18,14 @@ const MAX_CATALOG_ENTRIES: usize = 1_024;
 const MAX_TEST_STEPS: usize = 4_096;
 const MAX_ASSET_BLOBS: usize = 1_024;
 const MAX_ASSET_BLOB_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MIGRATION_STAGES: usize = 64;
+const MAX_MIGRATION_SOURCE_FILES: usize = 1_024;
+const MAX_MIGRATION_SCENARIO_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MIGRATION_ID_BYTES: usize = 128;
+pub const MAX_PERSISTENCE_OUTBOX_SAMPLES: usize = 16;
+pub const MAX_PERSISTENCE_STATUS_BYTES: usize = 4 * 1024;
+pub const MAX_PERSISTENCE_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AUTHORITY_PATH_BYTES: usize = 1024;
 pub const VERIFY_BOUNDED_WINDOWS_ENV: &str = "BOON_VERIFY_BOUNDED_WINDOWS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +79,562 @@ pub struct TestStep {
     pub pointer_y: Option<String>,
     pub pointer_width: Option<String>,
     pub pointer_height: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationStage {
+    pub id: String,
+    pub label: String,
+    pub schema_version: u64,
+    pub source: String,
+    pub source_files: Vec<String>,
+    pub units: Vec<SourceUnit>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationBundle {
+    pub initial_stage: String,
+    pub scenario_path: String,
+    pub stages: Vec<MigrationStage>,
+    pub scenario: MigrationScenario,
+}
+
+impl MigrationBundle {
+    pub fn stage(&self, id: &str) -> Option<&MigrationStage> {
+        self.stages.iter().find(|stage| stage.id == id)
+    }
+
+    pub fn initial(&self) -> Option<&MigrationStage> {
+        self.stage(&self.initial_stage)
+    }
+
+    pub fn manifest_sequence(&self) -> Result<MigrationSequence, String> {
+        #[derive(Serialize)]
+        struct SequenceDocument<'a> {
+            initial_stage: &'a str,
+            scenario: &'a str,
+            #[serde(rename = "stage")]
+            stages: Vec<StageDocument<'a>>,
+        }
+
+        #[derive(Serialize)]
+        struct StageDocument<'a> {
+            id: &'a str,
+            label: &'a str,
+            schema_version: u64,
+            source: &'a str,
+            source_files: &'a [String],
+        }
+
+        let document = SequenceDocument {
+            initial_stage: &self.initial_stage,
+            scenario: &self.scenario_path,
+            stages: self
+                .stages
+                .iter()
+                .map(|stage| StageDocument {
+                    id: &stage.id,
+                    label: &stage.label,
+                    schema_version: stage.schema_version,
+                    source: &stage.source,
+                    source_files: &stage.source_files,
+                })
+                .collect(),
+        };
+        let encoded = toml::to_string(&document).map_err(|error| error.to_string())?;
+        toml::from_str(&encoded).map_err(|error| error.to_string())
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.stages.is_empty() || self.stages.len() > MAX_MIGRATION_STAGES {
+            return Err(ProtocolError::LimitExceeded(
+                "migration stage count",
+                self.stages.len(),
+            ));
+        }
+        validate_migration_id("initial migration stage", &self.initial_stage)?;
+        if self.scenario_path.is_empty() {
+            return Err(ProtocolError::InvalidMigration(
+                "migration scenario path is empty".to_owned(),
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut previous_schema_version = None;
+        for stage in &self.stages {
+            validate_migration_id("migration stage", &stage.id)?;
+            if stage.label.is_empty() || stage.source.is_empty() || stage.units.is_empty() {
+                return Err(ProtocolError::InvalidMigration(format!(
+                    "migration stage `{}` has empty required data",
+                    stage.id
+                )));
+            }
+            if !ids.insert(stage.id.as_str()) {
+                return Err(ProtocolError::InvalidMigration(format!(
+                    "migration stage `{}` is duplicated",
+                    stage.id
+                )));
+            }
+            if previous_schema_version.is_some_and(|version| version >= stage.schema_version) {
+                return Err(ProtocolError::InvalidMigration(
+                    "migration schema versions are not strictly increasing".to_owned(),
+                ));
+            }
+            previous_schema_version = Some(stage.schema_version);
+            if stage.source_files.len() > MAX_MIGRATION_SOURCE_FILES {
+                return Err(ProtocolError::LimitExceeded(
+                    "migration source file count",
+                    stage.source_files.len(),
+                ));
+            }
+            if stage.units.len() > MAX_SOURCE_UNITS {
+                return Err(ProtocolError::LimitExceeded(
+                    "migration source unit count",
+                    stage.units.len(),
+                ));
+            }
+        }
+        if !ids.contains(self.initial_stage.as_str()) {
+            return Err(ProtocolError::InvalidMigration(format!(
+                "initial migration stage `{}` is absent",
+                self.initial_stage
+            )));
+        }
+        let sequence = self
+            .manifest_sequence()
+            .map_err(ProtocolError::InvalidMigration)?;
+        self.scenario
+            .validate(&sequence)
+            .map_err(|error| ProtocolError::InvalidMigration(error.to_string()))
+    }
+}
+
+fn validate_migration_id(name: &'static str, value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty() {
+        Err(ProtocolError::InvalidMigration(format!("{name} is empty")))
+    } else if value.len() > MAX_MIGRATION_ID_BYTES {
+        Err(ProtocolError::LimitExceeded(name, value.len()))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MigrationCommand {
+    Preview { stage_id: String },
+    Activate { stage_id: String },
+    Restart,
+    StartOver { confirmed: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum MigrationOperation {
+    Opened = 1,
+    Previewed = 2,
+    Activated = 3,
+    Restarted = 4,
+    StartedOver = 5,
+    Failed = 6,
+}
+
+impl MigrationOperation {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Opened),
+            2 => Ok(Self::Previewed),
+            3 => Ok(Self::Activated),
+            4 => Ok(Self::Restarted),
+            5 => Ok(Self::StartedOver),
+            6 => Ok(Self::Failed),
+            _ => Err(ProtocolError::InvalidEnum("migration operation", value)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationStatus {
+    pub request_id: Option<u64>,
+    pub revision: u64,
+    pub operation: MigrationOperation,
+    pub ok: bool,
+    pub active_stage: String,
+    pub previewed_stage: Option<String>,
+    pub target_stage: Option<String>,
+    pub target_schema_version: u64,
+    pub migration_step_count: u32,
+    pub deleted_memory_count: u32,
+    pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AuthoritySelectionKind {
+    Scalar = 1,
+    IndexedField = 2,
+    List = 3,
+}
+
+impl AuthoritySelectionKind {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Scalar),
+            2 => Ok(Self::IndexedField),
+            3 => Ok(Self::List),
+            _ => Err(ProtocolError::InvalidEnum(
+                "authority selection kind",
+                value,
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoritySelection {
+    pub semantic_path: String,
+    pub memory_id: [u8; 32],
+    pub kind: AuthoritySelectionKind,
+    pub row: Option<(u64, u64)>,
+    pub leaf_id: Option<[u8; 32]>,
+}
+
+impl AuthoritySelection {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.semantic_path.is_empty() || self.semantic_path.len() > MAX_AUTHORITY_PATH_BYTES {
+            return Err(ProtocolError::LimitExceeded(
+                "authority semantic path bytes",
+                self.semantic_path.len(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum StateArtifactFormat {
+    CanonicalCbor = 1,
+}
+
+impl StateArtifactFormat {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::CanonicalCbor),
+            _ => Err(ProtocolError::InvalidEnum("state artifact format", value)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalStateArtifact {
+    pub format: StateArtifactFormat,
+    pub schema_version: u64,
+    pub sha256: [u8; 32],
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateArtifactPreviewSummary {
+    pub preview_id: u64,
+    pub source_schema_version: u64,
+    pub target_schema_version: u64,
+    pub scalar_count: u32,
+    pub list_count: u32,
+    pub row_count: u64,
+    pub migration_step_count: u32,
+    pub deleted_memory_count: u32,
+    pub document_node_count: u32,
+    pub baseline_runtime_turn_sequence: u64,
+    pub baseline_durable_epoch: u64,
+    pub baseline_durable_turn_sequence: u64,
+}
+
+impl CanonicalStateArtifact {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.bytes.len() > MAX_PERSISTENCE_ARTIFACT_BYTES {
+            return Err(ProtocolError::LimitExceeded(
+                "persistence artifact bytes",
+                self.bytes.len(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PersistenceCommand {
+    Flush,
+    Compact,
+    ClearAll {
+        confirmed: bool,
+    },
+    ExportState,
+    ImportPreview {
+        artifact: CanonicalStateArtifact,
+    },
+    ActivateImport {
+        preview_id: u64,
+    },
+    ClearSelected {
+        selection: AuthoritySelection,
+        confirmed: bool,
+    },
+}
+
+impl PersistenceCommand {
+    fn decode(input: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
+        match input.u8()? {
+            1 => Ok(Self::Flush),
+            2 => Ok(Self::Compact),
+            3 => Ok(Self::ClearAll {
+                confirmed: input.bool()?,
+            }),
+            4 => Ok(Self::ExportState),
+            5 => Ok(Self::ImportPreview {
+                artifact: input.state_artifact()?,
+            }),
+            6 => Ok(Self::ActivateImport {
+                preview_id: input.u64()?,
+            }),
+            7 => Ok(Self::ClearSelected {
+                selection: input.authority_selection()?,
+                confirmed: input.bool()?,
+            }),
+            value => Err(ProtocolError::InvalidEnum("persistence command", value)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PersistenceOperation {
+    Flush = 1,
+    Compact = 2,
+    ClearAll = 3,
+    ExportState = 4,
+    ImportPreview = 5,
+    ActivateImport = 6,
+    ClearSelected = 7,
+}
+
+impl PersistenceOperation {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Flush),
+            2 => Ok(Self::Compact),
+            3 => Ok(Self::ClearAll),
+            4 => Ok(Self::ExportState),
+            5 => Ok(Self::ImportPreview),
+            6 => Ok(Self::ActivateImport),
+            7 => Ok(Self::ClearSelected),
+            _ => Err(ProtocolError::InvalidEnum("persistence operation", value)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistenceOperationStatus {
+    pub request_id: u64,
+    pub operation: PersistenceOperation,
+    pub ok: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistenceCapability {
+    pub available: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistenceCapabilities {
+    pub clear_selected: PersistenceCapability,
+    pub export_state: PersistenceCapability,
+    pub import_preview: PersistenceCapability,
+    pub activate_import: PersistenceCapability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoritySummary {
+    pub runtime_turn_sequence: u64,
+    pub source_event_sequence: u64,
+    pub scalar_count: u32,
+    pub indexed_field_count: u32,
+    pub list_count: u32,
+    pub effect_contract_count: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredSummary {
+    pub epoch: u64,
+    pub through_turn_sequence: u64,
+    pub scalar_count: u32,
+    pub list_count: u32,
+    pub row_count: u64,
+    pub encoded_value_bytes: Option<u64>,
+    pub completed_migration_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PersistenceTimingSummary {
+    pub authority_enqueue_us: u64,
+    pub encode_us: u64,
+    pub checkpoint_us: u64,
+    pub barrier_us: u64,
+    pub restore_us: u64,
+    pub migration_us: u64,
+    pub rebuild_derived_us: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSummary {
+    pub first_turn_sequence: Option<u64>,
+    pub last_turn_sequence: Option<u64>,
+    pub oldest_age_millis: u64,
+    pub turn_count: u64,
+    pub queue_depth: u32,
+    pub reserved_slots: u32,
+    pub accepting_turns: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableSummary {
+    pub epoch: u64,
+    pub through_turn_sequence: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum OutboxSampleState {
+    Pending = 1,
+    Dispatching = 2,
+    ReconciliationRequired = 3,
+    Completed = 4,
+}
+
+impl OutboxSampleState {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Pending),
+            2 => Ok(Self::Dispatching),
+            3 => Ok(Self::ReconciliationRequired),
+            4 => Ok(Self::Completed),
+            _ => Err(ProtocolError::InvalidEnum("outbox sample state", value)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxSample {
+    pub item_id: [u8; 32],
+    pub invocation_id: [u8; 32],
+    pub effect_id: [u8; 32],
+    pub state: OutboxSampleState,
+    pub attempt: u32,
+    pub created_turn_sequence: u64,
+    pub updated_turn_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutboxSummary {
+    pub pending_count: u32,
+    pub dispatching_count: u32,
+    pub reconciliation_count: u32,
+    pub completed_count: u32,
+    pub samples: Vec<OutboxSample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistenceSnapshot {
+    pub snapshot_sequence: u64,
+    pub revision: u64,
+    pub application: ApplicationIdentity,
+    pub schema_version: u64,
+    pub schema_hash: [u8; 32],
+    pub authority: AuthoritySummary,
+    pub stored: Option<StoredSummary>,
+    pub pending: PendingSummary,
+    pub durable: DurableSummary,
+    pub timings: PersistenceTimingSummary,
+    pub outbox: OutboxSummary,
+    pub worker_alive: bool,
+    pub capabilities: PersistenceCapabilities,
+    pub import_preview: Option<StateArtifactPreviewSummary>,
+    pub last_actionable_error: Option<String>,
+    pub last_operation: Option<PersistenceOperationStatus>,
+}
+
+impl PersistenceSnapshot {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.outbox.samples.len() > MAX_PERSISTENCE_OUTBOX_SAMPLES {
+            return Err(ProtocolError::LimitExceeded(
+                "persistence outbox sample count",
+                self.outbox.samples.len(),
+            ));
+        }
+        if let Some(preview) = self.import_preview.as_ref()
+            && preview.preview_id == 0
+        {
+            return Err(ProtocolError::InvalidPersistence(
+                "state artifact preview id must be non-zero".to_owned(),
+            ));
+        }
+        for value in [
+            self.last_actionable_error.as_deref(),
+            self.last_operation
+                .as_ref()
+                .map(|operation| operation.message.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.len() > MAX_PERSISTENCE_STATUS_BYTES {
+                return Err(ProtocolError::LimitExceeded(
+                    "persistence status bytes",
+                    value.len(),
+                ));
+            }
+        }
+        for capability in [
+            &self.capabilities.clear_selected,
+            &self.capabilities.export_state,
+            &self.capabilities.import_preview,
+            &self.capabilities.activate_import,
+        ] {
+            if capability.reason.len() > MAX_PERSISTENCE_STATUS_BYTES {
+                return Err(ProtocolError::LimitExceeded(
+                    "persistence status bytes",
+                    capability.reason.len(),
+                ));
+            }
+            if capability.available && !capability.reason.is_empty() {
+                return Err(ProtocolError::InvalidPersistence(
+                    "available persistence capability carries a failure reason".to_owned(),
+                ));
+            }
+            if !capability.available && capability.reason.is_empty() {
+                return Err(ProtocolError::InvalidPersistence(
+                    "unavailable persistence capability omits its reason".to_owned(),
+                ));
+            }
+        }
+        let has_first = self.pending.first_turn_sequence.is_some();
+        let has_last = self.pending.last_turn_sequence.is_some();
+        if has_first != has_last
+            || (!has_first && self.pending.turn_count != 0)
+            || self
+                .pending
+                .first_turn_sequence
+                .zip(self.pending.last_turn_sequence)
+                .is_some_and(|(first, last)| {
+                    first > last || self.pending.turn_count != last.saturating_sub(first) + 1
+                })
+        {
+            return Err(ProtocolError::InvalidPersistence(
+                "pending turn range and count are inconsistent".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,6 +709,14 @@ pub struct PreviewStats {
     pub missed_frames: u64,
     pub dropped_snapshots: u64,
     pub sample_age_millis: u32,
+    pub persistence_schema_version: u64,
+    pub persistence_durable_epoch: u64,
+    pub persistence_durable_turn: u64,
+    pub persistence_pending_turns: u32,
+    pub persistence_queue_depth: u32,
+    pub persistence_accepting: bool,
+    pub persistence_worker_alive: bool,
+    pub persistence_error: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,32 +735,41 @@ pub enum Message {
     OpenEditor {
         example_id: String,
         label: String,
+        application: ApplicationIdentity,
         revision: u64,
         units: Vec<SourceUnit>,
+        migration: Option<MigrationBundle>,
+        migration_stage: Option<String>,
     },
     DevSelectExample {
         example_id: String,
     },
     DevSourceChanged {
+        application: ApplicationIdentity,
         revision: u64,
         units: Vec<SourceUnit>,
     },
     DevRun {
+        application: ApplicationIdentity,
         revision: u64,
         units: Vec<SourceUnit>,
     },
     DevReset,
     DevTest {
         request_id: u64,
+        application: ApplicationIdentity,
         revision: u64,
         units: Vec<SourceUnit>,
     },
     PreviewApply {
         intent: PreviewIntent,
         request_id: Option<u64>,
+        application: ApplicationIdentity,
         revision: u64,
         units: Vec<SourceUnit>,
         test_steps: Vec<TestStep>,
+        migration: Option<MigrationBundle>,
+        migration_stage: Option<String>,
     },
     PreviewAssets {
         assets: Vec<AssetBlob>,
@@ -221,6 +806,34 @@ pub enum Message {
         path: String,
         ok: bool,
         value: String,
+        authority: Option<AuthoritySelection>,
+    },
+    DevMigrationCommand {
+        request_id: u64,
+        revision: u64,
+        command: MigrationCommand,
+    },
+    PreviewMigrationCommand {
+        request_id: u64,
+        revision: u64,
+        command: MigrationCommand,
+    },
+    PreviewMigrationStatus(MigrationStatus),
+    DevPersistenceCommand {
+        request_id: u64,
+        revision: u64,
+        command: PersistenceCommand,
+    },
+    PreviewPersistenceCommand {
+        request_id: u64,
+        revision: u64,
+        command: PersistenceCommand,
+    },
+    PreviewPersistenceSnapshot(Box<PersistenceSnapshot>),
+    PreviewPersistenceArtifact {
+        request_id: u64,
+        revision: u64,
+        artifact: CanonicalStateArtifact,
     },
     Shutdown,
 }
@@ -247,6 +860,13 @@ impl Message {
             Self::PreviewInspectResult { .. } => 17,
             Self::PreviewRuntimeChanged { .. } => 18,
             Self::PreviewAssets { .. } => 19,
+            Self::DevMigrationCommand { .. } => 20,
+            Self::PreviewMigrationCommand { .. } => 21,
+            Self::PreviewMigrationStatus(_) => 22,
+            Self::DevPersistenceCommand { .. } => 23,
+            Self::PreviewPersistenceCommand { .. } => 24,
+            Self::PreviewPersistenceSnapshot(_) => 25,
+            Self::PreviewPersistenceArtifact { .. } => 26,
         }
     }
 
@@ -264,41 +884,65 @@ impl Message {
             Self::OpenEditor {
                 example_id,
                 label,
+                application,
                 revision,
                 units,
+                migration,
+                migration_stage,
             } => {
                 out.string(example_id)?;
                 out.string(label)?;
+                out.application_identity(application)?;
                 out.u64(*revision);
                 out.source_units(units)?;
+                out.optional_migration_bundle(migration.as_ref())?;
+                out.optional_string(migration_stage.as_deref())?;
             }
             Self::DevSelectExample { example_id } => out.string(example_id)?,
-            Self::DevSourceChanged { revision, units } | Self::DevRun { revision, units } => {
+            Self::DevSourceChanged {
+                application,
+                revision,
+                units,
+            }
+            | Self::DevRun {
+                application,
+                revision,
+                units,
+            } => {
+                out.application_identity(application)?;
                 out.u64(*revision);
                 out.source_units(units)?;
             }
             Self::DevReset => {}
             Self::DevTest {
                 request_id,
+                application,
                 revision,
                 units,
             } => {
                 out.u64(*request_id);
+                out.application_identity(application)?;
                 out.u64(*revision);
                 out.source_units(units)?;
             }
             Self::PreviewApply {
                 intent,
                 request_id,
+                application,
                 revision,
                 units,
                 test_steps,
+                migration,
+                migration_stage,
             } => {
                 out.u8(*intent as u8);
                 out.optional_u64(*request_id);
+                out.application_identity(application)?;
                 out.u64(*revision);
                 out.source_units(units)?;
                 out.test_steps(test_steps)?;
+                out.optional_migration_bundle(migration.as_ref())?;
+                out.optional_string(migration_stage.as_deref())?;
             }
             Self::PreviewAssets { assets } => out.asset_blobs(assets)?,
             Self::PreviewStats(stats) => {
@@ -313,6 +957,14 @@ impl Message {
                 out.u64(stats.missed_frames);
                 out.u64(stats.dropped_snapshots);
                 out.u32(stats.sample_age_millis);
+                out.u64(stats.persistence_schema_version);
+                out.u64(stats.persistence_durable_epoch);
+                out.u64(stats.persistence_durable_turn);
+                out.u32(stats.persistence_pending_turns);
+                out.u32(stats.persistence_queue_depth);
+                out.bool(stats.persistence_accepting);
+                out.bool(stats.persistence_worker_alive);
+                out.string(&stats.persistence_error)?;
             }
             Self::PreviewStatus {
                 revision,
@@ -360,6 +1012,7 @@ impl Message {
                 path,
                 ok,
                 value,
+                authority,
             } => {
                 out.u64(*request_id);
                 out.u64(*revision);
@@ -367,6 +1020,54 @@ impl Message {
                 out.string(path)?;
                 out.bool(*ok);
                 out.string(value)?;
+                match authority.as_ref() {
+                    Some(selection) => {
+                        out.u8(1);
+                        out.authority_selection(selection)?;
+                    }
+                    None => out.u8(0),
+                }
+            }
+            Self::DevMigrationCommand {
+                request_id,
+                revision,
+                command,
+            }
+            | Self::PreviewMigrationCommand {
+                request_id,
+                revision,
+                command,
+            } => {
+                out.u64(*request_id);
+                out.u64(*revision);
+                out.migration_command(command)?;
+            }
+            Self::PreviewMigrationStatus(status) => out.migration_status(status)?,
+            Self::DevPersistenceCommand {
+                request_id,
+                revision,
+                command,
+            }
+            | Self::PreviewPersistenceCommand {
+                request_id,
+                revision,
+                command,
+            } => {
+                out.u64(*request_id);
+                out.u64(*revision);
+                out.persistence_command(command)?;
+            }
+            Self::PreviewPersistenceSnapshot(snapshot) => {
+                out.persistence_snapshot(snapshot)?;
+            }
+            Self::PreviewPersistenceArtifact {
+                request_id,
+                revision,
+                artifact,
+            } => {
+                out.u64(*request_id);
+                out.u64(*revision);
+                out.state_artifact(artifact)?;
             }
             Self::Shutdown => {}
         }
@@ -389,32 +1090,41 @@ impl Message {
             4 => Self::OpenEditor {
                 example_id: input.string()?,
                 label: input.string()?,
+                application: input.application_identity()?,
                 revision: input.u64()?,
                 units: input.source_units()?,
+                migration: input.optional_migration_bundle()?,
+                migration_stage: input.optional_string()?,
             },
             5 => Self::DevSelectExample {
                 example_id: input.string()?,
             },
             6 => Self::DevSourceChanged {
+                application: input.application_identity()?,
                 revision: input.u64()?,
                 units: input.source_units()?,
             },
             7 => Self::DevRun {
+                application: input.application_identity()?,
                 revision: input.u64()?,
                 units: input.source_units()?,
             },
             8 => Self::DevReset,
             9 => Self::DevTest {
                 request_id: input.u64()?,
+                application: input.application_identity()?,
                 revision: input.u64()?,
                 units: input.source_units()?,
             },
             10 => Self::PreviewApply {
                 intent: PreviewIntent::decode(input.u8()?)?,
                 request_id: input.optional_u64()?,
+                application: input.application_identity()?,
                 revision: input.u64()?,
                 units: input.source_units()?,
                 test_steps: input.test_steps()?,
+                migration: input.optional_migration_bundle()?,
+                migration_stage: input.optional_string()?,
             },
             11 => Self::PreviewStats(PreviewStats {
                 frame_seq: input.u64()?,
@@ -428,6 +1138,14 @@ impl Message {
                 missed_frames: input.u64()?,
                 dropped_snapshots: input.u64()?,
                 sample_age_millis: input.u32()?,
+                persistence_schema_version: input.u64()?,
+                persistence_durable_epoch: input.u64()?,
+                persistence_durable_turn: input.u64()?,
+                persistence_pending_turns: input.u32()?,
+                persistence_queue_depth: input.u32()?,
+                persistence_accepting: input.bool()?,
+                persistence_worker_alive: input.bool()?,
+                persistence_error: input.string()?,
             }),
             12 => Self::PreviewStatus {
                 revision: input.u64()?,
@@ -457,6 +1175,11 @@ impl Message {
                 path: input.string()?,
                 ok: input.bool()?,
                 value: input.string()?,
+                authority: match input.u8()? {
+                    0 => None,
+                    1 => Some(input.authority_selection()?),
+                    value => return Err(ProtocolError::InvalidOption(value)),
+                },
             },
             18 => Self::PreviewRuntimeChanged {
                 revision: input.u64()?,
@@ -464,6 +1187,33 @@ impl Message {
             },
             19 => Self::PreviewAssets {
                 assets: input.asset_blobs()?,
+            },
+            20 => Self::DevMigrationCommand {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                command: input.migration_command()?,
+            },
+            21 => Self::PreviewMigrationCommand {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                command: input.migration_command()?,
+            },
+            22 => Self::PreviewMigrationStatus(input.migration_status()?),
+            23 => Self::DevPersistenceCommand {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                command: PersistenceCommand::decode(input)?,
+            },
+            24 => Self::PreviewPersistenceCommand {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                command: PersistenceCommand::decode(input)?,
+            },
+            25 => Self::PreviewPersistenceSnapshot(Box::new(input.persistence_snapshot()?)),
+            26 => Self::PreviewPersistenceArtifact {
+                request_id: input.u64()?,
+                revision: input.u64()?,
+                artifact: input.state_artifact()?,
             },
             _ => return Err(ProtocolError::UnknownMessage(tag)),
         };
@@ -483,6 +1233,8 @@ pub enum ProtocolError {
     InvalidBool(u8),
     InvalidOption(u8),
     InvalidUtf8(std::str::Utf8Error),
+    InvalidMigration(String),
+    InvalidPersistence(String),
     LimitExceeded(&'static str, usize),
     Truncated,
     TrailingBytes(usize),
@@ -502,6 +1254,12 @@ impl fmt::Display for ProtocolError {
             Self::InvalidBool(value) => write!(f, "IPC bool value {value} is invalid"),
             Self::InvalidOption(value) => write!(f, "IPC option value {value} is invalid"),
             Self::InvalidUtf8(error) => write!(f, "IPC string is not UTF-8: {error}"),
+            Self::InvalidMigration(message) => {
+                write!(f, "IPC migration data is invalid: {message}")
+            }
+            Self::InvalidPersistence(message) => {
+                write!(f, "IPC persistence data is invalid: {message}")
+            }
             Self::LimitExceeded(name, value) => {
                 write!(f, "IPC {name} exceeds its limit: {value}")
             }
@@ -673,6 +1431,312 @@ impl Encoder {
         Ok(())
     }
 
+    fn application_identity(
+        &mut self,
+        application: &ApplicationIdentity,
+    ) -> Result<(), ProtocolError> {
+        self.string(&application.package_id)?;
+        self.string(&application.state_namespace)?;
+        self.string(&application.deployment_domain)
+    }
+
+    fn optional_migration_bundle(
+        &mut self,
+        migration: Option<&MigrationBundle>,
+    ) -> Result<(), ProtocolError> {
+        match migration {
+            Some(migration) => {
+                self.u8(1);
+                self.migration_bundle(migration)
+            }
+            None => {
+                self.u8(0);
+                Ok(())
+            }
+        }
+    }
+
+    fn migration_bundle(&mut self, migration: &MigrationBundle) -> Result<(), ProtocolError> {
+        migration.validate()?;
+        self.string(&migration.initial_stage)?;
+        self.string(&migration.scenario_path)?;
+        self.u32(migration.stages.len() as u32);
+        for stage in &migration.stages {
+            self.string(&stage.id)?;
+            self.string(&stage.label)?;
+            self.u64(stage.schema_version);
+            self.string(&stage.source)?;
+            self.string_slice(&stage.source_files, "migration source file count")?;
+            self.source_units(&stage.units)?;
+        }
+        let scenario = toml::to_string(&migration.scenario)
+            .map_err(|error| ProtocolError::InvalidMigration(error.to_string()))?;
+        if scenario.len() > MAX_MIGRATION_SCENARIO_BYTES {
+            return Err(ProtocolError::LimitExceeded(
+                "migration scenario bytes",
+                scenario.len(),
+            ));
+        }
+        self.string(&scenario)
+    }
+
+    fn migration_command(&mut self, command: &MigrationCommand) -> Result<(), ProtocolError> {
+        match command {
+            MigrationCommand::Preview { stage_id } => {
+                validate_migration_id("migration preview stage", stage_id)?;
+                self.u8(1);
+                self.string(stage_id)
+            }
+            MigrationCommand::Activate { stage_id } => {
+                validate_migration_id("migration activation stage", stage_id)?;
+                self.u8(2);
+                self.string(stage_id)
+            }
+            MigrationCommand::Restart => {
+                self.u8(3);
+                Ok(())
+            }
+            MigrationCommand::StartOver { confirmed } => {
+                self.u8(4);
+                self.bool(*confirmed);
+                Ok(())
+            }
+        }
+    }
+
+    fn migration_status(&mut self, status: &MigrationStatus) -> Result<(), ProtocolError> {
+        validate_migration_id("active migration stage", &status.active_stage)?;
+        if let Some(stage) = status.previewed_stage.as_deref() {
+            validate_migration_id("previewed migration stage", stage)?;
+        }
+        if let Some(stage) = status.target_stage.as_deref() {
+            validate_migration_id("target migration stage", stage)?;
+        }
+        self.optional_u64(status.request_id);
+        self.u64(status.revision);
+        self.u8(status.operation as u8);
+        self.bool(status.ok);
+        self.string(&status.active_stage)?;
+        self.optional_string(status.previewed_stage.as_deref())?;
+        self.optional_string(status.target_stage.as_deref())?;
+        self.u64(status.target_schema_version);
+        self.u32(status.migration_step_count);
+        self.u32(status.deleted_memory_count);
+        self.string(&status.message)
+    }
+
+    fn persistence_command(&mut self, command: &PersistenceCommand) -> Result<(), ProtocolError> {
+        match command {
+            PersistenceCommand::Flush => self.u8(1),
+            PersistenceCommand::Compact => self.u8(2),
+            PersistenceCommand::ClearAll { confirmed } => {
+                self.u8(3);
+                self.bool(*confirmed);
+            }
+            PersistenceCommand::ExportState => self.u8(4),
+            PersistenceCommand::ImportPreview { artifact } => {
+                self.u8(5);
+                self.state_artifact(artifact)?;
+            }
+            PersistenceCommand::ActivateImport { preview_id } => {
+                self.u8(6);
+                self.u64(*preview_id);
+            }
+            PersistenceCommand::ClearSelected {
+                selection,
+                confirmed,
+            } => {
+                self.u8(7);
+                self.authority_selection(selection)?;
+                self.bool(*confirmed);
+            }
+        }
+        Ok(())
+    }
+
+    fn persistence_snapshot(
+        &mut self,
+        snapshot: &PersistenceSnapshot,
+    ) -> Result<(), ProtocolError> {
+        snapshot.validate()?;
+        self.u64(snapshot.snapshot_sequence);
+        self.u64(snapshot.revision);
+        self.application_identity(&snapshot.application)?;
+        self.u64(snapshot.schema_version);
+        self.digest(snapshot.schema_hash);
+
+        self.u64(snapshot.authority.runtime_turn_sequence);
+        self.u64(snapshot.authority.source_event_sequence);
+        self.u32(snapshot.authority.scalar_count);
+        self.u32(snapshot.authority.indexed_field_count);
+        self.u32(snapshot.authority.list_count);
+        self.u32(snapshot.authority.effect_contract_count);
+
+        match snapshot.stored.as_ref() {
+            Some(stored) => {
+                self.u8(1);
+                self.u64(stored.epoch);
+                self.u64(stored.through_turn_sequence);
+                self.u32(stored.scalar_count);
+                self.u32(stored.list_count);
+                self.u64(stored.row_count);
+                self.optional_u64(stored.encoded_value_bytes);
+                self.u32(stored.completed_migration_count);
+            }
+            None => self.u8(0),
+        }
+
+        self.optional_u64(snapshot.pending.first_turn_sequence);
+        self.optional_u64(snapshot.pending.last_turn_sequence);
+        self.u64(snapshot.pending.oldest_age_millis);
+        self.u64(snapshot.pending.turn_count);
+        self.u32(snapshot.pending.queue_depth);
+        self.u32(snapshot.pending.reserved_slots);
+        self.bool(snapshot.pending.accepting_turns);
+
+        self.u64(snapshot.durable.epoch);
+        self.u64(snapshot.durable.through_turn_sequence);
+
+        self.u64(snapshot.timings.authority_enqueue_us);
+        self.u64(snapshot.timings.encode_us);
+        self.u64(snapshot.timings.checkpoint_us);
+        self.u64(snapshot.timings.barrier_us);
+        self.u64(snapshot.timings.restore_us);
+        self.u64(snapshot.timings.migration_us);
+        self.u64(snapshot.timings.rebuild_derived_us);
+
+        self.u32(snapshot.outbox.pending_count);
+        self.u32(snapshot.outbox.dispatching_count);
+        self.u32(snapshot.outbox.reconciliation_count);
+        self.u32(snapshot.outbox.completed_count);
+        self.u32(snapshot.outbox.samples.len() as u32);
+        for sample in &snapshot.outbox.samples {
+            self.digest(sample.item_id);
+            self.digest(sample.invocation_id);
+            self.digest(sample.effect_id);
+            self.u8(sample.state as u8);
+            self.u32(sample.attempt);
+            self.u64(sample.created_turn_sequence);
+            self.u64(sample.updated_turn_sequence);
+        }
+
+        self.bool(snapshot.worker_alive);
+        for capability in [
+            &snapshot.capabilities.clear_selected,
+            &snapshot.capabilities.export_state,
+            &snapshot.capabilities.import_preview,
+            &snapshot.capabilities.activate_import,
+        ] {
+            self.bool(capability.available);
+            self.bounded_persistence_string(&capability.reason)?;
+        }
+        match snapshot.import_preview.as_ref() {
+            Some(preview) => {
+                self.u8(1);
+                self.u64(preview.preview_id);
+                self.u64(preview.source_schema_version);
+                self.u64(preview.target_schema_version);
+                self.u32(preview.scalar_count);
+                self.u32(preview.list_count);
+                self.u64(preview.row_count);
+                self.u32(preview.migration_step_count);
+                self.u32(preview.deleted_memory_count);
+                self.u32(preview.document_node_count);
+                self.u64(preview.baseline_runtime_turn_sequence);
+                self.u64(preview.baseline_durable_epoch);
+                self.u64(preview.baseline_durable_turn_sequence);
+            }
+            None => self.u8(0),
+        }
+        self.optional_bounded_string(snapshot.last_actionable_error.as_deref())?;
+        match snapshot.last_operation.as_ref() {
+            Some(operation) => {
+                self.u8(1);
+                self.u64(operation.request_id);
+                self.u8(operation.operation as u8);
+                self.bool(operation.ok);
+                self.bounded_persistence_string(&operation.message)?;
+            }
+            None => self.u8(0),
+        }
+        Ok(())
+    }
+
+    fn authority_selection(&mut self, selection: &AuthoritySelection) -> Result<(), ProtocolError> {
+        selection.validate()?;
+        self.string(&selection.semantic_path)?;
+        self.digest(selection.memory_id);
+        self.u8(selection.kind as u8);
+        match selection.row {
+            Some((key, generation)) => {
+                self.u8(1);
+                self.u64(key);
+                self.u64(generation);
+            }
+            None => self.u8(0),
+        }
+        match selection.leaf_id {
+            Some(leaf_id) => {
+                self.u8(1);
+                self.digest(leaf_id);
+            }
+            None => self.u8(0),
+        }
+        Ok(())
+    }
+
+    fn state_artifact(&mut self, artifact: &CanonicalStateArtifact) -> Result<(), ProtocolError> {
+        artifact.validate()?;
+        self.u8(artifact.format as u8);
+        self.u64(artifact.schema_version);
+        self.digest(artifact.sha256);
+        self.u32(artifact.bytes.len() as u32);
+        self.bytes.extend_from_slice(&artifact.bytes);
+        Ok(())
+    }
+
+    fn digest(&mut self, value: [u8; 32]) {
+        self.bytes.extend_from_slice(&value);
+    }
+
+    fn optional_bounded_string(&mut self, value: Option<&str>) -> Result<(), ProtocolError> {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.bounded_persistence_string(value)
+            }
+            None => {
+                self.u8(0);
+                Ok(())
+            }
+        }
+    }
+
+    fn bounded_persistence_string(&mut self, value: &str) -> Result<(), ProtocolError> {
+        if value.len() > MAX_PERSISTENCE_STATUS_BYTES {
+            return Err(ProtocolError::LimitExceeded(
+                "persistence status bytes",
+                value.len(),
+            ));
+        }
+        self.string(value)
+    }
+
+    fn string_slice(
+        &mut self,
+        values: &[String],
+        limit_name: &'static str,
+    ) -> Result<(), ProtocolError> {
+        if values.len() > MAX_MIGRATION_SOURCE_FILES {
+            return Err(ProtocolError::LimitExceeded(limit_name, values.len()));
+        }
+        self.u32(values.len() as u32);
+        for value in values {
+            self.string(value)?;
+        }
+        Ok(())
+    }
+
     fn asset_blobs(&mut self, assets: &[AssetBlob]) -> Result<(), ProtocolError> {
         if assets.len() > MAX_ASSET_BLOBS {
             return Err(ProtocolError::LimitExceeded("asset count", assets.len()));
@@ -822,6 +1886,327 @@ impl<'a> Decoder<'a> {
             .collect()
     }
 
+    fn application_identity(&mut self) -> Result<ApplicationIdentity, ProtocolError> {
+        Ok(ApplicationIdentity::new(
+            self.string()?,
+            self.string()?,
+            self.string()?,
+        ))
+    }
+
+    fn optional_migration_bundle(&mut self) -> Result<Option<MigrationBundle>, ProtocolError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.migration_bundle().map(Some),
+            value => Err(ProtocolError::InvalidOption(value)),
+        }
+    }
+
+    fn migration_bundle(&mut self) -> Result<MigrationBundle, ProtocolError> {
+        let initial_stage = self.string()?;
+        let scenario_path = self.string()?;
+        let count = self.u32()? as usize;
+        if count > MAX_MIGRATION_STAGES {
+            return Err(ProtocolError::LimitExceeded("migration stage count", count));
+        }
+        let mut stages = Vec::with_capacity(count);
+        for _ in 0..count {
+            stages.push(MigrationStage {
+                id: self.string()?,
+                label: self.string()?,
+                schema_version: self.u64()?,
+                source: self.string()?,
+                source_files: self
+                    .string_vec(MAX_MIGRATION_SOURCE_FILES, "migration source file count")?,
+                units: self.source_units()?,
+            });
+        }
+        let encoded_scenario = self.string()?;
+        if encoded_scenario.len() > MAX_MIGRATION_SCENARIO_BYTES {
+            return Err(ProtocolError::LimitExceeded(
+                "migration scenario bytes",
+                encoded_scenario.len(),
+            ));
+        }
+        let scenario = toml::from_str(&encoded_scenario)
+            .map_err(|error| ProtocolError::InvalidMigration(error.to_string()))?;
+        let migration = MigrationBundle {
+            initial_stage,
+            scenario_path,
+            stages,
+            scenario,
+        };
+        migration.validate()?;
+        Ok(migration)
+    }
+
+    fn migration_command(&mut self) -> Result<MigrationCommand, ProtocolError> {
+        match self.u8()? {
+            1 => {
+                let stage_id = self.string()?;
+                validate_migration_id("migration preview stage", &stage_id)?;
+                Ok(MigrationCommand::Preview { stage_id })
+            }
+            2 => {
+                let stage_id = self.string()?;
+                validate_migration_id("migration activation stage", &stage_id)?;
+                Ok(MigrationCommand::Activate { stage_id })
+            }
+            3 => Ok(MigrationCommand::Restart),
+            4 => Ok(MigrationCommand::StartOver {
+                confirmed: self.bool()?,
+            }),
+            value => Err(ProtocolError::InvalidEnum("migration command", value)),
+        }
+    }
+
+    fn migration_status(&mut self) -> Result<MigrationStatus, ProtocolError> {
+        let status = MigrationStatus {
+            request_id: self.optional_u64()?,
+            revision: self.u64()?,
+            operation: MigrationOperation::decode(self.u8()?)?,
+            ok: self.bool()?,
+            active_stage: self.string()?,
+            previewed_stage: self.optional_string()?,
+            target_stage: self.optional_string()?,
+            target_schema_version: self.u64()?,
+            migration_step_count: self.u32()?,
+            deleted_memory_count: self.u32()?,
+            message: self.string()?,
+        };
+        validate_migration_id("active migration stage", &status.active_stage)?;
+        if let Some(stage) = status.previewed_stage.as_deref() {
+            validate_migration_id("previewed migration stage", stage)?;
+        }
+        if let Some(stage) = status.target_stage.as_deref() {
+            validate_migration_id("target migration stage", stage)?;
+        }
+        Ok(status)
+    }
+
+    fn persistence_snapshot(&mut self) -> Result<PersistenceSnapshot, ProtocolError> {
+        let snapshot_sequence = self.u64()?;
+        let revision = self.u64()?;
+        let application = self.application_identity()?;
+        let schema_version = self.u64()?;
+        let schema_hash = self.digest()?;
+        let authority = AuthoritySummary {
+            runtime_turn_sequence: self.u64()?,
+            source_event_sequence: self.u64()?,
+            scalar_count: self.u32()?,
+            indexed_field_count: self.u32()?,
+            list_count: self.u32()?,
+            effect_contract_count: self.u32()?,
+        };
+        let stored = match self.u8()? {
+            0 => None,
+            1 => Some(StoredSummary {
+                epoch: self.u64()?,
+                through_turn_sequence: self.u64()?,
+                scalar_count: self.u32()?,
+                list_count: self.u32()?,
+                row_count: self.u64()?,
+                encoded_value_bytes: self.optional_u64()?,
+                completed_migration_count: self.u32()?,
+            }),
+            value => return Err(ProtocolError::InvalidOption(value)),
+        };
+        let pending = PendingSummary {
+            first_turn_sequence: self.optional_u64()?,
+            last_turn_sequence: self.optional_u64()?,
+            oldest_age_millis: self.u64()?,
+            turn_count: self.u64()?,
+            queue_depth: self.u32()?,
+            reserved_slots: self.u32()?,
+            accepting_turns: self.bool()?,
+        };
+        let durable = DurableSummary {
+            epoch: self.u64()?,
+            through_turn_sequence: self.u64()?,
+        };
+        let timings = PersistenceTimingSummary {
+            authority_enqueue_us: self.u64()?,
+            encode_us: self.u64()?,
+            checkpoint_us: self.u64()?,
+            barrier_us: self.u64()?,
+            restore_us: self.u64()?,
+            migration_us: self.u64()?,
+            rebuild_derived_us: self.u64()?,
+        };
+        let pending_count = self.u32()?;
+        let dispatching_count = self.u32()?;
+        let reconciliation_count = self.u32()?;
+        let completed_count = self.u32()?;
+        let sample_count = self.u32()? as usize;
+        if sample_count > MAX_PERSISTENCE_OUTBOX_SAMPLES {
+            return Err(ProtocolError::LimitExceeded(
+                "persistence outbox sample count",
+                sample_count,
+            ));
+        }
+        let mut samples = Vec::with_capacity(sample_count);
+        for _ in 0..sample_count {
+            samples.push(OutboxSample {
+                item_id: self.digest()?,
+                invocation_id: self.digest()?,
+                effect_id: self.digest()?,
+                state: OutboxSampleState::decode(self.u8()?)?,
+                attempt: self.u32()?,
+                created_turn_sequence: self.u64()?,
+                updated_turn_sequence: self.u64()?,
+            });
+        }
+        let worker_alive = self.bool()?;
+        let mut capability = || -> Result<PersistenceCapability, ProtocolError> {
+            Ok(PersistenceCapability {
+                available: self.bool()?,
+                reason: self.bounded_persistence_string()?,
+            })
+        };
+        let capabilities = PersistenceCapabilities {
+            clear_selected: capability()?,
+            export_state: capability()?,
+            import_preview: capability()?,
+            activate_import: capability()?,
+        };
+        let import_preview = match self.u8()? {
+            0 => None,
+            1 => Some(StateArtifactPreviewSummary {
+                preview_id: self.u64()?,
+                source_schema_version: self.u64()?,
+                target_schema_version: self.u64()?,
+                scalar_count: self.u32()?,
+                list_count: self.u32()?,
+                row_count: self.u64()?,
+                migration_step_count: self.u32()?,
+                deleted_memory_count: self.u32()?,
+                document_node_count: self.u32()?,
+                baseline_runtime_turn_sequence: self.u64()?,
+                baseline_durable_epoch: self.u64()?,
+                baseline_durable_turn_sequence: self.u64()?,
+            }),
+            value => return Err(ProtocolError::InvalidOption(value)),
+        };
+        let last_actionable_error = self.optional_bounded_persistence_string()?;
+        let last_operation = match self.u8()? {
+            0 => None,
+            1 => Some(PersistenceOperationStatus {
+                request_id: self.u64()?,
+                operation: PersistenceOperation::decode(self.u8()?)?,
+                ok: self.bool()?,
+                message: self.bounded_persistence_string()?,
+            }),
+            value => return Err(ProtocolError::InvalidOption(value)),
+        };
+        let snapshot = PersistenceSnapshot {
+            snapshot_sequence,
+            revision,
+            application,
+            schema_version,
+            schema_hash,
+            authority,
+            stored,
+            pending,
+            durable,
+            timings,
+            outbox: OutboxSummary {
+                pending_count,
+                dispatching_count,
+                reconciliation_count,
+                completed_count,
+                samples,
+            },
+            worker_alive,
+            capabilities,
+            import_preview,
+            last_actionable_error,
+            last_operation,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn authority_selection(&mut self) -> Result<AuthoritySelection, ProtocolError> {
+        let semantic_path = self.string()?;
+        let memory_id = self.digest()?;
+        let kind = AuthoritySelectionKind::decode(self.u8()?)?;
+        let row = match self.u8()? {
+            0 => None,
+            1 => Some((self.u64()?, self.u64()?)),
+            value => return Err(ProtocolError::InvalidOption(value)),
+        };
+        let leaf_id = match self.u8()? {
+            0 => None,
+            1 => Some(self.digest()?),
+            value => return Err(ProtocolError::InvalidOption(value)),
+        };
+        let selection = AuthoritySelection {
+            semantic_path,
+            memory_id,
+            kind,
+            row,
+            leaf_id,
+        };
+        selection.validate()?;
+        Ok(selection)
+    }
+
+    fn state_artifact(&mut self) -> Result<CanonicalStateArtifact, ProtocolError> {
+        let format = StateArtifactFormat::decode(self.u8()?)?;
+        let schema_version = self.u64()?;
+        let sha256 = self.digest()?;
+        let length = self.u32()? as usize;
+        if length > MAX_PERSISTENCE_ARTIFACT_BYTES {
+            return Err(ProtocolError::LimitExceeded(
+                "persistence artifact bytes",
+                length,
+            ));
+        }
+        let artifact = CanonicalStateArtifact {
+            format,
+            schema_version,
+            sha256,
+            bytes: self.take(length)?.to_vec(),
+        };
+        artifact.validate()?;
+        Ok(artifact)
+    }
+
+    fn digest(&mut self) -> Result<[u8; 32], ProtocolError> {
+        Ok(self.take(32)?.try_into().expect("32-byte digest"))
+    }
+
+    fn optional_bounded_persistence_string(&mut self) -> Result<Option<String>, ProtocolError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.bounded_persistence_string().map(Some),
+            value => Err(ProtocolError::InvalidOption(value)),
+        }
+    }
+
+    fn bounded_persistence_string(&mut self) -> Result<String, ProtocolError> {
+        let value = self.string()?;
+        if value.len() > MAX_PERSISTENCE_STATUS_BYTES {
+            return Err(ProtocolError::LimitExceeded(
+                "persistence status bytes",
+                value.len(),
+            ));
+        }
+        Ok(value)
+    }
+
+    fn string_vec(
+        &mut self,
+        max: usize,
+        limit_name: &'static str,
+    ) -> Result<Vec<String>, ProtocolError> {
+        let count = self.u32()? as usize;
+        if count > max {
+            return Err(ProtocolError::LimitExceeded(limit_name, count));
+        }
+        (0..count).map(|_| self.string()).collect()
+    }
+
     fn asset_blobs(&mut self) -> Result<Vec<AssetBlob>, ProtocolError> {
         let count = self.u32()? as usize;
         if count > MAX_ASSET_BLOBS {
@@ -908,6 +2293,14 @@ impl<'a> Decoder<'a> {
 mod tests {
     use super::*;
 
+    fn application() -> ApplicationIdentity {
+        ApplicationIdentity::new(
+            "dev.boon.example.counter",
+            "builtin:example:counter",
+            "builtin",
+        )
+    }
+
     fn units() -> Vec<SourceUnit> {
         vec![
             SourceUnit {
@@ -948,8 +2341,11 @@ mod tests {
             Message::OpenEditor {
                 example_id: "counter".to_owned(),
                 label: "Counter".to_owned(),
+                application: application(),
                 revision: 7,
                 units: units(),
+                migration: None,
+                migration_stage: None,
             },
             Message::DevInspect {
                 request_id: 9,
@@ -968,20 +2364,29 @@ mod tests {
                 path: "store.count".to_owned(),
                 ok: true,
                 value: "3".to_owned(),
+                authority: None,
             },
             Message::DevSourceChanged {
+                application: application(),
                 revision: 8,
+                units: units(),
+            },
+            Message::DevRun {
+                application: application(),
+                revision: 9,
                 units: units(),
             },
             Message::DevTest {
                 request_id: 91,
-                revision: 9,
+                application: application(),
+                revision: 10,
                 units: units(),
             },
             Message::PreviewApply {
                 intent: PreviewIntent::Test,
                 request_id: Some(91),
-                revision: 9,
+                application: application(),
+                revision: 10,
                 units: units(),
                 test_steps: vec![TestStep {
                     source_path: "store.increment.press".to_owned(),
@@ -996,6 +2401,8 @@ mod tests {
                     pointer_width: Some("360".to_owned()),
                     pointer_height: Some("1".to_owned()),
                 }],
+                migration: None,
+                migration_stage: None,
             },
             Message::PreviewAssets {
                 assets: vec![AssetBlob {
@@ -1026,6 +2433,14 @@ mod tests {
             missed_frames: 2,
             dropped_snapshots: 1,
             sample_age_millis: 4,
+            persistence_schema_version: 3,
+            persistence_durable_epoch: 18,
+            persistence_durable_turn: 42,
+            persistence_pending_turns: 2,
+            persistence_queue_depth: 1,
+            persistence_accepting: true,
+            persistence_worker_alive: true,
+            persistence_error: String::new(),
         }));
         roundtrip(Message::PreviewStatus {
             revision: 19,
@@ -1041,6 +2456,71 @@ mod tests {
             passed: true,
             message: "counter scenario passed".to_owned(),
         });
+        roundtrip(Message::DevMigrationCommand {
+            request_id: 17,
+            revision: 19,
+            command: MigrationCommand::Preview {
+                stage_id: "v2".to_owned(),
+            },
+        });
+        roundtrip(Message::PreviewMigrationCommand {
+            request_id: 18,
+            revision: 19,
+            command: MigrationCommand::StartOver { confirmed: true },
+        });
+        roundtrip(Message::PreviewMigrationStatus(MigrationStatus {
+            request_id: Some(17),
+            revision: 19,
+            operation: MigrationOperation::Previewed,
+            ok: true,
+            active_stage: "v1".to_owned(),
+            previewed_stage: Some("v2".to_owned()),
+            target_stage: Some("v2".to_owned()),
+            target_schema_version: 2,
+            migration_step_count: 1,
+            deleted_memory_count: 0,
+            message: "candidate settled without mutation".to_owned(),
+        }));
+    }
+
+    #[test]
+    fn manifest_migration_bundle_roundtrips_with_bounded_typed_stages() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("counter_migration")
+            .unwrap();
+        let migration = example.migration.expect("migration bundle");
+        let message = Message::OpenEditor {
+            example_id: example.id,
+            label: example.label,
+            application: example.application,
+            revision: 1,
+            units: example.units,
+            migration: Some(migration.clone()),
+            migration_stage: Some(migration.initial_stage.clone()),
+        };
+        roundtrip(message);
+
+        let mut oversized = migration;
+        let first_stage = oversized.stages[0].clone();
+        oversized.stages = vec![first_stage; MAX_MIGRATION_STAGES + 1];
+        let mut bytes = Vec::new();
+        assert!(matches!(
+            write_message(
+                &mut bytes,
+                &Message::PreviewApply {
+                    intent: PreviewIntent::Replace,
+                    request_id: None,
+                    application: application(),
+                    revision: 1,
+                    units: units(),
+                    test_steps: Vec::new(),
+                    migration: Some(oversized),
+                    migration_stage: Some("v1".to_owned()),
+                },
+            ),
+            Err(ProtocolError::LimitExceeded("migration stage count", _))
+        ));
     }
 
     #[test]

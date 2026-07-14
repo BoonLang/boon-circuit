@@ -1,0 +1,206 @@
+-- Todo Migration V6: text is final and completed drains through a pure status conversion.
+
+store: [
+    sources: [
+        theme_button: [events: [press: SOURCE]]
+        density_button: [events: [press: SOURCE]]
+        help_button: [events: [press: SOURCE]]
+    ]
+
+    theme:
+        Light |> HOLD theme {
+            LATEST {
+                sources.theme_button.events.press |> THEN {
+                    theme |> WHEN {
+                        Light => Dark
+                        Dark => Light
+                    }
+                }
+            }
+        }
+
+    density:
+        Comfortable |> HOLD density {
+            LATEST {
+                sources.density_button.events.press |> THEN {
+                    density |> WHEN {
+                        Comfortable => Compact
+                        Compact => Comfortable
+                    }
+                }
+            }
+        }
+
+    show_help:
+        False |> HOLD show_help {
+            LATEST {
+                sources.help_button.events.press |> THEN { True }
+            }
+        }
+
+    tasks:
+        LIST {
+            [text: TEXT { Plan release }, completed: False, priority: Normal]
+            [text: TEXT { Test migration }, completed: True, priority: Normal]
+        }
+        |> List/map(task, new: new_task(task: task))
+]
+
+FUNCTION new_task(task) {
+    [
+        sources: [
+            toggle_button: [events: [press: SOURCE]]
+            rename_button: [events: [press: SOURCE]]
+            priority_button: [events: [press: SOURCE]]
+        ]
+
+        text:
+            task.text |> HOLD text {
+                LATEST {
+                    sources.rename_button.events.press |> THEN {
+                        TEXT { Plan release (edited) }
+                    }
+                }
+            }
+
+        completed:
+            task.completed
+            |> HOLD completed { LATEST {} }
+            |> DRAINING
+
+        status:
+            DRAIN { completed }
+            |> WHEN {
+                True => Done
+                False => Open
+            }
+            |> HOLD status {
+                LATEST {
+                    sources.toggle_button.events.press |> THEN {
+                        status |> WHEN {
+                            Open => Done
+                            Done => Open
+                        }
+                    }
+                }
+            }
+
+        priority:
+            task.priority |> HOLD priority {
+                LATEST {
+                    sources.priority_button.events.press |> THEN {
+                        priority |> WHEN {
+                            Normal => High
+                            High => Normal
+                        }
+                    }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: todo_migration_app())
+
+FUNCTION todo_migration_app() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 12
+        style: [width: Fill, height: Fill, padding: 24, background: [color: Oklch[lightness:0.97]], font: [size: 15, color: Oklch[lightness:0.20]]]
+        items: LIST {
+            Element/label(element: [], style: [width: Fill, height: 36, font: [size: 24]], label: TEXT { Todo Migration V6 })
+            migration_controls()
+            Element/label(element: [], style: [width: Fill, height: 28], label: preferences_text(theme: store.theme, density: store.density))
+            Element/label(element: [], style: [width: Fill, height: 28], label: help_text(show_help: store.show_help))
+            task_list()
+        }
+    )
+}
+
+FUNCTION migration_controls() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 40]
+        items: LIST {
+            migration_button(events: store.sources.theme_button.events, label: TEXT { Theme })
+            migration_button(events: store.sources.density_button.events, label: TEXT { Density })
+            migration_button(events: store.sources.help_button.events, label: TEXT { Help })
+        }
+    )
+}
+
+FUNCTION task_list() {
+    Element/stripe(
+        element: [tag: Main]
+        direction: Column
+        gap: 8
+        style: [width: Fill, height: Fill]
+        items: store.tasks |> List/map(task, new: task_row(task: task))
+    )
+}
+
+FUNCTION task_row(task) {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 48, padding: 8, background: [color: Oklch[lightness:1]], border: [color: Oklch[lightness:0.84]]]
+        items: LIST {
+            Element/label(element: [], style: [width: 240, height: 32], label: task.text)
+            Element/label(element: [], style: [width: 80, height: 32], label: status_text(status: task.status))
+            Element/label(element: [], style: [width: 80, height: 32], label: priority_text(priority: task.priority))
+            migration_button(events: task.sources.toggle_button.events, label: TEXT { Toggle })
+            migration_button(events: task.sources.rename_button.events, label: TEXT { Rename })
+            migration_button(events: task.sources.priority_button.events, label: TEXT { Priority })
+        }
+    )
+}
+
+FUNCTION migration_button(events, label) {
+    Element/button(
+        element: [events: events]
+        style: [width: 96, height: 36, background: [color: Oklch[lightness:0.93]], border: [color: Oklch[lightness:0.70]]]
+        label: label
+    )
+}
+
+FUNCTION status_text(status) {
+    status |> WHEN {
+        Open => TEXT { Open }
+        Done => TEXT { Done }
+    }
+}
+
+FUNCTION priority_text(priority) {
+    priority |> WHEN {
+        Normal => TEXT { Normal }
+        High => TEXT { High }
+    }
+}
+
+FUNCTION preferences_text(theme, density) {
+    theme_text(theme: theme) |> Text/concat(with: density_text(density: density), separator: " / ")
+}
+
+FUNCTION theme_text(theme) {
+    theme |> WHEN {
+        Light => TEXT { Light }
+        Dark => TEXT { Dark }
+    }
+}
+
+FUNCTION density_text(density) {
+    density |> WHEN {
+        Comfortable => TEXT { Comfortable }
+        Compact => TEXT { Compact }
+    }
+}
+
+FUNCTION help_text(show_help) {
+    show_help |> WHEN {
+        True => TEXT { Help is visible }
+        False => TEXT { Help is hidden }
+    }
+}

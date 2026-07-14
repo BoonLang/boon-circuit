@@ -46,7 +46,7 @@ fn rich_editor_spans_shape_pipe_forward_inside_operator_span() {
             .any(|window| window == raw_pipe)
     );
     assert!(
-        rich_pipe.iter().any(|glyph_id| *glyph_id == 1563),
+        rich_pipe.contains(&1563),
         "rich editor spans must shape |> to the bundled pipe-forward ligature glyph"
     );
 }
@@ -67,7 +67,7 @@ fn styled_editor_spans_keep_dash_ligatures_on_patched_jetbrains_variants() {
             .any(|window| window == raw_dash)
     );
     assert!(
-        styled_dash.iter().any(|glyph_id| *glyph_id == 876),
+        styled_dash.contains(&876),
         "italic comment spans must shape -- through the bundled patched JetBrains variant"
     );
 }

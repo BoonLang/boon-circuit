@@ -1,12 +1,17 @@
+use boon_example_manifest::{ExampleEntry, ExampleManifest};
 use boon_ir::{TypedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_parser::{AstExpr, AstExprKind, AstStatement, ParsedProgram, parse_project, parse_source};
-pub use boon_plan::{MachinePlan, PlanError, TargetProfile};
-use serde::Deserialize;
+pub use boon_plan::{
+    ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, TargetProfile,
+};
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 mod document_plan_backend;
 mod machine_plan_backend;
@@ -97,6 +102,9 @@ fn collect_expr_ids(id: usize, expressions: &[AstExpr], ids: &mut BTreeSet<usize
                 collect_expr_ids(arg.value, expressions, ids);
             }
         }
+        AstExprKind::Draining { input } => {
+            collect_expr_ids(*input, expressions, ids);
+        }
         AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
             collect_expr_ids(*initial, expressions, ids);
         }
@@ -129,6 +137,7 @@ fn collect_expr_ids(id: usize, expressions: &[AstExpr], ids: &mut BTreeSet<usize
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
@@ -297,12 +306,77 @@ pub fn compile_typed_program(
     program: &TypedProgram,
     target_profile: TargetProfile,
 ) -> Result<MachinePlan, PlanError> {
-    machine_plan_backend::compile_typed_program(program, target_profile)
+    compile_typed_program_with_identity(
+        program,
+        target_profile,
+        ApplicationIdentity::compiler_default(),
+    )
 }
 
+/// Compiles with a host-supplied durable application identity. Callers that
+/// may persist state should use this API instead of the compatibility boundary.
+pub fn compile_typed_program_with_identity(
+    program: &TypedProgram,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> Result<MachinePlan, PlanError> {
+    compile_typed_program_with_persistence_identity(
+        program,
+        target_profile,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+    )
+}
+
+pub fn compile_typed_program_with_persistence_identity(
+    program: &TypedProgram,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+) -> Result<MachinePlan, PlanError> {
+    compile_typed_program_with_persistence_catalog(
+        program,
+        target_profile,
+        application_identity,
+        schema_version,
+        &[],
+    )
+}
+
+pub fn compile_typed_program_with_persistence_catalog(
+    program: &TypedProgram,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> Result<MachinePlan, PlanError> {
+    machine_plan_backend::compile_typed_program(
+        program,
+        target_profile,
+        &application_identity,
+        schema_version,
+        migration_predecessors,
+    )
+}
+
+/// Uses `ApplicationIdentity::compiler_default()` because this compatibility
+/// boundary has no host application identity. Persistent hosts must call the
+/// identity-aware variant.
 pub fn compile_source_path_to_machine_plan(
     source_path: &Path,
     target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_path_to_machine_plan_with_identity(
+        source_path,
+        target_profile,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
+pub fn compile_source_path_to_machine_plan_with_identity(
+    source_path: &Path,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
@@ -314,6 +388,9 @@ pub fn compile_source_path_to_machine_plan(
         total_started,
         target_profile,
         LoweringMode::Full,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+        &[],
     )
 }
 
@@ -322,6 +399,20 @@ pub fn compile_source_text_to_machine_plan(
     source_text: &str,
     target_profile: TargetProfile,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_text_to_machine_plan_with_identity(
+        source_label,
+        source_text,
+        target_profile,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
+pub fn compile_source_text_to_machine_plan_with_identity(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
     let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
@@ -332,6 +423,9 @@ pub fn compile_source_text_to_machine_plan(
         total_started,
         target_profile,
         LoweringMode::Full,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+        &[],
     )
 }
 
@@ -340,6 +434,54 @@ pub fn compile_runtime_source_text_to_machine_plan(
     source_text: &str,
     target_profile: TargetProfile,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_text_to_machine_plan_with_identity(
+        source_label,
+        source_text,
+        target_profile,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
+pub fn compile_runtime_source_text_to_machine_plan_with_identity(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        source_label,
+        source_text,
+        target_profile,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+    )
+}
+
+pub fn compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+        source_label,
+        source_text,
+        target_profile,
+        application_identity,
+        schema_version,
+        &[],
+    )
+}
+
+pub fn compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
     let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
@@ -350,6 +492,9 @@ pub fn compile_runtime_source_text_to_machine_plan(
         total_started,
         target_profile,
         LoweringMode::Runtime,
+        application_identity,
+        schema_version,
+        migration_predecessors,
     )
 }
 
@@ -357,6 +502,20 @@ pub fn compile_source_units_to_machine_plan(
     source_label: &str,
     units: &[CompilerSourceUnit],
     target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_units_to_machine_plan_with_identity(
+        source_label,
+        units,
+        target_profile,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
+pub fn compile_source_units_to_machine_plan_with_identity(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
@@ -368,6 +527,9 @@ pub fn compile_source_units_to_machine_plan(
         total_started,
         target_profile,
         LoweringMode::Full,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+        &[],
     )
 }
 
@@ -375,6 +537,54 @@ pub fn compile_runtime_source_units_to_machine_plan(
     source_label: &str,
     units: &[CompilerSourceUnit],
     target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_units_to_machine_plan_with_identity(
+        source_label,
+        units,
+        target_profile,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
+pub fn compile_runtime_source_units_to_machine_plan_with_identity(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_units_to_machine_plan_with_persistence_identity(
+        source_label,
+        units,
+        target_profile,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+    )
+}
+
+pub fn compile_runtime_source_units_to_machine_plan_with_persistence_identity(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
+        source_label,
+        units,
+        target_profile,
+        application_identity,
+        schema_version,
+        &[],
+    )
+}
+
+pub fn compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
@@ -386,6 +596,9 @@ pub fn compile_runtime_source_units_to_machine_plan(
         total_started,
         target_profile,
         LoweringMode::Runtime,
+        application_identity,
+        schema_version,
+        migration_predecessors,
     )
 }
 
@@ -393,12 +606,27 @@ pub fn compile_parsed_program_to_machine_plan(
     parsed: ParsedProgram,
     target_profile: TargetProfile,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_parsed_program_to_machine_plan_with_identity(
+        parsed,
+        target_profile,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
+pub fn compile_parsed_program_to_machine_plan_with_identity(
+    parsed: ParsedProgram,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
     compile_parsed_to_machine_plan(
         parsed,
         0.0,
         Instant::now(),
         target_profile,
         LoweringMode::Full,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+        &[],
     )
 }
 
@@ -408,16 +636,27 @@ enum LoweringMode {
     Runtime,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_parsed_to_machine_plan(
     parsed: ParsedProgram,
     parse_ms: f64,
     total_started: Instant,
     target_profile: TargetProfile,
     lowering_mode: LoweringMode,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let lower_started = Instant::now();
+    let requires_recursive_migration_types = parsed.expressions.iter().any(|expression| {
+        matches!(
+            expression.kind,
+            AstExprKind::Drain { .. } | AstExprKind::Draining { .. }
+        )
+    });
     let ir = match lowering_mode {
         LoweringMode::Full => boon_ir::lower(&parsed),
+        LoweringMode::Runtime if requires_recursive_migration_types => boon_ir::lower(&parsed),
         LoweringMode::Runtime => boon_ir::lower_runtime(&parsed),
     }?;
     let lower_ms = elapsed_ms(lower_started);
@@ -426,7 +665,13 @@ fn compile_parsed_to_machine_plan(
     verify_static_schedule(&ir)?;
     let verify_ms = elapsed_ms(verify_started);
     let compile_started = Instant::now();
-    let plan = compile_typed_program(&ir, target_profile)?;
+    let plan = compile_typed_program_with_persistence_catalog(
+        &ir,
+        target_profile,
+        application_identity,
+        schema_version,
+        migration_predecessors,
+    )?;
     let compile_ms = elapsed_ms(compile_started);
     let profile = CompileProfile {
         source_unit_count: parsed.files.len(),
@@ -521,23 +766,6 @@ fn parse_source_path_or_manifest_project(source_path: &Path) -> CompilerResult<P
     parse_source_units(&source_path.display().to_string(), &units)
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct ExampleManifest {
-    #[serde(default)]
-    example: Vec<ExampleManifestEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct ExampleManifestEntry {
-    id: String,
-    label: String,
-    source: String,
-    #[serde(default)]
-    source_files: Vec<String>,
-    scenario: String,
-    budget: String,
-}
-
 fn source_files_for_path(source_path: &Path) -> CompilerResult<Vec<PathBuf>> {
     let source_path = resolve_repo_file(source_path);
     for entry in example_manifest_entries().unwrap_or_default() {
@@ -551,39 +779,10 @@ fn source_files_for_path(source_path: &Path) -> CompilerResult<Vec<PathBuf>> {
     Ok(vec![source_path])
 }
 
-fn example_manifest_entries() -> CompilerResult<Vec<ExampleManifestEntry>> {
+fn example_manifest_entries() -> CompilerResult<Vec<ExampleEntry>> {
     let path = resolve_repo_file("examples/manifest.toml");
-    let manifest: ExampleManifest = toml::from_str(&fs::read_to_string(&path)?)?;
-    validate_example_manifest(&path, &manifest)?;
+    let manifest = ExampleManifest::from_path(path)?;
     Ok(manifest.example)
-}
-
-fn validate_example_manifest(path: &Path, manifest: &ExampleManifest) -> CompilerResult<()> {
-    if manifest.example.is_empty() {
-        return Err(format!("example manifest `{}` has no entries", path.display()).into());
-    }
-    let mut ids = BTreeSet::new();
-    for entry in &manifest.example {
-        if entry.id.trim().is_empty() || !ids.insert(entry.id.clone()) {
-            return Err(format!(
-                "example manifest `{}` has an empty or duplicate id `{}`",
-                path.display(),
-                entry.id
-            )
-            .into());
-        }
-        for value in [&entry.label, &entry.source, &entry.scenario, &entry.budget] {
-            if value.trim().is_empty() {
-                return Err(format!(
-                    "example manifest `{}` entry `{}` has an empty required field",
-                    path.display(),
-                    entry.id
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
 }
 
 fn source_files_for_manifest_source(source: &str, source_files: &[String]) -> Vec<PathBuf> {

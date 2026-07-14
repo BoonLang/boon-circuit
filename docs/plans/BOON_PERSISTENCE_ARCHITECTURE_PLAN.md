@@ -2,417 +2,652 @@
 
 Date: 2026-07-13
 
-Status: architecture decision and implementation plan. Durable Boon application
-state is not implemented in `boon-circuit` yet. This document defines the
-language, compiler, runtime, storage, development tooling, and verification
-contract for implementing it.
+Status: implemented architecture and canonical acceptance contract. Durable
+semantic memory, restore, migration, effects, native redb, browser IndexedDB,
+and development tooling are present in the worktree. Completion is determined
+by fresh tests and the manifest-backed native handoff reports, not by a second
+hand-maintained pass list in this document.
+
+The language decision is recorded and implemented: authoritative memory is
+durable by default, and `DRAIN` / `DRAINING` is the explicit state-evolution
+syntax. There are no persistence lifetime keywords.
+
+This plan replaces the earlier opt-in persistence-boundary design. There is no
+second active persistence plan.
+
+## Implementation Map
+
+The implementation is split along existing ownership boundaries:
+
+- `boon_ir` and `boon_compiler` produce MachinePlan v3 semantic memory,
+  recursive type fingerprints, stable storage identities, output roots,
+  migration edges, and effect contracts.
+- `boon_plan_executor::Session` owns prepare/commit/settle, sparse authority
+  deltas, restore-before-publication, demand currentness, list identity, and
+  cycle-safe dependency evaluation.
+- `boon_persistence` owns the versioned canonical CBOR protocol, deterministic
+  in-memory backend, redb backend, large-blob lifecycle, export/import, repair,
+  compaction, and bounded checkpoint worker.
+- `boon_runtime` owns durable activation, migration sequencing, typed effects,
+  outbox dispatch/reconciliation, browser Rexie/IndexedDB integration, and
+  host-vault references for sensitive inputs.
+- The native playground exposes authority, durable/pending state, migrations,
+  outbox state, clear/start-over, import/export preview, and persistence timing
+  without querying storage from render hooks.
+- Versioned Counter and Todo migration fixtures exercise incremental and
+  skipped-version activation, `DRAINING` finalization, list/row identity, and
+  deterministic TEST playback.
+
+The implementation remains generic: no parser, compiler, runtime,
+persistence, document, renderer, playground, or verifier behavior is selected
+by an example name. Native product evidence is governed solely by
+`docs/architecture/native_gpu_handoff_manifest.json`.
 
 ## Executive Decision
 
-Use a Rust-only persistence stack:
+Boon persistence follows one simple language rule:
 
-- Native storage engine: [`redb`](https://github.com/cberner/redb).
-- Browser/Wasm storage adapter: Rust code using
-  [`rexie`](https://docs.rs/rexie) over the browser's IndexedDB API.
-- Durable value codec: [`minicbor`](https://docs.rs/minicbor) with an explicitly
-  versioned Boon-owned schema.
-- Test backend: an in-memory Rust implementation of the same durable-store
-  contract with deterministic fault injection.
+> Every compiler-created authoritative application memory node is durable by
+> default. Values that are not authoritative memory are supplied again or
+> reconstructed.
 
-No SQLite C library, `rusqlite`, JavaScript-authored storage layer, JSON product
-state path, or Python tooling belongs in this implementation.
+Persistence is attached to the semantic memory plan after lowering. It is not
+attached to `HOLD`, `LATEST`, variable-name conventions, source layout, or an
+author-written persistence block.
 
-`redb` is the native choice because it is stable, maintained, pure Rust, ACID,
-crash-safe by default, uses copy-on-write B+trees, provides MVCC readers, and
-supports explicit transaction durability, savepoints, repair, and custom
-storage backends. Its file format is documented as stable with an upgrade path.
+The implementation uses a Rust-only stack:
 
-Turso Database is not selected. It is an attractive pure-Rust, SQLite-compatible
-engine and may become useful for a future SQL-facing Boon data product, but its
-own repository currently labels the database beta. Canonical runtime state must
-start on the smaller stable key-value abstraction that Boon actually needs.
+- native storage: [`redb`](https://github.com/cberner/redb);
+- browser/Wasm storage: Rust using [`rexie`](https://docs.rs/rexie) over
+  IndexedDB;
+- durable codec: [`minicbor`](https://docs.rs/minicbor) with an explicitly
+  versioned Boon-owned schema;
+- test storage: a deterministic in-memory Rust driver with fault injection;
+- hashing and content identity: SHA-256;
+- no SQLite C library, `rusqlite`, LocalStorage, handwritten JavaScript storage
+  implementation, JSON product-state path, or Python tooling.
 
-The browser adapter is still a Rust-only application implementation. IndexedDB
-is a host platform service, like files or WGPU, and `rexie` exposes it to Rust
-and Wasm. No handwritten JavaScript storage implementation is required.
-`redb::StorageBackend` makes a future redb-on-OPFS experiment possible, but that
-is not the first browser implementation: its synchronous `Send + Sync` storage
-contract must first be proven sound and performant over browser worker/OPFS
-semantics. The durable-store contract below prevents that experiment from
-changing Boon semantics.
+`redb` is selected because Boon needs a compact transactional key-value store,
+not a SQL compatibility layer. It is pure Rust, stable, maintained, ACID, and
+supports explicit durability, savepoints, repair, and custom storage backends.
+Turso remains interesting for a future SQL-facing product but is not the first
+runtime-state backend.
 
-## Product Goal
+The browser implementation remains Rust application code. IndexedDB is a host
+platform service, like files and WGPU. The shared persistence protocol prevents
+native and browser backend mechanics from changing Boon semantics.
 
-Boon applications must be able to stop, restart, load compatible updated code,
-and continue from their last durable authoritative state without storing or
-restoring the entire dataflow graph.
+## Product Contract
 
-Persistence must preserve Boon's core properties:
+A Boon application should be able to stop, restart, refresh, load compatible
+new code, and continue from its latest acknowledged authoritative state without
+serializing the full dataflow graph.
 
-- The compiler owns static graph and storage metadata.
-- `Session` remains the only runtime execution owner.
-- A Boon turn commits atomically.
-- Derived data is recomputed through currentness barriers.
-- Dynamic lists keep hidden row identity and generation.
+The architecture must preserve these properties:
+
+- The compiler owns the static graph and semantic memory metadata.
+- `Session` remains the sole runtime execution owner.
+- A Boon turn is prepared and committed atomically in memory.
+- Derived data is recomputed through explicit currentness barriers.
+- Mutable lists retain hidden row keys, generations, order, and allocator
+  state.
+- Restore completes before any observable output is published.
+- A schema migration or deletion does not mutate the durable store until a
+  candidate Session has restored and settled successfully.
 - Rendering remains retained and independent from durable storage.
-- Normal interaction frames never wait for background storage unless an
-  explicitly strict external-effect policy requires a durable acknowledgement.
-- Persistence remains generic. No example name or Cells-specific branch may
-  appear in parser, compiler, runtime, document, renderer, playground, or
-  verifier code.
+- Interactive frames never perform database, full-state encoding, proof, or
+  report work.
+- Buffered persistence may coalesce complete turns off-thread.
+- Critical external effects cannot escape before their required durable
+  barriers.
+- Persistence remains generic. Parser, compiler, runtime, document, renderer,
+  playground, and verifier code may not branch on an example name.
 
-## Current State
+This contract applies equally to native, browser/Wasm, server, mobile, and
+future deployment targets. A target can provide different storage mechanics or
+durability guarantees, but not different Boon state semantics.
 
-### Implemented Session Memory
+## Baseline Before Implementation
+
+This section records the gaps that motivated the implementation. It is kept as
+design rationale; the implementation map above describes the current worktree.
+
+### In-Memory Execution Exists
 
 `boon_plan_executor::Session` currently owns:
 
-- root `HOLD` state values;
-- derived root fields and their currentness;
+- root state cells;
+- stateful expressions lowered from selected `HOLD`, `LATEST`, and standard
+  operators;
 - logical lists, row order, hidden row keys, and generations;
-- raw and derived row fields;
+- indexed row state;
+- derived fields and currentness;
 - indexes and dynamic dependencies;
-- source sequence and binding identity.
+- source sequence and binding identity;
+- document/output demand.
 
-This is valid in-memory reactive state. It is not durable application state.
+This is the right place to own execution. It is not yet a safe durable-state
+boundary.
 
-### Debug Snapshot, Not Restore Format
+### Runtime Values Need A Storage DTO Boundary
 
-The current `boon_plan_executor::Snapshot` contains:
+The current runtime `Value` enum contains ordinary language data and internal
+row representations. Persistence must not derive its file schema directly from
+that implementation enum.
 
-```text
-states: StateId -> Value
-fields: FieldId -> Value
-lists: ListId -> rows and fields
-```
+Define a Boon-owned recursive `StoredValue` format for language-level data and
+separate storage DTOs for list/row authority. Internal row views, runtime IDs,
+evaluation stacks, source bindings, document objects, and errors internal to
+the engine are never serialized as runtime snapshots.
 
-`Session::snapshot()` clones root states, demanded derived root fields, list
-rows, raw row fields, and any materialized current derived fields. It has no
-durable serialization contract and there is no inverse restore/hydration API.
-It mixes authoritative and derived data, and its numeric IDs are local to one
-compiled plan.
+All language-level data must have a deterministic encoding. The existence of a
+codec does not mean every computed value is written. Only authoritative memory
+uses it.
 
-The implementation should eventually rename this type to `DebugSnapshot` so it
-cannot be mistaken for a persistence checkpoint. Durable restore uses separate
-`RestoreImage` and `DurableCommitBatch` types.
+### State Discovery Is Too Syntax-Driven
 
-### Startup Always Builds Fresh State
+Current parser/IR paths identify memory through special cases such as `HOLD`,
+selected stateful `LATEST` shapes, and stateful standard operators. Persistence
+cannot duplicate that syntax list.
 
-`Session::new_shared` currently:
+The compiler must first lower all stateful constructs into generic semantic
+memory nodes. Persistence, inspection, hot reload, and migration consume those
+nodes. Adding a future stateful standard operator must not require another
+persistence-specific branch.
 
-1. constructs plan metadata;
-2. initializes scalar state from compiler-provided defaults;
-3. initializes all logical lists and rows;
-4. initializes indexed state;
-5. evaluates root-initial fields;
-6. makes demanded derived roots current.
+### Durable Identity Does Not Exist
 
-There is no restore barrier between raw state allocation and derived root
-evaluation. Persistence requires splitting this sequence so restored values are
-installed before derived computation or output publication.
+Current `StateId`, `ListId`, `FieldId`, and `PlanStorageId` values are local
+execution indexes. Anonymous state discovery can also depend on source line
+numbers. Neither is durable identity.
 
-### Sequential Runtime IDs
+Whitespace, comments, formatting, unrelated declaration insertion, and sibling
+reordering must not change a memory identity. Rename, move, and incompatible
+type change must be explicit migrations rather than accidental key reuse.
 
-The IR currently assigns `StateId`, `ListId`, `FieldId`, and `PlanStorageId` by
-enumeration. The IR also retains useful semantic paths, but the plan does not
-yet have durable storage identity or type fingerprints.
+### Turn Failure Can Leave Partial Mutation
 
-Numeric plan/runtime IDs must never be disk keys. Adding or reordering an
-unrelated declaration can change them.
+The current execution path can mutate state before all fallible currentness,
+document, or output work has completed. Persistence would make that ambiguity
+permanent.
 
-### Process-Local Runtime Cache
+Runtime execution must gain prepare, commit, and settle phases. No fallible
+operation after commit may retroactively invalidate the committed authority.
+Preparation failure publishes no authority delta and changes no current state.
 
-The native preview caches up to eight `RuntimeView` values by exact source key.
-Switching back to an unchanged source can recover the mounted runtime while the
-preview process remains alive. Edited source creates a new runtime, and process
-restart loses all state. This cache is useful mounting behavior, not persistence
-or migration.
+### Restore Has No Publication Barrier
 
-### Unrelated Project File Persistence
+Startup currently constructs defaults and can demand derived values immediately.
+A durable runtime needs an explicit restore-aware builder. No default-derived
+frame, server output, source subscription, or effect may escape before restored
+authority and migrations are installed.
 
-`boon_native_playground::workspace::PersistenceWorker` atomically writes custom
-example source and manifest files under `playground/custom_examples`. It does
-not persist Boon runtime state. Rename it to `ProjectFileWriter` when the durable
-runtime store is introduced so the two responsibilities cannot be confused.
+### Mutable Runtime Caching Can Fork State
 
-### Current Inspector
+Any cache that stores a mutable runtime/session instance across source
+replacement can create competing state owners. Cache immutable compiler
+artifacts only. Hot reload constructs one candidate Session, restores into it,
+settles it, and swaps it atomically after success.
 
-The dev inspector currently exposes only:
+### Playground Identity Needs To Be Stable
 
-```text
-symbol
-static type
-detail
-current runtime value
-```
-
-It has no knowledge of state class, durable identity, default value, last saved
-value, pending commit, storage backend, schema compatibility, or migration.
+Sequential labels such as `custom-1` are not sufficient application identity
+because they may be reused. Built-in examples, custom examples, production
+packages, and test runs require explicit stable application and namespace
+identities supplied by manifests or host launch configuration.
 
 ## Language Semantics
 
-### Four Value Roles
+### Authoritative Memory Is The Boundary
 
-Every inspectable value has exactly one role:
+The compiler classifies graph nodes into:
 
-1. **Durable state**: authoritative application memory that survives process
-   restart and compatible deployments.
-2. **Session state**: ordinary `HOLD` memory that survives ticks and compatible
-   in-process development reload, but not cold restart.
-3. **Transient state**: state that intentionally resets during reload, such as
-   focus, hover, caret, temporary drag state, timing handles, and secrets.
-4. **Derived value**: pure or demand-current data reconstructed from state and
-   inputs; never persisted.
+1. **Authoritative memory**: history that cannot be reconstructed from current
+   source, current inputs, and other authoritative memory.
+2. **Derived data**: pure or demand-current values reconstructed from authority
+   and inputs.
+3. **Source data**: current host/environment input events or continuous values.
+4. **Output data**: document, scene, route, response, build, hardware, or other
+   host-demanded roots reconstructed from the graph.
+5. **Runtime machinery**: indexes, dependency edges, dirty flags, caches,
+   scheduling state, host handles, rendering resources, and instrumentation.
 
-`HOLD` continues to mean semantic memory. It does not automatically mean disk
-durability.
+Every authoritative memory node is durable. The other categories are not
+durable records because they do not own application history.
 
-### One Explicit Durable Boundary
-
-The application author marks a model boundary as durable instead of annotating
-every field. Illustrative syntax is:
+This is deliberately independent from surface syntax:
 
 ```boon
-state: PERSIST {
-    count:
-        0 |> HOLD count {
-            increment |> THEN { count + 1 }
-        }
-
-    todos: LIST { ... }
-
-    -- Derived from authoritative state. Visible inside the same model, but not
-    -- written to storage.
-    completed_count: List/count(todos, where: completed)
-}
-
-ui: TRANSIENT {
-    focused_row: NoRow |> HOLD focused_row { ... }
-}
-
-document: app_view(PASS: [state: state, ui: ui])
+count:
+    0 |> HOLD count {
+        increment |> THEN { count + 1 }
+    }
 ```
 
-The exact parser spelling is decided during the language phase, but these
-semantics are fixed:
+and:
 
-- `PERSIST` marks a lexical/model policy boundary, not a request to serialize
-  the boundary's resulting record.
-- The compiler discovers storage cells and list memories owned by the boundary.
-- `SOURCE` ports are not persisted.
-- Pure fields and projections are not persisted.
-- Render/document/scene values are not persisted.
-- Ordinary `HOLD` outside a durable boundary is session state.
-- `TRANSIENT` explicitly prevents compatible hot reload transfer as well as
-  disk persistence.
-- Unsupported runtime handles or sensitive values inside `PERSIST` are compile
-  errors, not silently skipped fields.
-
-### Persistence Is Orthogonal To Backend
-
-Boon source states which memory is durable. Deployment/host configuration
-selects where and how strongly it is stored. Source must not mention redb,
-IndexedDB, filesystem paths, or database table names.
-
-### Secrets And External Resources
-
-Passwords, authentication tokens, cryptographic keys, open file handles,
-network sockets, timers, WGPU handles, and host objects are transient by
-default. Platform secret stores require a separate typed capability; they must
-not be represented as ordinary `PERSIST` values.
-
-An external resource may persist a serializable descriptor, such as a content
-digest, URL, or application-relative file reference. Restore reopens the
-resource through the host and exposes failure explicitly.
-
-## Minimal Durable State Selection
-
-### Persist Authority, Never Convenience
-
-The compiler emits persistence metadata only for values whose history cannot be
-reconstructed from source and other durable state:
-
-- root scalar `HOLD`/state cells inside `PERSIST`;
-- indexed `HOLD` columns inside durable list rows;
-- mutable list membership and order;
-- hidden list key allocator state and row generations;
-- raw constructor/input fields required to reconstruct dynamic rows;
-- durable source-event deduplication cursors only when the deployment protocol
-  can replay those events;
-- explicit migration metadata and completion state.
-
-Never persist:
-
-- pure or aggregate derived fields;
-- demand-current caches;
-- formula dependency graphs or evaluation stacks;
-- lookup indexes;
-- dirty/currentness flags;
-- source bindings rebuilt from live rows;
-- document, scene, layout, retained render state, glyph caches, GPU resources,
-  proof/readback state, or performance reports;
-- parser AST, IR, MachinePlan, operation schedule, or function closures;
-- unbounded debugging history.
-
-### Touched Overrides
-
-A conceptual state cell does not require a stored record until it has acquired
-user/application-owned history.
-
-For static/root initialization:
-
-1. Compile and evaluate the current default.
-2. If no durable update ever committed, store no override.
-3. On first durable update, write a touched override.
-4. Keep that override even if its value currently equals the default.
-5. Remove it only through an explicit reset-to-default operation.
-
-Equality with the current default is not enough to delete an override. The user
-may intentionally have stored `0`; if a later code version changes the default
-to `5`, restoring `5` would silently rewrite user intent.
-
-### Cells Example As A Generic Acceptance Fixture
-
-For a 2,600-cell logical sheet:
-
-- `address` is deterministic and never stored;
-- default formulas are regenerated from source;
-- untouched formula/editing state creates no durable row record;
-- edited `formula_text`/`editing_text` are sparse touched overrides;
-- `value` and `error` are derived and never stored;
-- formula dependencies and indexes are rebuilt;
-- editing one cell should ordinarily add one or a small bounded number of
-  durable records, not 2,600 records.
-
-This behavior must emerge from generic storage provenance and list semantics.
-
-### Static And Dynamic Lists
-
-An untouched static list/range is regenerated from the current plan. It stores
-no membership snapshot.
-
-Once a static list is structurally changed, membership becomes authoritative.
-The first implementation stores complete current membership/order for that list
-plus sparse row-state overrides. This is less clever and safer across code
-changes than trying to merge an arbitrary new initializer with old structural
-deltas.
-
-A dynamic list stores:
-
-- list durable key;
-- current ordered row keys;
-- each row generation;
-- monotonic `next_key`/allocation state;
-- raw inserted-row constructor fields needed for reconstruction;
-- touched indexed-state overrides.
-
-An empty list can still require durable metadata after mutation. For example,
-append then remove must not resurrect initial rows or reuse a stale key after
-restart.
-
-## Stable Identity And Persistence Schema
-
-### Application Identity
-
-The host/project manifest supplies a stable `application_id`. It is not derived
-from example name, source path, binary hash, process ID, or current program hash.
-
-Built-in examples receive versioned manifest IDs. Custom playground projects
-receive a generated ID stored in their versioned/custom manifest. Production
-applications use their deployment/package identity.
-
-### StorageKey
-
-Each durable cell/list receives a compiler-owned identity:
-
-```text
-StorageKey {
-    format_version
-    application_id
-    canonical_module_path
-    named_lexical_binding_path
-    storage_kind
-    hold_or_list_name
-    row_field_path, if indexed
-    sha256_of_the_canonical_identity
-}
+```boon
+count:
+    LATEST {
+        0
+        increment |> THEN { count + 1 }
+    }
 ```
 
-The store keeps both the readable canonical identity and full SHA-256 digest.
-The digest is the compact lookup key; the readable path detects impossible-but-
-unsafe collisions and supports the inspector.
+both lower to authoritative memory. Mutable `LIST` ownership and stateful
+standard combinators also lower to memory. `HOLD` is not a persistence marker.
 
-Do not include source spans, line numbers, parser order, current defaults,
-derived expressions, type fingerprints, or program hashes in identity. Those
-change for ordinary compatible edits.
+`HOLD` should remain a general feedback/memory primitive and may become less
+common as reusable loops move into generic standard operators. Persistence must
+not make `HOLD` more special than it already is.
 
-### Type Fingerprint
+### No Persistence Lifetime Keywords
 
-Every storage key has a separate canonical type fingerprint. Restore requires:
+Do not add `PERSIST`, `TRANSIENT`, `SESSION`, `RESET`, or `DEFAULT` syntax.
 
-- matching storage kind;
-- compatible Boon value type;
-- compatible scope/list ownership;
-- compatible codec/schema version.
+- Durability is the default for authoritative memory.
+- Host/test configuration may run the entire application against an in-memory
+  store without changing source semantics.
+- Browser, desktop, server, workspace, user, and tenant scope are host storage
+  namespaces, not lexical persistence blocks.
+- If a real future use case requires mixed lifetime authoritative memory, it
+  must receive a precise ownership/lifetime design. It must not be smuggled in
+  as an ambiguous generic transient block.
 
-A mismatch remains preserved as incompatible/orphaned data until explicit
-migration or reset. The runtime must never reinterpret bytes under a new type.
+### Boon Values Remain Data
 
-### PersistencePlan
+Language-level Boon values are data. Host-native objects do not enter the graph
+as opaque language values.
 
-Add a `PersistencePlan` to `MachinePlan` beside `StorageLayout`:
+Examples:
+
+- an open file is represented by an application-relative path, content digest,
+  or host-issued descriptor plus explicit open status;
+- a network connection is represented by configuration and a status `SOURCE`;
+- a timer is represented by duration/deadline data plus emitted source ticks;
+- a WGPU resource remains renderer-owned while Boon produces document/scene
+  data;
+- a credential is represented by a host credential reference, not token text.
+
+Derived document or scene values are still data, but they are not durable
+because they are reconstructed. Serialization capability and persistence
+authority are separate concepts.
+
+### Sources And Deliberate Retention
+
+`SOURCE` declares current input. Event presence, pointer position, hover,
+pressed buttons, focus, IME composition, network connection state, and timer
+ticks are not persisted as source events.
+
+If application code deliberately copies source data into semantic memory, that
+copy becomes durable. The compiler must not infer exceptions based on source
+provenance or variable names.
+
+This supports exact logical resume without storing host machinery:
+
+- a selected cell, text draft, logical edit mode, selected map item, or cursor
+  time may be retained deliberately;
+- a live pointer capture, compositor focus token, active socket, abort handle,
+  or timer handle is rebuilt by the host;
+- a remembered active-watch descriptor may persist while the WebSocket and
+  subscription are recreated.
+
+### Defaults And Touched Authority
+
+Untouched reconstructable program defaults do not require stored records.
+
+For every scalar or indexed memory node:
+
+1. Evaluate the current program default.
+2. If no authoritative write has occurred, store no override.
+3. On the first authoritative write, create a touched override.
+4. Preserve the override even when its value equals the current default.
+5. Change or remove it only through normal application updates or an explicit
+   host Clear State operation.
+
+Equality with the default is not a deletion signal. If a user intentionally
+sets Counter to `0`, changing the program default to `5` in a later release must
+not silently rewrite that intent.
+
+The dev-window Clear State action removes selected overrides and reconstructs
+them from current defaults. This is host tooling, not Boon syntax.
+
+`InitialProvenance` makes the sparse-default rule explicit:
+
+- **ReconstructableDefault** is deterministic from the current plan,
+  immutable host configuration, current restored authority, and explicitly
+  supplied startup inputs. It remains sparse until written.
+- **MaterializedAuthority** samples history that cannot be reproduced, such as
+  an event, time, randomness, or a one-shot host result. Its first
+  materialization is an authoritative touch and must enter the pending durable
+  turn before dependent consequential effects may escape.
+
+The compiler must not describe a source/event sample as a reconstructable
+default merely to avoid a record. If an author wants a new source sample after
+restart, it remains a `SOURCE`; if the sample is copied into memory, the copy
+is authority. Restore never invokes time, randomness, or a host effect. A
+materialized initial value must either arrive as an explicit bounded startup
+input or be created by the first normal source turn after activation.
+
+### Sensitive Input And Credentials
+
+Persistence v1 does not introduce a secret language type or `SECRET` block.
+
+Password controls keep editable bytes in a host-owned sensitive buffer. Boon
+may submit a host reference to a typed authentication effect and observe the
+result, but the plaintext draft is not copied into ordinary application
+memory. It intentionally clears on restart.
+
+Sensitive host paths must redact payloads from:
+
+- inspector snapshots;
+- runtime traces;
+- logs and diagnostics;
+- native GPU verifier reports;
+- scenario artifacts;
+- persistence encoding.
+
+Long-lived credentials use platform credential-store references. This is not
+an end-to-end secrecy claim: the host and authentication endpoint necessarily
+process the secret. A future general sensitivity/taint system requires its own
+language and threat-model plan.
+
+## Semantic Memory And MachinePlan v3
+
+Persistence requires a clean plan break. Introduce MachinePlan v3 and remove
+the old plan shape rather than carrying a dual executor or compatibility
+fallback.
+
+Illustrative plan types:
 
 ```rust
-pub struct PersistencePlan {
-    pub format_version: u32,
-    pub application_schema_id: String,
-    pub schema_hash: [u8; 32],
-    pub slots: Vec<DurableSlotPlan>,
-    pub lists: Vec<DurableListPlan>,
-    pub migrations: Vec<MigrationPlan>,
+pub struct MachinePlan {
+    pub format_version: u32, // exactly 3
+    pub application: ApplicationPlan,
+    pub storage: StorageLayout,
+    pub persistence: PersistencePlan,
+    pub effects: Vec<EffectContract>,
+    pub outputs: Vec<OutputRootPlan>,
+    // Existing operation regions, source routes, constants, and debug map.
 }
 
-pub struct DurableSlotPlan {
-    pub runtime_storage_id: PlanStorageId,
-    pub key: StorageKey,
-    pub value_type: PlanValueType,
+pub struct PersistencePlan {
+    pub format_version: u32,
+    pub schema_version: u64,
+    pub schema_hash: [u8; 32],
+    pub memory: Vec<MemoryPlan>,
+    pub lists: Vec<ListMemoryPlan>,
+    pub migration_edges: Vec<MigrationEdgePlan>,
+}
+
+pub struct MemoryPlan {
+    pub runtime_slot: PlanStorageId,
+    pub memory_id: MemoryId,
+    pub kind: MemoryKind,
+    pub data_type: DataTypePlan,
     pub type_fingerprint: [u8; 32],
-    pub role: StateRole,
     pub initial_provenance: InitialProvenance,
+    pub owner: MemoryOwnerPath,
+}
+
+pub enum MemoryKind {
+    Scalar,
+    IndexedField,
 }
 ```
 
-Runtime numeric IDs remain fast local indexes. `PersistencePlan` is the only
-mapping between local storage and durable identity.
+`PersistencePlan` includes every semantic memory node. It has no durable versus
+session versus transient role enum.
 
-The persistence schema hash covers durable keys, kinds, types, list ownership,
-and migration declarations. It does not cover the document tree, renderer,
-derived graph, constants unrelated to durable defaults, or source formatting.
+### Stable Application Identity
 
-## Runtime Initialization And Restore
+The host supplies:
 
-Split `Session` construction into explicit phases:
+```text
+ApplicationIdentity {
+    package_id
+    state_namespace
+    deployment_domain
+}
+```
 
-1. **Validate plan**: plan version, persistence metadata, key uniqueness, type
-   fingerprints, and migration graph.
-2. **Allocate raw storage**: scalar columns, list containers, and static row
-   identities without demanding derived fields.
-3. **Evaluate defaults**: initialize values that have no restored override.
-4. **Load restore image**: map durable keys to current runtime IDs and install
-   compatible scalar overrides, list structures, rows, generations, and
-   allocator state.
-5. **Execute migrations**: atomically transfer old storage ownership and record
-   completion.
-6. **Rebuild runtime-only structures**: indexes, source bindings, dependency
-   state, and caches.
-7. **Mark derived values dirty**: restored authority invalidates every relevant
-   derived cache.
-8. **Demand outputs**: run currentness barriers for active named output roots.
-9. **Publish first frame/output**: no default-derived frame may escape before
-   restore finishes or visibly fails.
+- Built-in examples receive versioned IDs in the example manifest.
+- Custom playground examples receive a generated immutable ID in their custom
+  manifest.
+- Production applications use package/deployment identity.
+- Tests use unique temporary namespaces and the in-memory driver.
+- Optional user, tenant, or workspace isolation is a host namespace component.
 
-Introduce a builder rather than adding optional restore parameters throughout
-`Session::new`:
+Do not derive identity from example display name, source path alone, process
+ID, current binary hash, current program hash, or launch order.
+
+### Stable Memory Identity
+
+Each memory node receives a compiler-owned semantic identity:
+
+```text
+MemoryId {
+    canonical_module_identity
+    named_owner_path
+    semantic_memory_path
+    memory_kind
+}
+```
+
+The compact storage key is a SHA-256 digest of the full canonical identity. The
+store also retains the readable identity for diagnostics and collision checks.
+
+Identity excludes:
+
+- source spans and line numbers;
+- declaration order and runtime numeric IDs;
+- current default values;
+- derived expressions;
+- document/render structure;
+- type fingerprints and schema hashes;
+- migration markers.
+
+An anonymous stateful operation that cannot receive a unique stable semantic
+path under a named owner is a compile error. The diagnostic asks the author to
+name or structurally disambiguate the owner; it does not generate a line-based
+key.
+
+### Recursive Type Fingerprints
+
+`PlanValueType` must become a recursive canonical data schema capable of
+describing:
+
+- null/unit;
+- booleans, numbers, bytes, and text;
+- variants/tags and their fields;
+- records with canonical field identities;
+- lists and row constructor authority;
+- fixed-length and variable bytes;
+- language-level error/result data where exposed as ordinary values.
+
+Type fingerprints are separate from memory identity. Compatible additions and
+migrations operate on known schemas. Bytes are never reinterpreted under a
+different type merely because a path matches.
+
+### Schema Hash
+
+The persistence schema hash covers:
+
+- application and state namespace format;
+- semantic memory identities;
+- memory kinds and recursive type fingerprints;
+- list ownership and authoritative row fields;
+- effect outbox schema.
+
+It excludes source formatting, pure-derived fields, output trees, render
+resources, debug labels, unrelated constants, and the historical migration
+catalog. Adding an older supported migration recipe must not change the state
+schema identity of an already deployed target.
+
+Migration identity is separate and non-circular:
+
+- each current-source `DRAIN` recipe has a canonical `recipe_hash` over stable
+  source/destination memory leaves, transfer kinds, and the closed pure
+  expression plan;
+- a bound historical edge ID hashes the exact source schema reference, target
+  schema reference, and `recipe_hash`;
+- a bundle may expose a `catalog_hash` over its ordered edge IDs for artifact
+  reproducibility, but `catalog_hash` is not part of `schema_hash`;
+- an edge ID never depends on a target schema hash that itself includes that
+  edge or catalog.
+
+## Durable Data Model
+
+### Stored Values
+
+Define versioned storage DTOs rather than deriving encoding from runtime
+structs:
+
+```text
+StoredValue
+  Null
+  Bool
+  signed 64-bit Number
+  Text
+  Bytes or BlobRef
+  Variant(tag, canonical fields)
+  Record(canonical fields)
+  ListValue(values) when the list is ordinary nested data
+  ErrorData(code, fields) when it is a language value
+```
+
+Mutable semantic list authority uses dedicated list/row records instead of a
+single encoded `Value::List` snapshot.
+
+Use `minicbor` with:
+
+- a top-level format version;
+- numeric field and variant tags that are never reused;
+- canonical field/map ordering;
+- bounded lengths and nesting depth;
+- explicit unknown-field handling for compatible additions;
+- SHA-256 checksums for checkpoint and migration envelopes;
+- golden fixtures for every released format version.
+
+Do not derive the durable schema directly on runtime structs whose layout can
+change.
+
+### Sparse Scalar And Indexed State
+
+Store only touched authoritative overrides. Untouched root and indexed state is
+regenerated from current defaults.
+
+For a Cells-sized logical model:
+
+- addresses and other deterministic fields are derived and not stored;
+- untouched cell formulas create no records;
+- edited formula/draft state creates sparse row-field overrides;
+- computed value, error, formula dependencies, indexes, and render state are
+  rebuilt;
+- the logical grid remains at least 2,600 cells and is not shrunk for storage.
+
+Persistence must use the same generic list/memory metadata for Cells and every
+other application.
+
+### Mutable Lists
+
+A mutable list stores:
+
+- stable list memory identity;
+- current ordered hidden row keys;
+- row generations;
+- monotonic allocator/`next_key` state;
+- raw inserted-row constructor authority;
+- touched indexed row-state overrides;
+- authoritative empty-list state after mutation.
+
+Append then remove must not resurrect initial rows or reuse an old key after
+restart. Derived mapped fields, source bindings, lookup indexes, filters,
+chunks, and summaries are reconstructed.
+
+### Large Bytes
+
+Small authoritative `BYTES` values stay inline. Values above a measured bounded
+threshold are content-addressed by SHA-256 in a blob table. References are
+derived from current durable roots and reclaimed during explicit/background
+maintenance.
+
+Source files, map tiles, waveform page caches, render assets, and other
+reconstructable external data are not copied into the state database merely
+because the application displays them. Serializable file/content descriptors
+may be durable authority.
+
+## Atomic Runtime Turns
+
+### Prepare, Commit, Settle
+
+Refactor `Session` execution into three explicit phases:
+
+1. **Prepare**
+   - ingest source events;
+   - evaluate affected equations against the previous committed snapshot;
+   - stage scalar/list/row writes;
+   - resolve `LATEST` and other write policies;
+   - validate list mutations and effect intents;
+   - perform every fallible operation required to decide authority.
+2. **Commit**
+   - atomically install staged authority;
+   - advance the runtime turn sequence once;
+   - emit ordered authority deltas and output invalidations.
+3. **Settle**
+   - rebuild affected source bindings and indexes;
+   - mark derived targets dirty;
+   - demand host-owned outputs through currentness barriers;
+   - enqueue persistence and effect work;
+   - publish diagnostics.
+
+Preparation failure changes no authority. Settle/output failure is visible but
+does not create a half-committed turn.
+
+### Authority Delta Contract
+
+The current broad `Delta::SetValue` shape mixes authority and derived
+recomputation. Introduce a dedicated semantic stream:
+
+```rust
+pub struct AuthorityTurn {
+    pub turn_seq: u64,
+    pub changes: Vec<AuthorityChange>,
+    pub effect_intents: Vec<EffectIntent>,
+}
+
+pub enum AuthorityChange {
+    TouchSetScalar { memory: MemoryId, value: DataValue },
+    TouchSetRowField { memory: MemoryId, row: StableRowKey, value: DataValue },
+    ClearAuthority { memory: MemoryId, scope: AuthorityScope },
+    InsertRow { list: MemoryId, row: AuthoritativeRow, position: u64 },
+    RemoveRow { list: MemoryId, row: StableRowKey },
+    MoveRow { list: MemoryId, row: StableRowKey, position: u64 },
+    ReplaceListAuthority { list: MemoryId, state: AuthoritativeList },
+}
+```
+
+An equal-value first write emits a touch. A later assignment of the same value
+may be elided from the durable delta, but it never clears existing touched
+authority. `ClearAuthority` is emitted only by explicit host Clear State
+tooling and is committed as a normal atomic turn. Derived values, source
+bind/unbind operations, currentness transitions, render patches, and proof
+events remain separate streams.
+
+### No Mutable Runtime Cache
+
+Compiler caches may retain immutable parse/type/IR/MachinePlan artifacts keyed
+by content. They must never retain a mutable `Session` as a reusable compiled
+artifact.
+
+Hot reload creates one candidate Session, restores/migrates authority into it,
+settles demanded outputs, then atomically swaps ownership. Failure leaves the
+old runtime active.
+
+## Restore And Hot Reload
+
+Use an explicit builder. `Load` is read-only and produces a validated store
+image; migration and deletion are first staged in memory:
 
 ```rust
 SessionBuilder::new(plan)
@@ -420,372 +655,659 @@ SessionBuilder::new(plan)
     .build()
 ```
 
-The restore image contains only canonical durable state. It is not a full
-runtime graph snapshot.
+Candidate construction phases are fixed:
 
-## Delta-Native Persistence
+1. Validate MachinePlan v3, persistence metadata, stable-key uniqueness, type
+   fingerprints, migration graph, and effect contracts.
+2. Validate the read-only store image and determine sequential migration
+   edges.
+3. Produce an in-memory migrated `RestoreImage` and an exact
+   `ActivationBatch`; do not mutate the store.
+4. Allocate raw scalar/list storage and static row identities without demanding
+   derived fields.
+5. Install compatible scalar, list, row, generation, allocator, and touched
+   authority.
+6. Evaluate reconstructable defaults only for memory with no restored touched
+   authority; materialized initial authority enters a staged turn.
+7. Rebuild indexes, dynamic dependencies, and dormant source-route metadata.
+8. Mark affected derived values dirty.
+9. Demand active output roots through currentness barriers without publishing,
+   attaching live sources, or dispatching effects.
+10. Mark the candidate ready only after all fallible settling work succeeds.
 
-The semantic delta layer is canonical. Persistence lowering filters each
-committed `RuntimeTurn` through `PersistencePlan`:
+`RestoreImage` contains canonical authority, not a graph or render snapshot.
 
-```text
-RuntimeTurn
-  -> keep authoritative durable State/List/Row changes
-  -> map local IDs to StorageKey
-  -> coalesce safely inside the same turn
-  -> DurableCommitBatch(base_epoch, next_epoch, changes)
-  -> background store transaction
-```
+Cold start commits any non-empty `ActivationBatch` with Immediate durability
+before attaching sources or publishing the first output. Hot reload uses a
+short activation barrier:
 
-Do not write all `Delta::SetValue` entries. Derived field deltas are renderer or
-debug facts, not durable state. Source bind/unbind deltas are rebuilt and are
-not durable.
+1. Build the candidate from an authority snapshot while the old Session stays
+   active.
+2. At a turn boundary, stop accepting new authoritative turns and replay the
+   complete tail since that snapshot into the candidate.
+3. Settle the candidate again and revalidate the durable base epoch.
+4. Atomically commit migrated authority, schema metadata, completed migration
+   edges, and removed-record deletion as one Immediate `ActivationBatch`.
+5. Perform an infallible Session ownership swap, attach live sources, publish
+   current outputs, and resume turn admission.
 
-One Boon turn maps to one atomic durable transaction. Either all state/list
-changes from the turn commit or none do.
+If any step before durable activation fails, the old Session and old store stay
+unchanged. If the process dies after durable activation but before publication,
+the next cold start observes the new schema. No effect worker runs candidate
+intents before activation.
 
-### Durable Commit Shape
+Compatible hot reload and cold restart use the same stable identity, type,
+migration, and deletion rules. Hot reload may source authority from the active
+Session while cold restart sources it from storage, but both feed the same
+builder.
+
+## Persistence Coordinator
+
+### Target-Neutral Command Protocol
+
+A synchronous `DurableStateStore: Send` trait does not fit both native redb and
+asynchronous browser IndexedDB cleanly. Core runtime code communicates through
+owned commands and results:
 
 ```rust
-pub struct DurableCommitBatch {
-    pub application_id: ApplicationId,
+pub enum PersistenceCommand {
+    Load(RestoreRequest),
+    Commit(CheckpointBatch),
+    Activate(ActivationBatch),
+    Barrier(BarrierRequest),
+    Inspect(InspectRequest),
+    Compact(CompactRequest),
+    Shutdown(ShutdownRequest),
+}
+
+pub enum PersistenceResult {
+    Loaded(Result<RestoreImage, StoreError>),
+    Committed(Result<CommitAck, StoreError>),
+    Activated(Result<ActivationAck, StoreError>),
+    BarrierComplete(Result<BarrierAck, StoreError>),
+    Inspected(Result<PersistenceInspectorSnapshot, StoreError>),
+    Compacted(Result<CompactAck, StoreError>),
+    ShutdownComplete(Result<ShutdownAck, StoreError>),
+}
+```
+
+- Native runs a synchronous redb driver on a dedicated thread.
+- Wasm runs an asynchronous Rexie driver in a browser worker/task boundary.
+- Tests run an in-memory deterministic driver.
+- The runtime and dev window consume the same bounded result/status shapes.
+
+### Checkpoint Batching
+
+In-memory Boon turns remain individually atomic. Backend transactions may
+contain one or more complete contiguous turns:
+
+```rust
+pub struct CheckpointBatch {
+    pub application: ApplicationIdentity,
     pub schema_hash: [u8; 32],
     pub base_epoch: u64,
     pub next_epoch: u64,
+    pub first_turn_seq: u64,
+    pub last_turn_seq: u64,
     pub changes: Vec<DurableChange>,
+    pub outbox_changes: Vec<DurableOutboxChange>,
     pub checksum: [u8; 32],
 }
 
-pub enum DurableChange {
-    SetOverride { key: StorageKey, scope: ScopeKey, value: StoredValue },
-    ResetOverride { key: StorageKey, scope: ScopeKey },
-    ReplaceListStructure { key: StorageKey, rows: Vec<StoredRow> },
-    InsertRow { list: StorageKey, row: StoredRow, position: u64 },
-    RemoveRow { list: StorageKey, key: u64, generation: u64 },
-    MoveRow { list: StorageKey, key: u64, generation: u64, position: u64 },
-    CompleteMigration { migration_id: MigrationId },
+pub struct ActivationBatch {
+    pub application: ApplicationIdentity,
+    pub expected_base_epoch: u64,
+    pub next_epoch: u64,
+    pub source_schema_hash: [u8; 32],
+    pub target_schema_version: u64,
+    pub target_schema_hash: [u8; 32],
+    pub through_turn_seq: u64,
+    pub authority_changes: Vec<DurableChange>,
+    pub completed_migration_edges: Vec<MigrationEdgeId>,
+    pub deleted_memory: Vec<MemoryId>,
+    pub checksum: [u8; 32],
 }
 ```
 
-Persistence epochs are durable-store epochs, not frame sequence numbers. They
-must advance monotonically and reject stale/repeated commit application.
+Coalescing rules:
 
-## Durable Store Boundary
+- never split a turn;
+- preserve complete turn order;
+- scalar/row-field sets may collapse to the final value while retaining first
+  touch and final turn sequence;
+- list operations may coalesce only when final order, row generation,
+  allocator, and delete semantics remain identical;
+- migration and outbox transitions may not be dropped;
+- acknowledgements cover an explicit contiguous turn/epoch range;
+- queue saturation applies visible backpressure at a turn boundary rather than
+  dropping durable authority.
 
-Core runtime code must not depend directly on redb, IndexedDB, filesystem APIs,
-threads, futures executors, or browser types.
+Prepare reserves bounded queue capacity before authority commit. If capacity
+cannot be reserved after semantic coalescing, the runtime rejects that
+authoritative turn promptly with a visible `PersistenceBackpressure` status;
+it does not mutate Session authority, wait for database I/O in the input frame,
+or silently drop the turn. Critical barriers may intentionally delay external
+acknowledgement/effect progress, but they do not turn ordinary rendering into a
+storage wait.
 
-Use a small host-owned interface:
+### Durability Policies
 
-```rust
-pub trait DurableStateStore: Send + 'static {
-    fn load(&mut self, request: RestoreRequest) -> Result<RestoreImage, StoreError>;
-    fn commit(&mut self, batch: DurableCommitBatch) -> Result<CommitAck, StoreError>;
-    fn flush(&mut self) -> Result<FlushAck, StoreError>;
-    fn inspect(&mut self, request: InspectRequest) -> Result<StoreSummary, StoreError>;
-    fn compact(&mut self, request: CompactRequest) -> Result<CompactAck, StoreError>;
-}
-```
+Durability is host/deployment policy, not Boon source syntax.
 
-The runtime communicates with a `PersistenceCoordinator`, not the backend:
+**Buffered** is the default interactive policy:
 
-```text
-Session commit
-  -> bounded coordinator queue
-  -> dedicated native thread or browser worker
-  -> DurableStateStore
-  -> CommitAck / failure status
-  -> cached inspector snapshot
-```
+- commit product state to the in-memory Session immediately;
+- render without waiting for storage;
+- coalesce pending complete turns on the persistence worker;
+- perform an Immediate checkpoint within a short bounded interval;
+- flush on clean shutdown, suspend, migration, and explicit Save/Flush;
+- expose pending turn range, oldest age, and last durable epoch.
 
-Do not use `async_trait` in the compiler/runtime core. Native redb is
-synchronous on its dedicated thread. Browser IndexedDB is asynchronous inside a
-worker, but messages crossing the coordinator boundary have the same request and
-acknowledgement shapes.
+**Immediate** is available for strict deployments and barriers:
+
+- the relevant turn range is acknowledged only after the backend's strongest
+  supported commit completes;
+- migrations and critical effect intents always use an Immediate barrier;
+- schema activation uses one Immediate transaction after the candidate settles;
+- a server may choose Immediate globally;
+- browser reports must not pretend IndexedDB completion equals native
+  power-loss guarantees.
+
+It is impossible to guarantee that every already-visible UI change survives
+sudden power loss while also never waiting for storage. Reports and the dev
+window must state the pending tail honestly.
+
+### Performance Boundary
+
+No render hook or input frame may:
+
+- open redb or IndexedDB;
+- encode a full application snapshot;
+- scan every state/list row;
+- wait for a storage acknowledgement;
+- parse persistence JSON;
+- issue dev-window IPC queries;
+- compact or repair storage.
+
+The hot path emits bounded authority deltas into a preallocated/bounded queue.
+Persistence costs are measured separately from product input-to-present
+latency.
 
 ## Native redb Backend
 
-Use `redb` tables with byte keys and explicitly encoded values:
+Use explicit byte-keyed tables:
 
 ```text
-META       singleton metadata, format, app id, schema, epoch, clean shutdown
-SLOTS      StorageKey + ScopeKey -> StoredSlot
-LISTS      StorageKey + parent scope -> StoredListMetadata
-ROWS       StorageKey + parent scope + row key + generation -> StoredRow
-JOURNAL    durable epoch -> DurableCommitBatch
-MIGRATIONS migration id -> completion record
-BLOBS      content digest -> bounded large value/blob metadata
+META        format, app identity, schema, epochs, clean shutdown
+SLOTS       MemoryId + scope -> touched scalar/indexed value
+LISTS       list MemoryId + parent scope -> order, allocator metadata
+ROWS        list MemoryId + scope + row key + generation -> row authority
+CHECKPOINTS bounded checkpoint/journal metadata
+MIGRATIONS  migration edge completion records
+OUTBOX      durable external-effect intents and outcomes
+BLOBS       content digest -> bounded large-value data/metadata
 ```
 
-The write worker applies a commit in one `redb::WriteTransaction`:
+A write transaction:
 
-1. Read and validate `META.current_epoch`.
-2. Reject mismatched schema or stale `base_epoch`.
-3. Insert the journal record.
-4. Apply slot/list/row materialized-state changes.
-5. Record migration completion.
-6. Advance metadata to `next_epoch`.
-7. Commit once.
-8. Send `CommitAck` only after `redb` returns success.
+1. validates application identity, schema, and current epoch;
+2. rejects stale or non-contiguous batches;
+3. records checkpoint metadata;
+4. applies scalar/list/row changes;
+5. applies migration completion and removed-key deletion;
+6. applies outbox transitions;
+7. advances the durable epoch and acknowledged turn sequence;
+8. commits once;
+9. returns acknowledgement only after redb reports success.
 
-The materialized tables provide bounded startup. The journal is retained only
-within a configured debugging/recovery window and compacted after a verified
-materialized checkpoint. Normal restore does not replay an unbounded history.
+Schema activation uses the same table set but a distinct transaction contract:
+it checks `expected_base_epoch`, writes the migrated candidate authority,
+records every completed edge, deletes removed memory, advances schema/epoch,
+and commits once. A stale base rejects the complete activation without partial
+cleanup.
 
-### redb Durability Modes
+Use `redb::Durability::Immediate` for barriers. Buffered coalescing occurs before
+the redb transaction, not by misreporting a weak commit as durable.
 
-Expose host/deployment policy, not Boon syntax:
+Evaluate `WriteTransaction::set_quick_repair(true)` through measured forced-
+crash and startup-repair tests. The final setting must meet explicit recovery
+budgets. Repair and compaction never run synchronously from product input.
 
-- **Immediate**: `redb::Durability::Immediate`; the commit acknowledgement means
-  the transaction is persistent. Use for explicit saves, shutdown barriers,
-  migrations, and externally consequential operations.
-- **Buffered**: commit/coalesce pending local UI turns on the worker, followed by
-  a bounded periodic Immediate barrier. The inspector must display pending and
-  last durable epochs. A clean shutdown performs an Immediate flush.
-
-The default desktop playground policy is Buffered for interaction latency, with
-a short bounded flush interval. Product state becomes visible from the
-in-memory Session immediately. The product frame never waits for redb. A strict
-deployment can require an Immediate acknowledgement before executing an
-external irreversible effect.
-
-The queue may be bounded, but it may not drop durable commits. It may safely
-coalesce scalar overrides only while preserving commit order, list structure,
-migration state, and the final epoch. If it cannot coalesce, it applies
-backpressure at a runtime turn boundary and reports the stall. It never performs
-storage work from a render hook.
-
-Evaluate `WriteTransaction::set_quick_repair(true)` in the redb backend spike.
-The final native setting must be selected by measured commit and forced-crash
-recovery results. Startup recovery has a hard budget, so accepting very slow
-full-file repair is not a valid silent default for large stores.
-
-Compaction runs only on explicit maintenance or bounded size/obsolete-page
-thresholds. It is never triggered synchronously from source input or rendering.
-
-### Native Storage Location
-
-Production applications use the platform application-data directory under
-their stable application ID.
-
-The playground uses a repository-local ignored directory, for example:
+Production storage uses the platform application-data directory. Playground
+storage uses a repository-local ignored path:
 
 ```text
-playground/state/<application-id>/state.redb
+playground/state/<application-id>/<namespace>/state.redb
 ```
 
-Built-in example source remains versioned. Runtime database files, journals,
-exports, and fault-test files remain ignored.
+Built-in source stays versioned. Runtime databases, fault files, exports, and
+repair artifacts remain ignored.
 
 ## Browser And Wasm Backend
 
-Implement `IndexedDbDurableStateStore` in Rust using `rexie` and IndexedDB
-object stores corresponding to the logical native tables:
+Implement a Rust Rexie driver over IndexedDB object stores corresponding to the
+logical native tables:
 
 ```text
 meta
 slots
 lists
 rows
-journal
+checkpoints
 migrations
+outbox
 blobs
 ```
 
-One Boon turn is one IndexedDB read-write transaction across all affected object
-stores. The browser worker returns an acknowledgement only after transaction
-completion.
+One IndexedDB transaction applies one complete `CheckpointBatch` or
+`ActivationBatch`. A checkpoint may contain multiple contiguous Boon turns.
+Completion acknowledges the batch, not stronger power-loss durability than the
+browser provides.
 
-The WebAssembly UI/main thread must never synchronously encode a full snapshot
-or wait on storage. It sends bounded durable batches to the worker and consumes
-acknowledgements/status updates.
+Rexie database and transaction objects stay on the browser worker/local
+executor that created them; they are not sent across threads. Protocol messages
+cross the boundary as owned bounded DTO bytes and scalar status only.
 
-Browser storage is normally best-effort and can be quota-limited or evicted.
-The host requests persistent storage through the browser Storage API and reports
-whether it was granted. Quota failure, transaction abort, private browsing, and
-version-change blocking are explicit runtime/dev statuses.
+Requirements:
 
-Do not use LocalStorage. It is synchronous, small, string-only, and unsuitable
-for atomic list/row commits.
+- no synchronous full-state encoding on the Wasm UI thread;
+- no handwritten JavaScript storage implementation;
+- no LocalStorage fallback;
+- request persistent browser storage and report whether it was granted;
+- surface quota, eviction risk, private mode, blocked upgrades, transaction
+  aborts, and version-change closure;
+- use the same codec, checkpoint, migration, deletion, and outbox golden
+  fixtures as native;
+- keep the old database untouched when migration cannot start safely.
 
-## Durable Codec
+The browser may evict or deny storage. The product must remain usable in memory
+where possible while reporting that durable guarantees are unavailable. It may
+not silently claim success.
 
-Define Boon-owned storage DTOs separate from runtime `Value`, `RowId`, and
-MachinePlan types.
+## DRAIN And DRAINING
 
-Use `minicbor` with:
+### Purpose
 
-- numeric field and variant tags that are never reused;
-- a top-level format version;
-- optional fields for compatible additions;
-- canonical map/list ordering;
-- explicit maximum lengths and nesting depth;
-- SHA-256 checksums for commit/checkpoint envelopes;
-- golden fixtures from every released format version;
-- no direct derive on internal runtime structs whose layout may change.
+Formatting and compatible same-identity changes migrate automatically. The
+compiler cannot safely infer whether a removed value and a new similar value
+represent rename, replacement, split, or unrelated state. Those ownership
+changes use the only persistence migration syntax: paired `DRAIN` and
+`DRAINING` markers.
 
-`StoredValue` initially supports only serializable Boon data:
-
-```text
-Null
-Tag/Bool
-signed Number
-Text
-Bytes
-List of StoredValue
-Record with canonical field ordering
-```
-
-Runtime-only `MappedRow`, `Row`, error stacks, handles, sources, and render
-objects are rejected or converted by an explicit durable descriptor type. They
-are never encoded accidentally.
-
-Large authoritative `BYTES` values use a bounded threshold. Small bytes remain
-inline. Large values are content-addressed by SHA-256 in `BLOBS`, with reference
-counts/marking derived from durable roots. Derived assets and source files stay
-outside the state database.
-
-## Hot Reload And Schema Evolution
-
-### Compatible Reload
-
-Hot reload uses the same stable persistence schema as cold restore:
-
-1. Compile the new plan.
-2. Export current authoritative Durable and Session values by stable key.
-3. Match unchanged keys and compatible types.
-4. Apply declared migrations.
-5. Build a new Session through the restore barrier.
-6. Recompute derived outputs.
-7. Atomically replace the active runtime only after success.
-
-Session values use stable keys in memory but are not written to the durable
-backend. Transient values are deliberately omitted.
-
-### DRAIN And DRAINING
-
-Renames, moves, splits, merges, and incompatible type changes require explicit
-state evolution. The intended language model is the paired
-`DRAIN`/`DRAINING` design:
+### Basic Rename
 
 ```boon
-counter: 0 |> HOLD value { ... } |> DRAINING
-click_count: DRAIN { counter } |> HOLD value { ... }
+counter:
+    0 |> HOLD count { ... } |> DRAINING
+
+click_count:
+    DRAIN { counter }
+    |> HOLD count { ... }
 ```
 
-Required invariants:
+`DRAINING` marks the old authoritative owner as retiring. `DRAIN { counter }`
+transfers its authority to the destination identity. The destination identity
+is durable immediately, so finalizing the source markers later does not rename
+storage again.
 
-- every `DRAINING` source has exactly one `DRAIN` destination;
-- every `DRAIN` references a valid draining source;
-- no double drain, conditional drain, cycle, or use-after-draining;
-- destination identity is the durable identity after migration;
-- source bytes remain preserved until the destination transaction commits;
-- migration completion is durable and idempotent;
-- removing migration markers while transfer is incomplete is rejected;
-- conversion is explicit for type changes;
-- unknown/orphaned data is retained until migration or explicit deletion.
+### Path-Only Grammar
 
-Until `DRAIN` is implemented, compatible stable-key restores may proceed, but
-renames/type mismatches must produce visible diagnostics and preserve old data.
-They must not silently reset or guess by source similarity.
+`DRAIN { ... }` accepts exactly one statically resolvable storage path:
 
-`FLUSH` remains a separate fail-fast/bypass concept. It is not state migration.
-`UNPLUGGED` remains structural-absence fallback, not ownership transfer.
+- a named binding;
+- a field path;
+- a statically resolved `PASSED` path.
 
-## Failure And Recovery Semantics
+It rejects:
 
-Persistence failure must be honest and non-destructive.
+- calls and operators;
+- indexing or list lookup;
+- literals and record expressions;
+- multiple source paths in one block;
+- optional/dynamic access;
+- `WHEN`, `THEN`, loops, event flow, or other runtime conditions;
+- a derived value, source event, or non-authoritative function argument.
 
-- Corrupt or incompatible data remains on disk and is reported.
-- A failed restore does not silently start from defaults and overwrite the old
-  database.
-- A failed commit leaves the previous durable epoch authoritative.
-- Partial Boon turns are impossible because one turn is one backend transaction.
-- Repeated commit batches are detected by epoch/checksum and are idempotent or
-  rejected deterministically.
-- A stale schema writer cannot update a newer store.
-- Storage queue saturation is observable and never resolved by dropping list or
-  migration changes.
-- Clean shutdown requests an Immediate flush with a bounded timeout and reports
-  failure.
-- Forced process termination can lose only commits explicitly reported as
-  pending under Buffered mode.
-- Power/storage corruption tests preserve the last acknowledged Immediate
-  epoch.
-- Restore rebuilds all derived indexes and bindings instead of trusting stored
-  cache state.
+`|> DRAINING` is a terminal declaration marker, not a normal runtime operator.
+A draining source cannot be used by ordinary Boon references.
 
-## Document, Scene, And Root Outputs
+### Pure Conversion
 
-### Output Ports, Not Stored Variables
-
-`document` and `scene` are named reactive output ports. They are not application
-state and are never part of `PERSIST`.
-
-Boon source may call a normal pure view function:
+Type conversion uses ordinary compiler-proven pure Boon after the path-only
+drain:
 
 ```boon
-document: app_view(PASS: [state: state, ui: ui])
+old_count:
+    0 |> HOLD count { ... } |> DRAINING
+
+count_text:
+    DRAIN { old_count }
+    |> Number/to_text()
+    |> HOLD text { ... }
 ```
 
-The compiler lowers this output into a typed document/scene plan. The runtime
-owns retained element identity, active/pending document state, layout, text
-resources, GPU resources, hit testing, and patch application. Boon functions
-produce structural descriptions and bindings, not host-owned widget objects.
+Conversion may call pure functions and construct pure records. It may not read
+time, randomness, sources, host resources, mutable state, or perform effects.
+The lowered transform is deterministic and versioned with the migration edge.
 
-### Generalize The Root Registry
+### Record Split And Merge
 
-The current semantic index recognizes `document` and `scene`, while
-`MachinePlan` has a dedicated optional `document` field. Generalize this into a
-typed named output-root registry:
+A draining record defines a source region. Every authoritative leaf in that
+region is consumed exactly once. Disjoint leaves may go to separate
+destinations; several independent sources may merge into one destination.
 
-```text
-outputs: Vec<OutputRootPlan>
+```boon
+settings:
+    [theme: Dark, zoom: 100]
+    |> HOLD settings { ... }
+    |> DRAINING
 
-OutputRootPlan {
-    name
-    contract kind
-    value target/document plan
-    demand policy
+theme:
+    DRAIN { settings.theme }
+    |> HOLD theme { ... }
+
+zoom:
+    DRAIN { settings.zoom }
+    |> HOLD zoom { ... }
+```
+
+```boon
+old_theme:
+    Dark |> HOLD theme { ... } |> DRAINING
+
+old_zoom:
+    100 |> HOLD zoom { ... } |> DRAINING
+
+settings:
+    [
+        theme: DRAIN { old_theme }
+        zoom: DRAIN { old_zoom }
+    ]
+    |> HOLD settings { ... }
+```
+
+Ancestor and descendant drains may not overlap. Self-drain, double drain,
+partial leaf coverage, cycles, and conflicting destination authority are
+compile errors.
+
+### Lists And Indexed Rows
+
+Hidden row keys preserve identity inside a list; they do not preserve identity
+when the owning list binding is renamed. Whole-list ownership transfer is
+therefore supported:
+
+```boon
+todos:
+    LIST { ... }
+    |> List/map(todo, new: new_todo(todo: todo))
+    |> DRAINING
+
+tasks:
+    DRAIN { todos }
+    |> List/map(task, new: new_task(task: task))
+```
+
+The transfer preserves order, hidden keys, generations, allocator state,
+constructor authority, and touched row fields. Runtime indexes, filters,
+source bindings, and derived rows are rebuilt.
+
+An indexed row-field drain is a migration template applied by hidden row key:
+
+```boon
+FUNCTION new_todo(todo) {
+    [
+        title:
+            todo.title |> HOLD title { ... } |> DRAINING
+
+        text:
+            DRAIN { title }
+            |> HOLD text { ... }
+    ]
 }
 ```
 
-Hosts demand only the roots they own. Future roots may include UI, server
-routes, scheduled tasks, build results, network endpoints, or hardware pins.
+Row-field migration is allowed within the same stable list owner. Renaming the
+list owner and changing its authoritative row schema happen in two schema
+versions so ownership remains unambiguous.
 
-### No Mandatory main Function
+General partition/merge of independent authoritative lists is rejected in v1.
+It requires row-owner, key-collision, order, and allocator policies that a
+path-only drain cannot express safely. Prefer one authoritative list and pure
+derived views:
 
-Do not add an imperative mandatory `main()`. A single main return value would
-hide independent reactive outputs and introduce unnecessary root unpacking.
+```boon
+active_tasks:
+    tasks |> List/retain(task, if: task.completed |> Bool/not())
 
-`BLOCK` continues to return its final expression/value. A named root may use a
-`BLOCK` to calculate and return its value, but the root registry defines host
-outputs. Persistence roots remain orthogonal to output roots.
+completed_tasks:
+    tasks |> List/retain(task, if: task.completed)
+```
+
+### Automatic Changes And Deletion
+
+The compiler automatically accepts:
+
+- formatting/comments;
+- unrelated declarations and sibling reordering;
+- unchanged semantic identity and compatible type;
+- new memory initialized from a current default;
+- new derived fields or output changes;
+- deletion of an old state definition.
+
+Removing an authoritative state definition without `DRAIN` means intentional
+deletion. Schema activation deletes its stored records atomically. Rename or
+move must include the pair in the same schema change or the old authority is
+deleted and the new memory starts from its default.
+
+The dev window shows pending deletions before activating a hot reload. No extra
+Boon delete keyword is introduced. Future host policy may optionally retain
+backups, but v1 does not accumulate removed state records.
+
+A stored type mismatch for an identity that still exists is not treated as
+deletion. Activation fails until a compatible type or explicit conversion is
+provided. Corrupt or unsupported stores fail before any cleanup transaction.
+
+### Sequential Migration Catalog
+
+Users may skip releases. This is common for browser/Wasm applications because
+IndexedDB remains in a browser profile while the next visit downloads the
+current Wasm directly. Native packages and FPGA bitstreams can also skip
+versions.
+
+When a DRAIN release is finalized, tooling writes its already-lowered and
+validated pure migration plan into a deterministic source-controlled fragment.
+Authors do not write another migration syntax. Current artifacts bundle every
+edge from the oldest supported schema:
+
+```text
+schema 7 -> 8
+schema 8 -> 9
+schema 9 -> 10
+```
+
+A store at schema 7 opening version 10 applies the three edges one by one in a
+single staged activation sequence. Each edge is idempotently recorded.
+
+This catalog is code, not a runtime history or user-data log. A future major
+release may raise the minimum supported schema and remove older recipe
+fragments. Stores older than that baseline fail visibly and remain untouched.
+
+For FPGA targets, migration normally runs in deployment/updater tooling or a
+host controller before the new design owns persistent memory. The same generic
+migration plan is used; normal datapath hardware need not interpret a migration
+catalog.
+
+### Migration Demonstration Examples
+
+Migration is not complete when it exists only in unit fixtures. Add two
+versioned built-in examples that use the same compiler, Session builder,
+activation transaction, storage drivers, dev-window controls, and native TEST
+path as ordinary applications. Neither runtime nor verifier may branch on the
+example IDs.
+
+**Counter Migration** is the small teaching sequence:
+
+1. V1 owns `count` with program default `0`.
+2. V2 marks `count` as `DRAINING` and initializes `click_count` from
+   `DRAIN { count }`.
+3. V3 removes both markers, retains only `click_count`, and changes its program
+   default to `10`.
+
+The scenario increments and explicitly writes `0`, checkpoints, restarts,
+previews and activates V2/V3, and proves the touched `0` does not become the
+new default `10`.
+
+**Todo Migration** is the realistic sequence:
+
+1. V1 owns `todos` rows with `title` and `completed`, a preferences record,
+   and obsolete `show_help` state.
+2. V2 transfers whole-list ownership from `todos` to `tasks`.
+3. V3 finalizes the list rename and adds an untouched `priority` row field.
+4. V4 splits preferences into `theme` and `density` through field drains.
+5. V5 finalizes that split and drains indexed row field `title` to `text`.
+6. V6 finalizes the row rename and purely converts `completed: Bool` into a
+   status variant.
+7. V7 finalizes conversion and deletes obsolete `show_help` authority.
+
+The scenario preserves order, hidden row keys, generations, allocator
+monotonicity, edited text, touched row fields, and preferences. One run applies
+each version incrementally. A second fresh namespace jumps from V1 to V7 and
+must produce the same canonical final authority by applying every catalog edge
+in order.
+
+The main example manifest retains V1 as the normal source and points to an
+optional migration-sequence manifest. The sequence owns ordered stage IDs,
+labels, schema versions, source units, and one typed migration scenario. Manual
+demo namespaces persist normally. TEST uses a launch-scoped temporary namespace
+and never clears or rewrites manual demo state.
+
+The dev Migration view provides forward-only target selection plus Preview,
+Activate, Restart, and confirmed Start Over commands. Preview compiles,
+migrates, and settles a candidate without mutating the store or mounted
+preview. Activate keeps the old retained frame visible until the durable schema
+transaction succeeds and then performs one current Session swap. Old stage
+source may be inspected but is not an implicit downgrade path.
+
+Invalid examples remain compiler/typecheck fixtures rather than selectable
+playground entries. They cover missing pairs, double drain, use after drain,
+dynamic/conditional paths, overlap, cycles, impure conversion, and simultaneous
+list-owner plus row-schema migration.
+
+## Critical External Effects
+
+Durable local state alone is insufficient when a turn triggers an external
+action. Persistence v1 includes effect consistency.
+
+### Effect Contracts
+
+Built-in and custom host effects expose typed metadata:
+
+```rust
+pub struct EffectContract {
+    pub effect_id: EffectId,
+    pub replay: EffectReplay,
+    pub barrier: EffectBarrier,
+    pub result_policy: EffectResultPolicy,
+}
+
+pub enum EffectReplay {
+    ReadOnly,
+    Idempotent { key_type: DataTypePlan },
+    NonReplayable,
+}
+
+pub enum EffectBarrier {
+    None,
+    Before,
+    BeforeAndAfter,
+}
+```
+
+The host contract, not a value name or Boon persistence annotation, determines
+barrier requirements. The compiler rejects an irreversible workflow that lacks
+a safe durable intent/idempotency contract.
+
+### Durable Outbox
+
+Consequential effects use a transactional outbox:
+
+1. A Boon turn stages local pending state and an effect intent with a stable
+   idempotency key.
+2. An Immediate checkpoint stores both atomically.
+3. Only after acknowledgement may the effect worker contact the external
+   system.
+4. The result enters Boon as a correlated source event.
+5. A second Immediate checkpoint stores the authoritative outcome and consumes
+   or completes the outbox item.
+6. Restart replays pending idempotent intents or reconciles their remote status.
+
+For a bank transfer, the UI may show `Pending` immediately. It may not show
+`Completed` before the authoritative remote result is durably recorded. If the
+remote system succeeded but the local result commit failed, restart queries by
+the same idempotency key and reconciles without issuing a second transfer.
+
+Exactly-once execution across an unreliable network is not generally possible.
+Durable intent, idempotency, and reconciliation provide the honest practical
+contract. The external bank/shared transactional database remains authoritative
+unless Boon is deployed with an appropriate shared/replicated database. Local
+redb is not distributed consensus.
+
+### Lifecycle Barriers
+
+Immediate barriers are automatic for:
+
+- migrations and schema activation;
+- critical effect intents and outcomes;
+- server acknowledgements that promise durable mutation;
+- explicit Save/Flush operations;
+- bounded clean shutdown/suspend handling.
+
+Read-only effects, repeatable fetches, rendering, and ordinary input do not
+force barriers.
+
+## Output Roots And Host Ownership
+
+`document`, `scene`, routes, responses, build outputs, scheduled tasks, and
+hardware pins are typed named output roots. They are reconstructed from current
+authority and inputs.
+
+Generalize the dedicated document field into:
+
+```rust
+pub struct OutputRootPlan {
+    pub name: String,
+    pub contract: OutputContractKind,
+    pub demand: OutputDemandPolicy,
+    pub value: ValueRef,
+}
+```
+
+Hosts demand only roots they own. There is no mandatory imperative `main()`.
+`BLOCK` continues to return its final value, while the root registry defines
+what the host observes.
+
+The runtime owns retained element identity, active/pending document state,
+layout, text resources, hit testing, GPU resources, and render patches. These
+are never durable application memory even if a structural document value could
+be encoded.
 
 ## Dev Window Persistence UX
 
-### Editor And Inspector Roles
+### Inspector
 
-Use restrained familiar icons in the editor gutter and inspector:
-
-- database icon: Durable state;
-- memory/history icon: Session state;
-- short-lived indicator: Transient state;
-- function/derived indicator: Derived, not stored;
-- warning icon: pending, failed, orphaned, or incompatible state.
-
-When the caret or inspector targets a value, show:
+For authoritative memory, show:
 
 ```text
 Symbol          store.count
+Kind            Authoritative memory
 Type            Number
-Role            Durable state
 Current         42
-Last persisted  42
 Default         0
-Status          Saved at epoch 18, 24 ms ago
+Touched         yes
+Last checkpoint 42 at epoch 18
+Pending         turns 37..39, oldest 24 ms
 Backend         redb, Buffered
-Storage key     app/state/store/count
+Memory ID       app/store/count
 Encoded size    7 bytes
 Last writer     increment_button.press, sequence 27
 ```
@@ -793,318 +1315,482 @@ Last writer     increment_button.press, sequence 27
 For a derived value:
 
 ```text
-Role            Derived, not stored
+Kind            Derived
 Current         3
+Stored          no
 Reconstructed   from store.todos.completed
-Reason          Pure aggregate with currentness barrier
+Currentness     current
 ```
 
-For a sparse indexed value:
+For source/resource state:
 
 ```text
-Logical rows    2,600
-Touched rows    1
-Stored values   1
-Current row     A2 / hidden key 27 / generation 1
+Kind            Source / host resource
+Stored          no
+Status          connected
+Descriptor      credential-ref or file digest only
 ```
+
+Sensitive values show only `redacted`; no length, hash, prefix, or payload is
+included in reports.
 
 ### Persistence Overview
 
-Add a Persistence view grouped by durable model/list:
+Show a cached scalar summary:
 
-- application ID and schema hash;
-- backend and durability policy;
-- current runtime epoch, queued epoch, and last durable epoch;
-- durable roots, scalar overrides, touched rows, dynamic rows, and byte size;
-- pending commit count and oldest pending age;
-- last commit/flush duration;
-- journal and blob sizes;
-- persistent browser permission/quota status;
-- matched, new, orphaned, incompatible, and migration-pending keys;
-- last error without truncating the actionable reason.
+- application identity, namespace, schema version/hash;
+- backend and effective durability guarantee;
+- runtime turn, queued turn range, and durable turn/epoch;
+- touched scalar and indexed counts;
+- logical/list row counts, stored rows, and byte size;
+- pending batch count and oldest age;
+- last encode, commit, barrier, and restore durations;
+- checkpoint, outbox, migration, and blob sizes;
+- browser persistence permission/quota status;
+- matched, added, deleted, incompatible, and migration-pending identities;
+- last actionable error.
 
-Controls use icon buttons with tooltips:
+Large lists use virtualized filtering and bounded row samples. The sidebar must
+never enumerate every Cells row during normal inspection.
+
+### Controls
+
+Use icon buttons with tooltips for:
 
 - flush now;
-- export durable state;
-- import/inspect an export;
-- clear/reset selected durable root;
-- clear all state with confirmation;
-- run compaction/maintenance explicitly.
+- clear selected authoritative memory/list scope (disabled for derived,
+  source, and output values);
+- clear all application state with confirmation;
+- export/inspect a state artifact;
+- import into a separate preview before activation;
+- run explicit maintenance/compaction;
+- inspect pending outbox work;
+- review and activate schema migration/deletion.
 
-Do not dump thousands of rows into the normal sidebar. Use filtering,
-pagination/virtualization, and bounded samples.
+The migration preview shows source, destination, conversion, affected row
+count, deletion count, required edges, and compatibility baseline before hot
+reload commits.
 
-### Migration View
+### Hot-Path Isolation
 
-On code replacement, show a migration summary before committing destructive
-changes:
+The dev window consumes a cached `PersistenceInspectorSnapshot` updated after
+turns and acknowledgements. Footer/render hooks perform zero storage queries,
+zero runtime lock acquisition, zero transport calls, and zero JSON report
+parsing.
 
-```text
-Matched             14
-New                  2
-Draining             1
-Orphaned             1
-Type incompatible    0
-```
-
-Selecting an entry shows old key/type/value summary, destination, conversion,
-completion epoch, and whether old data is still retained.
-
-### Performance Boundary
-
-The dev window consumes a cached `PersistenceInspectorSnapshot` sent on state or
-acknowledgement changes. It never opens redb, scans IndexedDB, serializes a full
-snapshot, performs IPC, or waits for the storage worker from a render hook.
-
-Persistence timings are reported separately:
+Report these costs separately:
 
 ```text
-enqueue_us
+authority_enqueue_us
 encode_us
 queue_age_ms
-commit_ms
-flush_ms
+checkpoint_ms
+barrier_ms
 restore_ms
+migration_ms
 rebuild_derived_ms
 stored_bytes
-pending_batches
+pending_turns
+outbox_pending
 ```
 
 ## Implementation Phases
 
-### Phase 1: Language And Plan Metadata
+No phase is optional. Do not start a backend first and patch semantics around
+it later.
 
-- Finalize `PERSIST`/`TRANSIENT` syntax without making backend names language
-  concepts.
-- Add state-role classification to parser semantic metadata and typechecking.
-- Reject unsupported/sensitive durable values.
-- Add stable `StorageKey`, type fingerprints, and `PersistencePlan` to IR and
-  MachinePlan.
-- Add uniqueness, determinism, and compatibility verification.
-- Add inspector metadata before any disk backend.
+### Phase 0: Canonical Documentation
 
-Exit condition: Counter, TodoMVC, Cells, and generic fixtures compile to a
-deterministic persistence plan whose durable slots exclude all derived fields.
+- Replace the old persistence-boundary design with this document.
+- Keep one active persistence plan.
+- Lock durable-by-default memory and DRAIN semantics before parser changes.
+- Record explicit user approval of the language-facing sections before Phase 1.
+- Record explicit non-goals and completion gates.
 
-### Phase 2: Restore-Aware Session Construction
+Exit condition: this document contains no contradictory lifetime-role,
+removed-record-retention, or one-turn-per-backend-transaction requirements.
 
-- Split raw initialization from derived publication.
-- Add `SessionBuilder`, `RestoreImage`, and state-role-aware export.
-- Add deterministic in-memory backend and restart harness.
-- Restore root/indexed state and list identity before currentness barriers.
-- Rename the existing broad snapshot to `DebugSnapshot`.
+### Phase 1: Semantic Memory And MachinePlan v3
 
-Exit condition: deterministic process-local cold-restart tests restore state
-without a file/database and derived outputs are recomputed, not copied.
+- Lower every stateful construct to generic semantic memory nodes.
+- Remove line-number and declaration-order durable identity inputs.
+- Add recursive data type plans/fingerprints.
+- Add stable application, memory, list, row-field, output, and effect metadata.
+- Cut MachinePlan v2 execution compatibility rather than carrying two worlds.
+- Add deterministic plan/debug inspection before disk storage.
 
-### Phase 3: Delta Lowering And Persistence Coordinator
+Exit condition: Counter, Counter without HOLD, TodoMVC, Cells, NovyWave, and
+generic fixtures emit deterministic memory plans independent of formatting and
+without example-specific branches.
 
-- Lower committed semantic deltas through `PersistencePlan`.
-- Filter derived/render/source-binding deltas.
-- Add atomic durable epochs and checksums.
-- Add bounded worker protocol, acknowledgements, errors, flush, and shutdown.
-- Prove no product render hook or interaction frame performs storage work.
+### Phase 2: Atomic Session And Restore Builder
 
-Exit condition: the in-memory backend receives exactly the authoritative
-changes for each Boon turn and fault injection cannot expose partial state.
+- Implement prepare/commit/settle turn phases.
+- Add staged scalar/list/row writes and rollback-on-prepare-failure.
+- Split authority deltas from derived/debug/render deltas.
+- Preserve equal-value touched writes.
+- Implement `SessionBuilder` and restore publication barrier.
+- Remove mutable Session/runtime caching from compile/hot-reload caches.
 
-### Phase 4: Native redb Backend
+Exit condition: deterministic fault injection cannot expose partial authority,
+and no output is published before restored authority is current.
 
-- Add target-gated `redb` dependency and Boon-owned backend crate/module.
-- Implement tables, metadata, materialized state, bounded journal, migrations,
-  blobs, repair reporting, and compaction.
-- Implement Immediate and Buffered policies.
-- Add repository-local ignored playground state location.
-- Benchmark queueing, commit, flush, restore, repair, and file growth.
+### Phase 3: Persistence Protocol And In-Memory Driver
 
-Exit condition: native Counter/TodoMVC restart tests, forced-crash tests, and
-schema mismatch tests pass with the last acknowledged epoch intact.
+- Add target-neutral command/result protocol.
+- Add checkpoint batching and exact acknowledgement ranges.
+- Implement deterministic in-memory load, commit, barrier, inspect, compact,
+  and failure behavior.
+- Add bounded queue/backpressure and cached inspector snapshots.
+- Prove no render/input hook performs storage work.
 
-### Phase 5: Sparse Lists And Large Logical Models
+Exit condition: golden authority turns lower to exact checkpoint batches;
+multi-turn coalescing preserves semantics under every injected failure.
 
-- Track untouched versus touched scalar/indexed state provenance.
-- Store sparse row overrides.
-- Store dynamic list structure, generations, order, and allocators.
+### Phase 4: Native redb
+
+- Add target-gated redb dependency and driver.
+- Implement metadata, slots, lists, rows, checkpoints, migrations, outbox, and
+  blob tables.
+- Implement Buffered and Immediate policies.
+- Add repository-local ignored playground state path.
+- Benchmark checkpoint, barrier, restore, repair, compaction, and file growth.
+
+Exit condition: native restart and forced-crash tests restore the last
+acknowledged epoch with bounded startup and no product-frame I/O.
+
+### Phase 5: Sparse Authority And Large Lists
+
+- Implement touched provenance for root and indexed memory.
+- Persist dynamic list structure, generations, order, allocators, and raw row
+  authority.
 - Handle empty-but-mutated and static-then-mutated lists.
-- Add bounded blob policy.
+- Implement bounded blob storage/reclamation.
+- Add Cells-scale logical-versus-stored diagnostics.
 
-Exit condition: editing one Cells formula stores bounded sparse state while all
-2,600 logical cells and derived formulas restore correctly.
+Exit condition: one Cells formula edit stores bounded sparse authority while
+all 2,600 logical cells and derived formulas restore correctly.
 
-### Phase 6: Compatible Hot Reload And Migration
+### Phase 6: Hot Reload, DRAIN, And Migration Catalog
 
-- Transfer Durable and Session state through stable keys.
-- Drop Transient state.
-- Add compatibility diagnostics and atomic runtime replacement.
-- Implement `DRAIN`/`DRAINING` analysis, transfer, completion, and finalization.
-- Retain orphaned/incompatible bytes until explicit action.
+- Implement path-only parser/type/IR support.
+- Add leaf ownership, purity, cycle, overlap, and list constraints.
+- Implement schema deletion and migration preview.
+- Transfer scalar, record, whole-list, and indexed row-field authority.
+- Generate deterministic finalized migration fragments.
+- Apply sequential edges for skipped versions.
+- Atomically swap a fully restored/current candidate Session.
+- Add the generic version-sequence manifest and migration-scenario runner.
+- Add Counter Migration and Todo Migration as mandatory built-in fixtures.
 
-Exit condition: whitespace/reordering/view changes preserve state; rename,
-move, split, merge, and type conversion scenarios require and correctly execute
-explicit migrations.
+Exit condition: formatting and compatible additions are automatic; rename,
+move, conversion, record split/merge, list rename, row-field rename, deletion,
+and skipped-version scenarios behave exactly as documented.
 
-### Phase 7: Browser/Wasm Backend
+### Phase 7: Critical Effects And Outbox
 
-- Implement the Rust `rexie`/IndexedDB worker backend.
-- Match native logical tables and transaction semantics.
-- Request/report persistent browser storage.
-- Handle quota, eviction status, private browsing, blocked upgrades, aborts, and
-  clean shutdown limitations.
-- Run the same backend contract fixtures in Wasm.
+- Add typed host effect contracts.
+- Lower effect intents into atomic authority turns.
+- Implement before/after barriers, outbox dispatch, idempotent retry, and
+  reconciliation.
+- Reject unsafe non-replayable workflows.
+- Add server acknowledgement integration.
 
-Exit condition: browser cold restart and schema evolution match native semantic
-results without LocalStorage or handwritten JavaScript persistence code.
+Exit condition: crash-at-every-boundary tests cannot duplicate a consequential
+effect when the declared external idempotency/reconciliation contract is
+honored, cannot report completion without a durable outcome, and reject effects
+that cannot provide such a contract.
 
-### Phase 8: Dev Window UX
+### Phase 8: Browser/Wasm
 
-- Extend language hints and runtime inspect responses with state roles.
-- Add current/default/persisted/pending values and storage identity.
-- Add virtualized Persistence and Migration views.
-- Add clear, flush, export/import, and maintenance commands.
-- Ensure all UI reads cached snapshots only.
+- Implement the Rust Rexie/IndexedDB driver.
+- Run storage work outside the Wasm UI hot path.
+- Match native logical schema and golden checkpoint behavior.
+- Add persistent-storage permission, quota, eviction, private-mode, blocked
+  upgrade, and transaction-abort statuses.
+- Bundle/apply the same supported migration chain.
 
-Exit condition: an operator can determine exactly what is stored, why it is
-stored, how much is stored, whether it is durable, and why a migration failed
-without inspecting database files manually.
+Exit condition: browser refresh, skipped deployment, quota failure, and schema
+evolution pass without LocalStorage or handwritten JavaScript persistence.
 
-### Phase 9: Generic Output Root Ownership
+### Phase 9: Dev Window UX
 
-- Replace the plan's dedicated output assumption with `OutputRootPlan` registry.
-- Keep `document` and `scene` as typed named roots.
-- Keep runtime-owned retained output resources outside persistence.
-- Add a non-UI root fixture proving no mandatory `main()` is required.
+- Extend inspector data with semantic memory/current/checkpoint metadata.
+- Add virtualized Persistence, Migration, and Outbox views.
+- Add clear, flush, export/import-preview, and maintenance controls.
+- Add migration stage inspection plus Preview, Activate, Restart, and Start
+  Over controls for any manifest-backed migration sequence.
+- Add sensitive-data redaction negative tests.
+- Keep render hooks on cached scalar snapshots only.
 
-Exit condition: multiple named roots can coexist, hosts demand selected roots,
-and no output object appears in a durable state record.
+Exit condition: an operator can explain what is authoritative, what is stored,
+what is pending, what will be deleted/migrated, and why an operation failed
+without opening backend files.
+
+### Phase 10: Generic Output Roots And Final Cleanup
+
+- Replace dedicated output assumptions with `OutputRootPlan`.
+- Keep retained host resources outside semantic memory.
+- Add non-UI/server/build fixtures.
+- Delete temporary adapters, duplicated schemas, old plan versions, and
+  migration compatibility scaffolding not part of the final architecture.
+- Run the no-special-case audit across compiler, runtime, document, renderer,
+  playground, app window, and verifiers.
+
+Exit condition: one execution architecture remains and every output kind uses
+the same restore/currentness boundary.
 
 ## Required Verification
 
 ### Compiler And Identity
 
-- Stable keys survive whitespace, comments, unrelated declarations, and sibling
-  reordering.
-- Renames and moves do not silently reuse state.
-- Numeric `StateId`/`ListId`/`FieldId` values never appear in durable keys.
-- Type changes fail compatibility unless explicitly migrated.
-- Persistence schema hash ignores render-only and pure-derived changes.
-- Duplicate canonical identities fail compilation.
+- `HOLD`, stateful `LATEST`, `LIST`, and stateful standard operators lower to
+  generic semantic memory.
+- Counter and Counter without HOLD produce equivalent persistence behavior.
+- Stable identities survive whitespace, comments, unrelated declarations, and
+  sibling reordering.
+- Line numbers, declaration-order IDs, program hashes, and example names never
+  appear in storage keys.
+- Recursive type fingerprints are canonical and collision-checked.
+- Duplicate/ambiguous semantic memory identities fail compilation.
+- MachinePlan v2 is rejected rather than silently routed through another
+  executor.
 
-### Runtime And Currentness
+### Atomicity And Currentness
 
-- Restored state is installed before any demanded derived read or first output.
-- Derived values are absent from stored records and recompute after restore.
-- Currentness barriers prevent stale values after restore or migration.
-- Indexes, dynamic dependencies, and source bindings are rebuilt.
-- Cycles remain protected by the default evaluation stack.
+- Failure during prepare changes no authority.
+- Commit installs all turn authority or none.
+- Equal-value first writes become touched authority.
+- Queue saturation rejects before commit and never blocks an interaction frame
+  on storage I/O.
+- Restore happens before source binding, derived demand, output publication, or
+  effects.
+- Derived values are not loaded from storage and recompute correctly.
+- Indexes, formula dependencies, source bindings, and render state rebuild.
+- Cycle/default-stack protection remains active after restore.
+- Hot reload failure leaves the previous Session active and unforked.
 
 ### Minimal State
 
-- Fresh Counter has zero overrides; one increment creates one scalar override.
-- Reset-to-default explicitly removes the override.
-- Cells startup stores no `value`/`error` and no untouched row state.
+- Fresh Counter stores no override.
+- Increment stores one override.
+- Reset button assigning `0` keeps a touched durable override.
+- Dev Clear State removes it and reuses the current program default.
+- Cells startup stores no `value`, `error`, index, dependency, or untouched row
+  values.
 - Editing one cell stores only edited authority and bounded list metadata.
-- TodoMVC preserves dynamic row order, keys, generations, titles, and completion
-  state across restart.
-- Removing every row preserves authoritative empty-list and allocator state.
+- TodoMVC preserves row order, keys, generations, titles, drafts, editing, and
+  completion.
+- Removing every list row preserves authoritative empty structure and allocator
+  state.
 
-### Atomicity And Recovery
+### Migration
 
-- Fault before commit changes nothing durable.
-- Fault during backend transaction restores the previous acknowledged epoch.
-- Fault after commit acknowledgement restores the acknowledged epoch.
-- Duplicate/stale batches cannot corrupt or double-apply state.
-- Corrupt values and incompatible schemas remain preserved and visible.
-- Buffered mode reports exactly which epochs are pending.
-- Immediate flush semantics match `redb::Durability::Immediate`.
+- Parser accepts only named, field, and statically resolved `PASSED` paths.
+- Calls, indexing, conditions, event flow, derived sources, and impure
+  conversion are rejected.
+- Missing pair, double drain, uncovered leaf, overlap, cycle, self-drain, and
+  conflicting destination fail.
+- Scalar rename, module move, conversion, record split/merge, whole-list
+  rename, and row-field rename preserve intended authority.
+- List rename preserves row order, hidden keys, generations, allocator, and
+  nested touched fields.
+- General authoritative list split/merge is rejected with a derived-view
+  recommendation.
+- Removing state deletes its records atomically.
+- Candidate settle failure leaves both active Session and durable schema
+  unchanged.
+- Schema activation commits migration results and deletion in one Immediate
+  transaction before Session swap/publication.
+- Existing-identity type mismatch fails without deletion.
+- Stores skipping multiple supported versions apply each edge in order.
+- Unsupported-old or corrupt stores fail before mutation.
+- Repeated migration activation is idempotent.
 
-### Backend Parity
+### Checkpoint And Backend Recovery
 
-- In-memory, redb, and IndexedDB backends consume the same golden commit batches
-  and produce semantically identical restore images.
-- Versioned `minicbor` golden files remain readable after codec changes.
-- Browser quota/abort and native I/O/repair failures map to the same public
-  status categories.
+- Fault before checkpoint changes nothing durable.
+- Fault during a backend transaction restores the prior acknowledged epoch.
+- Fault after acknowledgement restores the acknowledged turn range.
+- Stale, duplicate, non-contiguous, and checksum-invalid batches cannot corrupt
+  state.
+- Coalesced batches preserve complete turn order and list semantics.
+- Queue saturation never drops list, migration, deletion, or outbox changes.
+- Native repair preserves the last acknowledged Immediate state.
+- IndexedDB abort/quota/version-change failures map to explicit statuses.
+- Native, Wasm, and in-memory drivers consume the same golden batches and
+  produce equivalent restore images.
+
+### Critical Effects
+
+- Read-only effects require no barrier.
+- Consequential intent and local pending state commit atomically.
+- Dispatch never occurs before the required acknowledgement.
+- Crash before dispatch resumes the pending outbox item.
+- Crash after remote success but before local result commit reconciles by
+  idempotency key.
+- Duplicate retry cannot duplicate the external action.
+- Result commit failure cannot display authoritative completion.
+- Non-replayable effects without a safe contract are compile/activation errors.
+
+### Sensitive Data
+
+- Password drafts are absent from authority deltas and checkpoints.
+- Logs, inspector, reports, scenarios, and errors contain no password payload,
+  prefix, length, or hash.
+- Credential references encode without exposing credential material.
+- Restart clears host-owned sensitive input.
+- The plan and product do not claim cryptographic end-to-end secrecy beyond
+  tested host/storage/transport boundaries.
+
+### Application Fixtures
+
+- Counter and Interval test scalar updates and high-frequency coalescing.
+- TodoMVC tests dynamic lists and row state.
+- Cells tests sparse large logical models and formula currentness.
+- NovyWave tests workspace/file descriptors, selected signals, groups, markers,
+  panel dimensions, zoom, pan, and cursor while excluding waveform caches,
+  requests, and render resources.
+- A FjordPulse-shaped fixture tests locale, basemap, selection, focus/watch
+  descriptors, last-known snapshots, reconnect, TTL/staleness derivation, and
+  external authoritative reconciliation.
+- A non-UI fixture tests server/output roots and critical effect barriers.
+- Counter Migration proves scalar rename, paired-marker finalization, restart,
+  and touched-equal-default behavior.
+- Todo Migration proves whole-list and indexed-row ownership transfer, record
+  split, pure conversion, deletion, incremental activation, and V1-to-V7
+  skipped-version activation.
 
 ### Performance
 
-- Persistence disabled adds no hot-path branches beyond a predictable role
-  check.
-- Persistence enqueue/encoding does not perform file I/O or IndexedDB work on
-  the product thread.
-- Normal visible interactions retain the existing 16.7 ms p95 target with
-  persistence enabled.
-- Product input-to-present excludes asynchronous durable acknowledgement but
-  reports queue/commit latency separately.
-- No full state, list, document, or JSON snapshot is created per turn.
-- Storage queue never drops durable list/migration changes.
-- Restore and forced-crash repair have explicit release budgets and bounded
-  report evidence.
+- Persistence enqueue/authority encoding performs no file or IndexedDB I/O on
+  product threads.
+- No full application, document, scene, or JSON snapshot is created per turn;
+  unchanged list rows are not re-encoded. A deliberate whole-list replacement
+  encodes only its changed authority off the product thread and is subject to
+  explicit queue/backpressure budgets.
+- Buffered high-frequency state coalesces within bounded memory and time.
+- Persistence enabled retains the native 16.7 ms input-to-present and scroll
+  p95 targets for existing performance fixtures.
+- Product latency excludes asynchronous checkpoint/readback/report completion,
+  while those costs remain separately linked and reported.
+- Restore, migration, forced-crash repair, and large-store startup have explicit
+  release budgets.
+- The dev persistence UI cannot freeze on Cells-sized or NovyWave-sized state.
 
-### Dev Window
+### Dev Window And Native Evidence
 
-- Durable, Session, Transient, and Derived roles are visually distinct.
-- Current and last persisted values update after runtime turns and store acks.
-- Pending/failure/orphan/migration states are visible.
-- Large lists are virtualized and do not freeze the dev window.
-- The dev render hook performs zero store queries and zero IPC requests.
+- Inspector distinguishes authority, derived, source/resource, and output data.
+- Current, touched, pending, and durable values update after turns and acks.
+- Migration preview exposes additions, deletions, conversions, and supported
+  upgrade edges.
+- Large state is virtualized.
+- Dev render hooks perform zero storage/runtime queries and zero IPC requests.
+- Native visual/functional evidence uses app-owned events and WGPU/readback
+  according to `NATIVE_GPU_PIPELINE.md`, never fabricated human observation.
+- Migration TEST visibly performs application interactions with the virtual
+  cursor, uses the public activation path, shows stage progress in the dev
+  window, and leaves the manual namespace unchanged.
+- Candidate preparation never blanks or replaces the active preview; the final
+  retained-frame swap meets the normal interaction-frame budget while
+  preparation and durable activation are reported separately.
 
-### Output Roots
+### Genericity Audit
 
-- `document` and `scene` are never durable records.
-- View-only source changes do not invalidate compatible durable state.
-- Runtime retains and patches output resources after state restore.
-- Multiple output roots work without a mandatory `main()`.
+Scan parser, typechecker, IR, compiler, plan, executor, runtime, document,
+native GPU, playground, app window, and xtask verifiers for:
+
+- example-name branches;
+- Cells-specific storage logic;
+- source-label/geometry inference used as identity;
+- duplicate execution paths or fallback runtimes;
+- direct backend dependencies in compiler/runtime core;
+- LocalStorage, Python, JSON state snapshots, or render-hook storage access.
+
+Any positive finding blocks completion.
 
 ## Acceptance Criteria
 
-The persistence goal is complete only when all of the following are true:
+The implementation goal is complete only when all conditions below are true:
 
-- `PERSIST` and `TRANSIENT` have documented, typechecked semantics.
-- MachinePlan carries stable, deterministic persistence metadata.
-- Session restore occurs before derived currentness/output publication.
-- Only authoritative scalar/list/row state is stored.
-- Sparse untouched state is proven on Cells-sized logical models.
-- Native persistence uses redb and no C/SQLite dependency.
-- Browser persistence is implemented in Rust over IndexedDB and uses no
-  LocalStorage or handwritten JavaScript storage layer.
-- One Boon turn is one atomic durable transaction.
-- Immediate and Buffered durability are honest and visible.
-- Compatible hot reload and cold restart share the same identity/migration
-  rules.
-- DRAIN/DRAINING migrations are cycle-safe, atomic, idempotent, and visible.
-- Corrupt or incompatible state is preserved rather than silently reset.
-- The dev window explains what is stored, why, where, how much, and at which
-  durable epoch.
-- Normal render/input frames contain no database or proof work and retain their
-  performance budgets.
-- `document`, `scene`, retained elements, layout, and GPU resources remain
-  runtime-owned outputs, never stored application variables.
-- Deterministic native, Wasm, restart, crash, migration, sparse-state,
-  currentness, and visual/functional dev-window gates all pass from fresh
-  artifacts.
+- Boon has durable-by-default semantic memory with no persistence lifetime
+  keywords.
+- Every stateful construct lowers through one generic memory plan.
+- MachinePlan v3 contains stable identities, recursive data schemas,
+  persistence metadata, migration edges, effect contracts, and output roots.
+- No line/order/runtime numeric identity reaches durable storage.
+- Session turns are atomic and restore precedes first observable output.
+- Equal-value touched authority, sparse defaults, lists, rows, generations, and
+  allocators restore correctly.
+- Native redb, Rust IndexedDB/Wasm, and deterministic in-memory drivers satisfy
+  the same semantic contract.
+- Buffered and Immediate guarantees are honest and visible.
+- DRAIN/DRAINING is the only explicit persistence migration syntax and supports
+  the documented scalar, record, list-owner, and row-field cases.
+- Removed state is deleted atomically; incompatible/corrupt stores are not
+  silently reset.
+- Supported skipped versions migrate sequentially.
+- Critical external effects use barriers, durable outbox, idempotency, and
+  reconciliation.
+- Sensitive input does not enter ordinary state, persistence, logs, reports, or
+  inspector output.
+- Cells proves sparse large-model persistence without losing 60 FPS targets.
+- NovyWave and FjordPulse-shaped scenarios prove realistic desktop and
+  full-stack state ownership.
+- Counter Migration and Todo Migration pass manual controls, deterministic TEST,
+  restart, incremental, skipped-version, fault-injection, native visual, redb,
+  in-memory, and IndexedDB/Wasm verification.
+- The dev window explains current/durable/pending/migration/effect state without
+  hot-path queries.
+- `document`, `scene`, retained layout, GPU resources, caches, and proof data
+  remain reconstructed host/output state.
+- All deterministic native, Wasm, restart, crash, migration, outbox, sparse,
+  currentness, performance, and dev-window gates pass from fresh artifacts.
+- No temporary adapter, duplicate runtime, old plan fallback, or example hack
+  remains.
+
+Do not mark the goal complete for documentation alone, a redb proof of concept,
+Counter-only restore, stale reports, or passing smoke tests. Completion requires
+the entire contract above.
+
+## Explicit Non-Goals
+
+- SQL query semantics or a general relational database.
+- Distributed consensus, cross-region replication, or pretending local redb is
+  a shared banking database.
+- Aggressive guessed renames based on similar source structure.
+- A general list repartition/merge migration language in v1.
+- A general secret/taint language design inside persistence work.
+- Persisting render scenes, GPU buffers, host handles, source events, runtime
+  caches, or full graph snapshots.
+- Adding a mandatory imperative `main()`.
+- Weakening Cells/native GPU performance or proof gates to accommodate storage.
 
 ## Source References
 
-Current repository contracts and implementation:
+Repository contracts and implementation:
 
 - [`../architecture/RUNTIME_MODEL.md`](../architecture/RUNTIME_MODEL.md)
 - [`../architecture/DELTA_PROTOCOL.md`](../architecture/DELTA_PROTOCOL.md)
 - [`../architecture/LANGUAGE_SEMANTICS.md`](../architecture/LANGUAGE_SEMANTICS.md)
+- [`../architecture/NATIVE_GPU_PIPELINE.md`](../architecture/NATIVE_GPU_PIPELINE.md)
 - [`../../crates/boon_plan_executor/src/session.rs`](../../crates/boon_plan_executor/src/session.rs)
 - [`../../crates/boon_plan/src/lib.rs`](../../crates/boon_plan/src/lib.rs)
 - [`../../crates/boon_ir/src/lib.rs`](../../crates/boon_ir/src/lib.rs)
-- [`../../crates/boon_native_playground/src/dev.rs`](../../crates/boon_native_playground/src/dev.rs)
-- [`../../crates/boon_native_playground/src/ui.rs`](../../crates/boon_native_playground/src/ui.rs)
+- [`../../examples/novywave/RUN.bn`](../../examples/novywave/RUN.bn)
+
+Prior strict migration design consulted for semantic continuity:
+
+- `~/repos/boon_experiments/docs/new_boon/3.6_STATE_EVOLUTION.md`
+- [`../game/idea_1.md`](../game/idea_1.md)
 
 External Rust/storage references:
 
-- [redb repository and status](https://github.com/cberner/redb)
+- [redb repository](https://github.com/cberner/redb)
 - [redb crate documentation](https://docs.rs/redb)
 - [redb durability](https://docs.rs/redb/latest/redb/enum.Durability.html)
 - [redb custom StorageBackend](https://docs.rs/redb/latest/redb/trait.StorageBackend.html)
-- [Turso Database repository and beta status](https://github.com/tursodatabase/turso)
-- [rexie IndexedDB wrapper](https://docs.rs/rexie)
+- [Rexie IndexedDB wrapper](https://docs.rs/rexie)
 - [minicbor](https://docs.rs/minicbor)
 - [IndexedDB transactions](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API/Using_IndexedDB)
-- [Browser storage persistence, quotas, and eviction](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria)
+- [Browser storage persistence and quotas](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria)

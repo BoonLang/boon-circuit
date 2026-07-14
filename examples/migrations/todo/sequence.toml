@@ -1,0 +1,44 @@
+initial_stage = "v1"
+scenario = "examples/migrations/todo/migration.scn"
+
+[[stage]]
+id = "v1"
+label = "Todo Migration V1"
+schema_version = 1
+source = "examples/migrations/todo/v1.bn"
+
+[[stage]]
+id = "v2"
+label = "Todo Migration V2"
+schema_version = 2
+source = "examples/migrations/todo/v2.bn"
+
+[[stage]]
+id = "v3"
+label = "Todo Migration V3"
+schema_version = 3
+source = "examples/migrations/todo/v3.bn"
+
+[[stage]]
+id = "v4"
+label = "Todo Migration V4"
+schema_version = 4
+source = "examples/migrations/todo/v4.bn"
+
+[[stage]]
+id = "v5"
+label = "Todo Migration V5"
+schema_version = 5
+source = "examples/migrations/todo/v5.bn"
+
+[[stage]]
+id = "v6"
+label = "Todo Migration V6"
+schema_version = 6
+source = "examples/migrations/todo/v6.bn"
+
+[[stage]]
+id = "v7"
+label = "Todo Migration V7"
+schema_version = 7
+source = "examples/migrations/todo/v7.bn"

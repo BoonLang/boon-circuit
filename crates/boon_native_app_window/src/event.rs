@@ -3,14 +3,16 @@ use app_window::event::{
     ButtonState, ImeEvent, LogicalKey, PointerButton as NativePointerButton, WheelDelta,
     WindowEvent, WindowEventCapabilities, WindowEventCapability, WindowEventError,
 };
+use app_window::input::keyboard::key::KeyboardKey;
 use boon_host::{
     AccessibilityInputAction, AccessibilityInputEvent, CallbackToHostNs, HostEvent,
     HostEventEnvelope, HostEventOrigin, ImeInputEvent, ImeInputKind, KeyEvent,
     LogicalKey as HostLogicalKey, LogicalSize, PhysicalSize, PointerButton, PointerEvent,
-    PointerPhase, SurfaceResizeEvent, TextInputEvent, WheelEvent,
+    PointerPhase, SensitiveInputHandle, SurfaceResizeEvent, TextInputEvent, WheelEvent,
 };
 
 use crate::error::NativeHostError;
+use crate::sensitive_input::{SensitiveEdit, SensitiveInputTarget, SensitiveInputVault};
 use crate::surface::{NativeHostIds, NativeViewport};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +56,10 @@ pub(crate) struct EventAdapter {
     sequence: u64,
     pointer_position: Option<(f32, f32)>,
     ime_commit_echo: Option<String>,
+    sensitive_ime_commit_echo: bool,
+    shift_pressed: bool,
+    control_pressed: bool,
+    sensitive_inputs: SensitiveInputVault,
 }
 
 impl EventAdapter {
@@ -63,13 +69,46 @@ impl EventAdapter {
             sequence: 0,
             pointer_position: None,
             ime_commit_echo: None,
+            sensitive_ime_commit_echo: false,
+            shift_pressed: false,
+            control_pressed: false,
+            sensitive_inputs: SensitiveInputVault::default(),
         }
+    }
+
+    pub(crate) fn focus_sensitive_input(
+        &mut self,
+        target: SensitiveInputTarget,
+    ) -> Result<SensitiveInputHandle, NativeHostError> {
+        self.sensitive_inputs.focus(target).map_err(Into::into)
+    }
+
+    pub(crate) fn clear_sensitive_input_focus(&mut self) {
+        self.sensitive_inputs.clear_focus();
+        self.sensitive_ime_commit_echo = false;
+    }
+
+    pub(crate) fn restart_sensitive_inputs(&mut self) {
+        self.sensitive_inputs.restart();
+        self.sensitive_ime_commit_echo = false;
+    }
+
+    pub(crate) fn with_sensitive_input<R>(
+        &self,
+        handle: SensitiveInputHandle,
+        use_bytes: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, crate::SensitiveInputError> {
+        self.sensitive_inputs.with_bytes(handle, use_bytes)
     }
 
     pub(crate) fn adapt(
         &mut self,
         event: WindowEvent,
     ) -> Result<AdaptedWindowEvent, NativeHostError> {
+        if matches!(event, WindowEvent::TextInput(_)) && self.sensitive_ime_commit_echo {
+            self.sensitive_ime_commit_echo = false;
+            return Ok(AdaptedWindowEvent::Omitted);
+        }
         if let WindowEvent::TextInput(text) = &event {
             if self.ime_commit_echo.as_deref() == Some(text) {
                 self.ime_commit_echo = None;
@@ -136,39 +175,77 @@ impl EventAdapter {
                 physical_key,
                 logical_key,
                 state,
-            } => HostEvent::Keyboard(KeyEvent {
-                surface: self.ids.surface.clone(),
-                physical_key: physical_key.map(|key| format!("{key:?}")),
-                logical_key: logical_key_value(logical_key),
-                pressed: state == ButtonState::Pressed,
-            }),
-            WindowEvent::TextInput(text) => HostEvent::TextInput(TextInputEvent {
-                surface: self.ids.surface.clone(),
-                text,
-            }),
-            WindowEvent::Ime(ImeEvent::Commit(text)) => {
-                self.ime_commit_echo = Some(text.clone());
-                HostEvent::Ime(ImeInputEvent {
-                    surface: self.ids.surface.clone(),
-                    kind: ImeInputKind::Commit { text },
-                })
+            } => {
+                self.update_modifiers(physical_key, state);
+                let logical_is_text =
+                    matches!(&logical_key, LogicalKey::Character(_) | LogicalKey::Dead(_));
+                if let Some(handle) =
+                    self.capture_sensitive_key(physical_key, state, logical_is_text)
+                {
+                    HostEvent::SensitiveInput(
+                        self.sensitive_inputs.event(&self.ids.surface, handle),
+                    )
+                } else {
+                    HostEvent::Keyboard(KeyEvent {
+                        surface: self.ids.surface.clone(),
+                        physical_key: physical_key.map(|key| format!("{key:?}")),
+                        logical_key: logical_key_value(logical_key),
+                        pressed: state == ButtonState::Pressed,
+                    })
+                }
             }
-            WindowEvent::Ime(event) => HostEvent::Ime(ImeInputEvent {
-                surface: self.ids.surface.clone(),
-                kind: match event {
-                    ImeEvent::Enabled => ImeInputKind::Enabled,
-                    ImeEvent::Disabled => ImeInputKind::Disabled,
-                    ImeEvent::Preedit { text, cursor } => ImeInputKind::Preedit { text, cursor },
-                    ImeEvent::DeleteSurrounding {
-                        before_bytes,
-                        after_bytes,
-                    } => ImeInputKind::DeleteSurrounding {
-                        before_bytes,
-                        after_bytes,
-                    },
-                    ImeEvent::Commit(_) => unreachable!("commit handled above"),
-                },
-            }),
+            WindowEvent::TextInput(text) => {
+                if let Some(handle) = self.sensitive_inputs.insert_text(&text)? {
+                    HostEvent::SensitiveInput(
+                        self.sensitive_inputs.event(&self.ids.surface, handle),
+                    )
+                } else {
+                    HostEvent::TextInput(TextInputEvent {
+                        surface: self.ids.surface.clone(),
+                        text,
+                    })
+                }
+            }
+            WindowEvent::Ime(ImeEvent::Commit(text)) => {
+                if let Some(handle) = self.sensitive_inputs.insert_text(&text)? {
+                    self.sensitive_ime_commit_echo = true;
+                    HostEvent::SensitiveInput(
+                        self.sensitive_inputs.event(&self.ids.surface, handle),
+                    )
+                } else {
+                    self.ime_commit_echo = Some(text.clone());
+                    HostEvent::Ime(ImeInputEvent {
+                        surface: self.ids.surface.clone(),
+                        kind: ImeInputKind::Commit { text },
+                    })
+                }
+            }
+            WindowEvent::Ime(event) => {
+                if let Some(handle) = self.capture_sensitive_ime(&event)? {
+                    HostEvent::SensitiveInput(
+                        self.sensitive_inputs.event(&self.ids.surface, handle),
+                    )
+                } else {
+                    HostEvent::Ime(ImeInputEvent {
+                        surface: self.ids.surface.clone(),
+                        kind: match event {
+                            ImeEvent::Enabled => ImeInputKind::Enabled,
+                            ImeEvent::Disabled => ImeInputKind::Disabled,
+                            ImeEvent::Preedit { text, cursor } => {
+                                ImeInputKind::Preedit { text, cursor }
+                            }
+                            ImeEvent::DeleteSurrounding {
+                                before_bytes,
+                                after_bytes,
+                            } => ImeInputKind::DeleteSurrounding {
+                                before_bytes,
+                                after_bytes,
+                            },
+                            ImeEvent::Commit(_) => unreachable!("commit handled above"),
+                        },
+                    })
+                }
+            }
             WindowEvent::AccessibilityAction(request) => {
                 HostEvent::Accessibility(AccessibilityInputEvent {
                     surface: self.ids.surface.clone(),
@@ -192,19 +269,114 @@ impl EventAdapter {
                     },
                 })
             }
-            WindowEvent::Focused(focused) => HostEvent::Focus {
-                surface: self.ids.surface.clone(),
-                focused,
-            },
+            WindowEvent::Focused(focused) => {
+                if !focused {
+                    self.clear_sensitive_input_focus();
+                    self.shift_pressed = false;
+                    self.control_pressed = false;
+                }
+                HostEvent::Focus {
+                    surface: self.ids.surface.clone(),
+                    focused,
+                }
+            }
             WindowEvent::Resized { size, scale_factor } => {
                 return Ok(AdaptedWindowEvent::Resize(viewport(size, scale_factor)?));
             }
-            WindowEvent::CloseRequested => HostEvent::CloseRequested {
-                window: self.ids.window.clone(),
-            },
+            WindowEvent::CloseRequested => {
+                self.restart_sensitive_inputs();
+                HostEvent::CloseRequested {
+                    window: self.ids.window.clone(),
+                }
+            }
             _ => return Err(NativeHostError::UnknownWindowEvent),
         };
         Ok(AdaptedWindowEvent::Host(event))
+    }
+
+    fn update_modifiers(&mut self, key: Option<KeyboardKey>, state: ButtonState) {
+        let pressed = state == ButtonState::Pressed;
+        match key {
+            Some(KeyboardKey::Shift | KeyboardKey::RightShift) => self.shift_pressed = pressed,
+            Some(
+                KeyboardKey::Control
+                | KeyboardKey::RightControl
+                | KeyboardKey::Command
+                | KeyboardKey::RightCommand,
+            ) => self.control_pressed = pressed,
+            _ => {}
+        }
+    }
+
+    fn capture_sensitive_key(
+        &mut self,
+        key: Option<KeyboardKey>,
+        state: ButtonState,
+        logical_is_text: bool,
+    ) -> Option<SensitiveInputHandle> {
+        let active = self.sensitive_inputs.active_handle()?;
+        if logical_is_text {
+            return Some(active);
+        }
+        if state != ButtonState::Pressed {
+            return None;
+        }
+        let command = match key {
+            Some(KeyboardKey::Delete) => Some(SensitiveEdit::Backspace),
+            Some(KeyboardKey::ForwardDelete) => Some(SensitiveEdit::DeleteForward),
+            Some(KeyboardKey::LeftArrow) => Some(SensitiveEdit::MoveLeft {
+                extend: self.shift_pressed,
+            }),
+            Some(KeyboardKey::RightArrow) => Some(SensitiveEdit::MoveRight {
+                extend: self.shift_pressed,
+            }),
+            Some(KeyboardKey::Home) => Some(SensitiveEdit::MoveHome {
+                extend: self.shift_pressed,
+            }),
+            Some(KeyboardKey::End) => Some(SensitiveEdit::MoveEnd {
+                extend: self.shift_pressed,
+            }),
+            Some(KeyboardKey::A) if self.control_pressed => Some(SensitiveEdit::SelectAll),
+            Some(KeyboardKey::X) if self.control_pressed => Some(SensitiveEdit::CutSelection),
+            _ => None,
+        };
+        if let Some(command) = command {
+            return self.sensitive_inputs.edit(command);
+        }
+        if self.control_pressed
+            && matches!(
+                key,
+                Some(KeyboardKey::C | KeyboardKey::V | KeyboardKey::Z | KeyboardKey::Y)
+            )
+        {
+            // Clipboard/history shortcuts stay host-owned. Paste is disabled
+            // until a sensitive clipboard provider exists; forwarding it would
+            // let the ordinary text editor copy the credential into Boon state.
+            return Some(active);
+        }
+        None
+    }
+
+    fn capture_sensitive_ime(
+        &mut self,
+        event: &ImeEvent,
+    ) -> Result<Option<SensitiveInputHandle>, NativeHostError> {
+        if self.sensitive_inputs.active_handle().is_none() {
+            return Ok(None);
+        }
+        let handle = match event {
+            ImeEvent::Enabled => self.sensitive_inputs.active_handle(),
+            ImeEvent::Disabled => self.sensitive_inputs.clear_preedit(),
+            ImeEvent::Preedit { text, .. } => self.sensitive_inputs.set_preedit(text)?,
+            ImeEvent::DeleteSurrounding {
+                before_bytes,
+                after_bytes,
+            } => self
+                .sensitive_inputs
+                .delete_surrounding(*before_bytes, *after_bytes),
+            ImeEvent::Commit(_) => unreachable!("commit handled before sensitive IME routing"),
+        };
+        Ok(handle)
     }
 
     pub(crate) fn envelope(
@@ -335,7 +507,7 @@ fn physical_dimension(
 mod tests {
     use super::*;
     use app_window::input::keyboard::key::KeyboardKey;
-    use boon_host::{RoleId, SurfaceId, WindowId};
+    use boon_host::{DocumentNodeId, RoleId, SourceBindingId, SurfaceId, WindowId};
 
     fn adapter() -> EventAdapter {
         EventAdapter::new(NativeHostIds {
@@ -450,5 +622,81 @@ mod tests {
                 .unwrap(),
             AdaptedWindowEvent::Omitted
         ));
+    }
+
+    #[test]
+    fn sensitive_text_is_captured_as_a_handle_only_event_and_cleared_on_focus_loss() {
+        const SENTINEL: &str = "sensitive-SENTINEL-91c52f";
+        let mut adapter = adapter();
+        let handle = adapter
+            .focus_sensitive_input(SensitiveInputTarget::new(
+                DocumentNodeId("login-password".to_owned()),
+                Some(SourceBindingId("login.password".to_owned())),
+            ))
+            .unwrap();
+
+        let AdaptedWindowEvent::Host(key_event) = adapter
+            .adapt(WindowEvent::KeyboardInput {
+                physical_key: Some(KeyboardKey::A),
+                logical_key: LogicalKey::Character(SENTINEL.to_owned()),
+                state: ButtonState::Pressed,
+            })
+            .unwrap()
+        else {
+            panic!("sensitive logical text must produce a host event");
+        };
+        assert!(matches!(key_event, HostEvent::SensitiveInput(_)));
+        assert!(!toml::to_string(&key_event).unwrap().contains(SENTINEL));
+
+        let adapted = adapter
+            .adapt(WindowEvent::TextInput(SENTINEL.to_owned()))
+            .unwrap();
+        let AdaptedWindowEvent::Host(HostEvent::SensitiveInput(event)) = adapted else {
+            panic!("sensitive input must not enter an ordinary text event");
+        };
+        assert_eq!(event.handle, handle);
+        assert_eq!(
+            adapter.with_sensitive_input(handle, |bytes| bytes == SENTINEL.as_bytes()),
+            Ok(true)
+        );
+        let artifact = toml::to_string(&HostEvent::SensitiveInput(event)).unwrap();
+        assert!(!artifact.contains(SENTINEL));
+        assert!(!artifact.contains("91c52f"));
+        assert!(!artifact.contains("text"));
+
+        adapter.adapt(WindowEvent::Focused(false)).unwrap();
+        assert_eq!(
+            adapter.with_sensitive_input(handle, |_| ()),
+            Err(crate::SensitiveInputError::UnknownHandle)
+        );
+    }
+
+    #[test]
+    fn sensitive_ime_commit_never_keeps_a_plaintext_echo() {
+        const SENTINEL: &str = "ime-SENTINEL-d41c33";
+        let mut adapter = adapter();
+        let handle = adapter
+            .focus_sensitive_input(SensitiveInputTarget::new(
+                DocumentNodeId("login-password".to_owned()),
+                None,
+            ))
+            .unwrap();
+        let AdaptedWindowEvent::Host(HostEvent::SensitiveInput(event)) = adapter
+            .adapt(WindowEvent::Ime(ImeEvent::Commit(SENTINEL.to_owned())))
+            .unwrap()
+        else {
+            panic!("sensitive IME commit must be handle-only");
+        };
+        assert_eq!(event.handle, handle);
+        assert!(matches!(
+            adapter
+                .adapt(WindowEvent::TextInput(SENTINEL.to_owned()))
+                .unwrap(),
+            AdaptedWindowEvent::Omitted
+        ));
+        assert_eq!(
+            adapter.with_sensitive_input(handle, |bytes| bytes == SENTINEL.as_bytes()),
+            Ok(true)
+        );
     }
 }

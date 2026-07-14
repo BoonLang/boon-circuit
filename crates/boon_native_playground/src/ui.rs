@@ -6,7 +6,9 @@ use boon_document_model::{ScrollState, SourceBinding, SourceBindingId};
 use boon_editor::{Buffer, Selection};
 
 use crate::language::LanguageSnapshot;
-use crate::protocol::CatalogItem;
+use crate::protocol::{
+    AuthoritySelection, CatalogItem, MigrationStage, OutboxSampleState, PersistenceSnapshot,
+};
 use crate::workspace::ProjectOrigin;
 
 pub const DEV_PREVIOUS: &str = "dev.previous";
@@ -26,9 +28,28 @@ pub const DEV_FILE_NEW: &str = "dev.file.new";
 pub const DEV_FILE_RENAME: &str = "dev.file.rename";
 pub const DEV_FILE_REMOVE: &str = "dev.file.remove";
 pub const DEV_EDITOR: &str = "dev.editor";
+pub const DEV_EDITOR_INPUT_TARGET: &str = "dev.editor.code.0";
+pub const DEV_MIGRATION_PREVIEW: &str = "dev.migration.preview";
+pub const DEV_MIGRATION_ACTIVATE: &str = "dev.migration.activate";
+pub const DEV_MIGRATION_RESTART: &str = "dev.migration.restart";
+pub const DEV_MIGRATION_START_OVER: &str = "dev.migration.start_over";
+pub const DEV_MIGRATION_STAGE_PREFIX: &str = "dev.migration.stage.";
+pub const DEV_INSPECT_VALUE: &str = "dev.inspect.value";
+pub const DEV_INSPECT_PERSISTENCE: &str = "dev.inspect.persistence";
+pub const DEV_INSPECT_OUTBOX: &str = "dev.inspect.outbox";
+pub const DEV_PERSISTENCE_FLUSH: &str = "dev.persistence.flush";
+pub const DEV_PERSISTENCE_COMPACT: &str = "dev.persistence.compact";
+pub const DEV_PERSISTENCE_CLEAR_ALL: &str = "dev.persistence.clear_all";
+pub const DEV_PERSISTENCE_CLEAR_SELECTED: &str = "dev.persistence.clear_selected";
+pub const DEV_PERSISTENCE_EXPORT: &str = "dev.persistence.export";
+pub const DEV_PERSISTENCE_IMPORT_PREVIEW: &str = "dev.persistence.import_preview";
+pub const DEV_PERSISTENCE_ACTIVATE_IMPORT: &str = "dev.persistence.activate_import";
+pub const DEV_OUTBOX_PREVIOUS: &str = "dev.outbox.previous";
+pub const DEV_OUTBOX_NEXT: &str = "dev.outbox.next";
 
 const EDITOR_LINE_HEIGHT: f64 = 23.0;
 const EDITOR_WINDOW_LINES: usize = 36;
+pub const OUTBOX_WINDOW_ROWS: usize = 6;
 const DEV_BG: &str = "#0f1724";
 const DEV_PANEL: &str = "#141b2a";
 const DEV_PANEL_RAISED: &str = "#1a2435";
@@ -54,6 +75,32 @@ pub struct InspectorState<'a> {
     pub current_value: &'a str,
 }
 
+pub struct MigrationUiState<'a> {
+    pub stages: &'a [MigrationStage],
+    pub active_stage: &'a str,
+    pub selected_stage: &'a str,
+    pub previewed_stage: Option<&'a str>,
+    pub status: &'a str,
+    pub start_over_armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InspectorMode {
+    Value,
+    Persistence,
+    Outbox,
+}
+
+pub struct PersistenceUiState<'a> {
+    pub snapshot: Option<&'a PersistenceSnapshot>,
+    pub mode: InspectorMode,
+    pub outbox_offset: usize,
+    pub clear_all_armed: bool,
+    pub clear_selected_armed: bool,
+    pub selected_authority: Option<&'a AuthoritySelection>,
+    pub has_state_artifact: bool,
+}
+
 pub struct DevFrameState<'a> {
     pub catalog: &'a [CatalogItem],
     pub active_id: &'a str,
@@ -66,7 +113,9 @@ pub struct DevFrameState<'a> {
     pub rename_prompt: Option<&'a str>,
     pub editor_scroll: f32,
     pub language: Option<&'a LanguageSnapshot>,
+    pub migration: Option<MigrationUiState<'a>>,
     pub inspector: InspectorState<'a>,
+    pub persistence: PersistenceUiState<'a>,
     pub status: &'a str,
     pub perf: &'a str,
 }
@@ -77,9 +126,146 @@ pub fn dev_frame(state: DevFrameState<'_>) -> DocumentFrame {
     add_header(&mut frame);
     add_example_tabs(&mut frame, &state);
     add_file_tabs(&mut frame, &state);
+    if let Some(migration) = state.migration.as_ref() {
+        add_migration_bar(&mut frame, migration);
+    }
     add_workspace(&mut frame, &state);
     add_footer(&mut frame, &state);
     frame
+}
+
+fn add_migration_bar(frame: &mut DocumentFrame, state: &MigrationUiState<'_>) {
+    let mut strip = node("dev.migration", DocumentNodeKind::Row, Some("dev.root"));
+    strip.style.insert("height".into(), number(42.0));
+    strip.style.insert("width".into(), text("Fill"));
+    strip.style.insert("gap".into(), number(4.0));
+    strip.style.insert("padding".into(), number(5.0));
+    strip.style.insert("background".into(), text("#172033"));
+    strip.style.insert("border_bottom".into(), text(DEV_BORDER));
+    strip
+        .style
+        .insert("border_bottom_width".into(), number(1.0));
+    add(frame, "dev.root", strip);
+
+    let mut title = label("dev.migration.title", "MIGRATION", "dev.migration");
+    title.style.insert("width".into(), number(78.0));
+    title.style.insert("height".into(), number(32.0));
+    title.style.insert("font_size".into(), number(11.0));
+    title.style.insert("font_weight".into(), text("700"));
+    title.style.insert("color".into(), text("#72d6a5"));
+    title.style.insert("vertical_align".into(), text("Center"));
+    add(frame, "dev.migration", title);
+
+    let active_index = state
+        .stages
+        .iter()
+        .position(|stage| stage.id == state.active_stage)
+        .unwrap_or(0);
+    for (index, stage) in state.stages.iter().enumerate() {
+        let id = format!("{DEV_MIGRATION_STAGE_PREFIX}{}", stage.id);
+        if index > active_index {
+            let mut stage_button = button(&id, &stage.id, 40.0, "dev.migration", false);
+            stage_button
+                .style
+                .insert("accessibility_label".into(), text(&stage.label));
+            if stage.id == state.selected_stage {
+                stage_button
+                    .style
+                    .insert("background".into(), text(DEV_PANEL_ACTIVE));
+                stage_button.style.insert("border".into(), text("#72d6a5"));
+                stage_button.style.insert("color".into(), text(DEV_TEXT));
+            }
+            add(frame, "dev.migration", stage_button);
+        } else {
+            let mut stage_label = label(&id, &stage.id, "dev.migration");
+            stage_label.style.insert("width".into(), number(40.0));
+            stage_label.style.insert("height".into(), number(32.0));
+            stage_label.style.insert(
+                "background".into(),
+                text(if stage.id == state.active_stage {
+                    "#20543d"
+                } else {
+                    DEV_PANEL
+                }),
+            );
+            stage_label.style.insert(
+                "color".into(),
+                text(if stage.id == state.active_stage {
+                    "#b9f6d5"
+                } else {
+                    DEV_TEXT_MUTED
+                }),
+            );
+            stage_label
+                .style
+                .insert("text_align".into(), text("Center"));
+            stage_label
+                .style
+                .insert("vertical_align".into(), text("Center"));
+            add(frame, "dev.migration", stage_label);
+        }
+    }
+
+    let mut status = label("dev.migration.status", state.status, "dev.migration");
+    status.style.insert("width".into(), text("Fill"));
+    status.style.insert("height".into(), number(32.0));
+    status.style.insert("font_size".into(), number(11.0));
+    status.style.insert("color".into(), text(DEV_TEXT_MUTED));
+    status.style.insert("vertical_align".into(), text("Center"));
+    add(frame, "dev.migration", status);
+
+    if state.selected_stage != state.active_stage {
+        add(
+            frame,
+            "dev.migration",
+            button(
+                DEV_MIGRATION_PREVIEW,
+                "Preview",
+                62.0,
+                "dev.migration",
+                true,
+            ),
+        );
+        if state.previewed_stage == Some(state.selected_stage) {
+            add(
+                frame,
+                "dev.migration",
+                button(
+                    DEV_MIGRATION_ACTIVATE,
+                    "Activate",
+                    66.0,
+                    "dev.migration",
+                    true,
+                ),
+            );
+        }
+    }
+    add(
+        frame,
+        "dev.migration",
+        button(
+            DEV_MIGRATION_RESTART,
+            "Restart",
+            60.0,
+            "dev.migration",
+            false,
+        ),
+    );
+    add(
+        frame,
+        "dev.migration",
+        button(
+            DEV_MIGRATION_START_OVER,
+            if state.start_over_armed {
+                "Confirm Start Over"
+            } else {
+                "Start Over"
+            },
+            if state.start_over_armed { 118.0 } else { 76.0 },
+            "dev.migration",
+            false,
+        ),
+    );
 }
 
 fn add_header(frame: &mut DocumentFrame) {
@@ -99,10 +285,14 @@ fn add_header(frame: &mut DocumentFrame) {
         .insert("border_bottom_width".into(), number(1.0));
     add(frame, "dev.root", header);
 
+    add(
+        frame,
+        "dev.header",
+        button(DEV_TEST, "TEST", 52.0, "dev.header", true),
+    );
     add_brand(frame);
 
     for (id, label, width, accent) in [
-        (DEV_TEST, "TEST", 52.0, true),
         (DEV_RUN, "Run", 44.0, true),
         (DEV_SAVE, "Save", 48.0, false),
         (DEV_FORMAT, "Fmt", 44.0, false),
@@ -526,37 +716,74 @@ fn add_inspector(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
         DocumentNodeKind::Stack,
         Some("dev.workspace"),
     );
-    inspector.style.insert("width".into(), number(292.0));
+    inspector.style.insert("width".into(), number(340.0));
     inspector.style.insert("height".into(), text("Fill"));
-    inspector.style.insert("padding".into(), number(14.0));
-    inspector.style.insert("gap".into(), number(8.0));
+    inspector.style.insert("padding".into(), number(10.0));
+    inspector.style.insert("gap".into(), number(6.0));
     inspector.style.insert("background".into(), text(DEV_PANEL));
     add(frame, "dev.workspace", inspector);
 
-    let mut title = label("dev.inspector.title", "INSPECT", "dev.inspector");
-    title.style.insert("height".into(), number(24.0));
+    let mut title = label("dev.inspector.title", "STATE", "dev.inspector");
+    title.style.insert("height".into(), number(20.0));
     title.style.insert("font_size".into(), number(12.0));
     title.style.insert("font_weight".into(), text("700"));
     title.style.insert("color".into(), text(DEV_ACCENT));
     title.style.insert("vertical_align".into(), text("Center"));
     add(frame, "dev.inspector", title);
-    inspector_field(frame, "Symbol", state.inspector.symbol, 44.0, "symbol");
+    add_inspector_tabs(frame, state.persistence.mode);
+    match state.persistence.mode {
+        InspectorMode::Value => add_value_inspector(frame, state),
+        InspectorMode::Persistence => add_persistence_inspector(frame, &state.persistence),
+        InspectorMode::Outbox => add_outbox_inspector(frame, &state.persistence),
+    }
+}
+
+fn add_inspector_tabs(frame: &mut DocumentFrame, active: InspectorMode) {
+    let mut tabs = node(
+        "dev.inspector.tabs",
+        DocumentNodeKind::Row,
+        Some("dev.inspector"),
+    );
+    tabs.style.insert("width".into(), text("Fill"));
+    tabs.style.insert("height".into(), number(30.0));
+    tabs.style.insert("gap".into(), number(3.0));
+    add(frame, "dev.inspector", tabs);
+    for (id, caption, width, mode) in [
+        (DEV_INSPECT_VALUE, "Value", 65.0, InspectorMode::Value),
+        (
+            DEV_INSPECT_PERSISTENCE,
+            "Persistence",
+            94.0,
+            InspectorMode::Persistence,
+        ),
+        (DEV_INSPECT_OUTBOX, "Outbox", 70.0, InspectorMode::Outbox),
+    ] {
+        let mut tab = button(id, caption, width, "dev.inspector.tabs", false);
+        if mode == active {
+            tab.style.insert("background".into(), text("#315f9d"));
+            tab.style.insert("border".into(), text(DEV_ACCENT));
+        }
+        add(frame, "dev.inspector.tabs", tab);
+    }
+}
+
+fn add_value_inspector(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
+    inspector_field(frame, "Symbol", state.inspector.symbol, 38.0, "symbol");
     inspector_field(
         frame,
         "Static type",
         state.inspector.static_type,
-        62.0,
+        52.0,
         "type",
     );
     inspector_field(
         frame,
         "Current value",
         state.inspector.current_value,
-        92.0,
+        82.0,
         "value",
     );
-    inspector_field(frame, "Details", state.inspector.detail, 138.0, "detail");
-
+    inspector_field(frame, "Details", state.inspector.detail, 116.0, "detail");
     if let Some(language) = state.language
         && !language.diagnostics.is_empty()
     {
@@ -564,10 +791,353 @@ fn add_inspector(frame: &mut DocumentFrame, state: &DevFrameState<'_>) {
             frame,
             "Diagnostics",
             &language.diagnostics.join("\n"),
-            120.0,
+            98.0,
             "diagnostics",
         );
     }
+}
+
+fn add_persistence_inspector(frame: &mut DocumentFrame, state: &PersistenceUiState<'_>) {
+    let summary = state.snapshot.map_or_else(
+        || "Waiting for preview snapshot".to_owned(),
+        |snapshot| {
+            let stored = snapshot.stored.as_ref().map_or_else(
+                || "unavailable".to_owned(),
+                |stored| {
+                    let bytes = stored.encoded_value_bytes.map_or_else(
+                        || "size unknown".to_owned(),
+                        |bytes| format!("{bytes} bytes"),
+                    );
+                    format!(
+                        "e{} t{} | {} scalar, {} list, {} rows, {bytes}",
+                        stored.epoch,
+                        stored.through_turn_sequence,
+                        stored.scalar_count,
+                        stored.list_count,
+                        stored.row_count
+                    )
+                },
+            );
+            let pending = snapshot.pending.first_turn_sequence.zip(
+                snapshot.pending.last_turn_sequence,
+            ).map_or_else(
+                || "none".to_owned(),
+                |(first, last)| {
+                    format!(
+                        "{first}..{last} ({}), {}ms",
+                        snapshot.pending.turn_count, snapshot.pending.oldest_age_millis
+                    )
+                },
+            );
+            format!(
+                "Authority  turn {} / source {}\nDeclared   {} scalar, {} indexed, {} list\nStored     {stored}\nPending    {pending}; queue {} + {} reserved\nDurable    epoch {}, turn {}\nTimings    enqueue {}us, encode {}us, commit {}us\n            barrier {}us, restore {}us, migrate {}us, rebuild {}us\nSchema     v{} {}\nWorker     {}{}",
+                snapshot.authority.runtime_turn_sequence,
+                snapshot.authority.source_event_sequence,
+                snapshot.authority.scalar_count,
+                snapshot.authority.indexed_field_count,
+                snapshot.authority.list_count,
+                snapshot.pending.queue_depth,
+                snapshot.pending.reserved_slots,
+                snapshot.durable.epoch,
+                snapshot.durable.through_turn_sequence,
+                snapshot.timings.authority_enqueue_us,
+                snapshot.timings.encode_us,
+                snapshot.timings.checkpoint_us,
+                snapshot.timings.barrier_us,
+                snapshot.timings.restore_us,
+                snapshot.timings.migration_us,
+                snapshot.timings.rebuild_derived_us,
+                snapshot.schema_version,
+                short_digest(&snapshot.schema_hash),
+                if snapshot.worker_alive { "online" } else { "offline" },
+                if snapshot.pending.accepting_turns { "" } else { ", paused" },
+            )
+        },
+    );
+    inspector_field(frame, "Persistence", &summary, 212.0, "persistence.summary");
+
+    let mut controls = node(
+        "dev.persistence.controls",
+        DocumentNodeKind::Row,
+        Some("dev.inspector"),
+    );
+    controls.style.insert("width".into(), text("Fill"));
+    controls.style.insert("height".into(), number(32.0));
+    controls.style.insert("gap".into(), number(4.0));
+    add(frame, "dev.inspector", controls);
+    add(
+        frame,
+        "dev.persistence.controls",
+        button(
+            DEV_PERSISTENCE_FLUSH,
+            "Flush",
+            58.0,
+            "dev.persistence.controls",
+            true,
+        ),
+    );
+    add(
+        frame,
+        "dev.persistence.controls",
+        button(
+            DEV_PERSISTENCE_COMPACT,
+            "Maintain",
+            74.0,
+            "dev.persistence.controls",
+            false,
+        ),
+    );
+    add(
+        frame,
+        "dev.persistence.controls",
+        button(
+            DEV_PERSISTENCE_CLEAR_ALL,
+            if state.clear_all_armed {
+                "Confirm Clear All"
+            } else {
+                "Clear All"
+            },
+            if state.clear_all_armed { 126.0 } else { 72.0 },
+            "dev.persistence.controls",
+            false,
+        ),
+    );
+
+    let mut artifact_controls = node(
+        "dev.persistence.artifact_controls",
+        DocumentNodeKind::Row,
+        Some("dev.inspector"),
+    );
+    artifact_controls.style.insert("width".into(), text("Fill"));
+    artifact_controls
+        .style
+        .insert("height".into(), number(32.0));
+    artifact_controls.style.insert("gap".into(), number(4.0));
+    add(frame, "dev.inspector", artifact_controls);
+    let clear_selected = state.snapshot.map(|snapshot| {
+        (
+            snapshot.capabilities.clear_selected.available && state.selected_authority.is_some(),
+            snapshot.capabilities.clear_selected.reason.as_str(),
+        )
+    });
+    let export = state.snapshot.map(|snapshot| {
+        (
+            snapshot.capabilities.export_state.available,
+            snapshot.capabilities.export_state.reason.as_str(),
+        )
+    });
+    let import = state.snapshot.map(|snapshot| {
+        (
+            snapshot.capabilities.import_preview.available && state.has_state_artifact,
+            snapshot.capabilities.import_preview.reason.as_str(),
+        )
+    });
+    add(
+        frame,
+        "dev.persistence.artifact_controls",
+        capability_button(
+            DEV_PERSISTENCE_CLEAR_SELECTED,
+            if state.clear_selected_armed {
+                "Confirm Clear"
+            } else {
+                "Clear Selected"
+            },
+            104.0,
+            "dev.persistence.artifact_controls",
+            clear_selected,
+        ),
+    );
+    add(
+        frame,
+        "dev.persistence.artifact_controls",
+        capability_button(
+            DEV_PERSISTENCE_EXPORT,
+            "Export",
+            60.0,
+            "dev.persistence.artifact_controls",
+            export,
+        ),
+    );
+    add(
+        frame,
+        "dev.persistence.artifact_controls",
+        capability_button(
+            DEV_PERSISTENCE_IMPORT_PREVIEW,
+            "Import Preview",
+            108.0,
+            "dev.persistence.artifact_controls",
+            import,
+        ),
+    );
+
+    let activate = state.snapshot.map(|snapshot| {
+        (
+            snapshot.capabilities.activate_import.available && snapshot.import_preview.is_some(),
+            snapshot.capabilities.activate_import.reason.as_str(),
+        )
+    });
+    add(
+        frame,
+        "dev.inspector",
+        capability_button(
+            DEV_PERSISTENCE_ACTIVATE_IMPORT,
+            "Activate Import",
+            112.0,
+            "dev.inspector",
+            activate,
+        ),
+    );
+
+    if let Some(snapshot) = state.snapshot {
+        let operation = snapshot
+            .last_operation
+            .as_ref()
+            .map_or("No persistence command in this session", |operation| {
+                operation.message.as_str()
+            });
+        inspector_field(
+            frame,
+            "Last operation",
+            operation,
+            62.0,
+            "persistence.operation",
+        );
+        inspector_field(
+            frame,
+            "Last actionable error",
+            snapshot.last_actionable_error.as_deref().unwrap_or("None"),
+            82.0,
+            "persistence.error",
+        );
+        if let Some(preview) = snapshot.import_preview.as_ref() {
+            let detail = format!(
+                "Preview #{}: schema v{} -> v{}\n{} scalar, {} list, {} rows; {} document nodes\nActive runtime and durable namespace unchanged",
+                preview.preview_id,
+                preview.source_schema_version,
+                preview.target_schema_version,
+                preview.scalar_count,
+                preview.list_count,
+                preview.row_count,
+                preview.document_node_count,
+            );
+            inspector_field(
+                frame,
+                "Import Preview",
+                &detail,
+                72.0,
+                "persistence.import_preview",
+            );
+        }
+        let unavailable = [
+            &snapshot.capabilities.clear_selected,
+            &snapshot.capabilities.export_state,
+            &snapshot.capabilities.import_preview,
+            &snapshot.capabilities.activate_import,
+        ]
+        .into_iter()
+        .filter(|capability| !capability.available)
+        .map(|capability| capability.reason.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+        if !unavailable.is_empty() {
+            inspector_field(
+                frame,
+                "Unavailable core operations",
+                &unavailable,
+                86.0,
+                "persistence.capabilities",
+            );
+        }
+    }
+}
+
+fn add_outbox_inspector(frame: &mut DocumentFrame, state: &PersistenceUiState<'_>) {
+    let Some(snapshot) = state.snapshot else {
+        inspector_field(
+            frame,
+            "Outbox",
+            "Waiting for preview snapshot",
+            72.0,
+            "outbox.summary",
+        );
+        return;
+    };
+    let samples = &snapshot.outbox.samples;
+    let offset = state
+        .outbox_offset
+        .min(samples.len().saturating_sub(OUTBOX_WINDOW_ROWS));
+    let end = offset.saturating_add(OUTBOX_WINDOW_ROWS).min(samples.len());
+    let summary = format!(
+        "Pending {} | Dispatching {}\nReconcile {} | Completed {}\nShowing {}..{} of {} bounded samples",
+        snapshot.outbox.pending_count,
+        snapshot.outbox.dispatching_count,
+        snapshot.outbox.reconciliation_count,
+        snapshot.outbox.completed_count,
+        if samples.is_empty() { 0 } else { offset + 1 },
+        end,
+        samples.len(),
+    );
+    inspector_field(frame, "Durable outbox", &summary, 66.0, "outbox.summary");
+
+    if samples.len() > OUTBOX_WINDOW_ROWS {
+        let mut navigation = node(
+            "dev.outbox.navigation",
+            DocumentNodeKind::Row,
+            Some("dev.inspector"),
+        );
+        navigation.style.insert("width".into(), text("Fill"));
+        navigation.style.insert("height".into(), number(30.0));
+        navigation.style.insert("gap".into(), number(4.0));
+        add(frame, "dev.inspector", navigation);
+        let mut previous = button(
+            DEV_OUTBOX_PREVIOUS,
+            "<",
+            32.0,
+            "dev.outbox.navigation",
+            false,
+        );
+        previous.style.insert(
+            "accessibility_label".into(),
+            text("Previous outbox samples"),
+        );
+        add(frame, "dev.outbox.navigation", previous);
+        let mut next = button(DEV_OUTBOX_NEXT, ">", 32.0, "dev.outbox.navigation", false);
+        next.style
+            .insert("accessibility_label".into(), text("Next outbox samples"));
+        add(frame, "dev.outbox.navigation", next);
+    }
+
+    for (slot, sample) in samples[offset..end].iter().enumerate() {
+        let status = match sample.state {
+            OutboxSampleState::Pending => "Pending",
+            OutboxSampleState::Dispatching => "Dispatching",
+            OutboxSampleState::ReconciliationRequired => "Reconcile",
+            OutboxSampleState::Completed => "Completed",
+        };
+        let value = format!(
+            "{}  attempt {}\nitem {}  effect {}\nturn {} -> {}",
+            status,
+            sample.attempt,
+            short_digest(&sample.item_id),
+            short_digest(&sample.effect_id),
+            sample.created_turn_sequence,
+            sample.updated_turn_sequence,
+        );
+        inspector_field(
+            frame,
+            &format!("Sample {}", offset + slot + 1),
+            &value,
+            48.0,
+            &format!("outbox.sample.{slot}"),
+        );
+    }
+}
+
+fn short_digest(value: &[u8; 32]) -> String {
+    value[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn inspector_field(frame: &mut DocumentFrame, name: &str, value: &str, height: f64, key: &str) {
@@ -794,6 +1364,34 @@ fn button(id: &str, label: &str, width: f64, parent: &str, accent: bool) -> Docu
     button
 }
 
+fn capability_button(
+    id: &str,
+    label: &str,
+    width: f64,
+    parent: &str,
+    capability: Option<(bool, &str)>,
+) -> DocumentNode {
+    let (available, reason) = capability.unwrap_or((false, "Waiting for persistence snapshot"));
+    let mut control = button(id, label, width, parent, false);
+    if !available {
+        control.source_bindings.clear();
+        control.style.insert("background".into(), text(DEV_PANEL));
+        control.style.insert("color".into(), text("#66758b"));
+        control
+            .style
+            .insert("border".into(), text(DEV_BORDER_MUTED));
+        control.style.insert(
+            "accessibility_label".into(),
+            text(if reason.is_empty() {
+                "Unavailable for the current selection or artifact cache"
+            } else {
+                reason
+            }),
+        );
+    }
+    control
+}
+
 fn footer_label(id: &str, value: &str) -> DocumentNode {
     let mut node = label(id, value, "dev.footer");
     node.style.insert("width".into(), text("Fill"));
@@ -853,6 +1451,18 @@ mod tests {
 
     use crate::view::RetainedView;
 
+    fn empty_persistence() -> PersistenceUiState<'static> {
+        PersistenceUiState {
+            snapshot: None,
+            mode: InspectorMode::Value,
+            outbox_offset: 0,
+            clear_all_armed: false,
+            clear_selected_armed: false,
+            selected_authority: None,
+            has_state_artifact: false,
+        }
+    }
+
     #[test]
     fn dev_frame_exposes_versioned_and_custom_identity_without_fixture_branches() {
         let buffer = Buffer::new("value: 1\n");
@@ -874,12 +1484,14 @@ mod tests {
             rename_prompt: None,
             editor_scroll: 0.0,
             language: None,
+            migration: None,
             inspector: InspectorState {
                 symbol: "value",
                 static_type: "Number",
                 detail: "Number",
                 current_value: "1",
             },
+            persistence: empty_persistence(),
             status: "Ready",
             perf: "Preview idle",
         });
@@ -963,12 +1575,14 @@ mod tests {
             rename_prompt: None,
             editor_scroll: 0.0,
             language: None,
+            migration: None,
             inspector: InspectorState {
                 symbol: "",
                 static_type: "",
                 detail: "",
                 current_value: "",
             },
+            persistence: empty_persistence(),
             status: "Ready",
             perf: "Preview idle",
         });
@@ -990,12 +1604,53 @@ mod tests {
             assert!(target.center_y > 0.0 && target.center_y < 540.0);
             assert_eq!(view.hit(target.center_x, target.center_y), Some(id));
         }
+        let test = view.target_for_source(DEV_TEST, None).expect("TEST target");
+        assert!(
+            test.center_x < 75.0,
+            "primary action must remain at the safe left edge: {test:?}"
+        );
+        assert_eq!(view.hit(test.center_x, test.center_y), Some(DEV_TEST));
         let new_example = view
             .target_for_source(DEV_NEW, None)
             .expect("new-example target");
         assert!(
             new_example.center_y > 40.0,
             "new-example action must stay below native titlebar controls"
+        );
+        let editor = view
+            .target_for_source(DEV_EDITOR, None)
+            .expect("editor target");
+        assert!(
+            editor.bounds_width > 40.0,
+            "editor target must retain useful width: {editor:?}"
+        );
+        let editor_input = view
+            .target_for_source(DEV_EDITOR_INPUT_TARGET, None)
+            .expect("visible editor input target");
+        assert!(editor_input.bounds_width > 40.0);
+        assert_eq!(
+            view.hit(editor_input.center_x, editor_input.center_y),
+            Some(DEV_EDITOR_INPUT_TARGET)
+        );
+
+        let clipped = RetainedView::new(
+            view.frame().clone(),
+            Viewport {
+                surface: 1,
+                width: 508.0,
+                height: 136.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        let visible_editor_input = clipped
+            .target_for_source(DEV_EDITOR_INPUT_TARGET, None)
+            .expect("partially visible editor input target");
+        assert!(visible_editor_input.center_y < 136.0);
+        assert_eq!(
+            clipped.hit(visible_editor_input.center_x, visible_editor_input.center_y),
+            Some(DEV_EDITOR_INPUT_TARGET)
         );
     }
 
@@ -1025,12 +1680,14 @@ mod tests {
             rename_prompt,
             editor_scroll: 0.0,
             language: None,
+            migration: None,
             inspector: InspectorState {
                 symbol: "",
                 static_type: "",
                 detail: "",
                 current_value: "",
             },
+            persistence: empty_persistence(),
             status: "Ready",
             perf: "Preview idle",
         };
@@ -1097,12 +1754,14 @@ mod tests {
             rename_prompt: None,
             editor_scroll: 0.0,
             language: None,
+            migration: None,
             inspector: InspectorState {
                 symbol: "",
                 static_type: "",
                 detail: "",
                 current_value: "",
             },
+            persistence: empty_persistence(),
             status: "Ready",
             perf: "Preview idle",
         });

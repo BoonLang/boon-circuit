@@ -1,0 +1,19 @@
+store: [
+    request_received: SOURCE
+
+    request_count:
+        0 |> HOLD request_count {
+            LATEST {
+                store.request_received |> THEN { request_count + 1 }
+            }
+        }
+]
+
+outputs: [
+    api_response: [
+        status: 200
+        body: TEXT { accepted }
+        request_count: store.request_count
+    ]
+    pending_priorities: List/range(from: 1, to: 2)
+]

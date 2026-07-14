@@ -10,9 +10,15 @@ mod document;
 
 pub use document::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 2;
+pub const PLAN_MAJOR_VERSION: u32 = 3;
 pub const PLAN_MINOR_VERSION: u32 = 0;
+pub const PERSISTENCE_FORMAT_VERSION: u32 = 1;
+pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
 pub const INLINE_BYTE_CONSTANT_LIMIT: usize = 1024;
+
+pub const DEFAULT_APPLICATION_PACKAGE_ID: &str = "boon.compiler.unspecified";
+pub const DEFAULT_APPLICATION_STATE_NAMESPACE: &str = "default";
+pub const DEFAULT_APPLICATION_DEPLOYMENT_DOMAIN: &str = "local";
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
@@ -92,6 +98,1868 @@ plan_usize_ids!(
     ScopeId,
 );
 
+macro_rules! plan_digest_ids {
+    ($($name:ident),+ $(,)?) => {
+        $(
+            #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+            #[serde(transparent)]
+            pub struct $name(pub [u8; 32]);
+
+            impl $name {
+                pub fn as_bytes(&self) -> &[u8; 32] {
+                    &self.0
+                }
+            }
+
+            impl fmt::Display for $name {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str(&digest_hex(&self.0))
+                }
+            }
+        )+
+    };
+}
+
+plan_digest_ids!(
+    EffectId,
+    EffectInvocationId,
+    OutputRootId,
+    MemoryId,
+    MemoryLeafId,
+    MigrationInputId,
+    MigrationRecipeId,
+    MigrationEdgeId
+);
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ApplicationIdentity {
+    pub package_id: String,
+    pub state_namespace: String,
+    pub deployment_domain: String,
+}
+
+impl ApplicationIdentity {
+    pub fn new(
+        package_id: impl Into<String>,
+        state_namespace: impl Into<String>,
+        deployment_domain: impl Into<String>,
+    ) -> Self {
+        Self {
+            package_id: package_id.into(),
+            state_namespace: state_namespace.into(),
+            deployment_domain: deployment_domain.into(),
+        }
+    }
+
+    /// Compatibility identity for compile boundaries that have no host identity.
+    /// Hosts that persist state must use an identity-aware compiler API instead.
+    pub fn compiler_default() -> Self {
+        Self::new(
+            DEFAULT_APPLICATION_PACKAGE_ID,
+            DEFAULT_APPLICATION_STATE_NAMESPACE,
+            DEFAULT_APPLICATION_DEPLOYMENT_DOMAIN,
+        )
+    }
+
+    pub fn is_valid(&self) -> bool {
+        [
+            self.package_id.as_str(),
+            self.state_namespace.as_str(),
+            self.deployment_domain.as_str(),
+        ]
+        .into_iter()
+        .all(|component| !component.trim().is_empty())
+    }
+}
+
+impl Default for ApplicationIdentity {
+    fn default() -> Self {
+        Self::compiler_default()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApplicationPlan {
+    pub identity: ApplicationIdentity,
+    pub identity_hash: [u8; 32],
+}
+
+impl ApplicationPlan {
+    pub fn new(identity: ApplicationIdentity) -> Result<Self, PlanError> {
+        let identity_hash = canonical_sha256(&identity)?;
+        Ok(Self {
+            identity,
+            identity_hash,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryKind {
+    Scalar,
+    IndexedField,
+    List,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct MemoryOwnerPath {
+    pub canonical_module: String,
+    pub named_owner_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DataTypePlan {
+    Null,
+    Bool,
+    Number,
+    Byte,
+    Text,
+    Bytes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fixed_len: Option<u64>,
+    },
+    Variant {
+        variants: Vec<DataVariantPlan>,
+    },
+    Record {
+        fields: Vec<DataTypeFieldPlan>,
+        open: bool,
+    },
+    List {
+        item: Box<DataTypePlan>,
+    },
+    Error {
+        fields: Vec<DataTypeFieldPlan>,
+        open: bool,
+    },
+    Unknown,
+}
+
+impl DataTypePlan {
+    pub fn canonicalized(&self) -> Self {
+        match self {
+            Self::Variant { variants } => {
+                let mut variants = variants
+                    .iter()
+                    .map(DataVariantPlan::canonicalized)
+                    .collect::<Vec<_>>();
+                variants.sort_by(|left, right| left.tag.cmp(&right.tag));
+                variants.dedup_by(|left, right| left.tag == right.tag);
+                Self::Variant { variants }
+            }
+            Self::Record { fields, open } => Self::Record {
+                fields: canonical_data_type_fields(fields),
+                open: *open,
+            },
+            Self::List { item } => Self::List {
+                item: Box::new(item.canonicalized()),
+            },
+            Self::Error { fields, open } => Self::Error {
+                fields: canonical_data_type_fields(fields),
+                open: *open,
+            },
+            Self::Null
+            | Self::Bool
+            | Self::Number
+            | Self::Byte
+            | Self::Text
+            | Self::Bytes { .. }
+            | Self::Unknown => self.clone(),
+        }
+    }
+
+    pub fn is_canonical(&self) -> bool {
+        self == &self.canonicalized()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DataTypeFieldPlan {
+    pub name: String,
+    pub data_type: DataTypePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DataVariantPlan {
+    pub tag: String,
+    pub fields: Vec<DataTypeFieldPlan>,
+    pub open: bool,
+}
+
+impl DataVariantPlan {
+    fn canonicalized(&self) -> Self {
+        Self {
+            tag: self.tag.clone(),
+            fields: canonical_data_type_fields(&self.fields),
+            open: self.open,
+        }
+    }
+}
+
+fn canonical_data_type_fields(fields: &[DataTypeFieldPlan]) -> Vec<DataTypeFieldPlan> {
+    let mut fields = fields
+        .iter()
+        .map(|field| DataTypeFieldPlan {
+            name: field.name.clone(),
+            data_type: field.data_type.canonicalized(),
+        })
+        .collect::<Vec<_>>();
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    fields.dedup_by(|left, right| left.name == right.name);
+    fields
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectContract {
+    pub effect_id: EffectId,
+    pub host_operation: String,
+    pub replay: EffectReplay,
+    pub barrier: EffectBarrier,
+    pub result_policy: EffectResultPolicy,
+}
+
+impl EffectContract {
+    pub fn new(
+        host_operation: impl Into<String>,
+        replay: EffectReplay,
+        barrier: EffectBarrier,
+        result_policy: EffectResultPolicy,
+    ) -> Result<Self, PlanError> {
+        let host_operation = host_operation.into();
+        let contract = Self {
+            effect_id: EffectId::from_host_operation(&host_operation)?,
+            host_operation,
+            replay,
+            barrier,
+            result_policy,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    pub fn validate(&self) -> Result<(), PlanError> {
+        if self.host_operation.trim().is_empty()
+            || self.host_operation.trim() != self.host_operation
+        {
+            return Err(PlanError::new(
+                "effect host operation must be a non-empty canonical name",
+            ));
+        }
+        if self.effect_id != EffectId::from_host_operation(&self.host_operation)? {
+            return Err(PlanError::new(
+                "effect ID does not match its canonical host operation",
+            ));
+        }
+        if let EffectReplay::Idempotent { key_type } = &self.replay
+            && (!key_type.is_canonical() || data_type_contains_unknown(key_type))
+        {
+            return Err(PlanError::new(
+                "idempotent effect key type must be canonical and closed",
+            ));
+        }
+        match (&self.replay, self.barrier, self.result_policy) {
+            (EffectReplay::ReadOnly, EffectBarrier::None, _)
+            | (EffectReplay::NonReplayable, EffectBarrier::None, EffectResultPolicy::Discarded)
+            | (EffectReplay::Idempotent { .. }, EffectBarrier::Before, _)
+            | (EffectReplay::Idempotent { .. }, EffectBarrier::BeforeAndAfter, _) => Ok(()),
+            (EffectReplay::ReadOnly, _, _) => Err(PlanError::new(
+                "read-only effects cannot require a persistence barrier",
+            )),
+            (EffectReplay::Idempotent { .. }, EffectBarrier::None, _) => Err(PlanError::new(
+                "idempotent consequential effects require a persistence barrier",
+            )),
+            (EffectReplay::NonReplayable, _, _) => Err(PlanError::new(
+                "non-replayable consequential effects have no safe persistence contract",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectReplay {
+    ReadOnly,
+    Idempotent { key_type: DataTypePlan },
+    NonReplayable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectBarrier {
+    None,
+    Before,
+    BeforeAndAfter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectResultPolicy {
+    ReturnValue,
+    Acknowledgement,
+    CorrelatedSource,
+    Discarded,
+}
+
+#[derive(Clone, Copy)]
+struct BuiltinEffectSpec {
+    host_operation: &'static str,
+    replay: BuiltinEffectReplay,
+    barrier: EffectBarrier,
+    result_policy: EffectResultPolicy,
+}
+
+#[derive(Clone, Copy)]
+enum BuiltinEffectReplay {
+    ReadOnly,
+    IdempotentBytesKey,
+    NonReplayable,
+}
+
+const BUILTIN_EFFECT_CONTRACTS: &[BuiltinEffectSpec] = &[
+    BuiltinEffectSpec {
+        host_operation: "Directory/entries",
+        replay: BuiltinEffectReplay::ReadOnly,
+        barrier: EffectBarrier::None,
+        result_policy: EffectResultPolicy::ReturnValue,
+    },
+    BuiltinEffectSpec {
+        host_operation: "File/read_bytes",
+        replay: BuiltinEffectReplay::ReadOnly,
+        barrier: EffectBarrier::None,
+        result_policy: EffectResultPolicy::ReturnValue,
+    },
+    BuiltinEffectSpec {
+        host_operation: "File/read_text",
+        replay: BuiltinEffectReplay::ReadOnly,
+        barrier: EffectBarrier::None,
+        result_policy: EffectResultPolicy::ReturnValue,
+    },
+    BuiltinEffectSpec {
+        host_operation: "File/write_bytes",
+        replay: BuiltinEffectReplay::IdempotentBytesKey,
+        barrier: EffectBarrier::BeforeAndAfter,
+        result_policy: EffectResultPolicy::Acknowledgement,
+    },
+    BuiltinEffectSpec {
+        host_operation: "File/write_text",
+        replay: BuiltinEffectReplay::NonReplayable,
+        barrier: EffectBarrier::BeforeAndAfter,
+        result_policy: EffectResultPolicy::Acknowledgement,
+    },
+    BuiltinEffectSpec {
+        host_operation: "Log/error",
+        replay: BuiltinEffectReplay::NonReplayable,
+        barrier: EffectBarrier::None,
+        result_policy: EffectResultPolicy::Discarded,
+    },
+    BuiltinEffectSpec {
+        host_operation: "Log/info",
+        replay: BuiltinEffectReplay::NonReplayable,
+        barrier: EffectBarrier::None,
+        result_policy: EffectResultPolicy::Discarded,
+    },
+];
+
+pub fn builtin_effect_contract(host_operation: &str) -> Result<Option<EffectContract>, PlanError> {
+    let Some(spec) = BUILTIN_EFFECT_CONTRACTS
+        .iter()
+        .find(|spec| spec.host_operation == host_operation)
+    else {
+        return Ok(None);
+    };
+    let replay = match spec.replay {
+        BuiltinEffectReplay::ReadOnly => EffectReplay::ReadOnly,
+        BuiltinEffectReplay::IdempotentBytesKey => EffectReplay::Idempotent {
+            key_type: DataTypePlan::Bytes {
+                fixed_len: Some(32),
+            },
+        },
+        BuiltinEffectReplay::NonReplayable => EffectReplay::NonReplayable,
+    };
+    let contract = EffectContract {
+        effect_id: EffectId::from_host_operation(spec.host_operation)?,
+        host_operation: spec.host_operation.to_owned(),
+        replay,
+        barrier: spec.barrier,
+        result_policy: spec.result_policy,
+    };
+    Ok(Some(contract))
+}
+
+fn data_type_contains_unknown(data_type: &DataTypePlan) -> bool {
+    match data_type {
+        DataTypePlan::Unknown => true,
+        DataTypePlan::Variant { variants } => variants.iter().any(|variant| {
+            variant
+                .fields
+                .iter()
+                .any(|field| data_type_contains_unknown(&field.data_type))
+        }),
+        DataTypePlan::Record { fields, .. } | DataTypePlan::Error { fields, .. } => fields
+            .iter()
+            .any(|field| data_type_contains_unknown(&field.data_type)),
+        DataTypePlan::List { item } => data_type_contains_unknown(item),
+        DataTypePlan::Null
+        | DataTypePlan::Bool
+        | DataTypePlan::Number
+        | DataTypePlan::Byte
+        | DataTypePlan::Text
+        | DataTypePlan::Bytes { .. } => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialProvenance {
+    ReconstructableDefault,
+    MaterializedAuthority,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MemoryLeafPlan {
+    pub leaf_id: MemoryLeafId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_field_id: Option<FieldId>,
+    pub semantic_path: String,
+    pub data_type: DataTypePlan,
+    pub type_fingerprint: [u8; 32],
+}
+
+impl MemoryLeafPlan {
+    pub fn new(
+        memory_id: MemoryId,
+        runtime_field_id: Option<FieldId>,
+        semantic_path: impl Into<String>,
+        data_type: DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        let data_type = data_type.canonicalized();
+        Ok(Self {
+            leaf_id: MemoryLeafId::from_memory_path(memory_id, &semantic_path)?,
+            runtime_field_id,
+            semantic_path,
+            type_fingerprint: data_type_fingerprint(&data_type)?,
+            data_type,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MemoryPlan {
+    pub runtime_slot: PlanStorageId,
+    pub memory_id: MemoryId,
+    pub kind: MemoryKind,
+    pub semantic_path: String,
+    pub data_type: DataTypePlan,
+    pub type_fingerprint: [u8; 32],
+    pub initial_provenance: InitialProvenance,
+    pub owner: MemoryOwnerPath,
+    pub leaves: Vec<MemoryLeafPlan>,
+}
+
+impl MemoryPlan {
+    pub fn new(
+        runtime_slot: PlanStorageId,
+        kind: MemoryKind,
+        semantic_path: impl Into<String>,
+        data_type: DataTypePlan,
+        initial_provenance: InitialProvenance,
+        owner: MemoryOwnerPath,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        let data_type = data_type.canonicalized();
+        let memory_id = MemoryId::from_identity(&owner, &semantic_path, kind)?;
+        let leaves = vec![MemoryLeafPlan::new(
+            memory_id,
+            None,
+            semantic_path.clone(),
+            data_type.clone(),
+        )?];
+        Ok(Self {
+            runtime_slot,
+            memory_id,
+            kind,
+            semantic_path,
+            type_fingerprint: data_type_fingerprint(&data_type)?,
+            data_type,
+            initial_provenance,
+            owner,
+            leaves,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListMemoryPlan {
+    pub runtime_slot: PlanStorageId,
+    pub memory_id: MemoryId,
+    pub semantic_path: String,
+    pub data_type: DataTypePlan,
+    pub type_fingerprint: [u8; 32],
+    pub initial_provenance: InitialProvenance,
+    pub owner: MemoryOwnerPath,
+    pub hidden_key_type: String,
+    pub has_generation: bool,
+    pub row_fields: Vec<MemoryLeafPlan>,
+}
+
+impl ListMemoryPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        runtime_slot: PlanStorageId,
+        semantic_path: impl Into<String>,
+        data_type: DataTypePlan,
+        initial_provenance: InitialProvenance,
+        owner: MemoryOwnerPath,
+        hidden_key_type: impl Into<String>,
+        has_generation: bool,
+        mut row_fields: Vec<MemoryLeafPlan>,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        let data_type = data_type.canonicalized();
+        let memory_id = MemoryId::from_identity(&owner, &semantic_path, MemoryKind::List)?;
+        row_fields.sort_by_key(|field| field.leaf_id);
+        Ok(Self {
+            runtime_slot,
+            memory_id,
+            semantic_path,
+            type_fingerprint: data_type_fingerprint(&data_type)?,
+            data_type,
+            initial_provenance,
+            owner,
+            hidden_key_type: hidden_key_type.into(),
+            has_generation,
+            row_fields,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationTransferKindPlan {
+    Scalar,
+    List,
+    IndexedRowField,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationLeafRefPlan {
+    pub memory_id: MemoryId,
+    pub leaf_id: MemoryLeafId,
+    pub semantic_path: String,
+    pub data_type: DataTypePlan,
+    pub type_fingerprint: [u8; 32],
+}
+
+impl MigrationLeafRefPlan {
+    pub fn new(
+        memory_id: MemoryId,
+        semantic_path: impl Into<String>,
+        data_type: DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        let data_type = data_type.canonicalized();
+        Ok(Self {
+            memory_id,
+            leaf_id: MemoryLeafId::from_memory_path(memory_id, &semantic_path)?,
+            semantic_path,
+            type_fingerprint: data_type_fingerprint(&data_type)?,
+            data_type,
+        })
+    }
+
+    fn is_canonical(&self) -> Result<bool, PlanError> {
+        Ok(!self.semantic_path.trim().is_empty()
+            && self.data_type.is_canonical()
+            && self.leaf_id == MemoryLeafId::from_memory_path(self.memory_id, &self.semantic_path)?
+            && self.type_fingerprint == data_type_fingerprint(&self.data_type)?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationInputPlan {
+    pub input_id: MigrationInputId,
+    pub leaves: Vec<MigrationLeafRefPlan>,
+    pub data_type: DataTypePlan,
+    pub type_fingerprint: [u8; 32],
+}
+
+impl MigrationInputPlan {
+    pub fn new(
+        mut leaves: Vec<MigrationLeafRefPlan>,
+        data_type: DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        leaves.sort_by_key(|leaf| (leaf.memory_id, leaf.leaf_id));
+        let data_type = data_type.canonicalized();
+        let input_id = MigrationInputId::from_content(&leaves, &data_type)?;
+        Ok(Self {
+            input_id,
+            leaves,
+            type_fingerprint: data_type_fingerprint(&data_type)?,
+            data_type,
+        })
+    }
+
+    fn is_canonical(&self) -> Result<bool, PlanError> {
+        Ok(!self.leaves.is_empty()
+            && self.leaves.windows(2).all(|pair| {
+                (pair[0].memory_id, pair[0].leaf_id) < (pair[1].memory_id, pair[1].leaf_id)
+            })
+            && self
+                .leaves
+                .iter()
+                .map(|leaf| leaf.is_canonical())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .all(|valid| valid)
+            && self.data_type.is_canonical()
+            && self.type_fingerprint == data_type_fingerprint(&self.data_type)?
+            && self.input_id == MigrationInputId::from_content(&self.leaves, &self.data_type)?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationDestinationPlan {
+    pub memory_id: MemoryId,
+    pub leaf_id: MemoryLeafId,
+    pub semantic_path: String,
+    pub data_type: DataTypePlan,
+    pub type_fingerprint: [u8; 32],
+}
+
+impl MigrationDestinationPlan {
+    pub fn new(
+        memory_id: MemoryId,
+        semantic_path: impl Into<String>,
+        data_type: DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        let data_type = data_type.canonicalized();
+        Ok(Self {
+            memory_id,
+            leaf_id: MemoryLeafId::from_memory_path(memory_id, &semantic_path)?,
+            semantic_path,
+            type_fingerprint: data_type_fingerprint(&data_type)?,
+            data_type,
+        })
+    }
+
+    fn is_canonical(&self) -> Result<bool, PlanError> {
+        Ok(!self.semantic_path.trim().is_empty()
+            && self.data_type.is_canonical()
+            && self.leaf_id == MemoryLeafId::from_memory_path(self.memory_id, &self.semantic_path)?
+            && self.type_fingerprint == data_type_fingerprint(&self.data_type)?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationObjectFieldPlan {
+    pub name: String,
+    pub value: MigrationExpressionPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationCallArgumentPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub value: MigrationArgumentValuePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MigrationArgumentValuePlan {
+    Expression {
+        value: Box<MigrationExpressionPlan>,
+    },
+    Lambda {
+        parameter_count: u16,
+        body: Box<MigrationExpressionPlan>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationMatchArmPlan {
+    pub pattern: Vec<String>,
+    pub output: MigrationExpressionPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MigrationExpressionPlan {
+    Input {
+        input_id: MigrationInputId,
+    },
+    Parameter {
+        index: u16,
+    },
+    Text {
+        value: String,
+    },
+    Number {
+        value: i64,
+    },
+    Byte {
+        value: u8,
+    },
+    Bool {
+        value: bool,
+    },
+    Variant {
+        tag: String,
+    },
+    Tagged {
+        tag: String,
+        fields: Vec<MigrationObjectFieldPlan>,
+    },
+    Project {
+        input: Box<MigrationExpressionPlan>,
+        fields: Vec<String>,
+    },
+    Call {
+        function: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<Box<MigrationExpressionPlan>>,
+        arguments: Vec<MigrationCallArgumentPlan>,
+    },
+    Infix {
+        operator: String,
+        left: Box<MigrationExpressionPlan>,
+        right: Box<MigrationExpressionPlan>,
+    },
+    Record {
+        fields: Vec<MigrationObjectFieldPlan>,
+    },
+    List {
+        items: Vec<MigrationExpressionPlan>,
+    },
+    Bytes {
+        items: Vec<MigrationExpressionPlan>,
+    },
+    Match {
+        input: Box<MigrationExpressionPlan>,
+        arms: Vec<MigrationMatchArmPlan>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MigrationTransformPlan {
+    Identity { input_id: MigrationInputId },
+    Expression { root: MigrationExpressionPlan },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationTransferPlan {
+    pub transfer_kind: MigrationTransferKindPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_list_owner: Option<MigrationListOwnerPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_row_fields: Vec<MigrationListRowFieldPlan>,
+    pub inputs: Vec<MigrationInputPlan>,
+    pub destination: MigrationDestinationPlan,
+    pub transform: MigrationTransformPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationListRowFieldPlan {
+    pub source: MigrationLeafRefPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<MigrationDestinationPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationListOwnerPlan {
+    pub memory_id: MemoryId,
+    pub semantic_path: String,
+    pub owner: MemoryOwnerPath,
+}
+
+impl MigrationListOwnerPlan {
+    pub fn new(
+        owner: MemoryOwnerPath,
+        semantic_path: impl Into<String>,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        Ok(Self {
+            memory_id: MemoryId::from_identity(&owner, &semantic_path, MemoryKind::List)?,
+            semantic_path,
+            owner,
+        })
+    }
+
+    fn is_canonical(&self) -> Result<bool, PlanError> {
+        Ok(!self.owner.canonical_module.trim().is_empty()
+            && !self.owner.named_owner_path.trim().is_empty()
+            && !self.semantic_path.trim().is_empty()
+            && self.memory_id
+                == MemoryId::from_identity(&self.owner, &self.semantic_path, MemoryKind::List)?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationRecipePlan {
+    pub migration_recipe_id: MigrationRecipeId,
+    /// Empty transfers are the canonical representation of a compiler-proven
+    /// compatible schema transition. They perform no value transformation.
+    pub transfers: Vec<MigrationTransferPlan>,
+}
+
+impl MigrationRecipePlan {
+    pub fn new(mut transfers: Vec<MigrationTransferPlan>) -> Result<Self, PlanError> {
+        canonicalize_migration_transfers(&mut transfers)?;
+        let migration_recipe_id = MigrationRecipeId::from_transfers(&transfers)?;
+        let recipe = Self {
+            migration_recipe_id,
+            transfers,
+        };
+        recipe.validate()?;
+        Ok(recipe)
+    }
+
+    pub fn validate(&self) -> Result<(), PlanError> {
+        let mut canonical = self.transfers.clone();
+        canonicalize_migration_transfers(&mut canonical)?;
+        if canonical != self.transfers {
+            return Err(PlanError::new(
+                "migration recipe transfers are not canonical",
+            ));
+        }
+        if self.migration_recipe_id != MigrationRecipeId::from_transfers(&self.transfers)? {
+            return Err(PlanError::new(
+                "migration recipe ID does not match canonical transfer content",
+            ));
+        }
+        validate_migration_transfers(&self.transfers)
+    }
+
+    pub fn is_noop(&self) -> bool {
+        self.transfers.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationEdgePlan {
+    pub migration_edge_id: MigrationEdgeId,
+    pub source_schema_version: u64,
+    pub target_schema_version: u64,
+    pub source_schema_hash: [u8; 32],
+    pub migration_recipe_id: MigrationRecipeId,
+}
+
+impl MigrationEdgePlan {
+    pub fn new(
+        source_schema_version: u64,
+        target_schema_version: u64,
+        source_schema_hash: [u8; 32],
+        migration_recipe_id: MigrationRecipeId,
+    ) -> Result<Self, PlanError> {
+        Ok(Self {
+            migration_edge_id: MigrationEdgeId::from_schema_transition(
+                source_schema_version,
+                target_schema_version,
+                source_schema_hash,
+                migration_recipe_id,
+            )?,
+            source_schema_version,
+            target_schema_version,
+            source_schema_hash,
+            migration_recipe_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectOutboxSchema {
+    pub effect_id: EffectId,
+    pub intent_type: DataTypePlan,
+    pub idempotency_key_type: DataTypePlan,
+    pub result_type: DataTypePlan,
+}
+
+impl EffectOutboxSchema {
+    pub fn new(
+        effect_id: EffectId,
+        intent_type: DataTypePlan,
+        idempotency_key_type: DataTypePlan,
+        result_type: DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        let schema = Self {
+            effect_id,
+            intent_type: intent_type.canonicalized(),
+            idempotency_key_type: idempotency_key_type.canonicalized(),
+            result_type: result_type.canonicalized(),
+        };
+        schema.validate()?;
+        Ok(schema)
+    }
+
+    pub fn validate(&self) -> Result<(), PlanError> {
+        if [
+            &self.intent_type,
+            &self.idempotency_key_type,
+            &self.result_type,
+        ]
+        .into_iter()
+        .any(|data_type| !data_type.is_canonical() || data_type_contains_unknown(data_type))
+        {
+            return Err(PlanError::new(
+                "effect outbox schemas must use canonical closed data types",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PersistencePlan {
+    pub format_version: u32,
+    pub schema_version: u64,
+    pub schema_hash: [u8; 32],
+    pub migration_recipe_hash: [u8; 32],
+    pub migration_catalog_hash: [u8; 32],
+    pub memory: Vec<MemoryPlan>,
+    pub lists: Vec<ListMemoryPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_outbox: Vec<EffectOutboxSchema>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub migration_recipes: Vec<MigrationRecipePlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_migration_recipe_id: Option<MigrationRecipeId>,
+    pub migration_edges: Vec<MigrationEdgePlan>,
+}
+
+impl PersistencePlan {
+    pub fn new(
+        application: &ApplicationPlan,
+        schema_version: u64,
+        memory: Vec<MemoryPlan>,
+        lists: Vec<ListMemoryPlan>,
+        migration_edges: Vec<MigrationEdgePlan>,
+    ) -> Result<Self, PlanError> {
+        Self::new_with_migrations(
+            application,
+            schema_version,
+            memory,
+            lists,
+            Vec::new(),
+            None,
+            migration_edges,
+        )
+    }
+
+    pub fn new_with_migrations(
+        application: &ApplicationPlan,
+        schema_version: u64,
+        memory: Vec<MemoryPlan>,
+        lists: Vec<ListMemoryPlan>,
+        migration_recipes: Vec<MigrationRecipePlan>,
+        current_migration_recipe_id: Option<MigrationRecipeId>,
+        migration_edges: Vec<MigrationEdgePlan>,
+    ) -> Result<Self, PlanError> {
+        Self::new_with_migrations_and_effect_outbox(
+            application,
+            schema_version,
+            memory,
+            lists,
+            Vec::new(),
+            migration_recipes,
+            current_migration_recipe_id,
+            migration_edges,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_migrations_and_effect_outbox(
+        application: &ApplicationPlan,
+        schema_version: u64,
+        mut memory: Vec<MemoryPlan>,
+        mut lists: Vec<ListMemoryPlan>,
+        mut effect_outbox: Vec<EffectOutboxSchema>,
+        mut migration_recipes: Vec<MigrationRecipePlan>,
+        current_migration_recipe_id: Option<MigrationRecipeId>,
+        mut migration_edges: Vec<MigrationEdgePlan>,
+    ) -> Result<Self, PlanError> {
+        if schema_version == 0 {
+            return Err(PlanError::new(
+                "persistence schema version must be positive",
+            ));
+        }
+        memory.sort_by_key(|memory| memory.memory_id);
+        for memory in &mut memory {
+            memory.leaves.sort_by_key(|leaf| leaf.leaf_id);
+        }
+        lists.sort_by_key(|list| list.memory_id);
+        for list in &mut lists {
+            list.row_fields.sort_by_key(|leaf| leaf.leaf_id);
+        }
+        effect_outbox.sort_by_key(|schema| schema.effect_id);
+        migration_recipes.sort_by_key(|recipe| recipe.migration_recipe_id);
+        migration_edges.sort_by_key(|edge| edge.migration_edge_id);
+        let mut persistence = Self {
+            format_version: PERSISTENCE_FORMAT_VERSION,
+            schema_version,
+            schema_hash: [0; 32],
+            migration_recipe_hash: [0; 32],
+            migration_catalog_hash: [0; 32],
+            memory,
+            lists,
+            effect_outbox,
+            migration_recipes,
+            current_migration_recipe_id,
+            migration_edges,
+        };
+        validate_effect_outbox_schemas(&persistence.effect_outbox)?;
+        validate_migration_catalog(&persistence)?;
+        persistence.schema_hash = persistence_schema_hash(application, &persistence)?;
+        persistence.migration_recipe_hash = migration_recipe_hash(&persistence)?;
+        persistence.migration_catalog_hash = migration_catalog_hash(&persistence)?;
+        Ok(persistence)
+    }
+
+    pub fn validate_for_application(&self, application: &ApplicationPlan) -> Result<(), PlanError> {
+        if *application != ApplicationPlan::new(application.identity.clone())? {
+            return Err(PlanError::new(
+                "predecessor application identity hash is invalid",
+            ));
+        }
+        if self.format_version != PERSISTENCE_FORMAT_VERSION || self.schema_version == 0 {
+            return Err(PlanError::new(
+                "predecessor persistence format or schema version is invalid",
+            ));
+        }
+        if !persistence_identities_unique(self) {
+            return Err(PlanError::new(
+                "predecessor persistence identities are not unique",
+            ));
+        }
+        if !persistence_identities_match(self)? {
+            return Err(PlanError::new(
+                "predecessor persistence identities are not canonical",
+            ));
+        }
+        if !persistence_type_fingerprints_match(self)? {
+            return Err(PlanError::new(
+                "predecessor persistence type fingerprints are invalid",
+            ));
+        }
+        if !persistence_ordering_is_deterministic(self) {
+            return Err(PlanError::new(
+                "predecessor persistence entries are not canonically ordered",
+            ));
+        }
+        validate_effect_outbox_schemas(&self.effect_outbox)?;
+        validate_migration_catalog(self)?;
+        if self.schema_hash != persistence_schema_hash(application, self)? {
+            return Err(PlanError::new(
+                "predecessor persistence schema hash is invalid",
+            ));
+        }
+        if self.migration_recipe_hash != migration_recipe_hash(self)? {
+            return Err(PlanError::new(
+                "predecessor migration recipe hash is invalid",
+            ));
+        }
+        if self.migration_catalog_hash != migration_catalog_hash(self)? {
+            return Err(PlanError::new(
+                "predecessor migration catalog hash is invalid",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationPredecessorBinding {
+    /// The complete predecessor schema and inherited migration catalog. This
+    /// lets compilation prove compatibility and preserve skipped-version paths.
+    pub application: ApplicationPlan,
+    pub persistence: PersistencePlan,
+}
+
+impl MigrationPredecessorBinding {
+    pub fn from_machine_plan(plan: &MachinePlan) -> Self {
+        Self {
+            application: plan.application.clone(),
+            persistence: plan.persistence.clone(),
+        }
+    }
+
+    pub fn source_schema_version(&self) -> u64 {
+        self.persistence.schema_version
+    }
+
+    pub fn source_schema_hash(&self) -> [u8; 32] {
+        self.persistence.schema_hash
+    }
+}
+
+fn canonicalize_migration_transfers(
+    transfers: &mut [MigrationTransferPlan],
+) -> Result<(), PlanError> {
+    for transfer in transfers.iter_mut() {
+        transfer.inputs.sort_by_key(|input| input.input_id);
+        transfer.list_row_fields.sort_by_key(|field| {
+            (
+                field.source.memory_id,
+                field.source.leaf_id,
+                field.destination.as_ref().map(|value| value.memory_id),
+                field.destination.as_ref().map(|value| value.leaf_id),
+            )
+        });
+        canonicalize_migration_transform(&mut transfer.transform)?;
+    }
+    transfers.sort_by_key(|transfer| {
+        (
+            transfer.destination.memory_id,
+            transfer.destination.leaf_id,
+            transfer.transfer_kind,
+        )
+    });
+    Ok(())
+}
+
+fn canonicalize_migration_transform(
+    transform: &mut MigrationTransformPlan,
+) -> Result<(), PlanError> {
+    if let MigrationTransformPlan::Expression { root } = transform {
+        canonicalize_migration_expression(root)?;
+    }
+    Ok(())
+}
+
+fn canonicalize_migration_expression(
+    expression: &mut MigrationExpressionPlan,
+) -> Result<(), PlanError> {
+    match expression {
+        MigrationExpressionPlan::Tagged { fields, .. }
+        | MigrationExpressionPlan::Record { fields } => {
+            canonicalize_migration_fields(fields)?;
+        }
+        MigrationExpressionPlan::Project { input, .. } => {
+            canonicalize_migration_expression(input)?;
+        }
+        MigrationExpressionPlan::Call {
+            input, arguments, ..
+        } => {
+            if let Some(input) = input {
+                canonicalize_migration_expression(input)?;
+            }
+            for argument in arguments.iter_mut() {
+                match &mut argument.value {
+                    MigrationArgumentValuePlan::Expression { value } => {
+                        canonicalize_migration_expression(value)?;
+                    }
+                    MigrationArgumentValuePlan::Lambda { body, .. } => {
+                        canonicalize_migration_expression(body)?;
+                    }
+                }
+            }
+            let first_named = arguments
+                .iter()
+                .position(|argument| argument.name.is_some());
+            let split = first_named.unwrap_or(arguments.len());
+            if arguments[split..]
+                .iter()
+                .any(|argument| argument.name.is_none())
+            {
+                return Err(PlanError::new(
+                    "migration call positional arguments must precede named arguments",
+                ));
+            }
+            arguments[split..].sort_by(|left, right| left.name.cmp(&right.name));
+            if arguments[split..]
+                .windows(2)
+                .any(|pair| pair[0].name == pair[1].name)
+            {
+                return Err(PlanError::new(
+                    "migration call contains duplicate named arguments",
+                ));
+            }
+        }
+        MigrationExpressionPlan::Infix { left, right, .. } => {
+            canonicalize_migration_expression(left)?;
+            canonicalize_migration_expression(right)?;
+        }
+        MigrationExpressionPlan::List { items } | MigrationExpressionPlan::Bytes { items } => {
+            for item in items {
+                canonicalize_migration_expression(item)?;
+            }
+        }
+        MigrationExpressionPlan::Match { input, arms } => {
+            canonicalize_migration_expression(input)?;
+            for arm in arms.iter_mut() {
+                canonicalize_migration_expression(&mut arm.output)?;
+            }
+            arms.sort_by(|left, right| left.pattern.cmp(&right.pattern));
+            if arms
+                .windows(2)
+                .any(|pair| pair[0].pattern == pair[1].pattern)
+            {
+                return Err(PlanError::new(
+                    "migration match contains duplicate patterns",
+                ));
+            }
+        }
+        MigrationExpressionPlan::Input { .. }
+        | MigrationExpressionPlan::Parameter { .. }
+        | MigrationExpressionPlan::Text { .. }
+        | MigrationExpressionPlan::Number { .. }
+        | MigrationExpressionPlan::Byte { .. }
+        | MigrationExpressionPlan::Bool { .. }
+        | MigrationExpressionPlan::Variant { .. } => {}
+    }
+    Ok(())
+}
+
+fn canonicalize_migration_fields(fields: &mut [MigrationObjectFieldPlan]) -> Result<(), PlanError> {
+    for field in fields.iter_mut() {
+        canonicalize_migration_expression(&mut field.value)?;
+    }
+    fields.sort_by(|left, right| left.name.cmp(&right.name));
+    if fields.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return Err(PlanError::new(
+            "migration record contains duplicate field names",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migration_transfers(transfers: &[MigrationTransferPlan]) -> Result<(), PlanError> {
+    let mut destinations = BTreeSet::new();
+    let mut consumed_leaves = BTreeSet::new();
+    let mut dependency_graph = std::collections::BTreeMap::<MemoryId, BTreeSet<MemoryId>>::new();
+    for transfer in transfers {
+        match (&transfer.transfer_kind, &transfer.indexed_list_owner) {
+            (MigrationTransferKindPlan::IndexedRowField, Some(owner))
+                if owner.is_canonical()? =>
+            {
+                if owner.memory_id != transfer.destination.memory_id
+                    || transfer
+                        .inputs
+                        .iter()
+                        .flat_map(|input| &input.leaves)
+                        .any(|leaf| leaf.memory_id != owner.memory_id)
+                {
+                    return Err(PlanError::new(
+                        "indexed migration row leaves must use their list-owner durable identity",
+                    ));
+                }
+            }
+            (MigrationTransferKindPlan::IndexedRowField, _) => {
+                return Err(PlanError::new(
+                    "indexed migration requires a canonical list-owner identity",
+                ));
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(PlanError::new(
+                    "only indexed migration may declare a list-owner identity",
+                ));
+            }
+        }
+        if !transfer.destination.is_canonical()? {
+            return Err(PlanError::new(
+                "migration destination does not match its canonical identity or type",
+            ));
+        }
+        if !destinations.insert((transfer.destination.memory_id, transfer.destination.leaf_id)) {
+            return Err(PlanError::new(
+                "migration recipe writes a destination more than once",
+            ));
+        }
+        if matches!(transfer.transfer_kind, MigrationTransferKindPlan::List)
+            != matches!(transfer.destination.data_type, DataTypePlan::List { .. })
+        {
+            return Err(PlanError::new(
+                "migration list transfer kind does not match destination type",
+            ));
+        }
+        if transfer.transfer_kind != MigrationTransferKindPlan::List
+            && !transfer.list_row_fields.is_empty()
+        {
+            return Err(PlanError::new(
+                "only whole-list migration may declare row-field identity mappings",
+            ));
+        }
+        let mut input_ids = BTreeSet::new();
+        for input in &transfer.inputs {
+            if !input.is_canonical()? || !input_ids.insert(input.input_id) {
+                return Err(PlanError::new(
+                    "migration input is non-canonical or duplicated",
+                ));
+            }
+            for leaf in &input.leaves {
+                if !consumed_leaves.insert((leaf.memory_id, leaf.leaf_id)) {
+                    return Err(PlanError::new(
+                        "migration recipe consumes a source leaf more than once",
+                    ));
+                }
+                if leaf.memory_id == transfer.destination.memory_id
+                    && leaf.leaf_id == transfer.destination.leaf_id
+                {
+                    return Err(PlanError::new(
+                        "migration recipe cannot transfer a leaf onto itself",
+                    ));
+                }
+                if leaf.memory_id != transfer.destination.memory_id {
+                    dependency_graph
+                        .entry(leaf.memory_id)
+                        .or_default()
+                        .insert(transfer.destination.memory_id);
+                }
+            }
+        }
+        if input_ids.is_empty() {
+            return Err(PlanError::new(
+                "migration transfer must consume at least one input",
+            ));
+        }
+        if transfer.transfer_kind == MigrationTransferKindPlan::List {
+            let source_memory_id = transfer
+                .inputs
+                .first()
+                .filter(|_| transfer.inputs.len() == 1)
+                .and_then(|input| input.leaves.first().filter(|_| input.leaves.len() == 1))
+                .map(|leaf| leaf.memory_id)
+                .ok_or_else(|| {
+                    PlanError::new("whole-list migration must consume one canonical list input")
+                })?;
+            let mut source_fields = BTreeSet::new();
+            let mut destination_fields = BTreeSet::new();
+            for field in &transfer.list_row_fields {
+                if !field.source.is_canonical()?
+                    || !field
+                        .destination
+                        .as_ref()
+                        .map(|destination| destination.is_canonical())
+                        .transpose()?
+                        .unwrap_or(true)
+                {
+                    return Err(PlanError::new(
+                        "whole-list row-field mapping is not canonical",
+                    ));
+                }
+                if field.source.memory_id != source_memory_id {
+                    return Err(PlanError::new(
+                        "whole-list row-field mapping crosses its list transfer identities",
+                    ));
+                }
+                if !source_fields.insert(field.source.leaf_id) {
+                    return Err(PlanError::new(
+                        "whole-list row-field identity mapping is not one-to-one",
+                    ));
+                }
+                if let Some(destination) = &field.destination {
+                    if destination.memory_id != transfer.destination.memory_id {
+                        return Err(PlanError::new(
+                            "whole-list row-field mapping crosses its list transfer identities",
+                        ));
+                    }
+                    if field.source.data_type != destination.data_type
+                        || field.source.type_fingerprint != destination.type_fingerprint
+                    {
+                        return Err(PlanError::new(
+                            "whole-list row-field identity mapping changes field type",
+                        ));
+                    }
+                    if !destination_fields.insert(destination.leaf_id) {
+                        return Err(PlanError::new(
+                            "whole-list row-field identity mapping is not one-to-one",
+                        ));
+                    }
+                }
+            }
+        }
+        match &transfer.transform {
+            MigrationTransformPlan::Identity { input_id } => {
+                if transfer.inputs.len() != 1 || !input_ids.contains(input_id) {
+                    return Err(PlanError::new(
+                        "identity migration must reference its single canonical input",
+                    ));
+                }
+            }
+            MigrationTransformPlan::Expression { root } => {
+                let mut used_inputs = BTreeSet::new();
+                validate_migration_expression(root, &input_ids, 0, &mut used_inputs)?;
+                if used_inputs != input_ids {
+                    return Err(PlanError::new(
+                        "migration expression must consume every declared input exactly by identity",
+                    ));
+                }
+            }
+        }
+    }
+    if migration_memory_graph_has_cycle(&dependency_graph) {
+        return Err(PlanError::new("migration recipe contains a memory cycle"));
+    }
+    Ok(())
+}
+
+fn validate_migration_expression(
+    expression: &MigrationExpressionPlan,
+    inputs: &BTreeSet<MigrationInputId>,
+    parameter_depth: u32,
+    used_inputs: &mut BTreeSet<MigrationInputId>,
+) -> Result<(), PlanError> {
+    match expression {
+        MigrationExpressionPlan::Input { input_id } => {
+            if !inputs.contains(input_id) {
+                return Err(PlanError::new(
+                    "migration expression references an undeclared input",
+                ));
+            }
+            used_inputs.insert(*input_id);
+        }
+        MigrationExpressionPlan::Parameter { index } => {
+            if u32::from(*index) >= parameter_depth {
+                return Err(PlanError::new(
+                    "migration expression references an out-of-scope lambda parameter",
+                ));
+            }
+        }
+        MigrationExpressionPlan::Variant { tag } if tag.trim().is_empty() => {
+            return Err(PlanError::new("migration variant tag must not be empty"));
+        }
+        MigrationExpressionPlan::Tagged { tag, fields } => {
+            if tag.trim().is_empty() {
+                return Err(PlanError::new("migration tagged value must have a tag"));
+            }
+            validate_migration_fields(fields, inputs, parameter_depth, used_inputs)?;
+        }
+        MigrationExpressionPlan::Project { input, fields } => {
+            if fields.is_empty() || fields.iter().any(|field| field.trim().is_empty()) {
+                return Err(PlanError::new(
+                    "migration projection must contain non-empty field names",
+                ));
+            }
+            validate_migration_expression(input, inputs, parameter_depth, used_inputs)?;
+        }
+        MigrationExpressionPlan::Call {
+            function,
+            input,
+            arguments,
+        } => {
+            if !migration_call_is_supported(function) {
+                return Err(PlanError::new(format!(
+                    "migration recipe contains non-target-neutral call `{function}`"
+                )));
+            }
+            if let Some(input) = input {
+                validate_migration_expression(input, inputs, parameter_depth, used_inputs)?;
+            }
+            for argument in arguments {
+                match &argument.value {
+                    MigrationArgumentValuePlan::Expression { value } => {
+                        validate_migration_expression(value, inputs, parameter_depth, used_inputs)?;
+                    }
+                    MigrationArgumentValuePlan::Lambda {
+                        parameter_count,
+                        body,
+                    } => {
+                        if *parameter_count == 0 {
+                            return Err(PlanError::new(
+                                "migration lambda must declare at least one parameter",
+                            ));
+                        }
+                        validate_migration_expression(
+                            body,
+                            inputs,
+                            parameter_depth + u32::from(*parameter_count),
+                            used_inputs,
+                        )?;
+                    }
+                }
+            }
+        }
+        MigrationExpressionPlan::Infix {
+            operator,
+            left,
+            right,
+        } => {
+            if operator.trim().is_empty() {
+                return Err(PlanError::new("migration infix operator must not be empty"));
+            }
+            validate_migration_expression(left, inputs, parameter_depth, used_inputs)?;
+            validate_migration_expression(right, inputs, parameter_depth, used_inputs)?;
+        }
+        MigrationExpressionPlan::Record { fields } => {
+            validate_migration_fields(fields, inputs, parameter_depth, used_inputs)?;
+        }
+        MigrationExpressionPlan::List { items } | MigrationExpressionPlan::Bytes { items } => {
+            for item in items {
+                validate_migration_expression(item, inputs, parameter_depth, used_inputs)?;
+            }
+        }
+        MigrationExpressionPlan::Match { input, arms } => {
+            if arms.is_empty()
+                || arms.iter().any(|arm| {
+                    arm.pattern.is_empty() || arm.pattern.iter().any(|part| part.trim().is_empty())
+                })
+            {
+                return Err(PlanError::new(
+                    "migration match must contain non-empty canonical arms",
+                ));
+            }
+            validate_migration_expression(input, inputs, parameter_depth, used_inputs)?;
+            for arm in arms {
+                validate_migration_expression(&arm.output, inputs, parameter_depth, used_inputs)?;
+            }
+        }
+        MigrationExpressionPlan::Text { .. }
+        | MigrationExpressionPlan::Number { .. }
+        | MigrationExpressionPlan::Byte { .. }
+        | MigrationExpressionPlan::Bool { .. }
+        | MigrationExpressionPlan::Variant { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_migration_fields(
+    fields: &[MigrationObjectFieldPlan],
+    inputs: &BTreeSet<MigrationInputId>,
+    parameter_depth: u32,
+    used_inputs: &mut BTreeSet<MigrationInputId>,
+) -> Result<(), PlanError> {
+    if fields.iter().any(|field| field.name.trim().is_empty()) {
+        return Err(PlanError::new(
+            "migration record field name must not be empty",
+        ));
+    }
+    for field in fields {
+        validate_migration_expression(&field.value, inputs, parameter_depth, used_inputs)?;
+    }
+    Ok(())
+}
+
+pub fn migration_call_is_supported(function: &str) -> bool {
+    matches!(
+        function,
+        "Text/empty"
+            | "Text/space"
+            | "Text/trim"
+            | "Text/to_uppercase"
+            | "Text/concat"
+            | "Text/substring"
+            | "Text/is_empty"
+            | "Text/is_not_empty"
+            | "Text/starts_with"
+            | "Text/contains"
+            | "Text/find"
+            | "Text/length"
+            | "Text/to_number"
+            | "Text/to_bytes"
+            | "Number/add"
+            | "Number/subtract"
+            | "Number/min"
+            | "Number/max"
+            | "Number/to_text"
+            | "Bool/not"
+            | "Bool/and"
+            | "Bytes/length"
+            | "Bytes/is_empty"
+            | "Bytes/get"
+            | "Bytes/set"
+            | "Bytes/slice"
+            | "Bytes/take"
+            | "Bytes/drop"
+            | "Bytes/concat"
+            | "Bytes/equal"
+            | "Bytes/find"
+            | "Bytes/starts_with"
+            | "Bytes/ends_with"
+            | "Bytes/to_text"
+            | "Bytes/to_hex"
+            | "Bytes/to_base64"
+            | "Bytes/from_hex"
+            | "Bytes/from_base64"
+            | "Bytes/zeros"
+            | "Bytes/read_unsigned"
+            | "Bytes/read_signed"
+            | "Bytes/write_unsigned"
+            | "Bytes/write_signed"
+            | "List/map"
+            | "List/retain"
+            | "List/range"
+            | "List/chunk"
+            | "List/get"
+            | "List/count"
+            | "List/length"
+            | "List/sum"
+            | "List/every"
+            | "List/any"
+            | "List/is_not_empty"
+    )
+}
+
+fn migration_memory_graph_has_cycle(
+    graph: &std::collections::BTreeMap<MemoryId, BTreeSet<MemoryId>>,
+) -> bool {
+    fn visit(
+        node: MemoryId,
+        graph: &std::collections::BTreeMap<MemoryId, BTreeSet<MemoryId>>,
+        active: &mut BTreeSet<MemoryId>,
+        complete: &mut BTreeSet<MemoryId>,
+    ) -> bool {
+        if complete.contains(&node) {
+            return false;
+        }
+        if !active.insert(node) {
+            return true;
+        }
+        if graph
+            .get(&node)
+            .into_iter()
+            .flatten()
+            .copied()
+            .any(|next| visit(next, graph, active, complete))
+        {
+            return true;
+        }
+        active.remove(&node);
+        complete.insert(node);
+        false
+    }
+
+    let mut active = BTreeSet::new();
+    let mut complete = BTreeSet::new();
+    graph
+        .keys()
+        .copied()
+        .any(|node| visit(node, graph, &mut active, &mut complete))
+}
+
+fn validate_effect_outbox_schemas(schemas: &[EffectOutboxSchema]) -> Result<(), PlanError> {
+    let mut effect_ids = BTreeSet::new();
+    for schema in schemas {
+        schema.validate()?;
+        if !effect_ids.insert(schema.effect_id) {
+            return Err(PlanError::new(
+                "effect outbox schema contains a duplicate effect ID",
+            ));
+        }
+    }
+    if schemas
+        .windows(2)
+        .any(|pair| pair[0].effect_id > pair[1].effect_id)
+    {
+        return Err(PlanError::new(
+            "effect outbox schemas are not canonically ordered",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_migration_catalog(persistence: &PersistencePlan) -> Result<(), PlanError> {
+    let mut recipe_ids = BTreeSet::new();
+    for recipe in &persistence.migration_recipes {
+        recipe.validate()?;
+        if !recipe_ids.insert(recipe.migration_recipe_id) {
+            return Err(PlanError::new(
+                "migration catalog contains a duplicate recipe ID",
+            ));
+        }
+    }
+    if let Some(current) = persistence.current_migration_recipe_id
+        && !recipe_ids.contains(&current)
+    {
+        return Err(PlanError::new(
+            "current migration recipe ID is absent from the recipe catalog",
+        ));
+    }
+    let mut predecessor_bindings = BTreeSet::new();
+    for edge in &persistence.migration_edges {
+        if edge.source_schema_version == 0
+            || edge.source_schema_version >= edge.target_schema_version
+            || edge.target_schema_version > persistence.schema_version
+            || !recipe_ids.contains(&edge.migration_recipe_id)
+            || edge.migration_edge_id
+                != MigrationEdgeId::from_schema_transition(
+                    edge.source_schema_version,
+                    edge.target_schema_version,
+                    edge.source_schema_hash,
+                    edge.migration_recipe_id,
+                )?
+        {
+            return Err(PlanError::new(
+                "migration catalog edge is not a canonical forward predecessor binding",
+            ));
+        }
+        if !predecessor_bindings.insert((
+            edge.source_schema_version,
+            edge.source_schema_hash,
+            edge.target_schema_version,
+        )) {
+            return Err(PlanError::new(
+                "migration catalog binds the same predecessor more than once",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MemoryIdentityInput<'a> {
+    canonical_module: &'a str,
+    named_owner_path: &'a str,
+    semantic_memory_path: &'a str,
+    memory_kind: MemoryKind,
+}
+
+#[derive(Serialize)]
+struct EffectIdentityInput<'a> {
+    namespace: &'static str,
+    host_operation: &'a str,
+}
+
+impl EffectId {
+    pub fn from_host_operation(host_operation: &str) -> Result<Self, PlanError> {
+        if host_operation.trim().is_empty() || host_operation.trim() != host_operation {
+            return Err(PlanError::new(
+                "effect host operation must be a non-empty canonical name",
+            ));
+        }
+        Ok(Self(canonical_sha256(&EffectIdentityInput {
+            namespace: "boon.host-effect.v1",
+            host_operation,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct EffectInvocationIdentityInput<'a> {
+    namespace: &'static str,
+    effect_id: EffectId,
+    source_path: &'a str,
+    target_path: &'a str,
+}
+
+impl EffectInvocationId {
+    pub fn from_semantic_route(
+        effect_id: EffectId,
+        source_path: &str,
+        target_path: &str,
+    ) -> Result<Self, PlanError> {
+        if source_path.trim().is_empty() || target_path.trim().is_empty() {
+            return Err(PlanError::new(
+                "effect invocation source and target paths must be non-empty",
+            ));
+        }
+        Ok(Self(canonical_sha256(&EffectInvocationIdentityInput {
+            namespace: "boon.effect-invocation.v1",
+            effect_id,
+            source_path,
+            target_path,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct OutputRootIdentityInput<'a> {
+    namespace: &'static str,
+    name: &'a str,
+}
+
+impl OutputRootId {
+    pub fn from_name(name: &str) -> Result<Self, PlanError> {
+        if name.trim().is_empty() || name.trim() != name {
+            return Err(PlanError::new(
+                "output root name must be a non-empty canonical name",
+            ));
+        }
+        Ok(Self(canonical_sha256(&OutputRootIdentityInput {
+            namespace: "boon.output-root.v1",
+            name,
+        })?))
+    }
+}
+
+impl MemoryId {
+    pub fn from_identity(
+        owner: &MemoryOwnerPath,
+        semantic_path: &str,
+        kind: MemoryKind,
+    ) -> Result<Self, PlanError> {
+        Ok(Self(canonical_sha256(&MemoryIdentityInput {
+            canonical_module: &owner.canonical_module,
+            named_owner_path: &owner.named_owner_path,
+            semantic_memory_path: semantic_path,
+            memory_kind: kind,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct MemoryLeafIdentityInput<'a> {
+    memory_id: MemoryId,
+    semantic_leaf_path: &'a str,
+}
+
+impl MemoryLeafId {
+    pub fn from_memory_path(memory_id: MemoryId, semantic_path: &str) -> Result<Self, PlanError> {
+        Ok(Self(canonical_sha256(&MemoryLeafIdentityInput {
+            memory_id,
+            semantic_leaf_path: semantic_path,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct MigrationInputIdentityInput<'a> {
+    leaves: &'a [MigrationLeafRefPlan],
+    data_type: DataTypePlan,
+}
+
+impl MigrationInputId {
+    pub fn from_content(
+        leaves: &[MigrationLeafRefPlan],
+        data_type: &DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        Ok(Self(canonical_sha256(&MigrationInputIdentityInput {
+            leaves,
+            data_type: data_type.canonicalized(),
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct MigrationRecipeIdentityInput<'a> {
+    transfers: &'a [MigrationTransferPlan],
+}
+
+impl MigrationRecipeId {
+    pub fn from_transfers(transfers: &[MigrationTransferPlan]) -> Result<Self, PlanError> {
+        Ok(Self(canonical_sha256(&MigrationRecipeIdentityInput {
+            transfers,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct MigrationEdgeIdentityInput {
+    source_schema_version: u64,
+    target_schema_version: u64,
+    source_schema_hash: [u8; 32],
+    migration_recipe_id: MigrationRecipeId,
+}
+
+impl MigrationEdgeId {
+    pub fn from_schema_transition(
+        source_schema_version: u64,
+        target_schema_version: u64,
+        source_schema_hash: [u8; 32],
+        migration_recipe_id: MigrationRecipeId,
+    ) -> Result<Self, PlanError> {
+        Ok(Self(canonical_sha256(&MigrationEdgeIdentityInput {
+            source_schema_version,
+            target_schema_version,
+            source_schema_hash,
+            migration_recipe_id,
+        })?))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourcePayloadSchema {
     pub fields: Vec<SourcePayloadField>,
@@ -131,9 +1999,61 @@ pub enum SourcePayloadField {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputContractKind {
+    Document,
+    Scene,
+    HostValue { data_type: DataTypePlan },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputDemandPolicy {
+    HostDemanded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputValueRef {
+    RetainedVisual { expression: DocumentExprId },
+    RuntimeValue { value: ValueRef },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OutputRootPlan {
+    pub id: OutputRootId,
+    pub name: String,
+    pub contract: OutputContractKind,
+    pub demand: OutputDemandPolicy,
+    pub value: OutputValueRef,
+}
+
+impl OutputRootPlan {
+    pub fn new(
+        name: impl Into<String>,
+        contract: OutputContractKind,
+        demand: OutputDemandPolicy,
+        value: OutputValueRef,
+    ) -> Result<Self, PlanError> {
+        let name = name.into();
+        Ok(Self {
+            id: OutputRootId::from_name(&name)?,
+            name,
+            contract,
+            demand,
+            value,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MachinePlan {
     pub version: PlanVersion,
     pub target_profile: TargetProfile,
+    pub application: ApplicationPlan,
+    pub persistence: PersistencePlan,
+    pub effects: Vec<EffectContract>,
+    pub outputs: Vec<OutputRootPlan>,
     pub demand: DemandPlan,
     pub document: Option<DocumentPlan>,
     pub constants: Vec<PlanConstant>,
@@ -148,6 +2068,10 @@ pub struct MachinePlan {
 }
 
 impl MachinePlan {
+    pub fn output_root(&self, name: &str) -> Option<&OutputRootPlan> {
+        self.outputs.iter().find(|output| output.name == name)
+    }
+
     pub fn document_plan(&self) -> Option<&DocumentPlan> {
         self.document.as_ref()
     }
@@ -356,6 +2280,28 @@ pub struct PlanOp {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectInvocationPlan {
+    pub invocation_id: EffectInvocationId,
+    pub effect_id: EffectId,
+    pub intent_inputs: Vec<ValueRef>,
+    pub idempotency_key: EffectIdempotencyKeyPlan,
+    pub result: EffectResultRoute,
+    pub barrier: EffectBarrier,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectIdempotencyKeyPlan {
+    CanonicalIntentSha256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectResultRoute {
+    pub target: ValueRef,
+    pub policy: EffectResultPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanOpKind {
     SourceRoute,
@@ -380,6 +2326,8 @@ pub enum PlanOpKind {
         update_constant_id: Option<PlanConstantId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_guard: Option<PlanSourceGuard>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<EffectInvocationPlan>,
     },
     ListOperation {
         operation_kind: PlanListOperationKind,
@@ -947,6 +2895,130 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         pass: plan.version.major == PLAN_MAJOR_VERSION,
         detail: format!("plan version {}.{}", plan.version.major, plan.version.minor),
     });
+    let expected_application_hash = canonical_sha256(&plan.application.identity)?;
+    checks.push(PlanCheck {
+        id: "application-identity-valid".to_owned(),
+        pass: plan.application.identity.is_valid()
+            && plan.application.identity_hash == expected_application_hash,
+        detail: format!(
+            "package `{}`, namespace `{}`, deployment `{}`",
+            plan.application.identity.package_id,
+            plan.application.identity.state_namespace,
+            plan.application.identity.deployment_domain
+        ),
+    });
+    checks.push(PlanCheck {
+        id: "persistence-format-supported".to_owned(),
+        pass: plan.persistence.format_version == PERSISTENCE_FORMAT_VERSION
+            && plan.persistence.schema_version > 0,
+        detail: format!(
+            "persistence format {}, schema version {}",
+            plan.persistence.format_version, plan.persistence.schema_version
+        ),
+    });
+    checks.push(PlanCheck {
+        id: "persistence-identities-unique".to_owned(),
+        pass: persistence_identities_unique(&plan.persistence),
+        detail: format!(
+            "{} scalar/indexed memory node(s), {} list memory node(s), {} migration recipe(s), {} migration edge(s)",
+            plan.persistence.memory.len(),
+            plan.persistence.lists.len(),
+            plan.persistence.migration_recipes.len(),
+            plan.persistence.migration_edges.len()
+        ),
+    });
+    checks.push(PlanCheck {
+        id: "persistence-identities-match-canonical-inputs".to_owned(),
+        pass: persistence_identities_match(&plan.persistence)?,
+        detail: "memory, leaf, and migration IDs match their readable canonical inputs".to_owned(),
+    });
+    checks.push(PlanCheck {
+        id: "persistence-type-fingerprints-match".to_owned(),
+        pass: persistence_type_fingerprints_match(&plan.persistence)?,
+        detail: "memory and leaf type fingerprints match canonical recursive schemas".to_owned(),
+    });
+    checks.push(PlanCheck {
+        id: "persistence-runtime-slots-consistent".to_owned(),
+        pass: persistence_runtime_slots_consistent(plan),
+        detail:
+            "active persistence memory maps uniquely to executable slots and authoritative row fields"
+                .to_owned(),
+    });
+    checks.push(PlanCheck {
+        id: "list-authority-fields-have-stable-persistence-leaves".to_owned(),
+        pass: list_authority_fields_have_persistence_leaves(plan),
+        detail: "initial and appended row authority fields resolve to stable list memory leaves"
+            .to_owned(),
+    });
+    checks.push(PlanCheck {
+        id: "persistence-ordering-deterministic".to_owned(),
+        pass: persistence_ordering_is_deterministic(&plan.persistence),
+        detail: "memory, leaf, migration, and recursive type entries use canonical ordering"
+            .to_owned(),
+    });
+    checks.push(PlanCheck {
+        id: "migration-recipes-well-formed".to_owned(),
+        pass: plan
+            .persistence
+            .migration_recipes
+            .iter()
+            .all(|recipe| recipe.validate().is_ok()),
+        detail: format!(
+            "{} target-neutral migration recipe(s)",
+            plan.persistence.migration_recipes.len()
+        ),
+    });
+    checks.push(PlanCheck {
+        id: "migration-catalog-well-formed".to_owned(),
+        pass: migration_edges_well_formed(&plan.persistence)
+            && validate_migration_catalog(&plan.persistence).is_ok(),
+        detail: format!(
+            "{} predecessor-bound migration edge(s)",
+            plan.persistence.migration_edges.len()
+        ),
+    });
+    let expected_schema_hash = persistence_schema_hash(&plan.application, &plan.persistence)?;
+    checks.push(PlanCheck {
+        id: "persistence-schema-hash-consistent".to_owned(),
+        pass: plan.persistence.schema_hash == expected_schema_hash,
+        detail: format!(
+            "schema hash {}, expected {}",
+            digest_hex(&plan.persistence.schema_hash),
+            digest_hex(&expected_schema_hash)
+        ),
+    });
+    let expected_recipe_hash = migration_recipe_hash(&plan.persistence)?;
+    checks.push(PlanCheck {
+        id: "migration-recipe-hash-consistent".to_owned(),
+        pass: plan.persistence.migration_recipe_hash == expected_recipe_hash,
+        detail: format!(
+            "recipe hash {}, expected {}",
+            digest_hex(&plan.persistence.migration_recipe_hash),
+            digest_hex(&expected_recipe_hash)
+        ),
+    });
+    let expected_catalog_hash = migration_catalog_hash(&plan.persistence)?;
+    checks.push(PlanCheck {
+        id: "migration-catalog-hash-consistent".to_owned(),
+        pass: plan.persistence.migration_catalog_hash == expected_catalog_hash,
+        detail: format!(
+            "catalog hash {}, expected {}",
+            digest_hex(&plan.persistence.migration_catalog_hash),
+            digest_hex(&expected_catalog_hash)
+        ),
+    });
+    let effect_contract_failure = effect_contracts_failure(plan);
+    checks.push(PlanCheck {
+        id: "effect-contracts-canonical-and-safe".to_owned(),
+        pass: effect_contract_failure.is_none(),
+        detail: effect_contract_failure.unwrap_or_else(|| {
+            format!(
+                "{} canonical host effect contract(s), {} durable outbox schema(s)",
+                plan.effects.len(),
+                plan.persistence.effect_outbox.len()
+            )
+        }),
+    });
     checks.push(PlanCheck {
         id: "source-routes-use-typed-ids".to_owned(),
         pass: plan
@@ -994,6 +3066,13 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
                 field_ids.len()
             ),
         },
+    });
+    let output_root_failure = output_roots_failure(plan);
+    checks.push(PlanCheck {
+        id: "output-roots-typed-canonical-and-resolved".to_owned(),
+        pass: output_root_failure.is_none(),
+        detail: output_root_failure
+            .unwrap_or_else(|| format!("{} typed host output root(s)", plan.outputs.len())),
     });
     let document_failure = plan
         .document
@@ -1135,6 +3214,592 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
     })
 }
 
+fn persistence_identities_unique(persistence: &PersistencePlan) -> bool {
+    let memory_ids = persistence
+        .memory
+        .iter()
+        .map(|memory| memory.memory_id)
+        .chain(persistence.lists.iter().map(|list| list.memory_id))
+        .collect::<Vec<_>>();
+    let leaf_ids = persistence
+        .memory
+        .iter()
+        .flat_map(|memory| memory.leaves.iter().map(|leaf| leaf.leaf_id))
+        .chain(
+            persistence
+                .lists
+                .iter()
+                .flat_map(|list| list.row_fields.iter().map(|leaf| leaf.leaf_id)),
+        )
+        .collect::<Vec<_>>();
+    let edge_ids = persistence
+        .migration_edges
+        .iter()
+        .map(|edge| edge.migration_edge_id)
+        .collect::<Vec<_>>();
+    let recipe_ids = persistence
+        .migration_recipes
+        .iter()
+        .map(|recipe| recipe.migration_recipe_id)
+        .collect::<Vec<_>>();
+    memory_ids.iter().copied().collect::<BTreeSet<_>>().len() == memory_ids.len()
+        && leaf_ids.iter().copied().collect::<BTreeSet<_>>().len() == leaf_ids.len()
+        && recipe_ids.iter().copied().collect::<BTreeSet<_>>().len() == recipe_ids.len()
+        && edge_ids.iter().copied().collect::<BTreeSet<_>>().len() == edge_ids.len()
+}
+
+fn persistence_identities_match(persistence: &PersistencePlan) -> Result<bool, PlanError> {
+    for memory in &persistence.memory {
+        if memory.memory_id
+            != MemoryId::from_identity(&memory.owner, &memory.semantic_path, memory.kind)?
+        {
+            return Ok(false);
+        }
+        for leaf in &memory.leaves {
+            if leaf.leaf_id
+                != MemoryLeafId::from_memory_path(memory.memory_id, &leaf.semantic_path)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    for list in &persistence.lists {
+        if list.memory_id
+            != MemoryId::from_identity(&list.owner, &list.semantic_path, MemoryKind::List)?
+        {
+            return Ok(false);
+        }
+        for leaf in &list.row_fields {
+            if leaf.leaf_id != MemoryLeafId::from_memory_path(list.memory_id, &leaf.semantic_path)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    for recipe in &persistence.migration_recipes {
+        if recipe.migration_recipe_id != MigrationRecipeId::from_transfers(&recipe.transfers)? {
+            return Ok(false);
+        }
+        for transfer in &recipe.transfers {
+            for input in &transfer.inputs {
+                if input.input_id
+                    != MigrationInputId::from_content(&input.leaves, &input.data_type)?
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    for edge in &persistence.migration_edges {
+        if edge.migration_edge_id
+            != MigrationEdgeId::from_schema_transition(
+                edge.source_schema_version,
+                edge.target_schema_version,
+                edge.source_schema_hash,
+                edge.migration_recipe_id,
+            )?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn persistence_type_fingerprints_match(persistence: &PersistencePlan) -> Result<bool, PlanError> {
+    for memory in &persistence.memory {
+        if memory.type_fingerprint != data_type_fingerprint(&memory.data_type)? {
+            return Ok(false);
+        }
+        for leaf in &memory.leaves {
+            if leaf.type_fingerprint != data_type_fingerprint(&leaf.data_type)? {
+                return Ok(false);
+            }
+        }
+    }
+    for list in &persistence.lists {
+        if list.type_fingerprint != data_type_fingerprint(&list.data_type)? {
+            return Ok(false);
+        }
+        for leaf in &list.row_fields {
+            if leaf.type_fingerprint != data_type_fingerprint(&leaf.data_type)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn list_authority_fields_have_persistence_leaves(plan: &MachinePlan) -> bool {
+    plan.persistence.lists.iter().all(|memory| {
+        let Some(slot) = plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.id == memory.runtime_slot)
+        else {
+            return false;
+        };
+        let stable_fields = memory
+            .row_fields
+            .iter()
+            .filter_map(|field| field.runtime_field_id)
+            .collect::<BTreeSet<_>>();
+        let mut authoritative_fields = slot
+            .initial_rows
+            .iter()
+            .flat_map(|row| &row.fields)
+            .filter_map(|field| field.field_id)
+            .collect::<BTreeSet<_>>();
+        for append in plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .filter_map(|op| {
+                let PlanOpKind::ListOperation {
+                    append: Some(append),
+                    ..
+                } = &op.kind
+                else {
+                    return None;
+                };
+                (op.output == Some(ValueRef::List(slot.list_id))).then_some(append)
+            })
+        {
+            authoritative_fields.extend(append.fields.iter().filter_map(|field| field.field_id));
+        }
+        authoritative_fields.is_subset(&stable_fields)
+    })
+}
+
+fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
+    if plan
+        .effects
+        .windows(2)
+        .any(|pair| pair[0].effect_id >= pair[1].effect_id)
+    {
+        return Some("effect contracts are not uniquely ordered by stable effect ID".to_owned());
+    }
+    for contract in &plan.effects {
+        if let Err(error) = contract.validate() {
+            return Some(format!(
+                "effect contract `{}` is unsafe or malformed: {error}",
+                contract.host_operation
+            ));
+        }
+        if let Ok(Some(expected)) = builtin_effect_contract(&contract.host_operation)
+            && expected != *contract
+        {
+            return Some(format!(
+                "effect contract `{}` differs from the centralized host contract",
+                contract.host_operation
+            ));
+        }
+    }
+    if let Err(error) = validate_effect_outbox_schemas(&plan.persistence.effect_outbox) {
+        return Some(error.to_string());
+    }
+    for outbox in &plan.persistence.effect_outbox {
+        let Some(contract) = plan
+            .effects
+            .iter()
+            .find(|contract| contract.effect_id == outbox.effect_id)
+        else {
+            return Some(format!(
+                "outbox schema for effect {} has no host contract",
+                outbox.effect_id
+            ));
+        };
+        let EffectReplay::Idempotent { key_type } = &contract.replay else {
+            return Some(format!(
+                "outbox schema for `{}` is not attached to an idempotent effect",
+                contract.host_operation
+            ));
+        };
+        if key_type != &outbox.idempotency_key_type {
+            return Some(format!(
+                "outbox key schema for `{}` differs from its effect contract",
+                contract.host_operation
+            ));
+        }
+    }
+    for contract in &plan.effects {
+        if matches!(contract.replay, EffectReplay::Idempotent { .. })
+            && !plan
+                .persistence
+                .effect_outbox
+                .iter()
+                .any(|schema| schema.effect_id == contract.effect_id)
+        {
+            return Some(format!(
+                "idempotent effect `{}` has no durable outbox schema",
+                contract.host_operation
+            ));
+        }
+    }
+    let available = plan
+        .effects
+        .iter()
+        .map(|contract| contract.host_operation.as_str())
+        .collect::<BTreeSet<_>>();
+    for required in required_effect_operations(plan) {
+        if !available.contains(required) {
+            return Some(format!(
+                "executable host operation `{required}` has no effect contract"
+            ));
+        }
+    }
+    let mut invocation_ids = BTreeSet::new();
+    for op in plan.regions.iter().flat_map(|region| &region.ops) {
+        let PlanOpKind::UpdateBranch {
+            expression_kind,
+            ordered_inputs,
+            effect,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let consequential = matches!(expression_kind, PlanExpressionKind::FileWriteBytes);
+        if consequential != effect.is_some() {
+            return Some(format!(
+                "effectful update op {} has inconsistent invocation metadata",
+                op.id.0
+            ));
+        }
+        let Some(invocation) = effect else {
+            continue;
+        };
+        if !invocation_ids.insert(invocation.invocation_id) {
+            return Some(format!(
+                "effect invocation {} is used more than once",
+                invocation.invocation_id
+            ));
+        }
+        let Some(contract) = plan
+            .effects
+            .iter()
+            .find(|contract| contract.effect_id == invocation.effect_id)
+        else {
+            return Some(format!(
+                "effect invocation {} has no matching host contract",
+                invocation.invocation_id
+            ));
+        };
+        if invocation.intent_inputs != *ordered_inputs
+            || op.output.as_ref() != Some(&invocation.result.target)
+            || invocation.result.policy != contract.result_policy
+            || invocation.barrier != contract.barrier
+            || !plan
+                .persistence
+                .effect_outbox
+                .iter()
+                .any(|schema| schema.effect_id == invocation.effect_id)
+        {
+            return Some(format!(
+                "effect invocation {} disagrees with its update, contract, or outbox schema",
+                invocation.invocation_id
+            ));
+        }
+    }
+    None
+}
+
+fn required_effect_operations(plan: &MachinePlan) -> BTreeSet<&'static str> {
+    let mut operations = BTreeSet::new();
+    for op in plan.regions.iter().flat_map(|region| &region.ops) {
+        match &op.kind {
+            PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::FileReadBytes,
+                ..
+            } => {
+                operations.insert("File/read_bytes");
+            }
+            PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::FileWriteBytes,
+                ..
+            } => {
+                operations.insert("File/write_bytes");
+            }
+            _ => {}
+        }
+    }
+    if let Some(document) = &plan.document {
+        for expression in &document.expressions {
+            let DocumentExprOp::Builtin { builtin, .. } = expression.op else {
+                continue;
+            };
+            let operation = match builtin {
+                DocumentBuiltin::DirectoryEntries => Some("Directory/entries"),
+                DocumentBuiltin::FileReadBytes => Some("File/read_bytes"),
+                _ => None,
+            };
+            operations.extend(operation);
+        }
+    }
+    operations
+}
+
+fn output_roots_failure(plan: &MachinePlan) -> Option<String> {
+    if plan
+        .outputs
+        .windows(2)
+        .any(|pair| pair[0].name >= pair[1].name)
+    {
+        return Some("output roots are not uniquely ordered by name".to_owned());
+    }
+    for output in &plan.outputs {
+        if output.name.trim().is_empty() || output.name.trim() != output.name {
+            return Some("output root names must be non-empty and canonical".to_owned());
+        }
+        if output.id != OutputRootId::from_name(&output.name).ok()? {
+            return Some(format!(
+                "output root `{}` has a non-canonical stable identity",
+                output.name
+            ));
+        }
+        match (&output.contract, &output.value) {
+            (
+                OutputContractKind::Document | OutputContractKind::Scene,
+                OutputValueRef::RetainedVisual { expression },
+            ) => {
+                let Some(document) = &plan.document else {
+                    return Some(format!(
+                        "retained visual output root `{}` references an absent document plan",
+                        output.name
+                    ));
+                };
+                let expected_contract = match document.root.kind {
+                    DocumentRootKind::Document => OutputContractKind::Document,
+                    DocumentRootKind::Scene => OutputContractKind::Scene,
+                };
+                if output.contract != expected_contract
+                    || *expression != document.root.expression
+                    || document.expressions.get(expression.0).is_none()
+                {
+                    return Some(format!(
+                        "retained visual output root `{}` does not resolve to its document plan value",
+                        output.name
+                    ));
+                }
+            }
+            (
+                OutputContractKind::HostValue { data_type },
+                OutputValueRef::RuntimeValue { value },
+            ) => {
+                if !data_type.is_canonical() || !data_type_is_closed(data_type) {
+                    return Some(format!(
+                        "host output root `{}` does not have a closed canonical data type",
+                        output.name
+                    ));
+                }
+                if !runtime_output_ref_resolves(plan, value) {
+                    return Some(format!(
+                        "host output root `{}` does not resolve to an executable runtime value",
+                        output.name
+                    ));
+                }
+            }
+            _ => {
+                return Some(format!(
+                    "output root `{}` mixes retained-visual and host-value contracts",
+                    output.name
+                ));
+            }
+        }
+    }
+    let retained_count = plan
+        .outputs
+        .iter()
+        .filter(|output| {
+            matches!(
+                output.contract,
+                OutputContractKind::Document | OutputContractKind::Scene
+            )
+        })
+        .count();
+    match (&plan.document, retained_count) {
+        (None, 0) | (Some(_), 1) => None,
+        (None, _) => {
+            Some("output registry has a retained visual root without a document plan".to_owned())
+        }
+        (Some(_), count) => Some(format!(
+            "document plan must have exactly one retained visual output root, found {count}"
+        )),
+    }
+}
+
+fn data_type_is_closed(data_type: &DataTypePlan) -> bool {
+    match data_type {
+        DataTypePlan::Unknown => false,
+        DataTypePlan::Record { fields, open } | DataTypePlan::Error { fields, open } => {
+            !open
+                && fields
+                    .iter()
+                    .all(|field| data_type_is_closed(&field.data_type))
+        }
+        DataTypePlan::Variant { variants } => variants.iter().all(|variant| {
+            !variant.open
+                && variant
+                    .fields
+                    .iter()
+                    .all(|field| data_type_is_closed(&field.data_type))
+        }),
+        DataTypePlan::List { item } => data_type_is_closed(item),
+        DataTypePlan::Null
+        | DataTypePlan::Bool
+        | DataTypePlan::Number
+        | DataTypePlan::Byte
+        | DataTypePlan::Text
+        | DataTypePlan::Bytes { .. } => true,
+    }
+}
+
+fn runtime_output_ref_resolves(plan: &MachinePlan, value: &ValueRef) -> bool {
+    match value {
+        ValueRef::State(state) => plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .any(|slot| slot.state_id == *state && !slot.indexed),
+        ValueRef::Field(field) => plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .any(|op| !op.indexed && op.output.as_ref() == Some(&ValueRef::Field(*field))),
+        ValueRef::List(list) => plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .any(|slot| slot.list_id == *list),
+        ValueRef::Constant(constant) => plan.constants.iter().any(|item| item.id == *constant),
+        ValueRef::Source(_) | ValueRef::SourcePayload { .. } => false,
+    }
+}
+
+fn persistence_runtime_slots_consistent(plan: &MachinePlan) -> bool {
+    let mut linked_slots = BTreeSet::new();
+    for memory in &plan.persistence.memory {
+        let Some(slot) = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.id == memory.runtime_slot)
+        else {
+            return false;
+        };
+        let expected_kind = if slot.indexed {
+            MemoryKind::IndexedField
+        } else {
+            MemoryKind::Scalar
+        };
+        if memory.kind != expected_kind
+            || memory.leaves.is_empty()
+            || memory
+                .leaves
+                .iter()
+                .any(|leaf| leaf.runtime_field_id.is_some())
+            || !linked_slots.insert(memory.runtime_slot)
+        {
+            return false;
+        }
+    }
+
+    for list in &plan.persistence.lists {
+        let Some(slot) = plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .find(|slot| slot.id == list.runtime_slot)
+        else {
+            return false;
+        };
+        let runtime_fields = list
+            .row_fields
+            .iter()
+            .filter_map(|leaf| leaf.runtime_field_id)
+            .collect::<BTreeSet<_>>();
+        let expected_fields = slot.row_field_ids.iter().copied().collect::<BTreeSet<_>>();
+        if runtime_fields.len() != list.row_fields.len()
+            || !runtime_fields.is_subset(&expected_fields)
+            || !linked_slots.insert(list.runtime_slot)
+        {
+            return false;
+        }
+    }
+
+    linked_slots.len() == plan.persistence.memory.len() + plan.persistence.lists.len()
+}
+
+fn persistence_ordering_is_deterministic(persistence: &PersistencePlan) -> bool {
+    persistence
+        .memory
+        .windows(2)
+        .all(|pair| pair[0].memory_id < pair[1].memory_id)
+        && persistence.memory.iter().all(|memory| {
+            memory.data_type.is_canonical()
+                && memory
+                    .leaves
+                    .windows(2)
+                    .all(|pair| pair[0].leaf_id < pair[1].leaf_id)
+                && memory
+                    .leaves
+                    .iter()
+                    .all(|leaf| leaf.data_type.is_canonical())
+        })
+        && persistence
+            .lists
+            .windows(2)
+            .all(|pair| pair[0].memory_id < pair[1].memory_id)
+        && persistence.lists.iter().all(|list| {
+            list.data_type.is_canonical()
+                && list
+                    .row_fields
+                    .windows(2)
+                    .all(|pair| pair[0].leaf_id < pair[1].leaf_id)
+                && list
+                    .row_fields
+                    .iter()
+                    .all(|leaf| leaf.data_type.is_canonical())
+        })
+        && persistence
+            .effect_outbox
+            .windows(2)
+            .all(|pair| pair[0].effect_id < pair[1].effect_id)
+        && persistence
+            .effect_outbox
+            .iter()
+            .all(|schema| schema.validate().is_ok())
+        && persistence
+            .migration_recipes
+            .windows(2)
+            .all(|pair| pair[0].migration_recipe_id < pair[1].migration_recipe_id)
+        && persistence.migration_recipes.iter().all(|recipe| {
+            recipe.validate().is_ok()
+                && recipe.transfers.iter().all(|transfer| {
+                    transfer
+                        .inputs
+                        .windows(2)
+                        .all(|pair| pair[0].input_id < pair[1].input_id)
+                })
+        })
+        && persistence
+            .migration_edges
+            .windows(2)
+            .all(|pair| pair[0].migration_edge_id < pair[1].migration_edge_id)
+}
+
+fn migration_edges_well_formed(persistence: &PersistencePlan) -> bool {
+    persistence.migration_edges.iter().all(|edge| {
+        edge.source_schema_version > 0
+            && edge.source_schema_version < edge.target_schema_version
+            && edge.target_schema_version <= persistence.schema_version
+            && persistence
+                .migration_recipes
+                .iter()
+                .any(|recipe| recipe.migration_recipe_id == edge.migration_recipe_id)
+    })
+}
+
 fn root_output_demand_resolves(plan: &MachinePlan) -> bool {
     let RootOutputDemand::Selected(field_ids) = &plan.demand.root_derived_outputs else {
         return true;
@@ -1158,11 +3823,202 @@ fn root_output_demand_resolves(plan: &MachinePlan) -> bool {
         .all(|field_id| root_outputs.contains(field_id))
 }
 
+pub fn plan_binary(plan: &MachinePlan) -> Result<Vec<u8>, PlanError> {
+    binary::encode(plan)
+}
+
 pub fn plan_sha256(plan: &MachinePlan) -> Result<String, PlanError> {
-    let bytes = binary::encode(plan)?;
+    let bytes = plan_binary(plan)?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn data_type_fingerprint(data_type: &DataTypePlan) -> Result<[u8; 32], PlanError> {
+    canonical_sha256(&data_type.canonicalized())
+}
+
+#[derive(Serialize)]
+struct CanonicalMemoryLeafSchema {
+    leaf_id: MemoryLeafId,
+    semantic_path: String,
+    data_type: DataTypePlan,
+    type_fingerprint: [u8; 32],
+}
+
+impl CanonicalMemoryLeafSchema {
+    fn from_leaf(leaf: &MemoryLeafPlan) -> Self {
+        Self {
+            leaf_id: leaf.leaf_id,
+            semantic_path: leaf.semantic_path.clone(),
+            data_type: leaf.data_type.canonicalized(),
+            type_fingerprint: leaf.type_fingerprint,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalMemorySchema {
+    memory_id: MemoryId,
+    kind: MemoryKind,
+    semantic_path: String,
+    data_type: DataTypePlan,
+    type_fingerprint: [u8; 32],
+    initial_provenance: InitialProvenance,
+    owner: MemoryOwnerPath,
+    leaves: Vec<CanonicalMemoryLeafSchema>,
+}
+
+impl CanonicalMemorySchema {
+    fn from_memory(memory: &MemoryPlan) -> Self {
+        let mut leaves = memory
+            .leaves
+            .iter()
+            .map(CanonicalMemoryLeafSchema::from_leaf)
+            .collect::<Vec<_>>();
+        leaves.sort_by_key(|leaf| leaf.leaf_id);
+        Self {
+            memory_id: memory.memory_id,
+            kind: memory.kind,
+            semantic_path: memory.semantic_path.clone(),
+            data_type: memory.data_type.canonicalized(),
+            type_fingerprint: memory.type_fingerprint,
+            initial_provenance: memory.initial_provenance,
+            owner: memory.owner.clone(),
+            leaves,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalListMemorySchema {
+    memory_id: MemoryId,
+    semantic_path: String,
+    data_type: DataTypePlan,
+    type_fingerprint: [u8; 32],
+    initial_provenance: InitialProvenance,
+    owner: MemoryOwnerPath,
+    hidden_key_type: String,
+    has_generation: bool,
+    row_fields: Vec<CanonicalMemoryLeafSchema>,
+}
+
+impl CanonicalListMemorySchema {
+    fn from_list(list: &ListMemoryPlan) -> Self {
+        let mut row_fields = list
+            .row_fields
+            .iter()
+            .map(CanonicalMemoryLeafSchema::from_leaf)
+            .collect::<Vec<_>>();
+        row_fields.sort_by_key(|field| field.leaf_id);
+        Self {
+            memory_id: list.memory_id,
+            semantic_path: list.semantic_path.clone(),
+            data_type: list.data_type.canonicalized(),
+            type_fingerprint: list.type_fingerprint,
+            initial_provenance: list.initial_provenance,
+            owner: list.owner.clone(),
+            hidden_key_type: list.hidden_key_type.clone(),
+            has_generation: list.has_generation,
+            row_fields,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalPersistenceSchema<'a> {
+    application: &'a ApplicationIdentity,
+    format_version: u32,
+    schema_version: u64,
+    memory: Vec<CanonicalMemorySchema>,
+    lists: Vec<CanonicalListMemorySchema>,
+    effect_outbox: &'a [EffectOutboxSchema],
+}
+
+/// Hashes only canonical persistence schema data. Runtime numeric slots and
+/// fields are intentionally omitted because they are executable-plan links,
+/// not durable identity.
+pub fn persistence_schema_hash(
+    application: &ApplicationPlan,
+    persistence: &PersistencePlan,
+) -> Result<[u8; 32], PlanError> {
+    let mut memory = persistence
+        .memory
+        .iter()
+        .map(CanonicalMemorySchema::from_memory)
+        .collect::<Vec<_>>();
+    memory.sort_by_key(|memory| memory.memory_id);
+    let mut lists = persistence
+        .lists
+        .iter()
+        .map(CanonicalListMemorySchema::from_list)
+        .collect::<Vec<_>>();
+    lists.sort_by_key(|list| list.memory_id);
+    canonical_sha256(&CanonicalPersistenceSchema {
+        application: &application.identity,
+        format_version: persistence.format_version,
+        schema_version: persistence.schema_version,
+        memory,
+        lists,
+        effect_outbox: &persistence.effect_outbox,
+    })
+}
+
+#[derive(Serialize)]
+struct CanonicalCurrentMigrationRecipe<'a> {
+    current_migration_recipe_id: Option<MigrationRecipeId>,
+    current_recipe: Option<&'a MigrationRecipePlan>,
+}
+
+pub fn migration_recipe_hash(persistence: &PersistencePlan) -> Result<[u8; 32], PlanError> {
+    let current_recipe = persistence.current_migration_recipe_id.and_then(|current| {
+        persistence
+            .migration_recipes
+            .iter()
+            .find(|recipe| recipe.migration_recipe_id == current)
+    });
+    canonical_sha256(&CanonicalCurrentMigrationRecipe {
+        current_migration_recipe_id: persistence.current_migration_recipe_id,
+        current_recipe,
+    })
+}
+
+#[derive(Serialize)]
+struct CanonicalMigrationCatalog<'a> {
+    recipes: &'a [MigrationRecipePlan],
+    edges: &'a [MigrationEdgePlan],
+}
+
+pub fn migration_catalog_hash(persistence: &PersistencePlan) -> Result<[u8; 32], PlanError> {
+    canonical_sha256(&CanonicalMigrationCatalog {
+        recipes: &persistence.migration_recipes,
+        edges: &persistence.migration_edges,
+    })
+}
+
+pub fn canonical_persistence_schema_hash(
+    application: &ApplicationPlan,
+    persistence: &PersistencePlan,
+) -> Result<[u8; 32], PlanError> {
+    persistence_schema_hash(application, persistence)
+}
+
+fn canonical_sha256<T>(value: &T) -> Result<[u8; 32], PlanError>
+where
+    T: Serialize,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(binary::encode(value)?);
+    Ok(hasher.finalize().into())
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 fn computed_capability_summary(plan: &MachinePlan) -> CapabilitySummary {
@@ -1352,6 +4208,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
             source_payload_field,
             update_constant_id,
             source_guard,
+            effect: _,
         } => {
             if op.unresolved_executable_ref_count != 0 {
                 return false;
@@ -1941,6 +4798,7 @@ fn root_bool_expression_cpu_supported(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cpu_plan_executor_supports_indexed_update_op(
     scalar_slots: &[ScalarStorageSlot],
     list_slots: &[ListStorageSlot],
@@ -3752,6 +6610,7 @@ fn plan_constants_are_deduplicated(constants: &[PlanConstant]) -> bool {
     true
 }
 
+#[allow(clippy::single_match)]
 fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> Option<String> {
     let mut ids = BTreeSet::new();
     for (index, constant) in plan.constants.iter().enumerate() {
@@ -4128,9 +6987,7 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                         input_len,
                         bytes_number_operand_constant_u64(&plan.constants, offset_ref),
                         bytes_number_operand_constant_u64(&plan.constants, byte_count_ref),
-                    ) && !offset
-                        .checked_add(byte_count)
-                        .is_some_and(|end| end <= *len)
+                    ) && offset.checked_add(byte_count).is_none_or(|end| end > *len)
                     {
                         return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
@@ -4580,10 +7437,10 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                         }
                     }
                 }
-                PlanExpressionKind::FileWriteBytes => {
-                    if !file_write_bytes_op_is_well_formed(plan, op) {
-                        return Some(constant_ref_update_op_failure(*expression_kind, op));
-                    }
+                PlanExpressionKind::FileWriteBytes
+                    if !file_write_bytes_op_is_well_formed(plan, op) =>
+                {
+                    return Some(constant_ref_update_op_failure(*expression_kind, op));
                 }
                 _ => {}
             },
@@ -4612,9 +7469,11 @@ fn initial_field_paths_resolve(plan: &MachinePlan) -> bool {
                     && slot.initial_row_field_path.is_none()
             }
             InitialValueKind::RowInitialField => {
-                slot.initial_row_field_path
+                (slot
+                    .initial_row_field_path
                     .as_deref()
                     .is_some_and(|path| !path.trim().is_empty())
+                    || slot.initial_row_expression.is_some())
                     && slot.initial_root_field_path.is_none()
             }
             _ => slot.initial_root_field_path.is_none() && slot.initial_row_field_path.is_none(),

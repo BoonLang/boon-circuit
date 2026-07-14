@@ -185,6 +185,9 @@ pub struct AstExpr {
 pub enum AstExprKind {
     Identifier(String),
     Path(Vec<String>),
+    Drain {
+        path: AstDrainPath,
+    },
     StringLiteral(String),
     TextLiteral(String),
     Number(String),
@@ -209,6 +212,9 @@ pub enum AstExprKind {
         input: usize,
         op: String,
         args: Vec<AstCallArg>,
+    },
+    Draining {
+        input: usize,
     },
     Hold {
         initial: usize,
@@ -245,6 +251,20 @@ pub enum AstExprKind {
     },
     Delimiter,
     Unknown(Vec<String>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AstDrainPath {
+    Binding {
+        name: String,
+    },
+    Field {
+        binding: String,
+        fields: Vec<String>,
+    },
+    Passed {
+        fields: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -852,15 +872,47 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let text_body_line_ranges = text_literal_body_line_ranges(&tokens);
     let lines = parser_lines(&tokens);
     let item_lines = merge_multiline_bytes_lines(&lines, &text_body_line_ranges);
+    let item_lines = merge_multiline_drain_lines(&item_lines, &text_body_line_ranges);
     let items = parser_items(&item_lines, &text_body_line_ranges);
     let mut expressions = Vec::new();
     let statements = ast_statement_tree(&items, &mut expressions, source);
+    link_multiline_block_outputs(&statements, &mut expressions);
     Ok(AstProgram {
         tokens,
         lines,
         items,
         statements,
         expressions,
+    })
+}
+
+fn link_multiline_block_outputs(statements: &[AstStatement], expressions: &mut [AstExpr]) {
+    for statement in statements {
+        link_multiline_block_outputs(&statement.children, expressions);
+        let Some(parent_expr) = statement.expr else {
+            continue;
+        };
+        let Some(output) = first_statement_expression(&statement.children) else {
+            continue;
+        };
+        let Some(expression) = expressions.get_mut(parent_expr) else {
+            continue;
+        };
+        if let AstExprKind::Then {
+            output: current, ..
+        } = &mut expression.kind
+            && current.is_none()
+        {
+            *current = Some(output);
+        }
+    }
+}
+
+fn first_statement_expression(statements: &[AstStatement]) -> Option<usize> {
+    statements.iter().find_map(|statement| {
+        statement
+            .expr
+            .or_else(|| first_statement_expression(&statement.children))
     })
 }
 
@@ -1072,6 +1124,21 @@ fn merge_multiline_bytes_lines(
     lines: &[ParserLine],
     text_body_line_ranges: &[(usize, usize)],
 ) -> Vec<ParserLine> {
+    merge_multiline_braced_lines(lines, text_body_line_ranges, unclosed_bytes_body_open)
+}
+
+fn merge_multiline_drain_lines(
+    lines: &[ParserLine],
+    text_body_line_ranges: &[(usize, usize)],
+) -> Vec<ParserLine> {
+    merge_multiline_braced_lines(lines, text_body_line_ranges, unclosed_drain_body_open)
+}
+
+fn merge_multiline_braced_lines(
+    lines: &[ParserLine],
+    text_body_line_ranges: &[(usize, usize)],
+    unclosed_body_open: fn(&[String]) -> Option<usize>,
+) -> Vec<ParserLine> {
     let mut merged = Vec::new();
     let mut index = 0usize;
     while let Some(line) = lines.get(index) {
@@ -1080,7 +1147,7 @@ fn merge_multiline_bytes_lines(
             index += 1;
             continue;
         }
-        let Some(body_open) = unclosed_bytes_body_open(&line.symbols) else {
+        let Some(body_open) = unclosed_body_open(&line.symbols) else {
             merged.push(line.clone());
             index += 1;
             continue;
@@ -1123,6 +1190,15 @@ fn unclosed_bytes_body_open(symbols: &[String]) -> Option<usize> {
         }
         _ => return None,
     };
+    matching_close(symbols, body_open)
+        .is_none()
+        .then_some(body_open)
+}
+
+fn unclosed_drain_body_open(symbols: &[String]) -> Option<usize> {
+    let drain = symbols.iter().position(|symbol| symbol == "DRAIN")?;
+    let body_open =
+        (symbols.get(drain + 1).map(String::as_str) == Some("{")).then_some(drain + 1)?;
     matching_close(symbols, body_open)
         .is_none()
         .then_some(body_open)
@@ -1248,9 +1324,8 @@ fn ast_statement(
         }
     } else if let Some(field) = item.field.clone() {
         AstStatementKind::Field { name: field }
-    } else if is_semantic_block {
-        AstStatementKind::Block
-    } else if matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "(" | "]" | "}" | ")"))
+    } else if is_semantic_block
+        || matches!(item.symbols.as_slice(), [one] if matches!(one.as_str(), "[" | "{" | "(" | "]" | "}" | ")"))
     {
         AstStatementKind::Block
     } else if item
@@ -1401,6 +1476,9 @@ fn ast_expr_kind(
     {
         return AstExprKind::Identifier("BLOCK".to_owned());
     }
+    if let Some(path) = ast_drain_path(tokens) {
+        return AstExprKind::Drain { path };
+    }
     if let Some(pipe) = find_top_level_pipe(tokens) {
         return ast_pipe_expr_kind(tokens, pipe, item, expressions, source);
     }
@@ -1479,6 +1557,58 @@ fn ast_expr_kind(
     } else {
         AstExprKind::Unknown(tokens.to_vec())
     }
+}
+
+fn ast_drain_path(tokens: &[String]) -> Option<AstDrainPath> {
+    if tokens.first().map(String::as_str) != Some("DRAIN")
+        || tokens.get(1).map(String::as_str) != Some("{")
+        || matching_close(tokens, 1) != Some(tokens.len().checked_sub(1)?)
+    {
+        return None;
+    }
+    drain_path_from_symbols(&tokens[2..tokens.len() - 1])
+}
+
+fn drain_path_from_symbols(symbols: &[String]) -> Option<AstDrainPath> {
+    if symbols.is_empty() || symbols.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut segments = Vec::with_capacity(symbols.len().div_ceil(2));
+    for (index, symbol) in symbols.iter().enumerate() {
+        if index % 2 == 1 {
+            if symbol != "." {
+                return None;
+            }
+            continue;
+        }
+        if !is_drain_path_segment(symbol) {
+            return None;
+        }
+        segments.push(symbol.clone());
+    }
+    let root = segments.remove(0);
+    if root == "PASSED" {
+        return (!segments.is_empty()).then_some(AstDrainPath::Passed { fields: segments });
+    }
+    if value_starts_uppercase_identifier(&root) {
+        return None;
+    }
+    if segments.is_empty() {
+        Some(AstDrainPath::Binding { name: root })
+    } else {
+        Some(AstDrainPath::Field {
+            binding: root,
+            fields: segments,
+        })
+    }
+}
+
+fn is_drain_path_segment(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && is_name(value)
 }
 
 fn ast_number_literal(tokens: &[String]) -> Option<String> {
@@ -1589,6 +1719,9 @@ fn ast_pipe_expr_kind(
         .get(pipe + 1)
         .cloned()
         .unwrap_or_else(|| "pipe".to_owned());
+    if op == "DRAINING" && pipe + 2 == tokens.len() {
+        return AstExprKind::Draining { input };
+    }
     if op == "HOLD" {
         let name = tokens
             .get(pipe + 2)
@@ -2268,25 +2401,182 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
             }
         }
     }
-    if example_source {
-        if let Some(document) = document_statement(ast) {
-            let document_is_canonical = document.expr.is_some_and(|expr_id| {
-                ast.expressions.get(expr_id).is_some_and(|expr| {
-                    matches!(&expr.kind, AstExprKind::Call { function, .. } if function == "Document/new")
-                })
-            });
-            if !document_is_canonical || statement_has_field(document, "kind") {
-                return Err(error(
-                    path,
-                    document.line,
-                    document.indent + 1,
-                    "example documents must use `Document/new(root: Element/...)`",
-                ));
-            }
+    if example_source && let Some(document) = document_statement(ast) {
+        let document_is_canonical = document.expr.is_some_and(|expr_id| {
+            ast.expressions.get(expr_id).is_some_and(|expr| {
+                matches!(&expr.kind, AstExprKind::Call { function, .. } if function == "Document/new")
+            })
+        });
+        if !document_is_canonical || statement_has_field(document, "kind") {
+            return Err(error(
+                path,
+                document.line,
+                document.indent + 1,
+                "example documents must use `Document/new(root: Element/...)`",
+            ));
         }
     }
+    validate_drain_syntax(path, ast, &text_literal_spans)?;
     validate_bytes_syntax(path, ast, &text_literal_spans)?;
     Ok(())
+}
+
+fn validate_drain_syntax(
+    path: &str,
+    ast: &AstProgram,
+    text_literal_spans: &[(usize, usize)],
+) -> Result<(), ParseError> {
+    let tokens = ast
+        .tokens
+        .iter()
+        .filter(|token| {
+            if matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline) {
+                return false;
+            }
+            let containing_text = text_literal_spans
+                .iter()
+                .find(|(start, end)| token.start >= *start && token.end <= *end);
+            containing_text.is_none_or(|(start, _)| token.start == *start)
+        })
+        .collect::<Vec<_>>();
+
+    let mut index = 0usize;
+    while let Some(token) = tokens.get(index) {
+        if token.lexeme != "DRAIN" {
+            index += 1;
+            continue;
+        }
+        if tokens.get(index + 1).map(|token| token.lexeme.as_str()) != Some("{") {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`DRAIN` requires a `{ path }` body",
+            ));
+        }
+        let Some(close) = matching_semantic_brace(&tokens, index + 1) else {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`DRAIN` is missing closing `}`",
+            ));
+        };
+        let body = tokens[index + 2..close]
+            .iter()
+            .map(|token| token.lexeme.clone())
+            .collect::<Vec<_>>();
+        if drain_path_from_symbols(&body).is_none() {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`DRAIN` body must contain exactly one named binding, field path, or `PASSED` path",
+            ));
+        }
+        index = close + 1;
+    }
+
+    let depths = semantic_token_depths(&tokens);
+    for (index, token) in tokens.iter().enumerate() {
+        if token.lexeme != "DRAINING" {
+            continue;
+        }
+        if index
+            .checked_sub(1)
+            .and_then(|index| tokens.get(index))
+            .is_none_or(|previous| previous.lexeme != "|>")
+            || !draining_pipe_has_input(&tokens, index)
+        {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`DRAINING` must be used as terminal `input |> DRAINING` syntax",
+            ));
+        }
+        if draining_has_trailing_pipeline_syntax(&tokens, &depths, index) {
+            return Err(error(
+                path,
+                token.line,
+                token.column,
+                "`DRAINING` must be terminal in its pipeline",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn matching_semantic_brace(tokens: &[&AstToken], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate().skip(open) {
+        match token.lexeme.as_str() {
+            "{" => depth += 1,
+            "}" => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn semantic_token_depths(tokens: &[&AstToken]) -> Vec<i32> {
+    let mut depth = 0i32;
+    tokens
+        .iter()
+        .map(|token| {
+            let current = depth;
+            match token.lexeme.as_str() {
+                "[" | "{" | "(" => depth += 1,
+                "]" | "}" | ")" => depth -= 1,
+                _ => {}
+            }
+            current
+        })
+        .collect()
+}
+
+fn draining_pipe_has_input(tokens: &[&AstToken], draining: usize) -> bool {
+    let Some(pipe) = draining.checked_sub(1) else {
+        return false;
+    };
+    let Some(previous) = pipe.checked_sub(1).and_then(|index| tokens.get(index)) else {
+        return false;
+    };
+    !matches!(
+        previous.lexeme.as_str(),
+        ":" | "," | "(" | "[" | "{" | "=>" | "|>"
+    )
+}
+
+fn draining_has_trailing_pipeline_syntax(
+    tokens: &[&AstToken],
+    depths: &[i32],
+    draining: usize,
+) -> bool {
+    let Some(marker) = tokens.get(draining) else {
+        return false;
+    };
+    let marker_depth = depths.get(draining).copied().unwrap_or_default();
+    let Some(next) = tokens.get(draining + 1) else {
+        return false;
+    };
+    if next.line == marker.line {
+        return match next.lexeme.as_str() {
+            "," => marker_depth == 0,
+            ")" | "]" | "}" => false,
+            _ => true,
+        };
+    }
+    let next_depth = depths.get(draining + 1).copied().unwrap_or_default();
+    if matches!(next.lexeme.as_str(), ")" | "]" | "}") && next_depth <= marker_depth {
+        return false;
+    }
+    next.lexeme == "|>" && next_depth == marker_depth
 }
 
 fn validate_bytes_syntax(
@@ -2684,6 +2974,8 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
     matches!(
         lexeme,
         "SOURCE"
+            | "DRAIN"
+            | "DRAINING"
             | "HOLD"
             | "THEN"
             | "WHEN"
@@ -2943,9 +3235,7 @@ fn add_missing_row_scope_list_memories(
     }
 }
 
-fn function_body_index<'a>(
-    statements: &'a [AstStatement],
-) -> BTreeMap<&'a str, &'a [AstStatement]> {
+fn function_body_index(statements: &[AstStatement]) -> BTreeMap<&str, &[AstStatement]> {
     let mut functions = BTreeMap::new();
     collect_function_body_index(statements, &mut functions);
     functions
@@ -3051,6 +3341,7 @@ fn scope_names_nested_render_slot(scope: &[String]) -> bool {
         && scope.len() > 1
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_structure_from_statements(
     statements: &[AstStatement],
     expressions: &[AstExpr],
@@ -3286,6 +3577,7 @@ fn expr_id_contains_list_literal(expr_id: usize, expressions: &[AstExpr]) -> boo
     };
     match &expr.kind {
         AstExprKind::ListLiteral { .. } => true,
+        AstExprKind::Draining { input } => expr_id_contains_list_literal(*input, expressions),
         AstExprKind::Pipe { input, args, .. } => {
             expr_id_contains_list_literal(*input, expressions)
                 || args
@@ -3376,6 +3668,7 @@ fn sanitize_generated_list_name(value: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_structure_from_called_functions(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -3408,6 +3701,7 @@ fn derive_structure_from_called_functions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_structure_from_helper_function(
     function: &str,
     expressions: &[AstExpr],
@@ -3454,6 +3748,7 @@ fn derive_structure_from_helper_function(
     function_stack.pop();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_structure_from_called_functions_in_statements(
     statements: &[AstStatement],
     expressions: &[AstExpr],
@@ -3583,6 +3878,9 @@ fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut
                 collect_called_functions(arg.value, expressions, calls);
             }
         }
+        AstExprKind::Draining { input } => {
+            collect_called_functions(*input, expressions, calls);
+        }
         AstExprKind::Hold { initial, .. } | AstExprKind::When { input: initial } => {
             collect_called_functions(*initial, expressions, calls);
         }
@@ -3623,6 +3921,7 @@ fn collect_called_functions(expr_id: usize, expressions: &[AstExpr], calls: &mut
         }
         AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
@@ -3851,17 +4150,15 @@ fn collect_row_scope_statements(
             scope,
             previous_collection_list.as_deref(),
             include_append_constructors,
-        ) {
-            if !matches!(row_scope_function.list.as_str(), "items" | "children")
-                && list_memory_names.contains(&row_scope_function.list)
-                && !functions.iter().any(|existing| {
-                    existing.list == row_scope_function.list
-                        && existing.row_scope == row_scope_function.row_scope
-                        && existing.function == row_scope_function.function
-                })
-            {
-                push_row_scope_function(functions, row_scope_function, ast);
-            }
+        ) && !matches!(row_scope_function.list.as_str(), "items" | "children")
+            && list_memory_names.contains(&row_scope_function.list)
+            && !functions.iter().any(|existing| {
+                existing.list == row_scope_function.list
+                    && existing.row_scope == row_scope_function.row_scope
+                    && existing.function == row_scope_function.function
+            })
+        {
+            push_row_scope_function(functions, row_scope_function, ast);
         }
         let updates_collection_context = !matches!(
             &statement.kind,
@@ -4206,7 +4503,9 @@ fn collection_list_name(expr_id: usize, ast: &AstProgram) -> Option<String> {
     match &expr.kind {
         AstExprKind::Identifier(value) => Some(value.clone()),
         AstExprKind::Path(parts) => parts.last().cloned(),
-        AstExprKind::Pipe { input, .. } => collection_list_name(*input, ast),
+        AstExprKind::Pipe { input, .. } | AstExprKind::Draining { input } => {
+            collection_list_name(*input, ast)
+        }
         _ => None,
     }
 }
@@ -4239,6 +4538,9 @@ fn expr_returns_list_collection_inner(
         AstExprKind::ListLiteral { .. } => true,
         AstExprKind::Call { function, .. } => list_returning_operator(function),
         AstExprKind::Pipe { op, .. } => list_returning_operator(op),
+        AstExprKind::Draining { input } => {
+            expr_returns_list_collection_inner(*input, ast, list_names, allow_list_reference)
+        }
         AstExprKind::Then {
             output: Some(output),
             ..

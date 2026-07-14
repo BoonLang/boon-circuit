@@ -149,6 +149,19 @@ performance_thresholds = [
 ]
 
 [[example]]
+id = "todo_migration"
+label = "Todo Migration"
+source = "examples/migrations/todo/v1.bn"
+scenario = "examples/migrations/todo/migration.scn"
+budget = "examples/todomvc.budget.toml"
+category = "main"
+order = 21
+default_tab_order = 21
+shown_by_default = true
+application = { package_id = "dev.boon.example.todo-migration", deployment_domain = "builtin" }
+migration_sequence = "examples/migrations/todo/sequence.toml"
+
+[[example]]
 id = "todo_mvc_physical"
 label = "TodoMVC Physical"
 source = "examples/todo_mvc_physical/RUN.bn"
@@ -532,6 +545,19 @@ performance_thresholds = [
   "preview-interaction-p95-frame-ms <= 16.7",
   "preview-interaction-p99-frame-ms <= 25.0",
 ]
+
+[[example]]
+id = "counter_migration"
+label = "Counter Migration"
+source = "examples/migrations/counter/v1.bn"
+scenario = "examples/migrations/counter/migration.scn"
+budget = "examples/counter.budget.toml"
+category = "basic"
+order = 31
+default_tab_order = 31
+shown_by_default = true
+application = { package_id = "dev.boon.example.counter-migration", deployment_domain = "builtin" }
+migration_sequence = "examples/migrations/counter/sequence.toml"
 
 [[example]]
 id = "minimal"

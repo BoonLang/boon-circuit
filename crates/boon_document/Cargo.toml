@@ -10,3 +10,6 @@ boon_document_model.workspace = true
 boon_host.workspace = true
 serde.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

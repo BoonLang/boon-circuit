@@ -1,0 +1,20 @@
+initial_stage = "v1"
+scenario = "examples/migrations/counter/migration.scn"
+
+[[stage]]
+id = "v1"
+label = "Counter Migration V1"
+schema_version = 1
+source = "examples/migrations/counter/v1.bn"
+
+[[stage]]
+id = "v2"
+label = "Counter Migration V2"
+schema_version = 2
+source = "examples/migrations/counter/v2.bn"
+
+[[stage]]
+id = "v3"
+label = "Counter Migration V3"
+schema_version = 3
+source = "examples/migrations/counter/v3.bn"

@@ -1,6 +1,7 @@
 pub use boon_document_model::{
     Axis, ChangeBatch, DocumentFrame, DocumentNode, DocumentNodeId, DocumentNodeKind,
     DocumentPatch, LayoutStylePatch, MaterialStylePatch, MaterializedRange, PaintStylePatch, Rect,
+    SENSITIVE_INPUT_REDACTED_GLYPHS, SENSITIVE_INPUT_REDACTED_VALUE, SENSITIVE_INPUT_STYLE_KEY,
     ScrollRootId, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch, StyleRichTextSpan,
     StyleValue, TextStylePatch, TextValue, UiSemanticChange,
 };
@@ -576,7 +577,12 @@ fn semantic_node_from_document_node(
     } else {
         semantic_role_for_document_kind(&node.kind)
     };
+    let sensitive = node.is_sensitive_text_input();
     let mut actions = semantic_actions_for_node(&node.kind, source_intent.as_deref());
+    if sensitive {
+        actions.set_text = false;
+        actions.sensitive_input = true;
+    }
     if link {
         actions.focus = true;
         actions.press = true;
@@ -601,6 +607,7 @@ fn semantic_node_from_document_node(
             checked,
             disabled: semantic_style_bool(&node.style, "disabled").unwrap_or(false),
             selected: semantic_style_bool(&node.style, "selected").unwrap_or(false),
+            sensitive,
         },
         actions,
         relations: SemanticRelations {
@@ -662,6 +669,7 @@ fn semantic_actions_for_node(
         press: matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox)
             || press_intent,
         set_text: matches!(kind, DocumentNodeKind::TextInput),
+        sensitive_input: false,
         increment: false,
         decrement: false,
     }
@@ -678,8 +686,16 @@ fn semantic_name_for_node(node: &DocumentNode, item: Option<&DisplayItem>) -> Op
             "placeholder",
         ],
     )
-    .or_else(|| node.text.as_ref().map(|text| text.text.clone()))
-    .or_else(|| item.and_then(|item| item.text.clone()))
+    .or_else(|| {
+        (!node.is_sensitive_text_input())
+            .then(|| node.text.as_ref().map(|text| text.text.clone()))
+            .flatten()
+    })
+    .or_else(|| {
+        (!node.is_sensitive_text_input())
+            .then(|| item.and_then(|item| item.text.clone()))
+            .flatten()
+    })
 }
 
 fn semantic_value_for_node(
@@ -689,6 +705,11 @@ fn semantic_value_for_node(
     match node.kind {
         DocumentNodeKind::Checkbox => {
             semantic_style_bool(&node.style, "checked").map(|value| SemanticValue::Bool { value })
+        }
+        DocumentNodeKind::TextInput if node.is_sensitive_text_input() => {
+            Some(SemanticValue::Text {
+                text: SENSITIVE_INPUT_REDACTED_VALUE.to_owned(),
+            })
         }
         DocumentNodeKind::TextInput => node
             .text
@@ -1137,6 +1158,9 @@ impl SemanticDomNode {
             attributes.insert("data-boon-action-set-text".to_owned(), "true".to_owned());
             attributes.insert("data-boon-ime-endpoint".to_owned(), "true".to_owned());
         }
+        if node.actions.sensitive_input || node.state.sensitive {
+            attributes.insert("data-boon-sensitive-input".to_owned(), "true".to_owned());
+        }
         if node.actions.increment {
             attributes.insert("data-boon-action-increment".to_owned(), "true".to_owned());
         }
@@ -1169,7 +1193,10 @@ impl SemanticDomNode {
             role,
             attributes,
             text,
-            focus_proxy: focused || node.state.focused || node.actions.set_text,
+            focus_proxy: focused
+                || node.state.focused
+                || node.actions.set_text
+                || node.actions.sensitive_input,
             source_binding_id: node.source_binding_id.clone(),
         }
     }
@@ -1184,7 +1211,7 @@ impl SemanticDomNode {
             push_html_attr(html, name, value);
         }
         if self.tag == "input" {
-            html.push_str(">");
+            html.push('>');
             return;
         }
         html.push('>');
@@ -1226,7 +1253,14 @@ fn semantic_dom_shape(
             ("input".to_owned(), None, None)
         }
         SemanticRole::TextInput => {
-            attributes.insert("type".to_owned(), "text".to_owned());
+            attributes.insert(
+                "type".to_owned(),
+                if node.state.sensitive {
+                    "password".to_owned()
+                } else {
+                    "text".to_owned()
+                },
+            );
             if let Some(text) = semantic_text_value(node) {
                 attributes.insert("value".to_owned(), text);
             }
@@ -1784,6 +1818,9 @@ pub enum PatchApplyError {
         reference_kind: &'static str,
         id: DocumentNodeId,
     },
+    SensitiveTextOwnedByHost {
+        id: DocumentNodeId,
+    },
     UnsupportedTrustedNonstructuralPatch {
         patch_kind: &'static str,
     },
@@ -1841,6 +1878,11 @@ impl fmt::Display for PatchApplyError {
             Self::StaleReference { reference_kind, id } => {
                 write!(f, "{reference_kind} references stale node `{}`", id.0)
             }
+            Self::SensitiveTextOwnedByHost { id } => write!(
+                f,
+                "sensitive text input `{}` must keep its editable value in the host-owned buffer",
+                id.0
+            ),
             Self::UnsupportedTrustedNonstructuralPatch { patch_kind } => write!(
                 f,
                 "{patch_kind} cannot be applied through trusted nonstructural document patching"
@@ -2037,27 +2079,27 @@ impl DocumentInternIndex {
 
     fn update_node(&mut self, node: &DocumentNode, hot_ref: DocumentHotNodeRef) {
         let text = node
-            .text
-            .as_ref()
+            .artifact_text()
             .map(|text| self.texts.intern(text.text.clone()));
+        let artifact_style = node.artifact_style();
         let layout_style = self.layout_styles.intern(stable_style_intern_key(
-            &node.style,
+            artifact_style.as_ref(),
             StyleHashCategory::Layout,
         ));
         let paint_style = self.paint_styles.intern(stable_style_intern_key(
-            &node.style,
+            artifact_style.as_ref(),
             StyleHashCategory::Paint,
         ));
         let text_style = self.text_styles.intern(stable_style_intern_key(
-            &node.style,
+            artifact_style.as_ref(),
             StyleHashCategory::Font,
         ));
         let material = self.materials.intern(stable_style_intern_key(
-            &node.style,
+            artifact_style.as_ref(),
             StyleHashCategory::Material,
         ));
         let clip = self.clips.intern(stable_style_intern_key(
-            &node.style,
+            artifact_style.as_ref(),
             StyleHashCategory::Clip,
         ));
         let source_bindings = node
@@ -2350,23 +2392,23 @@ impl DocumentRetainedLayoutCache {
         let mut refreshed = Vec::new();
         let mut patch = DocumentRetainedLayoutPatch::default();
         for (id, measured_entry) in measured.entries {
-            if delta.reused.iter().any(|entry| entry.id == id) {
-                if let Some(previous_entry) = self.entries.get(&id) {
-                    patch
-                        .operations
-                        .push(DocumentRetainedLayoutPatchOperation::ReuseGeometry {
-                            node: measured_entry.node,
-                        });
-                    cache.entries.insert(
-                        id,
-                        DocumentRetainedLayoutCacheEntry {
-                            node: measured_entry.node,
-                            key: measured_entry.key,
-                            geometry: previous_entry.geometry.clone(),
-                        },
-                    );
-                    continue;
-                }
+            if delta.reused.iter().any(|entry| entry.id == id)
+                && let Some(previous_entry) = self.entries.get(&id)
+            {
+                patch
+                    .operations
+                    .push(DocumentRetainedLayoutPatchOperation::ReuseGeometry {
+                        node: measured_entry.node,
+                    });
+                cache.entries.insert(
+                    id,
+                    DocumentRetainedLayoutCacheEntry {
+                        node: measured_entry.node,
+                        key: measured_entry.key,
+                        geometry: previous_entry.geometry.clone(),
+                    },
+                );
+                continue;
             }
             let reasons = delta
                 .dirty
@@ -2580,18 +2622,9 @@ impl DocumentTypedStyleIndex {
                         reference_kind: "hot_id_table",
                         id: node_id.clone(),
                     })?;
-            index.records.insert(
-                node_ref.id,
-                DocumentTypedStyleRecord {
-                    node: node_ref,
-                    identity: computed_style_identity(&node.style),
-                    layout: typed_layout_style(&node.style),
-                    paint: typed_paint_style(&node.style),
-                    text: typed_text_style(&node.style),
-                    material: typed_material_style(&node.style),
-                    pseudo: typed_pseudo_style(&node.style),
-                },
-            );
+            index
+                .records
+                .insert(node_ref.id, typed_style_record_for_node(node_ref, node));
         }
         Ok(index)
     }
@@ -2603,22 +2636,28 @@ impl DocumentTypedStyleIndex {
         hot_ref: DocumentHotNodeRef,
     ) {
         let _ = node_id;
-        self.records.insert(
-            hot_ref.id,
-            DocumentTypedStyleRecord {
-                node: hot_ref,
-                identity: computed_style_identity(&node.style),
-                layout: typed_layout_style(&node.style),
-                paint: typed_paint_style(&node.style),
-                text: typed_text_style(&node.style),
-                material: typed_material_style(&node.style),
-                pseudo: typed_pseudo_style(&node.style),
-            },
-        );
+        self.records
+            .insert(hot_ref.id, typed_style_record_for_node(hot_ref, node));
     }
 
     pub fn record(&self, id: DocumentHotNodeId) -> Option<&DocumentTypedStyleRecord> {
         self.records.get(&id)
+    }
+}
+
+fn typed_style_record_for_node(
+    node_ref: DocumentHotNodeRef,
+    node: &DocumentNode,
+) -> DocumentTypedStyleRecord {
+    let style = node.artifact_style();
+    DocumentTypedStyleRecord {
+        node: node_ref,
+        identity: computed_style_identity(style.as_ref()),
+        layout: typed_layout_style(style.as_ref()),
+        paint: typed_paint_style(style.as_ref()),
+        text: typed_text_style(style.as_ref()),
+        material: typed_material_style(style.as_ref()),
+        pseudo: typed_pseudo_style(style.as_ref()),
     }
 }
 
@@ -3451,11 +3490,12 @@ impl RetainedDocument {
                 .filter(|(key, _)| key.starts_with("__clip_"))
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect::<StyleMap>();
+            let focused = self.focused.as_ref() == Some(&item.node);
             item.kind = node.kind.clone();
-            item.text = node.text.as_ref().map(|text| text.text.clone());
-            item.style = node.style.clone();
+            item.text = node.presentation_text(focused);
+            item.style = node.artifact_style().into_owned();
             item.style.extend(clip);
-            item.focused = self.focused.as_ref() == Some(&item.node);
+            item.focused = focused;
             if self.hovered.as_ref() == Some(&item.node) {
                 item.style
                     .insert("__hover".to_owned(), StyleValue::Bool(true));
@@ -4083,6 +4123,9 @@ fn apply_document_patch_unchecked(
         }
         DocumentPatch::SetText { id, text } => {
             let node = required_node_mut(frame, "set_text", &id)?;
+            if node.is_sensitive_text_input() && !text.text.is_empty() {
+                return Err(PatchApplyError::SensitiveTextOwnedByHost { id });
+            }
             node.text = Some(text);
             Ok(PatchApplyReport {
                 patch_kind: "set_text",
@@ -4101,6 +4144,9 @@ fn apply_document_patch_unchecked(
         }
         DocumentPatch::SetStyle { id, patch } => {
             let node = required_node_mut(frame, "set_style", &id)?;
+            let mut candidate = node.clone();
+            apply_style_patch(&mut candidate.style, patch.clone());
+            validate_sensitive_node_boundary(&candidate)?;
             let changed_keys = apply_style_patch(&mut node.style, patch);
             let invalidation = style_patch_invalidation(&changed_keys);
             Ok(PatchApplyReport {
@@ -4281,6 +4327,7 @@ fn required_node_mut<'a>(
 }
 
 fn apply_upsert_node(frame: &mut DocumentFrame, node: DocumentNode) -> Result<(), PatchApplyError> {
+    validate_sensitive_node_boundary(&node)?;
     let id = node.id.clone();
     if id == frame.root && node.parent.is_some() {
         return Err(PatchApplyError::InvalidParentChildLink {
@@ -4559,6 +4606,7 @@ fn validate_frame_integrity(frame: &DocumentFrame) -> Result<(), PatchApplyError
         });
     }
     for node in frame.nodes.values() {
+        validate_sensitive_node_boundary(node)?;
         validate_child_refs(frame, node)?;
         if node.id != frame.root {
             let Some(parent) = node.parent.as_ref() else {
@@ -4589,6 +4637,17 @@ fn validate_frame_integrity(frame: &DocumentFrame) -> Result<(), PatchApplyError
         return Err(PatchApplyError::StaleReference {
             reference_kind: "focus",
             id: focus.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sensitive_node_boundary(node: &DocumentNode) -> Result<(), PatchApplyError> {
+    if node.is_sensitive_text_input()
+        && node.text.as_ref().is_some_and(|text| !text.text.is_empty())
+    {
+        return Err(PatchApplyError::SensitiveTextOwnedByHost {
+            id: node.id.clone(),
         });
     }
     Ok(())
@@ -4876,7 +4935,7 @@ impl LayoutBuilder<'_, '_> {
         let padding = layout_edges(&node.style, typed_layout.as_ref(), "padding");
         let font_size = layout_spacing(&node.style, typed_layout.as_ref(), "size").unwrap_or(14.0);
         let auto_padding = layout_spacing(&node.style, typed_layout.as_ref(), "auto_padding")
-            .unwrap_or_else(|| font_size * 0.9);
+            .unwrap_or(font_size * 0.9);
         Some((label + auto_padding + padding.horizontal()).max(1.0))
     }
 
@@ -4934,7 +4993,8 @@ impl LayoutBuilder<'_, '_> {
             layout_dimension(&node.style, typed_layout, "width", available_width).or(box_size);
         let explicit_height =
             layout_dimension(&node.style, typed_layout, "height", available_height).or(box_size);
-        let text = node.text.as_ref().map(|value| value.text.clone());
+        let focused = self.document.focus.as_ref() == Some(&node.id);
+        let text = node.presentation_text(focused);
         let measurement_text = text
             .as_deref()
             .filter(|value| !value.is_empty())
@@ -4972,7 +5032,7 @@ impl LayoutBuilder<'_, '_> {
             );
         let mut width = if auto_width {
             let auto_padding = layout_spacing(&node.style, typed_layout, "auto_padding")
-                .unwrap_or_else(|| font_size * 0.9);
+                .unwrap_or(font_size * 0.9);
             (measured.width + auto_padding + padding.horizontal()).max(1.0)
         } else if shrink_to_child_width {
             padding.horizontal().max(1.0)
@@ -5015,12 +5075,15 @@ impl LayoutBuilder<'_, '_> {
             "height",
             available_height,
         );
-        let mut style_identity = typed_record
-            .as_ref()
-            .map(|record| record.identity)
-            .unwrap_or_else(|| computed_style_identity(&node.style));
-        let mut display_style = node.style.clone();
-        let focused = self.document.focus.as_ref() == Some(&node.id);
+        let mut display_style = node.artifact_style().into_owned();
+        let mut style_identity = if node.is_sensitive_text_input() {
+            computed_style_identity(&display_style)
+        } else {
+            typed_record
+                .as_ref()
+                .map(|record| record.identity)
+                .unwrap_or_else(|| computed_style_identity(&node.style))
+        };
         if focused {
             display_style.insert("__focused".to_owned(), StyleValue::Bool(true));
             style_identity = computed_style_identity(&display_style);
@@ -5573,10 +5636,10 @@ fn layout_edges(
     typed_layout: Option<&DocumentTypedLayoutStyle>,
     prefix: &str,
 ) -> EdgeSpacing {
-    if prefix == "padding" {
-        if let Some(typed_layout) = typed_layout {
-            return typed_edge_spacing_to_layout(typed_layout.padding);
-        }
+    if prefix == "padding"
+        && let Some(typed_layout) = typed_layout
+    {
+        return typed_edge_spacing_to_layout(typed_layout.padding);
     }
     style_edges(style, prefix)
 }
@@ -5818,8 +5881,8 @@ fn preferred_row_child_width_with_typed(
     };
     let font_size = layout_spacing(&node.style, typed_layout, "size").unwrap_or(14.0);
     if layout_dimension_is_auto(&node.style, typed_layout, "width") {
-        let auto_padding = layout_spacing(&node.style, typed_layout, "auto_padding")
-            .unwrap_or_else(|| font_size * 0.9);
+        let auto_padding =
+            layout_spacing(&node.style, typed_layout, "auto_padding").unwrap_or(font_size * 0.9);
         let measured_width = row_child_measurement_text(node, typed_layout)
             .map(|value| text.measure_styled(value, font_size, &node.style).width)
             .unwrap_or(0.0);
@@ -5845,16 +5908,23 @@ fn row_child_measurement_text<'a>(
     node: &'a DocumentNode,
     typed_layout: Option<&'a DocumentTypedLayoutStyle>,
 ) -> Option<&'a str> {
-    node.text
-        .as_ref()
-        .map(|value| value.text.as_str())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            matches!(node.kind, DocumentNodeKind::TextInput)
-                .then(|| layout_text(&node.style, typed_layout, "placeholder"))
-                .flatten()
-                .filter(|value| !value.is_empty())
-        })
+    let text = if node.is_sensitive_text_input() {
+        node.text
+            .as_ref()
+            .is_some_and(|value| !value.text.is_empty())
+            .then_some(SENSITIVE_INPUT_REDACTED_GLYPHS)
+    } else {
+        node.text
+            .as_ref()
+            .map(|value| value.text.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    text.or_else(|| {
+        matches!(node.kind, DocumentNodeKind::TextInput)
+            .then(|| layout_text(&node.style, typed_layout, "placeholder"))
+            .flatten()
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn constrain_layout_dimension(

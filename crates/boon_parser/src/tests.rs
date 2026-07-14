@@ -1,6 +1,94 @@
 use super::*;
 
 #[test]
+fn then_preserves_transactional_file_write_as_its_output_expression() {
+    let program = parse_source(
+        "file-write-effect.bn",
+        include_str!("../../../examples/bytes_file_write_effect.bn"),
+    )
+    .unwrap();
+    let then_output = program
+        .ast
+        .expressions
+        .iter()
+        .find_map(|expression| match expression.kind {
+            AstExprKind::Then {
+                output: Some(output),
+                ..
+            } => program
+                .ast
+                .expressions
+                .iter()
+                .find(|candidate| candidate.id == output),
+            _ => None,
+        })
+        .expect("THEN output expression");
+
+    assert!(
+        matches!(
+            &then_output.kind,
+            AstExprKind::Call { function, .. } if function == "File/write_bytes"
+        ),
+        "unexpected THEN output: {:?}",
+        then_output.kind
+    );
+}
+
+#[test]
+fn multiline_control_flow_expression_graph_is_acyclic() {
+    let ast = parse_ast(
+        "todo-migration-v4.bn",
+        include_str!("../../../examples/migrations/todo/v4.bn"),
+    )
+    .unwrap();
+    let mut state = vec![0u8; ast.expressions.len()];
+    let mut stack = Vec::new();
+    for expression in &ast.expressions {
+        visit_expression(expression.id, &ast.expressions, &mut state, &mut stack);
+    }
+}
+
+fn visit_expression(id: usize, expressions: &[AstExpr], state: &mut [u8], stack: &mut Vec<usize>) {
+    match state[id] {
+        2 => return,
+        1 => panic!("expression graph cycle: {stack:?} -> {id}"),
+        _ => {}
+    }
+    state[id] = 1;
+    stack.push(id);
+    for child in expression_children(&expressions[id].kind) {
+        visit_expression(child, expressions, state, stack);
+    }
+    stack.pop();
+    state[id] = 2;
+}
+
+fn expression_children(kind: &AstExprKind) -> Vec<usize> {
+    match kind {
+        AstExprKind::Call { args, .. } => args.iter().map(|arg| arg.value).collect(),
+        AstExprKind::Pipe { input, args, .. } => std::iter::once(*input)
+            .chain(args.iter().map(|arg| arg.value))
+            .collect(),
+        AstExprKind::Draining { input } | AstExprKind::When { input } => vec![*input],
+        AstExprKind::Hold { initial, .. } => vec![*initial],
+        AstExprKind::Then { input, output } => std::iter::once(*input)
+            .chain(output.iter().copied())
+            .collect(),
+        AstExprKind::Infix { left, right, .. } => vec![*left, *right],
+        AstExprKind::MatchArm { output, .. } => output.iter().copied().collect(),
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            fields.iter().map(|field| field.value).collect()
+        }
+        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => {
+            items.clone()
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[test]
 fn timer_intervals_are_typed_as_scheduled_source_ports() {
     let program = parse_source(
         "timer-sources.bn",
@@ -1344,6 +1432,141 @@ items |> List/map(item, new: new_item(item: item))
 "#;
     let err = parse_source("examples/todomvc.bn", source).unwrap_err();
     assert!(err.message.contains("central reducer"));
+}
+
+#[test]
+fn parses_structured_drain_paths_and_terminal_draining_forms() {
+    let program = parse_source(
+        "drain-syntax.bn",
+        r#"
+old_count: 0 |> HOLD count { LATEST {} } |> DRAINING
+old_text:
+    TEXT { old }
+    |> HOLD text { LATEST {} }
+    |> DRAINING
+count: DRAIN { old_count }
+theme: DRAIN { settings.theme }
+passed_theme:
+    DRAIN {
+        PASSED.store.settings.theme
+    }
+    |> Text/to_uppercase()
+"#,
+    )
+    .unwrap();
+
+    let drain_paths = program
+        .expressions
+        .iter()
+        .filter_map(|expr| match &expr.kind {
+            AstExprKind::Drain { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        drain_paths,
+        [
+            AstDrainPath::Binding {
+                name: "old_count".to_owned(),
+            },
+            AstDrainPath::Field {
+                binding: "settings".to_owned(),
+                fields: vec!["theme".to_owned()],
+            },
+            AstDrainPath::Passed {
+                fields: vec![
+                    "store".to_owned(),
+                    "settings".to_owned(),
+                    "theme".to_owned(),
+                ],
+            },
+        ]
+    );
+    assert_eq!(
+        program
+            .expressions
+            .iter()
+            .filter(|expr| matches!(expr.kind, AstExprKind::Draining { .. }))
+            .count(),
+        2
+    );
+    assert!(!program.expressions.iter().any(|expr| {
+        matches!(&expr.kind, AstExprKind::Call { function, .. } if function == "DRAIN")
+            || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "DRAINING")
+    }));
+
+    parse_source(
+        "drain-keywords-in-text.bn",
+        "note: TEXT { DRAIN { old() } |> DRAINING }\n",
+    )
+    .expect("drain keywords inside text literal content must not be parsed as syntax");
+}
+
+#[test]
+fn rejects_non_path_drain_bodies_with_deterministic_errors() {
+    for body in [
+        "",
+        "old()",
+        "old + 1",
+        "42",
+        "True",
+        "\"old\"",
+        "old[index]",
+        "old, newer",
+        "PASSED",
+        "old |> Number/to_text()",
+    ] {
+        let source = format!("value: DRAIN {{ {body} }}\n");
+        let error = parse_source("bad-drain.bn", source).unwrap_err();
+        assert_eq!(
+            error.message,
+            "`DRAIN` body must contain exactly one named binding, field path, or `PASSED` path at line 1, column 8",
+            "unexpected diagnostic for `{body}`"
+        );
+    }
+
+    let missing_body = parse_source("bad-drain.bn", "value: DRAIN old\n").unwrap_err();
+    assert_eq!(
+        missing_body.message,
+        "`DRAIN` requires a `{ path }` body at line 1, column 8"
+    );
+    let missing_close = parse_source("bad-drain.bn", "value: DRAIN { old\n").unwrap_err();
+    assert_eq!(
+        missing_close.message,
+        "`DRAIN` is missing closing `}` at line 1, column 8"
+    );
+}
+
+#[test]
+fn rejects_invalid_and_nonterminal_draining_placement() {
+    for source in [
+        "value: DRAINING\n",
+        "|> DRAINING\n",
+        "value:\n    |> DRAINING\n",
+    ] {
+        let error = parse_source("bad-draining.bn", source).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("`DRAINING` must be used as terminal `input |> DRAINING` syntax"),
+            "unexpected diagnostic: {error}"
+        );
+    }
+
+    for source in [
+        "value: 1 |> DRAINING |> Number/to_text()\n",
+        "value: 1 |> DRAINING()\n",
+        "value: 1 |> DRAINING + 1\n",
+        "value:\n    1\n    |> DRAINING\n    |> Number/to_text()\n",
+    ] {
+        let error = parse_source("bad-draining.bn", source).unwrap_err();
+        assert!(
+            error
+                .message
+                .starts_with("`DRAINING` must be terminal in its pipeline"),
+            "unexpected diagnostic: {error}"
+        );
+    }
 }
 
 fn find_statement(

@@ -1,4 +1,7 @@
-use crate::protocol::{AssetBlob, CatalogItem, SourceUnit, TestStep};
+use crate::protocol::{
+    ApplicationIdentity, AssetBlob, CatalogItem, MigrationBundle, MigrationStage, SourceUnit,
+    TestStep,
+};
 use boon_runtime::{ExampleManifestEntry, RuntimeResult};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -8,9 +11,11 @@ use std::{fs, path::PathBuf};
 pub struct LoadedExample {
     pub id: String,
     pub label: String,
+    pub application: ApplicationIdentity,
     pub units: Vec<SourceUnit>,
     pub test_steps: Vec<TestStep>,
     pub assets: Vec<AssetBlob>,
+    pub migration: Option<MigrationBundle>,
 }
 
 pub struct Catalog {
@@ -74,48 +79,33 @@ impl Catalog {
             .iter()
             .find(|entry| entry.id == id)
             .ok_or_else(|| format!("example manifest has no entry `{id}`"))?;
-        let units = boon_runtime::source_units_for_entry(entry)?
-            .into_iter()
-            .map(|unit| SourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect();
-        let test_steps = boon_runtime::parse_scenario(Path::new(&entry.scenario))?
-            .steps
-            .into_iter()
-            .filter_map(|step| {
-                step.user_action_kind
-                    .zip(step.source_event)
-                    .map(|(action_kind, event)| {
-                        (
-                            Some(action_kind),
-                            step.user_action_text,
-                            step.user_action_key,
-                            event,
-                        )
-                    })
-            })
-            .map(|(action_kind, action_text, action_key, event)| {
-                let pointer_x = payload_field_text(&event.payload, "pointer_x");
-                let pointer_y = payload_field_text(&event.payload, "pointer_y");
-                let pointer_width = payload_field_text(&event.payload, "pointer_width");
-                let pointer_height = payload_field_text(&event.payload, "pointer_height");
-                TestStep {
-                    source_path: event.source,
-                    action_kind,
-                    target_text: event.target_text,
-                    text: action_text,
-                    key: action_key,
-                    address: event.payload.address,
-                    target_occurrence: event.target_occurrence.map(|value| value as u64),
-                    pointer_x,
-                    pointer_y,
-                    pointer_width,
-                    pointer_height,
-                }
-            })
-            .collect();
+        let migration = boon_runtime::migration_sequence_for_entry(entry)?
+            .map(|(sequence, scenario)| load_migration_bundle(sequence, scenario))
+            .transpose()?;
+        let units = match migration.as_ref() {
+            Some(migration) => migration
+                .initial()
+                .ok_or_else(|| {
+                    format!(
+                        "migration initial stage `{}` is absent after validation",
+                        migration.initial_stage
+                    )
+                })?
+                .units
+                .clone(),
+            None => boon_runtime::source_units_for_entry(entry)?
+                .into_iter()
+                .map(|unit| SourceUnit {
+                    path: unit.path,
+                    source: unit.source,
+                })
+                .collect(),
+        };
+        let test_steps = if migration.is_some() {
+            Vec::new()
+        } else {
+            ordinary_test_steps(&entry.scenario)?
+        };
         let mut assets = entry
             .asset_files
             .iter()
@@ -128,11 +118,99 @@ impl Catalog {
         Ok(LoadedExample {
             id: entry.id.clone(),
             label: entry.label.clone(),
+            application: built_in_application_identity(entry),
             units,
             test_steps,
             assets,
+            migration,
         })
     }
+}
+
+fn load_migration_bundle(
+    sequence: boon_runtime::MigrationSequence,
+    scenario: boon_runtime::MigrationScenario,
+) -> RuntimeResult<MigrationBundle> {
+    let stages = sequence
+        .stages
+        .iter()
+        .map(|stage| {
+            let units = boon_compiler::compiler_source_units_for_manifest_source(
+                &stage.source,
+                &stage.source_files,
+            )?
+            .into_iter()
+            .map(|unit| SourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect();
+            Ok(MigrationStage {
+                id: stage.id.clone(),
+                label: stage.label.clone(),
+                schema_version: stage.schema_version,
+                source: stage.source.clone(),
+                source_files: stage.source_files.clone(),
+                units,
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    Ok(MigrationBundle {
+        initial_stage: sequence.initial_stage,
+        scenario_path: sequence.scenario,
+        stages,
+        scenario,
+    })
+}
+
+fn ordinary_test_steps(path: &str) -> RuntimeResult<Vec<TestStep>> {
+    Ok(boon_runtime::parse_scenario(Path::new(path))?
+        .steps
+        .into_iter()
+        .filter_map(|step| {
+            step.user_action_kind
+                .zip(step.source_event)
+                .map(|(action_kind, event)| {
+                    (
+                        Some(action_kind),
+                        step.user_action_text,
+                        step.user_action_key,
+                        event,
+                    )
+                })
+        })
+        .map(|(action_kind, action_text, action_key, event)| {
+            let pointer_x = payload_field_text(&event.payload, "pointer_x");
+            let pointer_y = payload_field_text(&event.payload, "pointer_y");
+            let pointer_width = payload_field_text(&event.payload, "pointer_width");
+            let pointer_height = payload_field_text(&event.payload, "pointer_height");
+            TestStep {
+                source_path: event.source,
+                action_kind,
+                target_text: event.target_text,
+                text: action_text,
+                key: action_key,
+                address: event.payload.address,
+                target_occurrence: event.target_occurrence.map(|value| value as u64),
+                pointer_x,
+                pointer_y,
+                pointer_width,
+                pointer_height,
+            }
+        })
+        .collect())
+}
+
+fn built_in_application_identity(entry: &ExampleManifestEntry) -> ApplicationIdentity {
+    let explicit = entry.application_identity();
+    ApplicationIdentity::new(
+        explicit.as_ref().map_or_else(
+            || format!("dev.boon.example.{}", entry.id),
+            |value| value.package_id.clone(),
+        ),
+        format!("builtin:example:{}", entry.id),
+        explicit.map_or_else(|| "builtin".to_owned(), |value| value.deployment_domain),
+    )
 }
 
 fn load_asset_directory(example_id: &str, directory: &str) -> RuntimeResult<Vec<AssetBlob>> {
@@ -221,6 +299,38 @@ mod tests {
         assert!(example.units.iter().all(|unit| !unit.path.is_empty()));
         assert!(example.units.iter().all(|unit| !unit.source.is_empty()));
         assert!(!example.test_steps.is_empty());
+        assert_eq!(
+            example.application.state_namespace,
+            "builtin:example:counter"
+        );
+
+        let counter_again = catalog.open(id).expect("counter sources again");
+        assert_eq!(counter_again.application, example.application);
+
+        let migration = catalog
+            .open("counter_migration")
+            .expect("counter migration sources");
+        assert_eq!(
+            migration.application.package_id,
+            "dev.boon.example.counter-migration"
+        );
+        assert_eq!(
+            migration.application.state_namespace,
+            "builtin:example:counter_migration"
+        );
+        let migration_bundle = migration
+            .migration
+            .as_ref()
+            .expect("typed migration metadata");
+        assert_eq!(migration_bundle.initial_stage, "v1");
+        assert_eq!(migration_bundle.stages.len(), 3);
+        assert!(!migration_bundle.scenario.steps.is_empty());
+        assert_eq!(
+            migration.units,
+            migration_bundle.initial().expect("initial stage").units,
+            "opening a migration example must use its declared initial stage"
+        );
+        assert!(migration.test_steps.is_empty());
 
         let novywave = catalog.open("novywave").expect("NovyWave sources");
         assert!(

@@ -1,6 +1,8 @@
 use super::*;
 use boon_plan::*;
+use std::collections::BTreeMap;
 
+#[allow(clippy::too_many_arguments)]
 fn plan(
     demand: RootOutputDemand,
     constants: Vec<PlanConstant>,
@@ -12,9 +14,92 @@ fn plan(
     list_labels: Vec<(ListId, &str)>,
     field_labels: Vec<(FieldId, &str)>,
 ) -> MachinePlan {
+    let application = ApplicationPlan::new(ApplicationIdentity::new(
+        "dev.boon.plan-executor-tests",
+        "test",
+        "local",
+    ))
+    .unwrap();
+    let state_label_map = state_labels.iter().copied().collect::<BTreeMap<_, _>>();
+    let list_label_map = list_labels.iter().copied().collect::<BTreeMap<_, _>>();
+    let field_label_map = field_labels.iter().copied().collect::<BTreeMap<_, _>>();
+    let memory = scalar_slots
+        .iter()
+        .map(|slot| {
+            let path = state_label_map
+                .get(&slot.state_id)
+                .copied()
+                .unwrap_or("state");
+            MemoryPlan::new(
+                slot.id,
+                if slot.indexed {
+                    MemoryKind::IndexedField
+                } else {
+                    MemoryKind::Scalar
+                },
+                path,
+                test_data_type(slot.value_type),
+                InitialProvenance::ReconstructableDefault,
+                MemoryOwnerPath {
+                    canonical_module: "tests".to_owned(),
+                    named_owner_path: path
+                        .rsplit_once('.')
+                        .map(|(owner, _)| owner)
+                        .unwrap_or("root")
+                        .to_owned(),
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    let lists = list_slots
+        .iter()
+        .map(|slot| {
+            let path = list_label_map.get(&slot.list_id).copied().unwrap_or("list");
+            let owner = MemoryOwnerPath {
+                canonical_module: "tests".to_owned(),
+                named_owner_path: "root".to_owned(),
+            };
+            let memory_id = MemoryId::from_identity(&owner, path, MemoryKind::List).unwrap();
+            let row_fields = slot
+                .row_field_ids
+                .iter()
+                .map(|field| {
+                    MemoryLeafPlan::new(
+                        memory_id,
+                        Some(*field),
+                        field_label_map.get(field).copied().unwrap_or("field"),
+                        DataTypePlan::Unknown,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            ListMemoryPlan::new(
+                slot.id,
+                path,
+                DataTypePlan::List {
+                    item: Box::new(DataTypePlan::Record {
+                        fields: Vec::new(),
+                        open: true,
+                    }),
+                },
+                InitialProvenance::ReconstructableDefault,
+                owner,
+                slot.hidden_key_type.clone(),
+                slot.has_generation,
+                row_fields,
+            )
+            .unwrap()
+        })
+        .collect();
+    let persistence = PersistencePlan::new(&application, 1, memory, lists, Vec::new()).unwrap();
     MachinePlan {
         version: PlanVersion::default(),
         target_profile: TargetProfile::SoftwareDefault,
+        application,
+        persistence,
+        effects: Vec::new(),
+        outputs: Vec::new(),
         demand: DemandPlan {
             root_derived_outputs: demand,
         },
@@ -89,6 +174,22 @@ fn plan(
     }
 }
 
+fn test_data_type(value_type: PlanValueType) -> DataTypePlan {
+    match value_type {
+        PlanValueType::Text => DataTypePlan::Text,
+        PlanValueType::Number => DataTypePlan::Number,
+        PlanValueType::Byte => DataTypePlan::Byte,
+        PlanValueType::Bool => DataTypePlan::Bool,
+        PlanValueType::Bytes { fixed_len } => DataTypePlan::Bytes { fixed_len },
+        PlanValueType::Enum => DataTypePlan::Variant {
+            variants: Vec::new(),
+        },
+        PlanValueType::RootInitialField
+        | PlanValueType::RowInitialField
+        | PlanValueType::Unknown => DataTypePlan::Unknown,
+    }
+}
+
 fn constant(id: usize, value: PlanConstantValue) -> PlanConstant {
     PlanConstant {
         id: PlanConstantId(id),
@@ -157,6 +258,7 @@ fn const_update(id: usize, source: usize, state: usize, constant: usize) -> Plan
             source_payload_field: None,
             update_constant_id: Some(PlanConstantId(constant)),
             source_guard: None,
+            effect: None,
         },
         inputs: vec![ValueRef::Source(SourceId(source))],
         output: Some(ValueRef::State(StateId(state))),
@@ -172,6 +274,118 @@ fn event(sequence: u64, source: usize, target: Option<RowId>) -> SourceEvent {
         target,
         payload: SourcePayload::default(),
     }
+}
+
+#[test]
+fn authority_restore_preserves_touched_value_equal_to_old_default() {
+    let make_plan = |default: i64| {
+        plan(
+            RootOutputDemand::Selected(Vec::new()),
+            vec![
+                constant(0, PlanConstantValue::Number { value: default }),
+                constant(1, PlanConstantValue::Number { value: 0 }),
+            ],
+            vec![route(0, None)],
+            vec![number_slot(0, 0)],
+            Vec::new(),
+            vec![const_update(0, 0, 0, 1)],
+            vec![(StateId(0), "count")],
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+
+    let mut original = Session::new(make_plan(0), SessionOptions::default()).unwrap();
+    let turn = original.apply(event(1, 0, None)).unwrap();
+    assert!(turn.deltas.is_empty());
+    assert_eq!(
+        turn.authority_deltas,
+        vec![AuthorityDelta::SetRoot {
+            state: StateId(0),
+            value: Value::Number(0),
+        }]
+    );
+    let authority = original.authority_snapshot().unwrap();
+    assert!(authority.states[&StateId(0)].touched);
+    assert_eq!(authority.through_turn_sequence, 1);
+
+    let durable = original
+        .durable_restore_image(7, Default::default())
+        .unwrap();
+    assert_eq!(durable.epoch, 7);
+    assert_eq!(durable.scalars.len(), 1);
+
+    let restored = SessionBuilder::new(make_plan(10), SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(
+        restored.authority_snapshot().unwrap().states[&StateId(0)].value,
+        Value::Number(0)
+    );
+}
+
+#[test]
+fn failed_turn_rolls_back_authority_and_touch_provenance() {
+    let machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        vec![
+            constant(0, PlanConstantValue::Number { value: 1 }),
+            constant(1, PlanConstantValue::Number { value: 2 }),
+        ],
+        vec![route(0, None)],
+        vec![number_slot(0, 0), number_slot(1, 0)],
+        Vec::new(),
+        vec![const_update(0, 0, 0, 1), const_update(1, 0, 1, 99)],
+        vec![(StateId(0), "first"), (StateId(1), "second")],
+        Vec::new(),
+        Vec::new(),
+    );
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let before = session.authority_snapshot().unwrap();
+
+    assert!(session.apply(event(1, 0, None)).is_err());
+    assert_eq!(session.authority_snapshot().unwrap(), before);
+}
+
+#[test]
+fn unsettled_turn_can_rollback_authority_sequence_and_durable_delta() {
+    let machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        vec![
+            constant(0, PlanConstantValue::Number { value: 1 }),
+            constant(1, PlanConstantValue::Number { value: 2 }),
+        ],
+        vec![route(0, None)],
+        vec![number_slot(0, 0)],
+        Vec::new(),
+        vec![const_update(0, 0, 0, 1)],
+        vec![(StateId(0), "count")],
+        Vec::new(),
+        Vec::new(),
+    );
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let before = session.authority_snapshot().unwrap();
+
+    let turn = session.apply(event(1, 0, None)).unwrap();
+    assert_eq!(turn.durable_changes.len(), 1);
+    assert_eq!(
+        session.authority_snapshot().unwrap().through_turn_sequence,
+        1
+    );
+
+    session.rollback_unsettled_turn().unwrap();
+    assert_eq!(session.authority_snapshot().unwrap(), before);
+
+    let retried = session.apply(event(1, 0, None)).unwrap();
+    assert_eq!(retried.durable_changes, turn.durable_changes);
+    session.settle_turn();
+    assert_eq!(
+        session.authority_snapshot().unwrap().through_turn_sequence,
+        1
+    );
 }
 
 #[test]
@@ -509,6 +723,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
             source_payload_field: None,
             update_constant_id: Some(PlanConstantId(0)),
             source_guard: None,
+            effect: None,
         },
         inputs: vec![ValueRef::Source(SourceId(0))],
         output: Some(ValueRef::State(StateId(0))),
@@ -740,6 +955,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
             source_payload_field: None,
             update_constant_id: None,
             source_guard: None,
+            effect: None,
         },
         inputs: vec![
             ValueRef::Source(SourceId(0)),
@@ -1221,6 +1437,7 @@ fn source_transform_keeps_precommit_state_for_the_event_turn() {
             source_payload_field: None,
             update_constant_id: Some(PlanConstantId(1)),
             source_guard: None,
+            effect: None,
         },
         inputs: vec![ValueRef::Source(SourceId(0))],
         output: Some(ValueRef::State(StateId(0))),
@@ -1318,6 +1535,7 @@ fn same_turn_recompute_does_not_suppress_later_invalidation() {
             source_payload_field: None,
             update_constant_id: None,
             source_guard: None,
+            effect: None,
         },
         inputs: vec![ValueRef::Source(SourceId(0)), ValueRef::Field(FieldId(1))],
         output: Some(ValueRef::State(StateId(state))),
@@ -1522,6 +1740,191 @@ fn remove_then_append_allocates_a_new_row_identity() {
 }
 
 #[test]
+fn authority_restore_preserves_an_explicitly_emptied_list_and_allocator() {
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_field_ids: vec![FieldId(0)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![PlanInitialListRow {
+            fields: vec![PlanInitialListField {
+                name: "value".into(),
+                field_id: Some(FieldId(0)),
+                value: PlanConstantValue::Text {
+                    value: "default".into(),
+                },
+            }],
+        }],
+    };
+    let remove = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::ListOperation {
+            operation_kind: PlanListOperationKind::Remove,
+            append: None,
+            remove: Some(PlanListRemove {
+                source: ValueRef::Source(SourceId(0)),
+                predicate: PlanListRemovePredicate::AlwaysTrue,
+            }),
+            retain: None,
+            count: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0))],
+        output: Some(ValueRef::List(ListId(0))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        Vec::new(),
+        vec![route(0, Some(0))],
+        Vec::new(),
+        vec![list],
+        vec![remove],
+        Vec::new(),
+        vec![(ListId(0), "items")],
+        vec![(FieldId(0), "items.value")],
+    );
+    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let original = session.list_row_at(ListId(0), 0).unwrap();
+    session.apply(event(1, 0, Some(original))).unwrap();
+    let authority = session.authority_snapshot().unwrap();
+    assert!(authority.lists[&ListId(0)].touched);
+    assert!(authority.lists[&ListId(0)].rows.is_empty());
+    assert_eq!(authority.lists[&ListId(0)].next_key, 2);
+    let durable = session
+        .durable_restore_image(3, Default::default())
+        .unwrap();
+    assert_eq!(durable.lists.len(), 1);
+    assert!(durable.lists.values().next().unwrap().rows.is_empty());
+
+    let restored = SessionBuilder::new(machine, SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(restored.list_rows(ListId(0)).is_empty());
+    assert_eq!(
+        restored.authority_snapshot().unwrap().lists[&ListId(0)].next_key,
+        2
+    );
+}
+
+#[test]
+fn indexed_override_does_not_materialize_the_whole_default_list() {
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_field_ids: vec![FieldId(0)],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: (0..2)
+            .map(|_| PlanInitialListRow {
+                fields: vec![PlanInitialListField {
+                    name: "formula".into(),
+                    field_id: Some(FieldId(0)),
+                    value: PlanConstantValue::Text {
+                        value: "default".into(),
+                    },
+                }],
+            })
+            .collect(),
+    };
+    let indexed = ScalarStorageSlot {
+        id: PlanStorageId(1),
+        state_id: StateId(0),
+        value_type: PlanValueType::Text,
+        scope_id: Some(ScopeId(0)),
+        indexed: true,
+        initial_value_kind: InitialValueKind::Text,
+        initial_constant_id: Some(PlanConstantId(0)),
+        initial_root_field_path: None,
+        initial_row_field_path: None,
+        initial_row_expression: None,
+    };
+    let update = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::Const,
+            ordered_inputs: Vec::new(),
+            source_payload_field: None,
+            update_constant_id: Some(PlanConstantId(1)),
+            source_guard: None,
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        vec![
+            constant(
+                0,
+                PlanConstantValue::Text {
+                    value: "default".into(),
+                },
+            ),
+            constant(
+                1,
+                PlanConstantValue::Text {
+                    value: "=A1+1".into(),
+                },
+            ),
+        ],
+        vec![route(0, Some(0))],
+        vec![indexed],
+        vec![list],
+        vec![update],
+        vec![(StateId(0), "formula")],
+        vec![(ListId(0), "cells")],
+        vec![(FieldId(0), "cells.formula")],
+    );
+    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let selected = session.list_row_at(ListId(0), 1).unwrap();
+    let turn = session.apply(event(1, 0, Some(selected))).unwrap();
+    assert!(matches!(
+        turn.authority_deltas.as_slice(),
+        [AuthorityDelta::SetRowField { row, .. }] if *row == selected
+    ));
+    let durable = session
+        .durable_restore_image(1, Default::default())
+        .unwrap();
+    let stored = durable.lists.values().next().unwrap();
+    assert!(!stored.touched);
+    assert_eq!(stored.next_key, 0);
+    assert_eq!(stored.rows.len(), 1);
+    assert_eq!(stored.rows[0].key, selected.key);
+
+    let restored = SessionBuilder::new(machine, SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable)
+        .unwrap()
+        .build()
+        .unwrap();
+    let snapshot = restored.snapshot().unwrap();
+    assert_eq!(snapshot.lists[&ListId(0)].len(), 2);
+    assert_eq!(
+        snapshot.lists[&ListId(0)][0].fields[&FieldId(0)],
+        Value::Text("default".into())
+    );
+    assert_eq!(
+        snapshot.lists[&ListId(0)][1].fields[&FieldId(0)],
+        Value::Text("=A1+1".into())
+    );
+}
+
+#[test]
 fn non_monotonic_source_sequences_are_rejected() {
     let mut session = Session::new(
         plan(
@@ -1543,4 +1946,86 @@ fn non_monotonic_source_sequences_are_rejected() {
         session.apply(event(1, 0, None)),
         Err(Error::InvalidEvent(_))
     ));
+}
+
+#[test]
+fn durable_variants_round_trip_tag_only_and_structured_values() {
+    assert_eq!(
+        crate::session::runtime_value(boon_persistence::StoredValue::Variant {
+            tag: "Done".to_owned(),
+            fields: BTreeMap::new(),
+        })
+        .unwrap(),
+        Value::Text("Done".to_owned())
+    );
+
+    let runtime = Value::Record(BTreeMap::from([
+        ("$tag".to_owned(), Value::Text("Ready".to_owned())),
+        ("count".to_owned(), Value::Number(4)),
+    ]));
+    let stored = crate::session::stored_value(&runtime).unwrap();
+    assert!(matches!(
+        &stored,
+        boon_persistence::StoredValue::Variant { tag, fields }
+            if tag == "Ready" && fields["count"] == boon_persistence::StoredValue::Number(4)
+    ));
+    assert_eq!(crate::session::runtime_value(stored).unwrap(), runtime);
+}
+
+#[test]
+fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "server-outputs.bn",
+        include_str!("../../../examples/server_outputs.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(compiled.plan.document.is_none());
+    let response_field = match &compiled.plan.output_root("api_response").unwrap().value {
+        OutputValueRef::RuntimeValue {
+            value: ValueRef::Field(field),
+        } => *field,
+        other => panic!("unexpected response output ref: {other:?}"),
+    };
+    let source = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.request_received")
+        .unwrap()
+        .source_id;
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    assert_eq!(
+        session.output_value_current("api_response").unwrap(),
+        Value::Record(BTreeMap::from([
+            ("body".to_owned(), Value::Text("accepted".to_owned())),
+            ("request_count".to_owned(), Value::Number(0)),
+            ("status".to_owned(), Value::Number(200)),
+        ]))
+    );
+    assert_eq!(
+        session.output_value_current("pending_priorities").unwrap(),
+        Value::List(vec![Value::Number(1), Value::Number(2)])
+    );
+
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    assert!(
+        !turn
+            .metrics
+            .recomputed_targets
+            .contains(&ValueTarget::Field(response_field)),
+        "host-demanded output must stay lazy during the source turn"
+    );
+    let Value::Record(response) = session.output_value_current("api_response").unwrap() else {
+        panic!("response output must remain a record");
+    };
+    assert_eq!(response["request_count"], Value::Number(1));
 }

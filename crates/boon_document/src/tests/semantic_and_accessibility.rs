@@ -127,7 +127,10 @@ fn semantic_scene_derives_stable_roles_bounds_actions_and_patch() {
         .get(&SemanticId("semantic:docs".to_owned()))
         .expect("link semantic node should exist");
     assert_eq!(link_semantic.role, SemanticRole::Link);
-    assert_eq!(link_semantic.href.as_deref(), Some("https://example.com/docs"));
+    assert_eq!(
+        link_semantic.href.as_deref(),
+        Some("https://example.com/docs")
+    );
     assert!(link_semantic.actions.press);
 
     let mut next = scene.clone();
@@ -156,12 +159,13 @@ fn semantic_scene_derives_stable_roles_bounds_actions_and_patch() {
     )));
 }
 
-
 #[test]
 fn semantic_dom_snapshot_exposes_minimal_web_semantics_not_visual_dom() {
-    let mut scene = SemanticScene::default();
-    scene.root = Some(SemanticId("semantic:root".to_owned()));
-    scene.focused = Some(SemanticId("semantic:filter".to_owned()));
+    let mut scene = SemanticScene {
+        root: Some(SemanticId("semantic:root".to_owned())),
+        focused: Some(SemanticId("semantic:filter".to_owned())),
+        ..SemanticScene::default()
+    };
     scene.nodes.insert(
         SemanticId("semantic:root".to_owned()),
         SemanticNode {
@@ -197,6 +201,7 @@ fn semantic_dom_snapshot_exposes_minimal_web_semantics_not_visual_dom() {
                 focus: true,
                 press: true,
                 set_text: false,
+                sensitive_input: false,
                 increment: false,
                 decrement: false,
             },
@@ -227,6 +232,7 @@ fn semantic_dom_snapshot_exposes_minimal_web_semantics_not_visual_dom() {
                 focus: true,
                 press: true,
                 set_text: false,
+                sensitive_input: false,
                 increment: false,
                 decrement: false,
             },
@@ -259,6 +265,7 @@ fn semantic_dom_snapshot_exposes_minimal_web_semantics_not_visual_dom() {
                 focus: true,
                 press: false,
                 set_text: true,
+                sensitive_input: false,
                 increment: false,
                 decrement: false,
             },
@@ -297,12 +304,13 @@ fn semantic_dom_snapshot_exposes_minimal_web_semantics_not_visual_dom() {
     assert!(!html.contains("<svg"));
 }
 
-
 #[test]
 fn semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom() {
-    let mut scene = SemanticScene::default();
-    scene.root = Some(SemanticId("semantic:root".to_owned()));
-    scene.focused = Some(SemanticId("semantic:filter".to_owned()));
+    let mut scene = SemanticScene {
+        root: Some(SemanticId("semantic:root".to_owned())),
+        focused: Some(SemanticId("semantic:filter".to_owned())),
+        ..SemanticScene::default()
+    };
     scene.nodes.insert(
         SemanticId("semantic:filter".to_owned()),
         SemanticNode {
@@ -322,6 +330,7 @@ fn semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom() {
                 focus: true,
                 press: false,
                 set_text: true,
+                sensitive_input: false,
                 increment: false,
                 decrement: false,
             },
@@ -349,6 +358,7 @@ fn semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom() {
                 focus: true,
                 press: true,
                 set_text: false,
+                sensitive_input: false,
                 increment: false,
                 decrement: false,
             },
@@ -376,6 +386,7 @@ fn semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom() {
                 focus: true,
                 press: false,
                 set_text: false,
+                sensitive_input: false,
                 increment: true,
                 decrement: false,
             },
@@ -403,6 +414,7 @@ fn semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom() {
                 focus: true,
                 press: false,
                 set_text: false,
+                sensitive_input: false,
                 increment: false,
                 decrement: true,
             },
@@ -481,7 +493,6 @@ fn semantic_web_bridge_maps_ime_events_to_source_dispatch_without_visual_dom() {
     assert_eq!(decrement_dispatch.text, None);
 }
 
-
 #[test]
 fn document_batch_accepts_ui_semantic_change_batch() {
     let mut state = DocumentState::new("root");
@@ -535,7 +546,6 @@ fn document_batch_accepts_ui_semantic_change_batch() {
             .contains(&PatchInvalidationClass::Style)
     );
 }
-
 
 #[test]
 fn document_batch_set_binding_at_updates_canonical_ordinal_only() {
@@ -604,7 +614,6 @@ fn document_batch_set_binding_at_updates_canonical_ordinal_only() {
     );
 }
 
-
 #[test]
 fn document_batch_ui_semantic_typed_style_preserves_typed_patch_kinds() {
     let mut state = DocumentState::new("root");
@@ -668,7 +677,6 @@ fn document_batch_ui_semantic_typed_style_preserves_typed_patch_kinds() {
         Some(&StyleValue::Text("#fff".to_owned()))
     );
 }
-
 
 #[test]
 fn typed_style_index_extracts_known_hot_style_properties() {
@@ -785,7 +793,6 @@ fn typed_style_index_extracts_known_hot_style_properties() {
     ));
 }
 
-
 #[test]
 fn checkbox_size_wins_over_accessibility_label_text() {
     let mut frame = DocumentFrame::empty("root");
@@ -828,4 +835,131 @@ fn checkbox_size_wins_over_accessibility_label_text() {
 
     assert_eq!(checkbox.bounds.width, 40.0);
     assert_eq!(checkbox.bounds.height, 40.0);
+}
+
+#[test]
+fn sensitive_document_plaintext_is_redacted_in_artifacts_and_rejected_as_state() {
+    const SENTINEL: &str = "document-SENTINEL-5d7a13";
+    let mut frame = DocumentFrame::empty("root");
+    let mut input = node("password", DocumentNodeKind::TextInput, Some("root"));
+    input.text = Some(TextValue {
+        text: SENTINEL.to_owned(),
+    });
+    input
+        .style
+        .insert(SENSITIVE_INPUT_STYLE_KEY.to_owned(), StyleValue::Bool(true));
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(input.id.clone());
+    frame.nodes.insert(input.id.clone(), input);
+
+    let serialized = toml::to_string(&frame).unwrap();
+    let debug = format!("{frame:?}");
+    for artifact in [&serialized, &debug] {
+        assert!(!artifact.contains(SENTINEL));
+        assert!(!artifact.contains("5d7a13"));
+        assert!(artifact.contains(SENSITIVE_INPUT_REDACTED_VALUE));
+    }
+    assert!(matches!(
+        DocumentState::from_frame(frame),
+        Err(PatchApplyError::SensitiveTextOwnedByHost { .. })
+    ));
+}
+
+#[test]
+fn sensitive_semantics_and_render_scene_use_fixed_redaction_without_text_dispatch() {
+    const SENTINEL: &str = "semantic-SENTINEL-3c9e40";
+    let mut frame = DocumentFrame::empty("root");
+    let mut input = node("password", DocumentNodeKind::TextInput, Some("root"));
+    input.text = Some(TextValue {
+        text: String::new(),
+    });
+    input
+        .style
+        .insert(SENSITIVE_INPUT_STYLE_KEY.to_owned(), StyleValue::Bool(true));
+    input.set_primary_source_binding(boon_document_model::SourceBinding {
+        id: SourceBindingId("source:password".to_owned()),
+        source_path: "login.password".to_owned(),
+        intent: "change".to_owned(),
+    });
+    frame.focus = Some(input.id.clone());
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(input.id.clone());
+    frame.nodes.insert(input.id.clone(), input);
+
+    let mut text = SimpleTextMeasurer;
+    let layout = layout(LayoutInput {
+        document: &frame,
+        viewport: Viewport {
+            surface: 1,
+            width: 320.0,
+            height: 80.0,
+            scale: 1.0,
+        },
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    });
+    let item = layout
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "password")
+        .unwrap();
+    assert_eq!(item.text.as_deref(), Some(SENSITIVE_INPUT_REDACTED_GLYPHS));
+
+    let semantics = semantic_scene_from_document_layout(&frame, &layout);
+    let semantic = &semantics.nodes[&SemanticId("semantic:password".to_owned())];
+    assert!(semantic.state.sensitive);
+    assert!(semantic.actions.sensitive_input);
+    assert!(!semantic.actions.set_text);
+    assert_eq!(
+        semantic.value,
+        Some(SemanticValue::Text {
+            text: SENSITIVE_INPUT_REDACTED_VALUE.to_owned(),
+        })
+    );
+    let bridge = SemanticWebBridgeSnapshot::from_scene(&semantics);
+    assert!(bridge.ime_endpoints.is_empty());
+    assert!(
+        !bridge
+            .action_routes
+            .iter()
+            .any(|route| route.action == SemanticWebAction::SetText)
+    );
+    assert!(bridge.to_html_fragment().contains("type=\"password\""));
+    assert!(
+        bridge
+            .source_dispatch_for_event(SemanticWebInputEvent::SetText {
+                semantic_id: semantic.id.clone(),
+                text: SENTINEL.to_owned(),
+            })
+            .is_none()
+    );
+
+    let indexes = DocumentDerivedIndexBundle::from_frame(&frame).unwrap();
+    let mut columns = render_scene::ApproximateTextColumnMeasurer;
+    let scene = indexes
+        .try_render_scene(&layout, 320, 80, &mut columns)
+        .unwrap();
+    assert!(
+        scene
+            .text_runs
+            .iter()
+            .any(|run| run.node.0 == "password" && run.text == SENSITIVE_INPUT_REDACTED_GLYPHS)
+    );
+    for artifact in [
+        toml::to_string(&layout).unwrap(),
+        toml::to_string(&semantics).unwrap(),
+        toml::to_string(&bridge).unwrap(),
+        toml::to_string(&scene).unwrap(),
+    ] {
+        assert!(!artifact.contains(SENTINEL));
+        assert!(!artifact.contains("3c9e40"));
+    }
 }

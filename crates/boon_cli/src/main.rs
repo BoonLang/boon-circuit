@@ -66,9 +66,16 @@ fn check_source(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let compiled = compile_source_path_to_machine_plan(Path::new(source), target)?;
     let verification = verify_plan(&compiled.plan)?;
     if verification.status != "pass" {
+        let failed = verification
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .map(|check| format!("{}: {}", check.id, check.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
         return Err(format!(
-            "MachinePlan verification failed with {} error(s)",
-            verification.error_count
+            "MachinePlan verification failed with {} error(s): {failed}",
+            verification.error_count,
         )
         .into());
     }

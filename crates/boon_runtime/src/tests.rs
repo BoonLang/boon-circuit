@@ -261,6 +261,85 @@ fn counter_mount_and_update_are_complete_typed_document_patches() {
 }
 
 #[test]
+fn unsettled_runtime_turn_rolls_back_authority_document_and_sequence() {
+    let mut runtime = LiveRuntime::from_source(
+        "examples/counter.bn",
+        include_str!("../../../examples/counter.bn"),
+    )
+    .unwrap();
+    let original_frame = runtime.document_frame().cloned().unwrap();
+    let event = runtime
+        .source_event(
+            1,
+            "store.sources.increment_button.press",
+            None,
+            SourcePayload::default(),
+        )
+        .unwrap();
+
+    let prepared = runtime.dispatch_unsettled(event.clone()).unwrap();
+    assert!(!prepared.durable_changes.is_empty());
+    assert_eq!(
+        runtime.root_value_current("store.count").unwrap(),
+        Value::Number(1)
+    );
+
+    runtime.rollback_unsettled_turn().unwrap();
+    assert_eq!(
+        runtime.root_value_current("store.count").unwrap(),
+        Value::Number(0)
+    );
+    assert_eq!(runtime.document_frame(), Some(&original_frame));
+
+    runtime.dispatch(event).unwrap();
+    assert_eq!(
+        runtime.root_value_current("store.count").unwrap(),
+        Value::Number(1)
+    );
+}
+
+#[test]
+fn unsettled_structural_turn_swaps_back_list_and_document_without_cloning_runtime() {
+    let mut runtime = runtime_for_path("../../examples/todomvc.bn");
+    let change = runtime
+        .source_event(
+            1,
+            "store.sources.new_todo_input.change",
+            None,
+            SourcePayload {
+                text: Some("Transactional todo".into()),
+                ..SourcePayload::default()
+            },
+        )
+        .unwrap();
+    runtime.dispatch(change).unwrap();
+    let original_frame = runtime.document_frame().cloned().unwrap();
+    let original_snapshot = runtime.snapshot().unwrap();
+    let submit = runtime
+        .source_event(
+            2,
+            "store.sources.new_todo_input.key_down",
+            None,
+            SourcePayload {
+                key: Some("Enter".into()),
+                ..SourcePayload::default()
+            },
+        )
+        .unwrap();
+
+    let prepared = runtime.dispatch_unsettled(submit.clone()).unwrap();
+    assert!(!prepared.durable_changes.is_empty());
+    assert_ne!(runtime.document_frame(), Some(&original_frame));
+
+    runtime.rollback_unsettled_turn().unwrap();
+    assert_eq!(runtime.snapshot().unwrap(), original_snapshot);
+    assert_eq!(runtime.document_frame(), Some(&original_frame));
+
+    runtime.dispatch(submit).unwrap();
+    assert_ne!(runtime.document_frame(), Some(&original_frame));
+}
+
+#[test]
 fn source_pipeline_binds_the_declared_widget_event_slot() {
     let runtime = LiveRuntime::from_source(
         "source-pipeline.bn",
@@ -774,6 +853,24 @@ fn cells_commit_with_unchanged_display_emits_no_redundant_patch() {
         "{:#?}",
         turn.document_patches
     );
+    assert!(
+        turn.durable_changes.iter().all(|change| matches!(
+            change,
+            DurableChange::SetRowField { .. } | DurableChange::SetScalar { .. }
+        )),
+        "Cells edit emitted structural persistence: {:#?}",
+        turn.durable_changes
+    );
+    let durable = runtime.durable_restore_image(1, BTreeSet::new()).unwrap();
+    let persisted_rows = durable
+        .lists
+        .values()
+        .map(|list| {
+            assert!(!list.touched, "Cells edit persisted full list structure");
+            list.rows.len()
+        })
+        .sum::<usize>();
+    assert_eq!(persisted_rows, 1, "{durable:#?}");
 }
 
 #[test]
@@ -1045,4 +1142,110 @@ fn runtime_plan_cache_is_keyed_by_source_content() {
         second.compile.expression_count
     );
     assert!(second.cache_hit);
+}
+
+#[test]
+fn runtime_source_cache_is_partitioned_by_application_identity() {
+    let source = include_str!("../../../examples/counter.bn");
+    let first_identity =
+        ApplicationIdentity::new("dev.boon.runtime-cache", "first", "runtime-test");
+    let second_identity =
+        ApplicationIdentity::new("dev.boon.runtime-cache", "second", "runtime-test");
+
+    let (first, _) = LiveRuntime::from_source_profiled_with_identity(
+        "identity-first.bn",
+        source,
+        first_identity.clone(),
+    )
+    .unwrap();
+    let (second, second_profile) = LiveRuntime::from_source_profiled_with_identity(
+        "identity-second.bn",
+        source,
+        second_identity.clone(),
+    )
+    .unwrap();
+    let (_, first_again_profile) = LiveRuntime::from_source_profiled_with_identity(
+        "identity-first-again.bn",
+        source,
+        first_identity.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(first.machine_plan().application.identity, first_identity);
+    assert_eq!(second.machine_plan().application.identity, second_identity);
+    assert!(!second_profile.cache_hit);
+    assert!(first_again_profile.cache_hit);
+}
+
+#[test]
+fn runtime_source_units_preserve_identity_and_partition_the_cache() {
+    let source = include_str!("../../../examples/counter.bn");
+    let units = [RuntimeSourceUnit {
+        path: "counter-unit.bn".to_owned(),
+        source: source.to_owned(),
+    }];
+    let first_identity =
+        ApplicationIdentity::new("dev.boon.runtime-units", "first", "runtime-test");
+    let second_identity =
+        ApplicationIdentity::new("dev.boon.runtime-units", "second", "runtime-test");
+
+    let first =
+        LiveRuntime::from_project_with_identity("counter-project", &units, first_identity.clone())
+            .unwrap();
+    let (second, second_profile) = LiveRuntime::from_project_profiled_with_identity(
+        "counter-project",
+        &units,
+        second_identity.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(first.machine_plan().application.identity, first_identity);
+    assert_eq!(second.machine_plan().application.identity, second_identity);
+    assert!(!second_profile.cache_hit);
+}
+
+#[test]
+fn durable_restore_settles_before_initial_document_materialization() {
+    let identity = ApplicationIdentity::new("dev.boon.runtime-restore", "counter", "runtime-test");
+    let mut runtime = LiveRuntime::from_source_with_identity(
+        "counter-restore.bn",
+        include_str!("../../../examples/counter.bn"),
+        identity.clone(),
+    )
+    .unwrap();
+    let plan = runtime.shared_machine_plan();
+    let increment = runtime
+        .source_event(
+            1,
+            "store.sources.increment_button.press",
+            None,
+            SourcePayload::default(),
+        )
+        .unwrap();
+    let turn = runtime.dispatch(increment).unwrap();
+    assert!(!turn.authority_deltas.is_empty());
+
+    let image = runtime.durable_restore_image(7, BTreeSet::new()).unwrap();
+    assert_eq!(image.application, identity);
+    assert_eq!(image.epoch, 7);
+
+    let mut restored = LiveRuntime::from_shared_machine_plan_with_restore(
+        plan,
+        SessionOptions::default(),
+        Some(image),
+    )
+    .unwrap();
+
+    assert_eq!(
+        restored.root_value_current("store.count").unwrap(),
+        Value::Number(1)
+    );
+    assert!(
+        restored
+            .document_frame()
+            .unwrap()
+            .nodes
+            .values()
+            .any(|node| node.text.as_ref().is_some_and(|text| text.text == "1"))
+    );
 }

@@ -2,18 +2,27 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use boon_runtime::{LiveRuntime, RuntimeSourceUnit, RuntimeTurn};
+use boon_compiler::{
+    CompilerSourceUnit, compile_runtime_source_units_to_machine_plan_with_persistence_catalog,
+};
+use boon_plan::{
+    DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, TargetProfile,
+};
+use boon_runtime::ApplicationIdentity;
 use futures::channel::mpsc;
 
-use crate::protocol::{PreviewIntent, SourceUnit, TestStep};
+use crate::protocol::{MigrationBundle, PreviewIntent, SourceUnit, TestStep};
 
 #[derive(Clone)]
 pub struct CompileRequest {
     pub intent: PreviewIntent,
     pub request_id: Option<u64>,
+    pub application: ApplicationIdentity,
     pub revision: u64,
     pub units: Vec<SourceUnit>,
     pub test_steps: Vec<TestStep>,
+    pub migration: Option<MigrationBundle>,
+    pub migration_stage: Option<String>,
 }
 
 pub struct CompiledPreview {
@@ -22,8 +31,7 @@ pub struct CompiledPreview {
     pub revision: u64,
     pub elapsed: Duration,
     pub source_key: String,
-    pub runtime: LiveRuntime,
-    pub mount: RuntimeTurn,
+    pub plan: Arc<MachinePlan>,
     pub test_steps: Vec<TestStep>,
 }
 
@@ -119,32 +127,108 @@ fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
         return Err("preview source bundle is empty".to_owned());
     }
     let started = Instant::now();
-    let source_key = source_key(&request.units);
+    let source_key = project_key_for_stage(
+        &request.application,
+        &request.units,
+        request.migration_stage.as_deref(),
+    );
     let label = request
         .units
         .last()
         .map(|unit| unit.path.clone())
         .unwrap_or_else(|| "preview.bn".to_owned());
-    let units = request
-        .units
-        .into_iter()
-        .map(|unit| RuntimeSourceUnit {
-            path: unit.path,
-            source: unit.source,
-        })
-        .collect::<Vec<_>>();
-    let runtime = LiveRuntime::from_project(&label, &units).map_err(|error| error.to_string())?;
-    let mount = runtime.mount();
+    let plan = match (&request.migration, request.migration_stage.as_deref()) {
+        (Some(migration), Some(stage_id)) => compile_migration_stage_with_units(
+            &request.application,
+            migration,
+            stage_id,
+            Some(&request.units),
+        )?,
+        (None, None) => {
+            let units = compiler_units(&request.units);
+            Arc::new(
+                compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
+                    &label,
+                    &units,
+                    TargetProfile::SoftwareDefault,
+                    request.application,
+                    DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+                    &[] as &[MigrationPredecessorBinding],
+                )
+                .map_err(|error| error.to_string())?
+                .plan,
+            )
+        }
+        _ => {
+            return Err(
+                "migration source compile requires both a bundle and an active stage".to_owned(),
+            );
+        }
+    };
     Ok(CompiledPreview {
         intent: request.intent,
         request_id: request.request_id,
         revision: request.revision,
         elapsed: started.elapsed(),
         source_key,
-        runtime,
-        mount,
+        plan,
         test_steps: request.test_steps,
     })
+}
+
+pub fn compile_migration_stage(
+    application: &ApplicationIdentity,
+    migration: &MigrationBundle,
+    target_stage: &str,
+) -> Result<Arc<MachinePlan>, String> {
+    compile_migration_stage_with_units(application, migration, target_stage, None)
+}
+
+fn compile_migration_stage_with_units(
+    application: &ApplicationIdentity,
+    migration: &MigrationBundle,
+    target_stage: &str,
+    target_units: Option<&[SourceUnit]>,
+) -> Result<Arc<MachinePlan>, String> {
+    if migration.stage(target_stage).is_none() {
+        return Err(format!("migration stage `{target_stage}` is absent"));
+    }
+    let mut predecessor = None::<MigrationPredecessorBinding>;
+    for stage in &migration.stages {
+        let units = compiler_units(if stage.id == target_stage {
+            target_units.unwrap_or(&stage.units)
+        } else {
+            &stage.units
+        });
+        let predecessors = predecessor.as_slice();
+        let plan = Arc::new(
+            compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
+                &stage.source,
+                &units,
+                TargetProfile::SoftwareDefault,
+                application.clone(),
+                stage.schema_version,
+                predecessors,
+            )
+            .map_err(|error| format!("migration stage `{}` failed to compile: {error}", stage.id))?
+            .plan,
+        );
+        if stage.id == target_stage {
+            return Ok(plan);
+        }
+        predecessor = Some(MigrationPredecessorBinding::from_machine_plan(&plan));
+    }
+    Err(format!("migration stage `{target_stage}` is absent"))
+}
+
+fn compiler_units(units: &[SourceUnit]) -> Vec<CompilerSourceUnit> {
+    units
+        .iter()
+        .map(|unit| CompilerSourceUnit {
+            path: unit.path.clone(),
+            source: unit.source.clone(),
+        })
+        .collect()
 }
 
 pub fn source_key(units: &[SourceUnit]) -> String {
@@ -156,8 +240,38 @@ pub fn source_key(units: &[SourceUnit]) -> String {
 }
 
 #[cfg(test)]
+pub fn project_key(application: &ApplicationIdentity, units: &[SourceUnit]) -> String {
+    project_key_for_stage(application, units, None)
+}
+
+pub fn project_key_for_stage(
+    application: &ApplicationIdentity,
+    units: &[SourceUnit],
+    migration_stage: Option<&str>,
+) -> String {
+    let source = source_key(units);
+    boon_runtime::source_unit_parts_hash(&[
+        ("application.package_id", application.package_id.as_str()),
+        (
+            "application.state_namespace",
+            application.state_namespace.as_str(),
+        ),
+        (
+            "application.deployment_domain",
+            application.deployment_domain.as_str(),
+        ),
+        ("migration.stage", migration_stage.unwrap_or_default()),
+        ("source", source.as_str()),
+    ])
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn application(namespace: &str) -> ApplicationIdentity {
+        ApplicationIdentity::new("dev.boon.test", namespace, "test")
+    }
 
     #[test]
     fn mailbox_is_depth_one_and_latest_wins() {
@@ -166,11 +280,50 @@ mod tests {
             worker.replace(CompileRequest {
                 intent: PreviewIntent::Replace,
                 request_id: None,
+                application: application(&format!("mailbox-{revision}")),
                 revision,
                 units: Vec::new(),
                 test_steps: Vec::new(),
+                migration: None,
+                migration_stage: None,
             });
         }
         assert!(worker.replaced_count() >= 1);
+    }
+
+    #[test]
+    fn project_key_partitions_identical_source_by_application_identity() {
+        let units = vec![SourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: "value: 1\n".to_owned(),
+        }];
+        assert_ne!(
+            project_key(&application("first"), &units),
+            project_key(&application("second"), &units)
+        );
+    }
+
+    #[test]
+    fn compile_installs_the_host_application_identity_in_the_machine_plan() {
+        let application = application("compile-propagation");
+        let compiled = compile(CompileRequest {
+            intent: PreviewIntent::Replace,
+            request_id: None,
+            application: application.clone(),
+            revision: 1,
+            units: vec![SourceUnit {
+                path: "examples/minimal.bn".to_owned(),
+                source: include_str!("../../../examples/minimal.bn").to_owned(),
+            }],
+            test_steps: Vec::new(),
+            migration: None,
+            migration_stage: None,
+        })
+        .expect("compile preview with host identity");
+        assert_eq!(compiled.plan.application.identity, application);
+        assert_eq!(
+            compiled.plan.persistence.schema_version,
+            DEFAULT_PERSISTENCE_SCHEMA_VERSION
+        );
     }
 }

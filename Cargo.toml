@@ -1,9 +1,11 @@
 [workspace]
 members = [
+    "crates/boon_example_manifest",
     "crates/boon_parser",
     "crates/boon_typecheck",
     "crates/boon_ir",
     "crates/boon_plan",
+    "crates/boon_persistence",
     "crates/boon_plan_executor",
     "crates/boon_compiler",
     "crates/boon_runtime",
@@ -25,10 +27,12 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
+boon_example_manifest = { path = "crates/boon_example_manifest" }
 boon_parser = { path = "crates/boon_parser" }
 boon_typecheck = { path = "crates/boon_typecheck" }
 boon_ir = { path = "crates/boon_ir" }
 boon_plan = { path = "crates/boon_plan" }
+boon_persistence = { path = "crates/boon_persistence" }
 boon_plan_executor = { path = "crates/boon_plan_executor" }
 boon_compiler = { path = "crates/boon_compiler" }
 boon_runtime = { path = "crates/boon_runtime" }
@@ -42,6 +46,7 @@ app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "6aec98
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
+web-time = "1.1.0"
 sha2 = "0.10"
 chumsky = "0.9"
 ena = "0.14"
@@ -51,7 +56,9 @@ ropey = "1.6"
 unicode-segmentation = "1.13"
 arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 image = { version = "0.24.9", default-features = false, features = ["jpeg", "png", "webp"] }
+minicbor = { version = "2.2.2", features = ["std"] }
 open = "5.3"
+redb = "4.1.0"
 resvg = { version = "0.47.0", default-features = false }
 wgpu = "=29.0.1"
 glyphon = "=0.11.0"

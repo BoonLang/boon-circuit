@@ -1,14 +1,20 @@
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::SourceUnit;
+use crate::protocol::{ApplicationIdentity, SourceUnit};
 
 const CUSTOM_ROOT: &str = "playground/custom_examples";
+const CUSTOM_PACKAGE_ID: &str = "dev.boon.playground.custom";
+const CUSTOM_DEPLOYMENT_DOMAIN: &str = "local";
+const CUSTOM_NAMESPACE_PREFIX: &str = "custom:";
+static CUSTOM_NAMESPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProjectOrigin {
@@ -30,6 +36,7 @@ pub struct StoredProject {
     pub id: String,
     pub label: String,
     pub origin: ProjectOrigin,
+    pub application: ApplicationIdentity,
     pub units: Vec<SourceUnit>,
 }
 
@@ -110,6 +117,8 @@ impl StoredProject {
 struct CustomManifest {
     id: String,
     label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    state_namespace: Option<String>,
     files: Vec<String>,
 }
 
@@ -158,6 +167,10 @@ impl ProjectStore {
             id: id.clone(),
             label: format!("Untitled {ordinal}"),
             origin: ProjectOrigin::Custom,
+            application: custom_application_identity(generate_state_namespace(
+                &self.repo_root,
+                &id,
+            )),
             units: vec![SourceUnit {
                 path: format!("{CUSTOM_ROOT}/{id}/RUN.bn"),
                 source: concat!(
@@ -182,11 +195,33 @@ impl ProjectStore {
                 "built-in project cannot be written to custom storage",
             ));
         }
+        validate_custom_application(&project.application)?;
         let directory = self.custom_root.join(&project.id);
         fs::create_dir_all(&directory)?;
-        let previous_files = fs::read_to_string(directory.join("example.toml"))
-            .ok()
-            .and_then(|manifest| toml::from_str::<CustomManifest>(&manifest).ok())
+        let manifest_path = directory.join("example.toml");
+        let previous_manifest = match fs::read_to_string(&manifest_path) {
+            Ok(manifest) => Some(
+                toml::from_str::<CustomManifest>(&manifest).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid custom example manifest: {error}"),
+                    )
+                })?,
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(previous_namespace) = previous_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.state_namespace.as_deref())
+            && previous_namespace != project.application.state_namespace
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom example state namespace is immutable",
+            ));
+        }
+        let previous_files = previous_manifest
             .map(|manifest| manifest.files)
             .unwrap_or_default();
         let mut files = Vec::with_capacity(project.units.len());
@@ -198,10 +233,11 @@ impl ProjectStore {
         let manifest = toml::to_string_pretty(&CustomManifest {
             id: project.id.clone(),
             label: project.label.clone(),
+            state_namespace: Some(project.application.state_namespace.clone()),
             files: files.clone(),
         })
         .map_err(io::Error::other)?;
-        atomic_write(&directory.join("example.toml"), manifest.as_bytes())?;
+        atomic_write(&manifest_path, manifest.as_bytes())?;
         for stale in previous_files
             .into_iter()
             .filter(|previous| !files.iter().any(|file| file == previous))
@@ -260,9 +296,9 @@ impl ProjectStore {
     }
 
     fn load_one(&self, directory: &Path) -> io::Result<StoredProject> {
-        let manifest: CustomManifest =
-            toml::from_str(&fs::read_to_string(directory.join("example.toml"))?)
-                .map_err(io::Error::other)?;
+        let manifest_path = directory.join("example.toml");
+        let mut manifest: CustomManifest =
+            toml::from_str(&fs::read_to_string(&manifest_path)?).map_err(io::Error::other)?;
         validate_custom_id(&manifest.id)?;
         if directory.file_name().and_then(|name| name.to_str()) != Some(&manifest.id) {
             return Err(io::Error::new(
@@ -270,6 +306,19 @@ impl ProjectStore {
                 "custom example directory does not match manifest id",
             ));
         }
+        let state_namespace = match manifest.state_namespace.as_deref() {
+            Some(namespace) => {
+                validate_state_namespace(namespace)?;
+                namespace.to_owned()
+            }
+            None => {
+                let namespace = generate_state_namespace(&self.repo_root, &manifest.id);
+                manifest.state_namespace = Some(namespace.clone());
+                let upgraded = toml::to_string_pretty(&manifest).map_err(io::Error::other)?;
+                atomic_write(&manifest_path, upgraded.as_bytes())?;
+                namespace
+            }
+        };
         let units = manifest
             .files
             .iter()
@@ -291,9 +340,58 @@ impl ProjectStore {
             id: manifest.id,
             label: manifest.label,
             origin: ProjectOrigin::Custom,
+            application: custom_application_identity(state_namespace),
             units,
         })
     }
+}
+
+fn custom_application_identity(state_namespace: String) -> ApplicationIdentity {
+    ApplicationIdentity::new(CUSTOM_PACKAGE_ID, state_namespace, CUSTOM_DEPLOYMENT_DOMAIN)
+}
+
+fn validate_custom_application(application: &ApplicationIdentity) -> io::Result<()> {
+    if application.package_id != CUSTOM_PACKAGE_ID
+        || application.deployment_domain != CUSTOM_DEPLOYMENT_DOMAIN
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "custom example application identity has invalid host-owned components",
+        ));
+    }
+    validate_state_namespace(&application.state_namespace)
+}
+
+fn validate_state_namespace(namespace: &str) -> io::Result<()> {
+    let digest = namespace
+        .strip_prefix(CUSTOM_NAMESPACE_PREFIX)
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if digest.is_some() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "custom example state namespace is invalid",
+        ))
+    }
+}
+
+fn generate_state_namespace(repo_root: &Path, project_id: &str) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = CUSTOM_NAMESPACE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let seed = format!(
+        "{}\0{project_id}\0{}\0{timestamp}\0{}\0{nonce}",
+        repo_root.display(),
+        std::process::id(),
+        format_args!("{:?}", thread::current().id()),
+    );
+    format!(
+        "{CUSTOM_NAMESPACE_PREFIX}{}",
+        boon_runtime::sha256_bytes(seed.as_bytes())
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -454,6 +552,7 @@ mod tests {
         fs::create_dir_all(root.join("examples")).unwrap();
         let store = ProjectStore::at(root.clone()).unwrap();
         let mut project = store.create_custom(std::iter::empty());
+        let original_application = project.application.clone();
         store.save_custom(&project).unwrap();
         assert_eq!(store.load_custom().unwrap(), vec![project.clone()]);
         project.label = "Renamed example".to_owned();
@@ -483,7 +582,79 @@ mod tests {
                 .join("playground/custom_examples/custom-1/Store.bn")
                 .exists()
         );
-        assert_eq!(store.load_custom().unwrap(), vec![project]);
+        let reloaded = store.load_custom().unwrap();
+        assert_eq!(reloaded, vec![project]);
+        assert_eq!(reloaded[0].application, original_application);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_manifest_is_upgraded_once_with_an_immutable_namespace() {
+        let root = std::env::temp_dir().join(format!(
+            "boon-custom-upgrade-{}-{}",
+            std::process::id(),
+            CUSTOM_NAMESPACE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let directory = root.join("playground/custom_examples/custom-1");
+        fs::create_dir_all(&directory).unwrap();
+        fs::create_dir_all(root.join("examples")).unwrap();
+        fs::write(directory.join("RUN.bn"), "value: 1\n").unwrap();
+        fs::write(
+            directory.join("example.toml"),
+            "id = \"custom-1\"\nlabel = \"Old\"\nfiles = [\"RUN.bn\"]\n",
+        )
+        .unwrap();
+
+        let store = ProjectStore::at(root.clone()).unwrap();
+        let first = store.load_custom().unwrap().remove(0);
+        validate_custom_application(&first.application).unwrap();
+        let upgraded_manifest = fs::read_to_string(directory.join("example.toml")).unwrap();
+        assert!(upgraded_manifest.contains("state_namespace"));
+        let second = store.load_custom().unwrap().remove(0);
+        assert_eq!(second.application, first.application);
+        assert_eq!(
+            fs::read_to_string(directory.join("example.toml")).unwrap(),
+            upgraded_manifest
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reused_ordinal_gets_a_new_state_namespace() {
+        let root = std::env::temp_dir().join(format!(
+            "boon-custom-reuse-{}-{}",
+            std::process::id(),
+            CUSTOM_NAMESPACE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("examples")).unwrap();
+        let store = ProjectStore::at(root.clone()).unwrap();
+        let first = store.create_custom(std::iter::empty());
+        store.save_custom(&first).unwrap();
+        store.remove_custom(&first.id).unwrap();
+        let second = store.create_custom(std::iter::empty());
+        assert_eq!(first.id, second.id);
+        assert_ne!(
+            first.application.state_namespace,
+            second.application.state_namespace
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_custom_namespace_cannot_be_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "boon-custom-immutable-{}-{}",
+            std::process::id(),
+            CUSTOM_NAMESPACE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("examples")).unwrap();
+        let store = ProjectStore::at(root.clone()).unwrap();
+        let mut project = store.create_custom(std::iter::empty());
+        store.save_custom(&project).unwrap();
+        project.application =
+            custom_application_identity(generate_state_namespace(&store.repo_root, &project.id));
+        assert!(store.save_custom(&project).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

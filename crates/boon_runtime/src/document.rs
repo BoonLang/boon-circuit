@@ -19,6 +19,17 @@ use std::sync::Arc;
 const DEFAULT_VISIBLE_ITEMS: u64 = 16;
 const DEFAULT_OVERSCAN_ITEMS: u64 = 4;
 
+type RetainedScalarEvaluation = (
+    EvalValue,
+    BTreeSet<ValueTarget>,
+    BTreeMap<ValueTarget, BTreeSet<Value>>,
+);
+type ScalarDependentIndexes = (
+    BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
+    BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
+    BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>>,
+);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocumentWindowDemand {
     pub materialization: DocumentMaterializationId,
@@ -72,6 +83,42 @@ pub(crate) struct DocumentRuntime {
     full_evaluation_count: u64,
     retained_scalar_evaluation_count: u64,
     stats: DocumentMaterializationStats,
+}
+
+pub(crate) struct DocumentRollback(DocumentRollbackKind);
+
+enum DocumentRollbackKind {
+    Unchanged,
+    Scalar {
+        retained_nodes: Vec<(FrameNodeId, RetainedNode)>,
+        frame_nodes: Vec<(FrameNodeId, DocumentNode)>,
+        target_values: Vec<(ValueTarget, Option<Value>)>,
+        retained_scalar_evaluation_count: u64,
+    },
+    Rebuilt {
+        evaluated: Box<EvaluatedDocument>,
+        full_evaluation_count: u64,
+    },
+}
+
+impl DocumentRollback {
+    pub(crate) fn unchanged() -> Self {
+        Self(DocumentRollbackKind::Unchanged)
+    }
+
+    pub(crate) fn is_unchanged(&self) -> bool {
+        matches!(self.0, DocumentRollbackKind::Unchanged)
+    }
+}
+
+enum ScalarPatchOutcome {
+    Patched {
+        patches: Vec<DocumentPatch>,
+        retained_nodes: Vec<(FrameNodeId, RetainedNode)>,
+        frame_nodes: Vec<(FrameNodeId, DocumentNode)>,
+        retained_scalar_evaluation_count: u64,
+    },
+    Rebuild,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,18 +302,79 @@ impl DocumentRuntime {
         &mut self,
         session: &mut Session,
         deltas: &[Delta],
-    ) -> Result<Vec<DocumentPatch>, DocumentError> {
+    ) -> Result<(Vec<DocumentPatch>, DocumentRollback), DocumentError> {
         if self.turn_affects_structure(deltas) {
-            return self.rebuild(session);
+            return self.rebuild_transactional(session);
         }
+        let target_values = self.capture_delta_values(deltas);
         let affected = self.affected_scalar_bindings(deltas);
-        let patches = if affected.is_empty() {
-            Vec::new()
+        let outcome = if affected.is_empty() {
+            ScalarPatchOutcome::Patched {
+                patches: Vec::new(),
+                retained_nodes: Vec::new(),
+                frame_nodes: Vec::new(),
+                retained_scalar_evaluation_count: self.retained_scalar_evaluation_count,
+            }
         } else {
             self.patch_scalars(session, affected)?
         };
+        let ScalarPatchOutcome::Patched {
+            patches,
+            retained_nodes,
+            frame_nodes,
+            retained_scalar_evaluation_count,
+        } = outcome
+        else {
+            return self.rebuild_transactional(session);
+        };
         self.record_delta_values(deltas);
-        Ok(patches)
+        Ok((
+            patches,
+            DocumentRollback(DocumentRollbackKind::Scalar {
+                retained_nodes,
+                frame_nodes,
+                target_values,
+                retained_scalar_evaluation_count,
+            }),
+        ))
+    }
+
+    pub(crate) fn rollback_turn(&mut self, rollback: DocumentRollback) {
+        match rollback.0 {
+            DocumentRollbackKind::Unchanged => {}
+            DocumentRollbackKind::Scalar {
+                retained_nodes,
+                frame_nodes,
+                target_values,
+                retained_scalar_evaluation_count,
+            } => {
+                for (id, retained) in retained_nodes {
+                    self.retained_nodes.insert(id, retained);
+                }
+                for (id, node) in frame_nodes {
+                    self.frame.nodes.insert(id, node);
+                }
+                for (target, previous) in target_values {
+                    match previous {
+                        Some(value) => {
+                            self.target_values.insert(target, value);
+                        }
+                        None => {
+                            self.target_values.remove(&target);
+                        }
+                    }
+                }
+                self.retained_scalar_evaluation_count = retained_scalar_evaluation_count;
+                self.rebuild_scalar_dependency_indexes();
+            }
+            DocumentRollbackKind::Rebuilt {
+                evaluated,
+                full_evaluation_count,
+            } => {
+                self.replace_evaluated(*evaluated);
+                self.full_evaluation_count = full_evaluation_count;
+            }
+        }
     }
 
     pub(crate) fn demand_window(
@@ -324,6 +432,24 @@ impl DocumentRuntime {
         Ok(patches)
     }
 
+    fn rebuild_transactional(
+        &mut self,
+        session: &mut Session,
+    ) -> Result<(Vec<DocumentPatch>, DocumentRollback), DocumentError> {
+        let evaluated = self.evaluate(session)?;
+        let patches = diff_frames(&self.frame, &evaluated.frame);
+        let previous = self.replace_evaluated(evaluated);
+        let full_evaluation_count = self.full_evaluation_count;
+        self.full_evaluation_count = self.full_evaluation_count.saturating_add(1);
+        Ok((
+            patches,
+            DocumentRollback(DocumentRollbackKind::Rebuilt {
+                evaluated: Box::new(previous),
+                full_evaluation_count,
+            }),
+        ))
+    }
+
     fn evaluate(&self, session: &mut Session) -> Result<EvaluatedDocument, DocumentError> {
         Evaluator::new(self, session).evaluate()
     }
@@ -345,18 +471,56 @@ impl DocumentRuntime {
     }
 
     fn install_evaluated(&mut self, evaluated: EvaluatedDocument) {
-        self.frame = evaluated.frame;
-        self.dependencies = evaluated.dependencies;
-        self.structural_dependencies = evaluated.structural_dependencies;
-        self.structural_lists = evaluated.structural_lists;
-        self.retained_nodes = evaluated.retained_nodes;
+        self.replace_evaluated(evaluated);
+    }
+
+    fn replace_evaluated(&mut self, evaluated: EvaluatedDocument) -> EvaluatedDocument {
+        let previous = EvaluatedDocument {
+            frame: std::mem::replace(&mut self.frame, evaluated.frame),
+            dependencies: std::mem::replace(&mut self.dependencies, evaluated.dependencies),
+            structural_dependencies: std::mem::replace(
+                &mut self.structural_dependencies,
+                evaluated.structural_dependencies,
+            ),
+            structural_lists: std::mem::replace(
+                &mut self.structural_lists,
+                evaluated.structural_lists,
+            ),
+            retained_nodes: std::mem::replace(&mut self.retained_nodes, evaluated.retained_nodes),
+            target_values: std::mem::replace(&mut self.target_values, evaluated.target_values),
+            stats: std::mem::replace(&mut self.stats, evaluated.stats),
+        };
         (
             self.scalar_dependents,
             self.scalar_guarded_dependents,
             self.scalar_guard_values,
         ) = scalar_dependent_indexes(&self.retained_nodes);
-        self.target_values = evaluated.target_values;
-        self.stats = evaluated.stats;
+        previous
+    }
+
+    fn rebuild_scalar_dependency_indexes(&mut self) {
+        (
+            self.scalar_dependents,
+            self.scalar_guarded_dependents,
+            self.scalar_guard_values,
+        ) = scalar_dependent_indexes(&self.retained_nodes);
+        self.dependencies = self.structural_dependencies.clone();
+        self.dependencies
+            .extend(self.scalar_dependents.keys().copied());
+    }
+
+    fn capture_delta_values(&self, deltas: &[Delta]) -> Vec<(ValueTarget, Option<Value>)> {
+        deltas
+            .iter()
+            .filter_map(|delta| match delta {
+                Delta::SetValue { target, .. } => {
+                    Some((*target, self.target_values.get(target).cloned()))
+                }
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect()
     }
 
     fn affected_scalar_bindings(&self, deltas: &[Delta]) -> BTreeSet<RetainedBindingKey> {
@@ -399,7 +563,7 @@ impl DocumentRuntime {
         &mut self,
         session: &mut Session,
         affected: BTreeSet<RetainedBindingKey>,
-    ) -> Result<Vec<DocumentPatch>, DocumentError> {
+    ) -> Result<ScalarPatchOutcome, DocumentError> {
         let requests = affected
             .iter()
             .map(|key| {
@@ -442,7 +606,7 @@ impl DocumentRuntime {
                 || retained_value_affects_structure(role, &value)
             {
                 drop(evaluator);
-                return self.rebuild(session);
+                return Ok(ScalarPatchOutcome::Rebuild);
             }
             updates.push((
                 key,
@@ -518,12 +682,27 @@ impl DocumentRuntime {
             staged_frame_nodes.push((id, next));
         }
 
-        for (id, retained) in staged_retained_nodes {
-            self.retained_nodes.insert(id, retained);
-        }
-        for (id, node) in staged_frame_nodes {
-            self.frame.nodes.insert(id, node);
-        }
+        let previous_retained_nodes = staged_retained_nodes
+            .into_iter()
+            .map(|(id, retained)| {
+                let previous = self
+                    .retained_nodes
+                    .insert(id.clone(), retained)
+                    .expect("staged retained node must replace an existing node");
+                (id, previous)
+            })
+            .collect();
+        let previous_frame_nodes = staged_frame_nodes
+            .into_iter()
+            .map(|(id, node)| {
+                let previous = self
+                    .frame
+                    .nodes
+                    .insert(id.clone(), node)
+                    .expect("staged frame node must replace an existing node");
+                (id, previous)
+            })
+            .collect();
         for (key, _, dependencies, previous_dependencies, guards, previous_guards) in &updates {
             self.replace_scalar_dependencies(
                 key,
@@ -536,7 +715,14 @@ impl DocumentRuntime {
         self.retained_scalar_evaluation_count = self
             .retained_scalar_evaluation_count
             .saturating_add(evaluated_count as u64);
-        Ok(patches)
+        Ok(ScalarPatchOutcome::Patched {
+            patches,
+            retained_nodes: previous_retained_nodes,
+            frame_nodes: previous_frame_nodes,
+            retained_scalar_evaluation_count: self
+                .retained_scalar_evaluation_count
+                .saturating_sub(evaluated_count as u64),
+        })
     }
 
     fn replace_scalar_dependencies(
@@ -1233,14 +1419,7 @@ impl<'a> Evaluator<'a> {
         &mut self,
         expression: DocumentExprId,
         env: &mut EvalEnv,
-    ) -> Result<
-        (
-            EvalValue,
-            BTreeSet<ValueTarget>,
-            BTreeMap<ValueTarget, BTreeSet<Value>>,
-        ),
-        DocumentError,
-    > {
+    ) -> Result<RetainedScalarEvaluation, DocumentError> {
         if self.dependency_capture.is_some() {
             return Err(DocumentError::InvalidPlan(
                 "nested retained scalar dependency capture".to_owned(),
@@ -1296,10 +1475,9 @@ impl<'a> Evaluator<'a> {
             | DocumentExprOp::NoElement
             | DocumentExprOp::SourceContext => Ok(ScalarTargetUse::Independent),
             DocumentExprOp::Read { read } => {
-                if self.direct_read_target(read, env) == Some(target) {
-                    Ok(ScalarTargetUse::Unguarded)
-                } else if matches!(read, DocumentRead::Passed { .. })
-                    && matches!(env.passed, None | Some(EvalValue::Global))
+                if self.direct_read_target(read, env) == Some(target)
+                    || (matches!(read, DocumentRead::Passed { .. })
+                        && matches!(env.passed, None | Some(EvalValue::Global)))
                 {
                     Ok(ScalarTargetUse::Unguarded)
                 } else {
@@ -3531,13 +3709,7 @@ fn format_record(tag: Option<&str>, fields: &BTreeMap<String, EvalValue>) -> Str
         .unwrap_or_else(|| body)
 }
 
-fn scalar_dependent_indexes(
-    nodes: &BTreeMap<FrameNodeId, RetainedNode>,
-) -> (
-    BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
-    BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
-    BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>>,
-) {
+fn scalar_dependent_indexes(nodes: &BTreeMap<FrameNodeId, RetainedNode>) -> ScalarDependentIndexes {
     let mut index: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>> = BTreeMap::new();
     let mut guarded: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>> = BTreeMap::new();
     let mut guard_values: BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>> =

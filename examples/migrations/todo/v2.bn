@@ -1,0 +1,198 @@
+-- Todo Migration V2: whole-list authority moves from todos to tasks.
+
+store: [
+    sources: [
+        help_button: [events: [press: SOURCE]]
+    ]
+
+    preferences: [
+        theme: Light |> HOLD theme { LATEST {} }
+        density: Comfortable |> HOLD density { LATEST {} }
+    ]
+
+    show_help:
+        False |> HOLD show_help {
+            LATEST {
+                sources.help_button.events.press |> THEN { True }
+            }
+        }
+
+    todos:
+        LIST {
+            [title: TEXT { Plan release }, completed: False]
+            [title: TEXT { Test migration }, completed: True]
+        }
+        |> List/map(todo, new: retiring_todo(todo: todo))
+        |> DRAINING
+
+    tasks:
+        DRAIN { todos }
+        |> List/map(task, new: new_task(task: task))
+]
+
+FUNCTION retiring_todo(todo) {
+    [
+        title: todo.title |> HOLD title { LATEST {} }
+        completed: todo.completed |> HOLD completed { LATEST {} }
+    ]
+}
+
+FUNCTION new_task(task) {
+    [
+        sources: [
+            toggle_button: [events: [press: SOURCE]]
+            rename_button: [events: [press: SOURCE]]
+        ]
+
+        title:
+            task.title |> HOLD title {
+                LATEST {
+                    sources.rename_button.events.press |> THEN {
+                        TEXT { Plan release (edited) }
+                    }
+                }
+            }
+
+        completed:
+            task.completed |> HOLD completed {
+                LATEST {
+                    sources.toggle_button.events.press |> THEN { completed |> Bool/not() }
+                }
+            }
+    ]
+}
+
+document: Document/new(root: todo_migration_app())
+
+FUNCTION todo_migration_app() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: 12
+        style: [
+            width: Fill
+            height: Fill
+            padding: 24
+            background: [color: Oklch[lightness:0.97]]
+            font: [size: 15, color: Oklch[lightness:0.20]]
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [width: Fill, height: 36, font: [size: 24]]
+                label: TEXT { Todo Migration V2 }
+            )
+            migration_controls()
+            Element/label(
+                element: []
+                style: [width: Fill, height: 28]
+                label: preferences_text(
+                    theme: store.preferences.theme
+                    density: store.preferences.density
+                )
+            )
+            Element/label(
+                element: []
+                style: [width: Fill, height: 28]
+                label: help_text(show_help: store.show_help)
+            )
+            task_list()
+        }
+    )
+}
+
+FUNCTION migration_controls() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [width: Fill, height: 40]
+        items: LIST {
+            migration_button(events: store.sources.help_button.events, label: TEXT { Help })
+        }
+    )
+}
+
+FUNCTION task_list() {
+    Element/stripe(
+        element: [tag: Main]
+        direction: Column
+        gap: 8
+        style: [width: Fill, height: Fill]
+        items: store.tasks |> List/map(task, new: task_row(task: task))
+    )
+}
+
+FUNCTION task_row(task) {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 8
+        style: [
+            width: Fill
+            height: 48
+            padding: 8
+            background: [color: Oklch[lightness:1]]
+            border: [color: Oklch[lightness:0.84]]
+        ]
+        items: LIST {
+            Element/label(
+                element: []
+                style: [width: 300, height: 32]
+                label: task.title
+            )
+            Element/label(
+                element: []
+                style: [width: 90, height: 32]
+                label: completed_text(completed: task.completed)
+            )
+            migration_button(events: task.sources.toggle_button.events, label: TEXT { Toggle })
+            migration_button(events: task.sources.rename_button.events, label: TEXT { Rename })
+        }
+    )
+}
+
+FUNCTION migration_button(events, label) {
+    Element/button(
+        element: [events: events]
+        style: [
+            width: 104
+            height: 36
+            background: [color: Oklch[lightness:0.93]]
+            border: [color: Oklch[lightness:0.70]]
+        ]
+        label: label
+    )
+}
+
+FUNCTION completed_text(completed) {
+    completed |> WHEN {
+        True => TEXT { Done }
+        False => TEXT { Open }
+    }
+}
+
+FUNCTION preferences_text(theme, density) {
+    theme_text(theme: theme) |> Text/concat(with: density_text(density: density), separator: " / ")
+}
+
+FUNCTION theme_text(theme) {
+    theme |> WHEN {
+        Light => TEXT { Light }
+        Dark => TEXT { Dark }
+    }
+}
+
+FUNCTION density_text(density) {
+    density |> WHEN {
+        Comfortable => TEXT { Comfortable }
+        Compact => TEXT { Compact }
+    }
+}
+
+FUNCTION help_text(show_help) {
+    show_help |> WHEN {
+        True => TEXT { Help is visible }
+        False => TEXT { Help is hidden }
+    }
+}

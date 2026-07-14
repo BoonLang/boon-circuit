@@ -229,7 +229,7 @@ impl Buffer {
                 return self.move_horizontal(true, false);
             }
         }
-        let close = pair.then(|| match text {
+        let close = pair.then_some(match text {
             "(" => ")",
             "[" => "]",
             "{" => "}",
@@ -455,7 +455,7 @@ fn byte_for_grapheme_column(text: &str, column: usize) -> usize {
 fn previous_grapheme(text: &str, byte: usize) -> usize {
     text[..byte.min(text.len())]
         .grapheme_indices(true)
-        .last()
+        .next_back()
         .map(|(index, _)| index)
         .unwrap_or(0)
 }

@@ -1,0 +1,388 @@
+name = "todo-migration-lifecycle"
+
+[[step]]
+id = "start-incremental-v1"
+action = { kind = "start", stage = "v1", namespace = "todo-incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+
+[[step]]
+id = "edit-incremental-first-title"
+action = { kind = "dispatch", public_source = "todo.sources.rename_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+
+[[step]]
+id = "touch-incremental-first-completed"
+action = { kind = "dispatch", public_source = "todo.sources.toggle_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+
+[[step]]
+id = "touch-incremental-obsolete-help"
+action = { kind = "dispatch", public_source = "store.sources.help_button.press" }
+
+[[step]]
+id = "checkpoint-incremental-v1"
+action = { kind = "checkpoint" }
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.show_help"
+  value = true
+  touched = true
+  [[step.assert]]
+  kind = "list"
+  scope = "durable"
+  path = "store.todos"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { title = "Plan release (edited)", completed = true }, touched_fields = ["title", "completed"] },
+    { key = 2, generation = 1, values = { title = "Test migration", completed = true }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "restart-incremental-v1"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+  [[step.assert]]
+  kind = "list"
+  scope = "current"
+  path = "store.todos"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { title = "Plan release (edited)", completed = true }, touched_fields = ["title", "completed"] },
+    { key = 2, generation = 1, values = { title = "Test migration", completed = true }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "preview-incremental-v2"
+action = { kind = "preview", stage = "v2" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+  preview_stage = "v2"
+
+[[step]]
+id = "activate-incremental-v2"
+action = { kind = "activate", stage = "v2", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v2"
+  durable_stage = "v2"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v1"
+  to_stage = "v2"
+  applied = [{ from_stage = "v1", to_stage = "v2" }]
+  [[step.assert]]
+  kind = "list"
+  scope = "current"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { title = "Plan release (edited)", completed = true }, touched_fields = ["title", "completed"] },
+    { key = 2, generation = 1, values = { title = "Test migration", completed = true }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "preview-incremental-v3"
+action = { kind = "preview", stage = "v3" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v2"
+  durable_stage = "v2"
+  preview_stage = "v3"
+
+[[step]]
+id = "activate-incremental-v3"
+action = { kind = "activate", stage = "v3", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v3"
+  durable_stage = "v3"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v2"
+  to_stage = "v3"
+  applied = [{ from_stage = "v2", to_stage = "v3" }]
+  [[step.assert]]
+  kind = "list"
+  scope = "current"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { title = "Plan release (edited)", completed = true, priority = "Normal" }, touched_fields = ["title", "completed"] },
+    { key = 2, generation = 1, values = { title = "Test migration", completed = true, priority = "Normal" }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "preview-incremental-v4"
+action = { kind = "preview", stage = "v4" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v3"
+  durable_stage = "v3"
+  preview_stage = "v4"
+
+[[step]]
+id = "activate-incremental-v4"
+action = { kind = "activate", stage = "v4", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v4"
+  durable_stage = "v4"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v3"
+  to_stage = "v4"
+  applied = [{ from_stage = "v3", to_stage = "v4" }]
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.theme"
+  value = "Light"
+  touched = false
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.density"
+  value = "Comfortable"
+  touched = false
+
+[[step]]
+id = "preview-incremental-v5"
+action = { kind = "preview", stage = "v5" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v4"
+  durable_stage = "v4"
+  preview_stage = "v5"
+
+[[step]]
+id = "activate-incremental-v5"
+action = { kind = "activate", stage = "v5", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v5"
+  durable_stage = "v5"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v4"
+  to_stage = "v5"
+  applied = [{ from_stage = "v4", to_stage = "v5" }]
+  [[step.assert]]
+  kind = "list"
+  scope = "current"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", completed = true, priority = "Normal" }, touched_fields = ["text", "completed"] },
+    { key = 2, generation = 1, values = { text = "Test migration", completed = true, priority = "Normal" }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "preview-incremental-v6"
+action = { kind = "preview", stage = "v6" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v5"
+  durable_stage = "v5"
+  preview_stage = "v6"
+
+[[step]]
+id = "activate-incremental-v6"
+action = { kind = "activate", stage = "v6", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v6"
+  durable_stage = "v6"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v5"
+  to_stage = "v6"
+  applied = [{ from_stage = "v5", to_stage = "v6" }]
+  [[step.assert]]
+  kind = "list"
+  scope = "current"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "preview-incremental-v7"
+action = { kind = "preview", stage = "v7" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v6"
+  durable_stage = "v6"
+  preview_stage = "v7"
+
+[[step]]
+id = "activate-incremental-v7"
+action = { kind = "activate", stage = "v7", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v7"
+  durable_stage = "v7"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v6"
+  to_stage = "v7"
+  applied = [{ from_stage = "v6", to_stage = "v7" }]
+  [[step.assert]]
+  kind = "current_absent"
+  path = "store.show_help"
+  [[step.assert]]
+  kind = "durable_absent"
+  path = "store.show_help"
+  [[step.assert]]
+  kind = "list"
+  scope = "current"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "restart-incremental-v7"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.theme"
+  value = "Light"
+  touched = false
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.density"
+  value = "Comfortable"
+  touched = false
+  [[step.assert]]
+  kind = "list"
+  scope = "durable"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "start-skipped-v1"
+action = { kind = "start", stage = "v1", namespace = "todo-skipped" }
+
+[[step]]
+id = "edit-skipped-first-title"
+action = { kind = "dispatch", public_source = "todo.sources.rename_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+
+[[step]]
+id = "touch-skipped-first-completed"
+action = { kind = "dispatch", public_source = "todo.sources.toggle_button.press", target = { list = "store.todos", key = 1, generation = 1 } }
+
+[[step]]
+id = "touch-skipped-obsolete-help"
+action = { kind = "dispatch", public_source = "store.sources.help_button.press" }
+
+[[step]]
+id = "checkpoint-skipped-v1"
+action = { kind = "checkpoint" }
+
+[[step]]
+id = "restart-skipped-v1"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "list"
+  scope = "durable"
+  path = "store.todos"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { title = "Plan release (edited)", completed = true }, touched_fields = ["title", "completed"] },
+    { key = 2, generation = 1, values = { title = "Test migration", completed = true }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "preview-skipped-v7"
+action = { kind = "preview", stage = "v7" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+  preview_stage = "v7"
+
+[[step]]
+id = "activate-skipped-v7"
+action = { kind = "activate", stage = "v7", mode = "skipped" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v7"
+  durable_stage = "v7"
+  [[step.assert]]
+  kind = "edges"
+  mode = "skipped"
+  from_stage = "v1"
+  to_stage = "v7"
+  applied = [
+    { from_stage = "v1", to_stage = "v2" },
+    { from_stage = "v2", to_stage = "v3" },
+    { from_stage = "v3", to_stage = "v4" },
+    { from_stage = "v4", to_stage = "v5" },
+    { from_stage = "v5", to_stage = "v6" },
+    { from_stage = "v6", to_stage = "v7" },
+  ]
+  [[step.assert]]
+  kind = "current_absent"
+  path = "store.show_help"
+  [[step.assert]]
+  kind = "list"
+  scope = "current"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+  ]
+
+[[step]]
+id = "restart-skipped-v7"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "durable_absent"
+  path = "store.show_help"
+  [[step.assert]]
+  kind = "list"
+  scope = "durable"
+  path = "store.tasks"
+  next_key = 3
+  touched = false
+  rows = [
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+  ]
+  [[step.assert]]
+  kind = "namespace_isolation"
+  namespace = "todo-incremental"
+  unchanged_since = "restart-incremental-v7"
+  [[step.assert]]
+  kind = "namespace_equivalent"
+  namespace = "todo-incremental"
+  other_namespace = "todo-skipped"

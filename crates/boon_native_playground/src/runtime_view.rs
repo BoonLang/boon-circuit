@@ -3,19 +3,55 @@ use boon_document::{
     StyleValue, TextValue,
 };
 use boon_editor::{Buffer, Command, Position};
-use boon_host::{HostEvent, PointerButton, PointerPhase};
-use boon_runtime::{
-    DocumentPatch, DocumentPatchStatus, LiveRuntime, RowId, RuntimePhaseTimings, RuntimeTurn,
-    SourcePayload, Value,
+use boon_host::{
+    DocumentNodeId as HostDocumentNodeId, HostEvent, PointerButton, PointerPhase, SourceBindingId,
 };
+use boon_persistence::{
+    MigrationPreview, OutboxInspectorState, PersistenceInspectorSnapshot, PersistenceWorkerConfig,
+    PersistenceWorkerStatus, RedbDriver,
+};
+use boon_plan::{ApplicationIdentity, ApplicationPlan, MachinePlan, MemoryKind};
+use boon_runtime::{
+    DocumentPatch, DocumentPatchStatus, LiveRuntime, PersistentRuntime, RowId, RuntimePhaseTimings,
+    RuntimeTurn, SessionOptions, SourcePayload, Value,
+};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::protocol::{
+    AuthoritySelection, AuthoritySelectionKind, AuthoritySummary, DurableSummary,
+    MAX_PERSISTENCE_OUTBOX_SAMPLES, MAX_PERSISTENCE_STATUS_BYTES, OutboxSample, OutboxSampleState,
+    OutboxSummary, PendingSummary, PersistenceCapabilities, PersistenceCapability,
+    PersistenceOperationStatus, PersistenceSnapshot, PersistenceTimingSummary,
+    StateArtifactPreviewSummary, StoredSummary,
+};
 use crate::view::HitTarget;
+#[cfg(test)]
+use boon_persistence::InMemoryDriver;
 
 type ViewResult<T> = Result<T, String>;
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const PERSISTENCE_ACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const STATE_DIRECTORY: &str = "playground/state";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AuthorityPlanCounts {
+    scalar: u32,
+    indexed_field: u32,
+    list: u32,
+    effect_contract: u32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PersistenceQueryCounts {
+    pub status: u64,
+    pub storage: u64,
+}
 
 struct ScheduledSource {
     path: String,
@@ -59,7 +95,19 @@ struct InputModifiers {
 }
 
 pub struct RuntimeView {
-    runtime: LiveRuntime,
+    runtime: PersistentRuntime,
+    application: ApplicationIdentity,
+    persistence_schema_version: u64,
+    persistence_schema_hash: [u8; 32],
+    authority_plan_counts: AuthorityPlanCounts,
+    authority_selections: std::collections::BTreeMap<String, AuthoritySelection>,
+    persistence_status: PersistenceWorkerStatus,
+    persistence_inspector: Option<PersistenceInspectorSnapshot>,
+    persistence_inspector_error: Option<String>,
+    next_persistence_poll: Option<Instant>,
+    runtime_turn_sequence: u64,
+    #[cfg(test)]
+    persistence_query_counts: PersistenceQueryCounts,
     hovered: Option<String>,
     pressed: Option<String>,
     focused: Option<String>,
@@ -77,31 +125,76 @@ pub struct RuntimeView {
     scheduled_sources: Vec<ScheduledSource>,
 }
 
+pub struct RuntimePlanChange {
+    pub target_schema_version: u64,
+    pub durable_epoch: u64,
+    pub through_turn_sequence: u64,
+    pub migration: Option<MigrationPreview>,
+}
+
 impl RuntimeView {
-    pub fn mount(runtime: LiveRuntime, turn: RuntimeTurn) -> ViewResult<Self> {
+    pub fn open(plan: Arc<MachinePlan>) -> ViewResult<Self> {
+        validate_preview_plan(&plan)?;
+        let database_path = state_database_path(&plan.application.identity)?;
+        let parent = database_path
+            .parent()
+            .ok_or_else(|| "playground state database has no parent directory".to_owned())?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "create playground state directory `{}`: {error}",
+                parent.display()
+            )
+        })?;
+        let driver = RedbDriver::open(&database_path).map_err(|error| {
+            format!(
+                "open playground state database `{}`: {error}",
+                database_path.display()
+            )
+        })?;
+        let (runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+            plan,
+            SessionOptions::default(),
+            driver,
+            PersistenceWorkerConfig::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mount = runtime.runtime().mount();
+        let _ = startup;
+        Self::mount_persistent(runtime, mount)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_in_memory(runtime: LiveRuntime) -> ViewResult<Self> {
+        let (runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+            runtime.shared_machine_plan(),
+            SessionOptions::default(),
+            InMemoryDriver::default(),
+            PersistenceWorkerConfig::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mount = runtime.runtime().mount();
+        let _ = startup;
+        Self::mount_persistent(runtime, mount)
+    }
+
+    fn mount_persistent(runtime: PersistentRuntime, turn: RuntimeTurn) -> ViewResult<Self> {
+        let source_sequence = source_sequence_after_turn(0, turn.source_sequence);
+        let runtime_turn_sequence = turn.sequence;
         if turn.document_patch_status != DocumentPatchStatus::Complete {
             return Err("MachinePlan did not produce complete typed document bindings".to_owned());
         }
         let mounted = state_from_mount(turn.document_patches)?;
         let frame = runtime
-            .document_frame()
-            .ok_or_else(|| "mounted runtime has no document frame".to_owned())?;
-        if let Some(source) = runtime
-            .source_inventory()
-            .sources
-            .iter()
-            .find(|source| source.interval_ms == Some(0))
-        {
-            return Err(format!(
-                "scheduled source `{}` has a zero interval",
-                source.path
-            ));
-        }
+            .runtime()
+            .primary_retained_output_frame()
+            .map_err(|error| error.to_string())?;
         debug_assert_eq!(mounted.frame(), frame);
         let text_inputs = frame
             .nodes
             .values()
-            .filter(|node| node.kind == DocumentNodeKind::TextInput)
+            .filter(|node| {
+                node.kind == DocumentNodeKind::TextInput && !node.is_sensitive_text_input()
+            })
             .map(|node| {
                 (
                     node.id.0.clone(),
@@ -114,22 +207,35 @@ impl RuntimeView {
                 )
             })
             .collect();
-        let now = Instant::now();
-        let scheduled_sources = runtime
-            .source_inventory()
-            .sources
-            .iter()
-            .filter_map(|source| {
-                let interval = Duration::from_millis(source.interval_ms?);
-                Some(ScheduledSource {
-                    path: source.path.clone(),
-                    interval,
-                    next: now + interval,
-                })
-            })
-            .collect();
+        let scheduled_sources = scheduled_sources(runtime.runtime())?;
+        let plan = runtime.runtime().machine_plan();
+        let application = plan.application.identity.clone();
+        let persistence_schema_version = plan.persistence.schema_version;
+        let persistence_schema_hash = plan.persistence.schema_hash;
+        let authority_plan_counts = authority_plan_counts(plan);
+        let authority_selections = authority_selections(plan);
+        let (persistence_inspector, persistence_inspector_error) = match runtime.inspect() {
+            Ok(inspector) => (inspector, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let persistence_status = runtime.status();
         Ok(Self {
             runtime,
+            application,
+            persistence_schema_version,
+            persistence_schema_hash,
+            authority_plan_counts,
+            authority_selections,
+            persistence_status,
+            persistence_inspector,
+            persistence_inspector_error,
+            next_persistence_poll: None,
+            runtime_turn_sequence,
+            #[cfg(test)]
+            persistence_query_counts: PersistenceQueryCounts {
+                status: 1,
+                storage: 1,
+            },
             hovered: None,
             pressed: None,
             focused: None,
@@ -139,7 +245,7 @@ impl RuntimeView {
             scroll_offsets: std::collections::BTreeMap::new(),
             materialization_overscan: std::collections::BTreeMap::new(),
             pending_patches: Vec::new(),
-            sequence: 0,
+            sequence: source_sequence,
             last_dispatched_source: None,
             pending_external_url: None,
             last_primary_click: None,
@@ -148,12 +254,444 @@ impl RuntimeView {
         })
     }
 
-    pub fn frame(&self) -> DocumentFrame {
-        let mut frame = self
+    pub fn application_identity(&self) -> &ApplicationIdentity {
+        &self.application
+    }
+
+    pub fn plan_schema_matches(&self, plan: &MachinePlan) -> bool {
+        self.persistence_schema_version == plan.persistence.schema_version
+            && self.persistence_schema_hash == plan.persistence.schema_hash
+    }
+
+    pub fn preview_machine_plan(
+        &self,
+        plan: Arc<MachinePlan>,
+    ) -> ViewResult<boon_runtime::PersistentPlanPreview> {
+        validate_preview_plan(&plan)?;
+        if &plan.application.identity != self.application_identity() {
+            return Err("preview plan belongs to a different application identity".to_owned());
+        }
+        self.runtime
+            .preview_machine_plan(plan, SessionOptions::default())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn activate_machine_plan(
+        &mut self,
+        plan: Arc<MachinePlan>,
+    ) -> ViewResult<RuntimePlanChange> {
+        validate_preview_plan(&plan)?;
+        if &plan.application.identity != self.application_identity() {
+            return Err("replacement plan belongs to a different application identity".to_owned());
+        }
+        let target_schema_version = plan.persistence.schema_version;
+        let activation = self
             .runtime
-            .document_frame()
-            .expect("mounted runtime keeps a document frame")
+            .activate_machine_plan(plan, SessionOptions::default())
+            .map_err(|error| error.to_string())?;
+        let acknowledgement = activation.acknowledgement;
+        let migration = activation.migration;
+        self.install_runtime_mount(activation.mount)?;
+        let durable_epoch = acknowledgement
+            .as_ref()
+            .map_or(self.persistence_status.durable_epoch, |ack| ack.epoch);
+        let through_turn_sequence = acknowledgement.as_ref().map_or(
+            self.persistence_status.durable_through_turn_sequence,
+            |ack| ack.through_turn_sequence,
+        );
+        Ok(RuntimePlanChange {
+            target_schema_version,
+            durable_epoch,
+            through_turn_sequence,
+            migration,
+        })
+    }
+
+    pub fn restart(&mut self) -> ViewResult<RuntimePlanChange> {
+        let plan = self.runtime.runtime().shared_machine_plan();
+        self.activate_machine_plan(plan)
+    }
+
+    pub fn start_over(&mut self) -> ViewResult<RuntimePlanChange> {
+        let plan = self.runtime.runtime().shared_machine_plan();
+        let target_schema_version = plan.persistence.schema_version;
+        let reset = self
+            .runtime
+            .start_over_machine_plan(plan, SessionOptions::default())
+            .map_err(|error| error.to_string())?;
+        let durable_epoch = reset.acknowledgement.epoch;
+        let through_turn_sequence = reset.acknowledgement.through_turn_sequence;
+        self.install_runtime_mount(reset.mount)?;
+        Ok(RuntimePlanChange {
+            target_schema_version,
+            durable_epoch,
+            through_turn_sequence,
+            migration: None,
+        })
+    }
+
+    fn install_runtime_mount(&mut self, mount: RuntimeTurn) -> ViewResult<()> {
+        let runtime_turn_sequence = mount.sequence;
+        if mount.document_patch_status != DocumentPatchStatus::Complete {
+            return Err("MachinePlan did not produce complete typed document bindings".to_owned());
+        }
+        let mounted = state_from_mount(mount.document_patches)?;
+        let frame = self
+            .runtime
+            .runtime()
+            .primary_retained_output_frame()
+            .map_err(|error| error.to_string())?
             .clone();
+        debug_assert_eq!(mounted.frame(), &frame);
+
+        self.retain_view_state(&frame);
+        self.materialization_overscan.clear();
+        self.pending_patches.clear();
+        self.last_runtime_phase = RuntimePhaseTimings::default();
+        self.scheduled_sources = scheduled_sources(self.runtime.runtime())?;
+        self.runtime_turn_sequence = runtime_turn_sequence;
+        self.refresh_plan_metadata();
+        self.refresh_persistence_after_control();
+        Ok(())
+    }
+
+    pub fn persistence_status(&self) -> &PersistenceWorkerStatus {
+        &self.persistence_status
+    }
+
+    pub fn persistence_schema_version(&self) -> u64 {
+        self.persistence_schema_version
+    }
+
+    pub fn authority_selection_for_path(&self, path: &str) -> Option<AuthoritySelection> {
+        self.authority_selections.get(path).cloned()
+    }
+
+    pub fn runtime_turn_sequence(&self) -> u64 {
+        self.runtime_turn_sequence
+    }
+
+    pub fn persistence_poll_deadline(&self) -> Option<Instant> {
+        self.next_persistence_poll
+    }
+
+    pub fn poll_persistence_acknowledgement(&mut self, now: Instant) -> bool {
+        if self
+            .next_persistence_poll
+            .is_none_or(|deadline| deadline > now)
+        {
+            return false;
+        }
+        let previous_status = self.persistence_status.clone();
+        self.persistence_status = self.query_persistence_status();
+        let mut changed = self.persistence_status != previous_status;
+        let idle = self.persistence_status.pending.is_none()
+            && self.persistence_status.queue_depth == 0
+            && self.persistence_status.reserved_slots == 0;
+        let inspector_is_stale = self.persistence_inspector.as_ref().is_none_or(|inspector| {
+            inspector.epoch < self.persistence_status.durable_epoch
+                || inspector.through_turn_sequence
+                    < self.persistence_status.durable_through_turn_sequence
+        });
+        if idle && inspector_is_stale {
+            changed |= self.refresh_persistence_inspector();
+        }
+        self.next_persistence_poll = (!idle).then_some(now + PERSISTENCE_ACK_POLL_INTERVAL);
+        changed
+    }
+
+    pub fn cached_persistence_snapshot(
+        &self,
+        snapshot_sequence: u64,
+        revision: u64,
+        last_operation: Option<PersistenceOperationStatus>,
+        import_preview: Option<StateArtifactPreviewSummary>,
+    ) -> PersistenceSnapshot {
+        let pending = self.persistence_status.pending.as_ref();
+        let first_turn_sequence = pending.map(|pending| pending.first_turn_sequence);
+        let last_turn_sequence = pending.map(|pending| pending.last_turn_sequence);
+        let turn_count = pending.map_or(0, |pending| {
+            pending
+                .last_turn_sequence
+                .saturating_sub(pending.first_turn_sequence)
+                .saturating_add(1)
+        });
+        let inspector = self.persistence_inspector.as_ref();
+        let stored = inspector.map(|inspector| StoredSummary {
+            epoch: inspector.epoch,
+            through_turn_sequence: inspector.through_turn_sequence,
+            scalar_count: saturating_u32(inspector.scalar_count),
+            list_count: saturating_u32(inspector.list_count),
+            row_count: inspector.row_count.try_into().unwrap_or(u64::MAX),
+            encoded_value_bytes: inspector.encoded_value_bytes,
+            completed_migration_count: saturating_u32(inspector.completed_migration_count),
+        });
+        let outbox = inspector.map_or_else(
+            || OutboxSummary {
+                pending_count: 0,
+                dispatching_count: 0,
+                reconciliation_count: 0,
+                completed_count: 0,
+                samples: Vec::new(),
+            },
+            |inspector| OutboxSummary {
+                pending_count: saturating_u32(inspector.outbox_pending_count),
+                dispatching_count: saturating_u32(inspector.outbox_dispatching_count),
+                reconciliation_count: saturating_u32(inspector.outbox_reconciliation_count),
+                completed_count: saturating_u32(inspector.outbox_completed_count),
+                samples: inspector
+                    .outbox_samples
+                    .iter()
+                    .take(MAX_PERSISTENCE_OUTBOX_SAMPLES)
+                    .map(|sample| OutboxSample {
+                        item_id: *sample.item_id.as_bytes(),
+                        invocation_id: *sample.invocation_id.as_bytes(),
+                        effect_id: *sample.effect_id.as_bytes(),
+                        state: match sample.state {
+                            OutboxInspectorState::Pending => OutboxSampleState::Pending,
+                            OutboxInspectorState::Dispatching => OutboxSampleState::Dispatching,
+                            OutboxInspectorState::ReconciliationRequired => {
+                                OutboxSampleState::ReconciliationRequired
+                            }
+                            OutboxInspectorState::Completed => OutboxSampleState::Completed,
+                        },
+                        attempt: sample.attempt,
+                        created_turn_sequence: sample.created_turn_sequence,
+                        updated_turn_sequence: sample.updated_turn_sequence,
+                    })
+                    .collect(),
+            },
+        );
+        let operation_error = last_operation
+            .as_ref()
+            .filter(|operation| !operation.ok)
+            .map(|operation| operation.message.as_str());
+        let worker_error = self
+            .persistence_status
+            .last_error
+            .as_ref()
+            .map(ToString::to_string);
+        let last_actionable_error = operation_error
+            .or(self.persistence_inspector_error.as_deref())
+            .map(str::to_owned)
+            .or(worker_error)
+            .map(|message| bounded_persistence_text(&message));
+
+        PersistenceSnapshot {
+            snapshot_sequence,
+            revision,
+            application: self.application.clone(),
+            schema_version: self.persistence_schema_version,
+            schema_hash: self.persistence_schema_hash,
+            authority: AuthoritySummary {
+                runtime_turn_sequence: self.runtime_turn_sequence,
+                source_event_sequence: self.sequence,
+                scalar_count: self.authority_plan_counts.scalar,
+                indexed_field_count: self.authority_plan_counts.indexed_field,
+                list_count: self.authority_plan_counts.list,
+                effect_contract_count: self.authority_plan_counts.effect_contract,
+            },
+            stored,
+            pending: PendingSummary {
+                first_turn_sequence,
+                last_turn_sequence,
+                oldest_age_millis: pending.map_or(0, |pending| {
+                    pending.age.as_millis().try_into().unwrap_or(u64::MAX)
+                }),
+                turn_count,
+                queue_depth: saturating_u32(self.persistence_status.queue_depth),
+                reserved_slots: saturating_u32(self.persistence_status.reserved_slots),
+                accepting_turns: self.persistence_status.accepting_turns,
+            },
+            durable: DurableSummary {
+                epoch: self.persistence_status.durable_epoch,
+                through_turn_sequence: self.persistence_status.durable_through_turn_sequence,
+            },
+            timings: PersistenceTimingSummary {
+                authority_enqueue_us: self
+                    .last_runtime_phase
+                    .persistence_enqueue_us
+                    .max(self.persistence_status.timings.authority_enqueue_us),
+                encode_us: self.persistence_status.timings.encode_us,
+                checkpoint_us: self.persistence_status.timings.checkpoint_us,
+                barrier_us: self.persistence_status.timings.barrier_us,
+                restore_us: self.persistence_status.timings.restore_us,
+                migration_us: self.persistence_status.timings.migration_us,
+                rebuild_derived_us: self.runtime.last_rebuild_derived_us(),
+            },
+            outbox,
+            worker_alive: self.persistence_status.worker_alive,
+            capabilities: PersistenceCapabilities {
+                clear_selected: available_capability(),
+                export_state: available_capability(),
+                import_preview: available_capability(),
+                activate_import: available_capability(),
+            },
+            import_preview,
+            last_actionable_error,
+            last_operation: last_operation.map(|mut operation| {
+                operation.message = bounded_persistence_text(&operation.message);
+                operation
+            }),
+        }
+    }
+
+    pub fn flush_persistence(&mut self) -> ViewResult<(u64, u64)> {
+        let acknowledgement = self.runtime.flush().map_err(|error| error.to_string())?;
+        self.refresh_persistence_after_control();
+        Ok((
+            acknowledgement.epoch,
+            self.persistence_status.durable_through_turn_sequence,
+        ))
+    }
+
+    pub fn compact_persistence(&mut self) -> ViewResult<u64> {
+        let acknowledgement = self.runtime.compact().map_err(|error| error.to_string())?;
+        self.refresh_persistence_after_control();
+        Ok(acknowledgement.epoch)
+    }
+
+    pub fn export_state_artifact(&mut self) -> ViewResult<Vec<u8>> {
+        let artifact = self
+            .runtime
+            .export_state_artifact()
+            .map_err(|error| error.to_string())?;
+        self.refresh_persistence_after_control();
+        Ok(artifact)
+    }
+
+    pub fn preview_state_artifact(
+        &mut self,
+        artifact: &[u8],
+    ) -> ViewResult<boon_runtime::PersistentStateArtifactPreview> {
+        let preview = self
+            .runtime
+            .preview_state_artifact(artifact, SessionOptions::default())
+            .map_err(|error| error.to_string())?;
+        self.refresh_persistence_after_control();
+        Ok(preview)
+    }
+
+    pub fn activate_state_artifact(
+        &mut self,
+        artifact: &[u8],
+    ) -> ViewResult<(boon_runtime::PersistentStateArtifactPreview, u64)> {
+        let activation = self
+            .runtime
+            .activate_state_artifact(artifact, SessionOptions::default())
+            .map_err(|error| error.to_string())?;
+        let epoch = activation.acknowledgement.epoch;
+        let preview = activation.preview;
+        self.install_runtime_mount(activation.mount)?;
+        Ok((preview, epoch))
+    }
+
+    pub fn clear_authority_path(&mut self, semantic_path: &str) -> ViewResult<(u64, u64)> {
+        let activation = self
+            .runtime
+            .clear_authority_path(semantic_path, SessionOptions::default())
+            .map_err(|error| error.to_string())?;
+        let acknowledgement = activation
+            .acknowledgement
+            .ok_or_else(|| "clear authority did not produce a durable activation".to_owned())?;
+        let epoch = acknowledgement.epoch;
+        let turn = acknowledgement.through_turn_sequence;
+        self.install_runtime_mount(activation.mount)?;
+        Ok((epoch, turn))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persistence_query_counts(&self) -> PersistenceQueryCounts {
+        self.persistence_query_counts
+    }
+
+    fn refresh_plan_metadata(&mut self) {
+        let plan = self.runtime.runtime().machine_plan();
+        self.application = plan.application.identity.clone();
+        self.persistence_schema_version = plan.persistence.schema_version;
+        self.persistence_schema_hash = plan.persistence.schema_hash;
+        self.authority_plan_counts = authority_plan_counts(plan);
+        self.authority_selections = authority_selections(plan);
+    }
+
+    fn refresh_persistence_after_control(&mut self) {
+        self.persistence_status = self.query_persistence_status();
+        self.refresh_persistence_inspector();
+        self.persistence_status = self.query_persistence_status();
+        self.next_persistence_poll = None;
+    }
+
+    fn refresh_persistence_inspector(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            self.persistence_query_counts.storage =
+                self.persistence_query_counts.storage.saturating_add(1);
+        }
+        let previous = self.persistence_inspector.clone();
+        let previous_error = self.persistence_inspector_error.clone();
+        match self.runtime.inspect() {
+            Ok(inspector) => {
+                self.persistence_inspector = inspector;
+                self.persistence_inspector_error = None;
+            }
+            Err(error) => {
+                self.persistence_inspector_error = Some(error.to_string());
+            }
+        }
+        self.persistence_inspector != previous || self.persistence_inspector_error != previous_error
+    }
+
+    fn query_persistence_status(&mut self) -> PersistenceWorkerStatus {
+        #[cfg(test)]
+        {
+            self.persistence_query_counts.status =
+                self.persistence_query_counts.status.saturating_add(1);
+        }
+        self.runtime.status()
+    }
+
+    fn retain_view_state(&mut self, frame: &DocumentFrame) {
+        let contains_node = |id: &str| frame.nodes.contains_key(&DocumentNodeId(id.to_owned()));
+        self.hovered = self.hovered.take().filter(|id| contains_node(id));
+        self.pressed = self.pressed.take().filter(|id| contains_node(id));
+        self.focused = self.focused.take().filter(|id| contains_node(id));
+        self.text_drag = self.text_drag.take().filter(|id| contains_node(id));
+        self.scroll_offsets.retain(|id, _| contains_node(id));
+        self.last_primary_click = self
+            .last_primary_click
+            .take()
+            .filter(|(id, _)| contains_node(id));
+
+        let mut previous = std::mem::take(&mut self.text_inputs);
+        self.text_inputs = frame
+            .nodes
+            .values()
+            .filter(|node| node.kind == DocumentNodeKind::TextInput)
+            .map(|node| {
+                let text = node
+                    .text
+                    .as_ref()
+                    .map(|text| text.text.as_str())
+                    .unwrap_or_default();
+                let state = previous.remove(&node.id.0).map_or_else(
+                    || TextInputState::new(text),
+                    |mut state| {
+                        if state.buffer.text() != text {
+                            let column = state.buffer.caret().column;
+                            state.reset(text, column);
+                        }
+                        state
+                    },
+                );
+                (node.id.0.clone(), state)
+            })
+            .collect();
+        self.modifiers = InputModifiers::default();
+        self.pending_external_url = None;
+    }
+
+    pub fn frame(&self) -> DocumentFrame {
+        let mut frame = self.retained_frame().clone();
         for (id, scroll) in &self.scroll_offsets {
             if let Some(node) = frame.nodes.get_mut(&DocumentNodeId(id.clone())) {
                 node.scroll = Some(*scroll);
@@ -162,12 +700,34 @@ impl RuntimeView {
         frame
     }
 
+    fn retained_frame(&self) -> &DocumentFrame {
+        self.runtime
+            .runtime()
+            .primary_retained_output_frame()
+            .expect("mounted runtime keeps a retained output frame")
+    }
+
     pub fn hovered(&self) -> Option<&str> {
         self.hovered.as_deref()
     }
 
     pub fn focused(&self) -> Option<&str> {
         self.focused.as_deref()
+    }
+
+    pub fn focused_sensitive_input(&self) -> Option<(HostDocumentNodeId, Option<SourceBindingId>)> {
+        let node = self.focused.as_ref().and_then(|focused| {
+            self.retained_frame()
+                .nodes
+                .get(&DocumentNodeId(focused.clone()))
+        })?;
+        node.is_sensitive_text_input().then(|| {
+            (
+                HostDocumentNodeId(node.id.0.clone()),
+                node.primary_source_binding()
+                    .map(|binding| binding.id.clone()),
+            )
+        })
     }
 
     pub fn event_sequence(&self) -> u64 {
@@ -234,6 +794,7 @@ impl RuntimeView {
             .map_err(|_| "scenario target occurrence exceeds usize".to_owned())?;
         Ok(self
             .runtime
+            .runtime()
             .row_target_for_source_text(source_path, target_text, occurrence)
             .map_err(|error| error.to_string())?
             .map(|row| (row.key, row.generation)))
@@ -355,37 +916,35 @@ impl RuntimeView {
                     self.text_drag = None;
                     let matches = self.pressed.take().as_deref()
                         == target.as_ref().map(|target| target.node.as_str());
-                    if matches {
-                        if let Some(target) = target {
-                            if let Some(url) = self.external_url_for_node(&target.node) {
-                                self.pending_external_url = Some(url);
-                                return Ok(true);
-                            }
-                            if target.source_intent.as_deref() == Some("double_click") {
-                                let now = Instant::now();
-                                let is_double_click =
-                                    self.last_primary_click.take().is_some_and(|(node, at)| {
-                                        node == target.node
-                                            && now.saturating_duration_since(at)
-                                                <= DOUBLE_CLICK_INTERVAL
-                                    });
-                                if is_double_click {
-                                    return self.dispatch_target(
-                                        &target,
-                                        pointer_source_payload(pointer, &target),
-                                    );
-                                }
-                                self.last_primary_click = Some((target.node, now));
-                                return Ok(false);
-                            }
-                            if pointer_activation_intent(target.source_intent.as_deref())
-                                && !self.bare_source_is_text_input(&target)
-                            {
+                    if matches && let Some(target) = target {
+                        if let Some(url) = self.external_url_for_node(&target.node) {
+                            self.pending_external_url = Some(url);
+                            return Ok(true);
+                        }
+                        if target.source_intent.as_deref() == Some("double_click") {
+                            let now = Instant::now();
+                            let is_double_click =
+                                self.last_primary_click.take().is_some_and(|(node, at)| {
+                                    node == target.node
+                                        && now.saturating_duration_since(at)
+                                            <= DOUBLE_CLICK_INTERVAL
+                                });
+                            if is_double_click {
                                 return self.dispatch_target(
                                     &target,
                                     pointer_source_payload(pointer, &target),
                                 );
                             }
+                            self.last_primary_click = Some((target.node, now));
+                            return Ok(false);
+                        }
+                        if pointer_activation_intent(target.source_intent.as_deref())
+                            && !self.bare_source_is_text_input(&target)
+                        {
+                            return self.dispatch_target(
+                                &target,
+                                pointer_source_payload(pointer, &target),
+                            );
                         }
                     }
                     Ok(false)
@@ -402,9 +961,9 @@ impl RuntimeView {
                     .get(&root.0)
                     .copied()
                     .or_else(|| {
-                        self.runtime
-                            .document_frame()
-                            .and_then(|frame| frame.nodes.get(&root))
+                        self.retained_frame()
+                            .nodes
+                            .get(&root)
                             .and_then(|node| node.scroll)
                     })
                     .unwrap_or(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
@@ -456,10 +1015,7 @@ impl RuntimeView {
         intents: &[&str],
         mut payload: SourcePayload,
     ) -> ViewResult<bool> {
-        let frame = self
-            .runtime
-            .document_frame()
-            .ok_or_else(|| "mounted runtime has no document frame".to_owned())?;
+        let frame = self.retained_frame();
         let Some(node) = frame.nodes.get(&DocumentNodeId(node_id.to_owned())) else {
             return Ok(false);
         };
@@ -509,9 +1065,9 @@ impl RuntimeView {
         payload: SourcePayload,
     ) -> ViewResult<bool> {
         let binding = self
-            .runtime
-            .document_frame()
-            .and_then(|frame| frame.nodes.get(&DocumentNodeId(target.node.clone())))
+            .retained_frame()
+            .nodes
+            .get(&DocumentNodeId(target.node.clone()))
             .and_then(|node| {
                 intents.iter().find_map(|intent| {
                     node.source_bindings
@@ -534,16 +1090,15 @@ impl RuntimeView {
     }
 
     fn target_is_text_input(&self, target: &HitTarget) -> bool {
-        self.runtime
-            .document_frame()
-            .and_then(|frame| frame.nodes.get(&DocumentNodeId(target.node.clone())))
+        self.retained_frame()
+            .nodes
+            .get(&DocumentNodeId(target.node.clone()))
             .is_some_and(|node| node.kind == DocumentNodeKind::TextInput)
     }
 
     fn external_url_for_node(&self, node_id: &str) -> Option<String> {
         let style = &self
-            .runtime
-            .document_frame()?
+            .retained_frame()
             .nodes
             .get(&DocumentNodeId(node_id.to_owned()))?
             .style;
@@ -567,12 +1122,13 @@ impl RuntimeView {
         if target.row_key.is_none()
             && let Some(field) = self
                 .runtime
+                .runtime()
                 .source_row_lookup_field(path)
                 .map(str::to_owned)
             && let Some(value) = self
-                .runtime
-                .document_frame()
-                .and_then(|frame| frame.nodes.get(&DocumentNodeId(target.node.clone())))
+                .retained_frame()
+                .nodes
+                .get(&DocumentNodeId(target.node.clone()))
                 .and_then(|node| node.style.get(&field))
                 .and_then(style_payload_value)
         {
@@ -585,7 +1141,7 @@ impl RuntimeView {
                 }
             }
         }
-        let row = if self.runtime.source_is_row_scoped(path) == Some(true) {
+        let row = if self.runtime.runtime().source_is_row_scoped(path) == Some(true) {
             self.row_target(path, target.row_key, target.row_generation)?
         } else {
             None
@@ -599,15 +1155,20 @@ impl RuntimeView {
         row: Option<RowId>,
         payload: SourcePayload,
     ) -> ViewResult<bool> {
-        self.sequence = self.sequence.saturating_add(1);
+        let next_sequence = self.sequence.saturating_add(1);
         let event = self
             .runtime
-            .source_event(self.sequence, path, row, payload)
+            .runtime()
+            .source_event(next_sequence, path, row, payload)
             .map_err(|error| error.to_string())?;
         let turn = self
             .runtime
             .dispatch(event)
             .map_err(|error| error.to_string())?;
+        self.runtime_turn_sequence = turn.sequence;
+        self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
+        self.persistence_status = self.query_persistence_status();
+        self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
         self.last_runtime_phase = turn.phase_timings;
         self.last_dispatched_source = Some(path.to_owned());
         let changed = !turn.document_patches.is_empty();
@@ -836,9 +1397,9 @@ impl RuntimeView {
 
     fn sync_text_input_from_document(&mut self, id: &str, column: Option<usize>) {
         let Some(text) = self
-            .runtime
-            .document_frame()
-            .and_then(|frame| frame.nodes.get(&DocumentNodeId(id.to_owned())))
+            .retained_frame()
+            .nodes
+            .get(&DocumentNodeId(id.to_owned()))
             .filter(|node| node.kind == DocumentNodeKind::TextInput)
             .map(|node| {
                 node.text
@@ -953,10 +1514,171 @@ impl RuntimeView {
             return Ok(None);
         };
         self.runtime
+            .runtime()
             .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
             .map(Some)
             .map_err(|error| error.to_string())
     }
+}
+
+fn validate_preview_plan(plan: &MachinePlan) -> ViewResult<()> {
+    if !plan.application.identity.is_valid() {
+        return Err("MachinePlan has an invalid application identity".to_owned());
+    }
+    if plan.document_plan().is_none() {
+        return Err("MachinePlan has no typed document plan".to_owned());
+    }
+    Ok(())
+}
+
+fn scheduled_sources(runtime: &LiveRuntime) -> ViewResult<Vec<ScheduledSource>> {
+    if let Some(source) = runtime
+        .source_inventory()
+        .sources
+        .iter()
+        .find(|source| source.interval_ms == Some(0))
+    {
+        return Err(format!(
+            "scheduled source `{}` has a zero interval",
+            source.path
+        ));
+    }
+    let now = Instant::now();
+    Ok(runtime
+        .source_inventory()
+        .sources
+        .iter()
+        .filter_map(|source| {
+            let interval = Duration::from_millis(source.interval_ms?);
+            Some(ScheduledSource {
+                path: source.path.clone(),
+                interval,
+                next: now + interval,
+            })
+        })
+        .collect())
+}
+
+fn authority_plan_counts(plan: &MachinePlan) -> AuthorityPlanCounts {
+    AuthorityPlanCounts {
+        scalar: saturating_u32(
+            plan.persistence
+                .memory
+                .iter()
+                .filter(|memory| memory.kind == MemoryKind::Scalar)
+                .count(),
+        ),
+        indexed_field: saturating_u32(
+            plan.persistence
+                .memory
+                .iter()
+                .filter(|memory| memory.kind == MemoryKind::IndexedField)
+                .count(),
+        ),
+        list: saturating_u32(plan.persistence.lists.len()),
+        effect_contract: saturating_u32(plan.persistence.effect_outbox.len()),
+    }
+}
+
+fn authority_selections(
+    plan: &MachinePlan,
+) -> std::collections::BTreeMap<String, AuthoritySelection> {
+    let mut selections = std::collections::BTreeMap::new();
+    for memory in &plan.persistence.memory {
+        let kind = match memory.kind {
+            MemoryKind::Scalar => AuthoritySelectionKind::Scalar,
+            MemoryKind::IndexedField => AuthoritySelectionKind::IndexedField,
+            MemoryKind::List => AuthoritySelectionKind::List,
+        };
+        selections.insert(
+            memory.semantic_path.clone(),
+            AuthoritySelection {
+                semantic_path: memory.semantic_path.clone(),
+                memory_id: *memory.memory_id.as_bytes(),
+                kind,
+                row: None,
+                leaf_id: (memory.kind == MemoryKind::IndexedField)
+                    .then(|| memory.leaves.first().map(|leaf| *leaf.leaf_id.as_bytes()))
+                    .flatten(),
+            },
+        );
+    }
+    for list in &plan.persistence.lists {
+        selections.insert(
+            list.semantic_path.clone(),
+            AuthoritySelection {
+                semantic_path: list.semantic_path.clone(),
+                memory_id: *list.memory_id.as_bytes(),
+                kind: AuthoritySelectionKind::List,
+                row: None,
+                leaf_id: None,
+            },
+        );
+        for field in &list.row_fields {
+            selections.insert(
+                field.semantic_path.clone(),
+                AuthoritySelection {
+                    semantic_path: field.semantic_path.clone(),
+                    memory_id: *list.memory_id.as_bytes(),
+                    kind: AuthoritySelectionKind::IndexedField,
+                    row: None,
+                    leaf_id: Some(*field.leaf_id.as_bytes()),
+                },
+            );
+        }
+    }
+    selections
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    value.try_into().unwrap_or(u32::MAX)
+}
+
+fn bounded_persistence_text(value: &str) -> String {
+    if value.len() <= MAX_PERSISTENCE_STATUS_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_PERSISTENCE_STATUS_BYTES
+        .saturating_sub(3)
+        .min(value.len());
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}...", &value[..end])
+}
+
+fn available_capability() -> PersistenceCapability {
+    PersistenceCapability {
+        available: true,
+        reason: String::new(),
+    }
+}
+
+fn state_database_path(application: &ApplicationIdentity) -> ViewResult<PathBuf> {
+    let application =
+        ApplicationPlan::new(application.clone()).map_err(|error| error.to_string())?;
+    Ok(repository_root()
+        .join(STATE_DIRECTORY)
+        .join(digest_hex(&application.identity_hash))
+        .join("state.redb"))
+}
+
+fn repository_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|crates| crates.parent())
+        .expect("boon_native_playground lives under the workspace crates directory")
+        .to_path_buf()
+}
+
+fn digest_hex(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 fn external_url_scheme_is_allowed(url: &str) -> bool {
@@ -1156,6 +1878,10 @@ fn state_from_mount(patches: Vec<DocumentPatch>) -> ViewResult<DocumentState> {
     Ok(state)
 }
 
+fn source_sequence_after_turn(current: u64, source_sequence: Option<u64>) -> u64 {
+    source_sequence.unwrap_or(current)
+}
+
 fn style_u64(node: &boon_document::DocumentNode, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|key| match node.style.get(*key) {
         Some(StyleValue::Number(value)) if value.is_finite() && *value >= 0.0 => {
@@ -1171,6 +1897,103 @@ mod tests {
     use super::*;
     use boon_host::{KeyEvent, LogicalKey, PointerEvent, SurfaceId, TextInputEvent, WheelEvent};
     use boon_runtime::RuntimeSourceUnit;
+
+    #[test]
+    fn internal_runtime_turns_do_not_advance_the_source_event_sequence() {
+        assert_eq!(source_sequence_after_turn(7, None), 7);
+        assert_eq!(source_sequence_after_turn(7, Some(8)), 8);
+    }
+
+    #[test]
+    fn persistence_snapshot_and_render_construction_use_only_cached_state() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("minimal")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/minimal.bn", &units).unwrap();
+        let model = RuntimeView::open_in_memory(runtime).unwrap();
+        let queries_before = model.persistence_query_counts();
+
+        let _snapshot = model.cached_persistence_snapshot(1, 1, None, None);
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let _view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 640.0,
+                height: 480.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        let _snapshot = model.cached_persistence_snapshot(2, 1, None, None);
+
+        assert_eq!(model.persistence_query_counts(), queries_before);
+    }
+
+    #[test]
+    fn sensitive_input_never_enters_the_ordinary_editor_or_source_payload() {
+        const SENTINEL: &str = "sensitive-runtime-sentinel-28b7";
+        let source = r#"
+store: [
+    password_events: [change: SOURCE]
+]
+
+document: Document/new(
+    root: Element/text_input(
+        element: [events: store.password_events]
+        style: [width: 240, height: 36, sensitive: True]
+        text: TEXT { }
+    )
+)
+"#;
+        let runtime = LiveRuntime::from_source("sensitive-input.bn", source).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        let sensitive = model
+            .retained_frame()
+            .nodes
+            .values()
+            .find(|node| node.is_sensitive_text_input())
+            .expect("fixture has sensitive text input")
+            .clone();
+        assert!(!model.text_inputs.contains_key(&sensitive.id.0));
+
+        model.focused = Some(sensitive.id.0.clone());
+        let (node, binding) = model
+            .focused_sensitive_input()
+            .expect("focused sensitive input has a host target");
+        assert_eq!(node.0, sensitive.id.0);
+        assert_eq!(
+            binding,
+            sensitive
+                .primary_source_binding()
+                .map(|item| item.id.clone())
+        );
+
+        let sequence = model.event_sequence();
+        assert!(
+            !model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        text: SENTINEL.to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.event_sequence(), sequence);
+        assert!(!format!("{:?}", model.frame()).contains(SENTINEL));
+    }
 
     #[test]
     fn kavik_portfolio_reflows_without_horizontal_overflow() {
@@ -1191,8 +2014,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/kavik_cz/RUN.bn", &units).unwrap();
-        let mount = runtime.mount();
-        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
             model.frame(),
@@ -1411,8 +2233,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let runtime = LiveRuntime::from_project("examples/kavik_cz/RUN.bn", &units).unwrap();
-            let mount = runtime.mount();
-            let mut model = RuntimeView::mount(runtime, mount).unwrap();
+            let mut model = RuntimeView::open_in_memory(runtime).unwrap();
             let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
             let mut view = crate::view::RetainedView::new(
                 model.frame(),
@@ -1634,8 +2455,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/cells.bn", &units).unwrap();
-        let mount = runtime.mount();
-        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
             model.frame(),
@@ -1787,8 +2607,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/cells.bn", &units).unwrap();
-        let mount = runtime.mount();
-        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
             model.frame(),
@@ -2012,8 +2831,9 @@ mod tests {
                     .collect::<Vec<_>>();
                 let runtime_bindings = model
                     .runtime
-                    .document_frame()
-                    .expect("mounted runtime document")
+                    .runtime()
+                    .primary_retained_output_frame()
+                    .expect("mounted runtime output")
                     .nodes
                     .values()
                     .flat_map(|node| node.source_bindings.iter())
@@ -2124,8 +2944,9 @@ mod tests {
                 .focused()
                 .and_then(|focused| model
                     .runtime
-                    .document_frame()
-                    .expect("mounted runtime document")
+                    .runtime()
+                    .primary_retained_output_frame()
+                    .expect("mounted runtime output")
                     .nodes
                     .get(&DocumentNodeId(focused.to_owned())))
                 .map(|node| node
@@ -2172,8 +2993,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let runtime =
                 LiveRuntime::from_project(&format!("examples/{example_id}.bn"), &units).unwrap();
-            let mount = runtime.mount();
-            let mut model = RuntimeView::mount(runtime, mount).unwrap();
+            let mut model = RuntimeView::open_in_memory(runtime).unwrap();
             let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
             let mut view = crate::view::RetainedView::new(
                 model.frame(),
@@ -2293,15 +3113,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/novywave/RUN.bn", &units).unwrap();
-        let mount = runtime.mount();
-        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
             model.frame(),
             boon_host::Viewport {
                 surface: 1,
-                width: 508.0,
-                height: 540.0,
+                width: 1_100.0,
+                height: 760.0,
                 scale: 1.0,
             },
             &mut columns,
@@ -2318,12 +3137,10 @@ mod tests {
         }
 
         let selected_lane_count = model
-            .runtime
-            .inspect_value_current("selected_lane_materialized_row_count", 1)
+            .inspect_root_current("selected_lane_materialized_row_count")
             .unwrap();
         assert_eq!(
-            selected_lane_count,
-            boon_runtime::Value::Number(3),
+            selected_lane_count, "3",
             "NovyWave selected lane model is not current"
         );
 
@@ -2418,8 +3235,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/novywave/RUN.bn", &units).unwrap();
-        let mount = runtime.mount();
-        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
             model.frame(),
@@ -2440,18 +3256,12 @@ mod tests {
 
         assert_eq!(model.event_sequence(), example.test_steps.len() as u64);
         assert_eq!(
-            model
-                .runtime
-                .inspect_value_current("cursor_position", 1)
-                .unwrap(),
-            Value::Text("Cursor48".to_owned())
+            model.inspect_root_current("cursor_position").unwrap(),
+            "\"Cursor48\""
         );
         assert_eq!(
-            model
-                .runtime
-                .inspect_value_current("keyboard_cursor_label", 1)
-                .unwrap(),
-            Value::Text("150 s".to_owned())
+            model.inspect_root_current("keyboard_cursor_label").unwrap(),
+            "\"150 s\""
         );
     }
 
@@ -2480,8 +3290,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let runtime =
                 LiveRuntime::from_project(&format!("examples/{example_id}.bn"), &units).unwrap();
-            let mount = runtime.mount();
-            let mut model = RuntimeView::mount(runtime, mount).unwrap();
+            let mut model = RuntimeView::open_in_memory(runtime).unwrap();
             let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
             let mut view = crate::view::RetainedView::new(
                 model.frame(),
@@ -2537,8 +3346,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/counter.bn", &units).unwrap();
-        let mount = runtime.mount();
-        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
             model.frame(),
@@ -2594,6 +3402,68 @@ mod tests {
         }
 
         assert_eq!(view.retained_stats().full_lower_count, initial_full_lowers);
+
+        let replacement = model.runtime.runtime().shared_machine_plan();
+        model.activate_machine_plan(replacement).unwrap();
+        assert_eq!(model.inspect_root_current("store.count").unwrap(), "0");
+        assert!(
+            model.persistence_status().durable_through_turn_sequence >= model.event_sequence(),
+            "compatible activation must retain the acknowledged authority"
+        );
+    }
+
+    #[test]
+    fn migration_preview_is_detached_and_activation_updates_store_before_view_state() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("counter_migration")
+            .unwrap();
+        let migration = example.migration.expect("migration bundle");
+        let initial = crate::compile::compile_migration_stage(
+            &example.application,
+            &migration,
+            &migration.initial_stage,
+        )
+        .unwrap();
+        let runtime =
+            LiveRuntime::from_shared_machine_plan(initial, SessionOptions::default()).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        let before_frame = model.frame();
+        let before_store = model.runtime.load_durable_image().unwrap().unwrap();
+        let target =
+            crate::compile::compile_migration_stage(&example.application, &migration, "v2")
+                .unwrap();
+
+        assert!(!model.plan_schema_matches(&target));
+        let preview = model.preview_machine_plan(Arc::clone(&target)).unwrap();
+        assert_eq!(preview.target_schema_version, 2);
+        assert!(preview.migration.is_some());
+        assert_eq!(model.frame(), before_frame);
+        assert_eq!(
+            model.runtime.load_durable_image().unwrap(),
+            Some(before_store)
+        );
+        assert_eq!(model.persistence_schema_version(), 1);
+
+        let activation = model.activate_machine_plan(target).unwrap();
+        assert_eq!(activation.target_schema_version, 2);
+        assert!(activation.migration.is_some());
+        assert_eq!(model.persistence_schema_version(), 2);
+        assert_eq!(
+            model
+                .runtime
+                .load_durable_image()
+                .unwrap()
+                .unwrap()
+                .schema_version,
+            2
+        );
+
+        let reset = model.start_over().unwrap();
+        assert!(reset.durable_epoch >= activation.durable_epoch);
+        let restart = model.restart().unwrap();
+        assert_eq!(restart.target_schema_version, 2);
+        assert_eq!(model.persistence_schema_version(), 2);
     }
 
     #[test]
@@ -2613,8 +3483,7 @@ mod tests {
             .collect::<Vec<_>>();
         let runtime =
             LiveRuntime::from_project("examples/todo_mvc_physical/RUN.bn", &units).unwrap();
-        let mount = runtime.mount();
-        let mut model = RuntimeView::mount(runtime, mount).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
             model.frame(),

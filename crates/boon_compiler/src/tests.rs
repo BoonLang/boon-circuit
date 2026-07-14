@@ -31,9 +31,12 @@ store: [
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
 }
 use boon_plan::{
-    DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
-    DocumentValueClass, PLAN_MAJOR_VERSION, PlanDerivedExpression, PlanOpKind, PlanRowExpression,
-    RootOutputDemand, ValueRef, plan_sha256,
+    DataTypePlan, DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
+    DocumentValueClass, EffectBarrier, EffectReplay, MemoryId, MemoryKind, MigrationExpressionPlan,
+    MigrationPredecessorBinding, MigrationTransferKindPlan, MigrationTransformPlan,
+    OutputContractKind, OutputDemandPolicy, OutputValueRef, PLAN_MAJOR_VERSION,
+    PlanDerivedExpression, PlanExpressionKind, PlanOpKind, PlanRowExpression, RootOutputDemand,
+    ValueRef, plan_binary, plan_sha256, verify_plan,
 };
 
 fn example_path(path: &str) -> PathBuf {
@@ -74,8 +77,44 @@ fn expression_reads_field(
     }
 }
 
+fn compile_migration_fixture_chain(
+    fixture: &str,
+    final_version: u64,
+    identity: ApplicationIdentity,
+) {
+    let mut predecessor = None;
+    for version in 1..=final_version {
+        let relative_path = format!("examples/migrations/{fixture}/v{version}.bn");
+        let source = fs::read_to_string(example_path(&relative_path)).unwrap();
+        let bindings = predecessor.as_slice();
+        let compiled = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+            &relative_path,
+            &source,
+            TargetProfile::SoftwareDefault,
+            identity.clone(),
+            version,
+            bindings,
+        )
+        .unwrap_or_else(|error| panic!("{relative_path} did not compile: {error}"));
+        let verification = verify_plan(&compiled.plan).unwrap();
+        assert_eq!(
+            verification.status,
+            "pass",
+            "{relative_path} emitted an invalid MachinePlan: {:?}",
+            verification
+                .checks
+                .iter()
+                .filter(|check| !check.pass)
+                .collect::<Vec<_>>()
+        );
+        predecessor = Some(MigrationPredecessorBinding::from_machine_plan(
+            &compiled.plan,
+        ));
+    }
+}
+
 #[test]
-fn compiler_emits_machine_plan_v2_as_its_only_output() {
+fn compiler_emits_machine_plan_v3_as_its_only_output() {
     let compiled = compile_source_text_to_machine_plan(
         "examples/bytes_length_plan_ops.bn",
         include_str!("../../../examples/bytes_length_plan_ops.bn"),
@@ -86,6 +125,990 @@ fn compiler_emits_machine_plan_v2_as_its_only_output() {
     assert_eq!(compiled.plan.version.major, PLAN_MAJOR_VERSION);
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
     assert!(compiled.profile.expression_count > 0);
+}
+
+#[test]
+fn compiler_lowers_typed_output_roots_into_the_generic_registry() {
+    let compiled = compile_source_text_to_machine_plan(
+        "counter-output-root.bn",
+        include_str!("../../../examples/counter.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert_eq!(compiled.plan.outputs.len(), 1);
+    assert_eq!(compiled.plan.outputs[0].name, "document");
+    assert_eq!(
+        compiled.plan.outputs[0].contract,
+        OutputContractKind::Document
+    );
+    assert_eq!(
+        compiled.plan.outputs[0].demand,
+        OutputDemandPolicy::HostDemanded
+    );
+    assert_eq!(
+        compiled.plan.outputs[0].value,
+        OutputValueRef::RetainedVisual {
+            expression: document.root.expression
+        }
+    );
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .any(|check| check.id == "output-roots-typed-canonical-and-resolved" && check.pass)
+    );
+}
+
+#[test]
+fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
+    let compiled = compile_source_text_to_machine_plan(
+        "server-outputs.bn",
+        include_str!("../../../examples/server_outputs.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert!(compiled.plan.document.is_none());
+    assert_eq!(
+        compiled
+            .plan
+            .outputs
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect::<Vec<_>>(),
+        ["api_response", "pending_priorities"]
+    );
+    let response = compiled.plan.output_root("api_response").unwrap();
+    assert!(matches!(
+        &response.contract,
+        OutputContractKind::HostValue {
+            data_type: DataTypePlan::Record { open: false, .. }
+        }
+    ));
+    assert!(matches!(
+        &response.value,
+        OutputValueRef::RuntimeValue {
+            value: ValueRef::Field(_)
+        }
+    ));
+    let jobs = compiled.plan.output_root("pending_priorities").unwrap();
+    assert!(matches!(
+        &jobs.contract,
+        OutputContractKind::HostValue {
+            data_type: DataTypePlan::List { .. }
+        }
+    ));
+    assert!(matches!(
+        &jobs.value,
+        OutputValueRef::RuntimeValue {
+            value: ValueRef::Field(_)
+        }
+    ));
+    let verification = verify_plan(&compiled.plan).unwrap();
+    let failures = verification
+        .checks
+        .iter()
+        .filter(|check| !check.pass)
+        .collect::<Vec<_>>();
+    assert!(
+        failures.is_empty(),
+        "non-visual output plan must be closed and executable: {failures:?}"
+    );
+}
+
+#[test]
+fn output_root_identity_ignores_formatting_and_unrelated_declarations() {
+    let compact = compile_source_text_to_machine_plan(
+        "stable-output.bn",
+        r#"
+store: [
+    value: 7 |> HOLD value { LATEST {} }
+]
+outputs: [
+    delivery_result: store.value
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let reformatted = compile_source_text_to_machine_plan(
+        "stable-output.bn",
+        r#"
+-- unrelated formatting and declaration do not define host identity
+helper: TEXT { ignored }
+
+store: [
+    value:
+        7 |> HOLD value {
+            LATEST {}
+        }
+]
+
+outputs: [
+    delivery_result: store.value
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(
+        compact.plan.output_root("delivery_result").unwrap().id,
+        reformatted.plan.output_root("delivery_result").unwrap().id
+    );
+}
+
+#[test]
+fn consequential_io_cannot_hide_in_retained_document_evaluation() {
+    let error = compile_source_text_to_machine_plan(
+        "document-log-effect.bn",
+        r#"
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: TEXT { hidden effect } |> Log/info()
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot run during retained document evaluation"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes() {
+    let read = compile_source_text_to_machine_plan(
+        "bytes-file-read.bn",
+        include_str!("../../../examples/bytes_file_read_plan_ops.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert_eq!(read.plan.effects.len(), 1);
+    assert_eq!(read.plan.effects[0].host_operation, "File/read_bytes");
+    assert_eq!(read.plan.effects[0].replay, EffectReplay::ReadOnly);
+    assert_eq!(read.plan.effects[0].barrier, EffectBarrier::None);
+
+    let write = compile_source_text_to_machine_plan(
+        "transactional-file-write.bn",
+        include_str!("../../../examples/bytes_file_write_effect.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let contract = write
+        .plan
+        .effects
+        .iter()
+        .find(|contract| contract.host_operation == "File/write_bytes")
+        .expect("write effect contract");
+    assert!(matches!(
+        contract.replay,
+        EffectReplay::Idempotent {
+            key_type: DataTypePlan::Bytes {
+                fixed_len: Some(32)
+            }
+        }
+    ));
+    assert_eq!(contract.barrier, EffectBarrier::BeforeAndAfter);
+    assert!(
+        write
+            .plan
+            .persistence
+            .effect_outbox
+            .iter()
+            .any(|schema| schema.effect_id == contract.effect_id)
+    );
+    let invocation = write
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::FileWriteBytes,
+                effect,
+                ..
+            } => effect.as_ref(),
+            _ => None,
+        })
+        .expect("write effect invocation");
+    assert_eq!(invocation.effect_id, contract.effect_id);
+    assert_eq!(invocation.intent_inputs.len(), 2);
+    assert!(
+        verify_plan(&write.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass),
+        "compiled transactional write plan must verify"
+    );
+}
+
+#[test]
+fn indexed_list_persistence_covers_every_executor_authority_field() {
+    let compiled = compile_source_text_to_machine_plan(
+        "todomvc-authority-coverage.bn",
+        include_str!("../../../examples/todomvc.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let list_slot = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| {
+            compiled.plan.debug_map.list_slots.iter().any(|entry| {
+                entry.id == format!("list:{}", slot.list_id.0) && entry.label == "todos"
+            })
+        })
+        .expect("todos list slot");
+    let list_memory = compiled
+        .plan
+        .persistence
+        .lists
+        .iter()
+        .find(|memory| memory.runtime_slot == list_slot.id)
+        .expect("todos persistence memory");
+    let stable_fields = list_memory
+        .row_fields
+        .iter()
+        .filter_map(|field| field.runtime_field_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let initial_fields = list_slot
+        .initial_rows
+        .iter()
+        .flat_map(|row| &row.fields)
+        .filter_map(|field| field.field_id)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert!(initial_fields.is_subset(&stable_fields));
+    assert!(
+        list_memory
+            .row_fields
+            .iter()
+            .any(|field| field.semantic_path == "store.todos.$input$title")
+    );
+    assert!(
+        list_memory
+            .row_fields
+            .iter()
+            .any(|field| field.semantic_path == "store.todos.$input$completed")
+    );
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .any(|check| {
+                check.id == "list-authority-fields-have-stable-persistence-leaves" && check.pass
+            })
+    );
+}
+
+fn persistence_ids_by_semantic_path(
+    plan: &boon_plan::MachinePlan,
+) -> std::collections::BTreeMap<(MemoryKind, String), MemoryId> {
+    plan.persistence
+        .memory
+        .iter()
+        .map(|memory| {
+            (
+                (memory.kind, memory.semantic_path.clone()),
+                memory.memory_id,
+            )
+        })
+        .chain(plan.persistence.lists.iter().map(|list| {
+            (
+                (MemoryKind::List, list.semantic_path.clone()),
+                list.memory_id,
+            )
+        }))
+        .collect()
+}
+
+#[test]
+fn compiler_persistence_metadata_verifies_and_has_no_invented_migrations() {
+    let compiled = compile_source_text_to_machine_plan(
+        "counter-display-label.bn",
+        include_str!("../../../examples/counter.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let verification = verify_plan(&compiled.plan).unwrap();
+
+    assert!(
+        verification
+            .checks
+            .iter()
+            .filter(|check| {
+                check.id.starts_with("application-")
+                    || check.id.starts_with("persistence-")
+                    || check.id.starts_with("migration-")
+            })
+            .all(|check| check.pass),
+        "{:#?}",
+        verification.checks
+    );
+    assert!(compiled.plan.persistence.migration_edges.is_empty());
+    assert_eq!(
+        compiled.plan.application.identity,
+        ApplicationIdentity::compiler_default()
+    );
+}
+
+#[test]
+fn persistence_identity_is_stable_across_formatting_and_display_labels() {
+    let source = include_str!("../../../examples/counter.bn");
+    let formatted = format!("\n\n\n{source}\n\n");
+    let first = compile_source_text_to_machine_plan(
+        "first-display-label.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let second = compile_source_text_to_machine_plan(
+        "renamed-display-label.bn",
+        &formatted,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(
+        persistence_ids_by_semantic_path(&first.plan),
+        persistence_ids_by_semantic_path(&second.plan)
+    );
+    assert_eq!(
+        first.plan.persistence.schema_hash,
+        second.plan.persistence.schema_hash
+    );
+}
+
+#[test]
+fn persistence_identity_is_stable_across_state_and_list_sibling_reordering() {
+    let first = r#"
+store: [
+    events: [
+        alpha: SOURCE
+        beta: SOURCE
+    ]
+    alpha:
+        0 |> HOLD alpha {
+            LATEST { events.alpha |> THEN { alpha + 1 } }
+        }
+    beta:
+        0 |> HOLD beta {
+            LATEST { events.beta |> THEN { beta + 1 } }
+        }
+    primary: LIST {
+        [label: TEXT { primary }]
+    }
+    secondary: LIST {
+        [label: TEXT { secondary }]
+    }
+]
+"#;
+    let reordered = r#"
+store: [
+    events: [
+        beta: SOURCE
+        alpha: SOURCE
+    ]
+    secondary: LIST {
+        [label: TEXT { secondary }]
+    }
+    beta:
+        0 |> HOLD beta {
+            LATEST { events.beta |> THEN { beta + 1 } }
+        }
+    primary: LIST {
+        [label: TEXT { primary }]
+    }
+    alpha:
+        0 |> HOLD alpha {
+            LATEST { events.alpha |> THEN { alpha + 1 } }
+        }
+]
+"#;
+    let first =
+        compile_source_text_to_machine_plan("ordered.bn", first, TargetProfile::SoftwareDefault)
+            .unwrap();
+    let reordered = compile_source_text_to_machine_plan(
+        "reordered.bn",
+        reordered,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(
+        persistence_ids_by_semantic_path(&first.plan),
+        persistence_ids_by_semantic_path(&reordered.plan)
+    );
+    assert_eq!(
+        first.plan.persistence.schema_hash,
+        reordered.plan.persistence.schema_hash
+    );
+}
+
+#[test]
+fn memory_identity_excludes_defaults_and_recursive_type_fingerprints() {
+    let number = r#"
+events: SOURCE
+value:
+    0 |> HOLD value {
+        LATEST { events |> THEN { 1 } }
+    }
+"#;
+    let text = r#"
+events: SOURCE
+value:
+    TEXT { zero } |> HOLD value {
+        LATEST { events |> THEN { TEXT { one } } }
+    }
+"#;
+    let number = compile_source_text_to_machine_plan(
+        "number-default.bn",
+        number,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let text = compile_source_text_to_machine_plan(
+        "text-default.bn",
+        text,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let number_memory = &number.plan.persistence.memory[0];
+    let text_memory = &text.plan.persistence.memory[0];
+    assert_eq!(number_memory.semantic_path, text_memory.semantic_path);
+    assert_eq!(number_memory.memory_id, text_memory.memory_id);
+    assert_ne!(number_memory.type_fingerprint, text_memory.type_fingerprint);
+}
+
+#[test]
+fn identity_aware_compiler_api_uses_host_identity_without_changing_memory_ids() {
+    let source = include_str!("../../../examples/counter.bn");
+    let first_identity = ApplicationIdentity::new("dev.boon.counter", "alice", "test");
+    let second_identity = ApplicationIdentity::new("dev.boon.counter", "bob", "test");
+    let first = compile_source_text_to_machine_plan_with_identity(
+        "counter-one.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+        first_identity.clone(),
+    )
+    .unwrap();
+    let second = compile_source_text_to_machine_plan_with_identity(
+        "counter-two.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+        second_identity.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(first.plan.application.identity, first_identity);
+    assert_eq!(second.plan.application.identity, second_identity);
+    assert_eq!(
+        persistence_ids_by_semantic_path(&first.plan),
+        persistence_ids_by_semantic_path(&second.plan)
+    );
+    assert_ne!(
+        first.plan.persistence.schema_hash,
+        second.plan.persistence.schema_hash
+    );
+}
+
+#[test]
+fn persistence_schema_version_is_an_explicit_compiler_input() {
+    let source = include_str!("../../../examples/counter.bn");
+    let identity = ApplicationIdentity::new("dev.boon.counter", "migration", "test");
+    let v1 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "counter-v1.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        1,
+    )
+    .unwrap();
+    let v2 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "counter-v2.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+        identity,
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(v1.plan.persistence.schema_version, 1);
+    assert_eq!(v2.plan.persistence.schema_version, 2);
+    assert_eq!(
+        persistence_ids_by_semantic_path(&v1.plan),
+        persistence_ids_by_semantic_path(&v2.plan)
+    );
+    assert_ne!(
+        v1.plan.persistence.schema_hash,
+        v2.plan.persistence.schema_hash
+    );
+}
+
+#[test]
+fn compatible_versions_bind_noop_edges_and_inherit_skipped_activation_catalog() {
+    let v1_source = "count: 0 |> HOLD count { LATEST {} }";
+    let v2_source = "count: 10 |> HOLD count { LATEST {} }";
+    let v3_source = "count: 20 |> HOLD count { LATEST {} }";
+    let identity = ApplicationIdentity::new("dev.boon.counter", "catalog", "test");
+    let v1 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "counter-v1.bn",
+        v1_source,
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        1,
+    )
+    .unwrap();
+    let v1_binding = MigrationPredecessorBinding::from_machine_plan(&v1.plan);
+    let v2 = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+        "counter-v2.bn",
+        v2_source,
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        2,
+        std::slice::from_ref(&v1_binding),
+    )
+    .unwrap();
+    let v2_repeat = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+        "counter-v2.bn",
+        v2_source,
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        2,
+        std::slice::from_ref(&v1_binding),
+    )
+    .unwrap();
+
+    assert_eq!(
+        plan_binary(&v2.plan).unwrap(),
+        plan_binary(&v2_repeat.plan).unwrap()
+    );
+    assert_eq!(v2.plan.persistence.migration_recipes.len(), 1);
+    assert!(v2.plan.persistence.migration_recipes[0].is_noop());
+    assert_eq!(v2.plan.persistence.migration_edges.len(), 1);
+    assert_eq!(
+        v2.plan.persistence.migration_edges[0].source_schema_hash,
+        v1.plan.persistence.schema_hash
+    );
+
+    let v2_binding = MigrationPredecessorBinding::from_machine_plan(&v2.plan);
+    let v3 = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+        "counter-v3.bn",
+        v3_source,
+        TargetProfile::SoftwareDefault,
+        identity,
+        3,
+        &[v2_binding],
+    )
+    .unwrap();
+
+    assert_eq!(v3.plan.persistence.migration_recipes.len(), 1);
+    assert!(v3.plan.persistence.migration_recipes[0].is_noop());
+    assert_eq!(v3.plan.persistence.migration_edges.len(), 2);
+    assert_eq!(
+        v3.plan
+            .persistence
+            .migration_edges
+            .iter()
+            .map(|edge| (edge.source_schema_version, edge.target_schema_version))
+            .collect::<Vec<_>>(),
+        vec![(1, 2), (2, 3)]
+    );
+    assert_eq!(verify_plan(&v3.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn incompatible_shared_memory_type_requires_drain() {
+    let identity = ApplicationIdentity::new("dev.boon.counter", "incompatible", "test");
+    let v1 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "value-v1.bn",
+        "value: 1 |> HOLD value { LATEST {} }",
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        1,
+    )
+    .unwrap();
+    let predecessor = MigrationPredecessorBinding::from_machine_plan(&v1.plan);
+    let error = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+        "value-v2.bn",
+        "value: TEXT { one } |> HOLD value { LATEST {} }",
+        TargetProfile::SoftwareDefault,
+        identity,
+        2,
+        &[predecessor],
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("without DRAIN"), "{error}");
+}
+
+#[test]
+fn every_versioned_migration_fixture_compiles_as_a_catalog_chain() {
+    compile_migration_fixture_chain(
+        "counter",
+        3,
+        ApplicationIdentity::new("dev.boon.counter", "fixture-chain", "test"),
+    );
+    compile_migration_fixture_chain(
+        "todo",
+        7,
+        ApplicationIdentity::new("dev.boon.todo", "fixture-chain", "test"),
+    );
+}
+
+#[test]
+fn compiler_lowers_when_migration_and_binds_predecessor_without_schema_cycle() {
+    let predecessor_source = r#"
+completed: False |> HOLD completed { LATEST {} }
+"#;
+    let source = r#"
+completed: False |> HOLD completed { LATEST {} } |> DRAINING
+status:
+    DRAIN { completed }
+    |> WHEN {
+        True => Done
+        False => Open
+    }
+    |> HOLD status { LATEST {} }
+"#;
+    let identity = ApplicationIdentity::new("dev.boon.todo", "migration", "test");
+    let predecessor_plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "status-v1.bn",
+        predecessor_source,
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        1,
+    )
+    .unwrap();
+    let unbound = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "status-v2.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        2,
+    )
+    .unwrap();
+    let predecessor = MigrationPredecessorBinding::from_machine_plan(&predecessor_plan.plan);
+    let bound = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+        "status-v2.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+        identity,
+        2,
+        std::slice::from_ref(&predecessor),
+    )
+    .unwrap();
+
+    assert_eq!(
+        unbound.plan.persistence.schema_hash,
+        bound.plan.persistence.schema_hash
+    );
+    assert_eq!(
+        unbound.plan.persistence.migration_recipe_hash,
+        bound.plan.persistence.migration_recipe_hash
+    );
+    assert_ne!(
+        unbound.plan.persistence.migration_catalog_hash,
+        bound.plan.persistence.migration_catalog_hash
+    );
+    assert_eq!(bound.plan.persistence.migration_recipes.len(), 1);
+    assert_eq!(bound.plan.persistence.migration_edges.len(), 1);
+    assert_eq!(
+        bound.plan.persistence.migration_edges[0].source_schema_hash,
+        predecessor.source_schema_hash()
+    );
+    assert!(
+        bound
+            .plan
+            .persistence
+            .memory
+            .iter()
+            .any(|memory| memory.semantic_path == "status")
+    );
+    assert!(
+        bound
+            .plan
+            .persistence
+            .memory
+            .iter()
+            .all(|memory| memory.semantic_path != "completed"),
+        "DRAINING source authority must not remain in the target schema"
+    );
+
+    let transfer = &bound.plan.persistence.migration_recipes[0].transfers[0];
+    assert_eq!(transfer.transfer_kind, MigrationTransferKindPlan::Scalar);
+    let MigrationTransformPlan::Expression {
+        root: MigrationExpressionPlan::Match { arms, .. },
+    } = &transfer.transform
+    else {
+        panic!("WHEN migration must lower to a target-neutral Match: {transfer:#?}");
+    };
+    assert_eq!(
+        arms.iter()
+            .map(|arm| arm.pattern.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&["False".to_owned()][..], &["True".to_owned()][..]]
+    );
+    assert!(format!("{:?}", bound.plan.regions).find("Drain").is_none());
+    assert_eq!(verify_plan(&bound.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn migration_recipe_ids_ignore_formatting_sibling_and_record_field_order() {
+    let ordered = r#"
+left: 1 |> HOLD left { LATEST {} } |> DRAINING
+right: 2 |> HOLD right { LATEST {} } |> DRAINING
+merged:
+    [left: DRAIN { left }, right: DRAIN { right }]
+    |> HOLD merged { LATEST {} }
+"#;
+    let reordered = r#"
+
+right: 2 |> HOLD right { LATEST {} } |> DRAINING
+
+left: 1 |> HOLD left { LATEST {} } |> DRAINING
+merged:
+    [right: DRAIN { right }, left: DRAIN { left }]
+    |> HOLD merged { LATEST {} }
+
+"#;
+    let identity = ApplicationIdentity::new("dev.boon.merge", "migration", "test");
+    let first = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "merge-a.bn",
+        ordered,
+        TargetProfile::SoftwareDefault,
+        identity.clone(),
+        2,
+    )
+    .unwrap();
+    let second = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "merge-b.bn",
+        reordered,
+        TargetProfile::SoftwareDefault,
+        identity,
+        2,
+    )
+    .unwrap();
+
+    assert_eq!(
+        first.plan.persistence.schema_hash,
+        second.plan.persistence.schema_hash
+    );
+    assert_eq!(
+        first.plan.persistence.current_migration_recipe_id,
+        second.plan.persistence.current_migration_recipe_id
+    );
+    let transfer = &first.plan.persistence.migration_recipes[0].transfers[0];
+    assert_eq!(
+        transfer.inputs.len(),
+        2,
+        "record merge must retain both DRAIN inputs"
+    );
+    assert!(matches!(
+        transfer.transform,
+        MigrationTransformPlan::Expression {
+            root: MigrationExpressionPlan::Record { .. }
+        }
+    ));
+}
+
+#[test]
+fn compiler_lowers_whole_list_and_indexed_field_migration_recipes() {
+    let whole_list = r#"
+FUNCTION keep_row(row) {
+    [title: TEXT { copied }]
+}
+
+todos:
+    LIST { [title: TEXT { one }] }
+    |> List/map(todo, new: keep_row(row: todo))
+    |> DRAINING
+
+tasks:
+    DRAIN { todos }
+    |> List/map(task, new: keep_row(row: task))
+"#;
+    let indexed = r#"
+todos:
+    LIST { [title: TEXT { one }, text: TEXT { unset }] }
+    |> List/map(todo, new: new_todo(todo: todo))
+
+FUNCTION new_todo(todo) {
+    [
+        title:
+            todo.title |> HOLD title { LATEST {} } |> DRAINING
+        text:
+            DRAIN { title } |> HOLD text { LATEST {} }
+    ]
+}
+"#;
+    let list_plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "list-v2.bn",
+        whole_list,
+        TargetProfile::SoftwareDefault,
+        ApplicationIdentity::new("dev.boon.list", "migration", "test"),
+        2,
+    )
+    .unwrap()
+    .plan;
+    let indexed_plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "indexed-v2.bn",
+        indexed,
+        TargetProfile::SoftwareDefault,
+        ApplicationIdentity::new("dev.boon.indexed", "migration", "test"),
+        2,
+    )
+    .unwrap()
+    .plan;
+
+    let list_transfer = &list_plan.persistence.migration_recipes[0].transfers[0];
+    assert_eq!(list_transfer.transfer_kind, MigrationTransferKindPlan::List);
+    assert!(list_transfer.indexed_list_owner.is_none());
+    assert!(matches!(
+        list_transfer.transform,
+        MigrationTransformPlan::Identity { .. }
+    ));
+    let indexed_transfer = &indexed_plan.persistence.migration_recipes[0].transfers[0];
+    assert_eq!(
+        indexed_transfer.transfer_kind,
+        MigrationTransferKindPlan::IndexedRowField
+    );
+    let indexed_owner = indexed_transfer.indexed_list_owner.as_ref().unwrap();
+    assert_eq!(
+        indexed_owner.memory_id,
+        indexed_plan.persistence.lists[0].memory_id
+    );
+    assert_eq!(
+        indexed_owner.memory_id,
+        indexed_transfer.destination.memory_id
+    );
+    assert!(
+        indexed_transfer
+            .inputs
+            .iter()
+            .flat_map(|input| &input.leaves)
+            .all(|leaf| leaf.memory_id == indexed_owner.memory_id)
+    );
+    assert!(matches!(
+        indexed_transfer.transform,
+        MigrationTransformPlan::Identity { .. }
+    ));
+    let verification = verify_plan(&list_plan).unwrap();
+    assert_eq!(
+        verification.status, "pass",
+        "checks={:?}",
+        verification.checks
+    );
+    let verification = verify_plan(&indexed_plan).unwrap();
+    assert_eq!(
+        verification.status, "pass",
+        "checks={:?}",
+        verification.checks
+    );
+}
+
+#[test]
+fn indexed_migrations_reconstruct_untouched_row_defaults() {
+    let identity = ApplicationIdentity::new("dev.boon.todo-migration", "migration", "test");
+    let compile_stage = |version, path: &str| {
+        compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            path,
+            &fs::read_to_string(example_path(path)).unwrap(),
+            TargetProfile::SoftwareDefault,
+            identity.clone(),
+            version,
+        )
+        .unwrap()
+        .plan
+    };
+    let v5 = compile_stage(5, "examples/migrations/todo/v5.bn");
+    let v6 = compile_stage(6, "examples/migrations/todo/v6.bn");
+    let initial_expression = |plan: &MachinePlan, path: &str| {
+        let memory = plan
+            .persistence
+            .memory
+            .iter()
+            .find(|memory| memory.semantic_path == path)
+            .unwrap_or_else(|| panic!("missing persistence memory `{path}`"));
+        plan.storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.id == memory.runtime_slot)
+            .and_then(|slot| slot.initial_row_expression.clone())
+            .unwrap_or_else(|| panic!("missing row default expression for `{path}`"))
+    };
+
+    assert!(matches!(
+        initial_expression(&v5, "task.text"),
+        PlanRowExpression::Field { .. }
+    ));
+    let PlanRowExpression::Select { input, arms } = initial_expression(&v6, "task.status") else {
+        panic!("pure indexed migration must compile to a sparse Select default");
+    };
+    assert!(matches!(input.as_ref(), PlanRowExpression::Field { .. }));
+    assert_eq!(arms.len(), 2);
+    assert!(arms.iter().any(|arm| matches!(
+        arm.pattern,
+        boon_plan::PlanRowSelectPattern::Bool { value: false }
+    )));
+    assert!(arms.iter().any(|arm| matches!(
+        arm.pattern,
+        boon_plan::PlanRowSelectPattern::Bool { value: true }
+    )));
+}
+
+#[test]
+fn compiled_v3_binary_and_hash_are_deterministic() {
+    let source = include_str!("../../../examples/counter.bn");
+    let first =
+        compile_source_text_to_machine_plan("counter.bn", source, TargetProfile::SoftwareDefault)
+            .unwrap();
+    let second =
+        compile_source_text_to_machine_plan("counter.bn", source, TargetProfile::SoftwareDefault)
+            .unwrap();
+
+    assert_eq!(
+        plan_binary(&first.plan).unwrap(),
+        plan_binary(&second.plan).unwrap()
+    );
+    assert_eq!(
+        plan_sha256(&first.plan).unwrap(),
+        plan_sha256(&second.plan).unwrap()
+    );
+}
+
+#[test]
+fn anonymous_line_based_state_is_a_compile_diagnostic() {
+    let error = compile_source_text_to_machine_plan(
+        "anonymous-state.bn",
+        r#"
+0 |> HOLD {
+    LATEST { 1 }
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("anonymous line-based state"),
+        "{error}"
+    );
 }
 
 #[test]

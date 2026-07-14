@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Formatter};
 use std::time::Duration;
 
 pub use boon_document_model::{DocumentNodeId, Rect, SourceBindingId};
@@ -50,6 +51,7 @@ pub enum HostEvent {
     Keyboard(KeyEvent),
     TextInput(TextInputEvent),
     Ime(ImeInputEvent),
+    SensitiveInput(SensitiveInputEvent),
     Pointer(PointerEvent),
     Wheel(WheelEvent),
     Accessibility(AccessibilityInputEvent),
@@ -125,6 +127,32 @@ pub enum LogicalKey {
 pub struct TextInputEvent {
     pub surface: SurfaceId,
     pub text: String,
+}
+
+/// A process-local reference to host-owned sensitive input.
+///
+/// The numeric token is deliberately not a credential, digest, prefix, or
+/// length. It is valid only in the native host instance that issued it.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveInputHandle(u64);
+
+impl SensitiveInputHandle {
+    pub fn from_host_sequence(sequence: u64) -> Option<Self> {
+        (sequence != 0).then_some(Self(sequence))
+    }
+}
+
+impl Debug for SensitiveInputHandle {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SensitiveInputHandle(<opaque>)")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SensitiveInputEvent {
+    pub surface: SurfaceId,
+    pub handle: SensitiveInputHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,6 +293,8 @@ pub struct SemanticState {
     pub checked: Option<bool>,
     pub disabled: bool,
     pub selected: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -272,6 +302,8 @@ pub struct SemanticActions {
     pub focus: bool,
     pub press: bool,
     pub set_text: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sensitive_input: bool,
     pub increment: bool,
     pub decrement: bool,
 }
@@ -283,6 +315,10 @@ pub struct SemanticRelations {
     pub controls: Vec<SemanticId>,
     pub labelled_by: Vec<SemanticId>,
     pub described_by: Vec<SemanticId>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -320,7 +356,7 @@ pub struct SemanticPatch {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticPatchOperation {
-    UpsertNode { node: SemanticNode },
+    UpsertNode { node: Box<SemanticNode> },
     RemoveNode { id: SemanticId },
     SetFocus { focused: Option<SemanticId> },
 }
@@ -380,7 +416,9 @@ impl SemanticScene {
         }
         for (id, node) in &next.nodes {
             if self.nodes.get(id) != Some(node) {
-                operations.push(SemanticPatchOperation::UpsertNode { node: node.clone() });
+                operations.push(SemanticPatchOperation::UpsertNode {
+                    node: Box::new(node.clone()),
+                });
             }
         }
         if self.focused != next.focused {

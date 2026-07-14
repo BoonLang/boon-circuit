@@ -637,6 +637,20 @@ impl DocumentPlan {
         let expression_count = self.expressions.len();
         let constant_count = self.constants.len();
         for expression in &self.expressions {
+            if matches!(
+                &expression.op,
+                DocumentExprOp::Builtin {
+                    builtin: DocumentBuiltin::FileWriteText
+                        | DocumentBuiltin::LogError
+                        | DocumentBuiltin::LogInfo,
+                    ..
+                }
+            ) {
+                return Err(format!(
+                    "document expression {} contains consequential host I/O; use a pure output descriptor or transactional effect branch",
+                    expression.id.0
+                ));
+            }
             for referenced in expression.op.expression_refs() {
                 if referenced.0 >= expression_count {
                     return Err(format!(

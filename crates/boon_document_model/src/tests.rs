@@ -53,3 +53,35 @@ fn typed_ui_style_changes_lower_to_compatible_style_patches() {
         );
     }
 }
+
+#[test]
+fn sensitive_text_input_artifacts_are_fixed_redactions() {
+    const SENTINEL: &str = "document-SENTINEL-82be7a";
+    let mut node = DocumentNode::new("password", DocumentNodeKind::TextInput);
+    node.text = Some(TextValue {
+        text: SENTINEL.to_owned(),
+    });
+    node.style
+        .insert(SENSITIVE_INPUT_STYLE_KEY.to_owned(), StyleValue::Bool(true));
+    node.style
+        .insert("value".to_owned(), StyleValue::Text(SENTINEL.to_owned()));
+    node.style
+        .insert("caret_column".to_owned(), StyleValue::Number(123.0));
+
+    let serialized = toml::to_string(&node).unwrap();
+    let debug = format!("{node:?}");
+    for artifact in [&serialized, &debug] {
+        assert!(!artifact.contains(SENTINEL));
+        assert!(!artifact.contains("82be7a"));
+        assert!(!artifact.contains("123.0"));
+        assert!(artifact.contains(SENSITIVE_INPUT_REDACTED_VALUE));
+    }
+    assert_eq!(
+        node.presentation_text(true).as_deref(),
+        Some(SENSITIVE_INPUT_REDACTED_GLYPHS)
+    );
+    assert_eq!(
+        node.presentation_text(false).as_deref(),
+        Some(SENSITIVE_INPUT_REDACTED_GLYPHS)
+    );
+}

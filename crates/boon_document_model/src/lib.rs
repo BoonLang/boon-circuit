@@ -1,7 +1,13 @@
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
+
+pub const SENSITIVE_INPUT_STYLE_KEY: &str = "sensitive";
+pub const SENSITIVE_INPUT_REDACTED_VALUE: &str = "redacted";
+pub const SENSITIVE_INPUT_REDACTED_GLYPHS: &str = "••••••••";
 
 macro_rules! string_ids {
     ($($name:ident),+ $(,)?) => {
@@ -202,7 +208,7 @@ pub struct MaterializedRange {
     pub logical_item_count: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 pub struct DocumentNode {
     pub id: DocumentNodeId,
     pub kind: DocumentNodeKind,
@@ -249,6 +255,120 @@ impl DocumentNode {
         } else {
             self.source_bindings.push(binding);
         }
+    }
+
+    pub fn is_sensitive_text_input(&self) -> bool {
+        matches!(self.kind, DocumentNodeKind::TextInput)
+            && style_flag(&self.style, SENSITIVE_INPUT_STYLE_KEY)
+    }
+
+    /// Returns a fixed presentation that is independent of the draft's length.
+    pub fn presentation_text(&self, focused: bool) -> Option<String> {
+        if self.is_sensitive_text_input() {
+            return (focused
+                || self
+                    .text
+                    .as_ref()
+                    .is_some_and(|value| !value.text.is_empty()))
+            .then(|| SENSITIVE_INPUT_REDACTED_GLYPHS.to_owned());
+        }
+        self.text.as_ref().map(|value| value.text.clone())
+    }
+
+    pub fn artifact_text(&self) -> Option<Cow<'_, TextValue>> {
+        self.text.as_ref().map(|text| {
+            if self.is_sensitive_text_input() {
+                Cow::Owned(TextValue {
+                    text: SENSITIVE_INPUT_REDACTED_VALUE.to_owned(),
+                })
+            } else {
+                Cow::Borrowed(text)
+            }
+        })
+    }
+
+    pub fn artifact_style(&self) -> Cow<'_, StyleMap> {
+        if !self.is_sensitive_text_input() {
+            return Cow::Borrowed(&self.style);
+        }
+        let mut style = self.style.clone();
+        for key in ["text", "value", "display_value", "contents"] {
+            if style.contains_key(key) {
+                style.insert(
+                    key.to_owned(),
+                    StyleValue::Text(SENSITIVE_INPUT_REDACTED_VALUE.to_owned()),
+                );
+            }
+        }
+        style.remove("selection_start");
+        style.remove("selection_end");
+        if style.contains_key("caret_column") {
+            style.insert(
+                "caret_column".to_owned(),
+                StyleValue::Number(SENSITIVE_INPUT_REDACTED_GLYPHS.chars().count() as f64),
+            );
+        }
+        Cow::Owned(style)
+    }
+}
+
+impl Debug for DocumentNode {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DocumentNode")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("parent", &self.parent)
+            .field("children", &self.children)
+            .field("text", &self.artifact_text())
+            .field("style", &self.artifact_style())
+            .field("source_bindings", &self.source_bindings)
+            .field("scroll", &self.scroll)
+            .field("materialized", &self.materialized)
+            .finish()
+    }
+}
+
+impl Serialize for DocumentNode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Artifact<'a> {
+            id: &'a DocumentNodeId,
+            kind: &'a DocumentNodeKind,
+            parent: &'a Option<DocumentNodeId>,
+            children: &'a [DocumentNodeId],
+            text: Option<Cow<'a, TextValue>>,
+            style: Cow<'a, StyleMap>,
+            #[serde(default, skip_serializing_if = "<[SourceBinding]>::is_empty")]
+            source_bindings: &'a [SourceBinding],
+            scroll: &'a Option<ScrollState>,
+            materialized: &'a [MaterializedRange],
+        }
+
+        Artifact {
+            id: &self.id,
+            kind: &self.kind,
+            parent: &self.parent,
+            children: &self.children,
+            text: self.artifact_text(),
+            style: self.artifact_style(),
+            source_bindings: &self.source_bindings,
+            scroll: &self.scroll,
+            materialized: &self.materialized,
+        }
+        .serialize(serializer)
+    }
+}
+
+fn style_flag(style: &StyleMap, key: &str) -> bool {
+    match style.get(key) {
+        Some(StyleValue::Bool(value)) => *value,
+        Some(StyleValue::Text(value)) => value.eq_ignore_ascii_case("true"),
+        Some(StyleValue::Number(value)) => *value != 0.0,
+        Some(StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_)) | None => false,
     }
 }
 

@@ -8,8 +8,8 @@ use app_window::surface::Surface as AppWindowSurface;
 use app_window::window::Window;
 use app_window::{WGPU_STRATEGY, WGPU_SURFACE_STRATEGY, WGPUStrategy};
 use boon_host::{
-    CallbackToHostNs, HostEvent, HostEventEnvelope, LogicalSize, PhysicalSize, RoleId, SurfaceId,
-    WindowId,
+    CallbackToHostNs, HostEvent, HostEventEnvelope, LogicalSize, PhysicalSize, RoleId,
+    SensitiveInputHandle, SurfaceId, WindowId,
 };
 use wgpu::{CurrentSurfaceTexture, SurfaceTargetUnsafe};
 
@@ -19,6 +19,7 @@ use crate::error::{
 use crate::event::{
     AdaptedWindowEvent, EventAdapter, NativeEventCapabilities, map_event_error, viewport,
 };
+use crate::sensitive_input::SensitiveInputTarget;
 
 static HOST_OPEN: AtomicBool = AtomicBool::new(false);
 
@@ -266,6 +267,37 @@ impl NativeSurfaceHost {
         self.capabilities
     }
 
+    pub fn focus_sensitive_input(
+        &mut self,
+        target: SensitiveInputTarget,
+    ) -> Result<SensitiveInputHandle, NativeHostError> {
+        self.ensure_render_thread("sensitive input focus")?;
+        self.event_adapter.focus_sensitive_input(target)
+    }
+
+    pub fn clear_sensitive_input_focus(&mut self) -> Result<(), NativeHostError> {
+        self.ensure_render_thread("sensitive input focus clear")?;
+        self.event_adapter.clear_sensitive_input_focus();
+        Ok(())
+    }
+
+    pub fn restart_sensitive_inputs(&mut self) -> Result<(), NativeHostError> {
+        self.ensure_render_thread("sensitive input restart")?;
+        self.event_adapter.restart_sensitive_inputs();
+        Ok(())
+    }
+
+    pub fn with_sensitive_input<R>(
+        &self,
+        handle: SensitiveInputHandle,
+        use_bytes: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, NativeHostError> {
+        self.ensure_render_thread("sensitive input access")?;
+        self.event_adapter
+            .with_sensitive_input(handle, use_bytes)
+            .map_err(Into::into)
+    }
+
     pub fn binding(&self) -> Option<NativeSurfaceBinding> {
         self.configuration
             .as_ref()
@@ -437,6 +469,7 @@ impl NativeSurfaceHost {
     }
 
     pub fn begin_close(&mut self) {
+        self.event_adapter.restart_sensitive_inputs();
         self.lifecycle = NativeSurfaceLifecycle::Closing;
     }
 

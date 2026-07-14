@@ -1328,6 +1328,7 @@ fn shadow_primitives_for_item(
     primitives
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_shadow_halo_primitives(
     primitives: &mut Vec<RenderVisualPrimitive>,
     item: &DisplayItem,
@@ -2451,11 +2452,10 @@ fn text_align(kind: &DocumentNodeKind, style: &StyleMap) -> RenderTextAlign {
         RenderTextAlign::Left
     } else if align.eq_ignore_ascii_case("right") {
         RenderTextAlign::Right
-    } else if align.eq_ignore_ascii_case("center") {
-        RenderTextAlign::Center
-    } else if style_bool(style, "center") == Some(true) {
-        RenderTextAlign::Center
-    } else if matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox) {
+    } else if align.eq_ignore_ascii_case("center")
+        || style_bool(style, "center") == Some(true)
+        || matches!(kind, DocumentNodeKind::Button | DocumentNodeKind::Checkbox)
+    {
         RenderTextAlign::Center
     } else {
         RenderTextAlign::Left
@@ -2610,7 +2610,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [u8; 4] {
             [246, 248, 251, 255]
         }
         DocumentNodeKind::Row => {
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 [255, 255, 255, 255]
             } else {
                 [242, 246, 251, 255]

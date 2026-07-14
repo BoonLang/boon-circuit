@@ -8,10 +8,12 @@ pub(super) fn compile_document_plan(
     program: &TypedProgram,
     executable_fields: &BTreeSet<FieldId>,
 ) -> Result<Option<DocumentPlan>, PlanError> {
-    let mut roots = program
-        .output_values
-        .iter()
-        .filter(|output| matches!(output.output_kind.as_str(), "document" | "scene"));
+    let mut roots = program.output_values.iter().filter(|output| {
+        matches!(
+            output.contract,
+            ir::SemanticOutputContractKind::RetainedVisual { .. }
+        )
+    });
     let Some(output) = roots.next() else {
         return Ok(None);
     };
@@ -252,12 +254,17 @@ impl<'a> DocumentCompiler<'a> {
     }
 
     fn compile(mut self, output: &ir::OutputRootValue) -> Result<DocumentPlan, PlanError> {
-        let root_kind = match output.output_kind.as_str() {
-            "document" => DocumentRootKind::Document,
-            "scene" => DocumentRootKind::Scene,
-            other => {
+        let root_kind = match output.contract {
+            ir::SemanticOutputContractKind::RetainedVisual {
+                kind: ir::SemanticRetainedVisualKind::Document,
+            } => DocumentRootKind::Document,
+            ir::SemanticOutputContractKind::RetainedVisual {
+                kind: ir::SemanticRetainedVisualKind::Scene,
+            } => DocumentRootKind::Scene,
+            ir::SemanticOutputContractKind::HostValue => {
                 return Err(PlanError::new(format!(
-                    "unsupported typed output root kind `{other}`"
+                    "host-value output `{}` cannot be lowered as retained visual content",
+                    output.root
                 )));
             }
         };
@@ -569,6 +576,12 @@ impl<'a> DocumentCompiler<'a> {
                 };
                 self.compile_call(expr_id, &op, &args, children, context, Some(input))
             }
+            AstExprKind::Draining { input } => {
+                self.compile_expr_with_children(input, children, context, input_override)
+            }
+            AstExprKind::Drain { .. } => Err(PlanError::new(format!(
+                "migration drain expression {expr_id} cannot be lowered as a document value"
+            ))),
             AstExprKind::Hold { name, .. } => self.compile_path(expr_id, &name, context),
             AstExprKind::Latest => {
                 let branches = children
@@ -777,6 +790,13 @@ impl<'a> DocumentCompiler<'a> {
                 context,
                 input,
             );
+        }
+        if builtin_effect_contract(function)?
+            .is_some_and(|contract| !matches!(contract.replay, EffectReplay::ReadOnly))
+        {
+            return Err(PlanError::new(format!(
+                "consequential host operation `{function}` cannot run during retained document evaluation; publish a pure output descriptor or use a transactional effect branch"
+            )));
         }
         let builtin = document_builtin(function).ok_or_else(|| {
             PlanError::new(format!(
@@ -2339,7 +2359,6 @@ fn document_builtin(function: &str) -> Option<DocumentBuiltin> {
         "Error/new" => DocumentBuiltin::ErrorNew,
         "Error/text" => DocumentBuiltin::ErrorText,
         "File/read_bytes" => DocumentBuiltin::FileReadBytes,
-        "File/write_text" => DocumentBuiltin::FileWriteText,
         "Light/ambient" => DocumentBuiltin::LightAmbient,
         "Light/directional" => DocumentBuiltin::LightDirectional,
         "Light/spot" => DocumentBuiltin::LightSpot,
@@ -2363,8 +2382,6 @@ fn document_builtin(function: &str) -> Option<DocumentBuiltin> {
         "List/retain" => DocumentBuiltin::ListRetain,
         "List/sort_by" => DocumentBuiltin::ListSortBy,
         "List/sum" => DocumentBuiltin::ListSum,
-        "Log/error" => DocumentBuiltin::LogError,
-        "Log/info" => DocumentBuiltin::LogInfo,
         "Number/bit_width" => DocumentBuiltin::NumberBitWidth,
         "Number/interpolate" => DocumentBuiltin::NumberInterpolate,
         "Number/max" => DocumentBuiltin::NumberMax,

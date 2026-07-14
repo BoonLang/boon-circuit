@@ -2,9 +2,14 @@ use boon_editor::{Buffer, Command, Position};
 use boon_host::{HostEvent, ImeInputKind, LogicalKey, PointerButton, PointerPhase};
 
 use crate::ui::{
-    DEV_EDITOR, DEV_FILE_NEW, DEV_FILE_REMOVE, DEV_FILE_RENAME, DEV_FORMAT, DEV_NEW, DEV_NEXT,
-    DEV_PREVIOUS, DEV_REMOVE, DEV_RENAME, DEV_RENAME_CANCEL, DEV_RENAME_INPUT, DEV_RENAME_SAVE,
-    DEV_RESET, DEV_RUN, DEV_SAVE, DEV_TEST,
+    DEV_EDITOR, DEV_FILE_NEW, DEV_FILE_REMOVE, DEV_FILE_RENAME, DEV_FORMAT, DEV_INSPECT_OUTBOX,
+    DEV_INSPECT_PERSISTENCE, DEV_INSPECT_VALUE, DEV_MIGRATION_ACTIVATE, DEV_MIGRATION_PREVIEW,
+    DEV_MIGRATION_RESTART, DEV_MIGRATION_STAGE_PREFIX, DEV_MIGRATION_START_OVER, DEV_NEW, DEV_NEXT,
+    DEV_OUTBOX_NEXT, DEV_OUTBOX_PREVIOUS, DEV_PERSISTENCE_ACTIVATE_IMPORT,
+    DEV_PERSISTENCE_CLEAR_ALL, DEV_PERSISTENCE_CLEAR_SELECTED, DEV_PERSISTENCE_COMPACT,
+    DEV_PERSISTENCE_EXPORT, DEV_PERSISTENCE_FLUSH, DEV_PERSISTENCE_IMPORT_PREVIEW, DEV_PREVIOUS,
+    DEV_REMOVE, DEV_RENAME, DEV_RENAME_CANCEL, DEV_RENAME_INPUT, DEV_RENAME_SAVE, DEV_RESET,
+    DEV_RUN, DEV_SAVE, DEV_TEST, InspectorMode,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +27,20 @@ pub enum DevAction {
     Run,
     Reset,
     Test,
+    MigrationPreview,
+    MigrationActivate,
+    MigrationRestart,
+    MigrationStartOver,
+    SelectInspector(InspectorMode),
+    PersistenceFlush,
+    PersistenceCompact,
+    PersistenceClearAll,
+    PersistenceClearSelected,
+    PersistenceExport,
+    PersistenceImportPreview,
+    PersistenceActivateImport,
+    OutboxPrevious,
+    OutboxNext,
     Save,
     Format,
     NewProject,
@@ -34,6 +53,7 @@ pub enum DevAction {
     RemoveFile,
     SelectExample(String),
     SelectFile(usize),
+    SelectMigrationStage(String),
     Clipboard(ClipboardAction),
     Close,
 }
@@ -607,6 +627,22 @@ fn action_for_target(target: Option<&str>) -> DevAction {
         Some(DEV_RUN) => DevAction::Run,
         Some(DEV_RESET) => DevAction::Reset,
         Some(DEV_TEST) => DevAction::Test,
+        Some(DEV_MIGRATION_PREVIEW) => DevAction::MigrationPreview,
+        Some(DEV_MIGRATION_ACTIVATE) => DevAction::MigrationActivate,
+        Some(DEV_MIGRATION_RESTART) => DevAction::MigrationRestart,
+        Some(DEV_MIGRATION_START_OVER) => DevAction::MigrationStartOver,
+        Some(DEV_INSPECT_VALUE) => DevAction::SelectInspector(InspectorMode::Value),
+        Some(DEV_INSPECT_PERSISTENCE) => DevAction::SelectInspector(InspectorMode::Persistence),
+        Some(DEV_INSPECT_OUTBOX) => DevAction::SelectInspector(InspectorMode::Outbox),
+        Some(DEV_PERSISTENCE_FLUSH) => DevAction::PersistenceFlush,
+        Some(DEV_PERSISTENCE_COMPACT) => DevAction::PersistenceCompact,
+        Some(DEV_PERSISTENCE_CLEAR_ALL) => DevAction::PersistenceClearAll,
+        Some(DEV_PERSISTENCE_CLEAR_SELECTED) => DevAction::PersistenceClearSelected,
+        Some(DEV_PERSISTENCE_EXPORT) => DevAction::PersistenceExport,
+        Some(DEV_PERSISTENCE_IMPORT_PREVIEW) => DevAction::PersistenceImportPreview,
+        Some(DEV_PERSISTENCE_ACTIVATE_IMPORT) => DevAction::PersistenceActivateImport,
+        Some(DEV_OUTBOX_PREVIOUS) => DevAction::OutboxPrevious,
+        Some(DEV_OUTBOX_NEXT) => DevAction::OutboxNext,
         Some(DEV_SAVE) => DevAction::Save,
         Some(DEV_FORMAT) => DevAction::Format,
         Some(DEV_NEW) => DevAction::NewProject,
@@ -623,6 +659,9 @@ fn action_for_target(target: Option<&str>) -> DevAction {
         Some(target) if target.starts_with("dev.file.") => target["dev.file.".len()..]
             .parse()
             .map_or(DevAction::None, DevAction::SelectFile),
+        Some(target) if target.starts_with(DEV_MIGRATION_STAGE_PREFIX) => {
+            DevAction::SelectMigrationStage(target[DEV_MIGRATION_STAGE_PREFIX.len()..].to_owned())
+        }
         _ => DevAction::None,
     }
 }
@@ -651,6 +690,30 @@ mod tests {
         let result =
             state.handle_event(&pointer(PointerPhase::Up), |_, _| Some(DEV_TEST.to_owned()));
         assert_eq!(result.action, DevAction::Test);
+    }
+
+    #[test]
+    fn migration_controls_emit_typed_actions() {
+        assert_eq!(
+            action_for_target(Some(DEV_MIGRATION_PREVIEW)),
+            DevAction::MigrationPreview
+        );
+        assert_eq!(
+            action_for_target(Some(DEV_MIGRATION_ACTIVATE)),
+            DevAction::MigrationActivate
+        );
+        assert_eq!(
+            action_for_target(Some(DEV_MIGRATION_RESTART)),
+            DevAction::MigrationRestart
+        );
+        assert_eq!(
+            action_for_target(Some(DEV_MIGRATION_START_OVER)),
+            DevAction::MigrationStartOver
+        );
+        assert_eq!(
+            action_for_target(Some("dev.migration.stage.v3")),
+            DevAction::SelectMigrationStage("v3".to_owned())
+        );
     }
 
     #[test]

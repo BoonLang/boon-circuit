@@ -1,0 +1,91 @@
+-- Counter Migration V1: the original authoritative count.
+
+store: [
+    sources: [
+        increment_button: [events: [press: SOURCE]]
+        decrement_button: [events: [press: SOURCE]]
+        reset_button: [events: [press: SOURCE]]
+    ]
+
+    count:
+        0 |> HOLD count {
+            LATEST {
+                sources.increment_button.events.press |> THEN { count + 1 }
+                sources.decrement_button.events.press |> THEN { count - 1 }
+                sources.reset_button.events.press |> THEN { 0 }
+            }
+        }
+]
+
+document: Document/new(
+    root: counter_migration_app(
+        value: store.count
+        version: TEXT { Counter Migration V1 }
+    )
+)
+
+FUNCTION counter_migration_app(value, version) {
+    Element/container(
+        element: []
+        style: [
+            width: Fill
+            height: Fill
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.97]]
+            font: [size: 16, color: Oklch[lightness:0.20]]
+        ]
+        child: Element/stripe(
+            element: [tag: Section]
+            direction: Column
+            gap: 16
+            style: [
+                width: 420
+                height: 250
+                padding: 24
+                align: [row: Center]
+                background: [color: Oklch[lightness:1]]
+                border: [color: Oklch[lightness:0.84]]
+            ]
+            items: LIST {
+                Element/label(
+                    element: []
+                    style: [width: Fill, height: 32, align: [row: Center], font: [size: 22]]
+                    label: version
+                )
+                Element/label(
+                    element: []
+                    style: [width: Fill, height: 72, align: [row: Center], font: [size: 56]]
+                    label: value
+                )
+                counter_controls()
+            }
+        )
+    )
+}
+
+FUNCTION counter_controls() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [width: Fill, height: 42, align: [row: Center]]
+        items: LIST {
+            counter_button(events: store.sources.decrement_button.events, label: TEXT { - })
+            counter_button(events: store.sources.reset_button.events, label: TEXT { Reset })
+            counter_button(events: store.sources.increment_button.events, label: TEXT { + })
+        }
+    )
+}
+
+FUNCTION counter_button(events, label) {
+    Element/button(
+        element: [events: events]
+        style: [
+            width: 96
+            height: 40
+            background: [color: Oklch[lightness:0.94]]
+            border: [color: Oklch[lightness:0.72]]
+        ]
+        label: label
+    )
+}

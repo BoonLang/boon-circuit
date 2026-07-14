@@ -208,7 +208,10 @@ fn built_in_application_identity(entry: &ExampleManifestEntry) -> ApplicationIde
             || format!("dev.boon.example.{}", entry.id),
             |value| value.package_id.clone(),
         ),
-        format!("builtin:example:{}", entry.id),
+        explicit
+            .as_ref()
+            .and_then(|value| value.state_namespace.clone())
+            .unwrap_or_else(|| format!("builtin:example:{}", entry.id)),
         explicit.map_or_else(|| "builtin".to_owned(), |value| value.deployment_domain),
     )
 }
@@ -350,8 +353,9 @@ mod tests {
         assert_eq!(persons.label, "Persons.pro");
         assert_eq!(
             persons.application.package_id,
-            "dev.boon.example.persons_pro"
+            "pro.persons.workspace"
         );
+        assert_eq!(persons.application.state_namespace, "local-first-v1");
         assert!(
             persons
                 .units

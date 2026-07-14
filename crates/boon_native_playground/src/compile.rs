@@ -11,7 +11,7 @@ use boon_plan::{
 };
 use boon_runtime::{
     ApplicationIdentity, ProgramArtifact, ProgramDiagnostic, ProgramHostRequest, ProgramRequestId,
-    compile_program_artifact,
+    ProgramSessionId, compile_program_artifact,
 };
 use futures::channel::mpsc;
 
@@ -101,13 +101,13 @@ impl Drop for CompileWorker {
 
 pub struct ProgramCompileOutcome {
     pub request_id: ProgramRequestId,
-    pub host: boon_document_model::DocumentNodeId,
+    pub session: ProgramSessionId,
     pub result: Result<ProgramArtifact, ProgramDiagnostic>,
 }
 
 #[derive(Default)]
 struct ProgramCompileState {
-    pending: BTreeMap<boon_document_model::DocumentNodeId, ProgramHostRequest>,
+    pending: BTreeMap<ProgramSessionId, ProgramHostRequest>,
     closing: bool,
     replaced: u64,
 }
@@ -140,7 +140,7 @@ impl ProgramCompileWorker {
         let mut state = lock.lock().expect("program compile worker lock");
         if state
             .pending
-            .insert(request.host.clone(), request)
+            .insert(request.session.clone(), request)
             .is_some()
         {
             state.replaced = state.replaced.saturating_add(1);
@@ -183,7 +183,7 @@ fn program_compile_loop(
             if state.closing {
                 return;
             }
-            let host = state
+            let session = state
                 .pending
                 .keys()
                 .next()
@@ -191,16 +191,16 @@ fn program_compile_loop(
                 .expect("nonempty program compile queue");
             state
                 .pending
-                .remove(&host)
+                .remove(&session)
                 .expect("program compile request")
         };
         let request_id = request.request_id;
-        let host = request.host;
+        let session = request.session;
         let result = compile_program_artifact(&request.compile);
         if output
             .unbounded_send(ProgramCompileOutcome {
                 request_id,
-                host,
+                session,
                 result,
             })
             .is_err()
@@ -407,15 +407,17 @@ mod tests {
     }
 
     #[test]
-    fn child_program_mailbox_is_depth_one_per_host_and_latest_wins() {
+    fn child_program_mailbox_is_depth_one_per_session_and_latest_wins() {
         let worker = ProgramCompileWorker {
             state: Arc::new((Mutex::new(ProgramCompileState::default()), Condvar::new())),
             thread: None,
         };
         let host = boon_document_model::DocumentNodeId("program-host".to_owned());
+        let session = ProgramSessionId("public-page".to_owned());
         for revision in 1..=4 {
             worker.replace(ProgramHostRequest {
                 request_id: ProgramRequestId(format!("request-{revision}")),
+                session: session.clone(),
                 host: host.clone(),
                 compile: boon_runtime::ProgramCompileRequest {
                     revision,
@@ -434,7 +436,7 @@ mod tests {
         assert_eq!(worker.replaced_count(), 3);
         let state = worker.state.0.lock().unwrap();
         assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.pending[&host].compile.revision, 4);
+        assert_eq!(state.pending[&session].compile.revision, 4);
     }
 
     #[test]

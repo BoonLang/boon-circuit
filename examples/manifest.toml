@@ -529,6 +529,7 @@ source_files = [
 ]
 scenario = "examples/persons_pro.scn"
 budget = "examples/persons_pro.budget.toml"
+application = { package_id = "pro.persons.workspace", state_namespace = "local-first-v1", deployment_domain = "builtin" }
 category = "main"
 order = 28
 default_tab_order = 28

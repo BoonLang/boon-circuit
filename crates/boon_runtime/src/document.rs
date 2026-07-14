@@ -3151,9 +3151,18 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                     _ => ProgramCapabilityProfile::PublicDocument,
                 };
             }
+            "session_key" => {
+                program.session_key = value.text();
+            }
+            "mount" => {
+                program.mount = value.truthy();
+            }
             _ => {}
         }
-        if matches!(name, "source" | "revision" | "capability_profile") {
+        if matches!(
+            name,
+            "source" | "revision" | "capability_profile" | "session_key" | "mount"
+        ) {
             return;
         }
     }
@@ -3581,6 +3590,7 @@ fn host_source_intent(value: &str) -> bool {
             | "cancel"
             | "change"
             | "click"
+            | "compiled"
             | "commit"
             | "double_click"
             | "escape"
@@ -3589,6 +3599,7 @@ fn host_source_intent(value: &str) -> bool {
             | "key_down"
             | "open"
             | "press"
+            | "rejected"
             | "select"
             | "submit"
             | "text"

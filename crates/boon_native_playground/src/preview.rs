@@ -980,8 +980,11 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 let Some(model) = runtime.as_mut() else {
                     continue;
                 };
-                let changed =
-                    model.complete_program(&outcome.host, &outcome.request_id, outcome.result)?;
+                let changed = model.complete_program(
+                    &outcome.session,
+                    &outcome.request_id,
+                    outcome.result,
+                )?;
                 let diagnostics = model.program_diagnostics();
                 if changed {
                     apply_runtime_update(model, &mut view, &mut columns)?;

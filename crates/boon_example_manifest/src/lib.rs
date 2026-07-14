@@ -154,6 +154,7 @@ pub struct SourceProject {
 #[serde(deny_unknown_fields)]
 pub struct ApplicationIdentity {
     pub package_id: String,
+    pub state_namespace: Option<String>,
     pub deployment_domain: String,
 }
 
@@ -161,6 +162,8 @@ pub struct ApplicationIdentity {
 #[serde(deny_unknown_fields)]
 pub struct ApplicationManifest {
     pub package_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_namespace: Option<String>,
     pub deployment_domain: String,
 }
 
@@ -168,6 +171,7 @@ impl ApplicationManifest {
     pub fn identity(&self) -> ApplicationIdentity {
         ApplicationIdentity {
             package_id: self.package_id.clone(),
+            state_namespace: self.state_namespace.clone(),
             deployment_domain: self.deployment_domain.clone(),
         }
     }
@@ -1479,6 +1483,13 @@ fn validate_application(
         &format!("example `{example_id}` application package_id"),
         &application.package_id,
     )?;
+    if let Some(state_namespace) = application.state_namespace.as_deref() {
+        validate_identity_text(
+            context,
+            &format!("example `{example_id}` application state_namespace"),
+            state_namespace,
+        )?;
+    }
     validate_identity_text(
         context,
         &format!("example `{example_id}` application deployment_domain"),

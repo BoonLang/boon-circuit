@@ -13,12 +13,12 @@ use boon_persistence::{
 use boon_plan::{ApplicationIdentity, ApplicationPlan, MachinePlan, MemoryKind};
 use boon_runtime::{
     DocumentPatch, DocumentPatchStatus, LiveRuntime, PersistentRuntime, ProgramArtifact,
-    ProgramDiagnostic, ProgramDocumentHost, ProgramHostDiagnostic, ProgramHostRequest,
-    ProgramRequestId, RowId, RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload,
-    Value,
+    ProgramCompletion, ProgramDiagnostic, ProgramDocumentHost, ProgramHostCompletion,
+    ProgramHostDiagnostic, ProgramHostRequest, ProgramRequestId, ProgramSessionId, RowId,
+    RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload, Value,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,8 +138,16 @@ pub struct RuntimePlanChange {
 
 impl RuntimeView {
     pub fn open(plan: Arc<MachinePlan>) -> ViewResult<Self> {
+        Self::open_with_state_root(plan, repository_root().join(STATE_DIRECTORY))
+    }
+
+    pub fn open_with_state_root(
+        plan: Arc<MachinePlan>,
+        state_root: impl AsRef<Path>,
+    ) -> ViewResult<Self> {
         validate_preview_plan(&plan)?;
-        let database_path = state_database_path(&plan.application.identity)?;
+        let database_path =
+            state_database_path_in(state_root.as_ref(), &plan.application.identity)?;
         let parent = database_path
             .parent()
             .ok_or_else(|| "playground state database has no parent directory".to_owned())?;
@@ -733,7 +741,7 @@ impl RuntimeView {
 
     pub fn complete_program(
         &mut self,
-        host: &DocumentNodeId,
+        session: &ProgramSessionId,
         request_id: &ProgramRequestId,
         result: Result<ProgramArtifact, ProgramDiagnostic>,
     ) -> ViewResult<bool> {
@@ -743,10 +751,51 @@ impl RuntimeView {
             .primary_retained_output_frame()
             .map_err(|error| error.to_string())?
             .clone();
-        let (_, update) = self
+        let (completion, update) = self
             .program_host
-            .complete(host, request_id, result, &parent);
-        Ok(self.queue_program_update(update.patches, update.requests))
+            .complete(session, request_id, result, &parent);
+        let lifecycle = match completion {
+            ProgramHostCompletion::Program(ProgramCompletion::Activated { revision }) => {
+                self.program_host.active_artifact(session).map(|artifact| {
+                    let mut payload = SourcePayload {
+                        text: Some(artifact.source_digest().to_owned()),
+                        ..SourcePayload::default()
+                    };
+                    payload
+                        .fields
+                        .insert("revision".to_owned(), Value::Text(revision.to_string()));
+                    payload.fields.insert(
+                        "source_digest".to_owned(),
+                        Value::Text(artifact.source_digest().to_owned()),
+                    );
+                    ("compiled", payload)
+                })
+            }
+            ProgramHostCompletion::Program(ProgramCompletion::Rejected { diagnostic }) => {
+                let mut payload = SourcePayload {
+                    text: Some(diagnostic.message.clone()),
+                    ..SourcePayload::default()
+                };
+                payload.fields.insert(
+                    "revision".to_owned(),
+                    Value::Text(diagnostic.revision.to_string()),
+                );
+                payload
+                    .fields
+                    .insert("diagnostic".to_owned(), Value::Text(diagnostic.message));
+                Some(("rejected", payload))
+            }
+            ProgramHostCompletion::Program(ProgramCompletion::Stale { .. })
+            | ProgramHostCompletion::Superseded { .. }
+            | ProgramHostCompletion::Removed { .. } => None,
+        };
+        let mut changed = self.queue_program_update(update.patches, update.requests);
+        if let Some((intent, payload)) = lifecycle {
+            for path in self.program_host.lifecycle_source_paths(session, intent) {
+                changed |= self.dispatch_source(&path, None, payload.clone())?;
+            }
+        }
+        Ok(changed)
     }
 
     pub fn program_diagnostics(&self) -> Vec<ProgramHostDiagnostic> {
@@ -1839,11 +1888,13 @@ fn available_capability() -> PersistenceCapability {
     }
 }
 
-fn state_database_path(application: &ApplicationIdentity) -> ViewResult<PathBuf> {
+fn state_database_path_in(
+    state_root: &Path,
+    application: &ApplicationIdentity,
+) -> ViewResult<PathBuf> {
     let application =
         ApplicationPlan::new(application.clone()).map_err(|error| error.to_string())?;
-    Ok(repository_root()
-        .join(STATE_DIRECTORY)
+    Ok(state_root
         .join(digest_hex(&application.identity_hash))
         .join("state.redb"))
 }
@@ -2083,6 +2134,55 @@ mod tests {
     use boon_host::{KeyEvent, LogicalKey, PointerEvent, SurfaceId, TextInputEvent, WheelEvent};
     use boon_runtime::RuntimeSourceUnit;
 
+    fn persons_plan(
+        schema_version: u64,
+        predecessor: Option<&MachinePlan>,
+        additive_source: Option<&str>,
+    ) -> Arc<MachinePlan> {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let mut units = example
+            .units
+            .into_iter()
+            .map(|unit| boon_compiler::CompilerSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        if let Some(source) = additive_source {
+            units.push(boon_compiler::CompilerSourceUnit {
+                path: "examples/persons_pro/MigrationProbe.bn".to_owned(),
+                source: source.to_owned(),
+            });
+        }
+        let predecessors = predecessor
+            .map(boon_plan::MigrationPredecessorBinding::from_machine_plan)
+            .into_iter()
+            .collect::<Vec<_>>();
+        Arc::new(
+            boon_compiler::compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
+                "examples/persons_pro/RUN.bn",
+                &units,
+                boon_plan::TargetProfile::SoftwareDefault,
+                example.application,
+                schema_version,
+                &predecessors,
+            )
+            .unwrap()
+            .plan,
+        )
+    }
+
+    fn unique_state_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("boon-{label}-{}-{nonce}", std::process::id()))
+    }
+
     #[test]
     fn internal_runtime_turns_do_not_advance_the_source_event_sequence() {
         assert_eq!(source_sequence_after_turn(7, None), 7);
@@ -2205,7 +2305,7 @@ document: Document/new(
         assert!(
             model
                 .complete_program(
-                    &initial_request.host,
+                    &initial_request.session,
                     &initial_request.request_id,
                     initial_artifact,
                 )
@@ -2312,7 +2412,7 @@ document: Document/new(
         assert!(invalid_artifact.is_err());
         model
             .complete_program(
-                &invalid_request.host,
+                &invalid_request.session,
                 &invalid_request.request_id,
                 invalid_artifact,
             )
@@ -2370,7 +2470,7 @@ document: Document/new(
         assert!(
             model
                 .complete_program(
-                    &corrected_request.host,
+                    &corrected_request.session,
                     &corrected_request.request_id,
                     corrected_artifact,
                 )
@@ -2437,6 +2537,169 @@ document: Document/new(
             );
         }
         assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
+    }
+
+    #[test]
+    fn persons_authority_survives_real_redb_reopen_export_import_migration_and_corruption() {
+        let state_root = unique_state_root("persons-redb-lifecycle");
+        let plan_v1 = persons_plan(1, None, None);
+        let edited_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Durable profile })\n";
+
+        let mut first = RuntimeView::open_with_state_root(Arc::clone(&plan_v1), &state_root)
+            .expect("open isolated Persons.pro redb store");
+        let initial = first
+            .take_program_requests()
+            .into_iter()
+            .next()
+            .expect("initial child compile request");
+        first
+            .complete_program(
+                &initial.session,
+                &initial.request_id,
+                boon_runtime::compile_program_artifact(&initial.compile),
+            )
+            .unwrap();
+        assert_eq!(
+            first
+                .runtime
+                .inspect_value_current("store.draft_compile_state", 1)
+                .unwrap(),
+            Value::Text("Ready".to_owned())
+        );
+
+        assert!(
+            first
+                .dispatch_source(
+                    "store.elements.source_editor",
+                    None,
+                    SourcePayload {
+                        text: Some(edited_source.to_owned()),
+                        ..SourcePayload::default()
+                    },
+                )
+                .unwrap()
+        );
+        let edited = first
+            .take_program_requests()
+            .into_iter()
+            .next()
+            .expect("edited child compile request");
+        first
+            .complete_program(
+                &edited.session,
+                &edited.request_id,
+                boon_runtime::compile_program_artifact(&edited.compile),
+            )
+            .unwrap();
+        let digest = boon_runtime::sha256_bytes(edited_source.as_bytes());
+        assert_eq!(
+            first
+                .runtime
+                .inspect_value_current("store.draft_compile_digest", 1)
+                .unwrap(),
+            Value::Text(digest.clone())
+        );
+        first.runtime.barrier().unwrap();
+        let artifact = first.export_state_artifact().unwrap();
+        first.runtime.shutdown().unwrap();
+        drop(first);
+
+        let mut restored = RuntimeView::open_with_state_root(Arc::clone(&plan_v1), &state_root)
+            .expect("reopen acknowledged Persons.pro state");
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned())
+        );
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.draft_compile_digest", 1)
+                .unwrap(),
+            Value::Text(digest.clone())
+        );
+        assert_eq!(restored.take_program_requests().len(), 1);
+
+        let mut corrupt_artifact = artifact.clone();
+        *corrupt_artifact.last_mut().unwrap() ^= 0x5a;
+        assert!(restored.preview_state_artifact(&corrupt_artifact).is_err());
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned())
+        );
+
+        restored.clear_authority_path("store.source_draft").unwrap();
+        assert_ne!(
+            restored
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned())
+        );
+        restored.activate_state_artifact(&artifact).unwrap();
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned())
+        );
+        restored.start_over().unwrap();
+        assert_ne!(
+            restored
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned())
+        );
+        restored.activate_state_artifact(&artifact).unwrap();
+        restored.runtime.barrier().unwrap();
+        restored.runtime.shutdown().unwrap();
+        drop(restored);
+
+        let plan_v2 = persons_plan(
+            2,
+            Some(&plan_v1),
+            Some("migration_probe: TEXT { v2 } |> HOLD migration_probe { LATEST {} }\n"),
+        );
+        let mut migrated = RuntimeView::open_with_state_root(Arc::clone(&plan_v2), &state_root)
+            .expect("migrate Persons.pro state to additive v2 schema");
+        assert_eq!(migrated.persistence_schema_version(), 2);
+        assert_eq!(
+            migrated
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned())
+        );
+        migrated.runtime.barrier().unwrap();
+        migrated.runtime.shutdown().unwrap();
+        drop(migrated);
+
+        let mut reopened_v2 = RuntimeView::open_with_state_root(Arc::clone(&plan_v2), &state_root)
+            .expect("reopen migrated v2 state");
+        assert_eq!(
+            reopened_v2
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned())
+        );
+        reopened_v2.runtime.shutdown().unwrap();
+        drop(reopened_v2);
+
+        let database_path =
+            state_database_path_in(&state_root, &plan_v2.application.identity).unwrap();
+        let corrupt_database = b"not-a-redb-database".to_vec();
+        fs::write(&database_path, &corrupt_database).unwrap();
+        assert!(RuntimeView::open_with_state_root(plan_v2, &state_root).is_err());
+        assert_eq!(fs::read(&database_path).unwrap(), corrupt_database);
+        fs::remove_dir_all(&state_root).unwrap();
     }
 
     #[test]

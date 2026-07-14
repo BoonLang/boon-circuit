@@ -60,13 +60,30 @@ impl ProgramCapabilityProfile {
     }
 }
 
-#[derive(Clone, Default, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Deserialize)]
 pub struct EmbeddedProgramDescriptor {
     #[serde(default)]
     pub source: String,
     pub source_digest: String,
     pub revision: u64,
     pub capability_profile: ProgramCapabilityProfile,
+    #[serde(default)]
+    pub session_key: String,
+    #[serde(default = "default_true")]
+    pub mount: bool,
+}
+
+impl Default for EmbeddedProgramDescriptor {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            source_digest: String::new(),
+            revision: 0,
+            capability_profile: ProgramCapabilityProfile::default(),
+            session_key: String::new(),
+            mount: true,
+        }
+    }
 }
 
 impl Debug for EmbeddedProgramDescriptor {
@@ -77,6 +94,8 @@ impl Debug for EmbeddedProgramDescriptor {
             .field("source_bytes", &self.source.len())
             .field("revision", &self.revision)
             .field("capability_profile", &self.capability_profile)
+            .field("session_key", &self.session_key)
+            .field("mount", &self.mount)
             .finish()
     }
 }
@@ -92,6 +111,8 @@ impl Serialize for EmbeddedProgramDescriptor {
             source_bytes: usize,
             revision: u64,
             capability_profile: ProgramCapabilityProfile,
+            session_key: &'a str,
+            mount: bool,
         }
 
         Artifact {
@@ -99,9 +120,15 @@ impl Serialize for EmbeddedProgramDescriptor {
             source_bytes: self.source.len(),
             revision: self.revision,
             capability_profile: self.capability_profile,
+            session_key: &self.session_key,
+            mount: self.mount,
         }
         .serialize(serializer)
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -6,6 +6,10 @@
 store: [
     elements: [
         source_editor: SOURCE
+        draft_program: [
+            compiled: SOURCE
+            rejected: SOURCE
+        ]
         show_code: SOURCE
         show_preview: SOURCE
         protect_workspace: SOURCE
@@ -29,6 +33,31 @@ store: [
         1 |> HOLD draft_revision {
             LATEST {
                 elements.source_editor.event.change |> THEN { draft_revision + 1 }
+            }
+        }
+
+    draft_compile_state:
+        Compiling |> HOLD draft_compile_state {
+            LATEST {
+                elements.source_editor.event.change |> THEN { Compiling }
+                elements.draft_program.compiled |> THEN { Ready }
+                elements.draft_program.rejected |> THEN { Invalid }
+            }
+        }
+
+    draft_compile_digest:
+        Text/empty() |> HOLD draft_compile_digest {
+            elements.draft_program.compiled
+                |> THEN { elements.draft_program.compiled.source_digest }
+        }
+
+    draft_compile_diagnostic:
+        Text/empty() |> HOLD draft_compile_diagnostic {
+            LATEST {
+                elements.source_editor.event.change |> THEN { Text/empty() }
+                elements.draft_program.compiled |> THEN { Text/empty() }
+                elements.draft_program.rejected
+                    |> THEN { elements.draft_program.rejected.diagnostic }
             }
         }
 

@@ -515,9 +515,13 @@ fn bounded_diagnostic(mut message: String) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramRequestId(pub String);
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProgramSessionId(pub String);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramHostRequest {
     pub request_id: ProgramRequestId,
+    pub session: ProgramSessionId,
     pub host: DocumentNodeId,
     pub compile: ProgramCompileRequest,
 }
@@ -530,7 +534,8 @@ pub struct ProgramHostUpdate {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramHostDiagnostic {
-    pub host: DocumentNodeId,
+    pub session: ProgramSessionId,
+    pub hosts: Vec<DocumentNodeId>,
     pub diagnostic: ProgramDiagnostic,
 }
 
@@ -538,24 +543,30 @@ pub struct ProgramHostDiagnostic {
 pub enum ProgramHostCompletion {
     Program(ProgramCompletion),
     Superseded {
-        host: DocumentNodeId,
+        session: ProgramSessionId,
         request_id: ProgramRequestId,
     },
     Removed {
-        host: DocumentNodeId,
+        session: ProgramSessionId,
     },
 }
 
 #[derive(Clone)]
 struct ProgramSourceRoute {
-    host: DocumentNodeId,
+    session: ProgramSessionId,
     source_path: String,
 }
 
 #[derive(Clone)]
 struct ProgramMaterializationRoute {
-    host: DocumentNodeId,
+    session: ProgramSessionId,
     materialization: u64,
+}
+
+#[derive(Clone)]
+struct ProgramProjection {
+    session: ProgramSessionId,
+    mount: bool,
 }
 
 struct HostedProgram {
@@ -570,7 +581,8 @@ struct HostedProgram {
 /// input or rendering transaction.
 pub struct ProgramDocumentHost {
     parent_application: ApplicationIdentity,
-    programs: BTreeMap<DocumentNodeId, HostedProgram>,
+    programs: BTreeMap<ProgramSessionId, HostedProgram>,
+    projections: BTreeMap<DocumentNodeId, ProgramProjection>,
     frame: DocumentFrame,
     source_routes: BTreeMap<String, ProgramSourceRoute>,
     materialization_routes: BTreeMap<u64, ProgramMaterializationRoute>,
@@ -584,6 +596,7 @@ impl ProgramDocumentHost {
         let mut host = Self {
             parent_application,
             programs: BTreeMap::new(),
+            projections: BTreeMap::new(),
             frame: parent.clone(),
             source_routes: BTreeMap::new(),
             materialization_routes: BTreeMap::new(),
@@ -597,34 +610,64 @@ impl ProgramDocumentHost {
     }
 
     pub fn reconcile(&mut self, parent: &DocumentFrame) -> ProgramHostUpdate {
-        let descriptors = parent
-            .nodes
-            .values()
-            .filter_map(|node| {
-                (node.kind == DocumentNodeKind::EmbeddedProgram)
-                    .then(|| {
-                        node.embedded_program
-                            .clone()
-                            .map(|program| (node.id.clone(), program))
-                    })
-                    .flatten()
-            })
-            .collect::<BTreeMap<_, _>>();
+        let mut descriptors =
+            BTreeMap::<ProgramSessionId, Vec<(DocumentNodeId, EmbeddedProgramDescriptor)>>::new();
+        let mut projections = BTreeMap::new();
+        for node in parent.nodes.values() {
+            if node.kind != DocumentNodeKind::EmbeddedProgram {
+                continue;
+            }
+            let Some(descriptor) = node.embedded_program.clone() else {
+                continue;
+            };
+            let session = program_session_id(&node.id, &descriptor);
+            projections.insert(
+                node.id.clone(),
+                ProgramProjection {
+                    session: session.clone(),
+                    mount: descriptor.mount,
+                },
+            );
+            descriptors
+                .entry(session)
+                .or_default()
+                .push((node.id.clone(), descriptor));
+        }
+        self.projections = projections;
         self.programs
-            .retain(|host, _| descriptors.contains_key(host));
+            .retain(|session, _| descriptors.contains_key(session));
 
         let mut requests = Vec::new();
-        for (host, descriptor) in descriptors {
+        for (session, descriptors) in descriptors {
+            let (host, descriptor) = descriptors
+                .first()
+                .cloned()
+                .expect("grouped embedded program descriptors are nonempty");
             let program = self
                 .programs
-                .entry(host.clone())
+                .entry(session.clone())
                 .or_insert_with(|| HostedProgram {
                     controller: ProgramController::new(descriptor.capability_profile),
                     descriptor: descriptor.clone(),
                     request_diagnostic: None,
                     latest_request_id: None,
                 });
-            if program.descriptor == descriptor
+            if let Some((conflicting_host, conflicting)) = descriptors
+                .iter()
+                .skip(1)
+                .find(|(_, other)| !same_program_definition(&descriptor, other))
+            {
+                program.request_diagnostic = Some(ProgramDiagnostic::new(
+                    descriptor.revision.max(conflicting.revision),
+                    ProgramDiagnosticPhase::Request,
+                    format!(
+                        "logical session `{}` has conflicting descriptors at `{}` and `{}`",
+                        session.0, host.0, conflicting_host.0
+                    ),
+                ));
+                continue;
+            }
+            if same_program_definition(&program.descriptor, &descriptor)
                 && program.controller.latest_requested_revision() >= descriptor.revision
             {
                 continue;
@@ -637,19 +680,20 @@ impl ProgramDocumentHost {
                 Ok(()) => {
                     program.request_diagnostic = None;
                     let request_id =
-                        program_request_id(&self.parent_application, &host, &descriptor);
+                        program_request_id(&self.parent_application, &session, &descriptor);
                     program.latest_request_id = Some(request_id.clone());
                     requests.push(ProgramHostRequest {
                         request_id,
+                        session: session.clone(),
                         host: host.clone(),
                         compile: ProgramCompileRequest {
                             revision: descriptor.revision,
-                            source_label: format!("embedded-program/{}.bn", namespace(&host.0)),
+                            source_label: format!("embedded-program/{}.bn", namespace(&session.0)),
                             units: vec![RuntimeSourceUnit {
                                 path: "RUN.bn".to_owned(),
                                 source: descriptor.source,
                             }],
-                            application: child_application(&self.parent_application, &host),
+                            application: child_application(&self.parent_application, &session),
                             capability_profile: descriptor.capability_profile,
                         },
                     });
@@ -663,21 +707,23 @@ impl ProgramDocumentHost {
 
     pub fn complete(
         &mut self,
-        host: &DocumentNodeId,
+        session: &ProgramSessionId,
         request_id: &ProgramRequestId,
         result: Result<ProgramArtifact, ProgramDiagnostic>,
         parent: &DocumentFrame,
     ) -> (ProgramHostCompletion, ProgramHostUpdate) {
-        let Some(program) = self.programs.get_mut(host) else {
+        let Some(program) = self.programs.get_mut(session) else {
             return (
-                ProgramHostCompletion::Removed { host: host.clone() },
+                ProgramHostCompletion::Removed {
+                    session: session.clone(),
+                },
                 ProgramHostUpdate::default(),
             );
         };
         if program.latest_request_id.as_ref() != Some(request_id) {
             return (
                 ProgramHostCompletion::Superseded {
-                    host: host.clone(),
+                    session: session.clone(),
                     request_id: request_id.clone(),
                 },
                 ProgramHostUpdate::default(),
@@ -697,24 +743,52 @@ impl ProgramDocumentHost {
     pub fn diagnostics(&self) -> Vec<ProgramHostDiagnostic> {
         self.programs
             .iter()
-            .filter_map(|(host, program)| {
+            .filter_map(|(session, program)| {
                 program
                     .request_diagnostic
                     .as_ref()
                     .or_else(|| program.controller.diagnostic())
                     .cloned()
                     .map(|diagnostic| ProgramHostDiagnostic {
-                        host: host.clone(),
+                        session: session.clone(),
+                        hosts: self
+                            .projections
+                            .iter()
+                            .filter_map(|(host, projection)| {
+                                (projection.session == *session).then_some(host.clone())
+                            })
+                            .collect(),
                         diagnostic,
                     })
             })
             .collect()
     }
 
+    pub fn active_artifact(&self, session: &ProgramSessionId) -> Option<&ProgramArtifact> {
+        self.programs
+            .get(session)?
+            .controller
+            .active()
+            .map(ProgramSession::artifact)
+    }
+
+    pub fn lifecycle_source_paths(&self, session: &ProgramSessionId, intent: &str) -> Vec<String> {
+        self.projections
+            .iter()
+            .filter(|(_, projection)| projection.session == *session)
+            .filter_map(|(host, _)| self.frame.nodes.get(host))
+            .flat_map(|node| node.source_bindings())
+            .filter(|binding| binding.intent == intent)
+            .map(|binding| binding.source_path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub fn source_is_row_scoped(&self, route: &str) -> Option<bool> {
         let route = self.source_routes.get(route)?;
         self.programs
-            .get(&route.host)?
+            .get(&route.session)?
             .controller
             .active()?
             .runtime()
@@ -733,9 +807,9 @@ impl ProgramDocumentHost {
             .ok_or_else(|| format!("embedded program has no source route `{route}`"))?;
         let program = self
             .programs
-            .get(&route.host)
+            .get(&route.session)
             .and_then(|program| program.controller.active())
-            .ok_or_else(|| format!("embedded program `{}` is not active", route.host.0))?;
+            .ok_or_else(|| format!("embedded program `{}` is not active", route.session.0))?;
         program
             .runtime()
             .row_target_for_source_text(&route.source_path, text, occurrence)
@@ -753,9 +827,9 @@ impl ProgramDocumentHost {
             .ok_or_else(|| format!("embedded program has no source route `{route}`"))?;
         let program = self
             .programs
-            .get(&route.host)
+            .get(&route.session)
             .and_then(|program| program.controller.active())
-            .ok_or_else(|| format!("embedded program `{}` is not active", route.host.0))?;
+            .ok_or_else(|| format!("embedded program `{}` is not active", route.session.0))?;
         program
             .runtime()
             .row_target_for_source_path(&route.source_path, key, generation)
@@ -776,9 +850,9 @@ impl ProgramDocumentHost {
             .ok_or_else(|| format!("embedded program has no source route `{route}`"))?;
         let program = self
             .programs
-            .get_mut(&route.host)
+            .get_mut(&route.session)
             .and_then(|program| program.controller.active_mut())
-            .ok_or_else(|| format!("embedded program `{}` is not active", route.host.0))?;
+            .ok_or_else(|| format!("embedded program `{}` is not active", route.session.0))?;
         let event =
             program
                 .runtime()
@@ -804,9 +878,9 @@ impl ProgramDocumentHost {
             })?;
         let program = self
             .programs
-            .get_mut(&route.host)
+            .get_mut(&route.session)
             .and_then(|program| program.controller.active_mut())
-            .ok_or_else(|| format!("embedded program `{}` is not active", route.host.0))?;
+            .ok_or_else(|| format!("embedded program `{}` is not active", route.session.0))?;
         program.runtime_mut().demand_document_window_by_id(
             route.materialization,
             visible,
@@ -824,7 +898,7 @@ impl ProgramDocumentHost {
     }
 
     fn refresh(&mut self, parent: &DocumentFrame) -> Vec<DocumentPatch> {
-        let composed = compose_frame(parent, &self.programs);
+        let composed = compose_frame(parent, &self.programs, &self.projections);
         let patches = crate::document::diff_frames(&self.frame, &composed.frame);
         self.frame = composed.frame;
         self.source_routes = composed.source_routes;
@@ -841,7 +915,8 @@ struct ComposedFrame {
 
 fn compose_frame(
     parent: &DocumentFrame,
-    programs: &BTreeMap<DocumentNodeId, HostedProgram>,
+    programs: &BTreeMap<ProgramSessionId, HostedProgram>,
+    projections: &BTreeMap<DocumentNodeId, ProgramProjection>,
 ) -> ComposedFrame {
     let mut frame = parent.clone();
     let mut source_routes = BTreeMap::new();
@@ -853,7 +928,13 @@ fn compose_frame(
         .filter_map(|range| range.materialization)
         .collect::<BTreeSet<_>>();
 
-    for (host, program) in programs {
+    for (host, projection) in projections {
+        if !projection.mount {
+            continue;
+        }
+        let Some(program) = programs.get(&projection.session) else {
+            continue;
+        };
         let Some(session) = program.controller.active() else {
             continue;
         };
@@ -893,7 +974,7 @@ fn compose_frame(
                 source_routes.insert(
                     route_key.clone(),
                     ProgramSourceRoute {
-                        host: host.clone(),
+                        session: projection.session.clone(),
                         source_path: original_path,
                     },
                 );
@@ -909,7 +990,7 @@ fn compose_frame(
                 materialization_routes.insert(
                     mapped,
                     ProgramMaterializationRoute {
-                        host: host.clone(),
+                        session: projection.session.clone(),
                         materialization: original,
                     },
                 );
@@ -943,17 +1024,20 @@ fn compose_frame(
     }
 }
 
-fn child_application(parent: &ApplicationIdentity, host: &DocumentNodeId) -> ApplicationIdentity {
+fn child_application(
+    parent: &ApplicationIdentity,
+    session: &ProgramSessionId,
+) -> ApplicationIdentity {
     ApplicationIdentity::new(
         format!("{}.embedded", parent.package_id),
-        format!("{}.{}", parent.state_namespace, namespace(&host.0)),
+        format!("{}.{}", parent.state_namespace, namespace(&session.0)),
         parent.deployment_domain.clone(),
     )
 }
 
 fn program_request_id(
     parent: &ApplicationIdentity,
-    host: &DocumentNodeId,
+    session: &ProgramSessionId,
     descriptor: &EmbeddedProgramDescriptor,
 ) -> ProgramRequestId {
     let revision = descriptor.revision.to_string();
@@ -964,10 +1048,31 @@ fn program_request_id(
             "parent.deployment_domain",
             parent.deployment_domain.as_str(),
         ),
-        ("host", host.0.as_str()),
+        ("session", session.0.as_str()),
         ("revision", revision.as_str()),
         ("source", descriptor.source_digest.as_str()),
     ]))
+}
+
+fn program_session_id(
+    host: &DocumentNodeId,
+    descriptor: &EmbeddedProgramDescriptor,
+) -> ProgramSessionId {
+    let explicit = descriptor.session_key.trim();
+    if explicit.is_empty() {
+        ProgramSessionId(host.0.clone())
+    } else {
+        ProgramSessionId(explicit.to_owned())
+    }
+}
+
+fn same_program_definition(
+    left: &EmbeddedProgramDescriptor,
+    right: &EmbeddedProgramDescriptor,
+) -> bool {
+    left.source_digest == right.source_digest
+        && left.revision == right.revision
+        && left.capability_profile == right.capability_profile
 }
 
 fn namespaced_node(host: &DocumentNodeId, child: &DocumentNodeId) -> DocumentNodeId {
@@ -1030,6 +1135,8 @@ mod tests {
             source_digest: crate::sha256_bytes(source.as_bytes()),
             revision,
             capability_profile: ProgramCapabilityProfile::PublicDocument,
+            session_key: String::new(),
+            mount: true,
         });
         frame
             .nodes
@@ -1187,11 +1294,68 @@ scene: Scene/Element/program(
             descriptor.capability_profile,
             ProgramCapabilityProfile::PublicDocument
         );
+        assert!(descriptor.session_key.is_empty());
+        assert!(descriptor.mount);
         assert_eq!(
             descriptor.source_digest,
             crate::sha256_bytes(b"child source")
         );
         assert!(!format!("{node:?}").contains("child source"));
+    }
+
+    #[test]
+    fn one_logical_session_can_project_into_multiple_retained_hosts() {
+        let source = child_source("Shared child");
+        let mut parent = DocumentFrame::empty("parent");
+        for host in ["desktop-preview", "mobile-preview"] {
+            let mut node = DocumentNode::new(host, DocumentNodeKind::EmbeddedProgram);
+            node.parent = Some(parent.root.clone());
+            node.embedded_program = Some(EmbeddedProgramDescriptor {
+                source: source.clone(),
+                source_digest: crate::sha256_bytes(source.as_bytes()),
+                revision: 1,
+                capability_profile: ProgramCapabilityProfile::PublicDocument,
+                session_key: "public-page".to_owned(),
+                mount: true,
+            });
+            parent
+                .nodes
+                .get_mut(&parent.root)
+                .unwrap()
+                .children
+                .push(node.id.clone());
+            parent.nodes.insert(node.id.clone(), node);
+        }
+
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "shared", "local"),
+            &parent,
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].session,
+            ProgramSessionId("public-page".to_owned())
+        );
+        assert_eq!(host.programs.len(), 1);
+        assert_eq!(host.projections.len(), 2);
+
+        host.complete(
+            &requests[0].session,
+            &requests[0].request_id,
+            compile_program_artifact(&requests[0].compile),
+            &parent,
+        );
+        assert_eq!(
+            host.frame()
+                .nodes
+                .values()
+                .filter(|node| node
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.text == "Shared child"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1204,7 +1368,7 @@ scene: Scene/Element/program(
         assert_eq!(requests.len(), 1);
         let first = compile_program_artifact(&requests[0].compile);
         let (completion, update) = host.complete(
-            &requests[0].host,
+            &requests[0].session,
             &requests[0].request_id,
             first,
             &first_parent,
@@ -1226,7 +1390,7 @@ scene: Scene/Element/program(
         assert_eq!(invalid.requests.len(), 1);
         let failed = compile_program_artifact(&invalid.requests[0].compile);
         let (completion, _) = host.complete(
-            &invalid.requests[0].host,
+            &invalid.requests[0].session,
             &invalid.requests[0].request_id,
             failed,
             &invalid_parent,
@@ -1252,7 +1416,7 @@ scene: Scene/Element/program(
             &parent,
         );
         host.complete(
-            &requests[0].host,
+            &requests[0].session,
             &requests[0].request_id,
             compile_program_artifact(&requests[0].compile),
             &parent,
@@ -1288,7 +1452,7 @@ scene: Scene/Element/program(
         );
         let first = compile_program_artifact(&first_requests[0].compile);
         host.complete(
-            &first_requests[0].host,
+            &first_requests[0].session,
             &first_requests[0].request_id,
             first,
             &first_parent,
@@ -1302,7 +1466,7 @@ scene: Scene/Element/program(
         let third_artifact = compile_program_artifact(&third.compile);
 
         let (stale, stale_update) = host.complete(
-            &second.host,
+            &second.session,
             &second.request_id,
             second_artifact,
             &third_parent,
@@ -1310,13 +1474,13 @@ scene: Scene/Element/program(
         assert_eq!(
             stale,
             ProgramHostCompletion::Superseded {
-                host: second.host.clone(),
+                session: second.session.clone(),
                 request_id: second.request_id.clone(),
             }
         );
         assert!(stale_update.patches.is_empty());
         let (latest, _) = host.complete(
-            &third.host,
+            &third.session,
             &third.request_id,
             third_artifact,
             &third_parent,

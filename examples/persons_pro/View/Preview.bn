@@ -47,7 +47,7 @@ FUNCTION browser_bar() {
 
 FUNCTION public_program() {
     Scene/Element/program(
-        element: []
+        element: [event: PASSED.store.elements.draft_program]
         style: [
             width: Fill
             height: Fill
@@ -55,5 +55,7 @@ FUNCTION public_program() {
         source: PASSED.store.source_draft
         revision: PASSED.store.draft_revision
         capability_profile: PublicDocument
+        session_key: TEXT { persons-public-draft }
+        mount: True
     )
 }

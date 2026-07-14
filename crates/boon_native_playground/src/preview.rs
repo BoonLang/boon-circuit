@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use boon_runtime::MigrationScenarioRunner;
 
 use crate::compile::{
-    CompileRequest, CompileWorker, compile_migration_stage, project_key_for_stage,
+    CompileRequest, CompileWorker, ProgramCompileWorker, compile_migration_stage,
+    project_key_for_stage,
 };
 use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, input_kind,
@@ -242,6 +243,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
     })?;
 
     let (compiler, mut compiled) = CompileWorker::start();
+    let (program_compiler, mut program_compiled) = ProgramCompileWorker::start();
     let mut runtime = None::<RuntimeView>;
     let mut runtime_key = None::<String>;
     let mut migration = None::<MigrationBundle>;
@@ -261,6 +263,11 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
     let mut deadline_scheduler = DeadlineScheduler::start()?;
 
     loop {
+        if let Some(runtime) = runtime.as_mut() {
+            for request in runtime.take_program_requests() {
+                program_compiler.replace(request);
+            }
+        }
         deadline_scheduler.schedule(runtime.as_ref().and_then(|runtime| {
             [
                 runtime.caret_blink_deadline(),
@@ -275,6 +282,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             Native(Result<HostEventEnvelope, boon_native_app_window::NativeHostError>),
             Ipc(Option<Result<Message, String>>),
             Compiled(Option<crate::compile::CompileOutcome>),
+            ProgramCompiled(Option<crate::compile::ProgramCompileOutcome>),
             Proof(Option<Box<ProofResult>>),
             Scheduled(Option<()>),
         }
@@ -282,6 +290,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             let native = host.next_event().fuse();
             let command = incoming.next().fuse();
             let result = compiled.next().fuse();
+            let program_result = program_compiled.next().fuse();
             let proof_result = async {
                 match proof.as_mut() {
                     Some(worker) => worker.next_result().await,
@@ -290,11 +299,19 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             }
             .fuse();
             let scheduled = deadline_scheduler.ticks.next().fuse();
-            pin_mut!(native, command, result, proof_result, scheduled);
+            pin_mut!(
+                native,
+                command,
+                result,
+                program_result,
+                proof_result,
+                scheduled
+            );
             select! {
                 value = native => Wake::Native(value),
                 value = command => Wake::Ipc(value),
                 value = result => Wake::Compiled(value),
+                value = program_result => Wake::ProgramCompiled(value),
                 value = proof_result => Wake::Proof(value.map(Box::new)),
                 value = scheduled => Wake::Scheduled(value),
             }
@@ -956,6 +973,48 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             message: error,
                         })?;
                     }
+                }
+            }
+            Wake::ProgramCompiled(outcome) => {
+                let outcome = outcome.ok_or("child program compiler stopped")?;
+                let Some(model) = runtime.as_mut() else {
+                    continue;
+                };
+                let changed =
+                    model.complete_program(&outcome.host, &outcome.request_id, outcome.result)?;
+                let diagnostics = model.program_diagnostics();
+                if changed {
+                    apply_runtime_update(model, &mut view, &mut columns)?;
+                    if let Some(presented) = product.present(&mut host, &view).await? {
+                        proof_eligible_ordinal = proof_eligible_ordinal.saturating_add(1);
+                        let proof_request = prepare_proof_request(
+                            proof.as_ref(),
+                            proof_config.as_ref(),
+                            &mut proof_requested,
+                            proof_eligible_ordinal,
+                            &presented,
+                            &view,
+                            &host,
+                        );
+                        emit_presented(&observer, &presented);
+                        submit_proof_request(&observer, proof.as_ref(), proof_request)?;
+                    }
+                }
+                if let Some(diagnostic) = diagnostics.first() {
+                    output.send(Message::PreviewStatus {
+                        revision: source_revision,
+                        ok: false,
+                        message: format!(
+                            "embedded program revision {} failed; last valid preview retained: {}",
+                            diagnostic.diagnostic.revision, diagnostic.diagnostic.message
+                        ),
+                    })?;
+                } else {
+                    output.send(Message::PreviewStatus {
+                        revision: source_revision,
+                        ok: true,
+                        message: "embedded program compiled and mounted".to_owned(),
+                    })?;
                 }
             }
             Wake::Proof(result) => {

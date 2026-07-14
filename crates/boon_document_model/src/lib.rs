@@ -38,10 +38,70 @@ pub enum DocumentNodeKind {
     Button,
     Checkbox,
     TextInput,
+    EmbeddedProgram,
     EmbeddedMedia,
     Table,
     TableCell,
     ScrollRoot,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramCapabilityProfile {
+    #[default]
+    PublicDocument,
+}
+
+impl ProgramCapabilityProfile {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PublicDocument => "public_document",
+        }
+    }
+}
+
+#[derive(Clone, Default, Eq, PartialEq, Deserialize)]
+pub struct EmbeddedProgramDescriptor {
+    #[serde(default)]
+    pub source: String,
+    pub source_digest: String,
+    pub revision: u64,
+    pub capability_profile: ProgramCapabilityProfile,
+}
+
+impl Debug for EmbeddedProgramDescriptor {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EmbeddedProgramDescriptor")
+            .field("source_digest", &self.source_digest)
+            .field("source_bytes", &self.source.len())
+            .field("revision", &self.revision)
+            .field("capability_profile", &self.capability_profile)
+            .finish()
+    }
+}
+
+impl Serialize for EmbeddedProgramDescriptor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct Artifact<'a> {
+            source_digest: &'a str,
+            source_bytes: usize,
+            revision: u64,
+            capability_profile: ProgramCapabilityProfile,
+        }
+
+        Artifact {
+            source_digest: &self.source_digest,
+            source_bytes: self.source.len(),
+            revision: self.revision,
+            capability_profile: self.capability_profile,
+        }
+        .serialize(serializer)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -216,6 +276,8 @@ pub struct DocumentNode {
     pub children: Vec<DocumentNodeId>,
     pub text: Option<TextValue>,
     pub style: StyleMap,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_program: Option<EmbeddedProgramDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_bindings: Vec<SourceBinding>,
     pub scroll: Option<ScrollState>,
@@ -224,6 +286,8 @@ pub struct DocumentNode {
 
 impl DocumentNode {
     pub fn new(id: impl Into<String>, kind: DocumentNodeKind) -> Self {
+        let embedded_program = matches!(kind, DocumentNodeKind::EmbeddedProgram)
+            .then(EmbeddedProgramDescriptor::default);
         Self {
             id: DocumentNodeId(id.into()),
             kind,
@@ -231,6 +295,7 @@ impl DocumentNode {
             children: Vec::new(),
             text: None,
             style: StyleMap::new(),
+            embedded_program,
             source_bindings: Vec::new(),
             scroll: None,
             materialized: Vec::new(),
@@ -322,6 +387,7 @@ impl Debug for DocumentNode {
             .field("children", &self.children)
             .field("text", &self.artifact_text())
             .field("style", &self.artifact_style())
+            .field("embedded_program", &self.embedded_program)
             .field("source_bindings", &self.source_bindings)
             .field("scroll", &self.scroll)
             .field("materialized", &self.materialized)
@@ -342,6 +408,8 @@ impl Serialize for DocumentNode {
             children: &'a [DocumentNodeId],
             text: Option<Cow<'a, TextValue>>,
             style: Cow<'a, StyleMap>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            embedded_program: &'a Option<EmbeddedProgramDescriptor>,
             #[serde(default, skip_serializing_if = "<[SourceBinding]>::is_empty")]
             source_bindings: &'a [SourceBinding],
             scroll: &'a Option<ScrollState>,
@@ -355,6 +423,7 @@ impl Serialize for DocumentNode {
             children: &self.children,
             text: self.artifact_text(),
             style: self.artifact_style(),
+            embedded_program: &self.embedded_program,
             source_bindings: &self.source_bindings,
             scroll: &self.scroll,
             materialized: &self.materialized,
@@ -400,6 +469,10 @@ pub enum DocumentPatch {
     SetStyle {
         id: DocumentNodeId,
         patch: StylePatch,
+    },
+    SetEmbeddedProgram {
+        id: DocumentNodeId,
+        program: EmbeddedProgramDescriptor,
     },
     SetBinding {
         id: DocumentNodeId,

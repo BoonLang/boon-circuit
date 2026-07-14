@@ -5457,6 +5457,7 @@ impl RuntimeRootContract {
             "Stack",
             "Text",
             "TextInput",
+            "EmbeddedProgram",
             "EmbeddedMedia",
         ])
         .with_fixed_constructor("Document/new", "Document")
@@ -5469,6 +5470,7 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Element/button", "Button")
         .with_fixed_constructor("Element/checkbox", "Checkbox")
         .with_fixed_constructor("Element/text_input", "TextInput")
+        .with_fixed_constructor("Element/program", "EmbeddedProgram")
         .with_fixed_constructor("Element/embedded_media", "EmbeddedMedia")
     }
 
@@ -5485,6 +5487,7 @@ impl RuntimeRootContract {
             "Stack",
             "Text",
             "TextInput",
+            "EmbeddedProgram",
             "EmbeddedMedia",
         ])
         .with_fixed_constructor("Scene/new", "Scene")
@@ -5492,6 +5495,7 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Scene/Element/block", "Block")
         .with_fixed_constructor("Scene/Element/text", "Text")
         .with_fixed_constructor("Scene/Element/text_input", "TextInput")
+        .with_fixed_constructor("Scene/Element/program", "EmbeddedProgram")
         .with_fixed_constructor("Scene/Element/checkbox", "Checkbox")
         .with_fixed_constructor("Scene/Element/label", "Label")
         .with_fixed_constructor("Scene/Element/button", "Button")
@@ -5612,12 +5616,14 @@ const RENDER_CONSTRUCTORS: &[&str] = &[
     "Element/button",
     "Element/checkbox",
     "Element/text_input",
+    "Element/program",
     "Element/embedded_media",
     "Scene/new",
     "Scene/Element/stripe",
     "Scene/Element/block",
     "Scene/Element/text",
     "Scene/Element/text_input",
+    "Scene/Element/program",
     "Scene/Element/checkbox",
     "Scene/Element/label",
     "Scene/Element/button",

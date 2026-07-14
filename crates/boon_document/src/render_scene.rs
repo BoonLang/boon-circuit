@@ -32,6 +32,36 @@ pub fn text_column_at(
         .unwrap_or_else(|| edges.len().saturating_sub(1))
 }
 
+pub fn text_position_at(
+    item: &DisplayItem,
+    x: f32,
+    y: f32,
+    columns: &mut impl RenderTextColumnMeasurer,
+) -> (usize, usize) {
+    let text = item.text.as_deref().unwrap_or_default();
+    let lines = text.split('\n').collect::<Vec<_>>();
+    let font_size = style_number(&item.style, "size").unwrap_or(14.0);
+    let line_height = style_line_height(&item.style, font_size).max(1.0);
+    let text_bounds = text_content_bounds_for_item(item);
+    let text_inset = style_number(&item.style, "text_inset").unwrap_or(4.0);
+    let top = text_top_for_parts(
+        text_bounds,
+        line_height * lines.len().max(1) as f32,
+        text_inset,
+        text_vertical_align(&item.kind, &item.style),
+    );
+    let line =
+        (((y - top) / line_height).floor().max(0.0) as usize).min(lines.len().saturating_sub(1));
+    let line_text = lines.get(line).copied().unwrap_or_default();
+    let edges = columns.column_edges(line_text, &item.style, line_height);
+    let local_x = x - text_left_for_width(item, edges.last().copied().unwrap_or_default());
+    let column = edges
+        .windows(2)
+        .position(|edge| local_x < (edge[0] + edge[1]) * 0.5)
+        .unwrap_or_else(|| edges.len().saturating_sub(1));
+    (line, column)
+}
+
 #[derive(Default)]
 pub struct ApproximateTextColumnMeasurer;
 
@@ -1975,37 +2005,80 @@ fn text_overlay_primitives(
         let font_size = style_number(&item.style, "size").unwrap_or(14.0);
         let text_inset = style_number(&item.style, "text_inset").unwrap_or(4.0);
         let vertical_align = text_vertical_align(&item.kind, &item.style);
-        let line_height =
-            style_line_height(&item.style, font_size).min(text_bounds.height.max(1.0));
-        let line_top = text_top_for_parts(text_bounds, line_height, text_inset, vertical_align);
+        let line_height = style_line_height(&item.style, font_size)
+            .min(text_bounds.height.max(1.0))
+            .max(1.0);
+        let lines = raw_text.split('\n').collect::<Vec<_>>();
+        let line_top = text_top_for_parts(
+            text_bounds,
+            line_height * lines.len().max(1) as f32,
+            text_inset,
+            vertical_align,
+        );
+        let mut x_for_line_column = |line: usize, column: f32| {
+            let line = lines.get(line).copied().unwrap_or_default();
+            let edges = columns.column_edges(line, &item.style, line_height);
+            let left = text_left_for_width(item, edges.last().copied().unwrap_or_default());
+            let column = column.max(0.0);
+            let lower = column.floor() as usize;
+            let fraction = column - lower as f32;
+            let lower_x = edges
+                .get(lower)
+                .copied()
+                .or_else(|| edges.last().copied())
+                .unwrap_or_default();
+            let upper_x = edges
+                .get(lower.saturating_add(1))
+                .copied()
+                .or_else(|| edges.last().copied())
+                .unwrap_or(lower_x);
+            left + lower_x + (upper_x - lower_x) * fraction
+        };
         if let (Some(start), Some(end)) = (
             style_number(&item.style, "selection_start"),
             style_number(&item.style, "selection_end"),
         ) {
             let start = start.max(0.0);
             let end = end.max(start);
-            let start_x = x_for_column(start);
-            let end_x = x_for_column(end);
-            primitives.push(text_overlay_primitive(
-                item,
-                RenderVisualPrimitiveKind::TextInputSelection,
-                Rect {
-                    x: start_x,
-                    y: line_top,
-                    width: (end_x - start_x).max(2.0),
-                    height: line_height,
-                },
-                style_color_u8(&item.style, "selection_color").unwrap_or([82, 139, 255, 72]),
-            ));
+            let start_line = style_number(&item.style, "selection_start_line")
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let end_line = style_number(&item.style, "selection_end_line")
+                .unwrap_or(start_line as f32)
+                .max(start_line as f32) as usize;
+            for line in start_line..=end_line.min(lines.len().saturating_sub(1)) {
+                let line_start = if line == start_line { start } else { 0.0 };
+                let line_end = if line == end_line {
+                    end
+                } else {
+                    lines.get(line).map_or(0, |line| line.chars().count()) as f32
+                };
+                let start_x = x_for_line_column(line, line_start);
+                let end_x = x_for_line_column(line, line_end);
+                primitives.push(text_overlay_primitive(
+                    item,
+                    RenderVisualPrimitiveKind::TextInputSelection,
+                    Rect {
+                        x: start_x,
+                        y: line_top + line as f32 * line_height,
+                        width: (end_x - start_x).max(2.0),
+                        height: line_height,
+                    },
+                    style_color_u8(&item.style, "selection_color").unwrap_or([82, 139, 255, 72]),
+                ));
+            }
         }
         if style_bool(&item.style, "caret_visible") == Some(true) {
             let caret_column = style_number(&item.style, "caret_column").unwrap_or(0.0);
+            let caret_line = style_number(&item.style, "caret_line")
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
             primitives.push(text_overlay_primitive(
                 item,
                 RenderVisualPrimitiveKind::TextInputCaret,
                 Rect {
-                    x: x_for_column(caret_column.max(0.0)),
-                    y: line_top,
+                    x: x_for_line_column(caret_line, caret_column.max(0.0)),
+                    y: line_top + caret_line as f32 * line_height,
                     width: 2.0,
                     height: line_height,
                 },
@@ -2617,7 +2690,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [u8; 4] {
             }
         }
         DocumentNodeKind::TextInput => [255, 255, 255, 255],
-        DocumentNodeKind::EmbeddedMedia => [255, 255, 255, 0],
+        DocumentNodeKind::EmbeddedProgram | DocumentNodeKind::EmbeddedMedia => [255, 255, 255, 0],
         DocumentNodeKind::Button | DocumentNodeKind::Checkbox | DocumentNodeKind::Text => {
             [255, 255, 255, 0]
         }

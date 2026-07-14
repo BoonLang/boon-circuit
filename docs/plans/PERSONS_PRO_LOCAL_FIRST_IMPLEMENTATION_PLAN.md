@@ -393,6 +393,23 @@ The local scenario must cover:
 - Embed the child document in the parent preview with stable retained identity.
 - Preserve the last valid child on diagnostics and reject stale results.
 
+Implementation checkpoint (2026-07-14): the generic Slice 2 code path is in
+place. `Element/program` and `Scene/Element/program` lower to a typed private
+descriptor; `ProgramArtifact`, `ProgramSession`, and `ProgramDocumentHost` own a
+bounded `SoftwareBounded` child runtime; compilation runs through a latest-wins
+per-host worker; child nodes, source routes, scroll roots, and materialization
+IDs are namespaced into the retained parent document; invalid and stale results
+cannot replace the active child. Persons.pro now edits the actual multiline Boon
+source and no longer duplicates its public page in trusted parent code. Generic
+compiler fixes cover function-wrapped HOLD constants, quoted-string newline
+escapes, and function-body SOURCE continuations rather than hiding those engine
+limitations in the example.
+
+This checkpoint does not complete the local-first milestone. Durable workspace
+restore, publishing and authentication adapters, native app-owned visual
+evidence, and release performance budgets remain governed by the later slices
+and the stop conditions below.
+
 ### Slice 3: Durable local workspace
 
 - Bind the example to a stable application identity and redb namespace.

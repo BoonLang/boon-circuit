@@ -1,6 +1,7 @@
 pub use boon_document_model::{
     Axis, ChangeBatch, DocumentFrame, DocumentNode, DocumentNodeId, DocumentNodeKind,
-    DocumentPatch, LayoutStylePatch, MaterialStylePatch, MaterializedRange, PaintStylePatch, Rect,
+    DocumentPatch, EmbeddedProgramDescriptor, LayoutStylePatch, MaterialStylePatch,
+    MaterializedRange, PaintStylePatch, ProgramCapabilityProfile, Rect,
     SENSITIVE_INPUT_REDACTED_GLYPHS, SENSITIVE_INPUT_REDACTED_VALUE, SENSITIVE_INPUT_STYLE_KEY,
     ScrollRootId, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch, StyleRichTextSpan,
     StyleValue, TextStylePatch, TextValue, UiSemanticChange,
@@ -638,7 +639,7 @@ fn semantic_node_from_document_node(
 fn semantic_role_for_document_kind(kind: &DocumentNodeKind) -> SemanticRole {
     match kind {
         DocumentNodeKind::Root => SemanticRole::Application,
-        DocumentNodeKind::Stack => SemanticRole::Group,
+        DocumentNodeKind::Stack | DocumentNodeKind::EmbeddedProgram => SemanticRole::Group,
         DocumentNodeKind::Row => SemanticRole::Row,
         DocumentNodeKind::Text => SemanticRole::Text,
         DocumentNodeKind::Button => SemanticRole::Button,
@@ -1751,6 +1752,7 @@ pub enum PatchInvalidationClass {
     Text,
     Style,
     Binding,
+    EmbeddedProgram,
     Scroll,
     Materialization,
     Layout,
@@ -3137,6 +3139,14 @@ pub fn diff_document_frames(previous: &DocumentFrame, next: &DocumentFrame) -> V
                 continue;
             }
         }
+        if previous_node.embedded_program != next_node.embedded_program
+            && let Some(program) = next_node.embedded_program.clone()
+        {
+            patches.push(DocumentPatch::SetEmbeddedProgram {
+                id: id.clone(),
+                program,
+            });
+        }
         let style = document_style_diff(&previous_node.style, &next_node.style);
         if !style.is_empty() {
             patches.push(DocumentPatch::SetStyle {
@@ -3813,7 +3823,9 @@ fn apply_direct_text_scroll(
 
 fn patch_preserves_layout_geometry(frame: &DocumentFrame, patch: &DocumentPatch) -> bool {
     match patch {
-        DocumentPatch::SetBinding { .. } | DocumentPatch::SetBindingAt { .. } => true,
+        DocumentPatch::SetBinding { .. }
+        | DocumentPatch::SetBindingAt { .. }
+        | DocumentPatch::SetEmbeddedProgram { .. } => true,
         DocumentPatch::SetText { id, .. } => frame
             .nodes
             .get(id)
@@ -3854,6 +3866,7 @@ fn patch_render_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
             | DocumentPatch::MoveChild { .. }
             | DocumentPatch::SetBinding { .. }
             | DocumentPatch::SetBindingAt { .. }
+            | DocumentPatch::SetEmbeddedProgram { .. }
             | DocumentPatch::SetScroll { .. }
             | DocumentPatch::SetListMaterialization { .. } => None,
         })
@@ -3874,6 +3887,7 @@ fn patch_hit_metadata_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeI
             }
             DocumentPatch::SetText { .. }
             | DocumentPatch::SetStyle { .. }
+            | DocumentPatch::SetEmbeddedProgram { .. }
             | DocumentPatch::SetScroll { .. }
             | DocumentPatch::SetListMaterialization { .. }
             | DocumentPatch::UpsertNode(_)
@@ -3975,6 +3989,7 @@ fn document_patch_structural_kind(patch: &DocumentPatch) -> Option<&'static str>
         DocumentPatch::MoveChild { .. } => Some("move_child"),
         DocumentPatch::SetText { .. }
         | DocumentPatch::SetStyle { .. }
+        | DocumentPatch::SetEmbeddedProgram { .. }
         | DocumentPatch::SetBinding { .. }
         | DocumentPatch::SetBindingAt { .. }
         | DocumentPatch::SetScroll { .. }
@@ -3992,6 +4007,7 @@ fn verify_nonstructural_patch(
     let (patch_kind, id) = match patch {
         DocumentPatch::SetText { id, .. } => ("set_text", id),
         DocumentPatch::SetStyle { id, .. } => ("set_style", id),
+        DocumentPatch::SetEmbeddedProgram { id, .. } => ("set_embedded_program", id),
         DocumentPatch::SetBinding { id, .. } => ("set_binding", id),
         DocumentPatch::SetBindingAt { id, ordinal, .. } => {
             let node = frame
@@ -4153,6 +4169,24 @@ fn apply_document_patch_unchecked(
                 patch_kind: "set_style",
                 target: Some(id),
                 invalidation,
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetEmbeddedProgram { id, program } => {
+            let node = required_node_mut(frame, "set_embedded_program", &id)?;
+            if node.kind != DocumentNodeKind::EmbeddedProgram {
+                return Err(PatchApplyError::StaleReference {
+                    reference_kind: "embedded_program_node",
+                    id,
+                });
+            }
+            node.embedded_program = Some(program);
+            Ok(PatchApplyReport {
+                patch_kind: "set_embedded_program",
+                target: Some(id),
+                invalidation: vec![PatchInvalidationClass::EmbeddedProgram],
                 removed_nodes: Vec::new(),
                 node_count_after: frame.nodes.len(),
                 materialization: None,

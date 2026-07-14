@@ -1,14 +1,11 @@
 -- Persons.pro local-first publishing workspace.
 --
--- This first slice owns the product shell and authoritative workspace state in
--- Boon. The generic restricted child-program host is the next implementation
--- slice; `implementation_stage` keeps that boundary observable in tests.
+-- The trusted workspace owns workflow state. The editable public page is a
+-- separate bounded Boon program mounted by the generic child-program host.
 
 store: [
     elements: [
-        profile_name: SOURCE
-        profile_introduction: SOURCE
-        profile_location: SOURCE
+        source_editor: SOURCE
         show_code: SOURCE
         show_preview: SOURCE
         protect_workspace: SOURCE
@@ -21,29 +18,17 @@ store: [
 
     workspace_id: TEXT { 019f-persons-local-first }
     workspace_path: TEXT { persons.pro/p/019f-persons-local-first }
-    implementation_stage: Shell
+    implementation_stage: ChildProgram
 
-    profile_name:
-        TEXT { Your name } |> HOLD profile_name {
-            elements.profile_name.event.change.text
-        }
-
-    profile_introduction:
-        TEXT { I build useful things with Boon. } |> HOLD profile_introduction {
-            elements.profile_introduction.event.change.text
-        }
-
-    profile_location:
-        TEXT { Trondheim, Norway } |> HOLD profile_location {
-            elements.profile_location.event.change.text
+    source_draft:
+        Profile/starter_source() |> HOLD source_draft {
+            elements.source_editor.event.change.text
         }
 
     draft_revision:
         1 |> HOLD draft_revision {
             LATEST {
-                elements.profile_name.event.change |> THEN { draft_revision + 1 }
-                elements.profile_introduction.event.change |> THEN { draft_revision + 1 }
-                elements.profile_location.event.change |> THEN { draft_revision + 1 }
+                elements.source_editor.event.change |> THEN { draft_revision + 1 }
             }
         }
 
@@ -68,16 +53,14 @@ store: [
     publish_state:
         Draft |> HOLD publish_state {
             LATEST {
-                elements.profile_name.event.change |> THEN { Draft }
-                elements.profile_introduction.event.change |> THEN { Draft }
-                elements.profile_location.event.change |> THEN { Draft }
+                elements.source_editor.event.change |> THEN { Draft }
                 elements.publish.event.press |> THEN { Published }
             }
         }
 
     published_name:
         TEXT { Not published } |> HOLD published_name {
-            elements.publish.event.press |> THEN { profile_name }
+            elements.publish.event.press |> THEN { TEXT { Workspace page } }
         }
 
     published_revision:
@@ -94,13 +77,6 @@ store: [
                 }
             }
         }
-
-    source_summary:
-        Profile/summary(
-            name: profile_name
-            introduction: profile_introduction
-            location: profile_location
-        )
 ]
 
 scene: App/main_scene(PASS: [store: store])

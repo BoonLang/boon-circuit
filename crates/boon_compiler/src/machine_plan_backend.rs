@@ -373,6 +373,30 @@ fn plan_value_type_from_initial_with_root_and_row_fields(
     }
 }
 
+fn state_initial_value_type(
+    program: &TypedProgram,
+    state: &boon_ir::StateCell,
+    root_field_types: &RootInitialFieldTypeMap,
+    row_field_types: &RowInitialFieldTypeMap,
+    expression_types: &BTreeMap<usize, PlanValueType>,
+) -> PlanValueType {
+    let declared = plan_value_type_from_initial_with_root_and_row_fields(
+        &state.path,
+        &state.initial_value,
+        plan_scope_id(state.scope_id),
+        root_field_types,
+        row_field_types,
+    );
+    if plan_value_type_is_concrete(declared) {
+        return declared;
+    }
+    state
+        .initial_expr_id
+        .and_then(|expr_id| inferred_expression_value_type(program, expr_id.0, expression_types))
+        .filter(|value_type| plan_value_type_is_concrete(*value_type))
+        .unwrap_or(declared)
+}
+
 fn initial_value_kind_from_ir(value: &InitialValue) -> InitialValueKind {
     match value {
         InitialValue::Text { .. } => InitialValueKind::Text,
@@ -2458,6 +2482,7 @@ pub fn compile_typed_program(
     let effect_outbox = effect_outbox_schemas(&effects)?;
     let row_initial_field_types = row_initial_field_value_types(program);
     let root_initial_field_types = root_initial_field_value_types(program);
+    let expression_value_types = expression_value_type_lookup(program);
     let synthetic_initial_field_ids = synthetic_initial_list_field_ids(program);
     let index = ValueIndex::new(program, &root_initial_field_types, &row_initial_field_types);
     let mut next_op = 0usize;
@@ -2484,12 +2509,24 @@ pub fn compile_typed_program(
         .iter()
         .map(|state| migration_storage_default(program, state))
         .collect::<Vec<_>>();
+    let inferred_initial_constants = program
+        .state_cells
+        .iter()
+        .map(|state| {
+            initial_constant_value(&state.initial_value).or_else(|| {
+                state.initial_expr_id.and_then(|expr_id| {
+                    constant_initial_expression_value(program, expr_id.as_usize())
+                })
+            })
+        })
+        .collect::<Vec<_>>();
     let initial_constant_ids = program
         .state_cells
         .iter()
         .enumerate()
-        .map(|(state_index, state)| {
-            initial_constant_value(&state.initial_value)
+        .map(|(state_index, _state)| {
+            inferred_initial_constants[state_index]
+                .clone()
                 .or_else(|| {
                     migration_storage_defaults[state_index]
                         .as_ref()
@@ -2506,7 +2543,17 @@ pub fn compile_typed_program(
             migration_storage_defaults[state_index]
                 .as_ref()
                 .map_or_else(
-                    || initial_value_kind_from_ir(&state.initial_value),
+                    || {
+                        let kind = initial_value_kind_from_ir(&state.initial_value);
+                        if kind == InitialValueKind::Unknown {
+                            inferred_initial_constants[state_index]
+                                .as_ref()
+                                .map(initial_value_kind_from_constant)
+                                .unwrap_or(kind)
+                        } else {
+                            kind
+                        }
+                    },
                     |default| default.initial_value_kind,
                 )
         })
@@ -2548,12 +2595,12 @@ pub fn compile_typed_program(
                 .as_ref()
                 .map_or_else(
                     || {
-                        plan_value_type_from_initial_with_root_and_row_fields(
-                            &state.path,
-                            &state.initial_value,
-                            plan_scope_id(state.scope_id),
+                        state_initial_value_type(
+                            program,
+                            state,
                             &root_initial_field_types,
                             &row_initial_field_types,
+                            &expression_value_types,
                         )
                     },
                     |default| default.value_type,
@@ -3302,6 +3349,88 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
         InitialValue::RootInitialField { .. }
         | InitialValue::RowInitialField { .. }
         | InitialValue::Unknown { .. } => None,
+    }
+}
+
+fn initial_value_kind_from_constant(value: &PlanConstantValue) -> InitialValueKind {
+    match value {
+        PlanConstantValue::Text { .. } => InitialValueKind::Text,
+        PlanConstantValue::Number { .. } => InitialValueKind::Number,
+        PlanConstantValue::Byte { .. } => InitialValueKind::Byte,
+        PlanConstantValue::Bool { .. } => InitialValueKind::Bool,
+        PlanConstantValue::Bytes { .. } => InitialValueKind::Bytes,
+        PlanConstantValue::Enum { .. } => InitialValueKind::Enum,
+    }
+}
+
+fn constant_initial_expression_value(
+    program: &TypedProgram,
+    expr_id: usize,
+) -> Option<PlanConstantValue> {
+    constant_initial_expression_value_inner(program, expr_id, &mut BTreeSet::new())
+}
+
+fn constant_initial_expression_value_inner(
+    program: &TypedProgram,
+    expr_id: usize,
+    visiting_functions: &mut BTreeSet<String>,
+) -> Option<PlanConstantValue> {
+    match &expr_by_id(program, expr_id)?.kind {
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+            Some(PlanConstantValue::Text {
+                value: value.clone(),
+            })
+        }
+        AstExprKind::Number(value) => value
+            .parse::<i64>()
+            .ok()
+            .map(|value| PlanConstantValue::Number { value }),
+        AstExprKind::ByteLiteral { value, .. } => Some(PlanConstantValue::Byte { value: *value }),
+        AstExprKind::Bool(value) => Some(PlanConstantValue::Bool { value: *value }),
+        AstExprKind::Enum(value) | AstExprKind::Tag(value) => Some(PlanConstantValue::Enum {
+            value: value.clone(),
+        }),
+        AstExprKind::BytesLiteral { items, .. } => {
+            let bytes = row_static_bytes_literal(program, items)?;
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            Some(PlanConstantValue::Bytes {
+                byte_len: bytes.len() as u64,
+                sha256: format!("{:x}", hasher.finalize()),
+                inline_bytes: (bytes.len() <= INLINE_BYTE_CONSTANT_LIMIT).then_some(bytes),
+            })
+        }
+        AstExprKind::Call { function, args } if args.is_empty() => match function.as_str() {
+            "Text/empty" => Some(PlanConstantValue::Text {
+                value: String::new(),
+            }),
+            "Text/space" => Some(PlanConstantValue::Text {
+                value: " ".to_owned(),
+            }),
+            _ => {
+                if !visiting_functions.insert(function.clone()) {
+                    return None;
+                }
+                let value = program
+                    .functions
+                    .iter()
+                    .find(|definition| definition.name == *function && definition.args.is_empty())
+                    .and_then(|definition| direct_statement_value_expr_id(&definition.statement))
+                    .and_then(|function_expr| {
+                        constant_initial_expression_value_inner(
+                            program,
+                            function_expr,
+                            visiting_functions,
+                        )
+                    });
+                visiting_functions.remove(function);
+                value
+            }
+        },
+        AstExprKind::Hold { initial, .. } => {
+            constant_initial_expression_value_inner(program, *initial, visiting_functions)
+        }
+        _ => None,
     }
 }
 
@@ -4184,12 +4313,29 @@ fn plan_value_type_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<Plan
 }
 
 fn direct_statement_value_expr_id(statement: &AstStatement) -> Option<usize> {
-    statement.expr.or_else(|| {
-        statement
-            .children
-            .iter()
-            .find_map(direct_statement_value_expr_id)
-    })
+    if let Some(expr) = statement.expr {
+        return Some(expr);
+    }
+    let body = statement
+        .children
+        .iter()
+        .find(|child| matches!(child.kind, AstStatementKind::Block))
+        .unwrap_or(statement);
+    body.children
+        .iter()
+        .rev()
+        .find_map(|child| match child.kind {
+            AstStatementKind::Expression | AstStatementKind::List { field: None, .. } => {
+                child.expr.or_else(|| direct_statement_value_expr_id(child))
+            }
+            AstStatementKind::Block => direct_statement_value_expr_id(child),
+            AstStatementKind::Function { .. }
+            | AstStatementKind::Field { .. }
+            | AstStatementKind::Source { .. }
+            | AstStatementKind::Hold { .. }
+            | AstStatementKind::List { field: Some(_), .. }
+            | AstStatementKind::Spread => None,
+        })
 }
 
 fn plan_initial_list_rows(
@@ -10289,6 +10435,7 @@ impl ValueIndex {
         let mut source_row_lookup_fields = BTreeMap::new();
         let mut state_value_types = BTreeMap::new();
         let mut field_value_types = BTreeMap::new();
+        let expression_types = expression_value_type_lookup(program);
         let synthetic_field_ids = synthetic_initial_list_field_ids(program);
         for source in &program.sources {
             by_path.insert(
@@ -10314,12 +10461,12 @@ impl ValueIndex {
                 state.path.clone(),
                 migration_storage_default(program, state).map_or_else(
                     || {
-                        plan_value_type_from_initial_with_root_and_row_fields(
-                            &state.path,
-                            &state.initial_value,
-                            plan_scope_id(state.scope_id),
+                        state_initial_value_type(
+                            program,
+                            state,
                             root_field_types,
                             row_field_types,
+                            &expression_types,
                         )
                     },
                     |default| default.value_type,

@@ -2151,7 +2151,14 @@ fn unescape_string_literal(value: &str) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             if let Some(next) = chars.next() {
-                output.push(next);
+                output.push(match next {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '\\' => '\\',
+                    '"' => '"',
+                    other => other,
+                });
             }
         } else {
             output.push(ch);

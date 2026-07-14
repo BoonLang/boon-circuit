@@ -1403,6 +1403,24 @@ fn permits_app_visible_id_field_as_ordinary_data() {
 }
 
 #[test]
+fn quoted_strings_decode_standard_escapes() {
+    let parsed = parse_source(
+        "string-escapes.bn",
+        r#"value: "first\nsecond\t\"quoted\"\\tail"
+"#,
+    )
+    .unwrap();
+
+    assert!(parsed.expressions.iter().any(|expr| {
+        matches!(
+            &expr.kind,
+            AstExprKind::StringLiteral(value)
+                if value == "first\nsecond\t\"quoted\"\\tail"
+        )
+    }));
+}
+
+#[test]
 fn permits_app_visible_todo_id_state_fields() {
     let source = r#"
 SOURCE

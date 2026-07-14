@@ -789,6 +789,53 @@ fn render_visual_primitives_lower_text_overlays_before_gpu() {
 }
 
 #[test]
+fn multiline_text_input_hit_testing_and_overlays_preserve_line_coordinates() {
+    let mut style = StyleMap::new();
+    style.insert("size".to_owned(), StyleValue::Number(10.0));
+    style.insert("line_height".to_owned(), StyleValue::Number(20.0));
+    style.insert("text_inset".to_owned(), StyleValue::Number(0.0));
+    style.insert(
+        "vertical_align".to_owned(),
+        StyleValue::Text("Top".to_owned()),
+    );
+    style.insert("caret_visible".to_owned(), StyleValue::Bool(true));
+    style.insert("caret_line".to_owned(), StyleValue::Number(1.0));
+    style.insert("caret_column".to_owned(), StyleValue::Number(2.0));
+    style.insert("selection_start_line".to_owned(), StyleValue::Number(0.0));
+    style.insert("selection_start".to_owned(), StyleValue::Number(1.0));
+    style.insert("selection_end_line".to_owned(), StyleValue::Number(2.0));
+    style.insert("selection_end".to_owned(), StyleValue::Number(1.0));
+    let item = DisplayItem {
+        node: DocumentNodeId("multiline-input".to_owned()),
+        kind: DocumentNodeKind::TextInput,
+        bounds: Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 160.0,
+            height: 80.0,
+        },
+        style,
+        text: Some("ab\ncdef\ng".to_owned()),
+        focused: true,
+        style_identity: identity(),
+    };
+    let mut columns = ApproximateTextColumnMeasurer;
+
+    assert_eq!(text_position_at(&item, 17.0, 45.0, &mut columns), (1, 1));
+    let primitives = render_visual_primitives(&frame_with_item(item), 200, 120, &mut columns);
+    let selections = primitives
+        .iter()
+        .filter(|primitive| primitive.primitive == RenderVisualPrimitiveKind::TextInputSelection)
+        .collect::<Vec<_>>();
+    assert_eq!(selections.len(), 3);
+    let caret = primitives
+        .iter()
+        .find(|primitive| primitive.primitive == RenderVisualPrimitiveKind::TextInputCaret)
+        .expect("multiline caret primitive");
+    assert_eq!(caret.bounds.y, 41.0);
+}
+
+#[test]
 fn lower_layout_frame_to_render_scene_combines_items_primitives_and_text() {
     let mut style = StyleMap::new();
     style.insert("bg".to_owned(), StyleValue::Text("#101820".to_owned()));

@@ -128,6 +128,52 @@ fn compiler_emits_machine_plan_v3_as_its_only_output() {
 }
 
 #[test]
+fn pure_function_wrapped_hold_initializer_is_materialized_as_a_typed_constant() {
+    let compiled = compile_source_text_to_machine_plan(
+        "function-initializer.bn",
+        r#"
+FUNCTION starter_text() {
+    decoy: "not the function result"
+    "first line\nsecond line"
+}
+
+store: [
+    value:
+        starter_text() |> HOLD value {
+            LATEST {}
+        }
+]
+
+scene: Scene/Element/text(
+    element: []
+    style: [width: Fill, height: 24]
+    text: store.value
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let slot = compiled
+        .plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| !slot.indexed)
+        .unwrap();
+    assert_eq!(slot.initial_value_kind, boon_plan::InitialValueKind::Text);
+    let constant = &compiled.plan.constants[slot.initial_constant_id.unwrap().0].value;
+    assert_eq!(
+        constant,
+        &boon_plan::PlanConstantValue::Text {
+            value: "first line\nsecond line".to_owned(),
+        }
+    );
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
 fn compiler_lowers_typed_output_roots_into_the_generic_registry() {
     let compiled = compile_source_text_to_machine_plan(
         "counter-output-root.bn",
@@ -1543,6 +1589,7 @@ FUNCTION action_button(label) {
         label: label
     )
 }
+
 "#
             .to_owned(),
         },
@@ -1580,6 +1627,38 @@ document: Document/new(root: View/root(PASS: [store: store]))
     let compiled =
         compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
             .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+
+    assert!(document.view_bindings.iter().any(|binding| {
+        binding.kind == boon_plan::DocumentBindingKind::Source
+            && matches!(
+                binding.target,
+                boon_plan::DocumentBindingTarget::Source { .. }
+            )
+    }));
+}
+
+#[test]
+fn document_function_block_binds_source_continuation_to_constructor_result() {
+    let compiled = compile_source_text_to_machine_plan(
+        "function-source-continuation.bn",
+        r#"
+store: [editor: SOURCE]
+
+FUNCTION editor() {
+    Scene/Element/text_input(
+        element: [event: [change: SOURCE]]
+        style: [width: Fill, height: 200, multiline: True]
+        text: TEXT { source }
+    )
+        |> SOURCE { PASSED.store.editor }
+}
+
+scene: editor(PASS: [store: store])
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
 
     assert!(document.view_bindings.iter().any(|binding| {

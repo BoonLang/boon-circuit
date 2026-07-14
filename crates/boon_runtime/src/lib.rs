@@ -4,7 +4,7 @@ use boon_compiler::{
     compile_runtime_source_units_to_machine_plan_with_identity, compiler_source_text_for_path,
     compiler_source_units_for_manifest_source, compiler_source_units_for_path,
 };
-pub use boon_document_model::{DocumentFrame, DocumentPatch};
+pub use boon_document_model::{DocumentFrame, DocumentPatch, ProgramCapabilityProfile};
 use boon_example_manifest::ExampleManifest;
 pub use boon_example_manifest::{
     ExampleEntry as ExampleManifestEntry, MigrationScenario, MigrationSequence,
@@ -30,6 +30,7 @@ use std::time::Instant;
 use web_time::Instant;
 
 mod document;
+mod program;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod persistent;
@@ -50,6 +51,7 @@ pub use effects::*;
 pub use migration_scenario::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use persistent::*;
+pub use program::*;
 #[cfg(target_arch = "wasm32")]
 pub use web_persistent::*;
 

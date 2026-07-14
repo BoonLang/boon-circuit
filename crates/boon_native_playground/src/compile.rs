@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -8,7 +9,10 @@ use boon_compiler::{
 use boon_plan::{
     DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, TargetProfile,
 };
-use boon_runtime::ApplicationIdentity;
+use boon_runtime::{
+    ApplicationIdentity, ProgramArtifact, ProgramDiagnostic, ProgramHostRequest, ProgramRequestId,
+    compile_program_artifact,
+};
 use futures::channel::mpsc;
 
 use crate::protocol::{MigrationBundle, PreviewIntent, SourceUnit, TestStep};
@@ -91,6 +95,117 @@ impl Drop for CompileWorker {
         wake.notify_one();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+    }
+}
+
+pub struct ProgramCompileOutcome {
+    pub request_id: ProgramRequestId,
+    pub host: boon_document_model::DocumentNodeId,
+    pub result: Result<ProgramArtifact, ProgramDiagnostic>,
+}
+
+#[derive(Default)]
+struct ProgramCompileState {
+    pending: BTreeMap<boon_document_model::DocumentNodeId, ProgramHostRequest>,
+    closing: bool,
+    replaced: u64,
+}
+
+pub struct ProgramCompileWorker {
+    state: Arc<(Mutex<ProgramCompileState>, Condvar)>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ProgramCompileWorker {
+    pub fn start() -> (Self, mpsc::UnboundedReceiver<ProgramCompileOutcome>) {
+        let state = Arc::new((Mutex::new(ProgramCompileState::default()), Condvar::new()));
+        let worker_state = Arc::clone(&state);
+        let (output, receiver) = mpsc::unbounded();
+        let thread = thread::Builder::new()
+            .name("boon-program-compile".to_owned())
+            .spawn(move || program_compile_loop(worker_state, output))
+            .expect("spawn child program compile worker");
+        (
+            Self {
+                state,
+                thread: Some(thread),
+            },
+            receiver,
+        )
+    }
+
+    pub fn replace(&self, request: ProgramHostRequest) {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("program compile worker lock");
+        if state
+            .pending
+            .insert(request.host.clone(), request)
+            .is_some()
+        {
+            state.replaced = state.replaced.saturating_add(1);
+        }
+        wake.notify_one();
+    }
+
+    #[cfg(test)]
+    pub fn replaced_count(&self) -> u64 {
+        self.state
+            .0
+            .lock()
+            .expect("program compile worker lock")
+            .replaced
+    }
+}
+
+impl Drop for ProgramCompileWorker {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.state;
+        lock.lock().expect("program compile worker lock").closing = true;
+        wake.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn program_compile_loop(
+    state: Arc<(Mutex<ProgramCompileState>, Condvar)>,
+    output: mpsc::UnboundedSender<ProgramCompileOutcome>,
+) {
+    loop {
+        let request = {
+            let (lock, wake) = &*state;
+            let mut state = lock.lock().expect("program compile worker lock");
+            while state.pending.is_empty() && !state.closing {
+                state = wake.wait(state).expect("program compile worker wait");
+            }
+            if state.closing {
+                return;
+            }
+            let host = state
+                .pending
+                .keys()
+                .next()
+                .cloned()
+                .expect("nonempty program compile queue");
+            state
+                .pending
+                .remove(&host)
+                .expect("program compile request")
+        };
+        let request_id = request.request_id;
+        let host = request.host;
+        let result = compile_program_artifact(&request.compile);
+        if output
+            .unbounded_send(ProgramCompileOutcome {
+                request_id,
+                host,
+                result,
+            })
+            .is_err()
+        {
+            return;
         }
     }
 }
@@ -289,6 +404,37 @@ mod tests {
             });
         }
         assert!(worker.replaced_count() >= 1);
+    }
+
+    #[test]
+    fn child_program_mailbox_is_depth_one_per_host_and_latest_wins() {
+        let worker = ProgramCompileWorker {
+            state: Arc::new((Mutex::new(ProgramCompileState::default()), Condvar::new())),
+            thread: None,
+        };
+        let host = boon_document_model::DocumentNodeId("program-host".to_owned());
+        for revision in 1..=4 {
+            worker.replace(ProgramHostRequest {
+                request_id: ProgramRequestId(format!("request-{revision}")),
+                host: host.clone(),
+                compile: boon_runtime::ProgramCompileRequest {
+                    revision,
+                    source_label: "Child.bn".to_owned(),
+                    units: vec![boon_runtime::RuntimeSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: format!("value: {revision}\n"),
+                    }],
+                    application: application("child-mailbox"),
+                    capability_profile:
+                        boon_document_model::ProgramCapabilityProfile::PublicDocument,
+                },
+            });
+        }
+
+        assert_eq!(worker.replaced_count(), 3);
+        let state = worker.state.0.lock().unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending[&host].compile.revision, 4);
     }
 
     #[test]

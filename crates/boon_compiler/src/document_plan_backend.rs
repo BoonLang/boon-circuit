@@ -400,6 +400,15 @@ impl<'a> DocumentCompiler<'a> {
         let mut bindings = Vec::new();
         let mut result = None;
         for (index, statement) in statements.iter().enumerate() {
+            if child_is_pipeline_continuation(statement, self.program) {
+                let input = result.take().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "document block {compiler_id} starts with a pipeline continuation"
+                    ))
+                })?;
+                result = Some(self.compile_statement_value(statement, &scoped, Some(input))?);
+                continue;
+            }
             let is_last = index + 1 == statements.len();
             if !is_last && statement_has_named_field(statement) {
                 let name = statement_field_name(statement).expect("checked named field");
@@ -2362,12 +2371,14 @@ fn document_constructor(function: &str) -> Option<DocumentConstructor> {
         "Element/button" => DocumentConstructor::ElementButton,
         "Element/checkbox" => DocumentConstructor::ElementCheckbox,
         "Element/text_input" => DocumentConstructor::ElementTextInput,
+        "Element/program" => DocumentConstructor::ElementProgram,
         "Element/embedded_media" => DocumentConstructor::ElementEmbeddedMedia,
         "Scene/new" => DocumentConstructor::SceneNew,
         "Scene/Element/stripe" => DocumentConstructor::SceneElementStripe,
         "Scene/Element/block" => DocumentConstructor::SceneElementBlock,
         "Scene/Element/text" => DocumentConstructor::SceneElementText,
         "Scene/Element/text_input" => DocumentConstructor::SceneElementTextInput,
+        "Scene/Element/program" => DocumentConstructor::SceneElementProgram,
         "Scene/Element/checkbox" => DocumentConstructor::SceneElementCheckbox,
         "Scene/Element/label" => DocumentConstructor::SceneElementLabel,
         "Scene/Element/button" => DocumentConstructor::SceneElementButton,

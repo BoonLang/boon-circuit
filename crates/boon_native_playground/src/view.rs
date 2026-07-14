@@ -20,6 +20,7 @@ pub struct HitTarget {
     pub bounds_y: f32,
     pub bounds_width: f32,
     pub bounds_height: f32,
+    pub text_line: Option<usize>,
     pub text_column: Option<usize>,
 }
 
@@ -204,13 +205,15 @@ impl RetainedView {
         columns: &mut impl RenderTextColumnMeasurer,
     ) -> Option<HitTarget> {
         let mut target = self.hit_target(x, y)?;
-        target.text_column = self
+        let position = self
             .retained
             .layout()
             .display_list
             .iter()
             .find(|item| item.node.0 == target.node && item.kind == DocumentNodeKind::TextInput)
-            .map(|item| boon_document::render_scene::text_column_at(item, x, columns));
+            .map(|item| boon_document::render_scene::text_position_at(item, x, y, columns));
+        target.text_line = position.map(|position| position.0);
+        target.text_column = position.map(|position| position.1);
         Some(target)
     }
 
@@ -238,6 +241,7 @@ impl RetainedView {
                     bounds_y: y,
                     bounds_width: 0.0,
                     bounds_height: 0.0,
+                    text_line: None,
                     text_column: None,
                 });
             }
@@ -462,6 +466,7 @@ fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
         bounds_y: entry.bounds.y,
         bounds_width: entry.bounds.width,
         bounds_height: entry.bounds.height,
+        text_line: None,
         text_column: None,
     }
 }

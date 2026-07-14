@@ -1,7 +1,7 @@
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
-    DocumentPatch, MaterializedRange, SourceBinding, SourceBindingId, StyleMap, StylePatch,
-    StyleValue, TextValue,
+    DocumentPatch, EmbeddedProgramDescriptor, MaterializedRange, ProgramCapabilityProfile,
+    SourceBinding, SourceBindingId, StyleMap, StylePatch, StyleValue, TextValue,
 };
 use boon_plan::{
     DocumentArgumentRole, DocumentBuiltin, DocumentConstantId, DocumentConstantValue,
@@ -3085,6 +3085,9 @@ fn constructor_kind(constructor: DocumentConstructor, direction: Option<&str>) -
         DocumentConstructor::ElementTextInput | DocumentConstructor::SceneElementTextInput => {
             DocumentNodeKind::TextInput
         }
+        DocumentConstructor::ElementProgram | DocumentConstructor::SceneElementProgram => {
+            DocumentNodeKind::EmbeddedProgram
+        }
         DocumentConstructor::ElementEmbeddedMedia
         | DocumentConstructor::SceneElementEmbeddedMedia => DocumentNodeKind::EmbeddedMedia,
         DocumentConstructor::ElementContainer
@@ -3127,6 +3130,32 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
     }
     if name == "items" || name == "children" || name == "child" || name == "root" {
         return;
+    }
+    if node.kind == DocumentNodeKind::EmbeddedProgram {
+        let program = node
+            .embedded_program
+            .get_or_insert_with(EmbeddedProgramDescriptor::default);
+        match name {
+            "source" => {
+                program.source = value.text();
+                program.source_digest = crate::sha256_bytes(program.source.as_bytes());
+            }
+            "revision" => {
+                program.revision = value.number().unwrap_or(0.0).max(0.0) as u64;
+            }
+            "capability_profile" => {
+                program.capability_profile = match value.text().as_str() {
+                    "PublicDocument" | "public_document" => {
+                        ProgramCapabilityProfile::PublicDocument
+                    }
+                    _ => ProgramCapabilityProfile::PublicDocument,
+                };
+            }
+            _ => {}
+        }
+        if matches!(name, "source" | "revision" | "capability_profile") {
+            return;
+        }
     }
     if let Some(style) = scalar_style_value(&value) {
         let key = match name {
@@ -3757,6 +3786,14 @@ fn diff_node(previous: &DocumentNode, next: &DocumentNode) -> Vec<DocumentPatch>
     }
 
     let mut patches = Vec::new();
+    if previous.embedded_program != next.embedded_program
+        && let Some(program) = next.embedded_program.clone()
+    {
+        patches.push(DocumentPatch::SetEmbeddedProgram {
+            id: next.id.clone(),
+            program,
+        });
+    }
     if previous.text != next.text
         && let Some(text) = next.text.clone()
     {
@@ -3815,7 +3852,7 @@ fn collect_preorder(frame: &DocumentFrame, id: &FrameNodeId, order: &mut Vec<Fra
     }
 }
 
-fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec<DocumentPatch> {
+pub(crate) fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec<DocumentPatch> {
     let mut patches = Vec::new();
     let removed = previous
         .nodes

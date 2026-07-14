@@ -3,25 +3,31 @@ source = "examples/persons_pro/RUN.bn"
 
 [[step]]
 id = "initial-workspace"
-expect_root_text = { "store.workspace_id" = "019f-persons-local-first", "store.implementation_stage" = "Shell", "store.profile_name" = "Your name", "store.account_state" = "Anonymous", "store.publish_state" = "Draft", "store.active_view" = "Code" }
+expect_root_text = { "store.workspace_id" = "019f-persons-local-first", "store.implementation_stage" = "ChildProgram", "store.account_state" = "Anonymous", "store.publish_state" = "Draft", "store.active_view" = "Code", "store.draft_revision" = "1" }
 
 [[step]]
-id = "edit-profile-name"
-user_action = { kind = "type_text", target = "profile name", text = "Martin Kavik" }
-expected_source_event = { source = "store.elements.profile_name", text = "Martin Kavik" }
-expect_root_text = { "store.profile_name" = "Martin Kavik", "store.publish_state" = "Draft" }
+id = "edit-valid-source"
+user_action = { kind = "type_text", target = "profile source", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })" }
+expected_source_event = { source = "store.elements.source_editor", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })" }
+expect_root_text = { "store.source_draft" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })", "store.draft_revision" = "2", "store.publish_state" = "Draft" }
 
 [[step]]
-id = "edit-profile-introduction"
-user_action = { kind = "type_text", target = "profile introduction", text = "Building Boon tools in Norway." }
-expected_source_event = { source = "store.elements.profile_introduction", text = "Building Boon tools in Norway." }
-expect_root_text = { "store.profile_introduction" = "Building Boon tools in Norway.", "store.publish_state" = "Draft" }
+id = "edit-invalid-source"
+user_action = { kind = "type_text", target = "profile source", text = "scene: Missing/constructor(" }
+expected_source_event = { source = "store.elements.source_editor", text = "scene: Missing/constructor(" }
+expect_root_text = { "store.source_draft" = "scene: Missing/constructor(", "store.draft_revision" = "3", "store.publish_state" = "Draft" }
+
+[[step]]
+id = "correct-source"
+user_action = { kind = "type_text", target = "profile source", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }
+expected_source_event = { source = "store.elements.source_editor", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }
+expect_root_text = { "store.source_draft" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })", "store.draft_revision" = "4", "store.publish_state" = "Draft" }
 
 [[step]]
 id = "publish-profile"
 user_action = { kind = "click", target = "publish", target_text = "Publish" }
 expected_source_event = { source = "store.elements.publish", target_text = "Publish" }
-expect_root_text = { "store.publish_state" = "Published", "store.published_name" = "Martin Kavik" }
+expect_root_text = { "store.publish_state" = "Published", "store.published_name" = "Workspace page", "store.published_revision" = "4" }
 
 [[step]]
 id = "protect-workspace"
@@ -46,12 +52,6 @@ id = "sign-in"
 user_action = { kind = "click", target = "sign in", target_text = "Sign in" }
 expected_source_event = { source = "store.elements.sign_in", target_text = "Sign in" }
 expect_root_text = { "store.account_state" = "TwoPasskeys" }
-
-[[step]]
-id = "edit-after-publish"
-user_action = { kind = "type_text", target = "profile location", text = "Oslo, Norway" }
-expected_source_event = { source = "store.elements.profile_location", text = "Oslo, Norway" }
-expect_root_text = { "store.profile_location" = "Oslo, Norway", "store.publish_state" = "Draft", "store.published_name" = "Martin Kavik" }
 
 [[step]]
 id = "toggle-dark"

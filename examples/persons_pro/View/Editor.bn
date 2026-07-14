@@ -11,7 +11,6 @@ FUNCTION root() {
         ]
         items: LIST {
             header()
-            fields()
             source_panel()
         }
     )
@@ -34,83 +33,27 @@ FUNCTION header() {
     )
 }
 
-FUNCTION fields() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 10
-        style: [width: Fill, paint: False]
-        items: LIST {
-            Components/field(
-                PASS: [store: PASSED.store]
-                label: TEXT { Profile name }
-                value: PASSED.store.profile_name
-                placeholder: TEXT { Your name }
-            )
-                |> SOURCE { PASSED.store.elements.profile_name }
-            Components/field(
-                PASS: [store: PASSED.store]
-                label: TEXT { Introduction }
-                value: PASSED.store.profile_introduction
-                placeholder: TEXT { What are you making? }
-            )
-                |> SOURCE { PASSED.store.elements.profile_introduction }
-            Components/field(
-                PASS: [store: PASSED.store]
-                label: TEXT { Location }
-                value: PASSED.store.profile_location
-                placeholder: TEXT { City, country }
-            )
-                |> SOURCE { PASSED.store.elements.profile_location }
-        }
-    )
-}
-
 FUNCTION source_panel() {
-    Scene/Element/stripe(
-        element: []
-        direction: Column
-        gap: 3
+    Scene/Element/text_input(
+        element: [event: [change: SOURCE]]
         style: [
             ...PersonsTheme/inset(mode: PASSED.store.mode)
+            ...PersonsTheme/code(mode: PASSED.store.mode)
             width: Fill
+            height: Fill
             padding: 12
+            text_inset: 2
+            multiline: True
+            input_live_change: True
+            text_wrap: False
+            vertical_align: Top
+            scroll_y: True
+            scrollbars: True
+            __focus_border: PersonsTheme/focus_border()
         ]
-        items: LIST {
-            code_line(value: TEXT { profile: [fields] }, tone: Keyword)
-            code_line(value: TEXT {     name: TEXT }, tone: Plain)
-            code_value(value: PASSED.store.profile_name)
-            code_line(value: TEXT {     introduction: TEXT }, tone: Plain)
-            code_value(value: PASSED.store.profile_introduction)
-            code_line(value: TEXT {     location: TEXT }, tone: Plain)
-            code_value(value: PASSED.store.profile_location)
-            code_line(value: TEXT { document: ProfilePage/render(profile: profile) }, tone: Keyword)
-        }
+        label: TEXT { Profile source }
+        text: PASSED.store.source_draft
+        placeholder: [text: TEXT { Enter a bounded Boon scene }]
     )
-}
-
-FUNCTION code_line(value, tone) {
-    Scene/Element/text(
-        element: []
-        style: [
-            ...PersonsTheme/code(mode: PASSED.store.mode)
-            width: Fill
-            height: 20
-            color: PersonsTheme/code_line(mode: PASSED.store.mode, tone: tone)
-        ]
-        text: value
-    )
-}
-
-FUNCTION code_value(value) {
-    Scene/Element/text(
-        element: []
-        style: [
-            ...PersonsTheme/code(mode: PASSED.store.mode)
-            width: Fill
-            text_wrap: True
-            color: PersonsTheme/code_value(mode: PASSED.store.mode)
-        ]
-        text: TEXT {         {value} }
-    )
+        |> SOURCE { PASSED.store.elements.source_editor }
 }

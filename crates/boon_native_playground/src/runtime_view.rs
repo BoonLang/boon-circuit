@@ -12,8 +12,10 @@ use boon_persistence::{
 };
 use boon_plan::{ApplicationIdentity, ApplicationPlan, MachinePlan, MemoryKind};
 use boon_runtime::{
-    DocumentPatch, DocumentPatchStatus, LiveRuntime, PersistentRuntime, RowId, RuntimePhaseTimings,
-    RuntimeTurn, SessionOptions, SourcePayload, Value,
+    DocumentPatch, DocumentPatchStatus, LiveRuntime, PersistentRuntime, ProgramArtifact,
+    ProgramDiagnostic, ProgramDocumentHost, ProgramHostDiagnostic, ProgramHostRequest,
+    ProgramRequestId, RowId, RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload,
+    Value,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -74,9 +76,9 @@ impl TextInputState {
         }
     }
 
-    fn reset(&mut self, text: &str, column: usize) {
+    fn reset(&mut self, text: &str, position: Position) {
         self.buffer = Buffer::new(text);
-        self.buffer.set_caret(Position { line: 0, column }, false);
+        self.buffer.set_caret(position, false);
         self.reset_blink();
     }
 
@@ -96,6 +98,8 @@ struct InputModifiers {
 
 pub struct RuntimeView {
     runtime: PersistentRuntime,
+    program_host: ProgramDocumentHost,
+    pending_program_requests: Vec<ProgramHostRequest>,
     application: ApplicationIdentity,
     persistence_schema_version: u64,
     persistence_schema_hash: [u8; 32],
@@ -187,8 +191,18 @@ impl RuntimeView {
         let frame = runtime
             .runtime()
             .primary_retained_output_frame()
-            .map_err(|error| error.to_string())?;
-        debug_assert_eq!(mounted.frame(), frame);
+            .map_err(|error| error.to_string())?
+            .clone();
+        debug_assert_eq!(mounted.frame(), &frame);
+        let application = runtime
+            .runtime()
+            .machine_plan()
+            .application
+            .identity
+            .clone();
+        let (program_host, pending_program_requests) =
+            ProgramDocumentHost::mount(application.clone(), &frame);
+        let frame = program_host.frame();
         let text_inputs = frame
             .nodes
             .values()
@@ -209,7 +223,6 @@ impl RuntimeView {
             .collect();
         let scheduled_sources = scheduled_sources(runtime.runtime())?;
         let plan = runtime.runtime().machine_plan();
-        let application = plan.application.identity.clone();
         let persistence_schema_version = plan.persistence.schema_version;
         let persistence_schema_hash = plan.persistence.schema_hash;
         let authority_plan_counts = authority_plan_counts(plan);
@@ -221,6 +234,8 @@ impl RuntimeView {
         let persistence_status = runtime.status();
         Ok(Self {
             runtime,
+            program_host,
+            pending_program_requests,
             application,
             persistence_schema_version,
             persistence_schema_hash,
@@ -344,7 +359,13 @@ impl RuntimeView {
             .clone();
         debug_assert_eq!(mounted.frame(), &frame);
 
-        self.retain_view_state(&frame);
+        let (program_host, pending_program_requests) =
+            ProgramDocumentHost::mount(self.application.clone(), &frame);
+        self.program_host = program_host;
+        self.pending_program_requests = pending_program_requests;
+        let frame = self.program_host.frame().clone();
+
+        self.retain_view_state(&frame, true);
         self.materialization_overscan.clear();
         self.pending_patches.clear();
         self.last_runtime_phase = RuntimePhaseTimings::default();
@@ -650,7 +671,7 @@ impl RuntimeView {
         self.runtime.status()
     }
 
-    fn retain_view_state(&mut self, frame: &DocumentFrame) {
+    fn retain_view_state(&mut self, frame: &DocumentFrame, reset_input: bool) {
         let contains_node = |id: &str| frame.nodes.contains_key(&DocumentNodeId(id.to_owned()));
         self.hovered = self.hovered.take().filter(|id| contains_node(id));
         self.pressed = self.pressed.take().filter(|id| contains_node(id));
@@ -677,8 +698,8 @@ impl RuntimeView {
                     || TextInputState::new(text),
                     |mut state| {
                         if state.buffer.text() != text {
-                            let column = state.buffer.caret().column;
-                            state.reset(text, column);
+                            let position = state.buffer.caret();
+                            state.reset(text, position);
                         }
                         state
                     },
@@ -686,8 +707,10 @@ impl RuntimeView {
                 (node.id.0.clone(), state)
             })
             .collect();
-        self.modifiers = InputModifiers::default();
-        self.pending_external_url = None;
+        if reset_input {
+            self.modifiers = InputModifiers::default();
+            self.pending_external_url = None;
+        }
     }
 
     pub fn frame(&self) -> DocumentFrame {
@@ -701,10 +724,33 @@ impl RuntimeView {
     }
 
     fn retained_frame(&self) -> &DocumentFrame {
-        self.runtime
+        self.program_host.frame()
+    }
+
+    pub fn take_program_requests(&mut self) -> Vec<ProgramHostRequest> {
+        std::mem::take(&mut self.pending_program_requests)
+    }
+
+    pub fn complete_program(
+        &mut self,
+        host: &DocumentNodeId,
+        request_id: &ProgramRequestId,
+        result: Result<ProgramArtifact, ProgramDiagnostic>,
+    ) -> ViewResult<bool> {
+        let parent = self
+            .runtime
             .runtime()
             .primary_retained_output_frame()
-            .expect("mounted runtime keeps a retained output frame")
+            .map_err(|error| error.to_string())?
+            .clone();
+        let (_, update) = self
+            .program_host
+            .complete(host, request_id, result, &parent);
+        Ok(self.queue_program_update(update.patches, update.requests))
+    }
+
+    pub fn program_diagnostics(&self) -> Vec<ProgramHostDiagnostic> {
+        self.program_host.diagnostics()
     }
 
     pub fn hovered(&self) -> Option<&str> {
@@ -830,10 +876,28 @@ impl RuntimeView {
             {
                 continue;
             }
-            let patches = self
-                .runtime
-                .demand_document_window_by_id(materialization, visible, overscan.clone())
-                .map_err(|error| error.to_string())?;
+            let patches = if self.program_host.owns_materialization(materialization) {
+                let parent = self
+                    .runtime
+                    .runtime()
+                    .primary_retained_output_frame()
+                    .map_err(|error| error.to_string())?
+                    .clone();
+                self.program_host
+                    .demand_document_window(materialization, visible, overscan.clone(), &parent)
+                    .map_err(|error| error.to_string())?
+            } else {
+                self.runtime
+                    .demand_document_window_by_id(materialization, visible, overscan.clone())
+                    .map_err(|error| error.to_string())?;
+                let parent = self
+                    .runtime
+                    .runtime()
+                    .primary_retained_output_frame()
+                    .map_err(|error| error.to_string())?
+                    .clone();
+                self.program_host.reconcile(&parent).patches
+            };
             self.materialization_overscan
                 .insert(materialization, overscan);
             for patch in patches {
@@ -861,9 +925,9 @@ impl RuntimeView {
                     let selection_changed = if let (Some(drag), Some(target)) =
                         (self.text_drag.clone(), target.as_ref())
                         && target.node == drag
-                        && let Some(column) = target.text_column
+                        && let (Some(line), Some(column)) = (target.text_line, target.text_column)
                     {
-                        self.set_text_input_caret(&drag, column, true)
+                        self.set_text_input_caret(&drag, line, column, true)
                     } else {
                         false
                     };
@@ -904,7 +968,13 @@ impl RuntimeView {
                         self.focused.as_deref() == Some(target.node.as_str())
                             && self.target_is_text_input(target)
                     }) {
-                        self.sync_text_input_from_document(&target.node, target.text_column);
+                        self.sync_text_input_from_document(
+                            &target.node,
+                            target
+                                .text_line
+                                .zip(target.text_column)
+                                .map(|(line, column)| Position { line, column }),
+                        );
                         self.text_drag = Some(target.node.clone());
                         self.queue_text_input_overlay(&target.node);
                     } else {
@@ -976,11 +1046,21 @@ impl RuntimeView {
                 Ok(true)
             }
             HostEvent::TextInput(text) => {
-                self.edit_focused_text(Command::InsertPlain(single_line_text(&text.text)))
+                let text = if self.focused_is_multiline() {
+                    text.text.clone()
+                } else {
+                    single_line_text(&text.text)
+                };
+                self.edit_focused_text(Command::InsertPlain(text))
             }
             HostEvent::Ime(ime) => match &ime.kind {
                 boon_host::ImeInputKind::Commit { text } => {
-                    self.edit_focused_text(Command::InsertPlain(single_line_text(text)))
+                    let text = if self.focused_is_multiline() {
+                        text.clone()
+                    } else {
+                        single_line_text(text)
+                    };
+                    self.edit_focused_text(Command::InsertPlain(text))
                 }
                 boon_host::ImeInputKind::DeleteSurrounding {
                     before_bytes,
@@ -1042,6 +1122,7 @@ impl RuntimeView {
             bounds_y: 0.0,
             bounds_width: 0.0,
             bounds_height: 0.0,
+            text_line: None,
             text_column: None,
         };
         if payload.text.is_none()
@@ -1141,7 +1222,11 @@ impl RuntimeView {
                 }
             }
         }
-        let row = if self.runtime.runtime().source_is_row_scoped(path) == Some(true) {
+        let row_scoped = self
+            .program_host
+            .source_is_row_scoped(path)
+            .or_else(|| self.runtime.runtime().source_is_row_scoped(path));
+        let row = if row_scoped == Some(true) {
             self.row_target(path, target.row_key, target.row_generation)?
         } else {
             None
@@ -1156,6 +1241,22 @@ impl RuntimeView {
         payload: SourcePayload,
     ) -> ViewResult<bool> {
         let next_sequence = self.sequence.saturating_add(1);
+        if self.program_host.owns_source_route(path) {
+            let parent = self
+                .runtime
+                .runtime()
+                .primary_retained_output_frame()
+                .map_err(|error| error.to_string())?
+                .clone();
+            let (turn, patches) = self
+                .program_host
+                .dispatch(next_sequence, path, row, payload, &parent)
+                .map_err(|error| error.to_string())?;
+            self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
+            self.last_runtime_phase = turn.phase_timings;
+            self.last_dispatched_source = Some(path.to_owned());
+            return Ok(self.queue_program_update(patches, Vec::new()));
+        }
         let event = self
             .runtime
             .runtime()
@@ -1171,13 +1272,14 @@ impl RuntimeView {
         self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
         self.last_runtime_phase = turn.phase_timings;
         self.last_dispatched_source = Some(path.to_owned());
-        let changed = !turn.document_patches.is_empty();
-        for patch in turn.document_patches {
-            let patch = self.with_view_state(patch);
-            self.sync_text_input_patch(&patch);
-            self.pending_patches.push(patch);
-        }
-        Ok(changed)
+        let parent = self
+            .runtime
+            .runtime()
+            .primary_retained_output_frame()
+            .map_err(|error| error.to_string())?
+            .clone();
+        let update = self.program_host.reconcile(&parent);
+        Ok(self.queue_program_update(update.patches, update.requests))
     }
 
     pub fn caret_blink_deadline(&self) -> Option<Instant> {
@@ -1203,11 +1305,24 @@ impl RuntimeView {
         true
     }
 
-    fn set_text_input_caret(&mut self, id: &str, column: usize, extend: bool) -> bool {
+    fn focused_is_multiline(&self) -> bool {
+        self.focused
+            .as_ref()
+            .and_then(|id| self.retained_frame().nodes.get(&DocumentNodeId(id.clone())))
+            .and_then(|node| node.style.get("multiline"))
+            .is_some_and(|value| match value {
+                StyleValue::Bool(value) => *value,
+                StyleValue::Text(value) => value.eq_ignore_ascii_case("true"),
+                StyleValue::Number(value) => *value != 0.0,
+                StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => false,
+            })
+    }
+
+    fn set_text_input_caret(&mut self, id: &str, line: usize, column: usize, extend: bool) -> bool {
         let Some(state) = self.text_inputs.get_mut(id) else {
             return false;
         };
-        let changed = state.buffer.set_caret(Position { line: 0, column }, extend);
+        let changed = state.buffer.set_caret(Position { line, column }, extend);
         state.reset_blink();
         self.queue_text_input_style(id);
         let _ = changed;
@@ -1310,8 +1425,12 @@ impl RuntimeView {
                     if let Ok(mut clipboard) = arboard::Clipboard::new()
                         && let Ok(text) = clipboard.get_text()
                     {
-                        return self
-                            .edit_focused_text(Command::InsertPlain(single_line_text(&text)));
+                        let text = if self.focused_is_multiline() {
+                            text
+                        } else {
+                            single_line_text(&text)
+                        };
+                        return self.edit_focused_text(Command::InsertPlain(text));
                     }
                     return Ok(false);
                 }
@@ -1328,6 +1447,8 @@ impl RuntimeView {
         let command = match normalized.as_str() {
             "left" => Some(Command::MoveLeft { extend }),
             "right" => Some(Command::MoveRight { extend }),
+            "up" => Some(Command::MoveUp { extend }),
+            "down" => Some(Command::MoveDown { extend }),
             "home" => Some(Command::MoveHome { extend }),
             "end" => Some(Command::MoveEnd { extend }),
             "backspace" => Some(Command::DeleteBackward),
@@ -1347,6 +1468,9 @@ impl RuntimeView {
         }
 
         if normalized == "enter" {
+            if self.focused_is_multiline() {
+                return self.edit_focused_text(Command::Newline);
+            }
             let changed = self.dispatch_node_intent(
                 &focused,
                 &["commit", "submit", "key_down", "source"],
@@ -1359,6 +1483,13 @@ impl RuntimeView {
             self.queue_text_input_overlay(&focused);
             let _ = changed;
             return Ok(true);
+        }
+        if normalized == "tab" && self.focused_is_multiline() {
+            return self.edit_focused_text(if self.modifiers.shift {
+                Command::Unindent
+            } else {
+                Command::Indent
+            });
         }
         if normalized == "escape" {
             let changed = self.dispatch_node_intent(
@@ -1395,7 +1526,7 @@ impl RuntimeView {
         self.finish_focused_edit(focused)
     }
 
-    fn sync_text_input_from_document(&mut self, id: &str, column: Option<usize>) {
+    fn sync_text_input_from_document(&mut self, id: &str, position: Option<Position>) {
         let Some(text) = self
             .retained_frame()
             .nodes
@@ -1414,7 +1545,13 @@ impl RuntimeView {
             .text_inputs
             .entry(id.to_owned())
             .or_insert_with(|| TextInputState::new(&text));
-        state.reset(&text, column.unwrap_or(usize::MAX));
+        state.reset(
+            &text,
+            position.unwrap_or(Position {
+                line: usize::MAX,
+                column: usize::MAX,
+            }),
+        );
     }
 
     fn queue_text_input_overlay(&mut self, id: &str) {
@@ -1437,9 +1574,9 @@ impl RuntimeView {
         let focused = self.focused.as_deref() == Some(id);
         let selection = state.buffer.selection();
         let (start, end) = if selection.anchor <= selection.head {
-            (selection.anchor.column, selection.head.column)
+            (selection.anchor, selection.head)
         } else {
-            (selection.head.column, selection.anchor.column)
+            (selection.head, selection.anchor)
         };
         let mut patch = StylePatch::new();
         patch.insert(
@@ -1451,12 +1588,24 @@ impl RuntimeView {
             Some(StyleValue::Number(state.buffer.caret().column as f64)),
         );
         patch.insert(
+            "caret_line".to_owned(),
+            Some(StyleValue::Number(state.buffer.caret().line as f64)),
+        );
+        patch.insert(
             "selection_start".to_owned(),
-            (focused && start != end).then_some(StyleValue::Number(start as f64)),
+            (focused && start != end).then_some(StyleValue::Number(start.column as f64)),
         );
         patch.insert(
             "selection_end".to_owned(),
-            (focused && start != end).then_some(StyleValue::Number(end as f64)),
+            (focused && start != end).then_some(StyleValue::Number(end.column as f64)),
+        );
+        patch.insert(
+            "selection_start_line".to_owned(),
+            (focused && start != end).then_some(StyleValue::Number(start.line as f64)),
+        );
+        patch.insert(
+            "selection_end_line".to_owned(),
+            (focused && start != end).then_some(StyleValue::Number(end.line as f64)),
         );
         self.pending_patches.push(DocumentPatch::SetStyle {
             id: DocumentNodeId(id.to_owned()),
@@ -1513,11 +1662,47 @@ impl RuntimeView {
         let Some(key) = key else {
             return Ok(None);
         };
+        if self.program_host.owns_source_route(source_path) {
+            return self
+                .program_host
+                .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
         self.runtime
             .runtime()
             .row_target_for_source_path(source_path, key, generation.unwrap_or(1))
             .map(Some)
             .map_err(|error| error.to_string())
+    }
+
+    fn queue_program_update(
+        &mut self,
+        patches: Vec<DocumentPatch>,
+        requests: Vec<ProgramHostRequest>,
+    ) -> bool {
+        let changed = !patches.is_empty();
+        let structural = patches.iter().any(|patch| {
+            matches!(
+                patch,
+                DocumentPatch::UpsertNode(_)
+                    | DocumentPatch::RemoveNode { .. }
+                    | DocumentPatch::InsertChild { .. }
+                    | DocumentPatch::RemoveChild { .. }
+                    | DocumentPatch::MoveChild { .. }
+            )
+        });
+        self.pending_program_requests.extend(requests);
+        for patch in patches {
+            let patch = self.with_view_state(patch);
+            self.sync_text_input_patch(&patch);
+            self.pending_patches.push(patch);
+        }
+        if structural {
+            let frame = self.program_host.frame().clone();
+            self.retain_view_state(&frame, false);
+        }
+        changed
     }
 }
 
@@ -1996,7 +2181,7 @@ document: Document/new(
     }
 
     #[test]
-    fn persons_pro_constructs_a_responsive_retained_document() {
+    fn persons_pro_edits_and_hosts_a_last_valid_child_document() {
         let example = crate::catalog::Catalog::load()
             .unwrap()
             .open("persons_pro")
@@ -2010,20 +2195,195 @@ document: Document/new(
             })
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
-        let model = RuntimeView::open_in_memory(runtime).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        let initial_request = model
+            .take_program_requests()
+            .into_iter()
+            .next()
+            .expect("Persons.pro requests its initial child program");
+        let initial_artifact = boon_runtime::compile_program_artifact(&initial_request.compile);
         assert!(
             model
-                .retained_frame()
-                .nodes
-                .values()
-                .filter(|node| node.primary_source_binding().is_some())
-                .count()
-                >= 10,
-            "Persons.pro shell should retain its editor, publish, account, view, and theme bindings"
+                .complete_program(
+                    &initial_request.host,
+                    &initial_request.request_id,
+                    initial_artifact,
+                )
+                .unwrap()
         );
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Your name")
+        }));
+        let source_paths = model
+            .retained_frame()
+            .nodes
+            .values()
+            .flat_map(|node| node.source_bindings.iter())
+            .map(|binding| binding.source_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "store.elements.source_editor",
+            "store.elements.show_code",
+            "store.elements.show_preview",
+            "store.elements.protect_workspace",
+            "store.elements.publish",
+            "store.elements.theme_toggle",
+        ] {
+            assert!(
+                source_paths.contains(expected),
+                "Persons.pro shell is missing source binding {expected:?}: {source_paths:?}"
+            );
+        }
 
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
         let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1280.0,
+                height: 800.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        model.take_patches();
+
+        let surface = SurfaceId("preview".to_owned());
+        let source_editor = view
+            .target_for_source("store.elements.source_editor", None)
+            .expect("Persons.pro source editor target");
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            model
+                .handle_event(
+                    &HostEvent::Pointer(PointerEvent {
+                        surface: surface.clone(),
+                        x: source_editor.center_x,
+                        y: source_editor.center_y,
+                        phase,
+                        button: Some(PointerButton::Primary),
+                    }),
+                    Some(source_editor.clone()),
+                )
+                .unwrap();
+        }
+        let focused = model.focused().expect("source editor focused").to_owned();
+
+        for (logical_key, pressed) in [
+            (LogicalKey::Named("Control_L".to_owned()), true),
+            (LogicalKey::Character("a".to_owned()), true),
+            (LogicalKey::Character("a".to_owned()), false),
+            (LogicalKey::Named("Control_L".to_owned()), false),
+        ] {
+            model
+                .handle_event(
+                    &HostEvent::Keyboard(KeyEvent {
+                        surface: surface.clone(),
+                        physical_key: None,
+                        logical_key,
+                        pressed,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+        let invalid_source = "scene: Missing/constructor(\n";
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: surface.clone(),
+                        text: invalid_source.to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), invalid_source);
+        let invalid_request = model
+            .take_program_requests()
+            .into_iter()
+            .next()
+            .expect("invalid child revision requested");
+        assert_eq!(invalid_request.compile.units[0].source, invalid_source);
+        let invalid_artifact = boon_runtime::compile_program_artifact(&invalid_request.compile);
+        assert!(invalid_artifact.is_err());
+        model
+            .complete_program(
+                &invalid_request.host,
+                &invalid_request.request_id,
+                invalid_artifact,
+            )
+            .unwrap();
+        assert_eq!(model.program_diagnostics().len(), 1);
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Your name")
+        }));
+
+        for (logical_key, pressed) in [
+            (LogicalKey::Named("Control_L".to_owned()), true),
+            (LogicalKey::Character("a".to_owned()), true),
+            (LogicalKey::Character("a".to_owned()), false),
+            (LogicalKey::Named("Control_L".to_owned()), false),
+        ] {
+            model
+                .handle_event(
+                    &HostEvent::Keyboard(KeyEvent {
+                        surface: surface.clone(),
+                        physical_key: None,
+                        logical_key,
+                        pressed,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+        let corrected_source = r#"scene: Scene/Element/text(
+    element: []
+    style: [width: Fill, height: 40]
+    text: TEXT { Corrected page }
+)
+"#;
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface,
+                        text: corrected_source.to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), corrected_source);
+        let corrected_request = model
+            .take_program_requests()
+            .into_iter()
+            .next()
+            .expect("corrected child revision requested");
+        assert_eq!(corrected_request.compile.units[0].source, corrected_source);
+        let corrected_artifact = boon_runtime::compile_program_artifact(&corrected_request.compile);
+        assert!(
+            model
+                .complete_program(
+                    &corrected_request.host,
+                    &corrected_request.request_id,
+                    corrected_artifact,
+                )
+                .unwrap()
+        );
+        assert!(model.program_diagnostics().is_empty());
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Corrected page")
+        }));
+
+        view = crate::view::RetainedView::new(
             model.frame(),
             boon_host::Viewport {
                 surface: 1,
@@ -2040,7 +2400,13 @@ document: Document/new(
             .iter()
             .map(|run| run.text.as_str())
             .collect::<Vec<_>>();
-        for expected in ["persons.pro", "Profile source", "Draft preview", "Publish"] {
+        for expected in [
+            "persons.pro",
+            "Profile source",
+            "Draft preview",
+            "Publish",
+            "Corrected page",
+        ] {
             assert!(
                 desktop_text.contains(&expected),
                 "missing desktop text {expected:?}: {desktop_text:?}"
@@ -2274,6 +2640,7 @@ document: Document/new(
                 bounds_y: bounds.y,
                 bounds_width: bounds.width,
                 bounds_height: bounds.height,
+                text_line: None,
                 text_column: None,
             },
         );
@@ -2704,6 +3071,7 @@ document: Document/new(
         let mut target = view
             .target_for_source("cell.sources.editor.change", None)
             .expect("formula text input");
+        target.text_line = Some(0);
         target.text_column = Some(0);
         let mut focused_dirty = false;
         for phase in [PointerPhase::Down, PointerPhase::Up] {
@@ -3861,6 +4229,7 @@ document: Document/new(
             bounds_y: link_bounds.y,
             bounds_width: link_bounds.width,
             bounds_height: link_bounds.height,
+            text_line: None,
             text_column: None,
         };
         for phase in [PointerPhase::Down, PointerPhase::Up] {

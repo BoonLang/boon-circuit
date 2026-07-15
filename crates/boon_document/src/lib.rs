@@ -126,6 +126,7 @@ pub struct LayoutSubtreeInput<'a> {
     pub y: f32,
     pub available_width: f32,
     pub available_height: f32,
+    pub viewport_width: f32,
     pub text: &'a mut dyn TextMeasurer,
     pub capabilities: RenderCapabilities,
 }
@@ -1382,6 +1383,9 @@ pub struct RetainedDocument {
     render_revision: u64,
     full_lower_count: u64,
     retained_patch_count: u64,
+    subtree_reflow_count: u64,
+    subtree_reflow_fallback_count: u64,
+    subtree_reflowed_node_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1391,6 +1395,9 @@ pub struct RetainedDocumentStats {
     pub render_revision: u64,
     pub full_lower_count: u64,
     pub retained_patch_count: u64,
+    pub subtree_reflow_count: u64,
+    pub subtree_reflow_fallback_count: u64,
+    pub subtree_reflowed_node_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3250,6 +3257,9 @@ impl RetainedDocument {
             render_revision: 1,
             full_lower_count: 1,
             retained_patch_count: 0,
+            subtree_reflow_count: 0,
+            subtree_reflow_fallback_count: 0,
+            subtree_reflowed_node_count: 0,
         })
     }
 
@@ -3280,6 +3290,9 @@ impl RetainedDocument {
             render_revision: self.render_revision,
             full_lower_count: self.full_lower_count,
             retained_patch_count: self.retained_patch_count,
+            subtree_reflow_count: self.subtree_reflow_count,
+            subtree_reflow_fallback_count: self.subtree_reflow_fallback_count,
+            subtree_reflowed_node_count: self.subtree_reflowed_node_count,
         }
     }
 
@@ -3375,6 +3388,26 @@ impl RetainedDocument {
         self.content_revision = self.content_revision.saturating_add(1);
 
         if !geometry_stable {
+            if let Some(reflowed_node_count) =
+                self.try_reflow_changed_subtrees(&changed_nodes, columns)?
+            {
+                self.layout_revision = self.layout_revision.saturating_add(1);
+                self.render_revision = self.render_revision.saturating_add(1);
+                self.retained_patch_count = self.retained_patch_count.saturating_add(1);
+                self.subtree_reflow_count = self.subtree_reflow_count.saturating_add(1);
+                self.subtree_reflowed_node_count = self
+                    .subtree_reflowed_node_count
+                    .saturating_add(reflowed_node_count.try_into().unwrap_or(u64::MAX));
+                return Ok(RetainedDocumentUpdate {
+                    content_changed: true,
+                    layout_changed: true,
+                    render_changed: true,
+                    full_lowered: false,
+                    patched_node_count: changed_nodes.len(),
+                });
+            }
+            self.subtree_reflow_fallback_count =
+                self.subtree_reflow_fallback_count.saturating_add(1);
             self.lower_all(columns)?;
             return Ok(RetainedDocumentUpdate {
                 content_changed: true,
@@ -3425,6 +3458,89 @@ impl RetainedDocument {
             full_lowered: false,
             patched_node_count: changed_nodes.len(),
         })
+    }
+
+    fn try_reflow_changed_subtrees(
+        &mut self,
+        changed_nodes: &BTreeSet<DocumentNodeId>,
+        columns: &mut impl render_scene::RenderTextColumnMeasurer,
+    ) -> Result<Option<usize>, PatchApplyError> {
+        let mut boundaries = BTreeSet::new();
+        for changed in changed_nodes {
+            let Some(boundary) = fixed_layout_boundary_for_node(
+                self.document.frame(),
+                &self.indexes,
+                &self.layout,
+                changed,
+            ) else {
+                return Ok(None);
+            };
+            boundaries.insert(boundary);
+        }
+        let boundaries = outermost_boundaries(self.document.frame(), boundaries);
+        if boundaries.is_empty() {
+            return Ok(None);
+        }
+
+        let mut replacements = Vec::with_capacity(boundaries.len());
+        let mut all_reflowed_nodes = BTreeSet::new();
+        for boundary in boundaries {
+            let Some(previous) = self
+                .layout
+                .display_list
+                .iter()
+                .find(|item| item.node == boundary)
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let nodes = document_subtree_nodes(self.document.frame(), &boundary);
+            let mut text = SimpleTextMeasurer;
+            let mut replacement = try_layout_subtree_with_typed_styles(
+                LayoutSubtreeInput {
+                    document: self.document.frame(),
+                    root: &boundary,
+                    x: previous.bounds.x,
+                    y: previous.bounds.y,
+                    available_width: previous.bounds.width,
+                    available_height: previous.bounds.height,
+                    viewport_width: self.viewport.width,
+                    text: &mut text,
+                    capabilities: RenderCapabilities::fake_portable(),
+                },
+                &self.indexes.hot_ids,
+                &self.indexes.typed_styles,
+            )?;
+            apply_subtree_scroll_offsets(self.document.frame(), &nodes, &mut replacement);
+            if let Some(clip) = item_clip_rect(&previous) {
+                apply_clip_to_display_items(&mut replacement.display_list, clip);
+            }
+            let Some(next) = replacement
+                .display_list
+                .iter()
+                .find(|item| item.node == boundary)
+            else {
+                return Ok(None);
+            };
+            if !rect_approximately_equal(previous.bounds, next.bounds) {
+                return Ok(None);
+            }
+            all_reflowed_nodes.extend(nodes.iter().cloned());
+            replacements.push((nodes, replacement));
+        }
+
+        for (nodes, replacement) in replacements {
+            if !replace_layout_subtree(&mut self.layout, &nodes, replacement) {
+                return Ok(None);
+            }
+        }
+        refresh_scroll_demands(self.document.frame(), &mut self.layout);
+        self.scroll_groups = build_retained_scroll_groups(self.document.frame(), &self.layout);
+        self.hits = self
+            .indexes
+            .try_hit_side_table(self.document.frame(), &self.layout)?;
+        self.replace_scene_nodes(&all_reflowed_nodes, columns)?;
+        Ok(Some(all_reflowed_nodes.len()))
     }
 
     pub fn set_interaction_state(
@@ -3535,26 +3651,16 @@ impl RetainedDocument {
         }
         let width = self.viewport.width.max(1.0).round() as u32;
         let height = self.viewport.height.max(1.0).round() as u32;
-        let items = render_scene::render_scene_items_for_touched_nodes(
-            &self.layout,
-            width,
-            height,
-            &visible,
-        );
-        let visual_primitives = render_scene::render_visual_primitives_for_touched_nodes(
-            &self.layout,
-            width,
-            height,
-            columns,
-            &visible,
-        );
-        let mut text_runs = render_scene::render_text_runs_for_touched_nodes(
-            &self.layout,
-            width,
-            height,
-            columns,
-            &visible,
-        );
+        let (items, visual_primitives, mut text_runs) =
+            render_scene::render_scene_entries_for_touched_nodes_with_retained_keys(
+                &self.layout,
+                &self.indexes.hot_ids,
+                &self.indexes.retained_layout_keys,
+                width,
+                height,
+                columns,
+                &visible,
+            )?;
         apply_direct_text_scroll(self.document.frame(), &self.layout, &mut text_runs);
         self.scene.apply_patch(&RenderScenePatch {
             operations: vec![RenderScenePatchOperation::ReplaceNodeEntries {
@@ -3592,6 +3698,193 @@ fn lower_retained_document(
     let mut scene = indexes.try_render_scene(&layout, width, height, columns)?;
     apply_direct_text_scroll(document, &layout, &mut scene.text_runs);
     Ok((layout, hits, scene))
+}
+
+fn fixed_layout_boundary_for_node(
+    document: &DocumentFrame,
+    indexes: &DocumentDerivedIndexBundle,
+    layout: &LayoutFrame,
+    changed: &DocumentNodeId,
+) -> Option<DocumentNodeId> {
+    let mut current = Some(changed.clone());
+    while let Some(id) = current.take() {
+        let node = document.nodes.get(&id)?;
+        let visible = layout.display_list.iter().any(|item| item.node == id);
+        let fixed = indexes
+            .hot_ids
+            .hot_id(&id)
+            .and_then(|hot| indexes.typed_styles.record(hot))
+            .is_some_and(|record| {
+                matches!(
+                    record.layout.width,
+                    Some(DocumentStyleDimension::Px { .. } | DocumentStyleDimension::Fill)
+                ) && matches!(
+                    record.layout.height,
+                    Some(DocumentStyleDimension::Px { .. } | DocumentStyleDimension::Fill)
+                )
+            });
+        if visible && fixed {
+            return Some(id);
+        }
+        current.clone_from(&node.parent);
+    }
+    None
+}
+
+fn outermost_boundaries(
+    document: &DocumentFrame,
+    boundaries: BTreeSet<DocumentNodeId>,
+) -> Vec<DocumentNodeId> {
+    boundaries
+        .iter()
+        .filter(|candidate| {
+            !boundaries.iter().any(|other| {
+                other != *candidate && node_is_descendant_of(document, candidate, other)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn node_is_descendant_of(
+    document: &DocumentFrame,
+    node: &DocumentNodeId,
+    ancestor: &DocumentNodeId,
+) -> bool {
+    let mut current = document
+        .nodes
+        .get(node)
+        .and_then(|node| node.parent.clone());
+    while let Some(id) = current {
+        if id == *ancestor {
+            return true;
+        }
+        current = document.nodes.get(&id).and_then(|node| node.parent.clone());
+    }
+    false
+}
+
+fn document_subtree_nodes(
+    document: &DocumentFrame,
+    root: &DocumentNodeId,
+) -> BTreeSet<DocumentNodeId> {
+    let mut nodes = BTreeSet::from([root.clone()]);
+    nodes.extend(document_descendants(document, root));
+    nodes
+}
+
+fn apply_subtree_scroll_offsets(
+    document: &DocumentFrame,
+    subtree: &BTreeSet<DocumentNodeId>,
+    layout: &mut LayoutFrame,
+) {
+    for id in subtree {
+        let Some(scroll) = document.nodes.get(id).and_then(|node| node.scroll) else {
+            continue;
+        };
+        if scroll.x != 0.0 || scroll.y != 0.0 {
+            shift_descendant_layout(document, layout, id, -scroll.x, -scroll.y);
+        }
+    }
+}
+
+fn rect_approximately_equal(left: Rect, right: Rect) -> bool {
+    const EPSILON: f32 = 0.01;
+    (left.x - right.x).abs() <= EPSILON
+        && (left.y - right.y).abs() <= EPSILON
+        && (left.width - right.width).abs() <= EPSILON
+        && (left.height - right.height).abs() <= EPSILON
+}
+
+fn replace_layout_subtree(
+    layout: &mut LayoutFrame,
+    nodes: &BTreeSet<DocumentNodeId>,
+    replacement: LayoutFrame,
+) -> bool {
+    if !replace_layout_entries(
+        &mut layout.display_list,
+        nodes,
+        replacement.display_list,
+        |item| &item.node,
+        true,
+    ) {
+        return false;
+    }
+    replace_layout_entries(
+        &mut layout.hit_regions,
+        nodes,
+        replacement.hit_regions,
+        |item| &item.node,
+        false,
+    );
+    replace_layout_entries(
+        &mut layout.scroll_regions,
+        nodes,
+        replacement.scroll_regions,
+        |item| &item.node,
+        false,
+    );
+    replace_layout_entries(
+        &mut layout.demands,
+        nodes,
+        replacement.demands,
+        |item| &item.node,
+        false,
+    );
+    replace_layout_entries(
+        &mut layout.materialization,
+        nodes,
+        replacement.materialization,
+        |item| &item.node,
+        false,
+    );
+    layout.metrics.display_item_count = layout.display_list.len();
+    layout.metrics.materialized_range_count = layout.materialization.len();
+    true
+}
+
+fn replace_layout_entries<T>(
+    entries: &mut Vec<T>,
+    nodes: &BTreeSet<DocumentNodeId>,
+    replacements: Vec<T>,
+    node_for_entry: impl Fn(&T) -> &DocumentNodeId,
+    require_existing_contiguous: bool,
+) -> bool {
+    let matching = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| nodes.contains(node_for_entry(entry)).then_some(index))
+        .collect::<Vec<_>>();
+    if require_existing_contiguous {
+        let Some(first) = matching.first().copied() else {
+            return replacements.is_empty();
+        };
+        let last = matching.last().copied().unwrap_or(first);
+        if (first..=last).any(|index| !nodes.contains(node_for_entry(&entries[index]))) {
+            return false;
+        }
+    }
+    let insert_at = matching.first().copied().unwrap_or(entries.len());
+    let original = std::mem::take(entries);
+    entries.reserve(original.len().saturating_add(replacements.len()));
+    let mut replacements = Some(replacements);
+    for (index, entry) in original.into_iter().enumerate() {
+        if index == insert_at {
+            entries.append(
+                replacements
+                    .as_mut()
+                    .expect("replacement entries are inserted once"),
+            );
+            replacements = None;
+        }
+        if !nodes.contains(node_for_entry(&entry)) {
+            entries.push(entry);
+        }
+    }
+    if let Some(mut replacements) = replacements {
+        entries.append(&mut replacements);
+    }
+    true
 }
 
 fn apply_all_scroll_offsets(document: &DocumentFrame, layout: &mut LayoutFrame) {
@@ -4750,7 +5043,22 @@ pub fn layout_with_typed_styles<'a>(
 
 pub fn try_layout_subtree(input: LayoutSubtreeInput<'_>) -> Result<LayoutFrame, PatchApplyError> {
     validate_frame_integrity(input.document)?;
-    Ok(layout_subtree_unchecked(input))
+    Ok(layout_subtree_unchecked(input, None))
+}
+
+pub fn try_layout_subtree_with_typed_styles<'a>(
+    input: LayoutSubtreeInput<'a>,
+    hot_ids: &'a DocumentHotIdTable,
+    typed_styles: &'a DocumentTypedStyleIndex,
+) -> Result<LayoutFrame, PatchApplyError> {
+    validate_typed_style_subtree_context(input.document, input.root, hot_ids, typed_styles)?;
+    Ok(layout_subtree_unchecked(
+        input,
+        Some(TypedLayoutStyleContext {
+            hot_ids,
+            typed_styles,
+        }),
+    ))
 }
 
 pub fn layout_subtree(input: LayoutSubtreeInput<'_>) -> LayoutFrame {
@@ -4809,18 +5117,21 @@ fn layout_unchecked_with_typed_styles<'a>(
     }
 }
 
-fn layout_subtree_unchecked(input: LayoutSubtreeInput<'_>) -> LayoutFrame {
+fn layout_subtree_unchecked(
+    input: LayoutSubtreeInput<'_>,
+    typed_styles: Option<TypedLayoutStyleContext<'_>>,
+) -> LayoutFrame {
     let mut builder = LayoutBuilder {
         document: input.document,
         text: input.text,
-        typed_styles: None,
+        typed_styles,
         display_list: Vec::new(),
         hit_regions: Vec::new(),
         scroll_regions: Vec::new(),
         demands: Vec::new(),
         materialization: Vec::new(),
         materialized_range_count: 0,
-        viewport_width: input.available_width,
+        viewport_width: input.viewport_width,
     };
     let subtree_node_count = document_subtree_node_count(input.document, input.root);
     builder.layout_node(
@@ -4847,6 +5158,62 @@ fn layout_subtree_unchecked(input: LayoutSubtreeInput<'_>) -> LayoutFrame {
         demands: builder.demands,
         materialization: builder.materialization,
     }
+}
+
+fn validate_typed_style_subtree_context(
+    document: &DocumentFrame,
+    root: &DocumentNodeId,
+    hot_ids: &DocumentHotIdTable,
+    typed_styles: &DocumentTypedStyleIndex,
+) -> Result<(), PatchApplyError> {
+    let mut pending = vec![root.clone()];
+    let mut visited = BTreeSet::new();
+    while let Some(node_id) = pending.pop() {
+        if !visited.insert(node_id.clone()) {
+            return Err(PatchApplyError::Cycle { id: node_id });
+        }
+        let node = document
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| PatchApplyError::MissingTarget {
+                patch_kind: "layout_subtree",
+                id: node_id.clone(),
+            })?;
+        let hot_ref = hot_ids
+            .hot_ref(&node_id)
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "typed_style_hot_id_table",
+                id: node_id.clone(),
+            })?;
+        let record =
+            typed_styles
+                .record(hot_ref.id)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "typed_style_index",
+                    id: node_id.clone(),
+                })?;
+        if record.node != hot_ref {
+            return Err(PatchApplyError::StaleReference {
+                reference_kind: "typed_style_generation",
+                id: node_id,
+            });
+        }
+        for child in &node.children {
+            let actual_parent = document
+                .nodes
+                .get(child)
+                .and_then(|child| child.parent.clone());
+            if actual_parent.as_ref() != Some(&node.id) {
+                return Err(PatchApplyError::InvalidParentChildLink {
+                    parent: node.id.clone(),
+                    child: child.clone(),
+                    actual_parent,
+                });
+            }
+            pending.push(child.clone());
+        }
+    }
+    Ok(())
 }
 
 fn validate_typed_style_context(

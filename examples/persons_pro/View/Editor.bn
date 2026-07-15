@@ -11,6 +11,7 @@ FUNCTION root() {
         ]
         items: LIST {
             header()
+            diagnostic()
             source_panel()
         }
     )
@@ -26,11 +27,68 @@ FUNCTION header() {
             Components/text(PASS: [store: PASSED.store], value: TEXT { Profile source }, of: Heading)
             Components/status(
                 PASS: [store: PASSED.store]
-                label: TEXT { r{PASSED.store.draft_revision} }
-                tone: Neutral
+                label: Workspace/compile_label(
+                    state: PASSED.store.draft_compile_state
+                    revision: PASSED.store.draft_revision
+                )
+                tone: Workspace/compile_tone(state: PASSED.store.draft_compile_state)
             )
         }
     )
+}
+
+FUNCTION diagnostic() {
+    PASSED.store.draft_compile_state |> WHEN {
+        Invalid => Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 3
+            style: [
+                width: Fill
+                padding: 10
+                rounded_corners: 5
+                background: [color: PersonsTheme/diagnostic_background(mode: PASSED.store.mode)]
+                border: [color: PersonsTheme/diagnostic_border(mode: PASSED.store.mode)]
+                border_width: 1
+            ]
+            items: LIST {
+                Scene/Element/text(
+                    element: []
+                    style: [
+                        ...PersonsTheme/body(mode: PASSED.store.mode)
+                        width: Fill
+                        height: 20
+                        size: 13
+                        weight: 700
+                        color: PersonsTheme/diagnostic_text(mode: PASSED.store.mode)
+                    ]
+                    text: TEXT { {PASSED.store.draft_compile_path}:{PASSED.store.draft_compile_line}:{PASSED.store.draft_compile_column} }
+                )
+                Scene/Element/text(
+                    element: []
+                    style: [
+                        ...PersonsTheme/body(mode: PASSED.store.mode)
+                        width: Fill
+                        text_wrap: True
+                        size: 13
+                        color: PersonsTheme/diagnostic_text(mode: PASSED.store.mode)
+                    ]
+                    text: PASSED.store.draft_compile_diagnostic
+                )
+                Scene/Element/text(
+                    element: []
+                    style: [
+                        ...PersonsTheme/muted(mode: PASSED.store.mode)
+                        width: Fill
+                        height: 18
+                        size: 12
+                    ]
+                    text: TEXT { Showing last valid preview r{PASSED.store.last_valid_draft_revision} }
+                )
+            }
+        )
+        __ => NoElement
+    }
 }
 
 FUNCTION source_panel() {

@@ -12,6 +12,7 @@ boon_example_manifest.workspace = true
 boon_persistence.workspace = true
 boon_plan.workspace = true
 boon_plan_executor.workspace = true
+ciborium.workspace = true
 serde.workspace = true
 sha2.workspace = true
 toml.workspace = true

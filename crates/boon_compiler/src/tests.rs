@@ -1,6 +1,72 @@
 use super::*;
 
 #[test]
+fn root_value_comparison_lowers_both_typed_operands() {
+    let compiled = compile_source_text_to_machine_plan(
+        "root-value-comparison.bn",
+        r#"
+store: [
+    change: SOURCE
+    requested:
+        0 |> HOLD requested {
+            change |> THEN { requested + 1 }
+        }
+    settled:
+        0 |> HOLD settled {
+            change |> THEN { settled }
+        }
+    pending:
+        requested == settled |> Bool/not()
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let pending = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.pending")
+        .expect("pending field");
+    let field = pending
+        .id
+        .strip_prefix("field:")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let expression = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| (op.output == Some(ValueRef::Field(FieldId(field)))).then_some(&op.kind))
+        .and_then(|kind| match kind {
+            PlanOpKind::DerivedValue {
+                expression: Some(expression),
+                ..
+            } => Some(expression),
+            _ => None,
+        })
+        .expect("typed pending expression");
+    assert!(matches!(
+        expression,
+        PlanDerivedExpression::BoolNotExpression { input }
+            if matches!(
+                input.as_ref(),
+                PlanDerivedExpression::ValueCompare {
+                    left: ValueRef::State(_),
+                    op,
+                    right: ValueRef::State(_),
+                } if op == "=="
+            )
+    ));
+    let verification = verify_plan(&compiled.plan).unwrap();
+    assert_eq!(verification.error_count, 0, "{:#?}", verification.checks);
+}
+
+#[test]
 fn timer_interval_lowers_once_as_a_scheduled_source_route() {
     let compiled = compile_source_text_to_machine_plan(
         "timer-interval.bn",
@@ -30,10 +96,104 @@ store: [
     );
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
 }
+
+#[test]
+fn source_payload_text_to_number_lowers_as_a_typed_conversion() {
+    let compiled = compile_source_text_to_machine_plan(
+        "source-text-to-number.bn",
+        r#"
+store: [
+    input: SOURCE
+    value:
+        0 |> HOLD value {
+            input.amount |> THEN {
+                input.amount |> Text/to_number()
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let route = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.input")
+        .expect("typed input source route");
+    assert!(route.payload_schema.typed_fields.iter().any(|descriptor| {
+        matches!(
+            (&descriptor.field, descriptor.value_type),
+            (
+                boon_plan::SourcePayloadField::Named(name),
+                boon_plan::SourcePayloadValueType::Text
+            ) if name == "amount"
+        )
+    }));
+
+    let update = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| {
+            matches!(
+                op.kind,
+                PlanOpKind::UpdateBranch {
+                    expression_kind: PlanExpressionKind::TextToNumber,
+                    ..
+                }
+            )
+        })
+        .expect("TextToNumber update op");
+    let PlanOpKind::UpdateBranch {
+        ordered_inputs,
+        source_payload_field,
+        ..
+    } = &update.kind
+    else {
+        unreachable!();
+    };
+    assert!(matches!(
+        source_payload_field,
+        Some(boon_plan::SourcePayloadField::Named(name)) if name == "amount"
+    ));
+    assert!(matches!(
+        ordered_inputs.as_slice(),
+        [ValueRef::SourcePayload {
+            field: boon_plan::SourcePayloadField::Named(name),
+            ..
+        }] if name == "amount"
+    ));
+    let Some(ValueRef::State(output)) = update.output else {
+        panic!("TextToNumber update must target scalar state");
+    };
+    assert_eq!(
+        compiled
+            .plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.state_id == output)
+            .map(|slot| &slot.value_type),
+        Some(&boon_plan::PlanValueType::Number)
+    );
+    let verification = verify_plan(&compiled.plan).unwrap();
+    assert!(
+        verification.checks.iter().all(|check| check.pass),
+        "verification failures: {:?}",
+        verification
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .collect::<Vec<_>>()
+    );
+}
 use boon_plan::{
     DataTypePlan, DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
     DocumentValueClass, EffectBarrier, EffectReplay, EffectResultPolicy, EffectResultRoute,
-    MemoryId, MemoryKind, MigrationExpressionPlan, MigrationPredecessorBinding,
+    FieldId, MemoryId, MemoryKind, MigrationExpressionPlan, MigrationPredecessorBinding,
     MigrationTransferKindPlan, MigrationTransformPlan, OutputContractKind, OutputDemandPolicy,
     OutputValueRef, PLAN_MAJOR_VERSION, PlanDerivedExpression, PlanExpressionKind, PlanOpKind,
     PlanRowExpression, RootOutputDemand, ValueRef, plan_binary, plan_sha256, verify_plan,
@@ -437,7 +597,7 @@ store: [
 effects: [
     register_passkey: [
         on: store.register
-        perform: Passkey/register(
+        perform: DevelopmentPasskey/register(
             workspace_id: store.workspace_id
             account_id: store.account_id
             credential_count: store.credential_count
@@ -452,7 +612,7 @@ effects: [
     ]
     authenticate_passkey: [
         on: store.authenticate
-        perform: Passkey/authenticate(
+        perform: DevelopmentPasskey/authenticate(
             account_id: store.account_id
             credential_count: store.credential_count
             simulation: store.simulation
@@ -475,7 +635,10 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    for operation in ["Passkey/register", "Passkey/authenticate"] {
+    for operation in [
+        "DevelopmentPasskey/register",
+        "DevelopmentPasskey/authenticate",
+    ] {
         let contract = compiled
             .plan
             .effects
@@ -484,14 +647,14 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
             .unwrap();
         assert_eq!(contract.result_policy, EffectResultPolicy::CorrelatedSource);
         assert_eq!(contract.barrier, EffectBarrier::BeforeAndAfter);
-        assert!(
-            compiled
-                .plan
-                .persistence
-                .effect_outbox
-                .iter()
-                .any(|schema| schema.effect_id == contract.effect_id)
-        );
+        let schema = compiled
+            .plan
+            .persistence
+            .effect_outbox
+            .iter()
+            .find(|schema| schema.effect_id == contract.effect_id)
+            .unwrap();
+        assert!(!schema.invocation_ids.is_empty());
     }
     let registration = compiled
         .plan
@@ -505,7 +668,7 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
                 ..
             } if compiled.plan.effects.iter().any(|contract| {
                 contract.effect_id == effect.effect_id
-                    && contract.host_operation == "Passkey/register"
+                    && contract.host_operation == "DevelopmentPasskey/register"
             }) =>
             {
                 Some(effect)
@@ -565,6 +728,50 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
             .iter()
             .filter(|check| !check.pass)
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn effect_invocation_identity_ignores_declaration_label_but_tracks_result_routes() {
+    let original = compile_source_text_to_machine_plan(
+        "typed-passkey-effects.bn",
+        typed_passkey_effect_source(),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let renamed_source =
+        typed_passkey_effect_source().replacen("register_passkey: [", "protect_workspace: [", 1);
+    let renamed = compile_source_text_to_machine_plan(
+        "typed-passkey-effects-renamed.bn",
+        &renamed_source,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert_eq!(
+        original.plan.persistence.schema_hash, renamed.plan.persistence.schema_hash,
+        "renaming a declaration must not orphan its durable invocation"
+    );
+
+    let rerouted_source = typed_passkey_effect_source()
+        .replacen(
+            "registration_cancelled: SOURCE",
+            "registration_cancelled: SOURCE\n    registration_cancelled_alt: SOURCE",
+            1,
+        )
+        .replacen(
+            "RegistrationCancelled: store.registration_cancelled",
+            "RegistrationCancelled: store.registration_cancelled_alt",
+            1,
+        );
+    let rerouted = compile_source_text_to_machine_plan(
+        "typed-passkey-effects-rerouted.bn",
+        &rerouted_source,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert_ne!(
+        original.plan.persistence.schema_hash, rerouted.plan.persistence.schema_hash,
+        "changing a correlated result route must change durable compatibility"
     );
 }
 
@@ -1506,17 +1713,37 @@ FUNCTION new_row(item) {
         .find(|op| op.output == Some(ValueRef::Field(field)))
         .expect("row_selected plan op");
 
-    assert!(matches!(
-        op.kind,
-        PlanOpKind::DerivedValue {
-            expression: Some(PlanDerivedExpression::SourceEventTransform { .. }),
-            ..
+    let PlanOpKind::DerivedValue {
+        expression: Some(PlanDerivedExpression::SourceEventTransform { default, .. }),
+        ..
+    } = &op.kind
+    else {
+        panic!("row projection must lower to a source-event transform");
+    };
+    let PlanRowExpression::Constant { constant_id } = default.as_ref() else {
+        panic!("event-only list projection must use a typed scalar default");
+    };
+    assert_eq!(
+        compiled.plan.constants[constant_id.0].value,
+        boon_plan::PlanConstantValue::Text {
+            value: String::new()
         }
-    ));
+    );
+    let verification = verify_plan(&compiled.plan).unwrap();
+    assert_eq!(
+        verification.status,
+        "pass",
+        "invalid list-event projection plan: {:?}",
+        verification
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
-fn source_event_transform_uses_the_branch_owned_by_each_source() {
+fn root_latest_memory_uses_the_branch_owned_by_each_source() {
     let compiled = compile_source_text_to_machine_plan(
         "source-event-branch-ownership.bn",
         r#"
@@ -1541,42 +1768,38 @@ store: [
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    let field = compiled
+    let state = compiled
         .plan
         .debug_map
-        .fields
+        .state_slots
         .iter()
         .find(|field| field.label == "store.format")
-        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.id.strip_prefix("state:"))
         .and_then(|field| field.parse::<usize>().ok())
-        .map(boon_plan::FieldId)
-        .expect("format field");
-    let op = compiled
-        .plan
-        .regions
-        .iter()
-        .flat_map(|region| &region.ops)
-        .find(|op| op.output == Some(ValueRef::Field(field)))
-        .expect("format operation");
-    let PlanOpKind::DerivedValue {
-        expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
-        ..
-    } = &op.kind
-    else {
-        panic!("format must lower as a source event transform: {op:#?}");
-    };
+        .map(boon_plan::StateId)
+        .expect("format state");
     let reset = compiled
         .plan
         .source_routes
         .iter()
         .find(|route| route.path == "store.sources.reset")
         .expect("reset source");
-    let reset_arm = arms
+    let reset_op = compiled
+        .plan
+        .regions
         .iter()
-        .find(|arm| arm.source_id == reset.source_id)
-        .expect("reset arm");
-    let PlanRowExpression::Constant { constant_id } = &reset_arm.value else {
-        panic!("reset arm must remain a constant: {reset_arm:#?}");
+        .flat_map(|region| &region.ops)
+        .find(|op| {
+            op.output == Some(ValueRef::State(state))
+                && op.inputs.contains(&ValueRef::Source(reset.source_id))
+        })
+        .expect("reset update operation");
+    let PlanOpKind::UpdateBranch {
+        update_constant_id: Some(constant_id),
+        ..
+    } = &reset_op.kind
+    else {
+        panic!("format reset must lower as a constant state update: {reset_op:#?}");
     };
     let constant = compiled
         .plan
@@ -2250,4 +2473,131 @@ document: Document/new(root: Unknown/widget())
         message.contains("unknown") || message.contains("render") || message.contains("typecheck"),
         "{message}"
     );
+}
+
+#[test]
+fn compiler_persists_root_latest_but_not_transient_or_derived_fields() {
+    let compiled = compile_source_text_to_machine_plan(
+        "root-latest-memory.bn",
+        r#"
+store: [
+    pulse: SOURCE
+    count:
+        LATEST {
+            0
+            pulse |> THEN { count + 1 }
+        }
+    transient:
+        LATEST {
+            pulse |> THEN { count + 10 }
+        }
+    derived: count + 20
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(
+        compiled
+            .plan
+            .persistence
+            .memory
+            .iter()
+            .map(|memory| (memory.semantic_path.as_str(), memory.kind))
+            .collect::<Vec<_>>(),
+        [("store.count", MemoryKind::Scalar)]
+    );
+    assert_eq!(compiled.plan.storage_layout.scalar_slots.len(), 1);
+    assert!(
+        compiled
+            .plan
+            .debug_map
+            .derived_values
+            .iter()
+            .any(|field| { field.label == "store.transient" })
+    );
+    assert!(
+        compiled
+            .plan
+            .debug_map
+            .derived_values
+            .iter()
+            .any(|field| { field.label == "store.derived" })
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn compiler_resolves_append_record_fields_from_the_trigger_source_payload() {
+    let compiled = compile_source_text_to_machine_plan(
+        "append-source-payload-fields.bn",
+        r#"
+store: [
+    completed: SOURCE
+    append_token:
+        LATEST {
+            completed |> THEN { completed.digest }
+        }
+    revisions:
+        LIST {}
+        |> List/append(item: append_token |> THEN {
+            [
+                digest: append_token
+                compiler: completed.compiler
+                target: completed.target
+            ]
+        })
+        |> List/map(revision, new: revision_view(revision: revision))
+]
+
+FUNCTION revision_view(revision) {
+[
+    digest: revision.digest
+    compiler: revision.compiler
+    target: revision.target
+]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let append_op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| {
+            matches!(
+                op.kind,
+                PlanOpKind::ListOperation {
+                    operation_kind: boon_plan::PlanListOperationKind::Append,
+                    ..
+                }
+            )
+        })
+        .expect("append op");
+    let PlanOpKind::ListOperation {
+        append: Some(append),
+        ..
+    } = &append_op.kind
+    else {
+        unreachable!();
+    };
+    assert_eq!(append_op.unresolved_executable_ref_count, 0);
+    for name in ["compiler", "target"] {
+        let field = append
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .expect("payload-backed append field");
+        assert!(matches!(
+            &field.value_ref,
+            Some(ValueRef::SourcePayload {
+                field: boon_plan::SourcePayloadField::Named(payload_name),
+                ..
+            }) if payload_name == name
+        ));
+    }
 }

@@ -109,6 +109,27 @@ FUNCTION warning_hover() {
     TEXT { #aa741a }
 }
 
+FUNCTION diagnostic_background(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #2b1818 }
+        Light => TEXT { #fff1f1 }
+    }
+}
+
+FUNCTION diagnostic_border(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #714040 }
+        Light => TEXT { #dca9a9 }
+    }
+}
+
+FUNCTION diagnostic_text(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #f2b8b8 }
+        Light => TEXT { #762828 }
+    }
+}
+
 FUNCTION focus_border() {
     accent()
 }
@@ -171,6 +192,10 @@ FUNCTION status_background(mode, tone) {
             Dark => TEXT { #3a2c15 }
             Light => TEXT { #f7e9c9 }
         }
+        Danger => mode |> WHEN {
+            Dark => TEXT { #442020 }
+            Light => TEXT { #f8dddd }
+        }
         __ => mode |> WHEN {
             Dark => TEXT { #29322d }
             Light => TEXT { #e7ebe8 }
@@ -187,6 +212,10 @@ FUNCTION status_text(mode, tone) {
         Warning => mode |> WHEN {
             Dark => TEXT { #efc46f }
             Light => TEXT { #795414 }
+        }
+        Danger => mode |> WHEN {
+            Dark => TEXT { #f4aaaa }
+            Light => TEXT { #8a2929 }
         }
         __ => mode |> WHEN {
             Dark => TEXT { #b6c2bb }
@@ -238,6 +267,20 @@ FUNCTION browser_chrome(mode) {
     mode |> WHEN {
         Dark => TEXT { #222b26 }
         Light => TEXT { #eef2ee }
+    }
+}
+
+FUNCTION preview_empty_background(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #141b17 }
+        Light => TEXT { #f7f9f6 }
+    }
+}
+
+FUNCTION simulator_background(mode) {
+    mode |> WHEN {
+        Dark => TEXT { #151d19 }
+        Light => TEXT { #e8eee9 }
     }
 }
 

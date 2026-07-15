@@ -1958,7 +1958,7 @@ async fn apply_sparse_outbox_changes(
             }
             outbox.insert(item_id, item);
         }
-        super::apply_outbox_changes(&mut outbox, std::slice::from_ref(change))?;
+        super::apply_durable_outbox_changes(&mut outbox, std::slice::from_ref(change))?;
         super::validate_outbox(&outbox)?;
         let item = outbox
             .get(&item_id)

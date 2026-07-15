@@ -3437,15 +3437,16 @@ fn derive_structure_from_statements(
                         capacity: None,
                     });
                 }
-                if scope_is_indexed(scope, row_scopes)
-                    && statement_direct_stateful_operator(statement, expressions)
+                let indexed = scope_is_indexed(scope, row_scopes);
+                if (indexed && statement_direct_stateful_operator(statement, expressions))
+                    || (!indexed && statement_direct_root_memory_operator(statement, expressions))
                 {
                     let path = join_path(scope, [name.as_str()]);
                     if !tables.state_cells.iter().any(|cell| cell.path == path) {
                         push_state_cell(
                             tables,
                             ParsedStateCell {
-                                indexed: true,
+                                indexed,
                                 hold_name: path.clone(),
                                 path,
                                 line: statement.line,
@@ -3990,6 +3991,34 @@ fn statement_direct_stateful_operator(statement: &AstStatement, expressions: &[A
             .any(|child| child_statement_is_stateful(child, expressions))
 }
 
+fn statement_direct_root_memory_operator(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .is_some_and(|expr| expr_is_root_memory_statement_expr(expr, statement, expressions))
+        || statement.children.iter().any(|child| {
+            child
+                .expr
+                .and_then(|expr_id| expressions.get(expr_id))
+                .is_some_and(|expr| expr_is_root_memory_statement_expr(expr, child, expressions))
+        })
+}
+
+fn expr_is_root_memory_statement_expr(
+    expr: &AstExpr,
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> bool {
+    match &expr.kind {
+        AstExprKind::Latest => latest_statement_has_initial(statement, expressions),
+        AstExprKind::Pipe { op, .. } => op == "Bool/toggle",
+        _ => false,
+    }
+}
+
 fn child_statement_is_stateful(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
     statement
         .expr
@@ -4013,7 +4042,16 @@ fn latest_statement_has_initial(statement: &AstStatement, expressions: &[AstExpr
     let Some(first) = statement.children.first() else {
         return false;
     };
-    if statement_has_then_or_when_continuation(first, expressions) {
+    if statement_is_transient_latest_branch(first, expressions) {
+        return false;
+    }
+    if statement
+        .children
+        .iter()
+        .skip(1)
+        .take_while(|continuation| statement_is_pipeline_continuation(continuation, expressions))
+        .any(|continuation| statement_is_transient_latest_branch(continuation, expressions))
+    {
         return false;
     }
     let Some(expr) = first.expr.and_then(|expr_id| expressions.get(expr_id)) else {
@@ -4026,20 +4064,78 @@ fn latest_statement_has_initial(statement: &AstStatement, expressions: &[AstExpr
     }
 }
 
-fn statement_has_then_or_when_continuation(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-) -> bool {
-    statement.children.iter().any(|child| {
-        child
-            .expr
-            .and_then(|expr_id| expressions.get(expr_id))
-            .is_some_and(|expr| match &expr.kind {
-                AstExprKind::Then { .. } | AstExprKind::When { .. } => true,
-                AstExprKind::Pipe { op, .. } if op == "THEN" || op == "WHEN" => true,
-                _ => false,
-            })
-    })
+fn statement_is_pipeline_continuation(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .is_some_and(|expr| match &expr.kind {
+            AstExprKind::Pipe { input, .. } | AstExprKind::Draining { input } => expressions
+                .get(*input)
+                .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter)),
+            _ => false,
+        })
+}
+
+fn statement_is_transient_latest_branch(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement
+        .expr
+        .is_some_and(|expr_id| expr_contains_transient_latest_operator(expr_id, expressions))
+        || statement
+            .children
+            .iter()
+            .any(|child| statement_is_transient_latest_branch(child, expressions))
+}
+
+fn expr_contains_transient_latest_operator(expr_id: usize, expressions: &[AstExpr]) -> bool {
+    let Some(expr) = expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Latest | AstExprKind::When { .. } | AstExprKind::Then { .. } => true,
+        AstExprKind::Pipe { input, op, args } => {
+            matches!(op.as_str(), "THEN" | "WHEN" | "List/latest")
+                || expr_contains_transient_latest_operator(*input, expressions)
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_transient_latest_operator(arg.value, expressions))
+        }
+        AstExprKind::Call { function, args } => {
+            matches!(function.as_str(), "THEN" | "WHEN" | "List/latest")
+                || args
+                    .iter()
+                    .any(|arg| expr_contains_transient_latest_operator(arg.value, expressions))
+        }
+        AstExprKind::Draining { input } | AstExprKind::Hold { initial: input, .. } => {
+            expr_contains_transient_latest_operator(*input, expressions)
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            expr_contains_transient_latest_operator(*left, expressions)
+                || expr_contains_transient_latest_operator(*right, expressions)
+        }
+        AstExprKind::MatchArm { output, .. } => output
+            .is_some_and(|output| expr_contains_transient_latest_operator(output, expressions)),
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => fields
+            .iter()
+            .any(|field| expr_contains_transient_latest_operator(field.value, expressions)),
+        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => items
+            .iter()
+            .any(|item| expr_contains_transient_latest_operator(*item, expressions)),
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::ByteLiteral { .. }
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => false,
+    }
 }
 
 fn collect_source_ports_from_statement_expr(

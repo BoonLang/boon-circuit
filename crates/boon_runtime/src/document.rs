@@ -3143,6 +3143,20 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
             "revision" => {
                 program.revision = value.number().unwrap_or(0.0).max(0.0) as u64;
             }
+            "artifact_id" => {
+                program.artifact_id = value.text();
+            }
+            "persist_artifact" => {
+                program.persist_artifact = value.truthy();
+            }
+            "bootstrap_source" => {
+                program.bootstrap_source = value.text();
+                program.bootstrap_source_digest =
+                    crate::sha256_bytes(program.bootstrap_source.as_bytes());
+            }
+            "bootstrap_revision" => {
+                program.bootstrap_revision = value.number().unwrap_or(0.0).max(0.0) as u64;
+            }
             "capability_profile" => {
                 program.capability_profile = match value.text().as_str() {
                     "PublicDocument" | "public_document" => {
@@ -3161,7 +3175,15 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
         }
         if matches!(
             name,
-            "source" | "revision" | "capability_profile" | "session_key" | "mount"
+            "source"
+                | "revision"
+                | "artifact_id"
+                | "persist_artifact"
+                | "bootstrap_source"
+                | "bootstrap_revision"
+                | "capability_profile"
+                | "session_key"
+                | "mount"
         ) {
             return;
         }
@@ -3900,7 +3922,10 @@ pub(crate) fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec
         else {
             continue;
         };
-        if previous_node.materialized != next_node.materialized {
+        if previous_node.kind != next_node.kind
+            || previous_node.parent != next_node.parent
+            || previous_node.materialized != next_node.materialized
+        {
             patches.push(DocumentPatch::UpsertNode(next_node.clone()));
             continue;
         }
@@ -3914,6 +3939,14 @@ pub(crate) fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec
                 patches.push(DocumentPatch::UpsertNode(next_node.clone()));
                 continue;
             }
+        }
+        if previous_node.embedded_program != next_node.embedded_program
+            && let Some(program) = next_node.embedded_program.clone()
+        {
+            patches.push(DocumentPatch::SetEmbeddedProgram {
+                id: id.clone(),
+                program,
+            });
         }
         let style = diff_style(&previous_node.style, &next_node.style);
         if !style.is_empty() {
@@ -3981,6 +4014,43 @@ fn diff_style(previous: &StyleMap, next: &StyleMap) -> StylePatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_diff_emits_embedded_program_descriptor_changes() {
+        let mut previous = DocumentFrame::empty("root");
+        let mut program = DocumentNode::new("program", DocumentNodeKind::EmbeddedProgram);
+        program.parent = Some(previous.root.clone());
+        program.embedded_program = Some(EmbeddedProgramDescriptor {
+            source: "first".to_owned(),
+            source_digest: crate::sha256_bytes(b"first"),
+            revision: 1,
+            ..EmbeddedProgramDescriptor::default()
+        });
+        previous
+            .nodes
+            .get_mut(&previous.root)
+            .unwrap()
+            .children
+            .push(program.id.clone());
+        previous.nodes.insert(program.id.clone(), program);
+        let mut next = previous.clone();
+        let descriptor = next
+            .nodes
+            .get_mut(&FrameNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap();
+        descriptor.source = "second".to_owned();
+        descriptor.source_digest = crate::sha256_bytes(b"second");
+        descriptor.revision = 2;
+
+        assert!(matches!(
+            diff_frames(&previous, &next).as_slice(),
+            [DocumentPatch::SetEmbeddedProgram { id, program }]
+                if id.0 == "program" && program.revision == 2
+        ));
+    }
 
     #[test]
     fn text_concat_uses_separator_between_values_only() {

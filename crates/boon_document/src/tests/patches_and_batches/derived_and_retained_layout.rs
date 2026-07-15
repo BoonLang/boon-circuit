@@ -191,6 +191,146 @@ fn retained_document_patches_fixed_geometry_without_full_lowering() {
 }
 
 #[test]
+fn retained_document_reflows_fixed_typed_subtree_without_touching_siblings() {
+    let mut panel = node("panel", DocumentNodeKind::Stack, Some("root"));
+    panel
+        .style
+        .insert("width".to_owned(), StyleValue::Number(200.0));
+    panel
+        .style
+        .insert("height".to_owned(), StyleValue::Number(100.0));
+    panel.children.push(DocumentNodeId("label".to_owned()));
+
+    let mut label = node("label", DocumentNodeKind::Text, Some("panel"));
+    label.text = Some(TextValue {
+        text: "short".to_owned(),
+    });
+    label
+        .style
+        .insert("width".to_owned(), StyleValue::Text("fill".to_owned()));
+    label
+        .style
+        .insert("text_wrap".to_owned(), StyleValue::Bool(true));
+    label.style.insert(
+        "visible_min_width".to_owned(),
+        StyleValue::Number(500.0),
+    );
+
+    let mut sibling = node("sibling", DocumentNodeKind::Text, Some("root"));
+    sibling.text = Some(TextValue {
+        text: "outside".to_owned(),
+    });
+    sibling
+        .style
+        .insert("width".to_owned(), StyleValue::Number(120.0));
+    sibling
+        .style
+        .insert("height".to_owned(), StyleValue::Number(30.0));
+
+    let mut frame = DocumentFrame::empty("root");
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .extend([panel.id.clone(), sibling.id.clone()]);
+    frame.nodes.insert(panel.id.clone(), panel);
+    frame.nodes.insert(label.id.clone(), label);
+    frame.nodes.insert(sibling.id.clone(), sibling);
+    let viewport = Viewport {
+        surface: 1,
+        width: 800.0,
+        height: 400.0,
+        scale: 1.0,
+    };
+    let mut columns = render_scene::ApproximateTextColumnMeasurer;
+    let mut retained = RetainedDocument::new(frame, viewport, &mut columns).unwrap();
+    let sibling_before = retained
+        .layout()
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "sibling")
+        .unwrap()
+        .clone();
+    let sibling_scene_items_before = retained
+        .scene()
+        .items
+        .iter()
+        .filter(|item| item.node.0 == "sibling")
+        .cloned()
+        .collect::<Vec<_>>();
+    let sibling_primitives_before = retained
+        .scene()
+        .visual_primitives
+        .iter()
+        .filter(|item| item.node.0 == "sibling")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let update = retained
+        .apply_patches(
+            vec![DocumentPatch::SetText {
+                id: DocumentNodeId("label".to_owned()),
+                text: TextValue {
+                    text: "a much longer line that wraps inside the fixed panel".to_owned(),
+                },
+            }],
+            &mut columns,
+        )
+        .unwrap();
+
+    assert!(!update.full_lowered);
+    assert!(update.layout_changed);
+    assert_eq!(retained.stats().full_lower_count, 1);
+    assert_eq!(retained.stats().subtree_reflow_count, 1);
+    assert_eq!(retained.stats().subtree_reflow_fallback_count, 0);
+    assert!(retained.stats().subtree_reflowed_node_count >= 2);
+    assert!(retained
+        .layout()
+        .display_list
+        .iter()
+        .any(|item| item.node.0 == "label"));
+    assert_eq!(
+        retained
+            .layout()
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == "sibling")
+            .unwrap(),
+        &sibling_before
+    );
+    assert_eq!(
+        retained
+            .scene()
+            .items
+            .iter()
+            .filter(|item| item.node.0 == "sibling")
+            .cloned()
+            .collect::<Vec<_>>(),
+        sibling_scene_items_before
+    );
+    assert_eq!(
+        retained
+            .scene()
+            .visual_primitives
+            .iter()
+            .filter(|item| item.node.0 == "sibling")
+            .cloned()
+            .collect::<Vec<_>>(),
+        sibling_primitives_before
+    );
+
+    let mut full_columns = render_scene::ApproximateTextColumnMeasurer;
+    let rebuilt = RetainedDocument::new(retained.frame().clone(), viewport, &mut full_columns)
+        .expect("full rebuild after subtree reflow");
+    assert_eq!(retained.layout(), rebuilt.layout());
+    assert!(retained.scene().text_runs.iter().any(|run| {
+        run.node.0 == "label"
+            && run.text == "a much longer line that wraps inside the fixed panel"
+    }));
+}
+
+#[test]
 fn retained_document_updates_hit_metadata_without_rebuilding_layout() {
     let mut button = node("button", DocumentNodeKind::Button, Some("root"));
     button

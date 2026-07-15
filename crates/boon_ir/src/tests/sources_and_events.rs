@@ -384,3 +384,152 @@ store: [
         ]
     );
 }
+
+#[test]
+fn multiline_list_literal_preserves_typed_initial_rows() {
+    let parsed = boon_parser::parse_source(
+        "multiline-list-literal.bn",
+        r#"
+store: [
+    items: LIST {
+        [
+            id: TEXT { a }
+            value: 7
+        ]
+        [
+            id: TEXT { b }
+            value: 9
+        ]
+    }
+]
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).expect("multiline list literals must lower through the structured AST");
+    let items = ir
+        .lists
+        .iter()
+        .find(|list| list.name == "items")
+        .expect("items list memory");
+    let ListInitializer::RecordLiteral { rows } = &items.initializer else {
+        panic!("expected typed record rows, got {:?}", items.initializer);
+    };
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].fields[0].name, "id");
+    assert_eq!(
+        rows[0].fields[0].value,
+        InitialValue::Text {
+            value: "a".to_owned()
+        }
+    );
+    assert_eq!(
+        rows[1].fields[1].value,
+        InitialValue::Number { value: 9 }
+    );
+}
+
+#[test]
+fn root_latest_lowers_to_semantic_memory_without_promoting_transient_latest() {
+    let source = r#"
+store: [
+    pulse: SOURCE
+    count:
+        LATEST {
+            0
+            pulse |> THEN { count + 1 }
+        }
+    transient:
+        LATEST {
+            pulse |> THEN { count + 10 }
+        }
+    derived: count + 20
+]
+"#;
+    let parsed = boon_parser::parse_source("root-latest-memory.bn", source).unwrap();
+    let ir = lower(&parsed).unwrap();
+
+    assert_eq!(
+        ir.state_cells
+            .iter()
+            .map(|state| state.path.as_str())
+            .collect::<Vec<_>>(),
+        ["store.count"]
+    );
+    assert_eq!(
+        ir.semantic_memory
+            .iter()
+            .map(|memory| (
+                memory.identity.semantic_path.as_str(),
+                memory.identity.kind,
+            ))
+            .collect::<Vec<_>>(),
+        [("store.count", SemanticMemoryKind::RootScalar)]
+    );
+    assert!(ir.derived_values.iter().any(|value| {
+        value.path == "store.transient" && value.kind == DerivedValueKind::SourceEventTransform
+    }));
+    assert!(
+        ir.derived_values
+            .iter()
+            .any(|value| value.path == "store.derived" && value.kind == DerivedValueKind::Pure)
+    );
+}
+
+#[test]
+fn authoritative_list_append_breaks_feedback_cycle_for_unique_candidate() {
+    let source = r#"
+store: [
+    add: SOURCE
+    candidate:
+        add |> THEN {
+            entries
+            |> List/any(entry, if:
+                entry.id == add.text
+            )
+            |> WHEN {
+                True => SKIP
+                False => [
+                    id: add.text
+                ]
+            }
+        }
+    entries:
+        LIST {}
+        |> List/append(item: candidate)
+        |> List/map(entry, new: entry_view(entry: entry))
+]
+
+FUNCTION entry_view(entry) {
+[
+    id: entry.id
+]
+}
+"#;
+    let parsed = boon_parser::parse_source("unique-append.bn", source).unwrap();
+    let ir = lower(&parsed).expect("authoritative list ownership must break the feedback cycle");
+
+    assert!(ir.lists.iter().any(|list| list.name == "entries"));
+    let append = ir
+        .list_operations
+        .iter()
+        .find(|operation| {
+            operation.list == "entries"
+                && matches!(operation.kind, ListOperationKind::Append { .. })
+        })
+        .expect("entries append operation");
+    let ListOperationKind::Append { trigger, fields } = &append.kind else {
+        unreachable!();
+    };
+    assert_eq!(trigger, "store.candidate");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "id");
+    assert!(matches!(
+        &fields[0].value,
+        ListAppendFieldValue::Source { path } if path == "add.text"
+    ));
+    assert!(ir
+        .derived_values
+        .iter()
+        .any(|value| value.path == "store.candidate"));
+}

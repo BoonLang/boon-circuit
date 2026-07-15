@@ -793,6 +793,9 @@ pub enum UpdateExpression {
         path: String,
         encoding: String,
     },
+    TextToNumber {
+        path: String,
+    },
     BytesToText {
         path: String,
         encoding: String,
@@ -1029,7 +1032,7 @@ fn lower_with_typecheck(
     let state_cells_ms = lower_elapsed_ms(state_cells_started);
     trace_phase("state_cells", state_cells_ms);
     let verify_cycles_started = Instant::now();
-    verify_combinational_field_cycles(&fields, &state_cells)?;
+    verify_combinational_field_cycles(program, &fields, &state_cells)?;
     let verify_cycles_ms = lower_elapsed_ms(verify_cycles_started);
     trace_phase("verify_combinational_field_cycles", verify_cycles_ms);
     let lists_started = Instant::now();
@@ -4850,6 +4853,13 @@ fn verify_scheduled_update_expression(
         UpdateExpression::BoolNot { path } => {
             require_known_symbol("update expression path", path, known_symbols)
         }
+        UpdateExpression::TextToNumber { path } => {
+            if source_payload_input_matches(path, source) {
+                Ok(())
+            } else {
+                require_known_symbol("text-to-number input", path, known_symbols)
+            }
+        }
         UpdateExpression::BytesLength { path }
         | UpdateExpression::BytesIsEmpty { path }
         | UpdateExpression::BytesGet { path, .. }
@@ -5214,18 +5224,28 @@ fn field_symbol_dependency_graph(
 }
 
 fn verify_combinational_field_cycles(
+    program: &ParsedProgram,
     fields: &[FieldDef],
     state_cells: &[StateCell],
 ) -> Result<(), String> {
-    let state_paths = state_cells
+    let memory_paths = state_cells
         .iter()
         .map(|cell| cell.path.as_str())
+        .chain(
+            fields
+                .iter()
+                .filter(|field| {
+                    (field_is_list_memory_path(field, program) || field.has_operator("List/append"))
+                        && !is_output_registry_value_path(&field.path)
+                })
+                .map(|field| field.path.as_str()),
+        )
         .collect::<BTreeSet<_>>();
-    let (state_field, dependency_edges) = field_symbol_dependency_graph(fields, &state_paths);
+    let (memory_field, dependency_edges) = field_symbol_dependency_graph(fields, &memory_paths);
 
     let mut visits = vec![FieldCycleVisit::Pending; fields.len()];
-    for (field_index, is_state_field) in state_field.iter().enumerate() {
-        if *is_state_field {
+    for (field_index, is_memory_field) in memory_field.iter().enumerate() {
+        if *is_memory_field {
             continue;
         }
         let mut visiting = Vec::new();
@@ -5260,7 +5280,7 @@ fn verify_combinational_field_cycles_from(
                 .collect::<Vec<_>>();
             cycle.push(fields[field_index].path.as_str());
             return Err(format!(
-                "combinational dependency cycle through pure/WHILE expressions must be broken by HOLD: {}",
+                "combinational dependency cycle through pure/WHILE expressions must be broken by HOLD or another authoritative memory boundary: {}",
                 cycle.join(" -> ")
             ));
         }
@@ -5391,6 +5411,7 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         UpdateExpression::PreviousValue { path }
         | UpdateExpression::ReadPath { path }
         | UpdateExpression::BoolNot { path }
+        | UpdateExpression::TextToNumber { path }
         | UpdateExpression::BytesLength { path }
         | UpdateExpression::BytesIsEmpty { path }
         | UpdateExpression::BytesGet { path, .. }
@@ -7067,6 +7088,11 @@ fn list_initializer(
             to: extract_i64_arg_from_items(&items, "to").unwrap_or(0),
         };
     }
+    if let Some(rows) = structured_list_record_rows(program, list)
+        && !rows.is_empty()
+    {
+        return ListInitializer::RecordLiteral { rows };
+    }
     let rows = list_record_literal_rows(&items);
     if !rows.is_empty() {
         return ListInitializer::RecordLiteral { rows };
@@ -7078,6 +7104,62 @@ fn list_initializer(
             summary: items.first().map(item_summary).unwrap_or_default(),
         }
     }
+}
+
+fn structured_list_record_rows(
+    program: &ParsedProgram,
+    list: &boon_parser::ParsedListMemory,
+) -> Option<Vec<ListInitialRecord>> {
+    let statement = find_list_statement(&program.ast.statements, list)?;
+    let rows = statement
+        .children
+        .iter()
+        .filter(|row| matches!(row.kind, AstStatementKind::Block))
+        .filter_map(|row| structured_list_record_row(program, row))
+        .collect::<Vec<_>>();
+    Some(rows)
+}
+
+fn find_list_statement<'a>(
+    statements: &'a [AstStatement],
+    list: &boon_parser::ParsedListMemory,
+) -> Option<&'a AstStatement> {
+    statements.iter().find_map(|statement| {
+        let matches_list = statement.line == list.line
+            && matches!(
+                &statement.kind,
+                AstStatementKind::List {
+                    field: Some(field),
+                    ..
+                } if field == &list.name
+            );
+        matches_list
+            .then_some(statement)
+            .or_else(|| find_list_statement(&statement.children, list))
+    })
+}
+
+fn structured_list_record_row(
+    program: &ParsedProgram,
+    statement: &AstStatement,
+) -> Option<ListInitialRecord> {
+    let fields = statement
+        .children
+        .iter()
+        .filter_map(|field| {
+            let AstStatementKind::Field { name } = &field.kind else {
+                return None;
+            };
+            let expr = field
+                .expr
+                .and_then(|expr_id| program.expressions.iter().find(|expr| expr.id == expr_id))?;
+            Some(ListRowInitialField {
+                name: name.clone(),
+                value: ast_initial_value(expr, &program.expressions, &[], None),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!fields.is_empty()).then_some(ListInitialRecord { fields })
 }
 
 fn list_body_items_by_line(program: &ParsedProgram, line: usize) -> Option<Vec<AstItem>> {
@@ -7948,7 +8030,30 @@ fn list_append_fields(
     if !statement_fields.is_empty() {
         return statement_fields;
     }
+    let referenced_fields = list_append_referenced_record_fields(field, fields, append_expr);
+    if !referenced_fields.is_empty() {
+        return referenced_fields;
+    }
     list_append_function_constructor_fields(field, program, fields, append_expr)
+}
+
+fn list_append_referenced_record_fields(
+    field: &FieldDef,
+    fields: &[FieldDef],
+    append_expr: &AstExpr,
+) -> Vec<ListAppendField> {
+    let Some(item_expr) = list_append_item_expr(field, append_expr) else {
+        return Vec::new();
+    };
+    let Some(path) = ast_argument_value(field, item_expr.id) else {
+        return Vec::new();
+    };
+    let path = canonical_local_path(&path, &field.parent_path);
+    fields
+        .iter()
+        .find(|candidate| candidate.path == path)
+        .and_then(|candidate| list_append_statement_fields(candidate, &candidate.statement))
+        .unwrap_or_default()
 }
 
 fn list_append_item_statement_fields(
@@ -9334,6 +9439,9 @@ fn update_expression_for_routed_branch(
         return expression;
     }
     if let Some(expression) = branch.then_file_write_bytes_expression(field, target, fields) {
+        return expression;
+    }
+    if let Some(expression) = branch.then_text_to_number_expression(field, target, fields) {
         return expression;
     }
     if let Some(expression) =
@@ -12101,6 +12209,39 @@ impl RoutedBranch {
                         canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
                     ),
                 },
+            })
+        })
+    }
+
+    fn then_text_to_number_expression(
+        &self,
+        field: &FieldDef,
+        target: &str,
+        fields: &[FieldDef],
+    ) -> Option<UpdateExpression> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Then {
+                output: Some(output),
+                ..
+            } = expr.kind
+            else {
+                return None;
+            };
+            let output = self
+                .ast_exprs
+                .iter()
+                .find(|candidate| candidate.id == output)?;
+            let raw_path = match &output.kind {
+                AstExprKind::Pipe { input, op, .. } if op == "Text/to_number" => {
+                    ast_argument_value_in_exprs(&self.ast_exprs, *input)?
+                }
+                AstExprKind::Call { function, args } if function == "Text/to_number" => {
+                    text_to_bytes_input_arg_in_exprs(&self.ast_exprs, args)?
+                }
+                _ => return None,
+            };
+            Some(UpdateExpression::TextToNumber {
+                path: canonical_scalar_update_path_with_fields(field, target, &raw_path, fields),
             })
         })
     }

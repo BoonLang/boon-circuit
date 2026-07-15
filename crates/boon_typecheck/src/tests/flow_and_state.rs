@@ -1,6 +1,49 @@
 // Included by `../tests.rs`; kept in the parent test module for private typechecker helper access.
 
 #[test]
+fn multiline_when_arm_continuation_determines_result_type() {
+    let parsed = boon_parser::parse_source(
+        "multiline-when-continuation-type.bn",
+        r#"
+store: [
+    key_down: SOURCE
+    text: TEXT { value }
+    result:
+        key_down.key |> WHEN {
+            Enter =>
+                text |> Text/trim() |> WHEN {
+                    TEXT {} => SKIP
+                    value => value
+                }
+            __ => SKIP
+        }
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}",
+        report.diagnostics
+    );
+    let outer_when = parsed
+        .expressions
+        .iter()
+        .find(|expr| expr.line == 6 && matches!(expr.kind, AstExprKind::When { .. }))
+        .expect("outer multiline WHEN expression");
+    let result = report
+        .expr_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.expr_id == outer_when.id)
+        .expect("outer WHEN type");
+
+    assert_eq!(result.flow_type.ty, Type::Text);
+    assert_eq!(result.flow_type.mode, FlowMode::PresentOrAbsent);
+}
+
+#[test]
 fn record_spread_fields_are_typed_and_later_fields_override() {
     let parsed = boon_parser::parse_source(
         "record-spread-type.bn",

@@ -3,6 +3,12 @@
 -- The trusted workspace owns workflow state. The editable public page is a
 -- separate bounded Boon program mounted by the generic child-program host.
 
+host: [
+    lifecycle: [
+        started: SOURCE
+    ]
+]
+
 store: [
     elements: [
         source_editor: SOURCE
@@ -10,19 +16,51 @@ store: [
             compiled: SOURCE
             rejected: SOURCE
         ]
+        publish_candidate_program: [
+            compiled: SOURCE
+            rejected: SOURCE
+        ]
+        published_program: [
+            compiled: SOURCE
+            rejected: SOURCE
+        ]
         show_code: SOURCE
         show_preview: SOURCE
-        protect_workspace: SOURCE
-        add_passkey: SOURCE
+        show_publish: SOURCE
+        show_draft_page: SOURCE
+        show_published_page: SOURCE
+        register_passkey: SOURCE
         sign_out: SOURCE
         sign_in: SOURCE
+        simulate_success: SOURCE
+        simulate_cancel: SOURCE
+        simulate_failure: SOURCE
+        simulate_duplicate: SOURCE
         publish: SOURCE
         theme_toggle: SOURCE
     ]
 
-    workspace_id: TEXT { 019f-persons-local-first }
-    workspace_path: TEXT { persons.pro/p/019f-persons-local-first }
-    implementation_stage: ChildProgram
+    passkey: [
+        registration_succeeded: SOURCE
+        registration_cancelled: SOURCE
+        registration_failed: SOURCE
+        duplicate_credential: SOURCE
+        authentication_succeeded: SOURCE
+        authentication_cancelled: SOURCE
+        authentication_failed: SOURCE
+    ]
+
+    workspace_id:
+        Text/empty() |> HOLD workspace_id {
+            host.lifecycle.started |> THEN {
+                Text/is_empty(workspace_id) |> WHEN {
+                    True => host.lifecycle.started.instance_id
+                    False => workspace_id
+                }
+            }
+        }
+    workspace_path: TEXT { persons.pro/p/{workspace_id} }
+    implementation_stage: LocalFirst
 
     source_draft:
         Profile/starter_source() |> HOLD source_draft {
@@ -37,12 +75,10 @@ store: [
         }
 
     draft_compile_state:
-        Compiling |> HOLD draft_compile_state {
-            LATEST {
-                elements.source_editor.event.change |> THEN { Compiling }
-                elements.draft_program.compiled |> THEN { Ready }
-                elements.draft_program.rejected |> THEN { Invalid }
-            }
+        LATEST {
+            elements.source_editor.event.change |> THEN { Compiling }
+            elements.draft_program.compiled |> THEN { Ready }
+            elements.draft_program.rejected |> THEN { Invalid }
         }
 
     draft_compile_digest:
@@ -52,53 +88,285 @@ store: [
         }
 
     draft_compile_diagnostic:
-        Text/empty() |> HOLD draft_compile_diagnostic {
-            LATEST {
-                elements.source_editor.event.change |> THEN { Text/empty() }
-                elements.draft_program.compiled |> THEN { Text/empty() }
-                elements.draft_program.rejected
-                    |> THEN { elements.draft_program.rejected.diagnostic }
+        LATEST {
+            elements.source_editor.event.change |> THEN { Text/empty() }
+            elements.draft_program.compiled |> THEN { Text/empty() }
+            elements.draft_program.rejected
+                |> THEN { elements.draft_program.rejected.diagnostic }
+        }
+
+    draft_compile_path:
+        LATEST {
+            elements.draft_program.compiled |> THEN { Text/empty() }
+            elements.draft_program.rejected
+                |> THEN { elements.draft_program.rejected.source_path }
+        }
+
+    draft_compile_line:
+        LATEST {
+            elements.draft_program.compiled |> THEN { TEXT { 0 } }
+            elements.draft_program.rejected
+                |> THEN { elements.draft_program.rejected.line }
+        }
+
+    draft_compile_column:
+        LATEST {
+            elements.draft_program.compiled |> THEN { TEXT { 0 } }
+            elements.draft_program.rejected
+                |> THEN { elements.draft_program.rejected.column }
+        }
+
+    last_valid_draft_revision:
+        1 |> HOLD last_valid_draft_revision {
+            elements.draft_program.compiled |> THEN {
+                elements.draft_program.compiled.bootstrap |> WHEN {
+                    True => last_valid_draft_revision
+                    False => draft_revision
+                }
+            }
+        }
+
+    last_valid_draft_source:
+        Profile/starter_source() |> HOLD last_valid_draft_source {
+            elements.draft_program.compiled |> THEN {
+                elements.draft_program.compiled.bootstrap |> WHEN {
+                    True => last_valid_draft_source
+                    False => source_draft
+                }
             }
         }
 
     active_view:
-        Code |> HOLD active_view {
+        LATEST {
+            Code
+            elements.show_code.event.press |> THEN { Code }
+            elements.show_preview.event.press |> THEN { Preview }
+            elements.show_publish.event.press |> THEN { Publish }
+        }
+
+    preview_surface:
+        LATEST {
+            DraftPage
+            elements.show_draft_page.event.press |> THEN { DraftPage }
+            elements.show_published_page.event.press |> THEN { PublishedPage }
+        }
+
+    passkey_simulation:
+        LATEST {
+            Success
+            elements.simulate_success.event.press |> THEN { Success }
+            elements.simulate_cancel.event.press |> THEN { Cancel }
+            elements.simulate_failure.event.press |> THEN { Failure }
+            elements.simulate_duplicate.event.press |> THEN { Duplicate }
+        }
+
+    account_id:
+        Text/empty() |> HOLD account_id {
+            passkey.registration_succeeded
+                |> THEN { passkey.registration_succeeded.account_id }
+        }
+
+    registered_credential:
+        passkey.registration_succeeded |> THEN {
+            credential_descriptors
+            |> List/any(credential, if:
+                credential.credential_id == passkey.registration_succeeded.credential_id
+            )
+            |> WHEN {
+                True => SKIP
+                False => credential_count >= 2 |> WHEN {
+                    True => SKIP
+                    False => [
+                        credential_id: passkey.registration_succeeded.credential_id
+                        label: passkey.registration_succeeded.label
+                    ]
+                }
+            }
+        }
+
+    credential_descriptors:
+        LIST {}
+        |> List/append(item: registered_credential)
+        |> List/map(credential, new: Account/credential(credential: credential))
+
+    credential_count:
+        credential_descriptors |> List/length()
+
+    signed_out:
+        False |> HOLD signed_out {
             LATEST {
-                elements.show_code.event.press |> THEN { Code }
-                elements.show_preview.event.press |> THEN { Preview }
+                elements.sign_out.event.press |> THEN { True }
+                passkey.registration_succeeded |> THEN { False }
+                passkey.authentication_succeeded |> THEN { False }
             }
         }
 
     account_state:
-        Anonymous |> HOLD account_state {
-            LATEST {
-                elements.protect_workspace.event.press |> THEN { OnePasskey }
-                elements.add_passkey.event.press |> THEN { TwoPasskeys }
-                elements.sign_out.event.press |> THEN { SignedOut }
-                elements.sign_in.event.press |> THEN { TwoPasskeys }
+        Text/is_empty(account_id) |> WHEN {
+            True => Anonymous
+            False => signed_out |> WHEN {
+                True => SignedOut
+                False => credential_count == 1 |> WHEN {
+                    True => OnePasskey
+                    False => TwoPasskeys
+                }
             }
+        }
+
+    passkey_workflow_state:
+        LATEST {
+            Idle
+            elements.register_passkey.event.press |> THEN { Registering }
+            elements.sign_in.event.press |> THEN { Authenticating }
+            passkey.registration_succeeded |> THEN { Registered }
+            passkey.registration_cancelled |> THEN { Cancelled }
+            passkey.registration_failed |> THEN { Failed }
+            passkey.duplicate_credential |> THEN { Duplicate }
+            passkey.authentication_succeeded |> THEN { Authenticated }
+            passkey.authentication_cancelled |> THEN { Cancelled }
+            passkey.authentication_failed |> THEN { Failed }
+        }
+
+    passkey_message:
+        passkey_workflow_state |> WHEN {
+            Registering => TEXT { Running simulated passkey registration... }
+            Authenticating => TEXT { Running simulated passkey authentication... }
+            Registered => TEXT { A public credential descriptor was registered. }
+            Authenticated => TEXT { Simulated passkey authentication succeeded. }
+            Cancelled => TEXT { The ceremony was cancelled. Workspace authority is unchanged. }
+            Failed => TEXT { The development simulator rejected the ceremony. }
+            Duplicate => TEXT { That simulated credential is already registered. }
+            __ => TEXT { Select an outcome, then use an account action. }
+        }
+
+    publish_request_sequence:
+        LATEST {
+            0
+            elements.publish.event.press |> THEN { publish_request_sequence + 1 }
+        }
+
+    publish_settled_sequence:
+        LATEST {
+            0
+            elements.publish_candidate_program.compiled
+                |> THEN { publish_request_sequence }
+            elements.publish_candidate_program.rejected
+                |> THEN { publish_request_sequence }
+        }
+
+    publish_candidate_source:
+        LATEST {
+            Profile/starter_source()
+            elements.publish.event.press |> THEN { source_draft }
+        }
+
+    publish_candidate_revision:
+        LATEST {
+            0
+            elements.publish.event.press |> THEN { draft_revision }
         }
 
     publish_state:
-        Draft |> HOLD publish_state {
-            LATEST {
-                elements.source_editor.event.change |> THEN { Draft }
-                elements.publish.event.press |> THEN { Published }
+        LATEST {
+            has_published_revision |> WHEN {
+                True => Published
+                False => Draft
             }
+            elements.source_editor.event.change |> THEN { Draft }
+            elements.publish.event.press |> THEN { Building }
+            elements.publish_candidate_program.compiled |> THEN { Published }
+            elements.publish_candidate_program.rejected |> THEN { Failed }
         }
 
-    published_name:
-        TEXT { Not published } |> HOLD published_name {
-            elements.publish.event.press |> THEN { TEXT { Workspace page } }
+    publish_diagnostic:
+        LATEST {
+            elements.publish.event.press |> THEN { Text/empty() }
+            elements.publish_candidate_program.compiled |> THEN { Text/empty() }
+            elements.publish_candidate_program.rejected
+                |> THEN { elements.publish_candidate_program.rejected.diagnostic }
         }
 
     published_revision:
         0 |> HOLD published_revision {
-            elements.publish.event.press |> THEN { draft_revision }
+            elements.publish_candidate_program.compiled |> THEN { publish_candidate_revision }
         }
 
+    published_source:
+        Profile/starter_source() |> HOLD published_source {
+            elements.publish_candidate_program.compiled |> THEN { publish_candidate_source }
+        }
+
+    published_digest:
+        Text/empty() |> HOLD published_digest {
+            elements.publish_candidate_program.compiled
+                |> THEN { elements.publish_candidate_program.compiled.source_digest }
+        }
+
+    published_artifact_id:
+        Text/empty() |> HOLD published_artifact_id {
+            elements.publish_candidate_program.compiled
+                |> THEN { elements.publish_candidate_program.compiled.artifact_id }
+        }
+
+    published_plan_digest:
+        Text/empty() |> HOLD published_plan_digest {
+            elements.publish_candidate_program.compiled
+                |> THEN { elements.publish_candidate_program.compiled.plan_digest }
+        }
+
+    published_compiler:
+        Text/empty() |> HOLD published_compiler {
+            elements.publish_candidate_program.compiled
+                |> THEN { elements.publish_candidate_program.compiled.compiler }
+        }
+
+    published_target:
+        Text/empty() |> HOLD published_target {
+            elements.publish_candidate_program.compiled
+                |> THEN { elements.publish_candidate_program.compiled.target }
+        }
+
+    published_capability_profile:
+        Text/empty() |> HOLD published_capability_profile {
+            elements.publish_candidate_program.compiled
+                |> THEN { elements.publish_candidate_program.compiled.capability_profile }
+        }
+
+    published_revision_to_append:
+        LATEST {
+            elements.publish_candidate_program.compiled
+                |> THEN { elements.publish_candidate_program.compiled.source_digest }
+        }
+
+    published_revisions:
+        LIST {}
+        |> List/append(item: published_revision_to_append |> THEN {
+            [
+                request: publish_request_sequence
+                draft_revision: publish_candidate_revision
+                source: publish_candidate_source
+                source_digest: published_revision_to_append
+                artifact_id: elements.publish_candidate_program.compiled.artifact_id
+                plan_digest: elements.publish_candidate_program.compiled.plan_digest
+                compiler: elements.publish_candidate_program.compiled.compiler
+                target: elements.publish_candidate_program.compiled.target
+                capability_profile: elements.publish_candidate_program.compiled.capability_profile
+            ]
+        })
+        |> List/map(revision, new: Workspace/published_revision(revision: revision))
+
+    published_revision_count:
+        published_revisions |> List/length()
+
+    has_publish_request:
+        publish_request_sequence == publish_settled_sequence |> Bool/not()
+
+    has_published_revision:
+        published_revision == 0 |> Bool/not()
+
     mode:
-        Light |> HOLD mode {
+        LATEST {
+            Light
             elements.theme_toggle.event.press |> THEN {
                 mode |> WHEN {
                     Light => Dark
@@ -106,6 +374,37 @@ store: [
                 }
             }
         }
+]
+
+effects: [
+    register_passkey: [
+        on: store.elements.register_passkey
+        perform: DevelopmentPasskey/register(
+            workspace_id: store.workspace_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.passkey_simulation
+        )
+        results: [
+            RegistrationSucceeded: store.passkey.registration_succeeded
+            RegistrationCancelled: store.passkey.registration_cancelled
+            RegistrationFailed: store.passkey.registration_failed
+            DuplicateCredential: store.passkey.duplicate_credential
+        ]
+    ]
+    authenticate: [
+        on: store.elements.sign_in
+        perform: DevelopmentPasskey/authenticate(
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.passkey_simulation
+        )
+        results: [
+            AuthenticationSucceeded: store.passkey.authentication_succeeded
+            AuthenticationCancelled: store.passkey.authentication_cancelled
+            AuthenticationFailed: store.passkey.authentication_failed
+        ]
+    ]
 ]
 
 scene: App/main_scene(PASS: [store: store])

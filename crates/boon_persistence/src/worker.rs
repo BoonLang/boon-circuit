@@ -1,9 +1,10 @@
 use super::{
     ActivationAck, ActivationBatch, BarrierAck, BarrierRequest, CheckpointBatch, CommitAck,
-    CompactAck, CompactRequest, DurableChange, DurableOutboxChange, InspectRequest,
-    PersistenceCommand, PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult,
-    ResetApplicationAck, ResetApplicationBatch, RestoreImage, RestoreRequest, ShutdownAck,
-    ShutdownRequest, StoreError,
+    CompactAck, CompactRequest, ContentArtifact, ContentArtifactId, DurableChange,
+    DurableOutboxChange, InspectRequest, LoadContentArtifactRequest, PersistenceCommand,
+    PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
+    PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
+    RestoreRequest, ShutdownAck, ShutdownRequest, StoreError,
 };
 use boon_plan::ApplicationIdentity;
 use std::collections::VecDeque;
@@ -223,6 +224,7 @@ pub struct PersistenceWorkerStatus {
     /// Turns waiting in the channel. Worker-owned batch turns remain visible in
     /// `pending` but are not included here.
     pub queue_depth: usize,
+    pub pending_content_artifact_stores: usize,
     pub reserved_slots: usize,
     pub accepting_turns: bool,
     pub worker_alive: bool,
@@ -239,6 +241,40 @@ pub struct PersistenceWorkerTimings {
     pub restore_us: u64,
     pub migration_us: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ContentArtifactStoreTicket(pub u64);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentArtifactStoreCompletion {
+    pub ticket: ContentArtifactStoreTicket,
+    pub result: Result<PutContentArtifactAck, StoreError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContentArtifactStoreEnqueueError {
+    Backpressure(ContentArtifact),
+    Closed(ContentArtifact),
+}
+
+impl ContentArtifactStoreEnqueueError {
+    pub fn into_artifact(self) -> ContentArtifact {
+        match self {
+            Self::Backpressure(artifact) | Self::Closed(artifact) => artifact,
+        }
+    }
+}
+
+impl fmt::Display for ContentArtifactStoreEnqueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backpressure(_) => formatter.write_str("content artifact store queue is full"),
+            Self::Closed(_) => formatter.write_str("persistence coordinator is closed"),
+        }
+    }
+}
+
+impl std::error::Error for ContentArtifactStoreEnqueueError {}
 
 #[derive(Clone, Debug)]
 struct PendingMeta {
@@ -261,6 +297,9 @@ struct SharedState {
     admission: Mutex<AdmissionState>,
     reservation_changed: Condvar,
     queue_depth: AtomicUsize,
+    pending_content_artifact_stores: AtomicUsize,
+    next_content_artifact_ticket: AtomicU64,
+    content_artifact_completions: Mutex<VecDeque<ContentArtifactStoreCompletion>>,
     durable_epoch: AtomicU64,
     durable_turn: AtomicU64,
     worker_alive: AtomicBool,
@@ -286,6 +325,9 @@ impl SharedState {
             }),
             reservation_changed: Condvar::new(),
             queue_depth: AtomicUsize::new(0),
+            pending_content_artifact_stores: AtomicUsize::new(0),
+            next_content_artifact_ticket: AtomicU64::new(1),
+            content_artifact_completions: Mutex::new(VecDeque::new()),
             durable_epoch: AtomicU64::new(0),
             durable_turn: AtomicU64::new(0),
             worker_alive: AtomicBool::new(true),
@@ -373,6 +415,9 @@ impl SharedState {
             durable_epoch: self.durable_epoch.load(Ordering::Acquire),
             durable_through_turn_sequence: self.durable_turn.load(Ordering::Acquire),
             queue_depth: self.queue_depth.load(Ordering::Acquire),
+            pending_content_artifact_stores: self
+                .pending_content_artifact_stores
+                .load(Ordering::Acquire),
             reserved_slots: admission.reservations,
             accepting_turns: admission.accepting && !admission.closed,
             worker_alive: self.worker_alive.load(Ordering::Acquire),
@@ -411,6 +456,8 @@ enum ControlReply {
     Activate(Result<ActivationAck, StoreError>),
     ResetApplication(Result<ResetApplicationAck, StoreError>),
     Compact(Result<CompactAck, StoreError>),
+    PutContentArtifact(Result<PutContentArtifactAck, StoreError>),
+    LoadContentArtifact(Result<Option<ContentArtifact>, StoreError>),
     Shutdown(Result<ShutdownAck, StoreError>),
 }
 
@@ -423,6 +470,9 @@ enum WorkerMessage {
     Activate(Box<ActivationBatch>, SyncSender<ControlReply>),
     ResetApplication(Box<ResetApplicationBatch>, SyncSender<ControlReply>),
     Compact(SyncSender<ControlReply>),
+    PutContentArtifact(Box<ContentArtifact>, SyncSender<ControlReply>),
+    PutContentArtifactAsync(ContentArtifactStoreTicket, Box<ContentArtifact>),
+    LoadContentArtifact(ContentArtifactId, SyncSender<ControlReply>),
     Shutdown(SyncSender<ControlReply>),
 }
 
@@ -711,6 +761,88 @@ impl PersistenceCoordinator {
             ControlReply::Compact(result) => result.map_err(PersistenceControlError::Store),
             _ => Err(PersistenceControlError::Protocol(
                 "worker returned a non-compact response".to_owned(),
+            )),
+        }
+    }
+
+    pub fn put_content_artifact(
+        &self,
+        artifact: ContentArtifact,
+    ) -> Result<PutContentArtifactAck, PersistenceControlError> {
+        match self.control_request(
+            |reply| WorkerMessage::PutContentArtifact(Box::new(artifact), reply),
+            false,
+        )? {
+            ControlReply::PutContentArtifact(result) => {
+                result.map_err(PersistenceControlError::Store)
+            }
+            _ => Err(PersistenceControlError::Protocol(
+                "worker returned a non-artifact-store response".to_owned(),
+            )),
+        }
+    }
+
+    pub fn try_put_content_artifact(
+        &self,
+        artifact: ContentArtifact,
+    ) -> Result<ContentArtifactStoreTicket, ContentArtifactStoreEnqueueError> {
+        {
+            let admission = lock(&self.shared.admission);
+            if admission.closed || !self.shared.worker_alive.load(Ordering::Acquire) {
+                return Err(ContentArtifactStoreEnqueueError::Closed(artifact));
+            }
+        }
+        let ticket = ContentArtifactStoreTicket(
+            self.shared
+                .next_content_artifact_ticket
+                .fetch_add(1, Ordering::AcqRel),
+        );
+        self.shared
+            .pending_content_artifact_stores
+            .fetch_add(1, Ordering::AcqRel);
+        match self.sender.try_send(WorkerMessage::PutContentArtifactAsync(
+            ticket,
+            Box::new(artifact),
+        )) {
+            Ok(()) => Ok(ticket),
+            Err(TrySendError::Full(WorkerMessage::PutContentArtifactAsync(_, artifact))) => {
+                self.shared
+                    .pending_content_artifact_stores
+                    .fetch_sub(1, Ordering::AcqRel);
+                Err(ContentArtifactStoreEnqueueError::Backpressure(*artifact))
+            }
+            Err(TrySendError::Disconnected(WorkerMessage::PutContentArtifactAsync(
+                _,
+                artifact,
+            ))) => {
+                self.shared
+                    .pending_content_artifact_stores
+                    .fetch_sub(1, Ordering::AcqRel);
+                self.mark_worker_exited();
+                Err(ContentArtifactStoreEnqueueError::Closed(*artifact))
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("artifact send can only return an artifact message")
+            }
+        }
+    }
+
+    pub fn take_content_artifact_store_completions(&self) -> Vec<ContentArtifactStoreCompletion> {
+        lock(&self.shared.content_artifact_completions)
+            .drain(..)
+            .collect()
+    }
+
+    pub fn load_content_artifact(
+        &self,
+        id: ContentArtifactId,
+    ) -> Result<Option<ContentArtifact>, PersistenceControlError> {
+        match self.control_request(|reply| WorkerMessage::LoadContentArtifact(id, reply), false)? {
+            ControlReply::LoadContentArtifact(result) => {
+                result.map_err(PersistenceControlError::Store)
+            }
+            _ => Err(PersistenceControlError::Protocol(
+                "worker returned a non-artifact-load response".to_owned(),
             )),
         }
     }
@@ -1128,7 +1260,7 @@ where
 {
     debug_assert!(!matches!(&message, WorkerMessage::Turn(_)));
     if let Err(error) = flush_pending(driver, durable, pending, shared) {
-        send_control_error(message, error);
+        send_control_error(message, error, shared);
         return false;
     }
 
@@ -1241,6 +1373,58 @@ where
             let _ = reply.send(ControlReply::Compact(result));
             false
         }
+        WorkerMessage::PutContentArtifact(artifact, reply) => {
+            let result = match driver.execute(PersistenceCommand::PutContentArtifact(
+                PutContentArtifactRequest {
+                    application: durable.application.clone(),
+                    artifact: *artifact,
+                },
+            )) {
+                PersistenceResult::ContentArtifactStored(result) => result,
+                _ => Err(StoreError::Backend(
+                    "driver returned the wrong result for PutContentArtifact".to_owned(),
+                )),
+            };
+            record_result_error(shared, &result);
+            let _ = reply.send(ControlReply::PutContentArtifact(result));
+            false
+        }
+        WorkerMessage::PutContentArtifactAsync(ticket, artifact) => {
+            let result = match driver.execute(PersistenceCommand::PutContentArtifact(
+                PutContentArtifactRequest {
+                    application: durable.application.clone(),
+                    artifact: *artifact,
+                },
+            )) {
+                PersistenceResult::ContentArtifactStored(result) => result,
+                _ => Err(StoreError::Backend(
+                    "driver returned the wrong result for PutContentArtifact".to_owned(),
+                )),
+            };
+            record_result_error(shared, &result);
+            lock(&shared.content_artifact_completions)
+                .push_back(ContentArtifactStoreCompletion { ticket, result });
+            shared
+                .pending_content_artifact_stores
+                .fetch_sub(1, Ordering::AcqRel);
+            false
+        }
+        WorkerMessage::LoadContentArtifact(id, reply) => {
+            let result = match driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: durable.application.clone(),
+                    id,
+                },
+            )) {
+                PersistenceResult::ContentArtifactLoaded(result) => result,
+                _ => Err(StoreError::Backend(
+                    "driver returned the wrong result for LoadContentArtifact".to_owned(),
+                )),
+            };
+            record_result_error(shared, &result);
+            let _ = reply.send(ControlReply::LoadContentArtifact(result));
+            false
+        }
         WorkerMessage::Shutdown(reply) => {
             let result = match driver.execute(PersistenceCommand::Shutdown(ShutdownRequest)) {
                 PersistenceResult::ShutdownComplete(result) => result,
@@ -1257,7 +1441,7 @@ where
     }
 }
 
-fn send_control_error(message: WorkerMessage, error: StoreError) {
+fn send_control_error(message: WorkerMessage, error: StoreError, shared: &SharedState) {
     match message {
         WorkerMessage::Load(reply) => {
             let _ = reply.send(ControlReply::Load(Err(error)));
@@ -1279,6 +1463,21 @@ fn send_control_error(message: WorkerMessage, error: StoreError) {
         }
         WorkerMessage::Compact(reply) => {
             let _ = reply.send(ControlReply::Compact(Err(error)));
+        }
+        WorkerMessage::PutContentArtifact(_, reply) => {
+            let _ = reply.send(ControlReply::PutContentArtifact(Err(error)));
+        }
+        WorkerMessage::PutContentArtifactAsync(ticket, _) => {
+            lock(&shared.content_artifact_completions).push_back(ContentArtifactStoreCompletion {
+                ticket,
+                result: Err(error),
+            });
+            shared
+                .pending_content_artifact_stores
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        WorkerMessage::LoadContentArtifact(_, reply) => {
+            let _ = reply.send(ControlReply::LoadContentArtifact(Err(error)));
         }
         WorkerMessage::Shutdown(reply) => {
             let _ = reply.send(ControlReply::Shutdown(Err(error)));
@@ -1521,6 +1720,47 @@ mod tests {
         assert_eq!(&*lock(&trace.commits), &[(1, 1), (2, 2)]);
         assert_eq!(coordinator.status().durable_through_turn_sequence, 2);
         assert!(coordinator.status().pending.is_none());
+        coordinator.shutdown().unwrap();
+    }
+
+    #[test]
+    fn content_artifact_store_is_acknowledged_without_pausing_turn_admission() {
+        let (coordinator, _trace) = coordinator(4, Duration::ZERO, None);
+        let artifact = ContentArtifact::new(
+            "application/vnd.boon.worker-test",
+            b"background artifact".to_vec(),
+        )
+        .unwrap();
+        let ticket = coordinator
+            .try_put_content_artifact(artifact.clone())
+            .unwrap();
+        let reservation = coordinator
+            .try_reserve_turn()
+            .expect("artifact storage must not pause authority admission");
+        drop(reservation);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let completion = loop {
+            if let Some(completion) = coordinator
+                .take_content_artifact_store_completions()
+                .into_iter()
+                .next()
+            {
+                break completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "artifact store was not acknowledged"
+            );
+            thread::yield_now();
+        };
+        assert_eq!(completion.ticket, ticket);
+        assert_eq!(completion.result.unwrap().id, artifact.id);
+        assert_eq!(coordinator.status().pending_content_artifact_stores, 0);
+        assert_eq!(
+            coordinator.load_content_artifact(artifact.id).unwrap(),
+            Some(artifact)
+        );
         coordinator.shutdown().unwrap();
     }
 

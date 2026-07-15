@@ -7,16 +7,20 @@ use boon_host::{
     DocumentNodeId as HostDocumentNodeId, HostEvent, PointerButton, PointerPhase, SourceBindingId,
 };
 use boon_persistence::{
+    ContentArtifact, ContentArtifactStoreEnqueueError, ContentArtifactStoreTicket,
     MigrationPreview, OutboxInspectorState, PersistenceInspectorSnapshot, PersistenceWorkerConfig,
     PersistenceWorkerStatus, RedbDriver,
 };
 use boon_plan::{ApplicationIdentity, ApplicationPlan, MachinePlan, MemoryKind};
 use boon_runtime::{
-    DocumentPatch, DocumentPatchStatus, LiveRuntime, PersistentRuntime, ProgramArtifact,
-    ProgramCompletion, ProgramDiagnostic, ProgramDocumentHost, ProgramHostCompletion,
-    ProgramHostDiagnostic, ProgramHostRequest, ProgramRequestId, ProgramSessionId, RowId,
-    RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload, Value,
+    DocumentPatch, DocumentPatchStatus, FileEffectDriver, HostEffectRouter, HostEffectWorker,
+    LiveRuntime, PersistentRuntime, PersistentRuntimeStartup, PersistentRuntimeStartupDisposition,
+    ProgramArtifact, ProgramCompletion, ProgramDiagnostic, ProgramDocumentHost,
+    ProgramHostCompletion, ProgramHostDiagnostic, ProgramHostRequest, ProgramRequestId,
+    ProgramSessionId, RowId, RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload,
+    Value,
 };
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +43,16 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const PERSISTENCE_ACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATE_DIRECTORY: &str = "playground/state";
+const STATE_ROOT_ENV: &str = "BOON_PLAYGROUND_STATE_ROOT";
+const EFFECT_DIRECTORY: &str = "playground/effects";
+const EFFECT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const HOST_LIFECYCLE_STARTED_SOURCE: &str = "host.lifecycle.started";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostIdentityMode {
+    Interactive,
+    Deterministic,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct AuthorityPlanCounts {
@@ -100,9 +114,14 @@ pub struct RuntimeView {
     runtime: PersistentRuntime,
     program_host: ProgramDocumentHost,
     pending_program_requests: Vec<ProgramHostRequest>,
+    pending_program_artifact_stores:
+        BTreeMap<ContentArtifactStoreTicket, PendingProgramArtifactStore>,
+    retry_program_artifact_store: Option<PendingProgramArtifactStore>,
+    program_artifact_cache: BTreeMap<boon_persistence::ContentArtifactId, ContentArtifact>,
     application: ApplicationIdentity,
     persistence_schema_version: u64,
     persistence_schema_hash: [u8; 32],
+    startup: RuntimeStartupEvidence,
     authority_plan_counts: AuthorityPlanCounts,
     authority_selections: std::collections::BTreeMap<String, AuthoritySelection>,
     persistence_status: PersistenceWorkerStatus,
@@ -127,6 +146,71 @@ pub struct RuntimeView {
     last_primary_click: Option<(String, Instant)>,
     last_runtime_phase: RuntimePhaseTimings,
     scheduled_sources: Vec<ScheduledSource>,
+    effect_worker: HostEffectWorker,
+    next_effect_poll: Option<Instant>,
+    host_identity_mode: HostIdentityMode,
+    host_identity_generation: u64,
+    scenario_trigger_source: Option<String>,
+    scenario_trigger_turn: Option<RuntimeTurn>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingProgramArtifactStore {
+    session: ProgramSessionId,
+    request_id: ProgramRequestId,
+    artifact: ProgramArtifact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeStartupDisposition {
+    Fresh,
+    Restored,
+    Migrated(MigrationPreview),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeStartupEvidence {
+    pub disposition: RuntimeStartupDisposition,
+    pub schema_version: u64,
+    pub schema_hash: [u8; 32],
+    pub durable_epoch: u64,
+    pub durable_turn_sequence: u64,
+}
+
+impl From<&PersistentRuntimeStartup> for RuntimeStartupEvidence {
+    fn from(startup: &PersistentRuntimeStartup) -> Self {
+        Self {
+            disposition: match &startup.disposition {
+                PersistentRuntimeStartupDisposition::Fresh => RuntimeStartupDisposition::Fresh,
+                PersistentRuntimeStartupDisposition::Restored => {
+                    RuntimeStartupDisposition::Restored
+                }
+                PersistentRuntimeStartupDisposition::Migrated(preview) => {
+                    RuntimeStartupDisposition::Migrated(preview.clone())
+                }
+            },
+            schema_version: startup.restore_image.schema_version,
+            schema_hash: startup.restore_image.schema_hash,
+            durable_epoch: startup.restore_image.epoch,
+            durable_turn_sequence: startup.restore_image.through_turn_sequence,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ProgramCompletionObservation {
+    Host(ProgramHostCompletion),
+    ArtifactStorePending {
+        session: ProgramSessionId,
+        request_id: ProgramRequestId,
+        artifact_id: boon_persistence::ContentArtifactId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ObservedProgramCompletion {
+    pub changed: bool,
+    pub completion: ProgramCompletionObservation,
 }
 
 pub struct RuntimePlanChange {
@@ -138,12 +222,37 @@ pub struct RuntimePlanChange {
 
 impl RuntimeView {
     pub fn open(plan: Arc<MachinePlan>) -> ViewResult<Self> {
-        Self::open_with_state_root(plan, repository_root().join(STATE_DIRECTORY))
+        Self::open_with_state_root_and_identity_mode(
+            plan,
+            configured_state_root(),
+            HostIdentityMode::Interactive,
+        )
     }
 
+    pub fn open_for_scenario(plan: Arc<MachinePlan>) -> ViewResult<Self> {
+        Self::open_with_state_root_and_identity_mode(
+            plan,
+            configured_state_root(),
+            HostIdentityMode::Deterministic,
+        )
+    }
+
+    #[cfg(test)]
     pub fn open_with_state_root(
         plan: Arc<MachinePlan>,
         state_root: impl AsRef<Path>,
+    ) -> ViewResult<Self> {
+        Self::open_with_state_root_and_identity_mode(
+            plan,
+            state_root,
+            HostIdentityMode::Interactive,
+        )
+    }
+
+    fn open_with_state_root_and_identity_mode(
+        plan: Arc<MachinePlan>,
+        state_root: impl AsRef<Path>,
+        host_identity_mode: HostIdentityMode,
     ) -> ViewResult<Self> {
         validate_preview_plan(&plan)?;
         let database_path =
@@ -163,35 +272,75 @@ impl RuntimeView {
                 database_path.display()
             )
         })?;
-        let (runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+        let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
             plan,
             SessionOptions::default(),
             driver,
             PersistenceWorkerConfig::default(),
         )
         .map_err(|error| error.to_string())?;
+        let host_identity_generation = 1;
+        let host_started = dispatch_host_lifecycle_started(
+            &mut runtime,
+            host_identity_mode,
+            host_identity_generation,
+            1,
+        )?;
         let mount = runtime.runtime().mount();
-        let _ = startup;
-        Self::mount_persistent(runtime, mount)
+        let startup = RuntimeStartupEvidence::from(&startup);
+        Self::mount_persistent(
+            runtime,
+            mount,
+            host_started,
+            startup,
+            host_identity_mode,
+            host_identity_generation,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn open_in_memory(runtime: LiveRuntime) -> ViewResult<Self> {
-        let (runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+        let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
             runtime.shared_machine_plan(),
             SessionOptions::default(),
             InMemoryDriver::default(),
             PersistenceWorkerConfig::default(),
         )
         .map_err(|error| error.to_string())?;
+        let host_identity_generation = 1;
+        let host_started = dispatch_host_lifecycle_started(
+            &mut runtime,
+            HostIdentityMode::Deterministic,
+            host_identity_generation,
+            1,
+        )?;
         let mount = runtime.runtime().mount();
-        let _ = startup;
-        Self::mount_persistent(runtime, mount)
+        let startup = RuntimeStartupEvidence::from(&startup);
+        Self::mount_persistent(
+            runtime,
+            mount,
+            host_started,
+            startup,
+            HostIdentityMode::Deterministic,
+            host_identity_generation,
+        )
     }
 
-    fn mount_persistent(runtime: PersistentRuntime, turn: RuntimeTurn) -> ViewResult<Self> {
-        let source_sequence = source_sequence_after_turn(0, turn.source_sequence);
-        let runtime_turn_sequence = turn.sequence;
+    fn mount_persistent(
+        runtime: PersistentRuntime,
+        turn: RuntimeTurn,
+        host_started: Option<RuntimeTurn>,
+        startup: RuntimeStartupEvidence,
+        host_identity_mode: HostIdentityMode,
+        host_identity_generation: u64,
+    ) -> ViewResult<Self> {
+        let source_sequence = source_sequence_after_turn(
+            source_sequence_after_turn(0, turn.source_sequence),
+            host_started.as_ref().and_then(|turn| turn.source_sequence),
+        );
+        let runtime_turn_sequence = host_started
+            .as_ref()
+            .map_or(turn.sequence, |turn| turn.sequence);
         if turn.document_patch_status != DocumentPatchStatus::Complete {
             return Err("MachinePlan did not produce complete typed document bindings".to_owned());
         }
@@ -240,19 +389,27 @@ impl RuntimeView {
             Err(error) => (None, Some(error.to_string())),
         };
         let persistence_status = runtime.status();
-        Ok(Self {
+        let effect_worker = native_effect_worker()?;
+        let next_effect_poll = runtime.has_effect_work().then_some(Instant::now());
+        let mut view = Self {
             runtime,
             program_host,
             pending_program_requests,
+            pending_program_artifact_stores: BTreeMap::new(),
+            retry_program_artifact_store: None,
+            program_artifact_cache: BTreeMap::new(),
             application,
             persistence_schema_version,
             persistence_schema_hash,
+            startup,
             authority_plan_counts,
             authority_selections,
             persistence_status,
             persistence_inspector,
             persistence_inspector_error,
-            next_persistence_poll: None,
+            next_persistence_poll: host_started
+                .as_ref()
+                .map(|_| Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL),
             runtime_turn_sequence,
             #[cfg(test)]
             persistence_query_counts: PersistenceQueryCounts {
@@ -272,13 +429,27 @@ impl RuntimeView {
             last_dispatched_source: None,
             pending_external_url: None,
             last_primary_click: None,
-            last_runtime_phase: RuntimePhaseTimings::default(),
+            last_runtime_phase: host_started
+                .map_or_else(RuntimePhaseTimings::default, |turn| turn.phase_timings),
             scheduled_sources,
-        })
+            effect_worker,
+            next_effect_poll,
+            host_identity_mode,
+            host_identity_generation,
+            scenario_trigger_source: None,
+            scenario_trigger_turn: None,
+        };
+        view.resolve_program_artifact_requests()?;
+        view.pending_patches.clear();
+        Ok(view)
     }
 
     pub fn application_identity(&self) -> &ApplicationIdentity {
         &self.application
+    }
+
+    pub(crate) fn shared_machine_plan(&self) -> Arc<MachinePlan> {
+        self.runtime.runtime().shared_machine_plan()
     }
 
     pub fn plan_schema_matches(&self, plan: &MachinePlan) -> bool {
@@ -314,7 +485,7 @@ impl RuntimeView {
             .map_err(|error| error.to_string())?;
         let acknowledgement = activation.acknowledgement;
         let migration = activation.migration;
-        self.install_runtime_mount(activation.mount)?;
+        self.install_replacement_runtime(activation.mount, false)?;
         let durable_epoch = acknowledgement
             .as_ref()
             .map_or(self.persistence_status.durable_epoch, |ack| ack.epoch);
@@ -344,7 +515,7 @@ impl RuntimeView {
             .map_err(|error| error.to_string())?;
         let durable_epoch = reset.acknowledgement.epoch;
         let through_turn_sequence = reset.acknowledgement.through_turn_sequence;
-        self.install_runtime_mount(reset.mount)?;
+        self.install_replacement_runtime(reset.mount, true)?;
         Ok(RuntimePlanChange {
             target_schema_version,
             durable_epoch,
@@ -354,6 +525,10 @@ impl RuntimeView {
     }
 
     fn install_runtime_mount(&mut self, mount: RuntimeTurn) -> ViewResult<()> {
+        self.pending_program_artifact_stores.clear();
+        self.retry_program_artifact_store = None;
+        self.program_artifact_cache.clear();
+        let _ = self.runtime.take_content_artifact_store_completions();
         let runtime_turn_sequence = mount.sequence;
         if mount.document_patch_status != DocumentPatchStatus::Complete {
             return Err("MachinePlan did not produce complete typed document bindings".to_owned());
@@ -371,8 +546,9 @@ impl RuntimeView {
             ProgramDocumentHost::mount(self.application.clone(), &frame);
         self.program_host = program_host;
         self.pending_program_requests = pending_program_requests;
+        self.resolve_program_artifact_requests()?;
+        self.pending_patches.clear();
         let frame = self.program_host.frame().clone();
-
         self.retain_view_state(&frame, true);
         self.materialization_overscan.clear();
         self.pending_patches.clear();
@@ -381,7 +557,20 @@ impl RuntimeView {
         self.runtime_turn_sequence = runtime_turn_sequence;
         self.refresh_plan_metadata();
         self.refresh_persistence_after_control();
+        self.schedule_effect_poll()?;
         Ok(())
+    }
+
+    fn install_replacement_runtime(
+        &mut self,
+        mount: RuntimeTurn,
+        renew_host_identity: bool,
+    ) -> ViewResult<()> {
+        self.install_runtime_mount(mount)?;
+        if renew_host_identity {
+            self.host_identity_generation = self.host_identity_generation.saturating_add(1);
+        }
+        self.dispatch_host_lifecycle_started()
     }
 
     pub fn persistence_status(&self) -> &PersistenceWorkerStatus {
@@ -392,6 +581,14 @@ impl RuntimeView {
         self.persistence_schema_version
     }
 
+    pub(crate) fn startup_evidence(&self) -> &RuntimeStartupEvidence {
+        &self.startup
+    }
+
+    pub(crate) fn parent_runtime_generation(&self) -> u64 {
+        self.runtime.generation()
+    }
+
     pub fn authority_selection_for_path(&self, path: &str) -> Option<AuthoritySelection> {
         self.authority_selections.get(path).cloned()
     }
@@ -400,8 +597,38 @@ impl RuntimeView {
         self.runtime_turn_sequence
     }
 
+    pub fn assert_scenario_step(&mut self, step: &boon_runtime::ScenarioStep) -> ViewResult<()> {
+        self.scenario_trigger_source = None;
+        let turn = self.scenario_trigger_turn.take();
+        self.runtime
+            .assert_scenario_step(step, turn.as_ref())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn begin_scenario_step(&mut self, source_path: &str) {
+        self.scenario_trigger_source = Some(source_path.to_owned());
+        self.scenario_trigger_turn = None;
+    }
+
     pub fn persistence_poll_deadline(&self) -> Option<Instant> {
         self.next_persistence_poll
+    }
+
+    pub fn effect_poll_deadline(&self) -> Option<Instant> {
+        self.next_effect_poll
+    }
+
+    pub fn poll_host_effects(&mut self, now: Instant) -> ViewResult<bool> {
+        if self.next_effect_poll.is_none_or(|deadline| deadline > now) {
+            return Ok(false);
+        }
+        let turn = self
+            .runtime
+            .poll_effect_worker(&mut self.effect_worker)
+            .map_err(|error| error.to_string())?;
+        let changed = turn.map_or(Ok(false), |turn| self.finish_parent_runtime_turn(turn))?;
+        self.schedule_effect_poll()?;
+        Ok(changed)
     }
 
     pub fn poll_persistence_acknowledgement(&mut self, now: Instant) -> bool {
@@ -416,7 +643,10 @@ impl RuntimeView {
         let mut changed = self.persistence_status != previous_status;
         let idle = self.persistence_status.pending.is_none()
             && self.persistence_status.queue_depth == 0
-            && self.persistence_status.reserved_slots == 0;
+            && self.persistence_status.reserved_slots == 0
+            && self.persistence_status.pending_content_artifact_stores == 0
+            && self.pending_program_artifact_stores.is_empty()
+            && self.retry_program_artifact_store.is_none();
         let inspector_is_stale = self.persistence_inspector.as_ref().is_none_or(|inspector| {
             inspector.epoch < self.persistence_status.durable_epoch
                 || inspector.through_turn_sequence
@@ -452,6 +682,8 @@ impl RuntimeView {
             scalar_count: saturating_u32(inspector.scalar_count),
             list_count: saturating_u32(inspector.list_count),
             row_count: inspector.row_count.try_into().unwrap_or(u64::MAX),
+            content_artifact_count: saturating_u32(inspector.content_artifact_count),
+            content_artifact_bytes: inspector.content_artifact_bytes,
             encoded_value_bytes: inspector.encoded_value_bytes,
             completed_migration_count: saturating_u32(inspector.completed_migration_count),
         });
@@ -611,7 +843,7 @@ impl RuntimeView {
             .map_err(|error| error.to_string())?;
         let epoch = activation.acknowledgement.epoch;
         let preview = activation.preview;
-        self.install_runtime_mount(activation.mount)?;
+        self.install_replacement_runtime(activation.mount, false)?;
         Ok((preview, epoch))
     }
 
@@ -625,7 +857,7 @@ impl RuntimeView {
             .ok_or_else(|| "clear authority did not produce a durable activation".to_owned())?;
         let epoch = acknowledgement.epoch;
         let turn = acknowledgement.through_turn_sequence;
-        self.install_runtime_mount(activation.mount)?;
+        self.install_replacement_runtime(activation.mount, false)?;
         Ok((epoch, turn))
     }
 
@@ -735,6 +967,64 @@ impl RuntimeView {
         self.program_host.frame()
     }
 
+    pub fn resolve_program_artifact_requests(&mut self) -> ViewResult<bool> {
+        let mut compile_requests = Vec::new();
+        let mut changed = false;
+        loop {
+            let requests = std::mem::take(&mut self.pending_program_requests);
+            if requests.is_empty() {
+                break;
+            }
+            for request in requests {
+                let Some(artifact_id) = request.artifact_id else {
+                    compile_requests.push(request);
+                    continue;
+                };
+                let content = self
+                    .program_artifact_cache
+                    .get(&artifact_id)
+                    .cloned()
+                    .map_or_else(
+                        || {
+                            self.runtime
+                                .load_content_artifact(artifact_id)
+                                .map_err(|error| {
+                                    ProgramDiagnostic::artifact(
+                                        request.compile.revision,
+                                        error.to_string(),
+                                    )
+                                })
+                                .and_then(|artifact| {
+                                    artifact.ok_or_else(|| {
+                                    ProgramDiagnostic::artifact(
+                                        request.compile.revision,
+                                        format!(
+                                            "immutable program artifact {artifact_id} is missing"
+                                        ),
+                                    )
+                                })
+                                })
+                        },
+                        Ok,
+                    );
+                let result = content.and_then(|artifact| {
+                    self.program_artifact_cache
+                        .insert(artifact.id, artifact.clone());
+                    ProgramArtifact::from_content_artifact(
+                        request.compile.revision,
+                        request.compile.capability_profile,
+                        artifact,
+                    )
+                });
+                changed |= self
+                    .complete_program_observed(&request.session, &request.request_id, result)?
+                    .changed;
+            }
+        }
+        self.pending_program_requests = compile_requests;
+        Ok(changed)
+    }
+
     pub fn take_program_requests(&mut self) -> Vec<ProgramHostRequest> {
         std::mem::take(&mut self.pending_program_requests)
     }
@@ -745,49 +1035,246 @@ impl RuntimeView {
         request_id: &ProgramRequestId,
         result: Result<ProgramArtifact, ProgramDiagnostic>,
     ) -> ViewResult<bool> {
-        let parent = self
-            .runtime
-            .runtime()
-            .primary_retained_output_frame()
-            .map_err(|error| error.to_string())?
-            .clone();
-        let (completion, update) = self
+        self.complete_program_observed(session, request_id, result)
+            .map(|outcome| outcome.changed)
+    }
+
+    pub(crate) fn complete_program_observed(
+        &mut self,
+        session: &ProgramSessionId,
+        request_id: &ProgramRequestId,
+        result: Result<ProgramArtifact, ProgramDiagnostic>,
+    ) -> ViewResult<ObservedProgramCompletion> {
+        let persist_artifact = self
             .program_host
-            .complete(session, request_id, result, &parent);
-        let lifecycle = match completion {
-            ProgramHostCompletion::Program(ProgramCompletion::Activated { revision }) => {
-                self.program_host.active_artifact(session).map(|artifact| {
+            .request_persists_artifact(session, request_id);
+        let artifact_load = self
+            .program_host
+            .request_is_artifact_load(session, request_id);
+        if persist_artifact {
+            return match result {
+                Ok(artifact) => {
+                    let pending = PendingProgramArtifactStore {
+                        session: session.clone(),
+                        request_id: request_id.clone(),
+                        artifact,
+                    };
+                    self.enqueue_program_artifact_store(pending)
+                }
+                Err(diagnostic) => self.finish_program_completion_observed(
+                    session,
+                    request_id,
+                    Err(diagnostic),
+                    false,
+                ),
+            };
+        }
+        self.finish_program_completion_observed(session, request_id, result, artifact_load)
+    }
+
+    fn enqueue_program_artifact_store(
+        &mut self,
+        pending: PendingProgramArtifactStore,
+    ) -> ViewResult<ObservedProgramCompletion> {
+        if self.retry_program_artifact_store.is_some()
+            || !self.pending_program_artifact_stores.is_empty()
+        {
+            return self.finish_program_completion_observed(
+                &pending.session,
+                &pending.request_id,
+                Err(ProgramDiagnostic::artifact(
+                    pending.artifact.revision(),
+                    "another immutable program artifact is still pending persistence",
+                )),
+                false,
+            );
+        }
+        let content = pending.artifact.to_content_artifact();
+        let artifact_id = pending.artifact.id();
+        let completion = ProgramCompletionObservation::ArtifactStorePending {
+            session: pending.session.clone(),
+            request_id: pending.request_id.clone(),
+            artifact_id,
+        };
+        match self.runtime.try_put_content_artifact(content) {
+            Ok(ticket) => {
+                self.pending_program_artifact_stores.insert(ticket, pending);
+            }
+            Err(ContentArtifactStoreEnqueueError::Backpressure(_)) => {
+                self.retry_program_artifact_store = Some(pending);
+            }
+            Err(ContentArtifactStoreEnqueueError::Closed(_)) => {
+                return self.finish_program_completion_observed(
+                    &pending.session,
+                    &pending.request_id,
+                    Err(ProgramDiagnostic::artifact(
+                        pending.artifact.revision(),
+                        "persistence coordinator closed before storing the program artifact",
+                    )),
+                    false,
+                );
+            }
+        }
+        self.next_persistence_poll = Some(Instant::now());
+        Ok(ObservedProgramCompletion {
+            changed: false,
+            completion,
+        })
+    }
+
+    pub fn poll_program_artifact_stores(&mut self) -> ViewResult<bool> {
+        let mut changed = false;
+        if let Some(pending) = self.retry_program_artifact_store.take() {
+            let content = pending.artifact.to_content_artifact();
+            match self.runtime.try_put_content_artifact(content) {
+                Ok(ticket) => {
+                    self.pending_program_artifact_stores.insert(ticket, pending);
+                }
+                Err(ContentArtifactStoreEnqueueError::Backpressure(_)) => {
+                    self.retry_program_artifact_store = Some(pending);
+                }
+                Err(ContentArtifactStoreEnqueueError::Closed(_)) => {
+                    changed |= self
+                        .finish_program_completion_observed(
+                            &pending.session,
+                            &pending.request_id,
+                            Err(ProgramDiagnostic::artifact(
+                                pending.artifact.revision(),
+                                "persistence coordinator closed before storing the program artifact",
+                            )),
+                            false,
+                        )?
+                        .changed;
+                }
+            }
+        }
+        for completion in self.runtime.take_content_artifact_store_completions() {
+            let Some(pending) = self
+                .pending_program_artifact_stores
+                .remove(&completion.ticket)
+            else {
+                continue;
+            };
+            let result = completion
+                .result
+                .map_err(|error| {
+                    ProgramDiagnostic::artifact(pending.artifact.revision(), error.to_string())
+                })
+                .and_then(|ack| {
+                    (ack.id == pending.artifact.id())
+                        .then_some(pending.artifact.clone())
+                        .ok_or_else(|| {
+                            ProgramDiagnostic::artifact(
+                                pending.artifact.revision(),
+                                "persistence acknowledged a different program artifact",
+                            )
+                        })
+                });
+            if let Ok(artifact) = &result {
+                self.program_artifact_cache
+                    .insert(artifact.id(), artifact.to_content_artifact());
+            }
+            changed |= self
+                .finish_program_completion_observed(
+                    &pending.session,
+                    &pending.request_id,
+                    result,
+                    false,
+                )?
+                .changed;
+        }
+        if changed {
+            changed |= self.resolve_program_artifact_requests()?;
+        }
+        let pending = self.retry_program_artifact_store.is_some()
+            || !self.pending_program_artifact_stores.is_empty();
+        if pending {
+            self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
+        }
+        Ok(changed)
+    }
+
+    fn finish_program_completion_observed(
+        &mut self,
+        session: &ProgramSessionId,
+        request_id: &ProgramRequestId,
+        result: Result<ProgramArtifact, ProgramDiagnostic>,
+        artifact_load: bool,
+    ) -> ViewResult<ObservedProgramCompletion> {
+        let (completion, update) = self.program_host.complete(session, request_id, result);
+        let bootstrap = update.bootstrap;
+        let lifecycle = if artifact_load {
+            None
+        } else {
+            match &completion {
+                ProgramHostCompletion::Program(ProgramCompletion::Activated { revision }) => {
+                    self.program_host.active_artifact(session).map(|artifact| {
+                        let mut payload = SourcePayload {
+                            text: Some(artifact.source_digest().to_owned()),
+                            ..SourcePayload::default()
+                        };
+                        payload
+                            .fields
+                            .insert("revision".to_owned(), Value::Text(revision.to_string()));
+                        payload.fields.insert(
+                            "source_digest".to_owned(),
+                            Value::Text(artifact.source_digest().to_owned()),
+                        );
+                        payload.fields.insert(
+                            "compiler".to_owned(),
+                            Value::Text(artifact.compiler_id().to_owned()),
+                        );
+                        payload.fields.insert(
+                            "target".to_owned(),
+                            Value::Text(artifact.target_profile_id().to_owned()),
+                        );
+                        payload.fields.insert(
+                            "capability_profile".to_owned(),
+                            Value::Text(artifact.capability_profile_id().to_owned()),
+                        );
+                        payload
+                            .fields
+                            .insert("artifact_id".to_owned(), Value::Text(artifact.id_text()));
+                        payload.fields.insert(
+                            "plan_digest".to_owned(),
+                            Value::Text(artifact.plan_digest().to_owned()),
+                        );
+                        payload
+                            .fields
+                            .insert("bootstrap".to_owned(), Value::Bool(bootstrap));
+                        ("compiled", payload)
+                    })
+                }
+                ProgramHostCompletion::Program(ProgramCompletion::Rejected { diagnostic }) => {
                     let mut payload = SourcePayload {
-                        text: Some(artifact.source_digest().to_owned()),
+                        text: Some(diagnostic.message.clone()),
                         ..SourcePayload::default()
                     };
+                    payload.fields.insert(
+                        "revision".to_owned(),
+                        Value::Text(diagnostic.revision.to_string()),
+                    );
+                    payload.fields.insert(
+                        "source_path".to_owned(),
+                        Value::Text(diagnostic.source_path.clone()),
+                    );
                     payload
                         .fields
-                        .insert("revision".to_owned(), Value::Text(revision.to_string()));
+                        .insert("line".to_owned(), Value::Text(diagnostic.line.to_string()));
                     payload.fields.insert(
-                        "source_digest".to_owned(),
-                        Value::Text(artifact.source_digest().to_owned()),
+                        "column".to_owned(),
+                        Value::Text(diagnostic.column.to_string()),
                     );
-                    ("compiled", payload)
-                })
+                    payload.fields.insert(
+                        "diagnostic".to_owned(),
+                        Value::Text(diagnostic.message.clone()),
+                    );
+                    Some(("rejected", payload))
+                }
+                ProgramHostCompletion::Program(ProgramCompletion::Stale { .. })
+                | ProgramHostCompletion::Superseded { .. }
+                | ProgramHostCompletion::Removed { .. } => None,
             }
-            ProgramHostCompletion::Program(ProgramCompletion::Rejected { diagnostic }) => {
-                let mut payload = SourcePayload {
-                    text: Some(diagnostic.message.clone()),
-                    ..SourcePayload::default()
-                };
-                payload.fields.insert(
-                    "revision".to_owned(),
-                    Value::Text(diagnostic.revision.to_string()),
-                );
-                payload
-                    .fields
-                    .insert("diagnostic".to_owned(), Value::Text(diagnostic.message));
-                Some(("rejected", payload))
-            }
-            ProgramHostCompletion::Program(ProgramCompletion::Stale { .. })
-            | ProgramHostCompletion::Superseded { .. }
-            | ProgramHostCompletion::Removed { .. } => None,
         };
         let mut changed = self.queue_program_update(update.patches, update.requests);
         if let Some((intent, payload)) = lifecycle {
@@ -795,7 +1282,10 @@ impl RuntimeView {
                 changed |= self.dispatch_source(&path, None, payload.clone())?;
             }
         }
-        Ok(changed)
+        Ok(ObservedProgramCompletion {
+            changed,
+            completion: ProgramCompletionObservation::Host(completion),
+        })
     }
 
     pub fn program_diagnostics(&self) -> Vec<ProgramHostDiagnostic> {
@@ -926,14 +1416,8 @@ impl RuntimeView {
                 continue;
             }
             let patches = if self.program_host.owns_materialization(materialization) {
-                let parent = self
-                    .runtime
-                    .runtime()
-                    .primary_retained_output_frame()
-                    .map_err(|error| error.to_string())?
-                    .clone();
                 self.program_host
-                    .demand_document_window(materialization, visible, overscan.clone(), &parent)
+                    .demand_document_window(materialization, visible, overscan.clone())
                     .map_err(|error| error.to_string())?
             } else {
                 self.runtime
@@ -1086,8 +1570,12 @@ impl RuntimeView {
                             .and_then(|node| node.scroll)
                     })
                     .unwrap_or(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
+                let previous = scroll;
                 scroll.x = (scroll.x + wheel.delta_x).max(0.0);
                 scroll.y = (scroll.y + wheel.delta_y).max(0.0);
+                if scroll == previous {
+                    return Ok(false);
+                }
                 let root_id = root.0.clone();
                 let patch = DocumentPatch::SetScroll { id: root, scroll };
                 self.scroll_offsets.insert(root_id, scroll);
@@ -1291,16 +1779,11 @@ impl RuntimeView {
     ) -> ViewResult<bool> {
         let next_sequence = self.sequence.saturating_add(1);
         if self.program_host.owns_source_route(path) {
-            let parent = self
-                .runtime
-                .runtime()
-                .primary_retained_output_frame()
-                .map_err(|error| error.to_string())?
-                .clone();
             let (turn, patches) = self
                 .program_host
-                .dispatch(next_sequence, path, row, payload, &parent)
+                .dispatch(next_sequence, path, row, payload)
                 .map_err(|error| error.to_string())?;
+            self.capture_scenario_turn(path, &turn);
             self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
             self.last_runtime_phase = turn.phase_timings;
             self.last_dispatched_source = Some(path.to_owned());
@@ -1315,20 +1798,13 @@ impl RuntimeView {
             .runtime
             .dispatch(event)
             .map_err(|error| error.to_string())?;
-        self.runtime_turn_sequence = turn.sequence;
-        self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
-        self.persistence_status = self.query_persistence_status();
-        self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
-        self.last_runtime_phase = turn.phase_timings;
+        self.capture_scenario_turn(path, &turn);
+        let source_sequence = turn.source_sequence;
+        let changed = self.finish_parent_runtime_turn(turn)?;
         self.last_dispatched_source = Some(path.to_owned());
-        let parent = self
-            .runtime
-            .runtime()
-            .primary_retained_output_frame()
-            .map_err(|error| error.to_string())?
-            .clone();
-        let update = self.program_host.reconcile(&parent);
-        Ok(self.queue_program_update(update.patches, update.requests))
+        debug_assert!(source_sequence.is_some());
+        self.schedule_effect_poll()?;
+        Ok(changed)
     }
 
     pub fn caret_blink_deadline(&self) -> Option<Instant> {
@@ -1753,6 +2229,124 @@ impl RuntimeView {
         }
         changed
     }
+
+    fn finish_parent_runtime_turn(&mut self, turn: RuntimeTurn) -> ViewResult<bool> {
+        let parent_patches = turn.document_patches;
+        self.runtime_turn_sequence = turn.sequence;
+        self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
+        self.persistence_status = self.query_persistence_status();
+        self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
+        self.last_runtime_phase = turn.phase_timings;
+        let parent = self
+            .runtime
+            .runtime()
+            .primary_retained_output_frame()
+            .map_err(|error| error.to_string())?;
+        let update = self
+            .program_host
+            .reconcile_with_parent_patches(&parent, parent_patches);
+        let changed = self.queue_program_update(update.patches, update.requests);
+        Ok(changed)
+    }
+
+    fn schedule_effect_poll(&mut self) -> ViewResult<()> {
+        let has_work = self.effect_worker.is_busy() || self.runtime.has_effect_work();
+        self.next_effect_poll = has_work.then_some(Instant::now() + EFFECT_POLL_INTERVAL);
+        Ok(())
+    }
+
+    fn capture_scenario_turn(&mut self, source_path: &str, turn: &RuntimeTurn) {
+        if self.scenario_trigger_turn.is_none()
+            && self.scenario_trigger_source.as_deref() == Some(source_path)
+        {
+            self.scenario_trigger_turn = Some(turn.clone());
+            self.scenario_trigger_source = None;
+        }
+    }
+
+    fn dispatch_host_lifecycle_started(&mut self) -> ViewResult<()> {
+        if !has_host_lifecycle_started_source(self.runtime.runtime()) {
+            return Ok(());
+        }
+        let payload =
+            host_lifecycle_started_payload(self.host_identity_mode, self.host_identity_generation);
+        self.dispatch_source(HOST_LIFECYCLE_STARTED_SOURCE, None, payload)?;
+        Ok(())
+    }
+}
+
+fn dispatch_host_lifecycle_started(
+    runtime: &mut PersistentRuntime,
+    mode: HostIdentityMode,
+    generation: u64,
+    sequence: u64,
+) -> ViewResult<Option<RuntimeTurn>> {
+    if !has_host_lifecycle_started_source(runtime.runtime()) {
+        return Ok(None);
+    }
+    let event = runtime
+        .runtime()
+        .source_event(
+            sequence,
+            HOST_LIFECYCLE_STARTED_SOURCE,
+            None,
+            host_lifecycle_started_payload(mode, generation),
+        )
+        .map_err(|error| error.to_string())?;
+    runtime
+        .dispatch(event)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn has_host_lifecycle_started_source(runtime: &LiveRuntime) -> bool {
+    runtime
+        .source_inventory()
+        .sources
+        .iter()
+        .any(|source| source.path == HOST_LIFECYCLE_STARTED_SOURCE)
+}
+
+fn host_lifecycle_started_payload(mode: HostIdentityMode, generation: u64) -> SourcePayload {
+    let instance_id = match mode {
+        HostIdentityMode::Interactive => uuid::Uuid::new_v4().hyphenated().to_string(),
+        HostIdentityMode::Deterministic => {
+            format!(
+                "00000000-0000-4000-8000-{:012x}",
+                generation.min(0xffff_ffff_ffff)
+            )
+        }
+    };
+    SourcePayload {
+        fields: [("instance_id".to_owned(), Value::Text(instance_id))]
+            .into_iter()
+            .collect(),
+        ..SourcePayload::default()
+    }
+}
+
+fn native_effect_worker() -> ViewResult<HostEffectWorker> {
+    let mut router = HostEffectRouter::new();
+    router
+        .register(
+            "File/write_bytes",
+            FileEffectDriver::new(repository_root().join(EFFECT_DIRECTORY))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+    router
+        .register(
+            crate::passkey_simulator::REGISTER_OPERATION,
+            crate::passkey_simulator::DevelopmentPasskeySimulator::registration(),
+        )
+        .map_err(|error| error.to_string())?;
+    router
+        .register(
+            crate::passkey_simulator::AUTHENTICATE_OPERATION,
+            crate::passkey_simulator::DevelopmentPasskeySimulator::authentication(),
+        )
+        .map_err(|error| error.to_string())?;
+    HostEffectWorker::start(router).map_err(|error| error.to_string())
 }
 
 fn validate_preview_plan(plan: &MachinePlan) -> ViewResult<()> {
@@ -1907,7 +2501,14 @@ fn repository_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn digest_hex(digest: &[u8; 32]) -> String {
+fn configured_state_root() -> PathBuf {
+    std::env::var_os(STATE_ROOT_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository_root().join(STATE_DIRECTORY))
+}
+
+pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::with_capacity(64);
@@ -2183,10 +2784,250 @@ mod tests {
         std::env::temp_dir().join(format!("boon-{label}-{}-{nonce}", std::process::id()))
     }
 
+    fn complete_pending_programs_successfully(model: &mut RuntimeView) -> usize {
+        let mut completed = 0usize;
+        for _ in 0..8 {
+            model.resolve_program_artifact_requests().unwrap();
+            let requests = model.take_program_requests();
+            if requests.is_empty() {
+                return completed;
+            }
+            for request in requests {
+                assert!(
+                    !request.is_artifact_load(),
+                    "stored artifact request reached the compiler helper"
+                );
+                let artifact = boon_runtime::compile_program_artifact(&request.compile)
+                    .unwrap_or_else(|diagnostic| {
+                        panic!(
+                            "expected successful child compile for {}: {diagnostic}",
+                            request.session.0
+                        )
+                    });
+                model
+                    .complete_program(&request.session, &request.request_id, Ok(artifact))
+                    .unwrap();
+                completed += 1;
+            }
+            settle_program_artifact_stores(model);
+        }
+        panic!("child program requests did not settle in eight rounds")
+    }
+
+    fn complete_pending_programs(model: &mut RuntimeView) -> (usize, usize) {
+        let mut activated = 0usize;
+        let mut rejected = 0usize;
+        for _ in 0..8 {
+            model.resolve_program_artifact_requests().unwrap();
+            let requests = model.take_program_requests();
+            if requests.is_empty() {
+                return (activated, rejected);
+            }
+            for request in requests {
+                assert!(
+                    !request.is_artifact_load(),
+                    "stored artifact request reached the compiler helper"
+                );
+                let result = boon_runtime::compile_program_artifact(&request.compile);
+                if result.is_ok() {
+                    activated += 1;
+                } else {
+                    rejected += 1;
+                }
+                model
+                    .complete_program(&request.session, &request.request_id, result)
+                    .unwrap();
+            }
+            settle_program_artifact_stores(model);
+        }
+        panic!("child program requests did not settle in eight rounds")
+    }
+
+    fn settle_program_artifact_stores(model: &mut RuntimeView) -> usize {
+        let started = Instant::now();
+        let mut changed = 0usize;
+        loop {
+            changed += usize::from(model.poll_program_artifact_stores().unwrap());
+            if model.pending_program_artifact_stores.is_empty()
+                && model.retry_program_artifact_store.is_none()
+            {
+                return changed;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "program artifact persistence did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn settle_host_effects(model: &mut RuntimeView) {
+        let started = Instant::now();
+        for round in 0..1_000 {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "host effects did not settle within two seconds; round={round}, busy={}, outbox={:?}",
+                model.effect_worker.is_busy(),
+                model.runtime.effect_work_items()
+            );
+            let Some(deadline) = model.effect_poll_deadline() else {
+                assert!(!model.effect_worker.is_busy());
+                assert!(model.runtime.effect_work_items().unwrap().is_empty());
+                return;
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                std::thread::sleep(remaining.min(Duration::from_millis(2)));
+            }
+            model
+                .poll_host_effects(Instant::now())
+                .unwrap_or_else(|error| panic!("host effect poll {round} failed: {error}"));
+            if model.effect_worker.is_busy() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        panic!("host effects did not settle in 1,000 polls")
+    }
+
+    fn dispatch_effect_action(model: &mut RuntimeView, source_path: &str) {
+        model
+            .dispatch_source(source_path, None, SourcePayload::default())
+            .unwrap();
+        assert!(
+            model.effect_poll_deadline().is_some(),
+            "{source_path} did not enqueue durable host-effect work"
+        );
+        assert!(
+            !model.runtime.effect_work_items().unwrap().is_empty(),
+            "{source_path} was not visible in the persistent outbox"
+        );
+        settle_host_effects(model);
+    }
+
+    fn assert_current_values(model: &mut RuntimeView, expected: &[(&str, Value)]) {
+        for (path, expected) in expected {
+            assert_eq!(
+                model.runtime.inspect_value_current(path, 8).unwrap(),
+                *expected,
+                "unexpected current value at {path}"
+            );
+        }
+    }
+
+    fn inspected_list_field_values(model: &mut RuntimeView, path: &str) -> Vec<Value> {
+        let Value::List(rows) = model.runtime.inspect_value_current(path, 32).unwrap() else {
+            panic!("inspected list field `{path}` did not return rows")
+        };
+        rows.into_iter()
+            .map(|row| {
+                let Value::Record(mut fields) = row else {
+                    panic!("inspected list field `{path}` returned a non-record row")
+                };
+                fields
+                    .remove("value")
+                    .unwrap_or_else(|| panic!("inspected list field `{path}` row has no value"))
+            })
+            .collect()
+    }
+
+    fn authoritative_semantic_snapshot(
+        model: &mut RuntimeView,
+        authority_plan: &MachinePlan,
+    ) -> std::collections::BTreeMap<String, Value> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        for memory in &authority_plan.persistence.memory {
+            snapshot.insert(
+                memory.semantic_path.clone(),
+                model
+                    .runtime
+                    .inspect_value_current(&memory.semantic_path, 32)
+                    .unwrap(),
+            );
+        }
+        for list in &authority_plan.persistence.lists {
+            for field in &list.row_fields {
+                snapshot.insert(
+                    field.semantic_path.clone(),
+                    Value::List(inspected_list_field_values(model, &field.semantic_path)),
+                );
+            }
+        }
+        snapshot
+    }
+
     #[test]
     fn internal_runtime_turns_do_not_advance_the_source_event_sequence() {
         assert_eq!(source_sequence_after_turn(7, None), 7);
         assert_eq!(source_sequence_after_turn(7, Some(8)), 8);
+    }
+
+    #[test]
+    fn scenario_turn_capture_survives_pointer_hover_and_down_before_dispatch() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("counter")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/counter.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 980.0,
+                height: 760.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        let step = example
+            .test_steps
+            .iter()
+            .find(|step| step.action_kind.is_some())
+            .unwrap();
+        let target = view
+            .target_for_source(&step.source_path, step.target_text.as_deref())
+            .unwrap();
+        model.begin_scenario_step(&step.source_path);
+        for phase in [PointerPhase::Move, PointerPhase::Down, PointerPhase::Up] {
+            model
+                .handle_event(
+                    &HostEvent::Pointer(PointerEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        x: target.center_x,
+                        y: target.center_y,
+                        phase,
+                        button: (phase != PointerPhase::Move).then_some(PointerButton::Primary),
+                    }),
+                    Some(target.clone()),
+                )
+                .unwrap();
+        }
+        model
+            .assert_scenario_step(&boon_runtime::ScenarioStep {
+                id: "counter-pointer-turn".to_owned(),
+                user_action_kind: Some("button_press".to_owned()),
+                user_action_text: None,
+                user_action_key: None,
+                source_event: None,
+                expectations: vec![
+                    boon_runtime::ScenarioExpectation::RootText {
+                        name: "store.count".to_owned(),
+                        value: "1".to_owned(),
+                    },
+                    boon_runtime::ScenarioExpectation::DocumentChanged,
+                ],
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2281,7 +3122,104 @@ document: Document/new(
     }
 
     #[test]
-    fn persons_pro_edits_and_hosts_a_last_valid_child_document() {
+    fn persons_semantic_memory_is_an_exact_authoritative_allowlist() {
+        let plan = persons_plan(1, None, None);
+        let scalar_paths = plan
+            .persistence
+            .memory
+            .iter()
+            .map(|memory| memory.semantic_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            scalar_paths,
+            [
+                "store.account_id",
+                "store.active_view",
+                "store.draft_compile_digest",
+                "store.draft_revision",
+                "store.last_valid_draft_revision",
+                "store.last_valid_draft_source",
+                "store.mode",
+                "store.passkey_simulation",
+                "store.passkey_workflow_state",
+                "store.preview_surface",
+                "store.publish_candidate_revision",
+                "store.publish_candidate_source",
+                "store.publish_request_sequence",
+                "store.publish_settled_sequence",
+                "store.published_capability_profile",
+                "store.published_artifact_id",
+                "store.published_compiler",
+                "store.published_digest",
+                "store.published_plan_digest",
+                "store.published_revision",
+                "store.published_source",
+                "store.published_target",
+                "store.signed_out",
+                "store.source_draft",
+                "store.workspace_id",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let list_paths = plan
+            .persistence
+            .lists
+            .iter()
+            .map(|list| list.semantic_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            list_paths,
+            ["store.credential_descriptors", "store.published_revisions"]
+                .into_iter()
+                .collect()
+        );
+        let row_fields = plan
+            .persistence
+            .lists
+            .iter()
+            .flat_map(|list| list.row_fields.iter())
+            .map(|field| field.semantic_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            row_fields,
+            [
+                "store.credential_descriptors.credential_id",
+                "store.credential_descriptors.label",
+                "store.published_revisions.capability_profile",
+                "store.published_revisions.artifact_id",
+                "store.published_revisions.compiler",
+                "store.published_revisions.draft_revision",
+                "store.published_revisions.request",
+                "store.published_revisions.source",
+                "store.published_revisions.source_digest",
+                "store.published_revisions.plan_digest",
+                "store.published_revisions.target",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        for forbidden in [
+            "store.draft_compile_column",
+            "store.draft_compile_diagnostic",
+            "store.draft_compile_line",
+            "store.draft_compile_path",
+            "store.passkey_message",
+            "store.publish_diagnostic",
+            "store.publish_state",
+        ] {
+            assert!(
+                !scalar_paths.contains(forbidden),
+                "transient or derived field `{forbidden}` entered semantic memory"
+            );
+        }
+        assert_eq!(plan.persistence.effect_outbox.len(), 2);
+    }
+
+    #[test]
+    fn persons_passkey_workflow_uses_the_durable_outbox_and_preserves_account_authority() {
         let example = crate::catalog::Catalog::load()
             .unwrap()
             .open("persons_pro")
@@ -2296,25 +3234,376 @@ document: Document/new(
             .collect::<Vec<_>>();
         let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
         let mut model = RuntimeView::open_in_memory(runtime).unwrap();
-        let initial_request = model
+        complete_pending_programs_successfully(&mut model);
+
+        for (mode_source, expected_state) in [
+            ("store.elements.simulate_cancel", "Cancelled"),
+            ("store.elements.simulate_failure", "Failed"),
+        ] {
+            model
+                .dispatch_source(mode_source, None, SourcePayload::default())
+                .unwrap();
+            dispatch_effect_action(&mut model, "store.elements.register_passkey");
+            assert_current_values(
+                &mut model,
+                &[
+                    (
+                        "store.passkey_workflow_state",
+                        Value::Text(expected_state.to_owned()),
+                    ),
+                    ("store.account_state", Value::Text("Anonymous".to_owned())),
+                    ("store.account_id", Value::Text(String::new())),
+                    ("store.credential_count", Value::Number(0)),
+                ],
+            );
+        }
+
+        model
+            .dispatch_source(
+                "store.elements.simulate_success",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        dispatch_effect_action(&mut model, "store.elements.register_passkey");
+        let account_id = model
+            .runtime
+            .inspect_value_current("store.account_id", 1)
+            .unwrap();
+        let Value::Text(account_id_text) = &account_id else {
+            panic!("passkey registration did not create a public account id")
+        };
+        assert!(account_id_text.starts_with("account-"));
+        assert_current_values(
+            &mut model,
+            &[
+                (
+                    "store.passkey_workflow_state",
+                    Value::Text("Registered".to_owned()),
+                ),
+                ("store.account_state", Value::Text("OnePasskey".to_owned())),
+                ("store.credential_count", Value::Number(1)),
+            ],
+        );
+
+        model
+            .dispatch_source(
+                "store.elements.simulate_duplicate",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        dispatch_effect_action(&mut model, "store.elements.register_passkey");
+        assert_current_values(
+            &mut model,
+            &[
+                (
+                    "store.passkey_workflow_state",
+                    Value::Text("Duplicate".to_owned()),
+                ),
+                ("store.account_id", account_id.clone()),
+                ("store.credential_count", Value::Number(1)),
+            ],
+        );
+
+        model
+            .dispatch_source(
+                "store.elements.simulate_success",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        dispatch_effect_action(&mut model, "store.elements.register_passkey");
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.account_id", account_id.clone()),
+                ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
+                ("store.credential_count", Value::Number(2)),
+            ],
+        );
+
+        model
+            .dispatch_source("store.elements.sign_out", None, SourcePayload::default())
+            .unwrap();
+        for (mode_source, expected_state) in [
+            ("store.elements.simulate_cancel", "Cancelled"),
+            ("store.elements.simulate_failure", "Failed"),
+        ] {
+            model
+                .dispatch_source(mode_source, None, SourcePayload::default())
+                .unwrap();
+            dispatch_effect_action(&mut model, "store.elements.sign_in");
+            assert_current_values(
+                &mut model,
+                &[
+                    (
+                        "store.passkey_workflow_state",
+                        Value::Text(expected_state.to_owned()),
+                    ),
+                    ("store.account_state", Value::Text("SignedOut".to_owned())),
+                    ("store.account_id", account_id.clone()),
+                    ("store.credential_count", Value::Number(2)),
+                ],
+            );
+        }
+
+        model
+            .dispatch_source(
+                "store.elements.simulate_success",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        dispatch_effect_action(&mut model, "store.elements.sign_in");
+        assert_current_values(
+            &mut model,
+            &[
+                (
+                    "store.passkey_workflow_state",
+                    Value::Text("Authenticated".to_owned()),
+                ),
+                ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
+                ("store.account_id", account_id),
+                ("store.credential_count", Value::Number(2)),
+            ],
+        );
+    }
+
+    #[test]
+    fn persons_overlapping_passkey_completions_are_idempotent_and_bounded() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        complete_pending_programs_successfully(&mut model);
+
+        for _ in 0..2 {
+            model
+                .dispatch_source(
+                    "store.elements.register_passkey",
+                    None,
+                    SourcePayload::default(),
+                )
+                .unwrap();
+        }
+        assert_eq!(model.runtime.effect_work_items().unwrap().len(), 2);
+        settle_host_effects(&mut model);
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.account_state", Value::Text("OnePasskey".to_owned())),
+                ("store.credential_count", Value::Number(1)),
+            ],
+        );
+        let first_ids =
+            inspected_list_field_values(&mut model, "store.credential_descriptors.credential_id");
+        assert_eq!(first_ids.len(), 1);
+
+        dispatch_effect_action(&mut model, "store.elements.register_passkey");
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
+                ("store.credential_count", Value::Number(2)),
+            ],
+        );
+        let two_ids =
+            inspected_list_field_values(&mut model, "store.credential_descriptors.credential_id");
+        assert_eq!(two_ids.len(), 2);
+        assert_ne!(two_ids[0], two_ids[1]);
+
+        dispatch_effect_action(&mut model, "store.elements.register_passkey");
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.credential_descriptors.credential_id",),
+            two_ids,
+            "credential authority must remain capped after two registrations"
+        );
+    }
+
+    #[test]
+    fn persons_first_invalid_publish_creates_no_public_artifact_or_pointer() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        complete_pending_programs_successfully(&mut model);
+
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some("scene: Missing/constructor(\n".to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let invalid_draft = model
             .take_program_requests()
             .into_iter()
-            .next()
-            .expect("Persons.pro requests its initial child program");
-        let initial_artifact = boon_runtime::compile_program_artifact(&initial_request.compile);
+            .find(|request| request.session.0 == "persons-public-draft")
+            .expect("invalid draft request");
+        model
+            .complete_program(
+                &invalid_draft.session,
+                &invalid_draft.request_id,
+                boon_runtime::compile_program_artifact(&invalid_draft.compile),
+            )
+            .unwrap();
+
+        model
+            .dispatch_source("store.elements.publish", None, SourcePayload::default())
+            .unwrap();
+        let failed_publish = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-candidate")
+            .expect("invalid publish candidate request");
+        model
+            .complete_program(
+                &failed_publish.session,
+                &failed_publish.request_id,
+                boon_runtime::compile_program_artifact(&failed_publish.compile),
+            )
+            .unwrap();
+        model
+            .dispatch_source(
+                "store.elements.show_published_page",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+
         assert!(
             model
-                .complete_program(
-                    &initial_request.session,
-                    &initial_request.request_id,
-                    initial_artifact,
-                )
-                .unwrap()
+                .take_program_requests()
+                .iter()
+                .all(|request| request.session.0 != "persons-public-published")
+        );
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.publish_state", Value::Text("Failed".to_owned())),
+                ("store.has_published_revision", Value::Bool(false)),
+                ("store.published_revision", Value::Number(0)),
+                ("store.published_revision_count", Value::Number(0)),
+                ("store.published_digest", Value::Text(String::new())),
+            ],
         );
         assert!(model.retained_frame().nodes.values().any(|node| {
             node.text
                 .as_ref()
+                .is_some_and(|text| text.text == "Nothing published yet")
+        }));
+    }
+
+    #[test]
+    fn persons_declarative_scenario_runs_every_action_and_semantic_expectation() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path.clone(),
+                source: unit.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1_280.0,
+                height: 900.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        converge_test_demands(&mut model, &mut view, &mut columns);
+        let mut completed_actions = 0usize;
+
+        for step in &example.test_steps {
+            settle_scenario_runtime(&mut model, &mut view, &mut columns);
+            if step.action_kind.is_none() {
+                drive_scenario_step(&mut model, &mut view, &mut columns, step);
+                continue;
+            }
+            model.begin_scenario_step(&step.source_path);
+            drive_scenario_step(&mut model, &mut view, &mut columns, step);
+            settle_scenario_runtime(&mut model, &mut view, &mut columns);
+            model
+                .assert_scenario_step(&boon_runtime::ScenarioStep {
+                    id: step.id.clone(),
+                    user_action_kind: step.action_kind.clone(),
+                    user_action_text: step.text.clone(),
+                    user_action_key: step.key.clone(),
+                    source_event: None,
+                    expectations: step.expectations.clone(),
+                })
+                .unwrap_or_else(|error| {
+                    panic!("Persons scenario step `{}` failed: {error}", step.id)
+                });
+            completed_actions += 1;
+        }
+        assert_eq!(
+            completed_actions,
+            executable_test_steps(&example.test_steps).count()
+        );
+    }
+
+    #[test]
+    fn persons_editor_and_responsive_layout_scenario_hosts_last_valid_child_document() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        assert!(complete_pending_programs_successfully(&mut model) >= 1);
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
                 .is_some_and(|text| text.text == "Your name")
+        }));
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Development passkey simulator")
         }));
         let source_paths = model
             .retained_frame()
@@ -2327,7 +3616,7 @@ document: Document/new(
             "store.elements.source_editor",
             "store.elements.show_code",
             "store.elements.show_preview",
-            "store.elements.protect_workspace",
+            "store.elements.register_passkey",
             "store.elements.publish",
             "store.elements.theme_toggle",
         ] {
@@ -2476,6 +3765,7 @@ document: Document/new(
                 )
                 .unwrap()
         );
+        complete_pending_programs_successfully(&mut model);
         assert!(model.program_diagnostics().is_empty());
         assert!(model.retained_frame().nodes.values().any(|node| {
             node.text
@@ -2494,6 +3784,7 @@ document: Document/new(
             &mut columns,
         )
         .unwrap();
+        model.take_patches();
         let desktop_text = view
             .scene()
             .text_runs
@@ -2503,7 +3794,7 @@ document: Document/new(
         for expected in [
             "persons.pro",
             "Profile source",
-            "Draft preview",
+            "Draft",
             "Publish",
             "Corrected page",
         ] {
@@ -2530,35 +3821,1020 @@ document: Document/new(
             .iter()
             .map(|run| run.text.as_str())
             .collect::<Vec<_>>();
-        for expected in ["persons.pro", "Code", "Preview", "Profile source"] {
+        for expected in [
+            "persons.pro",
+            "Code",
+            "Preview",
+            "Publish",
+            "Profile source",
+        ] {
             assert!(
                 mobile_text.contains(&expected),
                 "missing mobile text {expected:?}: {mobile_text:?}"
             );
         }
         assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
+
+        for (source, label) in [
+            ("store.elements.register_passkey", "Protect workspace"),
+            ("store.elements.theme_toggle", "Dark"),
+            ("store.elements.show_preview", "Preview"),
+            ("store.elements.show_publish", "Publish"),
+        ] {
+            assert!(
+                view.target_for_source(source, Some(label)).is_some(),
+                "narrow Persons layout is missing {label:?} action `{source}`"
+            );
+        }
+        let preview_tab = view
+            .target_for_source("store.elements.show_preview", Some("Preview"))
+            .unwrap();
+        click_target(&mut model, &mut view, &mut columns, preview_tab);
+        assert!(
+            view.target_for_source("store.elements.show_draft_page", Some("Draft"))
+                .is_some()
+        );
+        assert!(
+            view.target_for_source("store.elements.show_published_page", Some("Published"))
+                .is_some()
+        );
+        assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
+
+        let publish_tab = view
+            .target_for_source("store.elements.show_publish", Some("Publish"))
+            .unwrap();
+        click_target(&mut model, &mut view, &mut columns, publish_tab);
+        assert!(
+            view.target_for_source("store.elements.publish", Some("Publish"))
+                .is_some()
+        );
+        assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
     }
 
     #[test]
-    fn persons_authority_survives_real_redb_reopen_export_import_migration_and_corruption() {
+    fn persons_publish_recompiles_exact_source_and_preserves_previous_public_pointer_on_failure() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        assert!(complete_pending_programs_successfully(&mut model) >= 1);
+
+        let first_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { First immutable page })\n";
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(first_source.to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let draft = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-draft")
+            .expect("draft compile request");
+        model
+            .complete_program(
+                &draft.session,
+                &draft.request_id,
+                boon_runtime::compile_program_artifact(&draft.compile),
+            )
+            .unwrap();
+        complete_pending_programs_successfully(&mut model);
+
+        model
+            .dispatch_source("store.elements.publish", None, SourcePayload::default())
+            .unwrap();
+        assert_eq!(
+            model
+                .runtime
+                .inspect_value_current("store.publish_state", 1)
+                .unwrap(),
+            Value::Text("Building".to_owned())
+        );
+        let publish = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-candidate")
+            .expect("publish compiler request");
+        assert_eq!(publish.compile.units[0].source, first_source);
+        let first_artifact = boon_runtime::compile_program_artifact(&publish.compile).unwrap();
+        let first_digest = first_artifact.source_digest().to_owned();
+        let first_artifact_id = first_artifact.id_text();
+        let first_plan_digest = first_artifact.plan_digest().to_owned();
+        let compiler = first_artifact.compiler_id().to_owned();
+        let target = first_artifact.target_profile_id().to_owned();
+        let capability = first_artifact.capability_profile_id().to_owned();
+        let observation = model
+            .complete_program_observed(&publish.session, &publish.request_id, Ok(first_artifact))
+            .unwrap();
+        assert!(matches!(
+            observation.completion,
+            ProgramCompletionObservation::ArtifactStorePending { .. }
+        ));
+        assert!(!observation.changed);
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.publish_state", Value::Text("Building".to_owned())),
+                ("store.published_revision_count", Value::Number(0)),
+                ("store.published_artifact_id", Value::Text(String::new())),
+            ],
+        );
+        assert!(model.runtime.status().accepting_turns);
+        assert!(settle_program_artifact_stores(&mut model) >= 1);
+        for (path, expected) in [
+            ("store.publish_state", Value::Text("Published".to_owned())),
+            (
+                "store.published_source",
+                Value::Text(first_source.to_owned()),
+            ),
+            ("store.published_digest", Value::Text(first_digest.clone())),
+            (
+                "store.published_artifact_id",
+                Value::Text(first_artifact_id.clone()),
+            ),
+            (
+                "store.published_plan_digest",
+                Value::Text(first_plan_digest.clone()),
+            ),
+            ("store.published_revision_count", Value::Number(1)),
+        ] {
+            assert_eq!(
+                model.runtime.inspect_value_current(path, 8).unwrap(),
+                expected,
+                "unexpected published authority at {path}"
+            );
+        }
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.source"),
+            vec![Value::Text(first_source.to_owned())]
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.source_digest"),
+            vec![Value::Text(first_digest.clone())]
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.artifact_id"),
+            vec![Value::Text(first_artifact_id)]
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.plan_digest"),
+            vec![Value::Text(first_plan_digest)]
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.compiler"),
+            vec![Value::Text(compiler.clone())]
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.target"),
+            vec![Value::Text(target.clone())]
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.capability_profile",),
+            vec![Value::Text(capability.clone())]
+        );
+
+        let second_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Second immutable page })\n";
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(second_source.to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let second_draft = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-draft")
+            .expect("second draft compile request");
+        model
+            .complete_program(
+                &second_draft.session,
+                &second_draft.request_id,
+                boon_runtime::compile_program_artifact(&second_draft.compile),
+            )
+            .unwrap();
+        complete_pending_programs_successfully(&mut model);
+        model
+            .dispatch_source("store.elements.publish", None, SourcePayload::default())
+            .unwrap();
+        let second_publish = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-candidate")
+            .expect("second publish compiler request");
+        assert_eq!(second_publish.compile.units[0].source, second_source);
+        let second_artifact =
+            boon_runtime::compile_program_artifact(&second_publish.compile).unwrap();
+        let second_digest = second_artifact.source_digest().to_owned();
+        let second_artifact_id = second_artifact.id_text();
+        let second_plan_digest = second_artifact.plan_digest().to_owned();
+        model
+            .complete_program(
+                &second_publish.session,
+                &second_publish.request_id,
+                Ok(second_artifact),
+            )
+            .unwrap();
+        assert!(settle_program_artifact_stores(&mut model) >= 1);
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.publish_state", Value::Text("Published".to_owned())),
+                (
+                    "store.published_source",
+                    Value::Text(second_source.to_owned()),
+                ),
+                ("store.published_digest", Value::Text(second_digest.clone())),
+                (
+                    "store.published_artifact_id",
+                    Value::Text(second_artifact_id.clone()),
+                ),
+                (
+                    "store.published_plan_digest",
+                    Value::Text(second_plan_digest.clone()),
+                ),
+                ("store.published_revision_count", Value::Number(2)),
+            ],
+        );
+        let archive_sources = vec![
+            Value::Text(first_source.to_owned()),
+            Value::Text(second_source.to_owned()),
+        ];
+        let archive_digests = vec![
+            Value::Text(first_digest.clone()),
+            Value::Text(second_digest.clone()),
+        ];
+        let archive_compilers = vec![Value::Text(compiler.clone()), Value::Text(compiler)];
+        let archive_targets = vec![Value::Text(target.clone()), Value::Text(target)];
+        let archive_capabilities = vec![Value::Text(capability.clone()), Value::Text(capability)];
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.source"),
+            archive_sources
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.source_digest"),
+            archive_digests
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.compiler"),
+            archive_compilers
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.target"),
+            archive_targets
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.capability_profile",),
+            archive_capabilities
+        );
+
+        model
+            .dispatch_source(
+                "store.elements.show_published_page",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        assert!(
+            model.pending_program_requests.iter().any(|request| {
+                request.session.0 == "persons-public-published" && request.is_artifact_load()
+            }),
+            "published page must request its immutable artifact"
+        );
+        model.resolve_program_artifact_requests().unwrap();
+        assert!(
+            model
+                .take_program_requests()
+                .iter()
+                .all(|request| request.session.0 != "persons-public-published"),
+            "published artifact load must not escape to the compile worker"
+        );
+        assert_eq!(
+            model
+                .program_host
+                .active_artifact(&ProgramSessionId("persons-public-published".to_owned()))
+                .map(ProgramArtifact::id_text),
+            Some(second_artifact_id)
+        );
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Second immutable page")
+        }));
+
+        let invalid_source = "scene: Missing/constructor(\n";
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(invalid_source.to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let invalid_draft = model.take_program_requests().remove(0);
+        model
+            .complete_program(
+                &invalid_draft.session,
+                &invalid_draft.request_id,
+                boon_runtime::compile_program_artifact(&invalid_draft.compile),
+            )
+            .unwrap();
+        model
+            .dispatch_source("store.elements.publish", None, SourcePayload::default())
+            .unwrap();
+        let failed_publish = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-candidate")
+            .expect("failed publish compiler request");
+        let diagnostic = boon_runtime::compile_program_artifact(&failed_publish.compile)
+            .expect_err("invalid publication source must fail");
+        assert_eq!(diagnostic.source_path, "RUN.bn");
+        assert!(diagnostic.line > 0);
+        model
+            .complete_program(
+                &failed_publish.session,
+                &failed_publish.request_id,
+                Err(diagnostic),
+            )
+            .unwrap();
+        for (path, expected) in [
+            ("store.publish_state", Value::Text("Failed".to_owned())),
+            (
+                "store.published_source",
+                Value::Text(second_source.to_owned()),
+            ),
+            ("store.published_digest", Value::Text(second_digest.clone())),
+            ("store.published_revision_count", Value::Number(2)),
+        ] {
+            assert_eq!(
+                model.runtime.inspect_value_current(path, 8).unwrap(),
+                expected,
+                "failed publish changed public authority at {path}"
+            );
+        }
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.source"),
+            archive_sources
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.source_digest"),
+            archive_digests
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.compiler"),
+            archive_compilers
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.target"),
+            archive_targets
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.capability_profile",),
+            archive_capabilities
+        );
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Second immutable page")
+        }));
+    }
+
+    #[test]
+    fn persons_publish_rejects_out_of_order_candidate_completion() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        complete_pending_programs_successfully(&mut model);
+
+        let older_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Older publication })\n";
+        let newer_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Newer publication })\n";
+        let publish_request = |model: &mut RuntimeView, source: &str| {
+            model
+                .dispatch_source(
+                    "store.elements.source_editor",
+                    None,
+                    SourcePayload {
+                        text: Some(source.to_owned()),
+                        ..SourcePayload::default()
+                    },
+                )
+                .unwrap();
+            let draft = model
+                .take_program_requests()
+                .into_iter()
+                .find(|request| request.session.0 == "persons-public-draft")
+                .expect("draft compile request");
+            model
+                .complete_program(
+                    &draft.session,
+                    &draft.request_id,
+                    boon_runtime::compile_program_artifact(&draft.compile),
+                )
+                .unwrap();
+            complete_pending_programs_successfully(model);
+            model
+                .dispatch_source("store.elements.publish", None, SourcePayload::default())
+                .unwrap();
+            model
+                .take_program_requests()
+                .into_iter()
+                .find(|request| request.session.0 == "persons-public-candidate")
+                .expect("publish candidate request")
+        };
+
+        let older = publish_request(&mut model, older_source);
+        let newer = publish_request(&mut model, newer_source);
+        assert_ne!(older.request_id, newer.request_id);
+        model
+            .complete_program(
+                &newer.session,
+                &newer.request_id,
+                boon_runtime::compile_program_artifact(&newer.compile),
+            )
+            .unwrap();
+        settle_program_artifact_stores(&mut model);
+        let stale = model
+            .complete_program_observed(
+                &older.session,
+                &older.request_id,
+                boon_runtime::compile_program_artifact(&older.compile),
+            )
+            .unwrap();
+        assert!(!stale.changed);
+        assert_eq!(
+            stale.completion,
+            ProgramCompletionObservation::Host(ProgramHostCompletion::Removed {
+                session: older.session,
+            })
+        );
+        assert_current_values(
+            &mut model,
+            &[
+                (
+                    "store.published_source",
+                    Value::Text(newer_source.to_owned()),
+                ),
+                ("store.published_revision_count", Value::Number(1)),
+            ],
+        );
+        assert_eq!(
+            inspected_list_field_values(&mut model, "store.published_revisions.source"),
+            vec![Value::Text(newer_source.to_owned())]
+        );
+    }
+
+    #[test]
+    fn persons_draft_compilation_is_latest_wins_without_preview_regression() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        complete_pending_programs_successfully(&mut model);
+
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some("scene: Missing/constructor(\n".to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let invalid = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-draft")
+            .expect("invalid draft request before stale completion exercise");
+        model
+            .complete_program(
+                &invalid.session,
+                &invalid.request_id,
+                boon_runtime::compile_program_artifact(&invalid.compile),
+            )
+            .unwrap();
+        assert_eq!(model.program_diagnostics().len(), 1);
+
+        let older_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Older draft })\n";
+        let newer_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Newer draft })\n";
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(older_source.to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let older = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-draft")
+            .expect("older draft request");
+
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(newer_source.to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let newer = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-draft")
+            .expect("newer draft request");
+        assert_ne!(newer.request_id, older.request_id);
+
+        let stale = model
+            .complete_program_observed(
+                &older.session,
+                &older.request_id,
+                boon_runtime::compile_program_artifact(&older.compile),
+            )
+            .unwrap();
+        assert!(!stale.changed);
+        assert_eq!(
+            stale.completion,
+            ProgramCompletionObservation::Host(ProgramHostCompletion::Superseded {
+                session: older.session.clone(),
+                request_id: older.request_id.clone(),
+            })
+        );
+        assert_ne!(
+            model
+                .runtime
+                .inspect_value_current("store.last_valid_draft_source", 1)
+                .unwrap(),
+            Value::Text(older_source.to_owned())
+        );
+
+        model
+            .complete_program(
+                &newer.session,
+                &newer.request_id,
+                boon_runtime::compile_program_artifact(&newer.compile),
+            )
+            .unwrap();
+        complete_pending_programs_successfully(&mut model);
+        assert_eq!(
+            model
+                .runtime
+                .inspect_value_current("store.last_valid_draft_source", 1)
+                .unwrap(),
+            Value::Text(newer_source.to_owned())
+        );
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Newer draft")
+        }));
+        assert!(!model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Older draft")
+        }));
+    }
+
+    #[test]
+    fn persons_profile_edit_reports_bounded_dependency_breadth() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        complete_pending_programs_successfully(&mut model);
+        model.take_patches();
+
+        let before = model.runtime.runtime().document_materialization_stats();
+        let generation = model.parent_runtime_generation();
+        model
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(
+                        "scene: Scene/Element/text(element: [], style: [width: Fill, height: Fill], text: TEXT { Profile dependency breadth })\n"
+                            .to_owned(),
+                    ),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let after_edit = model.runtime.runtime().document_materialization_stats();
+        let request = model
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-draft")
+            .unwrap();
+        model
+            .complete_program(
+                &request.session,
+                &request.request_id,
+                boon_runtime::compile_program_artifact(&request.compile),
+            )
+            .unwrap();
+        let after_completion = model.runtime.runtime().document_materialization_stats();
+        let patches = model.take_patches();
+        let structural = patches
+            .iter()
+            .filter(|patch| {
+                matches!(
+                    patch,
+                    DocumentPatch::UpsertNode(_)
+                        | DocumentPatch::RemoveNode { .. }
+                        | DocumentPatch::InsertChild { .. }
+                        | DocumentPatch::RemoveChild { .. }
+                        | DocumentPatch::MoveChild { .. }
+                )
+            })
+            .count();
+        assert_eq!(model.parent_runtime_generation(), generation);
+        assert_eq!(
+            after_edit
+                .full_evaluation_count
+                .saturating_sub(before.full_evaluation_count),
+            1
+        );
+        assert_eq!(
+            after_completion
+                .full_evaluation_count
+                .saturating_sub(after_edit.full_evaluation_count),
+            1
+        );
+        assert!(patches.len() <= 24);
+        assert!(structural <= 4);
+    }
+
+    #[test]
+    fn persons_restart_restores_authority_before_the_first_frame_and_rebuilds_diagnostics() {
+        let state_root = unique_state_root("persons-restart-first-frame");
+        let plan = persons_plan(1, None, None);
+        let valid_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Restart-safe page })\n";
+        let invalid_source = "scene: Missing/constructor(\n";
+
+        let mut first = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root).unwrap();
+        complete_pending_programs_successfully(&mut first);
+        let workspace_id = first
+            .runtime
+            .inspect_value_current("store.workspace_id", 1)
+            .unwrap();
+        for _ in 0..2 {
+            dispatch_effect_action(&mut first, "store.elements.register_passkey");
+        }
+        let account_id = first
+            .runtime
+            .inspect_value_current("store.account_id", 1)
+            .unwrap();
+
+        first
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(valid_source.to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let (activated, rejected) = complete_pending_programs(&mut first);
+        assert!(activated >= 1);
+        assert_eq!(rejected, 0);
+        first
+            .dispatch_source("store.elements.publish", None, SourcePayload::default())
+            .unwrap();
+        let publish = first
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-candidate")
+            .expect("publish candidate request");
+        first
+            .complete_program(
+                &publish.session,
+                &publish.request_id,
+                boon_runtime::compile_program_artifact(&publish.compile),
+            )
+            .unwrap();
+        settle_program_artifact_stores(&mut first);
+        let published_digest = boon_runtime::sha256_bytes(valid_source.as_bytes());
+
+        first
+            .dispatch_source(
+                "store.elements.source_editor",
+                None,
+                SourcePayload {
+                    text: Some(invalid_source.to_owned()),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let (activated, rejected) = complete_pending_programs(&mut first);
+        assert_eq!(activated, 0);
+        assert_eq!(rejected, 1);
+        assert_current_values(
+            &mut first,
+            &[
+                ("store.source_draft", Value::Text(invalid_source.to_owned())),
+                (
+                    "store.last_valid_draft_source",
+                    Value::Text(valid_source.to_owned()),
+                ),
+                (
+                    "store.published_source",
+                    Value::Text(valid_source.to_owned()),
+                ),
+                (
+                    "store.published_digest",
+                    Value::Text(published_digest.clone()),
+                ),
+                ("store.published_revision_count", Value::Number(1)),
+                ("store.account_id", account_id.clone()),
+                ("store.credential_count", Value::Number(2)),
+            ],
+        );
+        let acknowledged_authority = authoritative_semantic_snapshot(&mut first, &plan);
+        let artifact = first.export_state_artifact().unwrap();
+        first.runtime.shutdown().unwrap();
+        drop(first);
+
+        let mut restored = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root)
+            .expect("restore acknowledged Persons authority");
+        assert_eq!(
+            authoritative_semantic_snapshot(&mut restored, &plan),
+            acknowledged_authority,
+            "restart changed acknowledged semantic authority before the first frame"
+        );
+        assert_current_values(
+            &mut restored,
+            &[
+                ("store.source_draft", Value::Text(invalid_source.to_owned())),
+                (
+                    "store.last_valid_draft_source",
+                    Value::Text(valid_source.to_owned()),
+                ),
+                (
+                    "store.published_source",
+                    Value::Text(valid_source.to_owned()),
+                ),
+                ("store.published_digest", Value::Text(published_digest)),
+                ("store.published_revision_count", Value::Number(1)),
+                ("store.account_id", account_id),
+                ("store.workspace_id", workspace_id.clone()),
+                ("store.credential_count", Value::Number(2)),
+                ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
+                ("store.publish_state", Value::Text("Published".to_owned())),
+                (
+                    "store.passkey_workflow_state",
+                    Value::Text("Registered".to_owned()),
+                ),
+            ],
+        );
+        let first_frame = restored.frame();
+        assert!(first_frame.nodes.values().any(|node| {
+            node.kind == DocumentNodeKind::TextInput
+                && node
+                    .source_bindings
+                    .iter()
+                    .any(|binding| binding.source_path == "store.elements.source_editor")
+                && node
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.text == invalid_source)
+        }));
+        assert!(first_frame.nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "2 passkeys")
+        }));
+        assert!(restored.program_diagnostics().is_empty());
+
+        let (activated, rejected) = complete_pending_programs(&mut restored);
+        assert!(activated >= 1);
+        assert_eq!(rejected, 1);
+        assert_eq!(restored.program_diagnostics().len(), 1);
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.draft_compile_state", 1)
+                .unwrap(),
+            Value::Text("Invalid".to_owned())
+        );
+        assert!(restored.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Restart-safe page")
+        }));
+
+        restored.start_over().unwrap();
+        assert_current_values(
+            &mut restored,
+            &[
+                ("store.account_id", Value::Text(String::new())),
+                ("store.account_state", Value::Text("Anonymous".to_owned())),
+                ("store.credential_count", Value::Number(0)),
+                ("store.published_revision", Value::Number(0)),
+                ("store.published_revision_count", Value::Number(0)),
+            ],
+        );
+        assert_ne!(
+            restored
+                .runtime
+                .inspect_value_current("store.workspace_id", 1)
+                .unwrap(),
+            workspace_id
+        );
+        let preview = restored.preview_state_artifact(&artifact).unwrap();
+        assert_eq!(preview.source_schema_version, 1);
+        assert_eq!(preview.target_schema_version, 1);
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.account_state", 1)
+                .unwrap(),
+            Value::Text("Anonymous".to_owned()),
+            "Import Preview mutated active account authority"
+        );
+        restored.activate_state_artifact(&artifact).unwrap();
+        assert_eq!(
+            authoritative_semantic_snapshot(&mut restored, &plan),
+            acknowledged_authority,
+            "import activation did not restore the complete acknowledged authority"
+        );
+        assert_current_values(
+            &mut restored,
+            &[
+                ("store.workspace_id", workspace_id),
+                ("store.source_draft", Value::Text(invalid_source.to_owned())),
+                (
+                    "store.last_valid_draft_source",
+                    Value::Text(valid_source.to_owned()),
+                ),
+                (
+                    "store.published_source",
+                    Value::Text(valid_source.to_owned()),
+                ),
+                ("store.published_revision_count", Value::Number(1)),
+                ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
+                ("store.credential_count", Value::Number(2)),
+            ],
+        );
+
+        restored.runtime.shutdown().unwrap();
+        drop(restored);
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn persons_restart_resumes_only_unsettled_publish_work() {
+        let state_root = unique_state_root("persons-publish-resume");
+        let plan = persons_plan(1, None, None);
+
+        let mut first = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root).unwrap();
+        complete_pending_programs_successfully(&mut first);
+        first
+            .dispatch_source("store.elements.publish", None, SourcePayload::default())
+            .unwrap();
+        assert!(
+            first
+                .take_program_requests()
+                .into_iter()
+                .any(|request| request.session.0 == "persons-public-candidate")
+        );
+        assert_eq!(
+            first
+                .runtime
+                .inspect_value_current("store.publish_state", 1)
+                .unwrap(),
+            Value::Text("Building".to_owned())
+        );
+        first.runtime.barrier().unwrap();
+        first.runtime.shutdown().unwrap();
+        drop(first);
+
+        let mut resumed =
+            RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root).unwrap();
+        let candidate = resumed
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-candidate")
+            .expect("an unsettled publish is resumed after restart");
+        resumed
+            .complete_program(
+                &candidate.session,
+                &candidate.request_id,
+                boon_runtime::compile_program_artifact(&candidate.compile),
+            )
+            .unwrap();
+        settle_program_artifact_stores(&mut resumed);
+        assert_current_values(
+            &mut resumed,
+            &[
+                ("store.publish_state", Value::Text("Published".to_owned())),
+                ("store.published_revision_count", Value::Number(1)),
+            ],
+        );
+        resumed.runtime.barrier().unwrap();
+        resumed.runtime.shutdown().unwrap();
+        drop(resumed);
+
+        let mut settled =
+            RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root).unwrap();
+        assert!(
+            settled
+                .take_program_requests()
+                .into_iter()
+                .all(|request| request.session.0 != "persons-public-candidate"),
+            "a settled publish must not replay after restart"
+        );
+        assert_current_values(
+            &mut settled,
+            &[
+                ("store.publish_state", Value::Text("Published".to_owned())),
+                ("store.published_revision_count", Value::Number(1)),
+            ],
+        );
+        settled.runtime.shutdown().unwrap();
+        drop(settled);
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
+    fn persons_host_control_scenario_covers_restart_clear_export_import_corruption_and_migration() {
         let state_root = unique_state_root("persons-redb-lifecycle");
         let plan_v1 = persons_plan(1, None, None);
         let edited_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Durable profile })\n";
 
         let mut first = RuntimeView::open_with_state_root(Arc::clone(&plan_v1), &state_root)
             .expect("open isolated Persons.pro redb store");
-        let initial = first
-            .take_program_requests()
-            .into_iter()
-            .next()
-            .expect("initial child compile request");
-        first
-            .complete_program(
-                &initial.session,
-                &initial.request_id,
-                boon_runtime::compile_program_artifact(&initial.compile),
-            )
-            .unwrap();
+        let workspace_id = match first
+            .runtime
+            .inspect_value_current("store.workspace_id", 1)
+            .unwrap()
+        {
+            Value::Text(value) => value,
+            value => panic!("workspace identity is not Text: {value:?}"),
+        };
+        assert_eq!(
+            uuid::Uuid::parse_str(&workspace_id)
+                .expect("interactive workspace identity is a UUID")
+                .get_version_num(),
+            4
+        );
+        assert!(complete_pending_programs_successfully(&mut first) >= 1);
         assert_eq!(
             first
                 .runtime
@@ -2582,8 +4858,8 @@ document: Document/new(
         let edited = first
             .take_program_requests()
             .into_iter()
-            .next()
-            .expect("edited child compile request");
+            .find(|request| request.session.0 == "persons-public-draft")
+            .expect("edited draft compile request");
         first
             .complete_program(
                 &edited.session,
@@ -2591,6 +4867,7 @@ document: Document/new(
                 boon_runtime::compile_program_artifact(&edited.compile),
             )
             .unwrap();
+        complete_pending_programs_successfully(&mut first);
         let digest = boon_runtime::sha256_bytes(edited_source.as_bytes());
         assert_eq!(
             first
@@ -2599,6 +4876,35 @@ document: Document/new(
                 .unwrap(),
             Value::Text(digest.clone())
         );
+        for _ in 0..2 {
+            dispatch_effect_action(&mut first, "store.elements.register_passkey");
+        }
+        first
+            .dispatch_source("store.elements.publish", None, SourcePayload::default())
+            .unwrap();
+        let publish = first
+            .take_program_requests()
+            .into_iter()
+            .find(|request| request.session.0 == "persons-public-candidate")
+            .expect("migration fixture publish candidate request");
+        first
+            .complete_program(
+                &publish.session,
+                &publish.request_id,
+                boon_runtime::compile_program_artifact(&publish.compile),
+            )
+            .unwrap();
+        settle_program_artifact_stores(&mut first);
+        assert_current_values(
+            &mut first,
+            &[
+                ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
+                ("store.credential_count", Value::Number(2)),
+                ("store.published_revision_count", Value::Number(1)),
+                ("store.published_digest", Value::Text(digest.clone())),
+            ],
+        );
+        let acknowledged_authority = authoritative_semantic_snapshot(&mut first, &plan_v1);
         first.runtime.barrier().unwrap();
         let artifact = first.export_state_artifact().unwrap();
         first.runtime.shutdown().unwrap();
@@ -2606,6 +4912,11 @@ document: Document/new(
 
         let mut restored = RuntimeView::open_with_state_root(Arc::clone(&plan_v1), &state_root)
             .expect("reopen acknowledged Persons.pro state");
+        assert_eq!(
+            authoritative_semantic_snapshot(&mut restored, &plan_v1),
+            acknowledged_authority,
+            "restart changed complete acknowledged authority"
+        );
         assert_eq!(
             restored
                 .runtime
@@ -2620,10 +4931,30 @@ document: Document/new(
                 .unwrap(),
             Value::Text(digest.clone())
         );
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.workspace_id", 1)
+                .unwrap(),
+            Value::Text(workspace_id.clone())
+        );
         assert_eq!(restored.take_program_requests().len(), 1);
 
+        let preview = restored.preview_state_artifact(&artifact).unwrap();
+        assert_eq!(preview.source_schema_version, 1);
+        assert_eq!(preview.target_schema_version, 1);
+        assert!(preview.scalar_count > 0);
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.source_draft", 1)
+                .unwrap(),
+            Value::Text(edited_source.to_owned()),
+            "Import Preview must not mutate active authority"
+        );
+
         let mut corrupt_artifact = artifact.clone();
-        *corrupt_artifact.last_mut().unwrap() ^= 0x5a;
+        corrupt_artifact.push(0);
         assert!(restored.preview_state_artifact(&corrupt_artifact).is_err());
         assert_eq!(
             restored
@@ -2643,6 +4974,12 @@ document: Document/new(
         );
         restored.activate_state_artifact(&artifact).unwrap();
         assert_eq!(
+            authoritative_semantic_snapshot(&mut restored, &plan_v1),
+            acknowledged_authority,
+            "import activation did not restore complete acknowledged authority"
+        );
+        assert!(restored.runtime_turn_sequence() > 0);
+        assert_eq!(
             restored
                 .runtime
                 .inspect_value_current("store.source_draft", 1)
@@ -2650,6 +4987,11 @@ document: Document/new(
             Value::Text(edited_source.to_owned())
         );
         restored.start_over().unwrap();
+        let start_over_workspace_id = restored
+            .runtime
+            .inspect_value_current("store.workspace_id", 1)
+            .unwrap();
+        assert_ne!(start_over_workspace_id, Value::Text(workspace_id.clone()));
         assert_ne!(
             restored
                 .runtime
@@ -2658,6 +5000,19 @@ document: Document/new(
             Value::Text(edited_source.to_owned())
         );
         restored.activate_state_artifact(&artifact).unwrap();
+        assert_eq!(
+            authoritative_semantic_snapshot(&mut restored, &plan_v1),
+            acknowledged_authority,
+            "start-over followed by import did not restore complete authority"
+        );
+        assert!(restored.runtime_turn_sequence() > 0);
+        assert_eq!(
+            restored
+                .runtime
+                .inspect_value_current("store.workspace_id", 1)
+                .unwrap(),
+            Value::Text(workspace_id.clone())
+        );
         restored.runtime.barrier().unwrap();
         restored.runtime.shutdown().unwrap();
         drop(restored);
@@ -2670,6 +5025,18 @@ document: Document/new(
         let mut migrated = RuntimeView::open_with_state_root(Arc::clone(&plan_v2), &state_root)
             .expect("migrate Persons.pro state to additive v2 schema");
         assert_eq!(migrated.persistence_schema_version(), 2);
+        assert!(
+            migrated
+                .persistence_inspector
+                .as_ref()
+                .is_some_and(|inspector| inspector.completed_migration_count >= 1),
+            "additive Persons migration was not recorded by the durable store"
+        );
+        assert_eq!(
+            authoritative_semantic_snapshot(&mut migrated, &plan_v1),
+            acknowledged_authority,
+            "schema migration changed pre-existing semantic authority"
+        );
         assert_eq!(
             migrated
                 .runtime
@@ -2683,6 +5050,11 @@ document: Document/new(
 
         let mut reopened_v2 = RuntimeView::open_with_state_root(Arc::clone(&plan_v2), &state_root)
             .expect("reopen migrated v2 state");
+        assert_eq!(
+            authoritative_semantic_snapshot(&mut reopened_v2, &plan_v1),
+            acknowledged_authority,
+            "reopening the migrated store changed pre-existing semantic authority"
+        );
         assert_eq!(
             reopened_v2
                 .runtime
@@ -3194,7 +5566,7 @@ document: Document/new(
                 && demand.item_extent_milli.is_some()
         }));
 
-        for step in example.test_steps.iter().take(4) {
+        for step in executable_test_steps(&example.test_steps).take(4) {
             drive_scenario_step(&mut model, &mut view, &mut columns, step);
         }
         let frame = view.frame();
@@ -3247,6 +5619,22 @@ document: Document/new(
         assert!(target.scroll_root.is_some());
         let scroll_target = target.clone();
         let full_lowers = view.retained_stats().full_lower_count;
+        assert!(
+            !model
+                .handle_event(
+                    &HostEvent::Wheel(WheelEvent {
+                        surface: SurfaceId("preview".to_owned()),
+                        x: target.center_x,
+                        y: target.center_y,
+                        delta_x: 0.0,
+                        delta_y: -4.0,
+                    }),
+                    Some(target.clone()),
+                )
+                .unwrap(),
+            "wheel movement beyond the top boundary must be a no-op"
+        );
+        assert!(model.take_patches().is_empty());
         let changed = model
             .handle_event(
                 &HostEvent::Wheel(WheelEvent {
@@ -3489,6 +5877,22 @@ document: Document/new(
         columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
         step: &crate::protocol::TestStep,
     ) {
+        if step.action_kind.is_none() {
+            assert!(step.source_path.is_empty());
+            model
+                .assert_scenario_step(&boon_runtime::ScenarioStep {
+                    id: step.id.clone(),
+                    user_action_kind: None,
+                    user_action_text: None,
+                    user_action_key: None,
+                    source_event: None,
+                    expectations: step.expectations.clone(),
+                })
+                .unwrap_or_else(|error| {
+                    panic!("assertion-only scenario step `{}` failed: {error}", step.id)
+                });
+            return;
+        }
         let surface = SurfaceId("preview".to_owned());
         let sequence_before = model.event_sequence();
         let target_row = model
@@ -3672,6 +6076,67 @@ document: Document/new(
         converge_test_demands(model, view, columns);
     }
 
+    fn executable_test_steps(
+        steps: &[crate::protocol::TestStep],
+    ) -> impl Iterator<Item = &crate::protocol::TestStep> {
+        steps.iter().filter(|step| step.action_kind.is_some())
+    }
+
+    fn settle_scenario_runtime(
+        model: &mut RuntimeView,
+        view: &mut crate::view::RetainedView,
+        columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
+    ) {
+        let started = Instant::now();
+        for round in 0..64 {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "scenario runtime did not settle within three seconds; round={round}"
+            );
+            model.resolve_program_artifact_requests().unwrap();
+            let requests = model.take_program_requests();
+            let had_requests = !requests.is_empty();
+            for request in requests {
+                assert!(
+                    !request.is_artifact_load(),
+                    "stored artifact request reached the scenario compiler"
+                );
+                let result = boon_runtime::compile_program_artifact(&request.compile);
+                model
+                    .complete_program(&request.session, &request.request_id, result)
+                    .unwrap();
+            }
+            model.poll_program_artifact_stores().unwrap();
+            if let Some(deadline) = model.effect_poll_deadline() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if !remaining.is_zero() {
+                    std::thread::sleep(remaining.min(Duration::from_millis(2)));
+                }
+                model.poll_host_effects(Instant::now()).unwrap();
+            }
+            let patches = model.take_patches();
+            if !patches.is_empty() {
+                view.apply_patches(patches, columns).unwrap();
+                view.set_interaction_state(model.hovered(), model.focused(), columns)
+                    .unwrap();
+            }
+            converge_test_demands(model, view, columns);
+            if !had_requests
+                && model.effect_poll_deadline().is_none()
+                && model.pending_program_artifact_stores.is_empty()
+                && model.retry_program_artifact_store.is_none()
+            {
+                return;
+            }
+            if !model.pending_program_artifact_stores.is_empty()
+                || model.retry_program_artifact_store.is_some()
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        panic!("scenario runtime exceeded its 64-round settle limit")
+    }
+
     fn converge_test_demands(
         model: &mut RuntimeView,
         view: &mut crate::view::RetainedView,
@@ -3708,11 +6173,7 @@ document: Document/new(
                 model.frame(),
                 boon_host::Viewport {
                     surface: 1,
-                    width: if example_id == "cells" {
-                        510.0
-                    } else {
-                        1_100.0
-                    },
+                    width: 1_100.0,
                     height: if example_id == "cells" { 540.0 } else { 760.0 },
                     scale: 1.0,
                 },
@@ -3721,23 +6182,25 @@ document: Document/new(
             .unwrap();
             converge_test_demands(&mut model, &mut view, &mut columns);
 
-            for step in example
-                .test_steps
-                .iter()
-                .take(crate::preview::TEST_STEP_LIMIT)
+            for step in
+                executable_test_steps(&example.test_steps).take(crate::preview::TEST_STEP_LIMIT)
             {
                 drive_scenario_step(&mut model, &mut view, &mut columns, step);
             }
             if example_id == "cells" {
+                let action_steps = executable_test_steps(&example.test_steps)
+                    .take(2)
+                    .collect::<Vec<_>>();
+                assert_eq!(action_steps.len(), 2);
                 for ordinal in 0..24 {
                     drive_scenario_step(
                         &mut model,
                         &mut view,
                         &mut columns,
-                        &example.test_steps[ordinal % 2],
+                        action_steps[ordinal % action_steps.len()],
                     );
                 }
-                let step = example.test_steps.first().expect("Cells test target");
+                let step = action_steps[0];
                 let target_row = model
                     .scenario_target_row(
                         &step.source_path,
@@ -3798,9 +6261,8 @@ document: Document/new(
             }
             assert!(
                 model.event_sequence()
-                    >= example
-                        .test_steps
-                        .len()
+                    >= executable_test_steps(&example.test_steps)
+                        .count()
                         .min(crate::preview::TEST_STEP_LIMIT) as u64,
                 "{example_id} missed source events"
             );
@@ -3837,10 +6299,7 @@ document: Document/new(
         .unwrap();
         converge_test_demands(&mut model, &mut view, &mut columns);
 
-        for step in example
-            .test_steps
-            .iter()
-            .take(crate::preview::TEST_STEP_LIMIT)
+        for step in executable_test_steps(&example.test_steps).take(crate::preview::TEST_STEP_LIMIT)
         {
             drive_scenario_step(&mut model, &mut view, &mut columns, step);
         }
@@ -3848,21 +6307,27 @@ document: Document/new(
         let selected_lane_count = model
             .inspect_root_current("selected_lane_materialized_row_count")
             .unwrap();
+        let selected_lane_visible_count = model
+            .inspect_root_current("selected_lane_visible_row_count")
+            .unwrap();
+        let selected_lane_overscan_count = model
+            .inspect_root_current("selected_lane_overscan_row_count")
+            .unwrap();
         assert_eq!(
-            selected_lane_count, "3",
-            "NovyWave selected lane model is not current"
+            selected_lane_count.parse::<u64>().unwrap(),
+            selected_lane_visible_count.parse::<u64>().unwrap()
+                + selected_lane_overscan_count.parse::<u64>().unwrap(),
+            "NovyWave selected lane materialization is not current"
         );
 
         for expected in [
             "Variables",
             "Selected Variables",
             "Value",
-            "ghw.counter[3:0]",
-            "ghw.enable",
-            "ghw.state",
-            "3",
-            "1",
-            "Count",
+            "tx_data[7:0]",
+            "rx_data[7:0]",
+            "baud_tick",
+            "uart_busy",
         ] {
             let node = view
                 .frame()
@@ -3877,7 +6342,7 @@ document: Document/new(
             let bounds = view
                 .node_bounds(&node.id.0)
                 .unwrap_or_else(|| panic!("NovyWave `{expected}` has no retained layout bounds"));
-            let vertical_limit = 540.0;
+            let vertical_limit = view.scene().viewport.y + view.scene().viewport.height;
             assert!(
                 bounds.width > 1.0
                     && bounds.height > 1.0
@@ -3963,7 +6428,10 @@ document: Document/new(
             drive_scenario_step(&mut model, &mut view, &mut columns, step);
         }
 
-        assert_eq!(model.event_sequence(), example.test_steps.len() as u64);
+        assert_eq!(
+            model.event_sequence(),
+            executable_test_steps(&example.test_steps).count() as u64
+        );
         assert_eq!(
             model.inspect_root_current("cursor_position").unwrap(),
             "\"Cursor48\""
@@ -4070,11 +6538,9 @@ document: Document/new(
         .unwrap();
         let initial_full_lowers = view.retained_stats().full_lower_count;
 
-        assert_eq!(example.test_steps.len(), 6);
-        for (step, expected_count) in example
-            .test_steps
-            .iter()
-            .zip(["1", "2", "1", "0", "-1", "0"])
+        assert_eq!(executable_test_steps(&example.test_steps).count(), 6);
+        for (step, expected_count) in
+            executable_test_steps(&example.test_steps).zip(["1", "2", "1", "0", "-1", "0"])
         {
             let target = view
                 .target_for_source(&step.source_path, step.target_text.as_deref())

@@ -224,6 +224,7 @@ fn route(source: usize, scope: Option<usize>) -> SourceRoute {
             fields: Vec::new(),
             typed_fields: Vec::new(),
             row_lookup_field: None,
+            row_lookup_field_id: None,
         },
     }
 }
@@ -274,6 +275,99 @@ fn event(sequence: u64, source: usize, target: Option<RowId>) -> SourceEvent {
         target,
         payload: SourcePayload::default(),
     }
+}
+
+#[test]
+fn root_value_comparison_tracks_both_state_inputs() {
+    let comparison = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::DerivedValue {
+            derived_kind: PlanDerivedKind::Pure,
+            startup_recompute: true,
+            expression: Some(PlanDerivedExpression::ValueCompare {
+                left: ValueRef::State(StateId(0)),
+                op: "==".to_owned(),
+                right: ValueRef::State(StateId(1)),
+            }),
+        },
+        inputs: vec![ValueRef::State(StateId(0)), ValueRef::State(StateId(1))],
+        output: Some(ValueRef::Field(FieldId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let mut session = Session::new(
+        plan(
+            RootOutputDemand::All,
+            vec![
+                constant(0, PlanConstantValue::Number { value: 3 }),
+                constant(1, PlanConstantValue::Number { value: 3 }),
+                constant(2, PlanConstantValue::Number { value: 4 }),
+            ],
+            vec![route(0, None)],
+            vec![number_slot(0, 0), number_slot(1, 1)],
+            Vec::new(),
+            vec![comparison, const_update(1, 0, 1, 2)],
+            vec![(StateId(0), "store.left"), (StateId(1), "store.right")],
+            Vec::new(),
+            vec![(FieldId(0), "store.same")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.same").unwrap(),
+        Value::Bool(true)
+    );
+    session.apply(event(1, 0, None)).unwrap();
+    assert_eq!(
+        session.root_value_current("store.same").unwrap(),
+        Value::Bool(false)
+    );
+}
+
+#[test]
+fn fully_qualified_state_lookup_wins_over_an_unrelated_field_local_name() {
+    let mut session = Session::new(
+        plan(
+            RootOutputDemand::All,
+            vec![
+                constant(0, PlanConstantValue::Number { value: 1 }),
+                constant(1, PlanConstantValue::Number { value: 0 }),
+            ],
+            Vec::new(),
+            vec![number_slot(0, 0)],
+            Vec::new(),
+            vec![derived(
+                0,
+                0,
+                vec![ValueRef::Constant(PlanConstantId(1))],
+                Some(PlanRowExpression::Constant {
+                    constant_id: PlanConstantId(1),
+                }),
+            )],
+            vec![(StateId(0), "store.draft_revision")],
+            Vec::new(),
+            vec![(FieldId(0), "revision.draft_revision")],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.draft_revision").unwrap(),
+        Value::Number(1)
+    );
+    assert_eq!(
+        session.root_value_current("draft_revision").unwrap(),
+        Value::Number(1)
+    );
+    assert_eq!(
+        session
+            .root_value_current("revision.draft_revision")
+            .unwrap(),
+        Value::Number(0)
+    );
 }
 
 #[test]
@@ -713,6 +807,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
             fields: Vec::new(),
             typed_fields: Vec::new(),
             row_lookup_field: Some("key".into()),
+            row_lookup_field_id: Some(FieldId(10)),
         },
     };
     let select_update = PlanOp {
@@ -1262,6 +1357,111 @@ fn selected_demand_stays_current_without_eager_unrequested_work() {
         session.snapshot().unwrap().fields[&FieldId(0)],
         Value::Number(2)
     );
+}
+
+#[test]
+fn deterministic_work_budget_bounds_startup_without_affecting_unbounded_sessions() {
+    let make_plan = || {
+        plan(
+            RootOutputDemand::Selected(vec![FieldId(0)]),
+            vec![constant(0, PlanConstantValue::Number { value: 1 })],
+            Vec::new(),
+            vec![number_slot(0, 0)],
+            Vec::new(),
+            vec![derived(
+                0,
+                0,
+                vec![ValueRef::State(StateId(0))],
+                Some(PlanRowExpression::Field {
+                    input: ValueRef::State(StateId(0)),
+                }),
+            )],
+            vec![(StateId(0), "count")],
+            Vec::new(),
+            vec![(FieldId(0), "current")],
+        )
+    };
+
+    Session::new(make_plan(), SessionOptions::default())
+        .expect("trusted sessions remain unbounded by default");
+    let error = Session::new(
+        make_plan(),
+        SessionOptions {
+            max_work_units_per_transaction: Some(0),
+            ..SessionOptions::default()
+        },
+    )
+    .err()
+    .expect("a zero-unit startup budget must fail closed");
+    assert_eq!(
+        error,
+        Error::WorkBudgetExceeded {
+            limit: 0,
+            attempted: 1,
+        }
+    );
+}
+
+#[test]
+fn source_turn_work_budget_rolls_back_authority_and_current_outputs() {
+    let read_update = PlanOp {
+        id: PlanOpId(2),
+        kind: PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::ReadPath,
+            ordered_inputs: Vec::new(),
+            source_payload_field: None,
+            update_constant_id: None,
+            source_guard: None,
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0)), ValueRef::Field(FieldId(0))],
+        output: Some(ValueRef::State(StateId(1))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let mut session = Session::new(
+        plan(
+            RootOutputDemand::Selected(vec![FieldId(1)]),
+            vec![constant(0, PlanConstantValue::Number { value: 1 })],
+            vec![route(0, None)],
+            vec![number_slot(0, 0), number_slot(1, 0)],
+            Vec::new(),
+            vec![
+                derived(
+                    0,
+                    0,
+                    vec![ValueRef::State(StateId(0))],
+                    Some(PlanRowExpression::Field {
+                        input: ValueRef::State(StateId(0)),
+                    }),
+                ),
+                derived(
+                    1,
+                    1,
+                    vec![ValueRef::State(StateId(1))],
+                    Some(PlanRowExpression::Field {
+                        input: ValueRef::State(StateId(1)),
+                    }),
+                ),
+                read_update,
+            ],
+            vec![(StateId(0), "source"), (StateId(1), "destination")],
+            Vec::new(),
+            vec![(FieldId(0), "source_value"), (FieldId(1), "current")],
+        ),
+        SessionOptions {
+            max_work_units_per_transaction: Some(4),
+            ..SessionOptions::default()
+        },
+    )
+    .expect("four work units admit the initial currentness barrier");
+    let before = session.snapshot().unwrap();
+
+    let error = session
+        .apply(event(1, 0, None))
+        .expect_err("the update plus currentness barrier must exceed four units");
+    assert!(matches!(error, Error::WorkBudgetExceeded { limit: 4, .. }));
+    assert_eq!(session.snapshot().unwrap(), before);
 }
 
 #[test]
@@ -2030,6 +2230,46 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
     assert_eq!(response["request_count"], Value::Number(1));
 }
 
+#[test]
+fn source_payload_text_to_number_executes_the_typed_conversion() {
+    let machine = boon_compiler::compile_source_text_to_machine_plan(
+        "source-text-to-number-executor.bn",
+        r#"
+store: [
+    input: SOURCE
+    value:
+        0 |> HOLD value {
+            input.amount |> THEN {
+                input.amount |> Text/to_number()
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let source = source_id(&machine, "store.input");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([("amount".to_owned(), Value::Text("42".to_owned()))]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        Value::Number(42)
+    );
+}
+
 fn typed_passkey_effect_machine() -> MachinePlan {
     boon_compiler::compile_source_text_to_machine_plan(
         "typed-passkey-effects-executor.bn",
@@ -2118,7 +2358,7 @@ store: [
 effects: [
     register_passkey: [
         on: store.register
-        perform: Passkey/register(
+        perform: DevelopmentPasskey/register(
             workspace_id: store.workspace_id
             account_id: store.account_id
             credential_count: store.credential_count
@@ -2133,7 +2373,7 @@ effects: [
     ]
     authenticate_passkey: [
         on: store.authenticate
-        perform: Passkey/authenticate(
+        perform: DevelopmentPasskey/authenticate(
             account_id: store.account_id
             credential_count: store.credential_count
             simulation: store.simulation
@@ -2389,6 +2629,26 @@ fn correlated_effect_completion_rejects_wrong_variant_and_shape_atomically() {
 }
 
 #[test]
+fn correlated_effect_result_source_rejects_external_dispatch() {
+    let machine = typed_passkey_effect_machine();
+    let result_source = source_id(&machine, "store.registration_succeeded");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let error = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: result_source,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::InvalidEvent(detail)
+            if detail.contains("reserved for correlated host-effect completion")
+    ));
+}
+
+#[test]
 fn identical_effect_intents_on_distinct_source_turns_have_distinct_identities() {
     let machine = typed_passkey_effect_machine();
     let register = source_id(&machine, "store.register");
@@ -2489,4 +2749,233 @@ fn reconciliation_completion_routes_result_after_session_restart() {
         snapshot.states[&state_id(&machine, "store.result_account_id")],
         Value::Text("restored-account".to_owned())
     );
+}
+
+#[test]
+fn generated_plan_restores_bare_root_latest_as_its_only_scalar_authority() {
+    let machine = boon_compiler::compile_source_text_to_machine_plan(
+        "root-latest-memory-executor.bn",
+        r#"
+store: [
+    pulse: SOURCE
+    count:
+        LATEST {
+            0
+            pulse |> THEN { count + 1 }
+        }
+    transient:
+        LATEST {
+            pulse |> THEN { count + 10 }
+        }
+    derived: count + 20
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let pulse = source_id(&machine, "store.pulse");
+    let count = state_id(&machine, "store.count");
+    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: pulse,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    let authority = session.authority_snapshot().unwrap();
+    assert_eq!(authority.states.len(), 1);
+    assert_eq!(authority.states[&count].value, Value::Number(1));
+    assert!(authority.states[&count].touched);
+
+    let mut restored = SessionBuilder::new(machine, SessionOptions::default())
+        .unwrap()
+        .restore(authority)
+        .build()
+        .unwrap();
+    assert_eq!(
+        restored.root_value_current("store.count").unwrap(),
+        Value::Number(1)
+    );
+}
+
+#[test]
+fn list_append_reads_pre_turn_authority_and_skips_duplicate_candidate() {
+    let machine = boon_compiler::compile_source_text_to_machine_plan(
+        "unique-append-executor.bn",
+        r#"
+store: [
+    add: SOURCE
+    candidate:
+        add |> THEN {
+            entries
+            |> List/any(entry, if:
+                entry.id == add.text
+            )
+            |> WHEN {
+                True => SKIP
+                False => [
+                    id: add.text
+                ]
+            }
+        }
+    entries:
+        LIST {}
+        |> List/append(item: candidate)
+        |> List/map(entry, new: entry_view(entry: entry))
+]
+
+FUNCTION entry_view(entry) {
+[
+    id: entry.id
+]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    assert!(machine.persistence.memory.is_empty());
+    assert_eq!(machine.persistence.lists.len(), 1);
+    let add = source_id(&machine, "store.add");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let event = |sequence, text: &str| SourceEvent {
+        sequence,
+        source: add,
+        target: None,
+        payload: SourcePayload {
+            text: Some(text.to_owned()),
+            ..SourcePayload::default()
+        },
+    };
+
+    let first = session.apply(event(1, "alpha")).unwrap();
+    assert!(first.authority_deltas.iter().any(|delta| matches!(
+        delta,
+        AuthorityDelta::ReplaceList { .. } | AuthorityDelta::InsertRow { .. }
+    )));
+    let duplicate = session.apply(event(2, "alpha")).unwrap();
+    assert!(duplicate.authority_deltas.iter().all(|delta| !matches!(
+        delta,
+        AuthorityDelta::ReplaceList { .. } | AuthorityDelta::InsertRow { .. }
+    )));
+    assert_eq!(
+        session
+            .authority_snapshot()
+            .unwrap()
+            .lists
+            .values()
+            .next()
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+
+    session.apply(event(3, "beta")).unwrap();
+    assert_eq!(
+        session
+            .authority_snapshot()
+            .unwrap()
+            .lists
+            .values()
+            .next()
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn list_append_record_transform_reads_current_source_payload_fields() {
+    let machine = boon_compiler::compile_source_text_to_machine_plan(
+        "append-source-payload-fields-executor.bn",
+        r#"
+store: [
+    completed: SOURCE
+    append_token:
+        LATEST {
+            completed |> THEN { completed.digest }
+        }
+    revisions:
+        LIST {}
+        |> List/append(item: append_token |> THEN {
+            [
+                digest: append_token
+                compiler: completed.compiler
+                target: completed.target
+            ]
+        })
+        |> List/map(revision, new: revision_view(revision: revision))
+]
+
+FUNCTION revision_view(revision) {
+[
+    digest: revision.digest
+    compiler: revision.compiler
+    target: revision.target
+]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let completed = source_id(&machine, "store.completed");
+    let append = machine
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::ListOperation {
+                operation_kind: PlanListOperationKind::Append,
+                append,
+                ..
+            } => append.as_ref(),
+            _ => None,
+        })
+        .expect("append descriptor");
+    let field_id = |name: &str| {
+        append
+            .fields
+            .iter()
+            .find(|field| field.name == name)
+            .and_then(|field| field.field_id)
+            .expect("append field id")
+    };
+    let digest = field_id("digest");
+    let compiler = field_id("compiler");
+    let target = field_id("target");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: completed,
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([
+                    ("digest".to_owned(), Value::Text("sha-123".to_owned())),
+                    ("compiler".to_owned(), Value::Text("boon-test".to_owned())),
+                    ("target".to_owned(), Value::Text("software".to_owned())),
+                ]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+
+    let authority = session.authority_snapshot().unwrap();
+    let row = authority
+        .lists
+        .values()
+        .next()
+        .and_then(|list| list.rows.first())
+        .expect("persisted revision row");
+    assert_eq!(row.fields[&digest], Value::Text("sha-123".to_owned()));
+    assert_eq!(row.fields[&compiler], Value::Text("boon-test".to_owned()));
+    assert_eq!(row.fields[&target], Value::Text("software".to_owned()));
 }

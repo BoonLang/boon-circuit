@@ -2,10 +2,11 @@ use crate::architecture::collect_architecture_evidence;
 use crate::report_v2::{
     AggregateGateResult, AggregateIdentity, AggregateMode, AggregateReport, AggregateReportKind,
     BoundedId, CheckOutcome, ChildValidation, DetailText, ExpectedIdentity, FORMAT_VERSION,
-    GateEvidence, GateName, GateReport, ManifestIdentity, ProducerEvidence, ReportStatus,
-    ToolResult, check, current_identity, detail, empty_evidence, gate_report, load_manifest,
-    make_report_id, make_run_id, protocol_name, read_gate_report, read_producer_envelope,
-    report_file_metadata, unix_time_ms, workspace_path, write_aggregate_report, write_gate_report,
+    GateEvidence, GateName, GateReport, GateRunner, ManifestGate, ManifestIdentity,
+    ProducerEvidence, ReportStatus, ToolResult, VerifierProfile, check, current_identity, detail,
+    empty_evidence, gate_report, load_manifest, make_report_id, make_run_id, protocol_name,
+    read_gate_report, read_producer_envelope, report_file_metadata, unix_time_ms, workspace_path,
+    write_aggregate_report, write_gate_report,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ pub fn run_gate(
     output_override: Option<PathBuf>,
 ) -> ToolResult<ReportStatus> {
     let (manifest, _) = load_manifest(workspace)?;
-    let entry = manifest.gate(gate);
+    let entry = manifest.gate(&gate);
     let output = output_override.unwrap_or_else(|| workspace_path(workspace, &entry.output));
     remove_file_if_present(&output)?;
     let run_id = std::env::var(RUN_ID_ENV)
@@ -32,10 +33,9 @@ pub fn run_gate(
         .transpose()?
         .unwrap_or(make_run_id(gate.slug())?);
 
-    let report = if gate == GateName::Architecture {
-        architecture_report(workspace, run_id)?
-    } else {
-        product_report(workspace, gate, run_id)?
+    let report = match entry.runner {
+        GateRunner::Architecture => architecture_report(workspace, entry, run_id)?,
+        GateRunner::NativeProduct => product_report(workspace, entry, run_id)?,
     };
     let status = report.status;
     write_gate_report(&output, &report, entry.byte_limit)?;
@@ -43,21 +43,25 @@ pub fn run_gate(
     Ok(status)
 }
 
-fn architecture_report(workspace: &Path, run_id: BoundedId) -> ToolResult<GateReport> {
+fn architecture_report(
+    workspace: &Path,
+    entry: &ManifestGate,
+    run_id: BoundedId,
+) -> ToolResult<GateReport> {
     let expected = current_identity(workspace)?;
     let evidence = collect_architecture_evidence(workspace);
     let (status, blockers) = status_and_blockers(&evidence);
     Ok(gate_report(
-        GateName::Architecture,
-        run_id,
-        expected,
-        status,
-        evidence,
-        blockers,
+        entry, run_id, expected, status, evidence, blockers,
     )?)
 }
 
-fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolResult<GateReport> {
+fn product_report(
+    workspace: &Path,
+    entry: &ManifestGate,
+    run_id: BoundedId,
+) -> ToolResult<GateReport> {
+    let gate = &entry.gate;
     let before = current_identity(workspace)?;
     let scratch = workspace.join("target/reports/report-v2/.producer");
     fs::create_dir_all(&scratch)?;
@@ -81,7 +85,7 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
             build_result.log_tail
         );
         return failing_product_report(
-            gate,
+            entry,
             run_id,
             current,
             ProducerEvidence {
@@ -126,6 +130,10 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
         "--source-digest",
         before.source.workspace_digest.as_str(),
     ]);
+    append_profile_arguments(
+        &mut producer,
+        entry.profile.as_ref().expect("product profile"),
+    );
     configure_product_scheduler(&mut producer);
     let process_result = run_logged(&mut producer, &producer_log, PRODUCER_TIMEOUT)?;
     let producer_metadata = ProducerEvidence {
@@ -138,7 +146,7 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
     if before != after {
         remove_file_if_present(&evidence_path)?;
         return failing_product_report(
-            gate,
+            entry,
             run_id,
             after,
             producer_metadata,
@@ -152,7 +160,7 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
             timeout_suffix(process_result.timed_out),
             process_result.log_tail
         );
-        return failing_product_report(gate, run_id, after, producer_metadata, message);
+        return failing_product_report(entry, run_id, after, producer_metadata, message);
     }
 
     let envelope = match read_producer_envelope(&evidence_path) {
@@ -160,7 +168,7 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
         Err(error) => {
             remove_file_if_present(&evidence_path)?;
             return failing_product_report(
-                gate,
+                entry,
                 run_id,
                 after,
                 producer_metadata,
@@ -169,9 +177,9 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
         }
     };
     remove_file_if_present(&evidence_path)?;
-    if let Err(error) = envelope.validate_for(gate, &run_id, &after.source) {
+    if let Err(error) = envelope.validate_for(entry, &run_id, &after.source) {
         return failing_product_report(
-            gate,
+            entry,
             run_id,
             after,
             producer_metadata,
@@ -188,7 +196,7 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
     ));
     let (status, blockers) = status_and_blockers(&evidence);
     let candidate = match gate_report(
-        gate,
+        entry,
         run_id.clone(),
         after.clone(),
         status,
@@ -198,7 +206,7 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
         Ok(report) => report,
         Err(error) => {
             return failing_product_report(
-                gate,
+                entry,
                 run_id,
                 after,
                 ProducerEvidence {
@@ -211,9 +219,9 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
             );
         }
     };
-    if let Err(error) = candidate.validate_artifacts(workspace) {
+    if let Err(error) = candidate.validate_artifacts(workspace, entry.sidecar_byte_limit) {
         return failing_product_report(
-            gate,
+            entry,
             run_id,
             after,
             ProducerEvidence {
@@ -226,6 +234,61 @@ fn product_report(workspace: &Path, gate: GateName, run_id: BoundedId) -> ToolRe
         );
     }
     Ok(candidate)
+}
+
+fn append_profile_arguments(command: &mut Command, profile: &VerifierProfile) {
+    command
+        .arg("--profile")
+        .arg(profile.id.as_str())
+        .arg("--profile-digest")
+        .arg(profile.digest().as_str());
+    for argument in &profile.arguments {
+        command
+            .arg(argument.flag.as_str())
+            .arg(argument.value.as_str());
+    }
+    let requirements = &profile.proof_requirements;
+    if let Some(scenario) = &requirements.scenario {
+        command
+            .arg("--scenario-proof")
+            .arg(scenario.path.as_str())
+            .arg("--require-semantic-scenario")
+            .arg(if scenario.semantic_assertions {
+                "true"
+            } else {
+                "false"
+            });
+    }
+    if let Some(budget) = &requirements.budget {
+        command
+            .arg("--budget-proof")
+            .arg(budget.path.as_str())
+            .arg("--required-budget-metrics")
+            .arg(
+                budget
+                    .metrics
+                    .iter()
+                    .map(BoundedId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+    }
+    if let Some(state_root) = &requirements.state_root {
+        command
+            .arg("--state-root-policy")
+            .arg(state_root.policy.as_str())
+            .arg("--restart-required")
+            .arg(if state_root.restart_required {
+                "true"
+            } else {
+                "false"
+            });
+    }
+    for checkpoint in &requirements.checkpoints {
+        command.arg("--required-checkpoint").arg(
+            serde_json::to_string(checkpoint).expect("validated checkpoint requirement serializes"),
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -250,7 +313,7 @@ fn configure_product_scheduler(command: &mut Command) {
 fn configure_product_scheduler(_command: &mut Command) {}
 
 fn failing_product_report(
-    gate: GateName,
+    entry: &ManifestGate,
     run_id: BoundedId,
     expected: ExpectedIdentity,
     producer: ProducerEvidence,
@@ -264,7 +327,7 @@ fn failing_product_report(
     )]);
     evidence.producer = Some(producer);
     Ok(gate_report(
-        gate,
+        entry,
         run_id,
         expected,
         ReportStatus::Fail,
@@ -361,7 +424,7 @@ pub fn run_verify_all(
         .iter()
         .any(|entry| output == workspace_path(workspace, &entry.output))
     {
-        return Err("aggregate output must not overwrite one of the six gate reports".into());
+        return Err("aggregate output must not overwrite a gate report".into());
     }
     write_aggregate_report(&output, &aggregate, manifest.aggregate_byte_limit)?;
     println!("wrote {} ({})", output.display(), status_name(status));
@@ -381,14 +444,14 @@ fn validate_child_report(
             .validate_current(entry, expected)
             .map_err(|error| error.to_string())?;
         report
-            .validate_artifacts(workspace)
+            .validate_artifacts(workspace, entry.sidecar_byte_limit)
             .map_err(|error| error.to_string())?;
         Ok((metadata, report))
     })();
     match validation {
         Ok((metadata, report)) => AggregateGateResult {
-            gate: entry.gate,
-            verifier: entry.verifier,
+            gate: entry.gate.clone(),
+            verifier: entry.verifier.clone(),
             report: Some(metadata),
             validation: ChildValidation::Valid,
             outcome: Some(report.status),
@@ -397,8 +460,8 @@ fn validate_child_report(
             issue: None,
         },
         Err(error) => AggregateGateResult {
-            gate: entry.gate,
-            verifier: entry.verifier,
+            gate: entry.gate.clone(),
+            verifier: entry.verifier.clone(),
             report: report_file_metadata(workspace, &entry.output, entry.byte_limit).ok(),
             validation: ChildValidation::Invalid,
             outcome: None,

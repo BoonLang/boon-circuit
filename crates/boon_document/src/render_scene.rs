@@ -896,6 +896,49 @@ pub fn render_scene_items_for_touched_nodes(
     render_scene_items_for_nodes(frame, width, height, Some(nodes))
 }
 
+pub fn render_scene_entries_for_touched_nodes_with_retained_keys(
+    frame: &LayoutFrame,
+    hot_ids: &DocumentHotIdTable,
+    retained_layout_keys: &DocumentRetainedLayoutKeyTable,
+    width: u32,
+    height: u32,
+    columns: &mut impl RenderTextColumnMeasurer,
+    nodes: &BTreeSet<DocumentNodeId>,
+) -> Result<
+    (
+        Vec<RenderSceneItem>,
+        Vec<RenderVisualPrimitive>,
+        Vec<RenderTextRun>,
+    ),
+    PatchApplyError,
+> {
+    let mut items = render_scene_items_for_touched_nodes(frame, width, height, nodes);
+    let mut retained_chunk_ids_by_node = BTreeMap::new();
+    for item in &mut items {
+        let retained_chunk_id =
+            checked_retained_chunk_id_for_item(item, hot_ids, retained_layout_keys)?;
+        item.retained_chunk_id = retained_chunk_id.clone();
+        retained_chunk_ids_by_node.insert(item.node.clone(), retained_chunk_id);
+    }
+    let mut visual_primitives =
+        render_visual_primitives_for_touched_nodes(frame, width, height, columns, nodes);
+    for primitive in &mut visual_primitives {
+        if primitive.node.0 == "__viewport__" || render_scene_synthetic_node(&primitive.node) {
+            continue;
+        }
+        let retained_chunk_id =
+            retained_chunk_ids_by_node
+                .get(&primitive.node)
+                .ok_or_else(|| PatchApplyError::StaleReference {
+                    reference_kind: "render_scene_primitive_retained_chunk",
+                    id: primitive.node.clone(),
+                })?;
+        primitive.retained_chunk_id = retained_chunk_id.clone();
+    }
+    let text_runs = render_text_runs_for_touched_nodes(frame, width, height, columns, nodes);
+    Ok((items, visual_primitives, text_runs))
+}
+
 fn render_scene_items_for_nodes(
     frame: &LayoutFrame,
     width: u32,

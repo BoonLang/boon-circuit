@@ -503,7 +503,7 @@ fn document_batch_accepts_ui_semantic_change_batch() {
                 UiSemanticChange::InsertNode {
                     parent: DocumentNodeId("root".to_owned()),
                     index: 0,
-                    node: node("label", DocumentNodeKind::Text, None),
+                    node: Box::new(node("label", DocumentNodeKind::Text, None)),
                 },
                 UiSemanticChange::SetText {
                     id: DocumentNodeId("label".to_owned()),

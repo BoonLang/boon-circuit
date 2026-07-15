@@ -809,12 +809,14 @@ fn add_persistence_inspector(frame: &mut DocumentFrame, state: &PersistenceUiSta
                         |bytes| format!("{bytes} bytes"),
                     );
                     format!(
-                        "e{} t{} | {} scalar, {} list, {} rows, {bytes}",
+                        "e{} t{} | {} scalar, {} list, {} rows, {} artifacts / {} bytes, {bytes}",
                         stored.epoch,
                         stored.through_turn_sequence,
                         stored.scalar_count,
                         stored.list_count,
-                        stored.row_count
+                        stored.row_count,
+                        stored.content_artifact_count,
+                        stored.content_artifact_bytes
                     )
                 },
             );

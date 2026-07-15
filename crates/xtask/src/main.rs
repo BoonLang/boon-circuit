@@ -3,72 +3,8 @@ mod gates;
 mod report_v2;
 mod shaders;
 
-use report_v2::{GateName, ReportStatus, ToolResult};
+use report_v2::{GateName, HandoffManifest, ReportStatus, ToolResult, load_manifest};
 use std::path::{Path, PathBuf};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublicCommand {
-    Shaders,
-    VerifyArchitecture,
-    VerifyCounterDev,
-    VerifyTodomvcPhysical,
-    VerifyCells,
-    VerifyNovywave,
-    VerifyNegative,
-    VerifyAll,
-}
-
-impl PublicCommand {
-    const ALL: [Self; 8] = [
-        Self::Shaders,
-        Self::VerifyArchitecture,
-        Self::VerifyCounterDev,
-        Self::VerifyTodomvcPhysical,
-        Self::VerifyCells,
-        Self::VerifyNovywave,
-        Self::VerifyNegative,
-        Self::VerifyAll,
-    ];
-
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "shaders" => Some(Self::Shaders),
-            "verify-architecture" => Some(Self::VerifyArchitecture),
-            "verify-counter-dev" => Some(Self::VerifyCounterDev),
-            "verify-todomvc-physical" => Some(Self::VerifyTodomvcPhysical),
-            "verify-cells" => Some(Self::VerifyCells),
-            "verify-novywave" => Some(Self::VerifyNovywave),
-            "verify-negative" => Some(Self::VerifyNegative),
-            "verify-all" => Some(Self::VerifyAll),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Shaders => "shaders",
-            Self::VerifyArchitecture => "verify-architecture",
-            Self::VerifyCounterDev => "verify-counter-dev",
-            Self::VerifyTodomvcPhysical => "verify-todomvc-physical",
-            Self::VerifyCells => "verify-cells",
-            Self::VerifyNovywave => "verify-novywave",
-            Self::VerifyNegative => "verify-negative",
-            Self::VerifyAll => "verify-all",
-        }
-    }
-
-    fn gate(self) -> Option<GateName> {
-        match self {
-            Self::VerifyArchitecture => Some(GateName::Architecture),
-            Self::VerifyCounterDev => Some(GateName::CounterDev),
-            Self::VerifyTodomvcPhysical => Some(GateName::TodomvcPhysical),
-            Self::VerifyCells => Some(GateName::Cells),
-            Self::VerifyNovywave => Some(GateName::Novywave),
-            Self::VerifyNegative => Some(GateName::Negative),
-            Self::Shaders | Self::VerifyAll => None,
-        }
-    }
-}
 
 #[derive(Debug, Eq, PartialEq)]
 enum ParsedCommand {
@@ -76,7 +12,7 @@ enum ParsedCommand {
         check: bool,
     },
     Gate {
-        command: PublicCommand,
+        gate: GateName,
         report: Option<PathBuf>,
     },
     VerifyAll {
@@ -95,20 +31,21 @@ fn main() {
 
 fn run() -> ToolResult<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let parsed = parse_command(&args)?;
     let workspace = workspace_root();
+    let (manifest, _) = load_manifest(&workspace)?;
+    let parsed = parse_command(&args, &manifest)?;
     let status = match parsed {
         ParsedCommand::Help => {
-            print_help();
+            print_help(&manifest);
             return Ok(());
         }
         ParsedCommand::Shaders { check } => {
             shaders::run(&workspace, check)?;
             return Ok(());
         }
-        ParsedCommand::Gate { command, report } => gates::run_gate(
+        ParsedCommand::Gate { gate, report } => gates::run_gate(
             &workspace,
-            command.gate().expect("gate command has a gate"),
+            gate,
             report.map(|path| resolve_path(&workspace, path)),
         )?,
         ParsedCommand::VerifyAll {
@@ -126,15 +63,13 @@ fn run() -> ToolResult<()> {
     Ok(())
 }
 
-fn parse_command(args: &[String]) -> Result<ParsedCommand, String> {
+fn parse_command(args: &[String], manifest: &HandoffManifest) -> Result<ParsedCommand, String> {
     if args.is_empty() || matches!(args, [flag] if flag == "-h" || flag == "--help") {
         return Ok(ParsedCommand::Help);
     }
     let command_name = &args[0];
-    let command = PublicCommand::parse(command_name)
-        .ok_or_else(|| format!("unknown xtask command {command_name}"))?;
-    match command {
-        PublicCommand::Shaders => {
+    match command_name.as_str() {
+        "shaders" => {
             let check = match &args[1..] {
                 [] => false,
                 [flag] if flag == "--check" => true,
@@ -142,7 +77,7 @@ fn parse_command(args: &[String]) -> Result<ParsedCommand, String> {
             };
             Ok(ParsedCommand::Shaders { check })
         }
-        PublicCommand::VerifyAll => {
+        command if command == manifest.aggregate.as_str() => {
             let mut check_existing = false;
             let mut report = None;
             parse_verify_options(&args[1..], true, &mut check_existing, &mut report)?;
@@ -151,12 +86,15 @@ fn parse_command(args: &[String]) -> Result<ParsedCommand, String> {
                 report,
             })
         }
-        gate => {
+        command => {
+            let entry = manifest
+                .gate_for_verifier(command)
+                .ok_or_else(|| format!("unknown xtask command {command_name}"))?;
             let mut unused_check_existing = false;
             let mut report = None;
             parse_verify_options(&args[1..], false, &mut unused_check_existing, &mut report)?;
             Ok(ParsedCommand::Gate {
-                command: gate,
+                gate: entry.gate.clone(),
                 report,
             })
         }
@@ -205,11 +143,13 @@ fn resolve_path(workspace: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-fn print_help() {
+fn print_help(manifest: &HandoffManifest) {
     println!("Boon Circuit tooling");
-    for command in PublicCommand::ALL {
-        println!("  {}", command.as_str());
+    println!("  shaders");
+    for gate in &manifest.gates {
+        println!("  {}", gate.verifier.as_str());
     }
+    println!("  {}", manifest.aggregate.as_str());
 }
 
 #[cfg(test)]

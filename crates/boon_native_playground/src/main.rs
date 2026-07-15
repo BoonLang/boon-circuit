@@ -1,3 +1,4 @@
+mod budget;
 mod catalog;
 mod compile;
 mod desktop;
@@ -8,6 +9,7 @@ mod language;
 #[cfg(target_os = "linux")]
 mod native_input;
 mod observer;
+mod passkey_simulator;
 mod preview;
 mod proof;
 mod protocol;

@@ -417,6 +417,7 @@ fn layout_subtree_matches_whole_frame_row_geometry() {
         y: 0.0,
         available_width: 300.0,
         available_height: 80.0,
+        viewport_width: 300.0,
         text: &mut subtree_text,
         capabilities: RenderCapabilities::fake_portable(),
     });

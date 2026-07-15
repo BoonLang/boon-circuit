@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/boon_effect_schema",
     "crates/boon_example_manifest",
     "crates/boon_parser",
     "crates/boon_typecheck",
@@ -27,6 +28,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
+boon_effect_schema = { path = "crates/boon_effect_schema" }
 boon_example_manifest = { path = "crates/boon_example_manifest" }
 boon_parser = { path = "crates/boon_parser" }
 boon_typecheck = { path = "crates/boon_typecheck" }
@@ -45,6 +47,7 @@ boon_native_app_window = { path = "crates/boon_native_app_window" }
 app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "6aec9831f281df355736df28a4c3aacdef7cf8a1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+ciborium = "0.2.2"
 toml = "0.9"
 web-time = "1.1.0"
 sha2 = "0.10"
@@ -59,6 +62,7 @@ image = { version = "0.24.9", default-features = false, features = ["jpeg", "png
 minicbor = { version = "2.2.2", features = ["std"] }
 open = "5.3"
 redb = "4.1.0"
+uuid = { version = "1.23", features = ["v4"] }
 resvg = { version = "0.47.0", default-features = false }
 wgpu = "=29.0.1"
 glyphon = "=0.11.0"

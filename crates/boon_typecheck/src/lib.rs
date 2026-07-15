@@ -462,89 +462,84 @@ struct HostEffectSignature {
 }
 
 fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
-    let text = || Type::Text;
-    let number = || Type::Number;
-    let boolean = || true_false_type();
-    let tagged = |tag: &str, fields: Vec<(&str, Type)>| Variant::Tagged {
-        tag: tag.to_owned(),
-        fields: ObjectShape::from_ordered_fields(
-            fields.into_iter().map(|(name, ty)| (name.to_owned(), ty)),
-            false,
-        ),
+    let spec = boon_effect_schema::host_effect_spec(operation)?;
+    let schema = spec.durable_schema?;
+    if spec.result_policy != boon_effect_schema::ResultPolicySpec::CorrelatedSource {
+        return None;
+    }
+    let boon_effect_schema::ValueType::Record {
+        fields,
+        open: false,
+    } = &schema.intent
+    else {
+        return None;
     };
-    let (intent_fields, variants) = match operation {
-        "Passkey/register" => (
-            vec![
-                ("workspace_id".to_owned(), text()),
-                ("account_id".to_owned(), text()),
-                ("credential_count".to_owned(), number()),
-                ("simulation".to_owned(), passkey_simulation_type()),
-            ],
-            vec![
-                tagged(
-                    "RegistrationSucceeded",
-                    vec![
-                        ("account_id", text()),
-                        ("credential_id", text()),
-                        ("label", text()),
-                    ],
-                ),
-                tagged("RegistrationCancelled", Vec::new()),
-                tagged(
-                    "RegistrationFailed",
-                    vec![
-                        ("code", text()),
-                        ("message", text()),
-                        ("retryable", boolean()),
-                    ],
-                ),
-                tagged(
-                    "DuplicateCredential",
-                    vec![("account_id", text()), ("credential_id", text())],
-                ),
-            ],
-        ),
-        "Passkey/authenticate" => (
-            vec![
-                ("account_id".to_owned(), text()),
-                ("credential_count".to_owned(), number()),
-                ("simulation".to_owned(), passkey_simulation_type()),
-            ],
-            vec![
-                tagged(
-                    "AuthenticationSucceeded",
-                    vec![("account_id", text()), ("credential_id", text())],
-                ),
-                tagged("AuthenticationCancelled", Vec::new()),
-                tagged(
-                    "AuthenticationFailed",
-                    vec![
-                        ("code", text()),
-                        ("message", text()),
-                        ("retryable", boolean()),
-                    ],
-                ),
-            ],
-        ),
-        _ => return None,
-    };
+    let intent_fields = fields
+        .iter()
+        .map(|field| {
+            (
+                field.name.to_owned(),
+                effect_schema_type_to_type(&field.value_type),
+            )
+        })
+        .collect::<Vec<_>>();
     Some(HostEffectSignature {
         intent_type: Type::Object(ObjectShape::from_ordered_fields(
             intent_fields.iter().cloned(),
             false,
         )),
         intent_fields,
-        result_type: Type::VariantSet(variants),
+        result_type: effect_schema_type_to_type(&schema.result),
     })
 }
 
-fn passkey_simulation_type() -> Type {
-    Type::VariantSet(
-        ["Success", "Cancel", "Failure", "Duplicate"]
-            .into_iter()
-            .map(|tag| Variant::Tag(tag.to_owned()))
-            .collect(),
-    )
+fn effect_schema_type_to_type(value_type: &boon_effect_schema::ValueType) -> Type {
+    match value_type {
+        boon_effect_schema::ValueType::Bool => true_false_type(),
+        boon_effect_schema::ValueType::Number => Type::Number,
+        boon_effect_schema::ValueType::Text => Type::Text,
+        boon_effect_schema::ValueType::Bytes { fixed_len } => {
+            Type::Bytes(fixed_len.map_or(BytesType::Dynamic, |len| {
+                BytesType::Fixed(
+                    usize::try_from(len).expect("host effect fixed byte length fits usize"),
+                )
+            }))
+        }
+        boon_effect_schema::ValueType::Record { fields, open } => {
+            Type::Object(ObjectShape::from_ordered_fields(
+                fields.iter().map(|field| {
+                    (
+                        field.name.to_owned(),
+                        effect_schema_type_to_type(&field.value_type),
+                    )
+                }),
+                *open,
+            ))
+        }
+        boon_effect_schema::ValueType::Variant { variants } => Type::VariantSet(
+            variants
+                .iter()
+                .map(|variant| {
+                    if variant.fields.is_empty() {
+                        Variant::Tag(variant.tag.to_owned())
+                    } else {
+                        Variant::Tagged {
+                            tag: variant.tag.to_owned(),
+                            fields: ObjectShape::from_ordered_fields(
+                                variant.fields.iter().map(|field| {
+                                    (
+                                        field.name.to_owned(),
+                                        effect_schema_type_to_type(&field.value_type),
+                                    )
+                                }),
+                                false,
+                            ),
+                        }
+                    }
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn host_effect_table(
@@ -4755,14 +4750,16 @@ impl<'a> Checker<'a> {
             }
         }
         for expr in &self.program.expressions {
-            let AstExprKind::Call { function, .. } = &expr.kind else {
-                continue;
+            let operation = match &expr.kind {
+                AstExprKind::Call { function, .. } => function,
+                AstExprKind::Pipe { op, .. } => op,
+                _ => continue,
             };
-            if host_effect_signature(function).is_some() && !perform_expr_ids.contains(&expr.id) {
+            if host_effect_signature(operation).is_some() && !perform_expr_ids.contains(&expr.id) {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     expr.id,
                     format!(
-                        "typed host effect `{function}` may only appear as `effects.<name>.perform`"
+                        "typed host effect `{operation}` may only appear as `effects.<name>.perform`"
                     ),
                 ));
             }
@@ -6692,7 +6689,7 @@ fn when_arm_expr_ids(
             return statement
                 .children
                 .iter()
-                .filter_map(|child| child.expr)
+                .flat_map(|child| statement_update_value_exprs(child, expressions))
                 .collect();
         }
         let nested = when_arm_expr_ids(&statement.children, expr_id, expressions);
@@ -6963,6 +6960,7 @@ fn statement_update_value_exprs(statement: &AstStatement, expressions: &[AstExpr
         if matches!(
             expressions.get(expr_id).map(|expr| &expr.kind),
             Some(AstExprKind::Then { output: None, .. })
+                | Some(AstExprKind::MatchArm { output: None, .. })
         ) {
             let nested = statement
                 .children

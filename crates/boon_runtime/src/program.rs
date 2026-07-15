@@ -9,13 +9,17 @@ use boon_compiler::{
 use boon_document_model::{
     DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor, ScrollRootId, SourceBindingId,
 };
+use boon_persistence::{ContentArtifact, ContentArtifactId, validate_content_artifact};
 use boon_plan::{DocumentConstructor, MachinePlan, OutputContractKind, TargetProfile};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 
 const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const PROGRAM_ARTIFACT_FORMAT: u32 = 1;
+const PROGRAM_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.boon.machine-plan+cbor;version=1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramLimits {
@@ -29,6 +33,7 @@ pub struct ProgramLimits {
     pub max_document_templates: usize,
     pub max_document_materializations: usize,
     pub max_declared_list_capacity: usize,
+    pub max_runtime_work_units_per_transaction: u64,
 }
 
 fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
@@ -44,6 +49,7 @@ fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
             max_document_templates: 2_000,
             max_document_materializations: 128,
             max_declared_list_capacity: 4_096,
+            max_runtime_work_units_per_transaction: 20_000,
         },
     }
 }
@@ -62,6 +68,7 @@ pub enum ProgramDiagnosticPhase {
     Request,
     Compile,
     Capability,
+    Artifact,
     Start,
 }
 
@@ -98,6 +105,10 @@ impl ProgramDiagnostic {
         self.column = column.unwrap_or_default();
         self
     }
+
+    pub fn artifact(revision: u64, message: impl Into<String>) -> Self {
+        Self::new(revision, ProgramDiagnosticPhase::Artifact, message)
+    }
 }
 
 impl fmt::Display for ProgramDiagnostic {
@@ -124,20 +135,35 @@ impl std::error::Error for ProgramDiagnostic {}
 
 #[derive(Clone, Debug)]
 pub struct ProgramArtifact {
+    id: ContentArtifactId,
     revision: u64,
     source_digest: String,
+    plan_digest: String,
     capability_profile: ProgramCapabilityProfile,
     compile_profile: CompileProfile,
     plan: Arc<MachinePlan>,
+    content: Arc<ContentArtifact>,
 }
 
 impl ProgramArtifact {
+    pub fn id(&self) -> ContentArtifactId {
+        self.id
+    }
+
+    pub fn id_text(&self) -> String {
+        self.id.to_string()
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
     pub fn source_digest(&self) -> &str {
         &self.source_digest
+    }
+
+    pub fn plan_digest(&self) -> &str {
+        &self.plan_digest
     }
 
     pub fn capability_profile(&self) -> ProgramCapabilityProfile {
@@ -165,6 +191,158 @@ impl ProgramArtifact {
             ProgramCapabilityProfile::PublicDocument => "public_document",
         }
     }
+
+    pub fn to_content_artifact(&self) -> ContentArtifact {
+        self.content.as_ref().clone()
+    }
+
+    pub fn from_content_artifact(
+        revision: u64,
+        expected_capability: ProgramCapabilityProfile,
+        artifact: ContentArtifact,
+    ) -> Result<Self, ProgramDiagnostic> {
+        decode_program_artifact(revision, expected_capability, artifact)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredProgramArtifact {
+    format: u32,
+    source_digest: String,
+    compiler_id: String,
+    target_profile: TargetProfile,
+    capability_profile: ProgramCapabilityProfile,
+    plan_digest: String,
+    plan: MachinePlan,
+}
+
+fn encode_program_artifact(
+    revision: u64,
+    source_digest: &str,
+    capability_profile: ProgramCapabilityProfile,
+    plan: &MachinePlan,
+) -> Result<ContentArtifact, ProgramDiagnostic> {
+    let plan_digest = boon_plan::plan_sha256(plan).map_err(|error| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })?;
+    let stored = StoredProgramArtifact {
+        format: PROGRAM_ARTIFACT_FORMAT,
+        source_digest: source_digest.to_owned(),
+        compiler_id: COMPILER_ID.to_owned(),
+        target_profile: plan.target_profile,
+        capability_profile,
+        plan_digest,
+        plan: plan.clone(),
+    };
+    let mut bytes = Vec::new();
+    ciborium::ser::into_writer(&stored, &mut bytes).map_err(|error| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            format!("encode immutable program artifact: {error}"),
+        )
+    })?;
+    ContentArtifact::new(PROGRAM_ARTIFACT_MEDIA_TYPE, bytes).map_err(|error| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })
+}
+
+fn decode_program_artifact(
+    revision: u64,
+    expected_capability: ProgramCapabilityProfile,
+    artifact: ContentArtifact,
+) -> Result<ProgramArtifact, ProgramDiagnostic> {
+    validate_content_artifact(&artifact).map_err(|error| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })?;
+    if artifact.media_type != PROGRAM_ARTIFACT_MEDIA_TYPE {
+        return Err(ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            format!(
+                "unsupported program artifact media type `{}`",
+                artifact.media_type
+            ),
+        ));
+    }
+    let stored: StoredProgramArtifact = ciborium::de::from_reader(artifact.bytes.as_slice())
+        .map_err(|error| {
+            ProgramDiagnostic::new(
+                revision,
+                ProgramDiagnosticPhase::Artifact,
+                format!("decode immutable program artifact: {error}"),
+            )
+        })?;
+    if stored.format != PROGRAM_ARTIFACT_FORMAT {
+        return Err(ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            format!("unsupported program artifact format {}", stored.format),
+        ));
+    }
+    if stored.compiler_id != COMPILER_ID {
+        return Err(ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            format!(
+                "program artifact compiler `{}` differs from host compiler `{COMPILER_ID}`",
+                stored.compiler_id
+            ),
+        ));
+    }
+    if stored.target_profile != TargetProfile::SoftwareBounded
+        || stored.plan.target_profile != stored.target_profile
+    {
+        return Err(ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            "program artifact target profile is not software_bounded",
+        ));
+    }
+    if stored.capability_profile != expected_capability {
+        return Err(ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            "program artifact capability profile differs from the requested profile",
+        ));
+    }
+    let actual_plan_digest = boon_plan::plan_sha256(&stored.plan).map_err(|error| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })?;
+    if stored.plan_digest != actual_plan_digest {
+        return Err(ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            "program artifact plan digest does not match its compiled plan",
+        ));
+    }
+    validate_plan(revision, expected_capability, &stored.plan)?;
+    Ok(ProgramArtifact {
+        id: artifact.id,
+        revision,
+        source_digest: stored.source_digest,
+        plan_digest: stored.plan_digest,
+        capability_profile: stored.capability_profile,
+        compile_profile: CompileProfile::default(),
+        plan: Arc::new(stored.plan),
+        content: Arc::new(artifact),
+    })
 }
 
 pub fn compile_program_artifact(
@@ -203,12 +381,28 @@ pub fn compile_program_artifact(
         })
     })?;
     validate_plan(request.revision, request.capability_profile, &compiled.plan)?;
+    let content = encode_program_artifact(
+        request.revision,
+        &source_digest,
+        request.capability_profile,
+        &compiled.plan,
+    )?;
+    let plan_digest = boon_plan::plan_sha256(&compiled.plan).map_err(|error| {
+        ProgramDiagnostic::new(
+            request.revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })?;
     Ok(ProgramArtifact {
+        id: content.id,
         revision: request.revision,
         source_digest,
+        plan_digest,
         capability_profile: request.capability_profile,
         compile_profile: compiled.profile,
         plan: Arc::new(compiled.plan),
+        content: Arc::new(content),
     })
 }
 
@@ -219,9 +413,13 @@ pub struct ProgramSession {
 
 impl ProgramSession {
     fn start(artifact: ProgramArtifact) -> Result<Self, ProgramDiagnostic> {
+        let limits = program_limits(artifact.capability_profile());
         let runtime = LiveRuntime::from_shared_machine_plan(
             Arc::clone(artifact.plan()),
-            SessionOptions::default(),
+            SessionOptions {
+                max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
+                ..SessionOptions::default()
+            },
         )
         .map_err(|error| {
             ProgramDiagnostic::new(
@@ -576,12 +774,21 @@ pub struct ProgramHostRequest {
     pub session: ProgramSessionId,
     pub host: DocumentNodeId,
     pub compile: ProgramCompileRequest,
+    pub artifact_id: Option<ContentArtifactId>,
+    pub persist_artifact: bool,
+}
+
+impl ProgramHostRequest {
+    pub const fn is_artifact_load(&self) -> bool {
+        self.artifact_id.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProgramHostUpdate {
     pub patches: Vec<DocumentPatch>,
     pub requests: Vec<ProgramHostRequest>,
+    pub bootstrap: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -618,7 +825,17 @@ struct ProgramMaterializationRoute {
 #[derive(Clone)]
 struct ProgramProjection {
     session: ProgramSessionId,
+    descriptor: EmbeddedProgramDescriptor,
     mount: bool,
+    parent_children: Vec<DocumentNodeId>,
+    projected: Option<ProjectedProgram>,
+}
+
+#[derive(Clone)]
+struct ProjectedProgram {
+    frame: DocumentFrame,
+    source_routes: BTreeMap<String, ProgramSourceRoute>,
+    materialization_routes: BTreeMap<u64, ProgramMaterializationRoute>,
 }
 
 struct HostedProgram {
@@ -626,6 +843,14 @@ struct HostedProgram {
     controller: ProgramController,
     request_diagnostic: Option<ProgramDiagnostic>,
     latest_request_id: Option<ProgramRequestId>,
+    bootstrapping: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgramDocumentHostStats {
+    pub full_reconcile_count: u64,
+    pub scoped_parent_patch_count: u64,
+    pub scoped_projection_refresh_count: u64,
 }
 
 /// Owns restricted child Sessions and projects them into one retained document.
@@ -636,8 +861,12 @@ pub struct ProgramDocumentHost {
     programs: BTreeMap<ProgramSessionId, HostedProgram>,
     projections: BTreeMap<DocumentNodeId, ProgramProjection>,
     frame: DocumentFrame,
+    parent_focus: Option<DocumentNodeId>,
+    parent_scroll_roots: BTreeMap<ScrollRootId, boon_document_model::ScrollState>,
+    parent_materializations: BTreeSet<u64>,
     source_routes: BTreeMap<String, ProgramSourceRoute>,
     materialization_routes: BTreeMap<u64, ProgramMaterializationRoute>,
+    stats: ProgramDocumentHostStats,
 }
 
 impl ProgramDocumentHost {
@@ -650,8 +879,12 @@ impl ProgramDocumentHost {
             programs: BTreeMap::new(),
             projections: BTreeMap::new(),
             frame: parent.clone(),
+            parent_focus: parent.focus.clone(),
+            parent_scroll_roots: parent.scroll_roots.clone(),
+            parent_materializations: frame_materializations(parent),
             source_routes: BTreeMap::new(),
             materialization_routes: BTreeMap::new(),
+            stats: ProgramDocumentHostStats::default(),
         };
         let update = host.reconcile(parent);
         (host, update.requests)
@@ -661,9 +894,105 @@ impl ProgramDocumentHost {
         &self.frame
     }
 
+    pub fn stats(&self) -> ProgramDocumentHostStats {
+        self.stats
+    }
+
     pub fn reconcile(&mut self, parent: &DocumentFrame) -> ProgramHostUpdate {
-        let mut descriptors =
-            BTreeMap::<ProgramSessionId, Vec<(DocumentNodeId, EmbeddedProgramDescriptor)>>::new();
+        self.reconcile_full(parent)
+    }
+
+    pub fn reconcile_with_parent_patches(
+        &mut self,
+        parent: &DocumentFrame,
+        parent_patches: Vec<DocumentPatch>,
+    ) -> ProgramHostUpdate {
+        if !parent_patches.iter().all(parent_patch_is_nonstructural) {
+            return self.reconcile_full(parent);
+        }
+        self.stats.scoped_parent_patch_count = self
+            .stats
+            .scoped_parent_patch_count
+            .saturating_add(parent_patches.len().try_into().unwrap_or(u64::MAX));
+
+        self.parent_focus.clone_from(&parent.focus);
+        self.parent_scroll_roots.clone_from(&parent.scroll_roots);
+        if parent_patches
+            .iter()
+            .any(|patch| matches!(patch, DocumentPatch::SetListMaterialization { .. }))
+        {
+            self.parent_materializations = frame_materializations(parent);
+        }
+        let mut changed_projection_hosts = BTreeSet::new();
+        let mut program_definition_changed = false;
+        let touched = parent_patches
+            .iter()
+            .filter_map(parent_patch_target)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for id in touched {
+            let Some(mut node) = parent.nodes.get(&id).cloned() else {
+                return self.reconcile_full(parent);
+            };
+            if let Some(projection) = self.projections.get_mut(&id) {
+                if node.kind != DocumentNodeKind::EmbeddedProgram {
+                    return self.reconcile_full(parent);
+                }
+                let Some(descriptor) = node.embedded_program.clone() else {
+                    return self.reconcile_full(parent);
+                };
+                let session = program_session_id(&id, &descriptor);
+                let projection_identity_changed = projection.session != session
+                    || projection.mount != descriptor.mount
+                    || projection.descriptor.capability_profile != descriptor.capability_profile;
+                program_definition_changed |= projection_identity_changed
+                    || !same_current_program_definition(&projection.descriptor, &descriptor);
+                projection.session = session;
+                projection.descriptor = descriptor.clone();
+                projection.mount = descriptor.mount;
+                projection.parent_children = node.children.clone();
+                node.children.extend(projected_root_children(projection));
+                if projection_identity_changed {
+                    changed_projection_hosts.insert(id.clone());
+                }
+            }
+            self.frame.nodes.insert(id, node);
+        }
+
+        let requests = if program_definition_changed {
+            self.schedule_requests()
+        } else {
+            Vec::new()
+        };
+        let mut patches = parent_patches;
+        if !changed_projection_hosts.is_empty() {
+            patches.extend(self.refresh_projections(Some(&changed_projection_hosts)));
+        }
+        self.refresh_metadata_and_routes();
+        ProgramHostUpdate {
+            patches,
+            requests,
+            bootstrap: false,
+        }
+    }
+
+    fn reconcile_full(&mut self, parent: &DocumentFrame) -> ProgramHostUpdate {
+        self.stats.full_reconcile_count = self.stats.full_reconcile_count.saturating_add(1);
+        let previous = self.frame.clone();
+        self.parent_focus.clone_from(&parent.focus);
+        self.parent_scroll_roots.clone_from(&parent.scroll_roots);
+        self.parent_materializations = frame_materializations(parent);
+        self.install_projections(parent);
+        let requests = self.schedule_requests();
+        self.rebuild_composed_frame(parent);
+        ProgramHostUpdate {
+            patches: crate::document::diff_frames(&previous, &self.frame),
+            requests,
+            bootstrap: false,
+        }
+    }
+
+    fn install_projections(&mut self, parent: &DocumentFrame) {
         let mut projections = BTreeMap::new();
         for node in parent.nodes.values() {
             if node.kind != DocumentNodeKind::EmbeddedProgram {
@@ -676,16 +1005,26 @@ impl ProgramDocumentHost {
             projections.insert(
                 node.id.clone(),
                 ProgramProjection {
-                    session: session.clone(),
+                    session,
+                    descriptor: descriptor.clone(),
                     mount: descriptor.mount,
+                    parent_children: node.children.clone(),
+                    projected: None,
                 },
             );
-            descriptors
-                .entry(session)
-                .or_default()
-                .push((node.id.clone(), descriptor));
         }
         self.projections = projections;
+    }
+
+    fn schedule_requests(&mut self) -> Vec<ProgramHostRequest> {
+        let mut descriptors =
+            BTreeMap::<ProgramSessionId, Vec<(DocumentNodeId, EmbeddedProgramDescriptor)>>::new();
+        for (host, projection) in &self.projections {
+            descriptors
+                .entry(projection.session.clone())
+                .or_default()
+                .push((host.clone(), projection.descriptor.clone()));
+        }
         self.programs
             .retain(|session, _| descriptors.contains_key(session));
 
@@ -703,6 +1042,7 @@ impl ProgramDocumentHost {
                     descriptor: descriptor.clone(),
                     request_diagnostic: None,
                     latest_request_id: None,
+                    bootstrapping: false,
                 });
             if let Some((conflicting_host, conflicting)) = descriptors
                 .iter()
@@ -719,42 +1059,211 @@ impl ProgramDocumentHost {
                 ));
                 continue;
             }
-            if same_program_definition(&program.descriptor, &descriptor)
+            if same_current_program_definition(&program.descriptor, &descriptor)
                 && program.controller.latest_requested_revision() >= descriptor.revision
             {
                 continue;
             }
             if program.controller.capability_profile != descriptor.capability_profile {
                 program.controller = ProgramController::new(descriptor.capability_profile);
+                program.bootstrapping = false;
             }
             program.descriptor = descriptor.clone();
-            match program.controller.request(descriptor.revision) {
+            if program.bootstrapping {
+                continue;
+            }
+            let request_descriptor = match bootstrap_descriptor(&descriptor) {
+                Ok(Some(bootstrap))
+                    if program.controller.active().is_none()
+                        && program.controller.latest_requested_revision() == 0 =>
+                {
+                    program.bootstrapping = true;
+                    bootstrap
+                }
+                Ok(_) => descriptor.clone(),
+                Err(diagnostic) => {
+                    program.request_diagnostic = Some(diagnostic);
+                    continue;
+                }
+            };
+            let artifact_id = match descriptor_artifact_id(&request_descriptor) {
+                Ok(artifact_id) => artifact_id,
+                Err(diagnostic) => {
+                    program.request_diagnostic = Some(diagnostic);
+                    continue;
+                }
+            };
+            match program.controller.request(request_descriptor.revision) {
                 Ok(()) => {
                     program.request_diagnostic = None;
                     let request_id =
-                        program_request_id(&self.parent_application, &session, &descriptor);
+                        program_request_id(&self.parent_application, &session, &request_descriptor);
                     program.latest_request_id = Some(request_id.clone());
+                    let units = artifact_id.map_or_else(
+                        || {
+                            vec![RuntimeSourceUnit {
+                                path: "RUN.bn".to_owned(),
+                                source: request_descriptor.source.clone(),
+                            }]
+                        },
+                        |_| Vec::new(),
+                    );
                     requests.push(ProgramHostRequest {
                         request_id,
                         session: session.clone(),
                         host: host.clone(),
                         compile: ProgramCompileRequest {
-                            revision: descriptor.revision,
+                            revision: request_descriptor.revision,
                             source_label: format!("embedded-program/{}.bn", namespace(&session.0)),
-                            units: vec![RuntimeSourceUnit {
-                                path: "RUN.bn".to_owned(),
-                                source: descriptor.source,
-                            }],
+                            units,
                             application: child_application(&self.parent_application, &session),
-                            capability_profile: descriptor.capability_profile,
+                            capability_profile: request_descriptor.capability_profile,
                         },
+                        artifact_id,
+                        persist_artifact: request_descriptor.persist_artifact,
                     });
                 }
                 Err(diagnostic) => program.request_diagnostic = Some(diagnostic),
             }
         }
-        let patches = self.refresh(parent);
-        ProgramHostUpdate { patches, requests }
+        requests
+    }
+
+    fn rebuild_composed_frame(&mut self, parent: &DocumentFrame) {
+        self.frame = parent.clone();
+        for projection in self.projections.values_mut() {
+            projection.projected = None;
+        }
+        let hosts = self.projections.keys().cloned().collect::<Vec<_>>();
+        for host in hosts {
+            let projected = self.project_for_host(&host);
+            self.install_projection(&host, projected);
+        }
+        self.refresh_metadata_and_routes();
+    }
+
+    fn refresh_projections(
+        &mut self,
+        only: Option<&BTreeSet<DocumentNodeId>>,
+    ) -> Vec<DocumentPatch> {
+        let hosts = self
+            .projections
+            .keys()
+            .filter(|host| only.is_none_or(|only| only.contains(*host)))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.stats.scoped_projection_refresh_count = self
+            .stats
+            .scoped_projection_refresh_count
+            .saturating_add(hosts.len().try_into().unwrap_or(u64::MAX));
+        let mut patches = Vec::new();
+        for host in hosts {
+            let previous = self
+                .projections
+                .get(&host)
+                .and_then(|projection| projection.projected.clone());
+            let next = self.project_for_host(&host);
+            let previous_frame = previous.as_ref().map_or_else(
+                || empty_projection_frame(&host),
+                |projected| projected.frame.clone(),
+            );
+            let next_frame = next.as_ref().map_or_else(
+                || empty_projection_frame(&host),
+                |projected| projected.frame.clone(),
+            );
+            let parent_child_count = self
+                .projections
+                .get(&host)
+                .map_or(0, |projection| projection.parent_children.len());
+            patches.extend(
+                crate::document::diff_frames(&previous_frame, &next_frame)
+                    .into_iter()
+                    .map(|patch| offset_projection_root_patch(patch, &host, parent_child_count)),
+            );
+            self.install_projection(&host, next);
+        }
+        self.refresh_metadata_and_routes();
+        patches
+    }
+
+    fn project_for_host(&self, host: &DocumentNodeId) -> Option<ProjectedProgram> {
+        let projection = self.projections.get(host)?;
+        if !projection.mount {
+            return None;
+        }
+        let session = self
+            .programs
+            .get(&projection.session)?
+            .controller
+            .active()?;
+        let mut used_materializations = self.parent_materializations.clone();
+        for (other_host, other) in &self.projections {
+            if other_host == host {
+                continue;
+            }
+            if let Some(projected) = &other.projected {
+                used_materializations.extend(projected.materialization_routes.keys().copied());
+            }
+        }
+        Some(project_program(
+            host,
+            &projection.session,
+            session.frame(),
+            &mut used_materializations,
+        ))
+    }
+
+    fn install_projection(&mut self, host: &DocumentNodeId, next: Option<ProjectedProgram>) {
+        let Some(projection) = self.projections.get_mut(host) else {
+            return;
+        };
+        if let Some(previous) = projection.projected.take() {
+            for id in previous
+                .frame
+                .nodes
+                .keys()
+                .filter(|id| **id != previous.frame.root)
+            {
+                self.frame.nodes.remove(id);
+            }
+        }
+        if let Some(projected) = &next {
+            for (id, node) in &projected.frame.nodes {
+                if *id != projected.frame.root {
+                    self.frame.nodes.insert(id.clone(), node.clone());
+                }
+            }
+        }
+        projection.projected = next;
+        if let Some(host_node) = self.frame.nodes.get_mut(host) {
+            host_node.children = projection.parent_children.clone();
+            host_node
+                .children
+                .extend(projected_root_children(projection));
+        }
+    }
+
+    fn refresh_metadata_and_routes(&mut self) {
+        self.frame.focus.clone_from(&self.parent_focus);
+        self.frame
+            .scroll_roots
+            .clone_from(&self.parent_scroll_roots);
+        self.source_routes.clear();
+        self.materialization_routes.clear();
+        for projection in self.projections.values() {
+            let Some(projected) = &projection.projected else {
+                continue;
+            };
+            self.source_routes.extend(projected.source_routes.clone());
+            self.materialization_routes
+                .extend(projected.materialization_routes.clone());
+            self.frame
+                .scroll_roots
+                .extend(projected.frame.scroll_roots.clone());
+            if projected.frame.focus.is_some() {
+                self.frame.focus.clone_from(&projected.frame.focus);
+            }
+        }
     }
 
     pub fn complete(
@@ -762,7 +1271,6 @@ impl ProgramDocumentHost {
         session: &ProgramSessionId,
         request_id: &ProgramRequestId,
         result: Result<ProgramArtifact, ProgramDiagnostic>,
-        parent: &DocumentFrame,
     ) -> (ProgramHostCompletion, ProgramHostUpdate) {
         let Some(program) = self.programs.get_mut(session) else {
             return (
@@ -781,13 +1289,28 @@ impl ProgramDocumentHost {
                 ProgramHostUpdate::default(),
             );
         }
+        let bootstrap = program.bootstrapping;
+        program.bootstrapping = false;
         let completion = ProgramHostCompletion::Program(program.controller.complete(result));
-        let patches = self.refresh(parent);
+        let hosts = self
+            .projections
+            .iter()
+            .filter_map(|(host, projection)| {
+                (projection.session == *session).then_some(host.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let patches = self.refresh_projections(Some(&hosts));
+        let requests = if bootstrap {
+            self.schedule_requests()
+        } else {
+            Vec::new()
+        };
         (
             completion,
             ProgramHostUpdate {
                 patches,
-                requests: Vec::new(),
+                requests,
+                bootstrap,
             },
         )
     }
@@ -822,6 +1345,28 @@ impl ProgramDocumentHost {
             .controller
             .active()
             .map(ProgramSession::artifact)
+    }
+
+    pub fn request_persists_artifact(
+        &self,
+        session: &ProgramSessionId,
+        request_id: &ProgramRequestId,
+    ) -> bool {
+        self.programs.get(session).is_some_and(|program| {
+            program.latest_request_id.as_ref() == Some(request_id)
+                && program.descriptor.persist_artifact
+        })
+    }
+
+    pub fn request_is_artifact_load(
+        &self,
+        session: &ProgramSessionId,
+        request_id: &ProgramRequestId,
+    ) -> bool {
+        self.programs.get(session).is_some_and(|program| {
+            program.latest_request_id.as_ref() == Some(request_id)
+                && !program.descriptor.artifact_id.is_empty()
+        })
     }
 
     pub fn lifecycle_source_paths(&self, session: &ProgramSessionId, intent: &str) -> Vec<String> {
@@ -893,7 +1438,6 @@ impl ProgramDocumentHost {
         route: &str,
         target: Option<RowId>,
         payload: SourcePayload,
-        parent: &DocumentFrame,
     ) -> crate::RuntimeResult<(crate::RuntimeTurn, Vec<DocumentPatch>)> {
         let route = self
             .source_routes
@@ -910,7 +1454,8 @@ impl ProgramDocumentHost {
                 .runtime()
                 .source_event(sequence, &route.source_path, target, payload)?;
         let turn = program.runtime_mut().dispatch(event)?;
-        let patches = self.refresh(parent);
+        let hosts = self.hosts_for_session(&route.session);
+        let patches = self.refresh_projections(Some(&hosts));
         Ok((turn, patches))
     }
 
@@ -919,7 +1464,6 @@ impl ProgramDocumentHost {
         materialization: u64,
         visible: Range<u64>,
         overscan: Range<u64>,
-        parent: &DocumentFrame,
     ) -> crate::RuntimeResult<Vec<DocumentPatch>> {
         let route = self
             .materialization_routes
@@ -938,7 +1482,8 @@ impl ProgramDocumentHost {
             visible,
             overscan,
         )?;
-        Ok(self.refresh(parent))
+        let hosts = self.hosts_for_session(&route.session);
+        Ok(self.refresh_projections(Some(&hosts)))
     }
 
     pub fn owns_source_route(&self, route: &str) -> bool {
@@ -949,130 +1494,186 @@ impl ProgramDocumentHost {
         self.materialization_routes.contains_key(&materialization)
     }
 
-    fn refresh(&mut self, parent: &DocumentFrame) -> Vec<DocumentPatch> {
-        let composed = compose_frame(parent, &self.programs, &self.projections);
-        let patches = crate::document::diff_frames(&self.frame, &composed.frame);
-        self.frame = composed.frame;
-        self.source_routes = composed.source_routes;
-        self.materialization_routes = composed.materialization_routes;
-        patches
+    fn hosts_for_session(&self, session: &ProgramSessionId) -> BTreeSet<DocumentNodeId> {
+        self.projections
+            .iter()
+            .filter_map(|(host, projection)| {
+                (projection.session == *session).then_some(host.clone())
+            })
+            .collect()
     }
 }
 
-struct ComposedFrame {
-    frame: DocumentFrame,
-    source_routes: BTreeMap<String, ProgramSourceRoute>,
-    materialization_routes: BTreeMap<u64, ProgramMaterializationRoute>,
-}
-
-fn compose_frame(
-    parent: &DocumentFrame,
-    programs: &BTreeMap<ProgramSessionId, HostedProgram>,
-    projections: &BTreeMap<DocumentNodeId, ProgramProjection>,
-) -> ComposedFrame {
-    let mut frame = parent.clone();
+fn project_program(
+    host: &DocumentNodeId,
+    session: &ProgramSessionId,
+    child: &DocumentFrame,
+    used_materializations: &mut BTreeSet<u64>,
+) -> ProjectedProgram {
+    let mut frame = empty_projection_frame(host);
     let mut source_routes = BTreeMap::new();
     let mut materialization_routes = BTreeMap::new();
-    let mut used_materializations = frame
+    let root_children = child
+        .nodes
+        .get(&child.root)
+        .map(|root| root.children.clone())
+        .unwrap_or_default();
+    let child_ids = child
+        .nodes
+        .keys()
+        .filter(|id| **id != child.root)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for child_id in child_ids {
+        let Some(mut node) = child.nodes.get(&child_id).cloned() else {
+            continue;
+        };
+        node.id = namespaced_node(host, &node.id);
+        node.parent = node.parent.as_ref().map(|parent_id| {
+            if *parent_id == child.root {
+                host.clone()
+            } else {
+                namespaced_node(host, parent_id)
+            }
+        });
+        node.children = node
+            .children
+            .iter()
+            .map(|child_id| namespaced_node(host, child_id))
+            .collect();
+        for binding in &mut node.source_bindings {
+            let original_path = binding.source_path.clone();
+            let route_key = source_route_key(host, &original_path);
+            source_routes.insert(
+                route_key.clone(),
+                ProgramSourceRoute {
+                    session: session.clone(),
+                    source_path: original_path,
+                },
+            );
+            binding.id =
+                SourceBindingId(format!("embedded/{}/{}", namespace(&host.0), binding.id.0));
+            binding.source_path = route_key;
+        }
+        for range in &mut node.materialized {
+            let Some(original) = range.materialization else {
+                continue;
+            };
+            let mapped = namespaced_materialization(host, original, used_materializations);
+            materialization_routes.insert(
+                mapped,
+                ProgramMaterializationRoute {
+                    session: session.clone(),
+                    materialization: original,
+                },
+            );
+            range.materialization = Some(mapped);
+        }
+        frame.nodes.insert(node.id.clone(), node);
+    }
+
+    if let Some(root) = frame.nodes.get_mut(&frame.root) {
+        root.children = root_children
+            .iter()
+            .map(|child_id| namespaced_node(host, child_id))
+            .collect();
+    }
+    frame.focus = child
+        .focus
+        .as_ref()
+        .map(|focus| namespaced_node(host, focus));
+    for (scroll_root, state) in &child.scroll_roots {
+        frame.scroll_roots.insert(
+            ScrollRootId(format!("embedded/{}/{}", namespace(&host.0), scroll_root.0)),
+            *state,
+        );
+    }
+
+    ProjectedProgram {
+        frame,
+        source_routes,
+        materialization_routes,
+    }
+}
+
+fn empty_projection_frame(host: &DocumentNodeId) -> DocumentFrame {
+    DocumentFrame::empty(host.0.clone())
+}
+
+fn projected_root_children(projection: &ProgramProjection) -> Vec<DocumentNodeId> {
+    projection
+        .projected
+        .as_ref()
+        .and_then(|projected| projected.frame.nodes.get(&projected.frame.root))
+        .map(|root| root.children.clone())
+        .unwrap_or_default()
+}
+
+fn frame_materializations(frame: &DocumentFrame) -> BTreeSet<u64> {
+    frame
         .nodes
         .values()
         .flat_map(|node| node.materialized.iter())
         .filter_map(|range| range.materialization)
-        .collect::<BTreeSet<_>>();
+        .collect()
+}
 
-    for (host, projection) in projections {
-        if !projection.mount {
-            continue;
-        }
-        let Some(program) = programs.get(&projection.session) else {
-            continue;
-        };
-        let Some(session) = program.controller.active() else {
-            continue;
-        };
-        let child = session.frame();
-        let root_children = child
-            .nodes
-            .get(&child.root)
-            .map(|root| root.children.clone())
-            .unwrap_or_default();
-        let child_ids = child
-            .nodes
-            .keys()
-            .filter(|id| **id != child.root)
-            .cloned()
-            .collect::<Vec<_>>();
+fn parent_patch_is_nonstructural(patch: &DocumentPatch) -> bool {
+    matches!(
+        patch,
+        DocumentPatch::SetText { .. }
+            | DocumentPatch::SetStyle { .. }
+            | DocumentPatch::SetEmbeddedProgram { .. }
+            | DocumentPatch::SetBinding { .. }
+            | DocumentPatch::SetBindingAt { .. }
+            | DocumentPatch::SetScroll { .. }
+            | DocumentPatch::SetListMaterialization { .. }
+    )
+}
 
-        for child_id in child_ids {
-            let Some(mut node) = child.nodes.get(&child_id).cloned() else {
-                continue;
-            };
-            node.id = namespaced_node(host, &node.id);
-            node.parent = node.parent.as_ref().map(|parent_id| {
-                if *parent_id == child.root {
-                    host.clone()
-                } else {
-                    namespaced_node(host, parent_id)
-                }
-            });
-            node.children = node
-                .children
-                .iter()
-                .map(|child_id| namespaced_node(host, child_id))
-                .collect();
-            for binding in &mut node.source_bindings {
-                let original_path = binding.source_path.clone();
-                let route_key = source_route_key(host, &original_path);
-                source_routes.insert(
-                    route_key.clone(),
-                    ProgramSourceRoute {
-                        session: projection.session.clone(),
-                        source_path: original_path,
-                    },
-                );
-                binding.id =
-                    SourceBindingId(format!("embedded/{}/{}", namespace(&host.0), binding.id.0));
-                binding.source_path = route_key;
-            }
-            for range in &mut node.materialized {
-                let Some(original) = range.materialization else {
-                    continue;
-                };
-                let mapped = namespaced_materialization(host, original, &mut used_materializations);
-                materialization_routes.insert(
-                    mapped,
-                    ProgramMaterializationRoute {
-                        session: projection.session.clone(),
-                        materialization: original,
-                    },
-                );
-                range.materialization = Some(mapped);
-            }
-            frame.nodes.insert(node.id.clone(), node);
-        }
-
-        if let Some(host_node) = frame.nodes.get_mut(host) {
-            host_node.children.extend(
-                root_children
-                    .iter()
-                    .map(|child_id| namespaced_node(host, child_id)),
-            );
-        }
-        if let Some(focus) = child.focus.as_ref() {
-            frame.focus = Some(namespaced_node(host, focus));
-        }
-        for (scroll_root, state) in &child.scroll_roots {
-            frame.scroll_roots.insert(
-                ScrollRootId(format!("embedded/{}/{}", namespace(&host.0), scroll_root.0)),
-                *state,
-            );
-        }
+fn parent_patch_target(patch: &DocumentPatch) -> Option<&DocumentNodeId> {
+    match patch {
+        DocumentPatch::SetText { id, .. }
+        | DocumentPatch::SetStyle { id, .. }
+        | DocumentPatch::SetEmbeddedProgram { id, .. }
+        | DocumentPatch::SetBinding { id, .. }
+        | DocumentPatch::SetBindingAt { id, .. }
+        | DocumentPatch::SetScroll { id, .. }
+        | DocumentPatch::SetListMaterialization { id, .. } => Some(id),
+        DocumentPatch::UpsertNode(_)
+        | DocumentPatch::RemoveNode { .. }
+        | DocumentPatch::InsertChild { .. }
+        | DocumentPatch::RemoveChild { .. }
+        | DocumentPatch::MoveChild { .. } => None,
     }
+}
 
-    ComposedFrame {
-        frame,
-        source_routes,
-        materialization_routes,
+fn offset_projection_root_patch(
+    patch: DocumentPatch,
+    host: &DocumentNodeId,
+    parent_child_count: usize,
+) -> DocumentPatch {
+    match patch {
+        DocumentPatch::InsertChild {
+            parent,
+            child,
+            index,
+        } if parent == *host => DocumentPatch::InsertChild {
+            parent,
+            child,
+            index: index.saturating_add(parent_child_count),
+        },
+        DocumentPatch::MoveChild {
+            child,
+            new_parent,
+            index,
+        } if new_parent == *host => DocumentPatch::MoveChild {
+            child,
+            new_parent,
+            index: index.saturating_add(parent_child_count),
+        },
+        patch => patch,
     }
 }
 
@@ -1103,6 +1704,7 @@ fn program_request_id(
         ("session", session.0.as_str()),
         ("revision", revision.as_str()),
         ("source", descriptor.source_digest.as_str()),
+        ("artifact", descriptor.artifact_id.as_str()),
     ]))
 }
 
@@ -1123,8 +1725,85 @@ fn same_program_definition(
     right: &EmbeddedProgramDescriptor,
 ) -> bool {
     left.source_digest == right.source_digest
+        && left.artifact_id == right.artifact_id
+        && left.persist_artifact == right.persist_artifact
+        && left.revision == right.revision
+        && left.bootstrap_source_digest == right.bootstrap_source_digest
+        && left.bootstrap_revision == right.bootstrap_revision
+        && left.capability_profile == right.capability_profile
+}
+
+fn same_current_program_definition(
+    left: &EmbeddedProgramDescriptor,
+    right: &EmbeddedProgramDescriptor,
+) -> bool {
+    left.source_digest == right.source_digest
+        && left.artifact_id == right.artifact_id
+        && left.persist_artifact == right.persist_artifact
         && left.revision == right.revision
         && left.capability_profile == right.capability_profile
+}
+
+fn bootstrap_descriptor(
+    descriptor: &EmbeddedProgramDescriptor,
+) -> Result<Option<EmbeddedProgramDescriptor>, ProgramDiagnostic> {
+    let has_bootstrap =
+        descriptor.bootstrap_revision > 0 && !descriptor.bootstrap_source.is_empty();
+    let differs = descriptor.bootstrap_revision != descriptor.revision
+        || descriptor.bootstrap_source_digest != descriptor.source_digest;
+    if !has_bootstrap || !differs {
+        return Ok(None);
+    }
+    if descriptor.bootstrap_revision >= descriptor.revision {
+        return Err(ProgramDiagnostic::new(
+            descriptor.revision,
+            ProgramDiagnosticPhase::Request,
+            "bootstrap_revision must be lower than the current program revision",
+        ));
+    }
+    let mut bootstrap = descriptor.clone();
+    bootstrap.source = descriptor.bootstrap_source.clone();
+    bootstrap.source_digest = descriptor.bootstrap_source_digest.clone();
+    bootstrap.revision = descriptor.bootstrap_revision;
+    bootstrap.bootstrap_source.clear();
+    bootstrap.bootstrap_source_digest.clear();
+    bootstrap.bootstrap_revision = 0;
+    Ok(Some(bootstrap))
+}
+
+fn descriptor_artifact_id(
+    descriptor: &EmbeddedProgramDescriptor,
+) -> Result<Option<ContentArtifactId>, ProgramDiagnostic> {
+    let artifact_id = descriptor.artifact_id.trim();
+    if artifact_id.is_empty() {
+        if descriptor.source.is_empty() {
+            return Err(ProgramDiagnostic::new(
+                descriptor.revision,
+                ProgramDiagnosticPhase::Request,
+                "embedded program requires source or artifact_id",
+            ));
+        }
+        return Ok(None);
+    }
+    if !descriptor.source.is_empty() {
+        return Err(ProgramDiagnostic::new(
+            descriptor.revision,
+            ProgramDiagnosticPhase::Request,
+            "artifact-backed embedded program cannot also provide source",
+        ));
+    }
+    if descriptor.persist_artifact {
+        return Err(ProgramDiagnostic::new(
+            descriptor.revision,
+            ProgramDiagnosticPhase::Request,
+            "artifact-backed embedded program cannot persist an already stored artifact",
+        ));
+    }
+    ContentArtifactId::from_hex(artifact_id)
+        .map(Some)
+        .map_err(|error| {
+            ProgramDiagnostic::new(descriptor.revision, ProgramDiagnosticPhase::Request, error)
+        })
 }
 
 fn namespaced_node(host: &DocumentNodeId, child: &DocumentNodeId) -> DocumentNodeId {
@@ -1159,6 +1838,7 @@ fn namespace(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_document::{DocumentChangeBatch, DocumentState};
     use boon_document_model::{DocumentNode, DocumentNodeKind, TextValue};
 
     fn request(revision: u64, source: &str) -> ProgramCompileRequest {
@@ -1189,6 +1869,7 @@ mod tests {
             capability_profile: ProgramCapabilityProfile::PublicDocument,
             session_key: String::new(),
             mount: true,
+            ..EmbeddedProgramDescriptor::default()
         });
         frame
             .nodes
@@ -1226,6 +1907,12 @@ document: Document/new(
 "#
     }
 
+    fn replay_patches(frame: DocumentFrame, patches: Vec<DocumentPatch>) -> DocumentFrame {
+        DocumentState::apply_batch_to_owned_frame(frame, DocumentChangeBatch { patches })
+            .unwrap()
+            .0
+    }
+
     #[test]
     fn bounded_program_artifact_starts_one_retained_session() {
         let artifact = compile_program_artifact(&request(1, &child_source("First"))).unwrap();
@@ -1246,6 +1933,145 @@ document: Document/new(
                 .nodes
                 .values()
                 .any(|node| { node.text.as_ref().is_some_and(|text| text.text == "First") })
+        );
+    }
+
+    #[test]
+    fn program_artifact_is_deterministic_round_trips_and_rejects_tampering() {
+        let source = child_source("Immutable");
+        let first = compile_program_artifact(&request(1, &source)).unwrap();
+        let second = compile_program_artifact(&request(99, &source)).unwrap();
+        assert_eq!(first.id(), second.id());
+        assert_eq!(first.plan_digest(), second.plan_digest());
+
+        let content = first.to_content_artifact();
+        let restored = ProgramArtifact::from_content_artifact(
+            7,
+            ProgramCapabilityProfile::PublicDocument,
+            content.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored.id(), first.id());
+        assert_eq!(restored.plan_digest(), first.plan_digest());
+        assert_eq!(restored.plan().as_ref(), first.plan().as_ref());
+
+        let mut corrupt = content.clone();
+        corrupt.bytes[0] ^= 0xff;
+        let diagnostic = ProgramArtifact::from_content_artifact(
+            7,
+            ProgramCapabilityProfile::PublicDocument,
+            corrupt,
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.phase, ProgramDiagnosticPhase::Artifact);
+        assert!(diagnostic.message.contains("digest"));
+
+        let mut stored: StoredProgramArtifact =
+            ciborium::de::from_reader(content.bytes.as_slice()).unwrap();
+        stored.compiler_id = "boon-compiler-future".to_owned();
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&stored, &mut bytes).unwrap();
+        let incompatible = ContentArtifact::new(PROGRAM_ARTIFACT_MEDIA_TYPE, bytes).unwrap();
+        let diagnostic = ProgramArtifact::from_content_artifact(
+            7,
+            ProgramCapabilityProfile::PublicDocument,
+            incompatible,
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.phase, ProgramDiagnosticPhase::Artifact);
+        assert!(diagnostic.message.contains("differs from host compiler"));
+
+        stored.compiler_id = COMPILER_ID.to_owned();
+        stored
+            .plan
+            .application
+            .identity
+            .state_namespace
+            .push_str("-tampered");
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&stored, &mut bytes).unwrap();
+        let stale_digest = ContentArtifact::new(PROGRAM_ARTIFACT_MEDIA_TYPE, bytes).unwrap();
+        let diagnostic = ProgramArtifact::from_content_artifact(
+            7,
+            ProgramCapabilityProfile::PublicDocument,
+            stale_digest,
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.phase, ProgramDiagnosticPhase::Artifact);
+        assert!(diagnostic.message.contains("plan digest"));
+    }
+
+    #[test]
+    fn document_host_mounts_an_artifact_without_compiling_source() {
+        let artifact =
+            compile_program_artifact(&request(1, &child_source("Stored child"))).unwrap();
+        let mut parent = DocumentFrame::empty("parent");
+        let mut program = DocumentNode::new("program", DocumentNodeKind::EmbeddedProgram);
+        program.parent = Some(parent.root.clone());
+        program.embedded_program = Some(EmbeddedProgramDescriptor {
+            artifact_id: artifact.id_text(),
+            revision: 1,
+            capability_profile: ProgramCapabilityProfile::PublicDocument,
+            session_key: "stored-child".to_owned(),
+            mount: true,
+            ..EmbeddedProgramDescriptor::default()
+        });
+        parent
+            .nodes
+            .get_mut(&parent.root)
+            .unwrap()
+            .children
+            .push(program.id.clone());
+        parent.nodes.insert(program.id.clone(), program);
+
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "artifact", "local"),
+            &parent,
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].is_artifact_load());
+        assert!(requests[0].compile.units.is_empty());
+        let loaded = ProgramArtifact::from_content_artifact(
+            requests[0].compile.revision,
+            requests[0].compile.capability_profile,
+            artifact.to_content_artifact(),
+        );
+        let (completion, _) = host.complete(&requests[0].session, &requests[0].request_id, loaded);
+        assert_eq!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
+        );
+        assert!(host.frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Stored child")
+        }));
+    }
+
+    #[test]
+    fn document_host_rejects_source_plus_artifact_descriptors() {
+        let source = child_source("Ambiguous child");
+        let artifact = compile_program_artifact(&request(1, &source)).unwrap();
+        let mut parent = parent_frame(1, &source);
+        parent
+            .nodes
+            .get_mut(&DocumentNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap()
+            .artifact_id = artifact.id_text();
+        let (host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "ambiguous", "local"),
+            &parent,
+        );
+        assert!(requests.is_empty());
+        assert_eq!(host.diagnostics().len(), 1);
+        assert!(
+            host.diagnostics()[0]
+                .diagnostic
+                .message
+                .contains("cannot also provide source")
         );
     }
 
@@ -1372,6 +2198,7 @@ scene: Scene/Element/program(
                 capability_profile: ProgramCapabilityProfile::PublicDocument,
                 session_key: "public-page".to_owned(),
                 mount: true,
+                ..EmbeddedProgramDescriptor::default()
             });
             parent
                 .nodes
@@ -1398,7 +2225,6 @@ scene: Scene/Element/program(
             &requests[0].session,
             &requests[0].request_id,
             compile_program_artifact(&requests[0].compile),
-            &parent,
         );
         assert_eq!(
             host.frame()
@@ -1422,12 +2248,8 @@ scene: Scene/Element/program(
         );
         assert_eq!(requests.len(), 1);
         let first = compile_program_artifact(&requests[0].compile);
-        let (completion, update) = host.complete(
-            &requests[0].session,
-            &requests[0].request_id,
-            first,
-            &first_parent,
-        );
+        let (completion, update) =
+            host.complete(&requests[0].session, &requests[0].request_id, first);
         assert_eq!(
             completion,
             ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
@@ -1448,7 +2270,6 @@ scene: Scene/Element/program(
             &invalid.requests[0].session,
             &invalid.requests[0].request_id,
             failed,
-            &invalid_parent,
         );
         assert!(matches!(
             completion,
@@ -1474,7 +2295,6 @@ scene: Scene/Element/program(
             &requests[0].session,
             &requests[0].request_id,
             compile_program_artifact(&requests[0].compile),
-            &parent,
         );
         let route = host
             .frame()
@@ -1487,7 +2307,7 @@ scene: Scene/Element/program(
         assert!(host.owns_source_route(&route));
 
         let (_, patches) = host
-            .dispatch(1, &route, None, SourcePayload::default(), &parent)
+            .dispatch(1, &route, None, SourcePayload::default())
             .unwrap();
         assert!(!patches.is_empty());
         assert!(
@@ -1510,7 +2330,6 @@ scene: Scene/Element/program(
             &first_requests[0].session,
             &first_requests[0].request_id,
             first,
-            &first_parent,
         );
 
         let second_parent = parent_frame(2, &child_source("second"));
@@ -1520,12 +2339,8 @@ scene: Scene/Element/program(
         let third = host.reconcile(&third_parent).requests.remove(0);
         let third_artifact = compile_program_artifact(&third.compile);
 
-        let (stale, stale_update) = host.complete(
-            &second.session,
-            &second.request_id,
-            second_artifact,
-            &third_parent,
-        );
+        let (stale, stale_update) =
+            host.complete(&second.session, &second.request_id, second_artifact);
         assert_eq!(
             stale,
             ProgramHostCompletion::Superseded {
@@ -1534,12 +2349,7 @@ scene: Scene/Element/program(
             }
         );
         assert!(stale_update.patches.is_empty());
-        let (latest, _) = host.complete(
-            &third.session,
-            &third.request_id,
-            third_artifact,
-            &third_parent,
-        );
+        let (latest, _) = host.complete(&third.session, &third.request_id, third_artifact);
         assert_eq!(
             latest,
             ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 3 })
@@ -1550,5 +2360,224 @@ scene: Scene/Element/program(
                     text: "third".to_owned(),
                 })
         }));
+    }
+
+    #[test]
+    fn incremental_parent_descriptor_patch_schedules_one_scoped_request() {
+        let first_parent = parent_frame(1, &child_source("first"));
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "incremental", "local"),
+            &first_parent,
+        );
+        host.complete(
+            &requests[0].session,
+            &requests[0].request_id,
+            compile_program_artifact(&requests[0].compile),
+        );
+
+        let next_parent = parent_frame(2, &child_source("second"));
+        let parent_patches = crate::document::diff_frames(&first_parent, &next_parent);
+        assert!(
+            parent_patches
+                .iter()
+                .any(|patch| matches!(patch, DocumentPatch::SetEmbeddedProgram { .. }))
+        );
+        let stats_before = host.stats();
+        let previous = host.frame().clone();
+        let update = host.reconcile_with_parent_patches(&next_parent, parent_patches.clone());
+
+        assert_eq!(update.requests.len(), 1);
+        assert_eq!(update.requests[0].compile.revision, 2);
+        assert_eq!(update.patches, parent_patches);
+        assert_eq!(replay_patches(previous, update.patches), *host.frame());
+        let stats_after = host.stats();
+        assert_eq!(
+            stats_after.scoped_parent_patch_count,
+            stats_before
+                .scoped_parent_patch_count
+                .saturating_add(parent_patches.len() as u64)
+        );
+        assert_eq!(
+            stats_after.scoped_projection_refresh_count,
+            stats_before.scoped_projection_refresh_count
+        );
+        assert_eq!(
+            stats_after.full_reconcile_count,
+            stats_before.full_reconcile_count
+        );
+
+        let request = &update.requests[0];
+        host.complete(
+            &request.session,
+            &request.request_id,
+            compile_program_artifact(&request.compile),
+        );
+        assert_eq!(
+            host.stats().scoped_projection_refresh_count,
+            stats_after
+                .scoped_projection_refresh_count
+                .saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn projection_patch_replay_preserves_parent_owned_host_children() {
+        let mut parent = parent_frame(1, &child_source("child"));
+        let host_id = DocumentNodeId("program".to_owned());
+        let mut owned = DocumentNode::new("owned", DocumentNodeKind::Text);
+        owned.parent = Some(host_id.clone());
+        owned.text = Some(TextValue {
+            text: "parent owned".to_owned(),
+        });
+        parent.nodes.insert(owned.id.clone(), owned);
+        parent
+            .nodes
+            .get_mut(&host_id)
+            .unwrap()
+            .children
+            .push(DocumentNodeId("owned".to_owned()));
+
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "owned-child", "local"),
+            &parent,
+        );
+        let previous = host.frame().clone();
+        let (_, update) = host.complete(
+            &requests[0].session,
+            &requests[0].request_id,
+            compile_program_artifact(&requests[0].compile),
+        );
+        assert!(update.patches.iter().any(|patch| matches!(
+            patch,
+            DocumentPatch::MoveChild {
+                new_parent,
+                index: 1,
+                ..
+            } if *new_parent == host_id
+        )));
+        assert_eq!(replay_patches(previous, update.patches), *host.frame());
+        assert_eq!(
+            host.frame().nodes[&host_id].children[0],
+            DocumentNodeId("owned".to_owned())
+        );
+    }
+
+    #[test]
+    fn bootstrap_activates_before_invalid_current_and_remains_last_valid() {
+        let bootstrap_source = child_source("bootstrap");
+        let mut parent = parent_frame(2, "scene: Missing/constructor(");
+        let descriptor = parent
+            .nodes
+            .get_mut(&DocumentNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap();
+        descriptor.bootstrap_source = bootstrap_source.clone();
+        descriptor.bootstrap_source_digest = crate::sha256_bytes(bootstrap_source.as_bytes());
+        descriptor.bootstrap_revision = 1;
+
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "bootstrap", "local"),
+            &parent,
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].compile.revision, 1);
+        let (completion, update) = host.complete(
+            &requests[0].session,
+            &requests[0].request_id,
+            compile_program_artifact(&requests[0].compile),
+        );
+        assert_eq!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
+        );
+        assert!(update.bootstrap);
+
+        assert_eq!(update.requests.len(), 1);
+        assert_eq!(update.requests[0].compile.revision, 2);
+        let (completion, update) = host.complete(
+            &update.requests[0].session,
+            &update.requests[0].request_id,
+            compile_program_artifact(&update.requests[0].compile),
+        );
+        assert!(matches!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Rejected { .. })
+        ));
+        assert!(update.patches.is_empty());
+        assert_eq!(
+            host.active_artifact(&ProgramSessionId("program".to_owned()))
+                .unwrap()
+                .revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn bootstrap_metadata_change_does_not_recompile_current_program() {
+        let source = child_source("current");
+        let first_parent = parent_frame(2, &source);
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "metadata", "local"),
+            &first_parent,
+        );
+        host.complete(
+            &requests[0].session,
+            &requests[0].request_id,
+            compile_program_artifact(&requests[0].compile),
+        );
+
+        let mut next_parent = first_parent.clone();
+        let bootstrap_source = child_source("older");
+        let descriptor = next_parent
+            .nodes
+            .get_mut(&DocumentNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap();
+        descriptor.bootstrap_source = bootstrap_source.clone();
+        descriptor.bootstrap_source_digest = crate::sha256_bytes(bootstrap_source.as_bytes());
+        descriptor.bootstrap_revision = 1;
+        let patches = crate::document::diff_frames(&first_parent, &next_parent);
+        let update = host.reconcile_with_parent_patches(&next_parent, patches);
+
+        assert!(update.requests.is_empty());
+        assert_eq!(
+            host.active_artifact(&ProgramSessionId("program".to_owned()))
+                .unwrap()
+                .revision(),
+            2
+        );
+    }
+
+    #[test]
+    fn invalid_bootstrap_revision_fails_closed_without_request() {
+        let source = child_source("current");
+        let mut parent = parent_frame(2, &source);
+        let descriptor = parent
+            .nodes
+            .get_mut(&DocumentNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap();
+        descriptor.bootstrap_source = child_source("not older");
+        descriptor.bootstrap_source_digest =
+            crate::sha256_bytes(descriptor.bootstrap_source.as_bytes());
+        descriptor.bootstrap_revision = 2;
+
+        let (host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "bad-bootstrap", "local"),
+            &parent,
+        );
+        assert!(requests.is_empty());
+        assert!(
+            host.diagnostics()[0]
+                .diagnostic
+                .message
+                .contains("must be lower")
+        );
     }
 }

@@ -10,7 +10,8 @@ use boon_native_gpu::{
 };
 
 use crate::observer::{
-    FrameEvidenceKey, FramePresented, InputKind, ObserverEvent, ObserverRole, RoleMetadata,
+    FrameEvidenceKey, FramePresented, InputKind, NATIVE_SESSION_ID_ENV, ObserverEvent,
+    ObserverRole, RoleMetadata,
 };
 use crate::view::RetainedView;
 
@@ -251,10 +252,16 @@ impl ProductFrame {
             || ["llvmpipe", "softpipe", "software", "swiftshader"]
                 .iter()
                 .any(|needle| adapter_name_lower.contains(needle));
+        let pid = std::process::id();
+        let session_id = std::env::var(NATIVE_SESSION_ID_ENV)
+            .ok()
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .unwrap_or_else(|| format!("process-{pid}"));
         let metadata = RoleMetadata {
             role,
-            pid: std::process::id(),
+            pid,
             surface_id: binding.surface_id.0.clone(),
+            session_id,
             surface_epoch: binding.epoch,
             logical_width: viewport.logical_size.width,
             logical_height: viewport.logical_size.height,
@@ -434,6 +441,9 @@ impl ProductFrame {
             .map(|input| input.sequence)
             .unwrap_or(self.frame_id);
         let key = FrameEvidenceKey {
+            surface_id: self.metadata.surface_id.clone(),
+            process_id: self.metadata.pid,
+            session_id: self.metadata.session_id.clone(),
             frame_id: self.frame_id,
             input_id: input_id.max(1),
             content_id: revisions.0.max(1),

@@ -339,7 +339,10 @@ fn proof_artifact(proof: RenderProof) -> Option<ProofArtifact> {
 
 fn render_identity(key: &FrameEvidenceKey) -> String {
     format!(
-        "frame:{}:input:{}:content:{}:layout:{}:render:{}:surface:{}:present:{}:proof:{}",
+        "surface-id:{}:process:{}:session:{}:frame:{}:input:{}:content:{}:layout:{}:render:{}:surface-epoch:{}:present:{}:proof:{}",
+        key.surface_id,
+        key.process_id,
+        key.session_id,
         key.frame_id,
         key.input_id,
         key.content_id,
@@ -357,6 +360,9 @@ mod tests {
 
     fn key(frame_id: u64) -> FrameEvidenceKey {
         FrameEvidenceKey {
+            surface_id: "preview-surface".to_owned(),
+            process_id: 42,
+            session_id: "launch-primary".to_owned(),
             frame_id,
             input_id: 2,
             content_id: 3,

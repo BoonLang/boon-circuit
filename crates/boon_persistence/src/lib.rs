@@ -450,6 +450,94 @@ pub struct CompactRequest {
     pub application: ApplicationIdentity,
 }
 
+pub const MAX_CONTENT_ARTIFACT_MEDIA_TYPE_BYTES: usize = 128;
+pub const MAX_CONTENT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct ContentArtifactId(pub [u8; 32]);
+
+impl ContentArtifactId {
+    pub fn for_content(media_type: &str, bytes: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"boon.content-artifact.v1");
+        hasher.update((media_type.len() as u64).to_be_bytes());
+        hasher.update(media_type.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+        Self(hasher.finalize().into())
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn from_hex(value: &str) -> Result<Self, String> {
+        if value.len() != 64 {
+            return Err(format!(
+                "content artifact ID has {} hexadecimal digits, expected 64",
+                value.len()
+            ));
+        }
+        let mut digest = [0; 32];
+        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+            let high = decode_lower_hex_digit(pair[0])?;
+            let low = decode_lower_hex_digit(pair[1])?;
+            digest[index] = (high << 4) | low;
+        }
+        Ok(Self(digest))
+    }
+}
+
+fn decode_lower_hex_digit(value: u8) -> Result<u8, String> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        _ => Err("content artifact ID must use lowercase hexadecimal digits".to_owned()),
+    }
+}
+
+impl fmt::Display for ContentArtifactId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContentArtifact {
+    pub id: ContentArtifactId,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl ContentArtifact {
+    pub fn new(media_type: impl Into<String>, bytes: Vec<u8>) -> Result<Self, StoreError> {
+        let media_type = media_type.into();
+        let artifact = Self {
+            id: ContentArtifactId::for_content(&media_type, &bytes),
+            media_type,
+            bytes,
+        };
+        validate_content_artifact(&artifact)?;
+        Ok(artifact)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PutContentArtifactRequest {
+    pub application: ApplicationIdentity,
+    pub artifact: ContentArtifact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LoadContentArtifactRequest {
+    pub application: ApplicationIdentity,
+    pub id: ContentArtifactId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ShutdownRequest;
 
@@ -463,6 +551,8 @@ pub enum PersistenceCommand {
     Barrier(BarrierRequest),
     Inspect(InspectRequest),
     Compact(CompactRequest),
+    PutContentArtifact(PutContentArtifactRequest),
+    LoadContentArtifact(LoadContentArtifactRequest),
     Shutdown(ShutdownRequest),
 }
 
@@ -503,6 +593,8 @@ pub struct PersistenceInspectorSnapshot {
     pub scalar_count: usize,
     pub list_count: usize,
     pub row_count: usize,
+    pub content_artifact_count: usize,
+    pub content_artifact_bytes: u64,
     /// Encoded backend bytes when the driver can report them without loading
     /// or serializing the complete application. `None` is an honest unknown.
     pub encoded_value_bytes: Option<u64>,
@@ -542,6 +634,13 @@ pub struct CompactAck {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PutContentArtifactAck {
+    pub id: ContentArtifactId,
+    pub stored_bytes: u64,
+    pub already_present: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ShutdownAck;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -554,6 +653,8 @@ pub enum PersistenceResult {
     BarrierComplete(Result<BarrierAck, StoreError>),
     Inspected(Result<Option<PersistenceInspectorSnapshot>, StoreError>),
     Compacted(Result<CompactAck, StoreError>),
+    ContentArtifactStored(Result<PutContentArtifactAck, StoreError>),
+    ContentArtifactLoaded(Result<Option<ContentArtifact>, StoreError>),
     ShutdownComplete(Result<ShutdownAck, StoreError>),
 }
 
@@ -569,6 +670,7 @@ pub enum StoreError {
     InvalidChecksum,
     InvalidAuthority(String),
     InvalidOutboxTransition(String),
+    InvalidContentArtifact(String),
     Backend(String),
 }
 
@@ -586,6 +688,9 @@ impl fmt::Display for StoreError {
             Self::InvalidOutboxTransition(detail) => {
                 write!(formatter, "invalid outbox transition: {detail}")
             }
+            Self::InvalidContentArtifact(detail) => {
+                write!(formatter, "invalid content artifact: {detail}")
+            }
             Self::Backend(detail) => write!(formatter, "persistence backend failed: {detail}"),
         }
     }
@@ -600,6 +705,7 @@ pub trait PersistenceDriver {
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryDriver {
     applications: BTreeMap<ApplicationIdentity, RestoreImage>,
+    artifacts: BTreeMap<(ApplicationIdentity, ContentArtifactId), ContentArtifact>,
     closed: bool,
     fail_next_activation: bool,
 }
@@ -681,8 +787,55 @@ impl InMemoryDriver {
             .cloned()
             .ok_or(StoreError::MissingApplication)?;
         let (reset, ack) = apply_reset_to_image(current, &batch)?;
+        self.artifacts
+            .retain(|(application, _), _| application != &batch.application);
         self.applications.insert(batch.application, reset);
         Ok(ack)
+    }
+
+    fn put_content_artifact(
+        &mut self,
+        request: PutContentArtifactRequest,
+    ) -> Result<PutContentArtifactAck, StoreError> {
+        validate_content_artifact(&request.artifact)?;
+        if !self.applications.contains_key(&request.application) {
+            return Err(StoreError::MissingApplication);
+        }
+        let key = (request.application, request.artifact.id);
+        let already_present = match self.artifacts.get(&key) {
+            Some(existing) if existing == &request.artifact => true,
+            Some(_) => {
+                return Err(StoreError::InvalidContentArtifact(
+                    "content digest collides with different artifact bytes".to_owned(),
+                ));
+            }
+            None => {
+                self.artifacts.insert(key, request.artifact.clone());
+                false
+            }
+        };
+        Ok(PutContentArtifactAck {
+            id: request.artifact.id,
+            stored_bytes: request.artifact.bytes.len().try_into().unwrap_or(u64::MAX),
+            already_present,
+        })
+    }
+
+    fn load_content_artifact(
+        &self,
+        request: LoadContentArtifactRequest,
+    ) -> Result<Option<ContentArtifact>, StoreError> {
+        if !self.applications.contains_key(&request.application) {
+            return Err(StoreError::MissingApplication);
+        }
+        let artifact = self
+            .artifacts
+            .get(&(request.application, request.id))
+            .cloned();
+        if let Some(artifact) = &artifact {
+            validate_content_artifact(artifact)?;
+        }
+        Ok(artifact)
     }
 }
 
@@ -719,7 +872,20 @@ impl PersistenceDriver for InMemoryDriver {
                 let snapshot = self
                     .applications
                     .get(&request.application)
-                    .map(inspector_snapshot);
+                    .map(inspector_snapshot)
+                    .map(|mut snapshot| {
+                        for ((application, _), artifact) in &self.artifacts {
+                            if application == &request.application {
+                                snapshot.content_artifact_count =
+                                    snapshot.content_artifact_count.saturating_add(1);
+                                snapshot.content_artifact_bytes =
+                                    snapshot.content_artifact_bytes.saturating_add(
+                                        artifact.bytes.len().try_into().unwrap_or(u64::MAX),
+                                    );
+                            }
+                        }
+                        snapshot
+                    });
                 PersistenceResult::Inspected(Ok(snapshot))
             }
             PersistenceCommand::Compact(request) => {
@@ -729,6 +895,12 @@ impl PersistenceDriver for InMemoryDriver {
                     .map(|image| CompactAck { epoch: image.epoch })
                     .ok_or(StoreError::MissingApplication);
                 PersistenceResult::Compacted(result)
+            }
+            PersistenceCommand::PutContentArtifact(request) => {
+                PersistenceResult::ContentArtifactStored(self.put_content_artifact(request))
+            }
+            PersistenceCommand::LoadContentArtifact(request) => {
+                PersistenceResult::ContentArtifactLoaded(self.load_content_artifact(request))
             }
             PersistenceCommand::Shutdown(_) => {
                 self.closed = true;
@@ -878,7 +1050,13 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
     Ok(())
 }
 
-fn apply_outbox_changes(
+/// Applies validated durable effect transitions to an acknowledged outbox image.
+///
+/// Runtime hosts use the same transition function to keep a local scheduling
+/// index synchronized after a persistence commit succeeds. The durable store
+/// remains authoritative across restart; this helper prevents the hot scheduler
+/// path from reloading that store merely to rediscover pending work.
+pub fn apply_durable_outbox_changes(
     outbox: &mut BTreeMap<OutboxItemId, DurableOutboxItem>,
     changes: &[DurableOutboxChange],
 ) -> Result<(), StoreError> {
@@ -1088,6 +1266,12 @@ pub fn validate_outbox_item_schema(
             item.item_id, schema.effect_id
         )));
     }
+    if !schema.invocation_ids.contains(&item.invocation_id) {
+        return Err(StoreError::InvalidOutboxTransition(format!(
+            "outbox item {} invocation {} is absent from effect schema {}",
+            item.item_id, item.invocation_id, schema.effect_id
+        )));
+    }
     validate_stored_value_type(&item.intent, &schema.intent_type, "intent")?;
     validate_stored_value_type(
         &item.idempotency_key,
@@ -1206,7 +1390,7 @@ fn apply_checkpoint_to_image(
     }
     let mut candidate = image.clone();
     apply_changes(&mut candidate, &batch.changes)?;
-    apply_outbox_changes(&mut candidate.outbox, &batch.outbox_changes)?;
+    apply_durable_outbox_changes(&mut candidate.outbox, &batch.outbox_changes)?;
     validate_outbox(&candidate.outbox)?;
     candidate.epoch = batch.next_epoch;
     candidate.through_turn_sequence = batch.last_turn_sequence;
@@ -1410,6 +1594,31 @@ fn validate_activation(batch: &ActivationBatch) -> Result<(), StoreError> {
         return Err(StoreError::InvalidAuthority(
             "target schema version must be positive".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+pub fn validate_content_artifact(artifact: &ContentArtifact) -> Result<(), StoreError> {
+    if artifact.media_type.is_empty()
+        || artifact.media_type.len() > MAX_CONTENT_ARTIFACT_MEDIA_TYPE_BYTES
+    {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "media type byte length {} is outside 1..={MAX_CONTENT_ARTIFACT_MEDIA_TYPE_BYTES}",
+            artifact.media_type.len()
+        )));
+    }
+    if artifact.bytes.len() > MAX_CONTENT_ARTIFACT_BYTES {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "artifact byte length {} exceeds {MAX_CONTENT_ARTIFACT_BYTES}",
+            artifact.bytes.len()
+        )));
+    }
+    let expected = ContentArtifactId::for_content(&artifact.media_type, &artifact.bytes);
+    if artifact.id != expected {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "content digest {} does not match payload digest {expected}",
+            artifact.id
+        )));
     }
     Ok(())
 }
@@ -1774,6 +1983,8 @@ fn inspector_snapshot(image: &RestoreImage) -> PersistenceInspectorSnapshot {
         scalar_count: image.scalars.len(),
         list_count: image.lists.len(),
         row_count: image.lists.values().map(|list| list.rows.len()).sum(),
+        content_artifact_count: 0,
+        content_artifact_bytes: 0,
         encoded_value_bytes: None,
         completed_migration_count: image.completed_migration_edges.len(),
         outbox_pending_count,
@@ -1794,6 +2005,12 @@ fn error_result(command: PersistenceCommand, error: StoreError) -> PersistenceRe
         PersistenceCommand::Barrier(_) => PersistenceResult::BarrierComplete(Err(error)),
         PersistenceCommand::Inspect(_) => PersistenceResult::Inspected(Err(error)),
         PersistenceCommand::Compact(_) => PersistenceResult::Compacted(Err(error)),
+        PersistenceCommand::PutContentArtifact(_) => {
+            PersistenceResult::ContentArtifactStored(Err(error))
+        }
+        PersistenceCommand::LoadContentArtifact(_) => {
+            PersistenceResult::ContentArtifactLoaded(Err(error))
+        }
         PersistenceCommand::Shutdown(_) => PersistenceResult::ShutdownComplete(Err(error)),
     }
 }
@@ -1835,6 +2052,94 @@ mod tests {
         let mut driver = InMemoryDriver::default();
         driver.seed(RestoreImage::empty(application(), 1, [1; 32]));
         driver
+    }
+
+    #[test]
+    fn content_artifacts_are_exact_idempotent_and_removed_by_reset() {
+        let mut driver = seeded_driver();
+        let artifact = ContentArtifact::new(
+            "application/vnd.boon.test-artifact",
+            b"immutable bytes".to_vec(),
+        )
+        .unwrap();
+        let put = PutContentArtifactRequest {
+            application: application(),
+            artifact: artifact.clone(),
+        };
+        assert!(matches!(
+            driver.execute(PersistenceCommand::PutContentArtifact(put.clone())),
+            PersistenceResult::ContentArtifactStored(Ok(PutContentArtifactAck {
+                already_present: false,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            driver.execute(PersistenceCommand::PutContentArtifact(put)),
+            PersistenceResult::ContentArtifactStored(Ok(PutContentArtifactAck {
+                already_present: true,
+                ..
+            }))
+        ));
+        assert_eq!(
+            driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: application(),
+                    id: artifact.id,
+                }
+            )),
+            PersistenceResult::ContentArtifactLoaded(Ok(Some(artifact.clone())))
+        );
+        let snapshot = match driver.execute(PersistenceCommand::Inspect(InspectRequest {
+            application: application(),
+        })) {
+            PersistenceResult::Inspected(Ok(Some(snapshot))) => snapshot,
+            result => panic!("unexpected inspector result: {result:?}"),
+        };
+        assert_eq!(snapshot.content_artifact_count, 1);
+        assert_eq!(snapshot.content_artifact_bytes, artifact.bytes.len() as u64);
+
+        let mut corrupt = artifact.clone();
+        corrupt.bytes.push(0xff);
+        assert!(matches!(
+            driver.execute(PersistenceCommand::PutContentArtifact(
+                PutContentArtifactRequest {
+                    application: application(),
+                    artifact: corrupt,
+                }
+            )),
+            PersistenceResult::ContentArtifactStored(Err(StoreError::InvalidContentArtifact(_)))
+        ));
+
+        let reset = ResetApplicationBatch {
+            application: application(),
+            expected_base_epoch: 0,
+            next_epoch: 1,
+            source_schema_hash: [1; 32],
+            default_image: RestoreImage::empty(application(), 1, [1; 32]),
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            driver.execute(PersistenceCommand::ResetApplication(reset)),
+            PersistenceResult::ApplicationReset(Ok(_))
+        ));
+        assert_eq!(
+            driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: application(),
+                    id: artifact.id,
+                }
+            )),
+            PersistenceResult::ContentArtifactLoaded(Ok(None))
+        );
+        let snapshot = match driver.execute(PersistenceCommand::Inspect(InspectRequest {
+            application: application(),
+        })) {
+            PersistenceResult::Inspected(Ok(Some(snapshot))) => snapshot,
+            result => panic!("unexpected inspector result: {result:?}"),
+        };
+        assert_eq!(snapshot.content_artifact_count, 0);
+        assert_eq!(snapshot.content_artifact_bytes, 0);
     }
 
     fn effect() -> EffectId {

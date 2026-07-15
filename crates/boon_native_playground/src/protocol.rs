@@ -6,16 +6,22 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-pub use boon_runtime::{ApplicationIdentity, MigrationScenario, MigrationSequence};
+pub use boon_runtime::{
+    ApplicationIdentity, MigrationScenario, MigrationSequence, ScenarioExpectation,
+    ScenarioFieldMatch,
+};
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 9;
+const VERSION: u16 = 10;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_UNITS: usize = 1_024;
 const MAX_CATALOG_ENTRIES: usize = 1_024;
 const MAX_TEST_STEPS: usize = 4_096;
+const MAX_TEST_EXPECTATIONS_PER_STEP: usize = 128;
+const MAX_TEST_EXPECTATION_VALUES: usize = 4_096;
+const MAX_TEST_EXPECTATION_FIELDS: usize = 1_024;
 const MAX_ASSET_BLOBS: usize = 1_024;
 const MAX_ASSET_BLOB_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MIGRATION_STAGES: usize = 64;
@@ -68,6 +74,7 @@ pub struct CatalogItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TestStep {
+    pub id: String,
     pub source_path: String,
     pub action_kind: Option<String>,
     pub target_text: Option<String>,
@@ -79,6 +86,7 @@ pub struct TestStep {
     pub pointer_y: Option<String>,
     pub pointer_width: Option<String>,
     pub pointer_height: Option<String>,
+    pub expectations: Vec<ScenarioExpectation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -470,6 +478,8 @@ pub struct StoredSummary {
     pub scalar_count: u32,
     pub list_count: u32,
     pub row_count: u64,
+    pub content_artifact_count: u32,
+    pub content_artifact_bytes: u64,
     pub encoded_value_bytes: Option<u64>,
     pub completed_migration_count: u32,
 }
@@ -1235,6 +1245,7 @@ pub enum ProtocolError {
     InvalidUtf8(std::str::Utf8Error),
     InvalidMigration(String),
     InvalidPersistence(String),
+    InvalidTest(String),
     LimitExceeded(&'static str, usize),
     Truncated,
     TrailingBytes(usize),
@@ -1260,6 +1271,7 @@ impl fmt::Display for ProtocolError {
             Self::InvalidPersistence(message) => {
                 write!(f, "IPC persistence data is invalid: {message}")
             }
+            Self::InvalidTest(message) => write!(f, "IPC TEST data is invalid: {message}"),
             Self::LimitExceeded(name, value) => {
                 write!(f, "IPC {name} exceeds its limit: {value}")
             }
@@ -1580,6 +1592,8 @@ impl Encoder {
                 self.u32(stored.scalar_count);
                 self.u32(stored.list_count);
                 self.u64(stored.row_count);
+                self.u32(stored.content_artifact_count);
+                self.u64(stored.content_artifact_bytes);
                 self.optional_u64(stored.encoded_value_bytes);
                 self.u32(stored.completed_migration_count);
             }
@@ -1780,6 +1794,7 @@ impl Encoder {
         }
         self.u32(steps.len() as u32);
         for step in steps {
+            self.string(&step.id)?;
             self.string(&step.source_path)?;
             self.optional_string(step.action_kind.as_deref())?;
             self.optional_string(step.target_text.as_deref())?;
@@ -1791,6 +1806,140 @@ impl Encoder {
             self.optional_string(step.pointer_y.as_deref())?;
             self.optional_string(step.pointer_width.as_deref())?;
             self.optional_string(step.pointer_height.as_deref())?;
+            self.test_expectations(&step.expectations)?;
+        }
+        Ok(())
+    }
+
+    fn test_expectations(
+        &mut self,
+        expectations: &[ScenarioExpectation],
+    ) -> Result<(), ProtocolError> {
+        if expectations.len() > MAX_TEST_EXPECTATIONS_PER_STEP {
+            return Err(ProtocolError::LimitExceeded(
+                "test expectations per step",
+                expectations.len(),
+            ));
+        }
+        self.u32(expectations.len() as u32);
+        for expectation in expectations {
+            match expectation {
+                ScenarioExpectation::RootText { name, value } => {
+                    self.u8(1);
+                    self.string(name)?;
+                    self.string(value)?;
+                }
+                ScenarioExpectation::ListTexts {
+                    list,
+                    field,
+                    filter,
+                    values,
+                } => {
+                    self.u8(2);
+                    self.string(list)?;
+                    self.string(field)?;
+                    self.optional_test_field_match(filter.as_ref())?;
+                    self.test_expectation_strings(values)?;
+                }
+                ScenarioExpectation::RootRowTexts {
+                    root,
+                    field,
+                    values,
+                } => {
+                    self.u8(3);
+                    self.string(root)?;
+                    self.string(field)?;
+                    self.test_expectation_strings(values)?;
+                }
+                ScenarioExpectation::ListCount {
+                    list,
+                    filter,
+                    count,
+                } => {
+                    self.u8(4);
+                    self.string(list)?;
+                    self.test_field_match(filter)?;
+                    self.u64(
+                        (*count)
+                            .try_into()
+                            .map_err(|_| ProtocolError::LimitExceeded("test list count", *count))?,
+                    );
+                }
+                ScenarioExpectation::RowFields {
+                    list,
+                    key_field,
+                    key,
+                    fields,
+                } => {
+                    self.u8(5);
+                    self.string(list)?;
+                    self.string(key_field)?;
+                    self.string(key)?;
+                    if fields.len() > MAX_TEST_EXPECTATION_FIELDS {
+                        return Err(ProtocolError::LimitExceeded(
+                            "test expectation field count",
+                            fields.len(),
+                        ));
+                    }
+                    self.u32(fields.len() as u32);
+                    for (name, value) in fields {
+                        self.string(name)?;
+                        self.string(value)?;
+                    }
+                }
+                ScenarioExpectation::RecomputedRows {
+                    list,
+                    key_field,
+                    field,
+                    keys,
+                } => {
+                    self.u8(6);
+                    self.string(list)?;
+                    self.string(key_field)?;
+                    self.string(field)?;
+                    self.test_expectation_strings(keys)?;
+                }
+                ScenarioExpectation::SemanticDeltaContains(value) => {
+                    self.u8(7);
+                    self.string(value)?;
+                }
+                ScenarioExpectation::DocumentChanged => self.u8(8),
+            }
+        }
+        Ok(())
+    }
+
+    fn optional_test_field_match(
+        &mut self,
+        value: Option<&ScenarioFieldMatch>,
+    ) -> Result<(), ProtocolError> {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.test_field_match(value)
+            }
+            None => {
+                self.u8(0);
+                Ok(())
+            }
+        }
+    }
+
+    fn test_field_match(&mut self, value: &ScenarioFieldMatch) -> Result<(), ProtocolError> {
+        self.string(&value.field)?;
+        self.string(&value.value)
+    }
+
+    fn test_expectation_strings(&mut self, values: &[String]) -> Result<(), ProtocolError> {
+        if values.len() > MAX_TEST_EXPECTATION_VALUES {
+            return Err(ProtocolError::LimitExceeded(
+                "test expectation value count",
+                values.len(),
+            ));
+        }
+        self.u32(values.len() as u32);
+        for value in values {
+            self.string(value)?;
         }
         Ok(())
     }
@@ -2006,6 +2155,8 @@ impl<'a> Decoder<'a> {
                 scalar_count: self.u32()?,
                 list_count: self.u32()?,
                 row_count: self.u64()?,
+                content_artifact_count: self.u32()?,
+                content_artifact_bytes: self.u64()?,
                 encoded_value_bytes: self.optional_u64()?,
                 completed_migration_count: self.u32()?,
             }),
@@ -2255,6 +2406,7 @@ impl<'a> Decoder<'a> {
         (0..count)
             .map(|_| {
                 Ok(TestStep {
+                    id: self.string()?,
                     source_path: self.string()?,
                     action_kind: self.optional_string()?,
                     target_text: self.optional_string()?,
@@ -2266,9 +2418,106 @@ impl<'a> Decoder<'a> {
                     pointer_y: self.optional_string()?,
                     pointer_width: self.optional_string()?,
                     pointer_height: self.optional_string()?,
+                    expectations: self.test_expectations()?,
                 })
             })
             .collect()
+    }
+
+    fn test_expectations(&mut self) -> Result<Vec<ScenarioExpectation>, ProtocolError> {
+        let count = self.u32()? as usize;
+        if count > MAX_TEST_EXPECTATIONS_PER_STEP {
+            return Err(ProtocolError::LimitExceeded(
+                "test expectations per step",
+                count,
+            ));
+        }
+        (0..count)
+            .map(|_| match self.u8()? {
+                1 => Ok(ScenarioExpectation::RootText {
+                    name: self.string()?,
+                    value: self.string()?,
+                }),
+                2 => Ok(ScenarioExpectation::ListTexts {
+                    list: self.string()?,
+                    field: self.string()?,
+                    filter: self.optional_test_field_match()?,
+                    values: self.test_expectation_strings()?,
+                }),
+                3 => Ok(ScenarioExpectation::RootRowTexts {
+                    root: self.string()?,
+                    field: self.string()?,
+                    values: self.test_expectation_strings()?,
+                }),
+                4 => {
+                    let list = self.string()?;
+                    let filter = self.test_field_match()?;
+                    let count = usize::try_from(self.u64()?)
+                        .map_err(|_| ProtocolError::LimitExceeded("test list count", usize::MAX))?;
+                    Ok(ScenarioExpectation::ListCount {
+                        list,
+                        filter,
+                        count,
+                    })
+                }
+                5 => {
+                    let list = self.string()?;
+                    let key_field = self.string()?;
+                    let key = self.string()?;
+                    let field_count = self.u32()? as usize;
+                    if field_count > MAX_TEST_EXPECTATION_FIELDS {
+                        return Err(ProtocolError::LimitExceeded(
+                            "test expectation field count",
+                            field_count,
+                        ));
+                    }
+                    let mut fields = std::collections::BTreeMap::new();
+                    for _ in 0..field_count {
+                        let name = self.string()?;
+                        let value = self.string()?;
+                        if fields.insert(name, value).is_some() {
+                            return Err(ProtocolError::InvalidTest(
+                                "duplicate test expectation field".to_owned(),
+                            ));
+                        }
+                    }
+                    Ok(ScenarioExpectation::RowFields {
+                        list,
+                        key_field,
+                        key,
+                        fields,
+                    })
+                }
+                6 => Ok(ScenarioExpectation::RecomputedRows {
+                    list: self.string()?,
+                    key_field: self.string()?,
+                    field: self.string()?,
+                    keys: self.test_expectation_strings()?,
+                }),
+                7 => Ok(ScenarioExpectation::SemanticDeltaContains(self.string()?)),
+                8 => Ok(ScenarioExpectation::DocumentChanged),
+                value => Err(ProtocolError::InvalidEnum("test expectation", value)),
+            })
+            .collect()
+    }
+
+    fn optional_test_field_match(&mut self) -> Result<Option<ScenarioFieldMatch>, ProtocolError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.test_field_match().map(Some),
+            value => Err(ProtocolError::InvalidOption(value)),
+        }
+    }
+
+    fn test_field_match(&mut self) -> Result<ScenarioFieldMatch, ProtocolError> {
+        Ok(ScenarioFieldMatch {
+            field: self.string()?,
+            value: self.string()?,
+        })
+    }
+
+    fn test_expectation_strings(&mut self) -> Result<Vec<String>, ProtocolError> {
+        self.string_vec(MAX_TEST_EXPECTATION_VALUES, "test expectation value count")
     }
 
     fn optional_string(&mut self) -> Result<Option<String>, ProtocolError> {
@@ -2389,6 +2638,7 @@ mod tests {
                 revision: 10,
                 units: units(),
                 test_steps: vec![TestStep {
+                    id: "increment".to_owned(),
                     source_path: "store.increment.press".to_owned(),
                     action_kind: Some("click".to_owned()),
                     target_text: Some("+".to_owned()),
@@ -2400,6 +2650,53 @@ mod tests {
                     pointer_y: Some("0".to_owned()),
                     pointer_width: Some("360".to_owned()),
                     pointer_height: Some("1".to_owned()),
+                    expectations: vec![
+                        ScenarioExpectation::RootText {
+                            name: "store.count".to_owned(),
+                            value: "1".to_owned(),
+                        },
+                        ScenarioExpectation::ListTexts {
+                            list: "todos".to_owned(),
+                            field: "title".to_owned(),
+                            filter: Some(ScenarioFieldMatch {
+                                field: "completed".to_owned(),
+                                value: "false".to_owned(),
+                            }),
+                            values: vec!["First".to_owned(), "Second".to_owned()],
+                        },
+                        ScenarioExpectation::RootRowTexts {
+                            root: "visible_todos".to_owned(),
+                            field: "title".to_owned(),
+                            values: vec!["First".to_owned()],
+                        },
+                        ScenarioExpectation::ListCount {
+                            list: "todos".to_owned(),
+                            filter: ScenarioFieldMatch {
+                                field: "completed".to_owned(),
+                                value: "false".to_owned(),
+                            },
+                            count: 2,
+                        },
+                        ScenarioExpectation::RowFields {
+                            list: "todos".to_owned(),
+                            key_field: "id".to_owned(),
+                            key: "1".to_owned(),
+                            fields: std::collections::BTreeMap::from([
+                                ("completed".to_owned(), "false".to_owned()),
+                                ("title".to_owned(), "First".to_owned()),
+                            ]),
+                        },
+                        ScenarioExpectation::RecomputedRows {
+                            list: "cells".to_owned(),
+                            key_field: "address".to_owned(),
+                            field: "value".to_owned(),
+                            keys: vec!["A0".to_owned(), "B0".to_owned()],
+                        },
+                        ScenarioExpectation::SemanticDeltaContains(
+                            "store.count changed".to_owned(),
+                        ),
+                        ScenarioExpectation::DocumentChanged,
+                    ],
                 }],
                 migration: None,
                 migration_stage: None,

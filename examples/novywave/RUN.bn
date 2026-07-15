@@ -1768,30 +1768,12 @@ store: [
             }
         }
 
-    waveform_click_pointer_width_text:
-        selected_waveform_metadata_canvas_width |> HOLD waveform_click_pointer_width_text {
-            LATEST {
-                elements.waveform_click.pointer_width
-                elements.load_default_file.event.press |> THEN { selected_waveform_metadata_canvas_width }
-                elements.show_empty.event.press |> THEN { selected_waveform_metadata_canvas_width }
-            }
-        }
-
     waveform_hover_pointer_x_text:
         TEXT { 0 } |> HOLD waveform_hover_pointer_x_text {
             LATEST {
                 elements.waveform_hover.pointer_x
                 elements.load_default_file.event.press |> THEN { TEXT { 0 } }
                 elements.show_empty.event.press |> THEN { TEXT { 0 } }
-            }
-        }
-
-    waveform_hover_pointer_width_text:
-        selected_waveform_metadata_canvas_width |> HOLD waveform_hover_pointer_width_text {
-            LATEST {
-                elements.waveform_hover.pointer_width
-                elements.load_default_file.event.press |> THEN { selected_waveform_metadata_canvas_width }
-                elements.show_empty.event.press |> THEN { selected_waveform_metadata_canvas_width }
             }
         }
 

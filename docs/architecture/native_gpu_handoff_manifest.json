@@ -6,40 +6,317 @@
   "aggregate_byte_limit": 262144,
   "gates": [
     {
+      "order": 0,
       "gate": "architecture",
       "verifier": "verify-architecture",
+      "runner": "architecture",
       "output": "target/reports/report-v2/architecture.json",
-      "byte_limit": 262144
+      "byte_limit": 262144,
+      "sidecar_byte_limit": 0
     },
     {
+      "order": 1,
       "gate": "counter-dev",
       "verifier": "verify-counter-dev",
+      "runner": "native-product",
       "output": "target/reports/report-v2/counter-dev.json",
-      "byte_limit": 262144
+      "byte_limit": 262144,
+      "sidecar_byte_limit": 67108864,
+      "profile": {
+        "id": "native-click-switch-v1",
+        "arguments": [
+          { "flag": "--harness", "value": "timed" },
+          { "flag": "--example", "value": "counter" },
+          { "flag": "--visible-mode", "value": "click" },
+          { "flag": "--visible-samples", "value": "120" },
+          { "flag": "--alternate-target", "value": "none" },
+          { "flag": "--selection-samples", "value": "0" },
+          { "flag": "--scroll-samples", "value": "0" },
+          { "flag": "--switch-samples", "value": "23" }
+        ],
+        "measurements": [
+          "callback-to-host-event",
+          "warm-visible-interaction",
+          "example-switch-acknowledgement",
+          "example-switch-final-preview"
+        ]
+      }
     },
     {
+      "order": 2,
       "gate": "todomvc-physical",
       "verifier": "verify-todomvc-physical",
+      "runner": "native-product",
       "output": "target/reports/report-v2/todomvc-physical.json",
-      "byte_limit": 262144
+      "byte_limit": 262144,
+      "sidecar_byte_limit": 67108864,
+      "profile": {
+        "id": "native-hover-v1",
+        "arguments": [
+          { "flag": "--harness", "value": "timed" },
+          { "flag": "--example", "value": "todo_mvc_physical" },
+          { "flag": "--visible-mode", "value": "hover" },
+          { "flag": "--visible-samples", "value": "120" },
+          { "flag": "--alternate-target", "value": "any" },
+          { "flag": "--selection-samples", "value": "0" },
+          { "flag": "--scroll-samples", "value": "0" },
+          { "flag": "--switch-samples", "value": "0" }
+        ],
+        "measurements": [
+          "callback-to-host-event",
+          "warm-visible-interaction"
+        ]
+      }
     },
     {
+      "order": 3,
       "gate": "cells",
       "verifier": "verify-cells",
+      "runner": "native-product",
       "output": "target/reports/report-v2/cells.json",
-      "byte_limit": 262144
+      "byte_limit": 262144,
+      "sidecar_byte_limit": 67108864,
+      "profile": {
+        "id": "native-selection-scroll-v1",
+        "arguments": [
+          { "flag": "--harness", "value": "timed" },
+          { "flag": "--example", "value": "cells" },
+          { "flag": "--visible-mode", "value": "hover" },
+          { "flag": "--visible-samples", "value": "120" },
+          { "flag": "--alternate-target", "value": "same-source" },
+          { "flag": "--selection-samples", "value": "24" },
+          { "flag": "--scroll-samples", "value": "148" },
+          { "flag": "--switch-samples", "value": "0" }
+        ],
+        "measurements": [
+          "callback-to-host-event",
+          "warm-visible-interaction",
+          "repeated-selection",
+          "warm-scroll"
+        ]
+      }
     },
     {
+      "order": 4,
       "gate": "novywave",
       "verifier": "verify-novywave",
+      "runner": "native-product",
       "output": "target/reports/report-v2/novywave.json",
-      "byte_limit": 262144
+      "byte_limit": 262144,
+      "sidecar_byte_limit": 67108864,
+      "profile": {
+        "id": "native-hover-v1",
+        "arguments": [
+          { "flag": "--harness", "value": "timed" },
+          { "flag": "--example", "value": "novywave" },
+          { "flag": "--visible-mode", "value": "hover" },
+          { "flag": "--visible-samples", "value": "120" },
+          { "flag": "--alternate-target", "value": "any" },
+          { "flag": "--selection-samples", "value": "0" },
+          { "flag": "--scroll-samples", "value": "0" },
+          { "flag": "--switch-samples", "value": "0" }
+        ],
+        "measurements": [
+          "callback-to-host-event",
+          "warm-visible-interaction"
+        ]
+      }
     },
     {
+      "order": 5,
+      "gate": "persons-pro",
+      "verifier": "verify-persons-pro",
+      "runner": "native-product",
+      "output": "target/reports/report-v2/persons-pro.json",
+      "byte_limit": 262144,
+      "sidecar_byte_limit": 67108864,
+      "profile": {
+        "id": "native-local-first-workflow-v1",
+        "arguments": [
+          { "flag": "--harness", "value": "timed" },
+          { "flag": "--example", "value": "persons_pro" },
+          { "flag": "--visible-mode", "value": "hover" },
+          { "flag": "--visible-samples", "value": "120" },
+          { "flag": "--alternate-target", "value": "any" },
+          { "flag": "--selection-samples", "value": "0" },
+          { "flag": "--scroll-samples", "value": "148" },
+          { "flag": "--switch-samples", "value": "0" },
+          { "flag": "--profile-benchmark-steps", "value": "valid-edit-preview,corrected-edit-preview" }
+        ],
+        "measurements": [
+          "callback-to-host-event",
+          "warm-visible-interaction",
+          "warm-scroll"
+        ],
+        "proof_requirements": {
+          "scenario": {
+            "path": "examples/persons_pro.scn",
+            "semantic_assertions": true
+          },
+          "budget": {
+            "path": "examples/persons_pro.budget.toml",
+            "metrics": [
+              "keystroke-to-editor-visible-p95",
+              "valid-edit-to-preview-visible-p95",
+              "valid-edit-to-preview-visible-p99",
+              "bounded-starter-source-compile-p95",
+              "bounded-starter-source-compile-max",
+              "passive-preview-scroll-p95",
+              "interaction-frame-block-max",
+              "pending-child-artifact-max",
+              "trusted-parent-rebuilds-per-edit"
+            ]
+          },
+          "state_root": {
+            "policy": "launch-scoped-clean",
+            "restart_required": true
+          },
+          "checkpoints": [
+            {
+              "id": "fresh-anonymous-workspace",
+              "kind": "scenario-step",
+              "scenario_step": "fresh-anonymous-workspace-and-starter-preview"
+            },
+            {
+              "id": "starter-child-preview",
+              "kind": "scenario-step",
+              "scenario_step": "fresh-anonymous-workspace-and-starter-preview"
+            },
+            {
+              "id": "valid-edit-preview",
+              "kind": "scenario-step",
+              "scenario_step": "valid-edit-preview"
+            },
+            {
+              "id": "invalid-edit-last-valid",
+              "kind": "scenario-step",
+              "scenario_step": "invalid-edit-retains-last-valid"
+            },
+            {
+              "id": "corrected-edit-preview",
+              "kind": "scenario-step",
+              "scenario_step": "corrected-edit-preview"
+            },
+            {
+              "id": "publish-success",
+              "kind": "scenario-step",
+              "scenario_step": "immutable-publish"
+            },
+            {
+              "id": "published-child-visible",
+              "kind": "scenario-step",
+              "scenario_step": "published-child-artifact-visible"
+            },
+            {
+              "id": "publish-failure-preserves-pointer",
+              "kind": "scenario-step",
+              "scenario_step": "failed-publish-preserves-pointer"
+            },
+            {
+              "id": "passkey-cancel-preserves-anonymous",
+              "kind": "scenario-step",
+              "scenario_step": "passkey-cancel-preserves-anonymous"
+            },
+            {
+              "id": "passkey-failure-preserves-anonymous",
+              "kind": "scenario-step",
+              "scenario_step": "passkey-registration-failure-preserves-anonymous"
+            },
+            {
+              "id": "first-passkey-protects",
+              "kind": "scenario-step",
+              "scenario_step": "first-passkey-protects"
+            },
+            {
+              "id": "duplicate-passkey-rejected",
+              "kind": "scenario-step",
+              "scenario_step": "duplicate-credential-is-rejected"
+            },
+            {
+              "id": "second-passkey-same-account",
+              "kind": "scenario-step",
+              "scenario_step": "second-passkey-same-account"
+            },
+            {
+              "id": "authentication-cancel-preserves-sign-out",
+              "kind": "scenario-step",
+              "scenario_step": "authentication-cancellation-preserves-sign-out"
+            },
+            {
+              "id": "authentication-failure-preserves-sign-out",
+              "kind": "scenario-step",
+              "scenario_step": "authentication-failure-preserves-sign-out"
+            },
+            {
+              "id": "sign-out-sign-in",
+              "kind": "scenario-step",
+              "scenario_step": "passkey-sign-in-restores-access"
+            },
+            {
+              "id": "restart-restores-authority",
+              "kind": "restart-restore",
+              "baseline_checkpoint": "sign-out-sign-in"
+            },
+            {
+              "id": "responsive-layout-parity",
+              "kind": "responsive-layout",
+              "baseline_checkpoint": "sign-out-sign-in",
+              "logical_width": 390,
+              "logical_height": 844
+            },
+            {
+              "id": "stale-compile-rejected",
+              "kind": "stale-compile-rejection"
+            },
+            {
+              "id": "clear-start-over",
+              "kind": "persistence-operation",
+              "operation": "cleared-and-started-over"
+            },
+            {
+              "id": "state-exported",
+              "kind": "persistence-operation",
+              "operation": "exported"
+            },
+            {
+              "id": "corrupt-state-rejected",
+              "kind": "persistence-operation",
+              "operation": "corruption-rejected"
+            },
+            {
+              "id": "state-import-previewed",
+              "kind": "persistence-operation",
+              "operation": "import-previewed"
+            },
+            {
+              "id": "state-import-activated",
+              "kind": "persistence-operation",
+              "operation": "import-activated"
+            },
+            {
+              "id": "schema-migration-activated",
+              "kind": "persistence-operation",
+              "operation": "migration-activated"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "order": 6,
       "gate": "negative",
       "verifier": "verify-negative",
+      "runner": "native-product",
       "output": "target/reports/report-v2/negative.json",
-      "byte_limit": 262144
+      "byte_limit": 262144,
+      "sidecar_byte_limit": 0,
+      "profile": {
+        "id": "bounded-negative-v1",
+        "arguments": [
+          { "flag": "--harness", "value": "negative" }
+        ],
+        "measurements": []
+      }
     }
   ]
 }

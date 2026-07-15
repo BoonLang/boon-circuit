@@ -10,7 +10,7 @@ FUNCTION root() {
         ]
         items: LIST {
             browser_bar()
-            public_program()
+            preview_content()
         }
     )
 }
@@ -29,7 +29,20 @@ FUNCTION browser_bar() {
             border_width: 1
         ]
         items: LIST {
-            Components/status(PASS: [store: PASSED.store], label: TEXT { Draft preview }, tone: Neutral)
+            Components/button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Draft }
+                tone: Neutral
+                selected: PASSED.store.preview_surface == DraftPage
+            )
+                |> SOURCE { PASSED.store.elements.show_draft_page }
+            Components/button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Published }
+                tone: Neutral
+                selected: PASSED.store.preview_surface == PublishedPage
+            )
+                |> SOURCE { PASSED.store.elements.show_published_page }
             Scene/Element/text(
                 element: []
                 style: [
@@ -45,7 +58,28 @@ FUNCTION browser_bar() {
     )
 }
 
-FUNCTION public_program() {
+FUNCTION preview_content() {
+    PASSED.store.preview_surface |> WHEN {
+        PublishedPage => published_program()
+        __ => draft_program()
+    }
+}
+
+FUNCTION draft_compiler() {
+    Scene/Element/program(
+        element: [event: PASSED.store.elements.draft_program]
+        style: [width: 0, height: 0, paint: False]
+        source: PASSED.store.source_draft
+        revision: PASSED.store.draft_revision
+        bootstrap_source: PASSED.store.last_valid_draft_source
+        bootstrap_revision: PASSED.store.last_valid_draft_revision
+        capability_profile: PublicDocument
+        session_key: TEXT { persons-public-draft }
+        mount: False
+    )
+}
+
+FUNCTION draft_program() {
     Scene/Element/program(
         element: [event: PASSED.store.elements.draft_program]
         style: [
@@ -54,8 +88,51 @@ FUNCTION public_program() {
         ]
         source: PASSED.store.source_draft
         revision: PASSED.store.draft_revision
+        bootstrap_source: PASSED.store.last_valid_draft_source
+        bootstrap_revision: PASSED.store.last_valid_draft_revision
         capability_profile: PublicDocument
         session_key: TEXT { persons-public-draft }
         mount: True
+    )
+}
+
+FUNCTION published_program() {
+    PASSED.store.has_published_revision |> WHEN {
+        True => Scene/Element/program(
+            element: [event: PASSED.store.elements.published_program]
+            style: [width: Fill, height: Fill]
+            artifact_id: PASSED.store.published_artifact_id
+            revision: PASSED.store.published_revision
+            capability_profile: PublicDocument
+            session_key: TEXT { persons-public-published }
+            mount: True
+        )
+        False => publication_placeholder()
+    }
+}
+
+FUNCTION publication_placeholder() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 8
+        style: [
+            width: Fill
+            height: Fill
+            padding: 28
+            background: [color: PersonsTheme/preview_empty_background(mode: PASSED.store.mode)]
+        ]
+        items: LIST {
+            Components/text(
+                PASS: [store: PASSED.store]
+                value: TEXT { Nothing published yet }
+                of: Heading
+            )
+            Components/text(
+                PASS: [store: PASSED.store]
+                value: TEXT { Publish a valid draft to create the first immutable public revision. }
+                of: Muted
+            )
+        }
     )
 }

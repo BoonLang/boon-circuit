@@ -2,11 +2,14 @@ use super::*;
 use crate::report_v2::{
     AdapterBackend, AdapterDeviceType, AggregateGateResult, AggregateIdentity, AggregateMode,
     AggregateReport, AggregateReportKind, ArtifactKind, ArtifactMetadata, AsyncProofTimingEvidence,
-    BoundedId, BoundedString, CaptureMethod, CheckOutcome, ChildValidation, ExpectedIdentity,
-    FORMAT_VERSION, FrameEvidenceKey, GateEvidence, GateName, HostBoundary, InputDelivery,
-    ManifestIdentity, MeasurementContract, NativeEvidence, PresentMode, ProducerEvidence,
-    ProductTimingEvidence, RelativePath, ReportFileMetadata, ReportStatus, Sha256Digest, ShortText,
-    SourceIdentity, TimingSummary, ToolIdentity, WindowBackend, check, detail, gate_report,
+    BoundedId, BoundedString, BudgetComparison, BudgetObservation, BudgetProof, BudgetUnit,
+    CaptureMethod, CheckOutcome, CheckpointEvidenceRequirement, ChildValidation, ExpectedIdentity,
+    FORMAT_VERSION, FrameEvidenceKey, GateCommand, GateEvidence, GateName, GateRunner,
+    HostBoundary, InputDelivery, ManifestGate, ManifestIdentity, MeasurementContract,
+    NativeEvidence, PresentMode, ProducerEvidence, ProductTimingEvidence, RelativePath,
+    ReportFileMetadata, ReportStatus, ScenarioBoundary, ScenarioProof, Sha256Digest, ShortText,
+    SourceIdentity, StateCheckpointEvidence, StateCheckpointProof, StateRootProof, TimingSummary,
+    ToolIdentity, VerificationProfileEvidence, WindowBackend, check, detail, gate_report,
     load_manifest, measurement_contract, protocol_name,
 };
 
@@ -14,46 +17,53 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
-#[test]
-fn command_parser_exposes_exactly_eight_commands() {
-    let names = PublicCommand::ALL
+fn gate(value: &str) -> GateName {
+    GateName::new(value).unwrap()
+}
+
+fn manifest_gate<'a>(
+    manifest: &'a crate::report_v2::HandoffManifest,
+    value: &str,
+) -> &'a ManifestGate {
+    manifest
+        .gates
         .iter()
-        .map(|command| command.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        names,
-        [
-            "shaders",
-            "verify-architecture",
-            "verify-counter-dev",
-            "verify-todomvc-physical",
-            "verify-cells",
-            "verify-novywave",
-            "verify-negative",
-            "verify-all",
-        ]
-    );
+        .find(|entry| entry.gate.slug() == value)
+        .unwrap_or_else(|| panic!("manifest gate {value} is missing"))
+}
+
+#[test]
+fn command_parser_exposes_manifest_gates_and_fixed_tools() {
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
+    let mut names = vec!["shaders"];
+    names.extend(manifest.gates.iter().map(|entry| entry.verifier.as_str()));
+    names.push(manifest.aggregate.as_str());
+    assert_eq!(names.len(), manifest.gates.len() + 2);
     for name in names {
-        assert!(PublicCommand::parse(name).is_some());
+        assert!(parse_command(&strings(&[name]), &manifest).is_ok());
     }
-    assert!(PublicCommand::parse("help").is_none());
-    assert!(PublicCommand::parse("verify-native-gpu-all").is_none());
-    assert!(PublicCommand::parse("verify-report-schema").is_none());
+    assert!(parse_command(&strings(&["help"]), &manifest).is_err());
+    assert!(parse_command(&strings(&["verify-native-gpu-all"]), &manifest).is_err());
+    assert!(parse_command(&strings(&["verify-report-schema"]), &manifest).is_err());
 }
 
 #[test]
 fn command_parser_accepts_only_v2_options() {
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
     assert_eq!(
-        parse_command(&strings(&["shaders", "--check"])).unwrap(),
+        parse_command(&strings(&["shaders", "--check"]), &manifest).unwrap(),
         ParsedCommand::Shaders { check: true }
     );
     assert_eq!(
-        parse_command(&strings(&[
-            "verify-all",
-            "--check-existing",
-            "--report",
-            "target/custom.json",
-        ]))
+        parse_command(
+            &strings(&[
+                "verify-all",
+                "--check-existing",
+                "--report",
+                "target/custom.json",
+            ]),
+            &manifest
+        )
         .unwrap(),
         ParsedCommand::VerifyAll {
             check_existing: true,
@@ -61,34 +71,31 @@ fn command_parser_accepts_only_v2_options() {
         }
     );
     assert_eq!(
-        parse_command(&strings(
-            &["verify-cells", "--report", "target/cells.json",]
-        ))
+        parse_command(
+            &strings(&["verify-cells", "--report", "target/cells.json"]),
+            &manifest,
+        )
         .unwrap(),
         ParsedCommand::Gate {
-            command: PublicCommand::VerifyCells,
+            gate: gate("cells"),
             report: Some(PathBuf::from("target/cells.json")),
         }
     );
-    assert!(parse_command(&strings(&["verify-cells", "--check-existing"])).is_err());
-    assert!(parse_command(&strings(&["verify-all", "--refresh"])).is_err());
-    assert!(parse_command(&strings(&["help"])).is_err());
+    assert!(parse_command(&strings(&["verify-cells", "--check-existing"]), &manifest).is_err());
+    assert!(parse_command(&strings(&["verify-all", "--refresh"]), &manifest).is_err());
+    assert!(parse_command(&strings(&["help"]), &manifest).is_err());
 }
 
 #[test]
-fn handoff_manifest_is_exactly_the_six_v2_gates() {
+fn handoff_manifest_defines_the_ordered_v2_gate_inventory() {
     let (manifest, _) = load_manifest(&workspace_root()).unwrap();
-    assert_eq!(manifest.gates.len(), 6);
     assert_eq!(
         manifest
             .gates
             .iter()
-            .map(|entry| (entry.gate, entry.verifier.as_str()))
+            .map(|entry| usize::from(entry.order))
             .collect::<Vec<_>>(),
-        GateName::ALL
-            .iter()
-            .map(|gate| (*gate, gate.command().as_str()))
-            .collect::<Vec<_>>()
+        (0..manifest.gates.len()).collect::<Vec<_>>()
     );
     assert!(
         manifest
@@ -96,13 +103,129 @@ fn handoff_manifest_is_exactly_the_six_v2_gates() {
             .iter()
             .all(|entry| !entry.output.as_str().contains("sidecar"))
     );
+    let persons = manifest_gate(&manifest, "persons-pro");
+    let profile = persons.profile.as_ref().expect("Persons.pro profile");
+    assert_eq!(profile.argument("--example"), Some("persons_pro"));
+    assert_eq!(profile.proof_requirements.checkpoints.len(), 25);
+    let checkpoint_ids = profile
+        .proof_requirements
+        .checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for required in [
+        "published-child-visible",
+        "passkey-failure-preserves-anonymous",
+        "duplicate-passkey-rejected",
+        "authentication-cancel-preserves-sign-out",
+        "authentication-failure-preserves-sign-out",
+    ] {
+        assert!(checkpoint_ids.contains(required));
+    }
+    assert!(
+        profile
+            .proof_requirements
+            .scenario
+            .as_ref()
+            .is_some_and(|scenario| scenario.semantic_assertions)
+    );
+}
+
+#[test]
+fn manifest_accepts_a_new_product_gate_without_a_rust_inventory_change() {
+    let mut manifest = load_manifest(&workspace_root()).unwrap().0;
+    let insert_at = manifest.gates.len();
+    manifest.gates.push(ManifestGate {
+        order: u16::try_from(insert_at).unwrap(),
+        gate: gate("future-product"),
+        verifier: GateCommand::new("verify-future-product").unwrap(),
+        runner: GateRunner::NativeProduct,
+        output: RelativePath::new("target/reports/report-v2/future-product.json").unwrap(),
+        byte_limit: 262_144,
+        sidecar_byte_limit: 67_108_864,
+        profile: manifest_gate(&manifest, "counter-dev").profile.clone(),
+    });
+    manifest.validate().unwrap();
+    assert_eq!(
+        manifest
+            .gate_for_verifier("verify-future-product")
+            .unwrap()
+            .gate
+            .slug(),
+        "future-product"
+    );
+}
+
+#[test]
+fn manifest_rejects_duplicate_identifiers_and_non_contiguous_order() {
+    let original = load_manifest(&workspace_root()).unwrap().0;
+
+    let mut duplicate_gate = original.clone();
+    duplicate_gate.gates[1].gate = duplicate_gate.gates[0].gate.clone();
+    assert!(
+        duplicate_gate
+            .validate()
+            .unwrap_err()
+            .contains("duplicated")
+    );
+
+    let mut duplicate_verifier = original.clone();
+    duplicate_verifier.gates[1].verifier = duplicate_verifier.gates[0].verifier.clone();
+    assert!(
+        duplicate_verifier
+            .validate()
+            .unwrap_err()
+            .contains("duplicated")
+    );
+
+    let mut wrong_order = original;
+    wrong_order.gates[1].order = 7;
+    assert!(wrong_order.validate().unwrap_err().contains("expected 1"));
+}
+
+#[test]
+fn manifest_rejects_duplicate_outputs_and_invalid_gate_identifiers() {
+    let mut duplicate_output = load_manifest(&workspace_root()).unwrap().0;
+    duplicate_output.gates[1].output = duplicate_output.gates[0].output.clone();
+    assert!(duplicate_output.validate().unwrap_err().contains("output"));
+
+    assert!(GateName::new("Invalid_Product").is_err());
+    assert!(GateName::new("x".repeat(65)).is_err());
+    assert!(GateCommand::new("future-product").is_err());
+    assert!(GateCommand::new("verify-Invalid").is_err());
+}
+
+#[test]
+fn manifest_rejects_profile_arguments_that_do_not_match_measurement_contract() {
+    let mut manifest = load_manifest(&workspace_root()).unwrap().0;
+    let persons = manifest
+        .gates
+        .iter_mut()
+        .find(|entry| entry.gate.slug() == "persons-pro")
+        .unwrap();
+    persons
+        .profile
+        .as_mut()
+        .unwrap()
+        .arguments
+        .iter_mut()
+        .find(|argument| argument.flag.as_str() == "--scroll-samples")
+        .unwrap()
+        .value = RelativePath::new("0").unwrap();
+    assert!(
+        manifest
+            .validate()
+            .unwrap_err()
+            .contains("measurements do not match")
+    );
 }
 
 #[test]
 fn valid_fail_report_is_structurally_distinct_from_invalid_report() {
     let blocker = detail("producer has not implemented v2 evidence");
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
     let report = gate_report(
-        GateName::Negative,
+        manifest_gate(&manifest, "negative"),
         bounded_id("run-one"),
         expected_identity(),
         ReportStatus::Fail,
@@ -113,6 +236,7 @@ fn valid_fail_report_is_structurally_distinct_from_invalid_report() {
                 blocker.as_str(),
             )],
             producer: Some(producer(Some(2))),
+            profile: None,
             native: None,
             product_ux_timings: Vec::new(),
             async_proof_timing: None,
@@ -131,13 +255,13 @@ fn valid_fail_report_is_structurally_distinct_from_invalid_report() {
 
 #[test]
 fn stale_identity_is_rejected() {
-    let report = passing_timed_report(GateName::Cells);
+    let report = passing_timed_report("cells");
     let mut stale = expected_identity();
     stale.source.workspace_digest = digest('9');
     let manifest = load_manifest(&workspace_root()).unwrap().0;
     assert!(
         report
-            .validate_current(manifest.gate(GateName::Cells), &stale)
+            .validate_current(manifest_gate(&manifest, "cells"), &stale)
             .unwrap_err()
             .contains("stale source identity")
     );
@@ -145,7 +269,7 @@ fn stale_identity_is_rejected() {
 
 #[test]
 fn mismatched_and_first_frame_proofs_are_rejected() {
-    let mut mismatched = passing_timed_report(GateName::Cells);
+    let mut mismatched = passing_timed_report("cells");
     mismatched
         .evidence
         .async_proof_timing
@@ -160,7 +284,7 @@ fn mismatched_and_first_frame_proofs_are_rejected() {
             .contains("frame identity")
     );
 
-    let mut first_frame = passing_timed_report(GateName::Cells);
+    let mut first_frame = passing_timed_report("cells");
     first_frame.evidence.product_ux_timings[0]
         .representative_frame
         .frame_id = 1;
@@ -174,7 +298,7 @@ fn mismatched_and_first_frame_proofs_are_rejected() {
 
 #[test]
 fn hash_only_proof_is_rejected_by_strict_artifact_shape() {
-    let report = passing_timed_report(GateName::Cells);
+    let report = passing_timed_report("cells");
     let mut value = serde_json::to_value(report).unwrap();
     value["evidence"]["artifacts"][0]
         .as_object_mut()
@@ -184,7 +308,72 @@ fn hash_only_proof_is_rejected_by_strict_artifact_shape() {
 }
 
 #[test]
-fn aggregate_requires_exact_current_six_gate_semantics() {
+fn persons_profile_rejects_unproven_semantic_scenario_and_missing_checkpoint() {
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
+    let entry = manifest_gate(&manifest, "persons-pro");
+    let expected = expected_identity();
+
+    let mut missing_semantics = passing_timed_report("persons-pro");
+    let scenario = missing_semantics
+        .evidence
+        .profile
+        .as_mut()
+        .unwrap()
+        .scenario
+        .as_mut()
+        .unwrap();
+    scenario.semantic_assertions_proven = false;
+    scenario.boundary = ScenarioBoundary::NativeTestPlayback;
+    assert!(
+        missing_semantics
+            .validate_current(entry, &expected)
+            .unwrap_err()
+            .contains("semantic scenario proof")
+    );
+
+    let mut missing_checkpoint = passing_timed_report("persons-pro");
+    let removed = missing_checkpoint
+        .evidence
+        .profile
+        .as_mut()
+        .unwrap()
+        .checkpoints
+        .pop()
+        .unwrap();
+    assert!(
+        missing_checkpoint
+            .validate_current(entry, &expected)
+            .unwrap_err()
+            .contains(removed.id.as_str())
+    );
+}
+
+#[test]
+fn persons_profile_rejects_budget_observation_over_its_limit() {
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
+    let entry = manifest_gate(&manifest, "persons-pro");
+    let expected = expected_identity();
+    let mut report = passing_timed_report("persons-pro");
+    let observation = &mut report
+        .evidence
+        .profile
+        .as_mut()
+        .unwrap()
+        .budget
+        .as_mut()
+        .unwrap()
+        .observations[0];
+    observation.observed = observation.limit + 1;
+    assert!(
+        report
+            .validate_current(entry, &expected)
+            .unwrap_err()
+            .contains("exceeds its limit")
+    );
+}
+
+#[test]
+fn aggregate_requires_exact_current_manifest_gate_semantics() {
     let (manifest, _) = load_manifest(&workspace_root()).unwrap();
     let expected = expected_identity();
     let manifest_digest = digest('7');
@@ -211,7 +400,7 @@ fn aggregate_requires_exact_current_six_gate_semantics() {
         aggregate
             .validate(&manifest, &manifest_digest, &expected)
             .unwrap_err()
-            .contains("exactly six")
+            .contains("exactly 7")
     );
 }
 
@@ -230,12 +419,14 @@ fn fresh_aggregate_rejects_reports_from_another_run() {
     );
 }
 
-fn passing_timed_report(gate: GateName) -> crate::report_v2::GateReport {
+fn passing_timed_report(gate: &str) -> crate::report_v2::GateReport {
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
+    let entry = manifest_gate(&manifest, gate);
     let frame = frame_key();
     let MeasurementContract::Timed {
         product_ux,
         async_proof,
-    } = measurement_contract(gate)
+    } = measurement_contract(entry)
     else {
         panic!("test gate must be timed");
     };
@@ -251,7 +442,7 @@ fn passing_timed_report(gate: GateName) -> crate::report_v2::GateReport {
     let linked_product_metric = product_ux_timings[0].metric;
     let artifact_id = bounded_id("proof-png");
     gate_report(
-        gate,
+        entry,
         bounded_id("fresh-run"),
         expected_identity(),
         ReportStatus::Pass,
@@ -262,6 +453,7 @@ fn passing_timed_report(gate: GateName) -> crate::report_v2::GateReport {
                 "all evidence passed",
             )],
             producer: Some(producer(Some(0))),
+            profile: Some(complete_profile_evidence(entry)),
             native: Some(native_evidence()),
             product_ux_timings,
             async_proof_timing: Some(AsyncProofTimingEvidence {
@@ -288,6 +480,113 @@ fn passing_timed_report(gate: GateName) -> crate::report_v2::GateReport {
     .unwrap()
 }
 
+fn complete_profile_evidence(entry: &ManifestGate) -> VerificationProfileEvidence {
+    let profile = entry.profile.as_ref().expect("product verifier profile");
+    let requirements = &profile.proof_requirements;
+    let checkpoint_count = requirements.checkpoints.len().max(1) as u32;
+    VerificationProfileEvidence {
+        profile_id: profile.id.clone(),
+        profile_digest: profile.digest(),
+        scenario: requirements
+            .scenario
+            .as_ref()
+            .map(|scenario| ScenarioProof {
+                path: scenario.path.clone(),
+                sha256: digest('4'),
+                boundary: if scenario.semantic_assertions {
+                    ScenarioBoundary::NativeTestPlaybackAndSemanticAssertions
+                } else {
+                    ScenarioBoundary::NativeTestPlayback
+                },
+                request_id: Some(1),
+                declared_steps: checkpoint_count,
+                executable_steps: checkpoint_count,
+                completed_steps: checkpoint_count,
+                passed: true,
+                semantic_assertions_proven: scenario.semantic_assertions,
+            }),
+        budget: requirements.budget.as_ref().map(|budget| BudgetProof {
+            path: budget.path.clone(),
+            sha256: digest('5'),
+            observations: budget
+                .metrics
+                .iter()
+                .cloned()
+                .map(|metric| BudgetObservation {
+                    metric,
+                    unit: BudgetUnit::Count,
+                    comparison: BudgetComparison::AtMost,
+                    observed: 1,
+                    limit: 1,
+                })
+                .collect(),
+        }),
+        state_root: requirements
+            .state_root
+            .as_ref()
+            .map(|state_root| StateRootProof {
+                root: ShortText::new("target/reports/report-v2/state/test-run").unwrap(),
+                policy: state_root.policy,
+                clean_at_start: true,
+                durable_file_count: 1,
+                restart_count: u32::from(state_root.restart_required),
+                restored_after_restart: state_root.restart_required,
+            }),
+        checkpoints: requirements
+            .checkpoints
+            .iter()
+            .cloned()
+            .map(|requirement| StateCheckpointProof {
+                id: requirement.id,
+                source_revision: 1,
+                runtime_sequence: 1,
+                durable_epoch: 1,
+                state_digest: digest('6'),
+                frame: frame_key(),
+                evidence: match requirement.evidence {
+                    CheckpointEvidenceRequirement::ScenarioStep { scenario_step } => {
+                        StateCheckpointEvidence::ScenarioSemanticFrame {
+                            scenario_step,
+                            assertion_count: 1,
+                        }
+                    }
+                    CheckpointEvidenceRequirement::RestartRestore {
+                        baseline_checkpoint,
+                    } => StateCheckpointEvidence::RestartRestore {
+                        baseline_checkpoint,
+                        before_restart_digest: digest('6'),
+                        startup_restored: true,
+                    },
+                    CheckpointEvidenceRequirement::ResponsiveLayout {
+                        baseline_checkpoint,
+                        logical_width,
+                        logical_height,
+                    } => StateCheckpointEvidence::ResponsiveLayout {
+                        baseline_checkpoint,
+                        logical_width,
+                        logical_height,
+                        action_count: 1,
+                        action_digest: digest('7'),
+                    },
+                    CheckpointEvidenceRequirement::StaleCompileRejection => {
+                        StateCheckpointEvidence::StaleCompileRejection {
+                            session: bounded_id("test-program"),
+                            stale_revision: 1,
+                            latest_revision: 2,
+                        }
+                    }
+                    CheckpointEvidenceRequirement::PersistenceOperation { operation } => {
+                        StateCheckpointEvidence::PersistenceOperation {
+                            operation,
+                            before_state_digest: digest('6'),
+                        }
+                    }
+                },
+            })
+            .collect(),
+    }
+}
+
 fn passing_aggregate(
     manifest: &crate::report_v2::HandoffManifest,
     expected: &ExpectedIdentity,
@@ -298,8 +597,8 @@ fn passing_aggregate(
         .gates
         .iter()
         .map(|entry| AggregateGateResult {
-            gate: entry.gate,
-            verifier: entry.verifier,
+            gate: entry.gate.clone(),
+            verifier: entry.verifier.clone(),
             report: Some(ReportFileMetadata {
                 path: entry.output.clone(),
                 sha256: digest('6'),

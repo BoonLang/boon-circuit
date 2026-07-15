@@ -402,100 +402,38 @@ pub enum EffectResultPolicy {
     Discarded,
 }
 
-#[derive(Clone, Copy)]
-struct BuiltinEffectSpec {
-    host_operation: &'static str,
-    replay: BuiltinEffectReplay,
-    barrier: EffectBarrier,
-    result_policy: EffectResultPolicy,
-}
-
-#[derive(Clone, Copy)]
-enum BuiltinEffectReplay {
-    ReadOnly,
-    IdempotentBytesKey,
-    NonReplayable,
-}
-
-const BUILTIN_EFFECT_CONTRACTS: &[BuiltinEffectSpec] = &[
-    BuiltinEffectSpec {
-        host_operation: "Directory/entries",
-        replay: BuiltinEffectReplay::ReadOnly,
-        barrier: EffectBarrier::None,
-        result_policy: EffectResultPolicy::ReturnValue,
-    },
-    BuiltinEffectSpec {
-        host_operation: "File/read_bytes",
-        replay: BuiltinEffectReplay::ReadOnly,
-        barrier: EffectBarrier::None,
-        result_policy: EffectResultPolicy::ReturnValue,
-    },
-    BuiltinEffectSpec {
-        host_operation: "File/read_text",
-        replay: BuiltinEffectReplay::ReadOnly,
-        barrier: EffectBarrier::None,
-        result_policy: EffectResultPolicy::ReturnValue,
-    },
-    BuiltinEffectSpec {
-        host_operation: "File/write_bytes",
-        replay: BuiltinEffectReplay::IdempotentBytesKey,
-        barrier: EffectBarrier::BeforeAndAfter,
-        result_policy: EffectResultPolicy::Acknowledgement,
-    },
-    BuiltinEffectSpec {
-        host_operation: "Passkey/register",
-        replay: BuiltinEffectReplay::IdempotentBytesKey,
-        barrier: EffectBarrier::BeforeAndAfter,
-        result_policy: EffectResultPolicy::CorrelatedSource,
-    },
-    BuiltinEffectSpec {
-        host_operation: "Passkey/authenticate",
-        replay: BuiltinEffectReplay::IdempotentBytesKey,
-        barrier: EffectBarrier::BeforeAndAfter,
-        result_policy: EffectResultPolicy::CorrelatedSource,
-    },
-    BuiltinEffectSpec {
-        host_operation: "File/write_text",
-        replay: BuiltinEffectReplay::NonReplayable,
-        barrier: EffectBarrier::BeforeAndAfter,
-        result_policy: EffectResultPolicy::Acknowledgement,
-    },
-    BuiltinEffectSpec {
-        host_operation: "Log/error",
-        replay: BuiltinEffectReplay::NonReplayable,
-        barrier: EffectBarrier::None,
-        result_policy: EffectResultPolicy::Discarded,
-    },
-    BuiltinEffectSpec {
-        host_operation: "Log/info",
-        replay: BuiltinEffectReplay::NonReplayable,
-        barrier: EffectBarrier::None,
-        result_policy: EffectResultPolicy::Discarded,
-    },
-];
-
 pub fn builtin_effect_contract(host_operation: &str) -> Result<Option<EffectContract>, PlanError> {
-    let Some(spec) = BUILTIN_EFFECT_CONTRACTS
-        .iter()
-        .find(|spec| spec.host_operation == host_operation)
-    else {
+    let Some(spec) = boon_effect_schema::host_effect_spec(host_operation) else {
         return Ok(None);
     };
     let replay = match spec.replay {
-        BuiltinEffectReplay::ReadOnly => EffectReplay::ReadOnly,
-        BuiltinEffectReplay::IdempotentBytesKey => EffectReplay::Idempotent {
+        boon_effect_schema::ReplaySpec::ReadOnly => EffectReplay::ReadOnly,
+        boon_effect_schema::ReplaySpec::IdempotentBytesKey => EffectReplay::Idempotent {
             key_type: DataTypePlan::Bytes {
                 fixed_len: Some(32),
             },
         },
-        BuiltinEffectReplay::NonReplayable => EffectReplay::NonReplayable,
+        boon_effect_schema::ReplaySpec::NonReplayable => EffectReplay::NonReplayable,
     };
     let contract = EffectContract {
-        effect_id: EffectId::from_host_operation(spec.host_operation)?,
-        host_operation: spec.host_operation.to_owned(),
+        effect_id: EffectId::from_host_operation(spec.operation)?,
+        host_operation: spec.operation.to_owned(),
         replay,
-        barrier: spec.barrier,
-        result_policy: spec.result_policy,
+        barrier: match spec.barrier {
+            boon_effect_schema::BarrierSpec::None => EffectBarrier::None,
+            boon_effect_schema::BarrierSpec::Before => EffectBarrier::Before,
+            boon_effect_schema::BarrierSpec::BeforeAndAfter => EffectBarrier::BeforeAndAfter,
+        },
+        result_policy: match spec.result_policy {
+            boon_effect_schema::ResultPolicySpec::ReturnValue => EffectResultPolicy::ReturnValue,
+            boon_effect_schema::ResultPolicySpec::Acknowledgement => {
+                EffectResultPolicy::Acknowledgement
+            }
+            boon_effect_schema::ResultPolicySpec::CorrelatedSource => {
+                EffectResultPolicy::CorrelatedSource
+            }
+            boon_effect_schema::ResultPolicySpec::Discarded => EffectResultPolicy::Discarded,
+        },
     };
     Ok(Some(contract))
 }
@@ -503,88 +441,14 @@ pub fn builtin_effect_contract(host_operation: &str) -> Result<Option<EffectCont
 pub fn builtin_effect_outbox_schema(
     host_operation: &str,
 ) -> Result<Option<EffectOutboxSchema>, PlanError> {
-    let (intent_type, result_type) = match host_operation {
-        "File/write_bytes" => (
-            DataTypePlan::Record {
-                fields: vec![
-                    data_type_field("bytes", DataTypePlan::Bytes { fixed_len: None }),
-                    data_type_field("path", DataTypePlan::Text),
-                ],
-                open: false,
-            },
-            DataTypePlan::Text,
-        ),
-        "Passkey/register" => (
-            DataTypePlan::Record {
-                fields: vec![
-                    data_type_field("workspace_id", DataTypePlan::Text),
-                    data_type_field("account_id", DataTypePlan::Text),
-                    data_type_field("credential_count", DataTypePlan::Number),
-                    data_type_field("simulation", passkey_simulation_data_type()),
-                ],
-                open: false,
-            },
-            DataTypePlan::Variant {
-                variants: vec![
-                    data_variant(
-                        "RegistrationSucceeded",
-                        vec![
-                            data_type_field("account_id", DataTypePlan::Text),
-                            data_type_field("credential_id", DataTypePlan::Text),
-                            data_type_field("label", DataTypePlan::Text),
-                        ],
-                    ),
-                    data_variant("RegistrationCancelled", Vec::new()),
-                    data_variant(
-                        "RegistrationFailed",
-                        vec![
-                            data_type_field("code", DataTypePlan::Text),
-                            data_type_field("message", DataTypePlan::Text),
-                            data_type_field("retryable", DataTypePlan::Bool),
-                        ],
-                    ),
-                    data_variant(
-                        "DuplicateCredential",
-                        vec![
-                            data_type_field("account_id", DataTypePlan::Text),
-                            data_type_field("credential_id", DataTypePlan::Text),
-                        ],
-                    ),
-                ],
-            },
-        ),
-        "Passkey/authenticate" => (
-            DataTypePlan::Record {
-                fields: vec![
-                    data_type_field("account_id", DataTypePlan::Text),
-                    data_type_field("credential_count", DataTypePlan::Number),
-                    data_type_field("simulation", passkey_simulation_data_type()),
-                ],
-                open: false,
-            },
-            DataTypePlan::Variant {
-                variants: vec![
-                    data_variant(
-                        "AuthenticationSucceeded",
-                        vec![
-                            data_type_field("account_id", DataTypePlan::Text),
-                            data_type_field("credential_id", DataTypePlan::Text),
-                        ],
-                    ),
-                    data_variant("AuthenticationCancelled", Vec::new()),
-                    data_variant(
-                        "AuthenticationFailed",
-                        vec![
-                            data_type_field("code", DataTypePlan::Text),
-                            data_type_field("message", DataTypePlan::Text),
-                            data_type_field("retryable", DataTypePlan::Bool),
-                        ],
-                    ),
-                ],
-            },
-        ),
-        _ => return Ok(None),
+    let Some(spec) = boon_effect_schema::host_effect_spec(host_operation) else {
+        return Ok(None);
     };
+    let Some(schema) = spec.durable_schema else {
+        return Ok(None);
+    };
+    let intent_type = effect_schema_type_to_plan(&schema.intent);
+    let result_type = effect_schema_type_to_plan(&schema.result);
     let contract = builtin_effect_contract(host_operation)?.ok_or_else(|| {
         PlanError::new(format!(
             "effect outbox schema `{host_operation}` has no built-in contract"
@@ -598,27 +462,41 @@ pub fn builtin_effect_outbox_schema(
     EffectOutboxSchema::new(contract.effect_id, intent_type, key_type, result_type).map(Some)
 }
 
-fn data_type_field(name: &str, data_type: DataTypePlan) -> DataTypeFieldPlan {
-    DataTypeFieldPlan {
-        name: name.to_owned(),
-        data_type,
-    }
-}
-
-fn data_variant(tag: &str, fields: Vec<DataTypeFieldPlan>) -> DataVariantPlan {
-    DataVariantPlan {
-        tag: tag.to_owned(),
-        fields,
-        open: false,
-    }
-}
-
-fn passkey_simulation_data_type() -> DataTypePlan {
-    DataTypePlan::Variant {
-        variants: ["Success", "Cancel", "Failure", "Duplicate"]
-            .into_iter()
-            .map(|tag| data_variant(tag, Vec::new()))
-            .collect(),
+fn effect_schema_type_to_plan(value_type: &boon_effect_schema::ValueType) -> DataTypePlan {
+    match value_type {
+        boon_effect_schema::ValueType::Bool => DataTypePlan::Bool,
+        boon_effect_schema::ValueType::Number => DataTypePlan::Number,
+        boon_effect_schema::ValueType::Text => DataTypePlan::Text,
+        boon_effect_schema::ValueType::Bytes { fixed_len } => DataTypePlan::Bytes {
+            fixed_len: *fixed_len,
+        },
+        boon_effect_schema::ValueType::Record { fields, open } => DataTypePlan::Record {
+            fields: fields
+                .iter()
+                .map(|field| DataTypeFieldPlan {
+                    name: field.name.to_owned(),
+                    data_type: effect_schema_type_to_plan(&field.value_type),
+                })
+                .collect(),
+            open: *open,
+        },
+        boon_effect_schema::ValueType::Variant { variants } => DataTypePlan::Variant {
+            variants: variants
+                .iter()
+                .map(|variant| DataVariantPlan {
+                    tag: variant.tag.to_owned(),
+                    fields: variant
+                        .fields
+                        .iter()
+                        .map(|field| DataTypeFieldPlan {
+                            name: field.name.to_owned(),
+                            data_type: effect_schema_type_to_plan(&field.value_type),
+                        })
+                        .collect(),
+                    open: false,
+                })
+                .collect(),
+        },
     }
 }
 
@@ -1110,6 +988,8 @@ pub struct EffectOutboxSchema {
     pub intent_type: DataTypePlan,
     pub idempotency_key_type: DataTypePlan,
     pub result_type: DataTypePlan,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocation_ids: Vec<EffectInvocationId>,
 }
 
 impl EffectOutboxSchema {
@@ -1124,6 +1004,7 @@ impl EffectOutboxSchema {
             intent_type: intent_type.canonicalized(),
             idempotency_key_type: idempotency_key_type.canonicalized(),
             result_type: result_type.canonicalized(),
+            invocation_ids: Vec::new(),
         };
         schema.validate()?;
         Ok(schema)
@@ -1142,7 +1023,25 @@ impl EffectOutboxSchema {
                 "effect outbox schemas must use canonical closed data types",
             ));
         }
+        if self
+            .invocation_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(PlanError::new(
+                "effect outbox invocation IDs must be unique and canonically ordered",
+            ));
+        }
         Ok(())
+    }
+
+    pub fn bind_invocations(
+        &mut self,
+        invocation_ids: impl IntoIterator<Item = EffectInvocationId>,
+    ) {
+        self.invocation_ids.extend(invocation_ids);
+        self.invocation_ids.sort();
+        self.invocation_ids.dedup();
     }
 }
 
@@ -2101,11 +2000,17 @@ pub struct SourcePayloadSchema {
     pub typed_fields: Vec<SourcePayloadDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_lookup_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_lookup_field_id: Option<FieldId>,
 }
 
 impl SourcePayloadSchema {
     pub fn row_lookup_field_name(&self) -> Option<&str> {
         self.row_lookup_field.as_deref()
+    }
+
+    pub fn row_lookup_field_id(&self) -> Option<FieldId> {
+        self.row_lookup_field_id
     }
 }
 
@@ -2572,6 +2477,11 @@ pub enum PlanDerivedExpression {
         op: String,
         right: i64,
     },
+    ValueCompare {
+        left: ValueRef,
+        op: String,
+        right: ValueRef,
+    },
     BoolAnd {
         left: Box<PlanDerivedExpression>,
         right: Box<PlanDerivedExpression>,
@@ -2768,6 +2678,11 @@ pub enum PlanRowExpression {
         object: Box<PlanRowExpression>,
         field: String,
     },
+    ListRowField {
+        row: Box<PlanRowExpression>,
+        list_id: ListId,
+        field: FieldId,
+    },
     BuiltinCall {
         function: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2832,6 +2747,7 @@ pub enum PlanExpressionKind {
     PrefixPayloadConcat,
     PrefixRootConcat,
     BoolNot,
+    TextToNumber,
     BytesLength,
     BytesIsEmpty,
     BytesGet,
@@ -3191,6 +3107,17 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
             .enumerate()
             .all(|(index, route)| route.id.0 == index),
         detail: format!("{} source routes", plan.source_routes.len()),
+    });
+    checks.push(PlanCheck {
+        id: "source-route-row-lookups-use-owned-field-ids".to_owned(),
+        pass: source_route_row_lookup_fields_resolve(plan),
+        detail: format!(
+            "{} scoped row lookup route(s)",
+            plan.source_routes
+                .iter()
+                .filter(|route| route.payload_schema.row_lookup_field.is_some())
+                .count()
+        ),
     });
     checks.push(PlanCheck {
         id: "scheduled-source-intervals-positive".to_owned(),
@@ -3585,13 +3512,15 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                 contract.host_operation
             ));
         }
-        if let Ok(Some(expected)) = builtin_effect_outbox_schema(&contract.host_operation)
-            && expected != *outbox
-        {
-            return Some(format!(
-                "outbox schema for `{}` differs from the centralized host schema",
-                contract.host_operation
-            ));
+        if let Ok(Some(expected)) = builtin_effect_outbox_schema(&contract.host_operation) {
+            let mut actual_value_schema = outbox.clone();
+            actual_value_schema.invocation_ids.clear();
+            if expected != actual_value_schema {
+                return Some(format!(
+                    "outbox schema for `{}` differs from the centralized host schema",
+                    contract.host_operation
+                ));
+            }
         }
     }
     for contract in &plan.effects {
@@ -3671,6 +3600,12 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                 invocation.invocation_id
             ));
         };
+        if !outbox.invocation_ids.contains(&invocation.invocation_id) {
+            return Some(format!(
+                "effect invocation {} is absent from its durable outbox schema",
+                invocation.invocation_id
+            ));
+        }
         let intent_inputs = invocation
             .intent_fields
             .iter()
@@ -3688,6 +3623,18 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                 invocation.invocation_id
             ));
         }
+    }
+    let bound_invocation_ids = plan
+        .persistence
+        .effect_outbox
+        .iter()
+        .flat_map(|schema| schema.invocation_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if bound_invocation_ids != invocation_ids {
+        return Some(
+            "durable outbox invocation identities differ from executable effect invocations"
+                .to_owned(),
+        );
     }
     None
 }
@@ -3776,6 +3723,26 @@ fn source_payload_matches_variant(source: &SourceRoute, variant: &DataVariantPla
             .cloned()
             .collect::<BTreeSet<_>>()
             == expected.keys().cloned().collect()
+}
+
+fn source_route_row_lookup_fields_resolve(plan: &MachinePlan) -> bool {
+    plan.source_routes.iter().all(|route| {
+        match (
+            route.payload_schema.row_lookup_field.as_ref(),
+            route.payload_schema.row_lookup_field_id,
+        ) {
+            (None, None) => true,
+            (Some(_), Some(field_id)) => {
+                let Some(scope_id) = route.scope_id else {
+                    return false;
+                };
+                plan.storage_layout.list_slots.iter().any(|slot| {
+                    slot.scope_id == Some(scope_id) && slot.row_field_ids.contains(&field_id)
+                })
+            }
+            (None, Some(_)) | (Some(_), None) => false,
+        }
+    })
 }
 
 fn source_payload_field_from_schema_name(name: &str) -> SourcePayloadField {
@@ -4564,6 +4531,16 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && single_state_input_type_is(scalar_slots, op, &PlanValueType::Bool)
                         && source_payload_input_ids(op).is_empty()
                 }
+                PlanExpressionKind::TextToNumber => {
+                    update_constant_id.is_none()
+                        && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
+                        && update_branch_source_ids(op).len() == 1
+                        && text_to_number_inputs_are_supported(
+                            scalar_slots,
+                            op,
+                            source_payload_field,
+                        )
+                }
                 PlanExpressionKind::BytesLength => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
@@ -5100,6 +5077,15 @@ fn root_bool_expression_cpu_supported(
                             && op.inputs.contains(left)
                 )
         }
+        PlanDerivedExpression::ValueCompare {
+            left,
+            op: op_name,
+            right,
+        } => {
+            matches!(op_name.as_str(), ">" | ">=" | "<" | "<=" | "==" | "!=")
+                && op.inputs.contains(left)
+                && op.inputs.contains(right)
+        }
         PlanDerivedExpression::BoolAnd { left, right } => {
             root_bool_expression_cpu_supported(op, left, supported_list_count_outputs)
                 && root_bool_expression_cpu_supported(op, right, supported_list_count_outputs)
@@ -5153,6 +5139,16 @@ fn cpu_plan_executor_supports_indexed_update_op(
                 && output_state_type_is(scalar_slots, op, &PlanValueType::Bool)
                 && indexed_bool_not_inputs_are_supported(scalar_slots, op)
                 && source_payload_input_ids(op).is_empty()
+        }
+        PlanExpressionKind::TextToNumber => {
+            update_constant_id.is_none()
+                && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
+                && indexed_text_to_number_inputs_are_supported(
+                    scalar_slots,
+                    list_slots,
+                    op,
+                    source_payload_field,
+                )
         }
         PlanExpressionKind::BytesLength => {
             source_payload_field.is_none()
@@ -5442,6 +5438,49 @@ fn indexed_bool_not_inputs_are_supported(scalar_slots: &[ScalarStorageSlot], op:
             .filter(|input| matches!(input, ValueRef::Field(_)))
             .count()
             == 1
+}
+
+fn text_to_number_inputs_are_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    op: &PlanOp,
+    source_payload_field: &Option<SourcePayloadField>,
+) -> bool {
+    let [input] = update_branch_ordered_inputs(op) else {
+        return false;
+    };
+    if !op.inputs.contains(input) {
+        return false;
+    }
+    match (source_payload_field, input) {
+        (Some(expected), ValueRef::SourcePayload { field: actual, .. }) => {
+            expected == actual
+                && source_payload_input_matches_single_source(op, expected)
+                && state_input_ids(op).is_empty()
+        }
+        (None, ValueRef::State(state_id)) => {
+            source_payload_input_ids(op).is_empty()
+                && state_input_ids(op).as_slice() == [*state_id]
+                && plan_value_type_for_state_slots(scalar_slots, *state_id)
+                    == Some(&PlanValueType::Text)
+        }
+        _ => false,
+    }
+}
+
+fn indexed_text_to_number_inputs_are_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    list_slots: &[ListStorageSlot],
+    op: &PlanOp,
+    source_payload_field: &Option<SourcePayloadField>,
+) -> bool {
+    if source_payload_field.is_some() {
+        return text_to_number_inputs_are_supported(scalar_slots, op, source_payload_field);
+    }
+    let [input] = update_branch_ordered_inputs(op) else {
+        return false;
+    };
+    source_payload_input_ids(op).is_empty()
+        && indexed_text_operand_is_supported(scalar_slots, list_slots, op, input)
 }
 
 fn indexed_read_path_inputs_supported(scalar_slots: &[ScalarStorageSlot], op: &PlanOp) -> bool {
@@ -6452,6 +6491,77 @@ fn source_payload_refs_are_declared_and_typed(
     true
 }
 
+fn source_payload_refs_are_declared_as(
+    plan: &MachinePlan,
+    op: &PlanOp,
+    expected_field: &SourcePayloadField,
+    expected_type: SourcePayloadValueType,
+) -> bool {
+    let payload_inputs = source_payload_input_ids(op);
+    if payload_inputs.is_empty() {
+        return false;
+    }
+    payload_inputs.into_iter().all(|(source_id, field)| {
+        field == *expected_field
+            && plan
+                .source_routes
+                .iter()
+                .find(|route| route.source_id == source_id)
+                .and_then(|route| {
+                    route
+                        .payload_schema
+                        .typed_fields
+                        .iter()
+                        .find(|descriptor| descriptor.field == field)
+                })
+                .is_some_and(|descriptor| descriptor.value_type == expected_type)
+    })
+}
+
+fn text_to_number_op_is_well_formed(
+    plan: &MachinePlan,
+    op: &PlanOp,
+    source_payload_field: &Option<SourcePayloadField>,
+    update_constant_id: &Option<PlanConstantId>,
+) -> bool {
+    if update_constant_id.is_some()
+        || output_state_type(&plan.storage_layout.scalar_slots, op) != Some(&PlanValueType::Number)
+    {
+        return false;
+    }
+    let [input] = update_branch_ordered_inputs(op) else {
+        return false;
+    };
+    if !op.inputs.contains(input) {
+        return false;
+    }
+    match (source_payload_field, input) {
+        (Some(expected), ValueRef::SourcePayload { field: actual, .. }) => {
+            expected == actual
+                && source_payload_input_matches_single_source(op, expected)
+                && source_payload_refs_are_declared_as(
+                    plan,
+                    op,
+                    expected,
+                    SourcePayloadValueType::Text,
+                )
+                && state_input_ids(op).is_empty()
+        }
+        (None, ValueRef::State(state_id)) => {
+            source_payload_input_ids(op).is_empty()
+                && state_input_ids(op).as_slice() == [*state_id]
+                && plan_value_type_for_state(plan, *state_id) == Some(&PlanValueType::Text)
+        }
+        (None, ValueRef::Field(field_id)) => {
+            op.indexed
+                && source_payload_input_ids(op).is_empty()
+                && indexed_output_scope_owns_row_field(plan, op, *field_id)
+                && plan_field_initial_value_matches_type(plan, *field_id, &PlanValueType::Text)
+        }
+        _ => false,
+    }
+}
+
 fn source_payload_ref_mismatch_detail(
     plan: &MachinePlan,
     op: &PlanOp,
@@ -7242,6 +7352,19 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                             }
                             _ => {}
                         }
+                    }
+                }
+                PlanExpressionKind::TextToNumber => {
+                    if !text_to_number_op_is_well_formed(
+                        plan,
+                        op,
+                        source_payload_field,
+                        update_constant_id,
+                    ) {
+                        return Some(format!(
+                            "TextToNumber update op {} requires one declared TEXT input and a NUMBER output",
+                            op.id.0
+                        ));
                     }
                 }
                 PlanExpressionKind::BytesGet => {
@@ -8437,6 +8560,9 @@ fn derived_expression_refs_resolve(plan: &MachinePlan) -> bool {
                 }
                 PlanDerivedExpression::BoolNot { input } => op.inputs.contains(input),
                 PlanDerivedExpression::NumberCompareConst { left, .. } => op.inputs.contains(left),
+                PlanDerivedExpression::ValueCompare { left, right, .. } => {
+                    op.inputs.contains(left) && op.inputs.contains(right)
+                }
                 PlanDerivedExpression::BoolAnd { left, right } => {
                     derived_expression_refs_resolve_for_op(op, left)
                         && derived_expression_refs_resolve_for_op(op, right)
@@ -8473,6 +8599,9 @@ fn derived_expression_refs_resolve_for_op(op: &PlanOp, expression: &PlanDerivedE
         }
         PlanDerivedExpression::BoolNot { input } => op.inputs.contains(input),
         PlanDerivedExpression::NumberCompareConst { left, .. } => op.inputs.contains(left),
+        PlanDerivedExpression::ValueCompare { left, right, .. } => {
+            op.inputs.contains(left) && op.inputs.contains(right)
+        }
         PlanDerivedExpression::BoolAnd { left, right } => {
             derived_expression_refs_resolve_for_op(op, left)
                 && derived_expression_refs_resolve_for_op(op, right)
@@ -8643,6 +8772,9 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
             .iter()
             .all(|field| row_expression_refs_resolve(op, &field.value)),
         PlanRowExpression::ObjectField { object, .. } => row_expression_refs_resolve(op, object),
+        PlanRowExpression::ListRowField { row, list_id, .. } => {
+            op.inputs.contains(&ValueRef::List(*list_id)) && row_expression_refs_resolve(op, row)
+        }
         PlanRowExpression::BuiltinCall { input, args, .. } => {
             input
                 .as_deref()
@@ -8692,6 +8824,14 @@ fn row_expression_list_fields_resolve_inner(
         | PlanRowExpression::ObjectField { object: input, .. }
         | PlanRowExpression::ListSum { input } => {
             row_expression_list_fields_resolve_inner(plan, input)
+        }
+        PlanRowExpression::ListRowField {
+            row,
+            list_id,
+            field,
+        } => {
+            list_has_row_field(plan, *list_id, *field)
+                && row_expression_list_fields_resolve_inner(plan, row)
         }
         PlanRowExpression::TextStartsWith { input, prefix } => {
             row_expression_list_fields_resolve_inner(plan, input)
@@ -8905,6 +9045,7 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         | PlanRowExpression::TextToNumber { input }
         | PlanRowExpression::ObjectField { object: input, .. }
         | PlanRowExpression::ListSum { input } => row_expression_cpu_evaluable(input),
+        PlanRowExpression::ListRowField { row, .. } => row_expression_cpu_evaluable(row),
         PlanRowExpression::TextStartsWith { input, prefix } => {
             row_expression_cpu_evaluable(input) && row_expression_cpu_evaluable(prefix)
         }
@@ -9061,6 +9202,7 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         | PlanRowExpression::ObjectField { object: input, .. } => {
             root_row_expression_cpu_evaluable(input)
         }
+        PlanRowExpression::ListRowField { .. } => false,
         PlanRowExpression::TextConcat { parts } => {
             parts.iter().all(root_row_expression_cpu_evaluable)
         }

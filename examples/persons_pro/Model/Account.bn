@@ -16,3 +16,35 @@ FUNCTION status_tone(state) {
         __ => Neutral
     }
 }
+
+FUNCTION credential(credential) {
+    [
+        credential_id: credential.credential_id
+        label: credential.label
+    ]
+}
+
+FUNCTION workflow_label(state) {
+    state |> WHEN {
+        Registering => TEXT { Registering }
+        Authenticating => TEXT { Authenticating }
+        Registered => TEXT { Registration complete }
+        Authenticated => TEXT { Signed in }
+        Cancelled => TEXT { Cancelled }
+        Failed => TEXT { Failed }
+        Duplicate => TEXT { Duplicate credential }
+        __ => TEXT { Ready }
+    }
+}
+
+FUNCTION workflow_tone(state) {
+    state |> WHEN {
+        Registered => Success
+        Authenticated => Success
+        Registering => Warning
+        Authenticating => Warning
+        Failed => Danger
+        Duplicate => Danger
+        __ => Neutral
+    }
+}

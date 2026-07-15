@@ -128,6 +128,7 @@ pub struct TurnMetrics {
     pub index_lookup_count: usize,
     pub index_candidate_count: usize,
     pub list_find_scan_count: usize,
+    pub work_unit_count: u64,
     pub recomputed_targets: Vec<ValueTarget>,
 }
 
@@ -204,12 +205,17 @@ impl Snapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionOptions {
     pub require_monotonic_sequences: bool,
+    /// Deterministic executor work allowed for one startup, source turn, or
+    /// host-owned currentness transaction. Trusted applications leave this
+    /// unbounded; capability hosts set it for restricted programs.
+    pub max_work_units_per_transaction: Option<u64>,
 }
 
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             require_monotonic_sequences: true,
+            max_work_units_per_transaction: None,
         }
     }
 }
@@ -220,6 +226,7 @@ pub enum Error {
     InvalidEvent(String),
     Unsupported { op: PlanOpId, detail: String },
     Cycle { field: FieldId, row: Option<RowId> },
+    WorkBudgetExceeded { limit: u64, attempted: u64 },
     Evaluation(String),
     NotDemanded(FieldId),
 }
@@ -240,6 +247,10 @@ impl fmt::Display for Error {
                 ),
                 None => write!(formatter, "derived cycle at root field {}", field.0),
             },
+            Self::WorkBudgetExceeded { limit, attempted } => write!(
+                formatter,
+                "executor work budget exceeded: attempted {attempted} units with a {limit}-unit transaction limit"
+            ),
             Self::Evaluation(detail) => write!(formatter, "evaluation failed: {detail}"),
             Self::NotDemanded(field) => {
                 write!(
@@ -422,9 +433,13 @@ struct Metadata {
     list_by_scope: BTreeMap<ScopeId, ListId>,
     list_labels: BTreeMap<ListId, String>,
     list_fields_by_name: BTreeMap<(ListId, String), Vec<FieldId>>,
+    list_fields_by_exact_name: BTreeMap<String, Vec<(ListId, FieldId)>>,
+    root_field_by_exact_name: BTreeMap<String, Vec<FieldId>>,
     root_field_by_name: BTreeMap<String, Vec<FieldId>>,
+    root_state_by_exact_name: BTreeMap<String, Vec<StateId>>,
     root_state_by_name: BTreeMap<String, Vec<StateId>>,
     routes: BTreeMap<SourceId, SourceRoute>,
+    internal_effect_result_sources: BTreeSet<SourceId>,
     updates_by_source: BTreeMap<SourceId, Vec<Arc<PlanOp>>>,
     mutations: Vec<Arc<PlanOp>>,
     source_derived_by_source: BTreeMap<SourceId, BTreeSet<FieldId>>,
@@ -445,7 +460,13 @@ impl Metadata {
             .collect::<BTreeMap<_, _>>();
         let mut row_field_owner = BTreeMap::new();
         let mut list_fields_by_name = BTreeMap::<(ListId, String), Vec<FieldId>>::new();
+        let mut list_fields_by_exact_name = BTreeMap::<String, Vec<(ListId, FieldId)>>::new();
         for slot in &plan.storage_layout.list_slots {
+            let persistence = plan
+                .persistence
+                .lists
+                .iter()
+                .find(|memory| memory.runtime_slot == slot.id);
             for field in &slot.row_field_ids {
                 if let Some(previous) = row_field_owner.insert(*field, slot.list_id)
                     && previous != slot.list_id
@@ -465,9 +486,32 @@ impl Metadata {
                         .or_default()
                         .push(*field);
                 }
+                if let Some(leaf) = persistence.and_then(|memory| {
+                    memory
+                        .row_fields
+                        .iter()
+                        .find(|leaf| leaf.runtime_field_id == Some(*field))
+                }) {
+                    list_fields_by_name
+                        .entry((slot.list_id, leaf.semantic_path.clone()))
+                        .or_default()
+                        .push(*field);
+                    list_fields_by_name
+                        .entry((slot.list_id, local_name(&leaf.semantic_path).to_owned()))
+                        .or_default()
+                        .push(*field);
+                    list_fields_by_exact_name
+                        .entry(leaf.semantic_path.clone())
+                        .or_default()
+                        .push((slot.list_id, *field));
+                }
             }
         }
         for fields in list_fields_by_name.values_mut() {
+            fields.sort();
+            fields.dedup();
+        }
+        for fields in list_fields_by_exact_name.values_mut() {
             fields.sort();
             fields.dedup();
         }
@@ -480,6 +524,7 @@ impl Metadata {
             .into_iter()
             .map(|(id, label)| (StateId(id), label))
             .collect::<BTreeMap<_, _>>();
+        let mut root_state_by_exact_name = BTreeMap::<String, Vec<StateId>>::new();
         let mut root_state_by_name = BTreeMap::<String, Vec<StateId>>::new();
         for slot in plan
             .storage_layout
@@ -488,6 +533,10 @@ impl Metadata {
             .filter(|slot| !slot.indexed)
         {
             if let Some(label) = state_labels.get(&slot.state_id) {
+                root_state_by_exact_name
+                    .entry(label.clone())
+                    .or_default()
+                    .push(slot.state_id);
                 for name in debug_name_variants(label) {
                     root_state_by_name
                         .entry(name)
@@ -495,6 +544,10 @@ impl Metadata {
                         .push(slot.state_id);
                 }
             }
+        }
+        for states in root_state_by_exact_name.values_mut() {
+            states.sort();
+            states.dedup();
         }
         for states in root_state_by_name.values_mut() {
             states.sort();
@@ -643,13 +696,22 @@ impl Metadata {
             RootOutputDemand::Selected(fields) => fields.iter().copied().collect(),
         };
 
+        let mut root_field_by_exact_name = BTreeMap::<String, Vec<FieldId>>::new();
         let mut root_field_by_name = BTreeMap::<String, Vec<FieldId>>::new();
         for field in root_computations.keys() {
             if let Some(label) = field_labels.get(field) {
+                root_field_by_exact_name
+                    .entry(label.clone())
+                    .or_default()
+                    .push(*field);
                 for name in debug_name_variants(label) {
                     root_field_by_name.entry(name).or_default().push(*field);
                 }
             }
+        }
+        for fields in root_field_by_exact_name.values_mut() {
+            fields.sort();
+            fields.dedup();
         }
         for fields in root_field_by_name.values_mut() {
             fields.sort();
@@ -664,6 +726,24 @@ impl Metadata {
         if routes.len() != plan.source_routes.len() {
             return Err(Error::InvalidPlan("duplicate source id".to_owned()));
         }
+        let internal_effect_result_sources = plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .filter_map(|op| match &op.kind {
+                PlanOpKind::UpdateBranch {
+                    effect:
+                        Some(boon_plan::EffectInvocationPlan {
+                            result: boon_plan::EffectResultRoute::CorrelatedSources { variants },
+                            ..
+                        }),
+                    ..
+                } => Some(variants.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .map(|route| route.source_id)
+            .collect::<BTreeSet<_>>();
 
         let mut metadata = Self {
             constants,
@@ -675,9 +755,13 @@ impl Metadata {
             list_by_scope,
             list_labels,
             list_fields_by_name,
+            list_fields_by_exact_name,
+            root_field_by_exact_name,
             root_field_by_name,
+            root_state_by_exact_name,
             root_state_by_name,
             routes,
+            internal_effect_result_sources,
             updates_by_source,
             mutations,
             source_derived_by_source,
@@ -802,13 +886,17 @@ impl Metadata {
     }
 
     fn root_field(&self, name: &str) -> Result<FieldId, Error> {
+        if let Some(field) = unique_root_name(&self.root_field_by_exact_name, name, "field")? {
+            return Ok(field);
+        }
         if !name.starts_with("store.")
-            && let Some([field]) = self
-                .root_field_by_name
-                .get(&format!("store.{name}"))
-                .map(Vec::as_slice)
+            && let Some(field) = unique_root_name(
+                &self.root_field_by_exact_name,
+                &format!("store.{name}"),
+                "field",
+            )?
         {
-            return Ok(*field);
+            return Ok(field);
         }
         let fields = self
             .root_field_by_name
@@ -820,29 +908,6 @@ impl Metadata {
             _ => Err(Error::InvalidPlan(format!(
                 "root field name `{name}` is ambiguous across FieldIds {:?}",
                 fields
-            ))),
-        }
-    }
-
-    fn root_state(&self, name: &str) -> Result<StateId, Error> {
-        if !name.starts_with("store.")
-            && let Some([state]) = self
-                .root_state_by_name
-                .get(&format!("store.{name}"))
-                .map(Vec::as_slice)
-        {
-            return Ok(*state);
-        }
-        let states = self
-            .root_state_by_name
-            .get(name)
-            .or_else(|| self.root_state_by_name.get(local_name(name)))
-            .ok_or_else(|| Error::InvalidPlan(format!("no root state `{name}`")))?;
-        match states.as_slice() {
-            [state] => Ok(*state),
-            _ => Err(Error::InvalidPlan(format!(
-                "root state name `{name}` is ambiguous across StateIds {:?}",
-                states
             ))),
         }
     }
@@ -878,6 +943,18 @@ impl Metadata {
             ))),
         }
     }
+
+    fn exact_list_field(&self, name: &str) -> Result<Option<(ListId, FieldId)>, Error> {
+        let Some(fields) = self.list_fields_by_exact_name.get(name) else {
+            return Ok(None);
+        };
+        match fields.as_slice() {
+            [field] => Ok(Some(*field)),
+            fields => Err(Error::InvalidPlan(format!(
+                "exact list field `{name}` is ambiguous across {fields:?}"
+            ))),
+        }
+    }
 }
 
 fn debug_name_variants(label: &str) -> Vec<String> {
@@ -885,6 +962,20 @@ fn debug_name_variants(label: &str) -> Vec<String> {
     (0..parts.len())
         .map(|start| parts[start..].join("."))
         .collect()
+}
+
+fn unique_root_name<T: Copy + std::fmt::Debug>(
+    names: &BTreeMap<String, Vec<T>>,
+    name: &str,
+    kind: &str,
+) -> Result<Option<T>, Error> {
+    match names.get(name).map(Vec::as_slice) {
+        Some([value]) => Ok(Some(*value)),
+        Some(values) => Err(Error::InvalidPlan(format!(
+            "root {kind} name `{name}` is ambiguous across {values:?}"
+        ))),
+        None => Ok(None),
+    }
 }
 
 fn resolve_named_field(
@@ -1181,9 +1272,20 @@ struct Work {
     pending_settle: bool,
     previous_last_sequence: Option<u64>,
     previous_turn_sequence: u64,
+    work_limit: Option<u64>,
+    work_units: u64,
+    enforce_work_limit: bool,
 }
 
 impl Work {
+    fn with_limit(work_limit: Option<u64>) -> Self {
+        Self {
+            work_limit,
+            enforce_work_limit: true,
+            ..Self::default()
+        }
+    }
+
     fn begin_turn(&mut self, last_sequence: Option<u64>, turn_sequence: u64) {
         self.emit = true;
         self.deltas.clear();
@@ -1201,6 +1303,30 @@ impl Work {
         self.pending_settle = false;
         self.previous_last_sequence = last_sequence;
         self.previous_turn_sequence = turn_sequence;
+        self.work_units = 0;
+        self.enforce_work_limit = true;
+    }
+
+    fn consume(&mut self, units: u64) -> Result<(), Error> {
+        let attempted = self.work_units.saturating_add(units);
+        if self.enforce_work_limit
+            && self
+                .work_limit
+                .is_some_and(|work_limit| attempted > work_limit)
+        {
+            return Err(Error::WorkBudgetExceeded {
+                limit: self.work_limit.unwrap_or_default(),
+                attempted,
+            });
+        }
+        self.work_units = attempted;
+        Ok(())
+    }
+
+    fn allow_rollback(&mut self) {
+        // Authority rollback must complete after a bounded evaluation aborts.
+        // Static plan and storage limits still bound this recovery path.
+        self.enforce_work_limit = false;
     }
 
     fn settle(&mut self) {
@@ -1214,6 +1340,7 @@ impl Work {
         self.metrics.dirty_state_count = self.dirty_states.len();
         self.metrics.dirty_field_count = self.dirty_consumers.len();
         self.metrics.changed_row_count = self.changed_rows.len();
+        self.metrics.work_unit_count = self.work_units;
         self.metrics.recomputed_targets.clear();
         self.metrics
             .recomputed_targets
@@ -1271,6 +1398,7 @@ impl SessionBuilder {
             )));
         }
         let metadata = Arc::new(Metadata::new(&plan)?);
+        let turn_work = Work::with_limit(options.max_work_units_per_transaction);
         Ok(Self {
             session: Session {
                 plan,
@@ -1287,7 +1415,7 @@ impl SessionBuilder {
                 touched_root_states: BTreeSet::new(),
                 touched_lists: BTreeSet::new(),
                 touched_row_fields: BTreeSet::new(),
-                turn_work: Work::default(),
+                turn_work,
             },
             authority: None,
         })
@@ -1304,7 +1432,7 @@ impl SessionBuilder {
     }
 
     pub fn build(mut self) -> Result<Session, Error> {
-        let mut work = Work::default();
+        let mut work = self.session.fresh_work();
         self.session.initialize_storage_defaults(&mut work)?;
         if let Some(authority) = self.authority.take() {
             self.session.install_authority(authority, &mut work)?;
@@ -1316,6 +1444,10 @@ impl SessionBuilder {
 }
 
 impl Session {
+    fn fresh_work(&self) -> Work {
+        Work::with_limit(self.options.max_work_units_per_transaction)
+    }
+
     pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
         SessionBuilder::new(plan, options)?.build()
     }
@@ -1402,7 +1534,8 @@ impl Session {
     }
 
     pub fn settle_published(&mut self) -> Result<(), Error> {
-        self.ensure_published_current(None, &mut Work::default())
+        let mut work = self.fresh_work();
+        self.ensure_published_current(None, &mut work)
     }
 
     pub fn document_plan(&self) -> Option<&boon_plan::DocumentPlan> {
@@ -2019,7 +2152,7 @@ impl Session {
         targets: &[ValueTarget],
     ) -> Result<BTreeMap<ValueTarget, Value>, Error> {
         let mut values = BTreeMap::new();
-        let mut work = Work::default();
+        let mut work = self.fresh_work();
         for target in targets {
             let value = match *target {
                 ValueTarget::State(state) => self.root_states.get(&state).cloned(),
@@ -2048,24 +2181,62 @@ impl Session {
     /// without cloning its values. Hosts use this after rollback/restore before
     /// exposing retained output state again.
     pub fn ensure_current(&mut self, targets: &[ValueTarget]) -> Result<(), Error> {
-        self.ensure_demanded_current(targets, None, &mut Work::default())
+        let mut work = self.fresh_work();
+        self.ensure_demanded_current(targets, None, &mut work)
     }
 
     pub fn root_value_current(&mut self, name: &str) -> Result<Value, Error> {
-        if self.metadata.root_field_by_name.contains_key(name)
-            || self
-                .metadata
-                .root_field_by_name
-                .contains_key(local_name(name))
+        if let Some(field) =
+            unique_root_name(&self.metadata.root_field_by_exact_name, name, "field")?
         {
-            let field = self.metadata.root_field(name)?;
-            return self.ensure_root_field(field, None, &mut Work::default());
+            let mut work = self.fresh_work();
+            return self.ensure_root_field(field, None, &mut work);
         }
-        let state = self.metadata.root_state(name)?;
-        self.root_states
-            .get(&state)
-            .cloned()
-            .ok_or_else(|| Error::Evaluation(format!("root state `{name}` has no value")))
+        if let Some(state) =
+            unique_root_name(&self.metadata.root_state_by_exact_name, name, "state")?
+        {
+            return self
+                .root_states
+                .get(&state)
+                .cloned()
+                .ok_or_else(|| Error::Evaluation(format!("root state `{name}` has no value")));
+        }
+        if !name.starts_with("store.") {
+            let qualified = format!("store.{name}");
+            if let Some(field) =
+                unique_root_name(&self.metadata.root_field_by_exact_name, &qualified, "field")?
+            {
+                let mut work = self.fresh_work();
+                return self.ensure_root_field(field, None, &mut work);
+            }
+            if let Some(state) =
+                unique_root_name(&self.metadata.root_state_by_exact_name, &qualified, "state")?
+            {
+                return self.root_states.get(&state).cloned().ok_or_else(|| {
+                    Error::Evaluation(format!("root state `{qualified}` has no value"))
+                });
+            }
+        }
+
+        let local = local_name(name);
+        let fields = self.metadata.root_field_by_name.get(local);
+        let states = self.metadata.root_state_by_name.get(local);
+        match (fields.map(Vec::as_slice), states.map(Vec::as_slice)) {
+            (Some([field]), None) => {
+                let field = *field;
+                let mut work = self.fresh_work();
+                self.ensure_root_field(field, None, &mut work)
+            }
+            (None, Some([state])) => self
+                .root_states
+                .get(state)
+                .cloned()
+                .ok_or_else(|| Error::Evaluation(format!("root state `{name}` has no value"))),
+            (None, None) => Err(Error::InvalidPlan(format!("no root value `{name}`"))),
+            _ => Err(Error::InvalidPlan(format!(
+                "root value name `{name}` is ambiguous"
+            ))),
+        }
     }
 
     /// Reconstructs one host-owned non-visual output after establishing its
@@ -2091,7 +2262,7 @@ impl Session {
         {
             return self.output_list_current(*list, item);
         }
-        let mut work = Work::default();
+        let mut work = self.fresh_work();
         let evaluated = self.eval_value_ref(&value, None, None, None, None, &mut work)?;
         let value = self.materialize_eval(evaluated)?;
         normalize_host_output_value(value)
@@ -2114,7 +2285,8 @@ impl Session {
         };
         let rows = self.list_row_ids(list);
         let mut values = Vec::with_capacity(rows.len());
-        let mut work = Work::default();
+        let mut work = self.fresh_work();
+        work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
         for row in rows {
             let mut record = BTreeMap::new();
             for output_field in fields {
@@ -2135,6 +2307,9 @@ impl Session {
     }
 
     pub fn inspect_value_current(&mut self, name: &str, max_rows: usize) -> Result<Value, Error> {
+        if let Some((list, field)) = self.metadata.exact_list_field(name)? {
+            return self.inspect_list_field_current(list, field, max_rows);
+        }
         if self.metadata.root_field_by_name.contains_key(name)
             || self
                 .metadata
@@ -2149,6 +2324,15 @@ impl Session {
             return self.root_value_current(name);
         }
         let (list, field) = self.metadata.any_list_field(name)?;
+        self.inspect_list_field_current(list, field, max_rows)
+    }
+
+    fn inspect_list_field_current(
+        &mut self,
+        list: ListId,
+        field: FieldId,
+        max_rows: usize,
+    ) -> Result<Value, Error> {
         let rows = self
             .lists
             .get(&list)
@@ -2161,7 +2345,8 @@ impl Session {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let mut work = Work::default();
+        let mut work = self.fresh_work();
+        work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
         let mut values = Vec::with_capacity(rows.len());
         for row in rows {
             let value = if self.metadata.row_computations.contains_key(&field) {
@@ -2377,6 +2562,7 @@ impl Session {
             let mut order = Vec::with_capacity(restored.rows.len());
             let mut seen = BTreeSet::new();
             for restored_row in restored.rows {
+                work.consume(1)?;
                 if restored_row.id.list != list_id {
                     return Err(Error::InvalidPlan(format!(
                         "restore row {}:{} belongs to list {}, expected {}",
@@ -2457,7 +2643,7 @@ impl Session {
             let _ = slot;
         }
 
-        self.rebuild_runtime_state()?;
+        self.rebuild_runtime_state(work)?;
         Ok(())
     }
 
@@ -2492,7 +2678,7 @@ impl Session {
         Ok(())
     }
 
-    fn rebuild_runtime_state(&mut self) -> Result<(), Error> {
+    fn rebuild_runtime_state(&mut self, work: &mut Work) -> Result<(), Error> {
         self.indexes.clear();
         self.dynamic_dependencies = DynamicDependencies::default();
         self.next_binding_id = 1;
@@ -2501,6 +2687,7 @@ impl Session {
             .iter()
             .flat_map(|(list, state)| state.order.iter().map(|row| (*list, *row)))
             .collect::<Vec<_>>();
+        work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
         for (_, row) in &rows {
             if let Some(state) = self
                 .lists
@@ -2575,8 +2762,9 @@ impl Session {
         slot: &ListStorageSlot,
         key: u64,
         fields: BTreeMap<FieldId, Value>,
-        _work: &mut Work,
+        work: &mut Work,
     ) -> Result<RowId, Error> {
+        work.consume(1)?;
         let row_id = RowId {
             list: slot.list_id,
             key,
@@ -3072,7 +3260,7 @@ impl Session {
                     target,
                     payload,
                 };
-                self.validate_event_route(&event)?;
+                self.validate_event_route(&event, true)?;
                 self.route_event_with_work(&mut event, &[], work)
             }
         }
@@ -3181,6 +3369,7 @@ impl Session {
     }
 
     fn rollback_turn(&mut self, work: &mut Work) -> Result<(), Error> {
+        work.allow_rollback();
         for undo in work.authority_undo.drain(..).rev() {
             match undo {
                 AuthorityUndo::RootState {
@@ -3291,7 +3480,7 @@ impl Session {
         work.authority_deltas.clear();
         work.outbox_changes.clear();
         work.emit = false;
-        self.rebuild_runtime_state()?;
+        self.rebuild_runtime_state(work)?;
         self.ensure_published_current(None, work)?;
         Ok(())
     }
@@ -3379,17 +3568,18 @@ impl Session {
             .routes
             .get(&event.source)
             .ok_or_else(|| Error::InvalidEvent(format!("unknown source {}", event.source.0)))?;
-        let Some(name) = route
-            .payload_schema
-            .row_lookup_field_name()
-            .map(str::to_owned)
-        else {
+        let Some(field) = route.payload_schema.row_lookup_field_id() else {
             return Ok(());
         };
         if source_payload_value(&event.payload, &SourcePayloadField::Address).is_some() {
             return Ok(());
         }
-        let field = self.metadata.list_field(row.list, &name)?;
+        if self.metadata.row_field_owner.get(&field) != Some(&row.list) {
+            return Err(Error::InvalidPlan(format!(
+                "source {} row lookup field {} does not belong to target list {}",
+                event.source.0, field.0, row.list.0
+            )));
+        }
         let value = if self.metadata.row_computations.contains_key(&field) {
             self.ensure_row_field(row, field, None, work)?
         } else {
@@ -3411,13 +3601,28 @@ impl Session {
                 self.last_sequence.unwrap_or_default()
             )));
         }
-        self.validate_event_route(event)
+        self.validate_event_route(event, false)
     }
 
-    fn validate_event_route(&self, event: &SourceEvent) -> Result<(), Error> {
+    fn validate_event_route(
+        &self,
+        event: &SourceEvent,
+        internal_effect_completion: bool,
+    ) -> Result<(), Error> {
         if !self.metadata.routes.contains_key(&event.source) {
             return Err(Error::InvalidEvent(format!(
                 "source {} is not in the plan",
+                event.source.0
+            )));
+        }
+        if !internal_effect_completion
+            && self
+                .metadata
+                .internal_effect_result_sources
+                .contains(&event.source)
+        {
+            return Err(Error::InvalidEvent(format!(
+                "source {} is reserved for correlated host-effect completion",
                 event.source.0
             )));
         }
@@ -3455,10 +3660,15 @@ impl Session {
                 event.source.0, scope.0
             ))
         })?;
-        let Some(lookup_name) = route.payload_schema.row_lookup_field_name() else {
+        let Some(field) = route.payload_schema.row_lookup_field_id() else {
             return Ok(Vec::new());
         };
-        let field = self.metadata.list_field(list, lookup_name)?;
+        if self.metadata.row_field_owner.get(&field) != Some(&list) {
+            return Err(Error::InvalidPlan(format!(
+                "source {} row lookup field {} does not belong to scoped list {}",
+                event.source.0, field.0, list.0
+            )));
+        }
         let Some(value) = source_payload_value(&event.payload, &SourcePayloadField::Address) else {
             return Ok(Vec::new());
         };
@@ -3781,6 +3991,7 @@ impl Session {
             Currentness::Evaluating => return Err(Error::Cycle { field, row: None }),
             Currentness::Dirty => {}
         }
+        work.consume(1)?;
         self.root_fields
             .get_mut(&field)
             .expect("root cell checked above")
@@ -3947,6 +4158,7 @@ impl Session {
             }
             Currentness::Dirty => {}
         }
+        work.consume(1)?;
         self.set_row_currentness(row, field, Currentness::Evaluating)?;
         let consumer = Consumer::Row(row, field);
         self.dynamic_dependencies.clear(consumer);
@@ -4559,6 +4771,7 @@ impl Session {
         bindings: &mut BTreeMap<String, EvalValue>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
+        work.consume(1)?;
         let consumer = output.map(|field| match row {
             Some(row) => Consumer::Row(row, field),
             None => Consumer::Root(field),
@@ -4619,6 +4832,23 @@ impl Session {
                     left, op, *right,
                 )?)))
             }
+            PlanDerivedExpression::ValueCompare { left, op, right } => {
+                let left = self.eval_value_ref(left, row, event, output, consumer, work)?;
+                let right = self.eval_value_ref(right, row, event, output, consumer, work)?;
+                let EvalValue::Value(left) = left else {
+                    return Err(Error::Evaluation(
+                        "left comparison operand is not a scalar value".to_owned(),
+                    ));
+                };
+                let EvalValue::Value(right) = right else {
+                    return Err(Error::Evaluation(
+                        "right comparison operand is not a scalar value".to_owned(),
+                    ));
+                };
+                Ok(EvalValue::Value(Value::Bool(compare_update_values(
+                    &left, op, &right,
+                )?)))
+            }
             PlanDerivedExpression::BoolAnd { left, right } => {
                 let left =
                     self.eval_derived_expression(left, row, event, output, bindings, work)?;
@@ -4656,6 +4886,7 @@ impl Session {
         consumer: Option<Consumer>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
+        work.consume(1)?;
         match value_ref {
             ValueRef::Source(source) => Ok(EvalValue::Value(Value::Bool(
                 event.is_some_and(|event| event.source == *source),
@@ -4677,11 +4908,10 @@ impl Session {
                 .ok_or_else(|| Error::InvalidPlan(format!("missing constant {}", constant.0))),
             ValueRef::List(list) => {
                 self.register_list_dependency(consumer, *list);
+                let rows = self.list_row_ids(*list);
+                work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 Ok(EvalValue::List(
-                    self.list_row_ids(*list)
-                        .into_iter()
-                        .map(EvalValue::Row)
-                        .collect(),
+                    rows.into_iter().map(EvalValue::Row).collect(),
                 ))
             }
             ValueRef::State(state) => {
@@ -4782,6 +5012,7 @@ impl Session {
         bindings: &mut BTreeMap<String, EvalValue>,
         work: &mut Work,
     ) -> Result<EvalValue, Error> {
+        work.consume(1)?;
         match expression {
             PlanRowExpression::Field { input } => {
                 self.eval_value_ref(input, row, event, output, consumer, work)
@@ -5169,11 +5400,10 @@ impl Session {
             }
             PlanRowExpression::ListRef { list_id } => {
                 self.register_list_dependency(consumer, *list_id);
+                let rows = self.list_row_ids(*list_id);
+                work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 Ok(EvalValue::List(
-                    self.list_row_ids(*list_id)
-                        .into_iter()
-                        .map(EvalValue::Row)
-                        .collect(),
+                    rows.into_iter().map(EvalValue::Row).collect(),
                 ))
             }
             PlanRowExpression::ListFindValue {
@@ -5209,6 +5439,12 @@ impl Session {
                 let to =
                     self.eval_expression_number(to, row, event, output, consumer, bindings, work)?;
                 let values = if from <= to {
+                    let length = to
+                        .checked_sub(from)
+                        .and_then(|span| span.checked_add(1))
+                        .and_then(|length| u64::try_from(length).ok())
+                        .unwrap_or(u64::MAX);
+                    work.consume(length)?;
                     (from..=to)
                         .map(|value| EvalValue::Value(Value::Number(value)))
                         .collect()
@@ -5236,6 +5472,7 @@ impl Session {
                 let input =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
                 let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
                 let previous = bindings.get(binding).cloned();
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -5268,8 +5505,10 @@ impl Session {
             PlanRowExpression::ListSum { input } => {
                 let input =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
+                let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
                 let mut total = 0i64;
-                for item in eval_to_list(input)? {
+                for item in items {
                     if let Ok(value) = eval_to_number(&item) {
                         total = total
                             .checked_add(value)
@@ -5300,6 +5539,22 @@ impl Session {
                 let object =
                     self.eval_row_expression(object, row, event, output, consumer, bindings, work)?;
                 self.eval_object_field(object, field, event, consumer, work)
+            }
+            PlanRowExpression::ListRowField {
+                row: row_expression,
+                list_id,
+                field,
+            } => {
+                let value = self.eval_row_expression(
+                    row_expression,
+                    row,
+                    event,
+                    output,
+                    consumer,
+                    bindings,
+                    work,
+                )?;
+                self.eval_list_row_field(value, *list_id, *field, event, consumer, work)
             }
             PlanRowExpression::BuiltinCall {
                 function,
@@ -5420,6 +5675,40 @@ impl Session {
                 "value {other:?} is not an object"
             ))),
         }
+    }
+
+    fn eval_list_row_field(
+        &mut self,
+        value: EvalValue,
+        list_id: ListId,
+        field: FieldId,
+        event: Option<&SourceEvent>,
+        consumer: Option<Consumer>,
+        work: &mut Work,
+    ) -> Result<EvalValue, Error> {
+        let row = match value {
+            EvalValue::Row(row) | EvalValue::Value(Value::Row { id: row, .. }) => row,
+            other => {
+                return Err(Error::Evaluation(format!(
+                    "value {other:?} is not a typed list row"
+                )));
+            }
+        };
+        if row.list != list_id {
+            return Err(Error::InvalidPlan(format!(
+                "typed row field {} belongs to list {}, but expression produced list {}",
+                field.0, list_id.0, row.list.0
+            )));
+        }
+        if self.metadata.row_field_owner.get(&field) != Some(&list_id) {
+            return Err(Error::InvalidPlan(format!(
+                "typed row field {} does not belong to list {}",
+                field.0, list_id.0
+            )));
+        }
+        self.register_row_dependency(consumer, row, field);
+        self.ensure_row_field(row, field, event, work)
+            .map(EvalValue::Value)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5740,7 +6029,9 @@ impl Session {
                     .ok_or_else(|| Error::Evaluation("List/any requires `if`".to_owned()))?;
                 let previous = bindings.get(&binding).cloned();
                 let mut matched = false;
-                for item in eval_to_list(input)? {
+                let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                for item in items {
                     bindings.insert(binding.clone(), item);
                     let include = self.eval_row_expression(
                         &predicate.value,
@@ -5787,7 +6078,9 @@ impl Session {
                     .ok_or_else(|| Error::Evaluation("List/retain requires `if`".to_owned()))?;
                 let previous = bindings.get(&binding).cloned();
                 let mut retained = Vec::new();
-                for item in eval_to_list(input)? {
+                let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                for item in items {
                     bindings.insert(binding.clone(), item.clone());
                     let include = self.eval_row_expression(
                         &predicate.value,
@@ -5829,7 +6122,9 @@ impl Session {
                 let expected = self.materialize_eval(expected)?;
                 let retain_equal = function == "List/filter_field_equal";
                 let mut filtered = Vec::new();
-                for item in eval_to_list(input)? {
+                let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                for item in items {
                     let actual =
                         self.eval_object_field(item.clone(), &field, event, consumer, work)?;
                     let actual = self.materialize_eval(actual)?;
@@ -5885,7 +6180,9 @@ impl Session {
                     work,
                 )?;
                 let mut filtered = Vec::new();
-                for item in eval_to_list(input)? {
+                let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                for item in items {
                     if needle.is_empty()
                         && let (Some(empty_field), Some(empty_value)) =
                             (empty_field.as_deref(), empty_value.as_deref())
@@ -5946,6 +6243,7 @@ impl Session {
                     .named_text_arg(args, "empty", row, event, output, consumer, bindings, work)?
                     .unwrap_or_default();
                 let items = eval_to_list(input)?;
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
                 if items.is_empty() {
                     return Ok(EvalValue::Value(Value::Text(empty)));
                 }
@@ -6069,6 +6367,17 @@ impl Session {
                 let input = self.single_update_input(op)?;
                 Value::Bool(!value_to_bool(
                     &self.eval_update_ref(&input, row, event, work)?,
+                )?)
+            }
+            PlanExpressionKind::TextToNumber => {
+                let [input] = ordered_inputs.as_slice() else {
+                    return Err(Error::InvalidPlan(format!(
+                        "TextToNumber update {} requires one text input",
+                        op.id.0
+                    )));
+                };
+                Value::Number(value_to_number(
+                    &self.eval_update_ref(input, row, event, work)?,
                 )?)
             }
             PlanExpressionKind::TextTrimOrPrevious => {
@@ -6750,6 +7059,7 @@ impl Session {
         event_targets: &[RowId],
         work: &mut Work,
     ) -> Result<(), Error> {
+        work.consume(1)?;
         let PlanOpKind::ListOperation {
             operation_kind,
             append,
@@ -6826,6 +7136,7 @@ impl Session {
                         .filter(|row| row.list == list)
                         .collect()
                 };
+                work.consume(candidates.len().try_into().unwrap_or(u64::MAX))?;
                 let mut removed = Vec::new();
                 for row in candidates {
                     if self.evaluate_list_predicate(
@@ -7172,8 +7483,10 @@ impl Session {
         };
         let consumer = Some(Consumer::Root(output));
         self.register_list_dependency(consumer, list);
+        let rows = self.list_row_ids(list);
+        work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
         let mut values = Vec::new();
-        for row in self.list_row_ids(list) {
+        for row in rows {
             if self.evaluate_list_predicate(&retain.predicate, row, event, consumer, work)? {
                 values.push(row_identity_value(row));
             }
@@ -7202,8 +7515,10 @@ impl Session {
         };
         let consumer = Some(Consumer::Root(output));
         self.register_list_dependency(consumer, list);
+        let rows = self.list_row_ids(list);
+        work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
         let mut total = 0i64;
-        for row in self.list_row_ids(list) {
+        for row in rows {
             if self.evaluate_list_predicate(&count.predicate, row, event, consumer, work)? {
                 total += 1;
             }
@@ -7254,6 +7569,7 @@ impl Session {
                 }
                 self.register_list_dependency(consumer, *source_list);
                 let rows = self.list_row_ids(*source_list);
+                work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 let mut chunks = Vec::new();
                 for (index, chunk) in rows.chunks(*size).enumerate() {
                     let items = chunk
@@ -7288,6 +7604,7 @@ impl Session {
                         op.0
                     )));
                 };
+                work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
                 let chunks = rows
                     .chunks(*size)
                     .enumerate()
@@ -7311,10 +7628,11 @@ impl Session {
 fn trigger_is_active(value: &Value, source: SourceId, trigger: &ValueRef) -> bool {
     match trigger {
         ValueRef::Source(expected) => *expected == source,
-        _ => !matches!(
-            value,
-            Value::Null | Value::Bool(false) | Value::Error { .. }
-        ),
+        _ => match value {
+            Value::Null | Value::Bool(false) | Value::Error { .. } => false,
+            Value::Text(value) if value == "SKIP" => false,
+            _ => true,
+        },
     }
 }
 

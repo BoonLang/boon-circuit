@@ -1587,6 +1587,43 @@ fn rejects_invalid_and_nonterminal_draining_placement() {
     }
 }
 
+#[test]
+fn stateful_root_latest_is_memory_but_event_only_latest_is_transient() {
+    let program = parse_source(
+        "root-latest-memory.bn",
+        r#"
+store: [
+    pulse: SOURCE
+    count:
+        LATEST {
+            0
+            pulse |> THEN { count + 1 }
+        }
+    transient:
+        LATEST {
+            pulse |> THEN { count + 10 }
+        }
+    projected_transient:
+        LATEST {
+            transient
+            |> List/latest()
+        }
+    derived: count + 20
+]
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        program
+            .state_cells
+            .iter()
+            .map(|cell| (cell.path.as_str(), cell.indexed))
+            .collect::<Vec<_>>(),
+        [("store.count", false)]
+    );
+}
+
 fn find_statement(
     statements: &[AstStatement],
     predicate: impl Fn(&AstStatement) -> bool + Copy,

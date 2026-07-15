@@ -66,6 +66,16 @@ pub struct EmbeddedProgramDescriptor {
     pub source: String,
     pub source_digest: String,
     pub revision: u64,
+    #[serde(default)]
+    pub artifact_id: String,
+    #[serde(default)]
+    pub persist_artifact: bool,
+    #[serde(default)]
+    pub bootstrap_source: String,
+    #[serde(default)]
+    pub bootstrap_source_digest: String,
+    #[serde(default)]
+    pub bootstrap_revision: u64,
     pub capability_profile: ProgramCapabilityProfile,
     #[serde(default)]
     pub session_key: String,
@@ -79,6 +89,11 @@ impl Default for EmbeddedProgramDescriptor {
             source: String::new(),
             source_digest: String::new(),
             revision: 0,
+            artifact_id: String::new(),
+            persist_artifact: false,
+            bootstrap_source: String::new(),
+            bootstrap_source_digest: String::new(),
+            bootstrap_revision: 0,
             capability_profile: ProgramCapabilityProfile::default(),
             session_key: String::new(),
             mount: true,
@@ -93,6 +108,11 @@ impl Debug for EmbeddedProgramDescriptor {
             .field("source_digest", &self.source_digest)
             .field("source_bytes", &self.source.len())
             .field("revision", &self.revision)
+            .field("artifact_id", &self.artifact_id)
+            .field("persist_artifact", &self.persist_artifact)
+            .field("bootstrap_source_digest", &self.bootstrap_source_digest)
+            .field("bootstrap_source_bytes", &self.bootstrap_source.len())
+            .field("bootstrap_revision", &self.bootstrap_revision)
             .field("capability_profile", &self.capability_profile)
             .field("session_key", &self.session_key)
             .field("mount", &self.mount)
@@ -110,6 +130,11 @@ impl Serialize for EmbeddedProgramDescriptor {
             source_digest: &'a str,
             source_bytes: usize,
             revision: u64,
+            artifact_id: &'a str,
+            persist_artifact: bool,
+            bootstrap_source_digest: &'a str,
+            bootstrap_source_bytes: usize,
+            bootstrap_revision: u64,
             capability_profile: ProgramCapabilityProfile,
             session_key: &'a str,
             mount: bool,
@@ -119,6 +144,11 @@ impl Serialize for EmbeddedProgramDescriptor {
             source_digest: &self.source_digest,
             source_bytes: self.source.len(),
             revision: self.revision,
+            artifact_id: &self.artifact_id,
+            persist_artifact: self.persist_artifact,
+            bootstrap_source_digest: &self.bootstrap_source_digest,
+            bootstrap_source_bytes: self.bootstrap_source.len(),
+            bootstrap_revision: self.bootstrap_revision,
             capability_profile: self.capability_profile,
             session_key: &self.session_key,
             mount: self.mount,
@@ -526,7 +556,7 @@ pub enum UiSemanticChange {
     InsertNode {
         parent: DocumentNodeId,
         index: usize,
-        node: DocumentNode,
+        node: Box<DocumentNode>,
     },
     RemoveSubtree {
         id: DocumentNodeId,
@@ -594,7 +624,7 @@ impl UiSemanticChange {
                 node.parent = Some(parent.clone());
                 let child = node.id.clone();
                 vec![
-                    DocumentPatch::UpsertNode(node),
+                    DocumentPatch::UpsertNode(*node),
                     DocumentPatch::InsertChild {
                         parent,
                         child,

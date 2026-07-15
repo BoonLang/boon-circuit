@@ -33,7 +33,7 @@ store: [
 effects: [
     protect_workspace: [
         on: store.register
-        perform: Passkey/register(
+        perform: DevelopmentPasskey/register(
             workspace_id: store.workspace_id
             account_id: store.account_id
             credential_count: store.credential_count
@@ -62,15 +62,24 @@ fn passkey_effect_declaration_has_closed_named_intent_and_typed_result_sources()
     );
     let declaration = &report.host_effect_table.declarations[0];
     assert_eq!(declaration.name, "protect_workspace");
-    assert_eq!(declaration.operation, "Passkey/register");
+    assert_eq!(declaration.operation, "DevelopmentPasskey/register");
+    let Type::VariantSet(simulation_variants) = &declaration
+        .intent_fields
+        .iter()
+        .find(|field| field.name == "simulation")
+        .unwrap()
+        .value_type
+    else {
+        panic!("development simulation must be a closed variant");
+    };
     assert_eq!(
-        declaration
-            .intent_fields
+        simulation_variants
             .iter()
-            .find(|field| field.name == "simulation")
-            .unwrap()
-            .value_type,
-        passkey_simulation_type()
+            .map(|variant| match variant {
+                Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag.as_str(),
+            })
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["Success", "Cancel", "Failure", "Duplicate"])
     );
     assert_eq!(
         declaration
@@ -139,6 +148,35 @@ fn passkey_effect_declaration_rejects_missing_result_route() {
         diagnostic
             .message
             .contains("missing result route `RegistrationCancelled`")
+    }));
+}
+
+#[test]
+fn piped_host_effect_call_outside_effect_declaration_is_rejected() {
+    let parsed = boon_parser::parse_source(
+        "piped-host-effect-outside-declaration.bn",
+        r#"
+store: [
+    trigger: SOURCE
+    workspace_id: TEXT { workspace-1 }
+    account_id: TEXT {}
+    credential_count: 0
+    simulation: Success
+    invalid:
+        store.workspace_id |> DevelopmentPasskey/register(
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.simulation
+        )
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("typed host effect `DevelopmentPasskey/register` may only appear")
     }));
 }
 

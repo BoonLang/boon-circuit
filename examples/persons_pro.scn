@@ -1,57 +1,160 @@
-name = "persons_pro"
+name = "persons_pro_local_first"
 source = "examples/persons_pro/RUN.bn"
 
-[[step]]
-id = "initial-workspace"
-expect_root_text = { "store.workspace_id" = "019f-persons-local-first", "store.implementation_stage" = "ChildProgram", "store.account_state" = "Anonymous", "store.publish_state" = "Draft", "store.active_view" = "Code", "store.draft_revision" = "1" }
+# This file owns document-action playback. Host-control checkpoints that the
+# current scenario transport cannot represent are deterministic scenarios in
+# runtime_view.rs: restart/start-over/export/import/corruption/migration,
+# reordered stale child completions, and desktop/narrow retained-layout parity.
+# Promoting those checkpoints here requires typed host_action variants rather
+# than fake source routes.
 
 [[step]]
-id = "edit-valid-source"
+id = "fresh-anonymous-workspace-and-starter-preview"
+expect_root_text = { "store.workspace_id" = "00000000-0000-4000-8000-000000000001", "store.implementation_stage" = "LocalFirst", "store.account_state" = "Anonymous", "store.credential_count" = "0", "store.publish_state" = "Draft", "store.active_view" = "Code", "store.draft_revision" = "1", "store.draft_compile_state" = "Ready", "store.last_valid_draft_revision" = "1" }
+
+[[step]]
+id = "valid-edit-preview"
 user_action = { kind = "type_text", target = "profile source", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })" }
 expected_source_event = { source = "store.elements.source_editor", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })" }
-expect_root_text = { "store.source_draft" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })", "store.draft_revision" = "2", "store.publish_state" = "Draft" }
+expect_root_text = { "store.source_draft" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })", "store.draft_revision" = "2", "store.draft_compile_state" = "Ready", "store.publish_state" = "Draft" }
 
 [[step]]
-id = "edit-invalid-source"
+id = "invalid-edit-retains-last-valid"
 user_action = { kind = "type_text", target = "profile source", text = "scene: Missing/constructor(" }
 expected_source_event = { source = "store.elements.source_editor", text = "scene: Missing/constructor(" }
-expect_root_text = { "store.source_draft" = "scene: Missing/constructor(", "store.draft_revision" = "3", "store.publish_state" = "Draft" }
+expect_root_text = { "store.source_draft" = "scene: Missing/constructor(", "store.draft_revision" = "3", "store.draft_compile_state" = "Invalid", "store.last_valid_draft_revision" = "2", "store.publish_state" = "Draft" }
 
 [[step]]
-id = "correct-source"
+id = "corrected-edit-preview"
 user_action = { kind = "type_text", target = "profile source", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }
 expected_source_event = { source = "store.elements.source_editor", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }
-expect_root_text = { "store.source_draft" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })", "store.draft_revision" = "4", "store.publish_state" = "Draft" }
+expect_root_text = { "store.source_draft" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })", "store.draft_revision" = "4", "store.draft_compile_state" = "Ready", "store.last_valid_draft_revision" = "4", "store.publish_state" = "Draft" }
 
 [[step]]
-id = "publish-profile"
+id = "immutable-publish"
 user_action = { kind = "click", target = "publish", target_text = "Publish" }
 expected_source_event = { source = "store.elements.publish", target_text = "Publish" }
-expect_root_text = { "store.publish_state" = "Published", "store.published_name" = "Workspace page", "store.published_revision" = "4" }
+expect_root_text = { "store.publish_state" = "Published", "store.published_revision" = "4", "store.published_revision_count" = "1", "store.published_source" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }
 
 [[step]]
-id = "protect-workspace"
+id = "published-child-artifact-visible"
+user_action = { kind = "click", target = "published page", target_text = "Published" }
+expected_source_event = { source = "store.elements.show_published_page", target_text = "Published" }
+expect_root_text = { "store.preview_surface" = "PublishedPage", "store.published_revision" = "4", "store.published_revision_count" = "1" }
+
+[[step]]
+id = "invalid-edit-before-failed-publish"
+user_action = { kind = "type_text", target = "profile source", text = "scene: Missing/constructor(" }
+expected_source_event = { source = "store.elements.source_editor", text = "scene: Missing/constructor(" }
+expect_root_text = { "store.draft_revision" = "5", "store.draft_compile_state" = "Invalid", "store.published_revision" = "4", "store.published_revision_count" = "1" }
+
+[[step]]
+id = "failed-publish-preserves-pointer"
+user_action = { kind = "click", target = "publish", target_text = "Publish" }
+expected_source_event = { source = "store.elements.publish", target_text = "Publish" }
+expect_root_text = { "store.publish_state" = "Failed", "store.published_revision" = "4", "store.published_revision_count" = "1", "store.published_source" = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }
+
+[[step]]
+id = "select-passkey-cancellation"
+user_action = { kind = "click", target = "cancel simulator", target_text = "Cancel" }
+expected_source_event = { source = "store.elements.simulate_cancel", target_text = "Cancel" }
+expect_root_text = { "store.passkey_simulation" = "Cancel", "store.account_state" = "Anonymous" }
+
+[[step]]
+id = "passkey-cancel-preserves-anonymous"
 user_action = { kind = "click", target = "protect workspace", target_text = "Protect workspace" }
-expected_source_event = { source = "store.elements.protect_workspace", target_text = "Protect workspace" }
-expect_root_text = { "store.account_state" = "OnePasskey" }
+expected_source_event = { source = "store.elements.register_passkey", target_text = "Protect workspace" }
+expect_root_text = { "store.passkey_workflow_state" = "Cancelled", "store.account_state" = "Anonymous", "store.credential_count" = "0" }
 
 [[step]]
-id = "add-second-passkey"
+id = "select-passkey-registration-failure"
+user_action = { kind = "click", target = "failure simulator", target_text = "Failure" }
+expected_source_event = { source = "store.elements.simulate_failure", target_text = "Failure" }
+expect_root_text = { "store.passkey_simulation" = "Failure", "store.account_state" = "Anonymous", "store.credential_count" = "0" }
+
+[[step]]
+id = "passkey-registration-failure-preserves-anonymous"
+user_action = { kind = "click", target = "protect workspace", target_text = "Protect workspace" }
+expected_source_event = { source = "store.elements.register_passkey", target_text = "Protect workspace" }
+expect_root_text = { "store.passkey_workflow_state" = "Failed", "store.account_state" = "Anonymous", "store.account_id" = "", "store.credential_count" = "0" }
+
+[[step]]
+id = "select-passkey-success"
+user_action = { kind = "click", target = "success simulator", target_text = "Success" }
+expected_source_event = { source = "store.elements.simulate_success", target_text = "Success" }
+expect_root_text = { "store.passkey_simulation" = "Success" }
+
+[[step]]
+id = "first-passkey-protects"
+user_action = { kind = "click", target = "protect workspace", target_text = "Protect workspace" }
+expected_source_event = { source = "store.elements.register_passkey", target_text = "Protect workspace" }
+expect_root_text = { "store.passkey_workflow_state" = "Registered", "store.account_state" = "OnePasskey", "store.account_id" = "account-cd5fa65ac0ad5c18eb2b", "store.credential_count" = "1" }
+
+[[step]]
+id = "select-duplicate-credential"
+user_action = { kind = "click", target = "duplicate simulator", target_text = "Duplicate" }
+expected_source_event = { source = "store.elements.simulate_duplicate", target_text = "Duplicate" }
+expect_root_text = { "store.passkey_simulation" = "Duplicate", "store.credential_count" = "1" }
+
+[[step]]
+id = "duplicate-credential-is-rejected"
 user_action = { kind = "click", target = "add passkey", target_text = "Add passkey" }
-expected_source_event = { source = "store.elements.add_passkey", target_text = "Add passkey" }
-expect_root_text = { "store.account_state" = "TwoPasskeys" }
+expected_source_event = { source = "store.elements.register_passkey", target_text = "Add passkey" }
+expect_root_text = { "store.passkey_workflow_state" = "Duplicate", "store.account_state" = "OnePasskey", "store.account_id" = "account-cd5fa65ac0ad5c18eb2b", "store.credential_count" = "1" }
+
+[[step]]
+id = "restore-passkey-success-mode"
+user_action = { kind = "click", target = "success simulator", target_text = "Success" }
+expected_source_event = { source = "store.elements.simulate_success", target_text = "Success" }
+expect_root_text = { "store.passkey_simulation" = "Success" }
+
+[[step]]
+id = "second-passkey-same-account"
+user_action = { kind = "click", target = "add passkey", target_text = "Add passkey" }
+expected_source_event = { source = "store.elements.register_passkey", target_text = "Add passkey" }
+expect_root_text = { "store.passkey_workflow_state" = "Registered", "store.account_state" = "TwoPasskeys", "store.account_id" = "account-cd5fa65ac0ad5c18eb2b", "store.credential_count" = "2" }
 
 [[step]]
 id = "sign-out"
 user_action = { kind = "click", target = "sign out", target_text = "Sign out" }
 expected_source_event = { source = "store.elements.sign_out", target_text = "Sign out" }
-expect_root_text = { "store.account_state" = "SignedOut" }
+expect_root_text = { "store.account_state" = "SignedOut", "store.credential_count" = "2" }
 
 [[step]]
-id = "sign-in"
+id = "select-authentication-cancellation"
+user_action = { kind = "click", target = "cancel simulator", target_text = "Cancel" }
+expected_source_event = { source = "store.elements.simulate_cancel", target_text = "Cancel" }
+expect_root_text = { "store.passkey_simulation" = "Cancel", "store.account_state" = "SignedOut", "store.account_id" = "account-cd5fa65ac0ad5c18eb2b", "store.credential_count" = "2" }
+
+[[step]]
+id = "authentication-cancellation-preserves-sign-out"
 user_action = { kind = "click", target = "sign in", target_text = "Sign in" }
 expected_source_event = { source = "store.elements.sign_in", target_text = "Sign in" }
-expect_root_text = { "store.account_state" = "TwoPasskeys" }
+expect_root_text = { "store.passkey_workflow_state" = "Cancelled", "store.account_state" = "SignedOut", "store.account_id" = "account-cd5fa65ac0ad5c18eb2b", "store.credential_count" = "2" }
+
+[[step]]
+id = "select-authentication-failure"
+user_action = { kind = "click", target = "failure simulator", target_text = "Failure" }
+expected_source_event = { source = "store.elements.simulate_failure", target_text = "Failure" }
+expect_root_text = { "store.passkey_simulation" = "Failure", "store.account_state" = "SignedOut" }
+
+[[step]]
+id = "authentication-failure-preserves-sign-out"
+user_action = { kind = "click", target = "sign in", target_text = "Sign in" }
+expected_source_event = { source = "store.elements.sign_in", target_text = "Sign in" }
+expect_root_text = { "store.passkey_workflow_state" = "Failed", "store.account_state" = "SignedOut", "store.account_id" = "account-cd5fa65ac0ad5c18eb2b", "store.credential_count" = "2" }
+
+[[step]]
+id = "select-authentication-success"
+user_action = { kind = "click", target = "success simulator", target_text = "Success" }
+expected_source_event = { source = "store.elements.simulate_success", target_text = "Success" }
+expect_root_text = { "store.passkey_simulation" = "Success", "store.account_state" = "SignedOut" }
+
+[[step]]
+id = "passkey-sign-in-restores-access"
+user_action = { kind = "click", target = "sign in", target_text = "Sign in" }
+expected_source_event = { source = "store.elements.sign_in", target_text = "Sign in" }
+expect_root_text = { "store.passkey_workflow_state" = "Authenticated", "store.account_state" = "TwoPasskeys", "store.account_id" = "account-cd5fa65ac0ad5c18eb2b", "store.credential_count" = "2" }
 
 [[step]]
 id = "toggle-dark"

@@ -28,6 +28,7 @@ arboard.workspace = true
 wgpu.workspace = true
 libc.workspace = true
 open.workspace = true
+uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev.workspace = true

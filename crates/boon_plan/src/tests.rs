@@ -232,13 +232,26 @@ fn effect_ids_and_builtin_contracts_are_stable_and_safe_by_construction() {
 
 #[test]
 fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
+    let simulation_type = || {
+        DataTypePlan::Variant {
+            variants: ["Success", "Cancel", "Failure", "Duplicate"]
+                .into_iter()
+                .map(|tag| DataVariantPlan {
+                    tag: tag.to_owned(),
+                    fields: Vec::new(),
+                    open: false,
+                })
+                .collect(),
+        }
+        .canonicalized()
+    };
     let cases = [
         (
-            "Passkey/register",
+            "DevelopmentPasskey/register",
             vec![
                 ("account_id", DataTypePlan::Text),
                 ("credential_count", DataTypePlan::Number),
-                ("simulation", passkey_simulation_data_type().canonicalized()),
+                ("simulation", simulation_type()),
                 ("workspace_id", DataTypePlan::Text),
             ],
             vec![
@@ -269,11 +282,11 @@ fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
             ],
         ),
         (
-            "Passkey/authenticate",
+            "DevelopmentPasskey/authenticate",
             vec![
                 ("account_id", DataTypePlan::Text),
                 ("credential_count", DataTypePlan::Number),
-                ("simulation", passkey_simulation_data_type().canonicalized()),
+                ("simulation", simulation_type()),
             ],
             vec![
                 ("AuthenticationCancelled", Vec::new()),

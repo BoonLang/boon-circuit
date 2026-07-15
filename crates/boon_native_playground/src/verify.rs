@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::fs::File;
 #[cfg(target_os = "linux")]
@@ -20,13 +21,20 @@ use std::thread::{self, JoinHandle};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::budget::{BudgetContract, BudgetUnit};
 
 #[cfg(target_os = "linux")]
 use crate::observer::{
-    FrameEvidenceKey, FramePresented, InputAccepted, InputKind, OBSERVER_SOCKET_ENV, ObserverEvent,
-    ObserverRole, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV, PROOF_SAMPLE_ORDINAL_ENV, ProofArtifact,
-    RoleMetadata, TestPointerPhase, read_event,
+    FrameEvidenceKey, FramePresented, InputAccepted, InputKind, MIGRATION_EVIDENCE_ENV,
+    NATIVE_SESSION_ID_ENV, OBSERVER_SOCKET_ENV, ObserverEvent, ObserverRole,
+    PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
+    PROFILE_BENCHMARK_STEPS_ENV, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV, PROOF_SAMPLE_ORDINAL_ENV,
+    PersistenceEvidenceKind, ProofArtifact, RESPONSIVE_EVIDENCE_SIZE_ENV, RoleMetadata,
+    SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV,
+    STATE_MOUNT_EVIDENCE_ENV, StartupDisposition, TestPointerPhase, read_event,
 };
 #[cfg(target_os = "linux")]
 use crate::{
@@ -41,8 +49,6 @@ const ROLE_READY_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(target_os = "linux")]
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
-const NORMAL_VISIBLE_SAMPLE_COUNT: usize = 120;
-#[cfg(target_os = "linux")]
 const INPUT_CALIBRATION_QUIET: Duration = Duration::from_millis(20);
 #[cfg(target_os = "linux")]
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -53,8 +59,387 @@ const OBSERVER_QUEUE_DEPTH: usize = 8_192;
 #[cfg(target_os = "linux")]
 const NATIVE_WORKSPACE: &str = "boon-circuit";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HarnessKind {
+    Timed,
+    Negative,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisibleSampleMode {
+    Click,
+    Hover,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlternateTarget {
+    None,
+    Any,
+    SameSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifierProfile {
+    gate: String,
+    id: String,
+    digest: String,
+    harness: HarnessKind,
+    example: Option<String>,
+    visible_mode: VisibleSampleMode,
+    visible_samples: usize,
+    alternate_target: AlternateTarget,
+    selection_samples: usize,
+    scroll_samples: usize,
+    switch_samples: usize,
+    scenario_proof: Option<PathBuf>,
+    require_semantic_scenario: bool,
+    budget_proof: Option<PathBuf>,
+    loaded_budget: Option<LoadedBudgetContract>,
+    required_budget_metrics: Vec<String>,
+    profile_benchmark_steps: Vec<String>,
+    state_root_policy: Option<String>,
+    restart_required: bool,
+    required_checkpoints: Vec<VerifierCheckpointRequirement>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadedBudgetContract {
+    declared_path: PathBuf,
+    source: String,
+    contract: BudgetContract,
+}
+
+impl LoadedBudgetContract {
+    fn load(declared_path: &Path) -> Result<Self, String> {
+        let filesystem_path = resolve_profile_input(declared_path);
+        let source = fs::read_to_string(&filesystem_path)
+            .map_err(|error| format!("read budget {}: {error}", filesystem_path.display()))?;
+        let contract = BudgetContract::parse(&source)
+            .map_err(|error| format!("parse budget {}: {error}", filesystem_path.display()))?;
+        Ok(Self {
+            declared_path: declared_path.to_path_buf(),
+            source,
+            contract,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+struct VerifierCheckpointRequirement {
+    id: String,
+    #[serde(flatten)]
+    evidence: VerifierCheckpointRequirementKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum VerifierCheckpointRequirementKind {
+    ScenarioStep {
+        scenario_step: String,
+    },
+    RestartRestore {
+        baseline_checkpoint: String,
+    },
+    ResponsiveLayout {
+        baseline_checkpoint: String,
+        logical_width: u32,
+        logical_height: u32,
+    },
+    StaleCompileRejection,
+    PersistenceOperation {
+        operation: VerifierPersistenceOperation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum VerifierPersistenceOperation {
+    Exported,
+    CorruptionRejected,
+    ClearedAndStartedOver,
+    ImportPreviewed,
+    ImportActivated,
+    MigrationActivated,
+}
+
+impl VerifierProfile {
+    fn parse(args: &[String]) -> Result<Self, String> {
+        let harness = match required(args, "--harness")? {
+            "timed" => HarnessKind::Timed,
+            "negative" => HarnessKind::Negative,
+            value => return Err(format!("unsupported verifier harness `{value}`")),
+        };
+        let visible_mode = match optional(args, "--visible-mode").unwrap_or("hover") {
+            "click" => VisibleSampleMode::Click,
+            "hover" => VisibleSampleMode::Hover,
+            value => return Err(format!("unsupported visible sample mode `{value}`")),
+        };
+        let alternate_target = match optional(args, "--alternate-target").unwrap_or("none") {
+            "none" => AlternateTarget::None,
+            "any" => AlternateTarget::Any,
+            "same-source" => AlternateTarget::SameSource,
+            value => return Err(format!("unsupported alternate-target policy `{value}`")),
+        };
+        let budget_proof = optional(args, "--budget-proof").map(PathBuf::from);
+        let loaded_budget = budget_proof
+            .as_deref()
+            .map(LoadedBudgetContract::load)
+            .transpose()?;
+        let profile = Self {
+            gate: required(args, "--gate")?.to_owned(),
+            id: required(args, "--profile")?.to_owned(),
+            digest: required(args, "--profile-digest")?.to_owned(),
+            harness,
+            example: optional(args, "--example").map(str::to_owned),
+            visible_mode,
+            visible_samples: parse_usize(args, "--visible-samples", 0)?,
+            alternate_target,
+            selection_samples: parse_usize(args, "--selection-samples", 0)?,
+            scroll_samples: parse_usize(args, "--scroll-samples", 0)?,
+            switch_samples: parse_usize(args, "--switch-samples", 0)?,
+            scenario_proof: optional(args, "--scenario-proof").map(PathBuf::from),
+            require_semantic_scenario: parse_bool(args, "--require-semantic-scenario", false)?,
+            budget_proof,
+            loaded_budget,
+            required_budget_metrics: parse_csv(args, "--required-budget-metrics")?,
+            profile_benchmark_steps: parse_csv(args, "--profile-benchmark-steps")?,
+            state_root_policy: optional(args, "--state-root-policy").map(str::to_owned),
+            restart_required: parse_bool(args, "--restart-required", false)?,
+            required_checkpoints: repeated(args, "--required-checkpoint")
+                .into_iter()
+                .map(|value| {
+                    serde_json::from_str(value)
+                        .map_err(|error| format!("invalid --required-checkpoint JSON: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.gate.is_empty() || self.id.is_empty() {
+            return Err("verifier gate and profile identities must not be empty".to_owned());
+        }
+        if self.digest.len() != 64
+            || !self
+                .digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("verifier profile digest must be lowercase SHA-256".to_owned());
+        }
+        match self.harness {
+            HarnessKind::Negative => {
+                if self.example.is_some()
+                    || self.visible_samples != 0
+                    || self.selection_samples != 0
+                    || self.scroll_samples != 0
+                    || self.switch_samples != 0
+                {
+                    return Err("negative harness cannot carry native product sampling".to_owned());
+                }
+            }
+            HarnessKind::Timed => {
+                if self.example.as_deref().is_none_or(str::is_empty) {
+                    return Err("timed harness requires a non-empty --example".to_owned());
+                }
+                if !(70..=256).contains(&self.visible_samples) {
+                    return Err("timed harness visible samples must be within 70..=256".to_owned());
+                }
+                if self.visible_mode == VisibleSampleMode::Click
+                    && self.alternate_target != AlternateTarget::None
+                {
+                    return Err("click sampling cannot use an alternate hover target".to_owned());
+                }
+                if self.visible_mode == VisibleSampleMode::Hover
+                    && self.alternate_target == AlternateTarget::None
+                {
+                    return Err("hover sampling requires an alternate target".to_owned());
+                }
+                validate_optional_samples("selection", self.selection_samples, 24, 128)?;
+                validate_optional_samples("scroll", self.scroll_samples, 140, 256)?;
+                validate_optional_samples("switch", self.switch_samples, 23, 64)?;
+                if self.selection_samples > 0 && self.alternate_target == AlternateTarget::None {
+                    return Err("selection sampling requires an alternate target".to_owned());
+                }
+            }
+        }
+        if self.require_semantic_scenario && self.scenario_proof.is_none() {
+            return Err("semantic scenario proof requires --scenario-proof".to_owned());
+        }
+        if !self.required_budget_metrics.is_empty() && self.budget_proof.is_none() {
+            return Err("required budget metrics require --budget-proof".to_owned());
+        }
+        if self.budget_proof.is_some() != self.loaded_budget.is_some() {
+            return Err("budget proof did not load its typed contract".to_owned());
+        }
+        if self.required_budget_metrics.is_empty() {
+            if !self.profile_benchmark_steps.is_empty() {
+                return Err("profile benchmark steps require budget metrics".to_owned());
+            }
+        } else if self.profile_benchmark_steps.len() != 2
+            || self
+                .profile_benchmark_steps
+                .iter()
+                .any(|step| !safe_evidence_id(step))
+        {
+            return Err(
+                "budgeted profile requires exactly two bounded --profile-benchmark-steps values"
+                    .to_owned(),
+            );
+        }
+        if let Some(loaded) = &self.loaded_budget {
+            for metric in &self.required_budget_metrics {
+                let limit = loaded.contract.limit(metric)?;
+                if let Some(expected) = observed_budget_unit(metric)
+                    && limit.unit != expected
+                {
+                    return Err(format!(
+                        "budget metric `{metric}` has unit {}, expected {}",
+                        budget_unit_name(limit.unit),
+                        budget_unit_name(expected),
+                    ));
+                }
+            }
+        }
+        if self.restart_required && self.state_root_policy.is_none() {
+            return Err("restart proof requires --state-root-policy".to_owned());
+        }
+        if self
+            .state_root_policy
+            .as_deref()
+            .is_some_and(|policy| policy != "launch-scoped-clean")
+        {
+            return Err("unsupported state-root proof policy".to_owned());
+        }
+        if self.required_checkpoints.len() > 32 {
+            return Err("required checkpoint count exceeds 32".to_owned());
+        }
+        let mut checkpoint_ids = BTreeSet::new();
+        for checkpoint in &self.required_checkpoints {
+            if !safe_evidence_id(&checkpoint.id) || !checkpoint_ids.insert(checkpoint.id.as_str()) {
+                return Err(format!(
+                    "invalid or duplicate required checkpoint `{}`",
+                    checkpoint.id
+                ));
+            }
+            match &checkpoint.evidence {
+                VerifierCheckpointRequirementKind::ScenarioStep { scenario_step }
+                    if !safe_evidence_id(scenario_step) =>
+                {
+                    return Err(format!(
+                        "checkpoint {} has an invalid scenario step",
+                        checkpoint.id
+                    ));
+                }
+                VerifierCheckpointRequirementKind::ResponsiveLayout {
+                    logical_width,
+                    logical_height,
+                    ..
+                } if !(240..=1_920).contains(logical_width)
+                    || !(320..=2_160).contains(logical_height) =>
+                {
+                    return Err(format!(
+                        "checkpoint {} has an unsupported responsive size",
+                        checkpoint.id
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for checkpoint in &self.required_checkpoints {
+            if let VerifierCheckpointRequirementKind::RestartRestore {
+                baseline_checkpoint,
+            } = &checkpoint.evidence
+            {
+                let valid_baseline = self.required_checkpoints.iter().any(|candidate| {
+                    candidate.id == *baseline_checkpoint
+                        && matches!(
+                            &candidate.evidence,
+                            VerifierCheckpointRequirementKind::ScenarioStep { .. }
+                        )
+                });
+                if !valid_baseline {
+                    return Err(format!(
+                        "restart checkpoint {} must reference a declared scenario checkpoint",
+                        checkpoint.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn is_timed(&self) -> bool {
+        self.harness == HarnessKind::Timed
+    }
+
+    fn example(&self) -> &str {
+        self.example
+            .as_deref()
+            .expect("validated timed profile has an example")
+    }
+
+    fn scenario_checkpoint_steps(&self) -> Vec<&str> {
+        self.required_checkpoints
+            .iter()
+            .filter_map(|checkpoint| match &checkpoint.evidence {
+                VerifierCheckpointRequirementKind::ScenarioStep { scenario_step } => {
+                    Some(scenario_step.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn requires_persistence_exercise(&self) -> bool {
+        self.required_checkpoints.iter().any(|checkpoint| {
+            matches!(
+                checkpoint.evidence,
+                VerifierCheckpointRequirementKind::PersistenceOperation { .. }
+            )
+        })
+    }
+
+    fn requires_migration_exercise(&self) -> bool {
+        self.required_checkpoints.iter().any(|checkpoint| {
+            matches!(
+                checkpoint.evidence,
+                VerifierCheckpointRequirementKind::PersistenceOperation {
+                    operation: VerifierPersistenceOperation::MigrationActivated
+                }
+            )
+        })
+    }
+}
+
+fn safe_evidence_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn validate_optional_samples(
+    label: &str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), String> {
+    if value != 0 && !(minimum..=maximum).contains(&value) {
+        return Err(format!(
+            "{label} samples must be zero or within {minimum}..={maximum}"
+        ));
+    }
+    Ok(())
+}
+
 pub fn run(args: &[String]) -> Result<(), String> {
-    let gate = Gate::parse(required(args, "--gate")?)?;
+    let profile = VerifierProfile::parse(args)?;
     let output = PathBuf::from(required(args, "--evidence-output")?);
     let artifact_dir = PathBuf::from(required(args, "--artifact-dir")?);
     let run_id = required(args, "--run-id")?.to_owned();
@@ -66,15 +451,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
         )
     })?;
 
-    let evidence = if gate.is_timed() {
-        run_native_harness(gate, &run_id, &artifact_dir)
+    let evidence = if profile.is_timed() {
+        run_native_harness(&profile, &run_id, &artifact_dir)
     } else {
-        negative_evidence()
+        negative_evidence(&profile)
     };
     let envelope = ProducerEnvelope {
         format: FORMAT_VERSION,
         protocol: PROTOCOL,
-        gate: gate.slug(),
+        gate: profile.gate.clone(),
         run_id,
         source_digest,
         evidence,
@@ -82,7 +467,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     write_envelope(&output, &envelope)
 }
 
-fn negative_evidence() -> GateEvidence {
+fn negative_evidence(profile: &VerifierProfile) -> GateEvidence {
     let mut invalid = vec![0_u8; 4];
     invalid.copy_from_slice(&(u32::MAX).to_le_bytes());
     #[cfg(target_os = "linux")]
@@ -102,6 +487,7 @@ fn negative_evidence() -> GateEvidence {
             )
         }],
         producer: None,
+        profile: Some(profile_evidence(profile, None)),
         native: None,
         product_ux_timings: Vec::new(),
         async_proof_timing: None,
@@ -109,23 +495,30 @@ fn negative_evidence() -> GateEvidence {
     }
 }
 
-fn run_native_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvidence {
+fn run_native_harness(
+    profile: &VerifierProfile,
+    run_id: &str,
+    artifact_dir: &Path,
+) -> GateEvidence {
     #[cfg(target_os = "linux")]
     {
-        run_linux_harness(gate, run_id, artifact_dir)
+        run_linux_harness(profile, run_id, artifact_dir)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (gate, run_id, artifact_dir);
-        GateEvidence::failed(Check::fail(
-            "native-os-input-harness",
-            "the kernel virtual-input harness is available only on Linux",
-        ))
+        let _ = (run_id, artifact_dir);
+        GateEvidence::failed(
+            profile,
+            Check::fail(
+                "native-os-input-harness",
+                "the kernel virtual-input harness is available only on Linux",
+            ),
+        )
     }
 }
 
 #[cfg(target_os = "linux")]
-fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvidence {
+fn run_linux_harness(profile: &VerifierProfile, run_id: &str, artifact_dir: &Path) -> GateEvidence {
     let mut capture = Capture::default();
     capture.checks.push(product_scheduler_check());
     let workspace = match std::env::current_dir() {
@@ -135,18 +528,20 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
                 "workspace-discovery",
                 format!("cannot read verifier working directory: {error}"),
             ));
-            return capture.into_evidence(gate);
+            return capture.into_evidence(profile);
         }
     };
-    let scratch = match ScratchDir::create(run_id, gate.slug()) {
+    let scratch = match ScratchDir::create(run_id, &profile.gate) {
         Ok(scratch) => scratch,
         Err(error) => {
             capture
                 .checks
                 .push(Check::fail("native-os-input-scratch", error));
-            return capture.into_evidence(gate);
+            return capture.into_evidence(profile);
         }
     };
+    let state_root = scratch.path.join("state");
+    let state_root_clean_at_start = !state_root.exists();
 
     let observer_path = scratch.path.join("observer.sock");
     let mut observer = match ObserverServer::bind(&observer_path) {
@@ -155,7 +550,7 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
             capture
                 .checks
                 .push(Check::fail("verifier-observer-bind", error));
-            return capture.into_evidence(gate);
+            return capture.into_evidence(profile);
         }
     };
     let executable = match std::env::current_exe() {
@@ -165,23 +560,29 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
                 "native-producer-executable",
                 format!("cannot resolve native producer executable: {error}"),
             ));
-            return capture.into_evidence(gate);
+            return capture.into_evidence(profile);
         }
     };
     let mut session = match NativeSession::start(
         &workspace,
         &scratch.path,
         &executable,
-        gate.example_id(),
+        profile.example(),
         &observer_path,
-        artifact_dir,
+        &artifact_dir.join("primary"),
+        profile
+            .state_root_policy
+            .as_ref()
+            .map(|_| state_root.as_path()),
+        profile,
+        NativeSessionPhase::Primary,
     ) {
         Ok(session) => session,
         Err(error) => {
             capture
                 .checks
                 .push(Check::fail("native-os-input-session", error));
-            return capture.into_evidence(gate);
+            return capture.into_evidence(profile);
         }
     };
     capture.checks.push(Check::pass(
@@ -191,12 +592,21 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
             session.isolated_seat_name
         ),
     ));
+    capture.state_root = profile
+        .state_root_policy
+        .as_ref()
+        .map(|_| CapturedStateRoot {
+            path: state_root.clone(),
+            clean_at_start: state_root_clean_at_start,
+            restart_count: 0,
+            restored_after_restart: false,
+        });
     capture.checks.push(Check::pass(
         "regular-cosmic-wayland",
         "preview and dev use ordinary Wayland/app_window callbacks on a launch-scoped COSMIC seat",
     ));
 
-    let roles = match session.wait_for_roles(ROLE_READY_TIMEOUT) {
+    let mut roles = match session.wait_for_roles(ROLE_READY_TIMEOUT) {
         Ok(roles) => {
             capture.checks.push(Check::pass(
                 "native-role-processes",
@@ -214,7 +624,7 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
                 .checks
                 .push(Check::fail("native-role-processes", error));
             capture.checks.push(cleanup_check(session.shutdown()));
-            return capture.into_evidence(gate);
+            return capture.into_evidence(profile);
         }
     };
 
@@ -223,29 +633,41 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
             .checks
             .push(Check::fail("isolated-cosmic-workspace", error));
         capture.checks.push(cleanup_check(session.shutdown()));
-        return capture.into_evidence(gate);
+        return capture.into_evidence(profile);
     }
     capture.checks.push(Check::pass(
         "isolated-cosmic-workspace",
         "the bounded test workspace remained inactive while launch-scoped input targeted it",
     ));
+    match session.launch_isolation_evidence() {
+        Ok(evidence) => capture.launch_isolation.push(evidence),
+        Err(error) => capture
+            .checks
+            .push(Check::fail("structured-launch-isolation", error)),
+    }
 
     let exercise = exercise_native_roles(
-        gate,
+        profile,
         &mut session,
         &mut observer,
         &mut capture.events,
         &mut capture.samples,
     );
-    match exercise {
-        Ok(()) => capture.checks.push(Check::pass(
-            "real-native-scenario",
-            "kernel virtual devices clicked dev TEST, exercised preview input, and completed bounded samples through COSMIC",
-        )),
-        Err(error) => capture
-            .checks
-            .push(Check::fail("real-native-scenario", error)),
-    }
+    let exercise_succeeded = match exercise {
+        Ok(()) => {
+            capture.checks.push(Check::pass(
+                "real-native-scenario",
+                "kernel virtual devices clicked dev TEST, exercised preview input, and completed bounded samples through COSMIC",
+            ));
+            true
+        }
+        Err(error) => {
+            capture
+                .checks
+                .push(Check::fail("real-native-scenario", error));
+            false
+        }
+    };
 
     drain_events(
         &mut observer,
@@ -271,14 +693,269 @@ fn run_linux_harness(gate: Gate, run_id: &str, artifact_dir: &Path) -> GateEvide
             ),
         ));
     }
+    if exercise_succeeded && profile.restart_required {
+        let baseline = restart_baseline_digest(profile, &capture.events);
+        let primary_shutdown = session.shutdown();
+        match (baseline, primary_shutdown) {
+            (Ok(baseline), Ok(())) => match run_restart_phase(
+                &workspace,
+                &scratch.path,
+                &executable,
+                profile,
+                &observer_path,
+                &artifact_dir.join("restart"),
+                &state_root,
+                &mut observer,
+                &mut capture.events,
+                &baseline,
+            ) {
+                Ok((restart_session, restart_roles)) => {
+                    session = restart_session;
+                    roles = restart_roles;
+                    match session.launch_isolation_evidence() {
+                        Ok(evidence) => capture.launch_isolation.push(evidence),
+                        Err(error) => capture
+                            .checks
+                            .push(Check::fail("structured-restart-isolation", error)),
+                    }
+                    if let Some(state_root) = capture.state_root.as_mut() {
+                        state_root.restart_count = state_root.restart_count.saturating_add(1);
+                        state_root.restored_after_restart = true;
+                    }
+                    capture.checks.push(Check::pass(
+                        "native-restart-restore",
+                        "a second native process restored the exact acknowledged authority before its first product frame",
+                    ));
+                }
+                Err(error) => capture
+                    .checks
+                    .push(Check::fail("native-restart-restore", error)),
+            },
+            (Err(error), _) => capture
+                .checks
+                .push(Check::fail("native-restart-restore", error)),
+            (_, Err(error)) => capture.checks.push(Check::fail(
+                "native-restart-restore",
+                format!("primary native process did not shut down cleanly: {error}"),
+            )),
+        }
+    }
     capture.checks.push(cleanup_check(session.shutdown()));
     drain_events(
         &mut observer,
         &mut capture.events,
         Duration::from_millis(100),
     );
-    capture.finalize_checks(gate, roles);
-    capture.into_evidence(gate)
+    capture.finalize_checks(profile, roles);
+    capture.into_evidence(profile)
+}
+
+#[cfg(target_os = "linux")]
+fn restart_baseline_digest(
+    profile: &VerifierProfile,
+    events: &[ObserverEvent],
+) -> Result<String, String> {
+    let baseline_checkpoint = profile
+        .required_checkpoints
+        .iter()
+        .find_map(|checkpoint| match &checkpoint.evidence {
+            VerifierCheckpointRequirementKind::RestartRestore {
+                baseline_checkpoint,
+            } => Some(baseline_checkpoint.as_str()),
+            _ => None,
+        })
+        .ok_or("restart profile has no restart-restore checkpoint")?;
+    let baseline_step = profile
+        .required_checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == baseline_checkpoint)
+        .and_then(|checkpoint| match &checkpoint.evidence {
+            VerifierCheckpointRequirementKind::ScenarioStep { scenario_step } => {
+                Some(scenario_step.as_str())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "restart baseline checkpoint `{baseline_checkpoint}` is not a scenario checkpoint"
+            )
+        })?;
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ObserverEvent::ScenarioCheckpoint {
+                step_id,
+                durable_turn_sequence,
+                state_digest,
+                ..
+            } if step_id == baseline_step && *durable_turn_sequence > 0 => {
+                Some(state_digest.clone())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "restart baseline scenario `{baseline_step}` has no acknowledged state checkpoint"
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_restart_phase(
+    workspace: &Path,
+    runtime_dir: &Path,
+    executable: &Path,
+    profile: &VerifierProfile,
+    observer_path: &Path,
+    artifact_dir: &Path,
+    state_root: &Path,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    baseline_digest: &str,
+) -> Result<(NativeSession, RolePids), String> {
+    let start = events.len();
+    let mut session = NativeSession::start(
+        workspace,
+        runtime_dir,
+        executable,
+        profile.example(),
+        observer_path,
+        artifact_dir,
+        Some(state_root),
+        profile,
+        NativeSessionPhase::Restart,
+    )?;
+    let result = (|| {
+        let roles = session.wait_for_roles(ROLE_READY_TIMEOUT)?;
+        session.prepare_background_workspace(executable)?;
+        let mounted = wait_for_value(
+            observer,
+            events,
+            EVENT_TIMEOUT,
+            start,
+            |event| match event {
+                ObserverEvent::StateMounted {
+                    disposition,
+                    schema_version,
+                    schema_hash,
+                    migration,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    state_digest,
+                    key,
+                } => Some(Ok((
+                    *disposition,
+                    *schema_version,
+                    schema_hash.clone(),
+                    migration.is_some(),
+                    *source_revision,
+                    *runtime_sequence,
+                    *durable_epoch,
+                    *durable_turn_sequence,
+                    state_digest.clone(),
+                    key.clone(),
+                ))),
+                ObserverEvent::SourceFailed {
+                    revision,
+                    stage,
+                    message,
+                } => Some(Err(format!(
+                    "source revision {revision} failed during {stage}: {message}"
+                ))),
+                _ => None,
+            },
+        )??;
+        if mounted.0 != StartupDisposition::Restored
+            || mounted.1 == 0
+            || mounted.2.len() != 64
+            || mounted.3
+            || mounted.4 == 0
+            || mounted.5 == 0
+            || mounted.6 == 0
+            || mounted.7 == 0
+            || mounted.8 != baseline_digest
+            || !mounted.9.is_complete()
+            || !frame_key_matches_session(events, &mounted.9, &session, ObserverRole::Preview)
+        {
+            return Err(format!(
+                "restart mount did not restore the exact baseline: disposition={:?}, schema_version={}, schema_hash={}, migration={}, source_revision={}, runtime_sequence={}, durable_epoch={}, durable_turn={}, digest={}, expected={baseline_digest}",
+                mounted.0,
+                mounted.1,
+                mounted.2,
+                mounted.3,
+                mounted.4,
+                mounted.5,
+                mounted.6,
+                mounted.7,
+                mounted.8,
+            ));
+        }
+        if profile.requires_migration_exercise() {
+            let migration =
+                wait_for_value(
+                    observer,
+                    events,
+                    EVENT_TIMEOUT,
+                    start,
+                    |event| match event {
+                        ObserverEvent::PersistenceEvidence {
+                            kind: PersistenceEvidenceKind::MigrationActivated,
+                            durable_epoch,
+                            durable_turn_sequence,
+                            before_state_digest,
+                            after_state_digest,
+                            key,
+                            ..
+                        } => Some((
+                            *durable_epoch,
+                            *durable_turn_sequence,
+                            before_state_digest.clone(),
+                            after_state_digest.clone(),
+                            key.clone(),
+                        )),
+                        _ => None,
+                    },
+                )?;
+            if migration.0 == 0
+                || migration.1 == 0
+                || migration.2 != baseline_digest
+                || migration.3 == migration.2
+                || !migration.4.is_complete()
+                || !frame_key_matches_session(events, &migration.4, &session, ObserverRole::Preview)
+            {
+                return Err(
+                    "restart process did not activate a durable, frame-linked schema migration"
+                        .to_owned(),
+                );
+            }
+        }
+        wait_for_evidence_proofs(observer, events)
+            .map_err(|error| format!("restart proof lane did not drain: {error}"))?;
+        if exact_proof_for_key(events, &mounted.9).is_none() {
+            return Err("restart mount has no exact app-owned WGPU proof".to_owned());
+        }
+        if !process_exists(session.desktop_id())
+            || !process_exists(roles.preview)
+            || !process_exists(roles.dev)
+        {
+            return Err("a restarted native role exited before evidence completed".to_owned());
+        }
+        Ok(roles)
+    })();
+    match result {
+        Ok(roles) => Ok((session, roles)),
+        Err(error) => {
+            let cleanup = session.shutdown();
+            Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; restart cleanup failed: {cleanup}"),
+            })
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -295,7 +972,7 @@ fn product_scheduler_check() -> Check {
 
 #[cfg(target_os = "linux")]
 fn exercise_native_roles(
-    gate: Gate,
+    profile: &VerifierProfile,
     session: &mut NativeSession,
     observer: &mut ObserverServer,
     events: &mut Vec<ObserverEvent>,
@@ -422,6 +1099,7 @@ fn exercise_native_roles(
                 passed: false,
                 completed_steps,
                 message,
+                ..
             } => Some(Err(format!(
                 "preview TEST request {request_id} failed after {completed_steps} steps: {message}"
             ))),
@@ -446,11 +1124,15 @@ fn exercise_native_roles(
                 ObserverEvent::TestCompleted {
                     request_id,
                     passed,
+                    semantic_assertions_proven,
                     completed_steps,
                     message,
-                } if *request_id == test_target.0 => {
-                    Some((*passed, *completed_steps, message.clone()))
-                }
+                } if *request_id == test_target.0 => Some((
+                    *passed,
+                    *semantic_assertions_proven,
+                    *completed_steps,
+                    message.clone(),
+                )),
                 _ => None,
             },
         )
@@ -458,10 +1140,31 @@ fn exercise_native_roles(
     if !completion.0 {
         return Err(format!(
             "preview TEST failed after {} steps: {}",
-            completion.1, completion.2
+            completion.2, completion.3
+        ));
+    }
+    if !completion.1 {
+        return Err(format!(
+            "preview TEST completed {} host-input steps without proving semantic assertions: {}",
+            completion.2, completion.3
         ));
     }
     drain_events(observer, events, Duration::from_millis(250));
+    wait_for_evidence_proofs(observer, events)
+        .map_err(|error| format!("checkpoint proof lane did not drain: {error}"))?;
+
+    if !profile.required_budget_metrics.is_empty() {
+        drive_product_profile_benchmark(
+            profile,
+            session,
+            observer,
+            events,
+            preview_placement,
+            before_test,
+        )?;
+        wait_for_evidence_proofs(observer, events)
+            .map_err(|error| format!("profile proof lane did not drain: {error}"))?;
+    }
 
     let preview_candidates =
         translated_target_candidates(preview_placement, test_target.3, test_target.4);
@@ -474,7 +1177,7 @@ fn exercise_native_roles(
         (test_target.3, test_target.4),
         preview_candidates,
     )?;
-    let off_target = if gate == Gate::CounterDev {
+    let off_target = if profile.visible_mode == VisibleSampleMode::Click {
         None
     } else {
         Some(locate_different_preview_target(
@@ -482,50 +1185,89 @@ fn exercise_native_roles(
             observer,
             events,
             &test_target.1,
-            (gate == Gate::Cells).then_some(test_target.2.as_str()),
+            (profile.alternate_target == AlternateTarget::SameSource)
+                .then_some(test_target.2.as_str()),
             preview_point,
             preview_placement.origin,
         )?)
     };
-    for ordinal in 0..NORMAL_VISIBLE_SAMPLE_COUNT {
-        let sequence = if gate == Gate::CounterDev {
-            drive_click_sample(session, observer, events, preview_point, &test_target.1)
-        } else {
-            let point = if ordinal % 2 == 0 {
-                preview_point
-            } else {
-                off_target.as_ref().expect("non-Counter hover target").0
-            };
-            drive_visible_sample(
-                session,
-                observer,
-                events,
-                point,
-                InputKind::PointerMove,
-                |input| {
-                    if ordinal % 2 == 0 {
-                        input.target.as_deref() == Some(test_target.1.as_str())
-                    } else {
-                        input.target.as_deref()
-                            == off_target
-                                .as_ref()
-                                .expect("non-Counter hover target")
-                                .1
-                                .as_deref()
-                    }
-                },
-            )
+    let mut proof_prelude = VecDeque::with_capacity(11);
+    let mut driven_ordinal = 0usize;
+    loop {
+        if driven_ordinal >= 160 {
+            return Err(
+                "product proof was not requested within 160 bounded interactions".to_owned(),
+            );
         }
-        .map_err(|error| format!("preview sample {ordinal} failed: {error}"))?;
+        let sequence = drive_profile_visible_sample(
+            profile,
+            session,
+            observer,
+            events,
+            preview_point,
+            &test_target.1,
+            off_target.as_ref(),
+            driven_ordinal,
+        )
+        .map_err(|error| format!("preview proof prelude {driven_ordinal} failed: {error}"))?;
+        driven_ordinal += 1;
+        if proof_prelude.len() == 11 {
+            proof_prelude.pop_front();
+        }
+        proof_prelude.push_back(sequence);
+        drain_events(observer, events, Duration::from_millis(1));
+        let Some(key) = presented_key_for_sequence(events, sequence) else {
+            return Err(format!(
+                "preview proof prelude sequence {sequence} has no presented frame"
+            ));
+        };
+        if events.iter().any(
+            |event| matches!(event, ObserverEvent::ProofRequested { key: requested, .. } if requested == &key),
+        ) {
+            if proof_prelude.len() < 11 {
+                return Err(
+                    "product proof was consumed before eleven warm interactions were available"
+                        .to_owned(),
+                );
+            }
+            wait_for_event(observer, events, EVENT_TIMEOUT, 0, |event| {
+                matches!(event, ObserverEvent::ProofCompleted {
+                    key: completed,
+                    artifact: Some(_),
+                    error: None,
+                    ..
+                } if completed == &key)
+            })
+            .map_err(|error| format!("product-frame proof did not complete: {error}"))?;
+            if exact_proof_for_key(events, &key).is_none() {
+                return Err("product-frame proof lacks exact presented-frame evidence".to_owned());
+            }
+            break;
+        }
+    }
+    samples.visible.extend(proof_prelude);
+    for sample_ordinal in 11..profile.visible_samples {
+        let sequence = drive_profile_visible_sample(
+            profile,
+            session,
+            observer,
+            events,
+            preview_point,
+            &test_target.1,
+            off_target.as_ref(),
+            driven_ordinal,
+        )
+        .map_err(|error| format!("preview sample {sample_ordinal} failed: {error}"))?;
+        driven_ordinal += 1;
         samples.visible.insert(sequence);
     }
-    if samples.visible.len() < NORMAL_VISIBLE_SAMPLE_COUNT {
+    if samples.visible.len() < profile.visible_samples {
         return Err("serialized preview interaction samples were not retained".to_owned());
     }
 
-    if gate == Gate::Cells {
-        let alternate = off_target.as_ref().expect("Cells alternate target");
-        for ordinal in 0..24 {
+    if profile.selection_samples > 0 {
+        let alternate = off_target.as_ref().expect("selection alternate target");
+        for ordinal in 0..profile.selection_samples {
             let (point, node) = if ordinal % 2 == 0 {
                 (preview_point, test_target.1.as_str())
             } else {
@@ -534,58 +1276,110 @@ fn exercise_native_roles(
                     alternate
                         .1
                         .as_deref()
-                        .expect("Cells alternate has a same-route target"),
+                        .ok_or("selection alternate has no observed target")?,
                 )
             };
             let sequence = drive_click_sample(session, observer, events, point, node)
-                .map_err(|error| format!("Cells selection sample {ordinal} failed: {error}"))?;
+                .map_err(|error| format!("selection sample {ordinal} failed: {error}"))?;
             samples.visible.insert(sequence);
             samples.clicks.insert(sequence);
         }
     }
 
-    if gate == Gate::Cells {
-        let move_start = events.len();
-        session.run_driver(&[
-            "move",
-            &preview_point.0.to_string(),
-            &preview_point.1.to_string(),
-        ])?;
-        wait_for_visible_present(
-            observer,
-            events,
-            move_start,
-            InputKind::PointerMove,
-            |input| input.target.as_deref() == Some(test_target.1.as_str()),
-        )
-        .map_err(|error| {
+    if profile.scroll_samples > 0 {
+        let discovery_start = events.len();
+        let mut candidates = Vec::new();
+        if let Some(alternate) = off_target.as_ref() {
+            candidates.push(alternate.0);
+        }
+        candidates.extend([
+            preview_point,
+            (
+                preview_placement.origin.0 + 24,
+                preview_placement.origin.1 + 120,
+            ),
+            (
+                preview_placement.origin.0 + 760,
+                preview_placement.origin.1 + 120,
+            ),
+        ]);
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut selected = None;
+        for point in candidates {
+            let move_start = events.len();
+            session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
+            if wait_for_event(
+                observer,
+                events,
+                Duration::from_secs(2),
+                move_start,
+                |event| {
+                    matches!(event, ObserverEvent::InputAccepted(input)
+                        if input.role == ObserverRole::Preview
+                            && input.real_os
+                            && input.kind == InputKind::PointerMove)
+                },
+            )
+            .is_err()
+            {
+                continue;
+            }
+            for amount in [4_i32, -4_i32] {
+                if let Some(sequence) = drive_wheel_attempt(session, observer, events, amount)? {
+                    selected = Some((point, -amount, sequence));
+                    break;
+                }
+            }
+            if selected.is_some() {
+                break;
+            }
+        }
+        let (_scroll_point, mut amount, first_sequence) = selected.ok_or_else(|| {
             format!(
-                "preview scroll target was not entered: {error}; observed={}",
-                input_event_trace(events, move_start, 8)
+                "no real preview point exposed visible vertical scrolling; observed={}",
+                input_event_trace(events, discovery_start, 16)
             )
         })?;
-        for ordinal in 0..148 {
-            let amount = if ordinal % 2 == 0 { "-4" } else { "4" };
-            let start = events.len();
-            session.run_driver(&["axis", "vertical", amount])?;
-            let sequence =
-                wait_for_visible_present(observer, events, start, InputKind::Wheel, |_| true)
-                    .map_err(|error| {
-                        format!(
-                            "scroll sample {ordinal} failed: {error}; observed={}",
-                            input_event_trace(events, start, 8)
-                        )
-                    })?;
+        samples.scroll.insert(first_sequence);
+        for ordinal in 1..profile.scroll_samples {
+            let sample_start = events.len();
+            let mut visible_sequence = None;
+            for _ in 0..2 {
+                if let Some(sequence) = drive_wheel_attempt(session, observer, events, amount)? {
+                    visible_sequence = Some(sequence);
+                    break;
+                }
+                amount = -amount;
+            }
+            let sequence = visible_sequence.ok_or_else(|| {
+                format!(
+                    "scroll sample {ordinal} changed no visible scroll state in either direction; observed={}",
+                    input_event_trace(events, sample_start, 8)
+                )
+            })?;
             samples.scroll.insert(sequence);
+            amount = -amount;
         }
-        if samples.scroll.len() < 148 {
+        if samples.scroll.len() < profile.scroll_samples {
             return Err("serialized preview scroll samples were not retained".to_owned());
         }
     }
 
-    if gate == Gate::CounterDev {
+    if profile.required_checkpoints.iter().any(|checkpoint| {
+        matches!(
+            checkpoint.evidence,
+            VerifierCheckpointRequirementKind::ResponsiveLayout { .. }
+        )
+    }) {
+        drive_responsive_resize(session, observer, events, &mut placements, before_test)?;
+        wait_for_evidence_proofs(observer, events)
+            .map_err(|error| format!("responsive proof lane did not drain: {error}"))?;
+    }
+
+    if profile.switch_samples > 0 {
         let mut revision = maximum_switch_revision(events);
-        for ordinal in 0..23 {
+        for ordinal in 0..profile.switch_samples {
             session.reconcile_background_layout()?;
             dev_placement = activate_window(
                 session,
@@ -626,7 +1420,7 @@ fn exercise_native_roles(
             )
             .map_err(|error| {
                 format!(
-                    "Counter source switch {ordinal} did not finish: {error}; observed={}",
+                    "source switch {ordinal} did not finish: {error}; observed={}",
                     input_event_trace(events, start, 12)
                 )
             })?;
@@ -645,6 +1439,438 @@ fn exercise_native_roles(
     })
     .map_err(|error| format!("final app-owned proof did not complete: {error}"))?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn drive_product_profile_benchmark(
+    profile: &VerifierProfile,
+    session: &mut NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    preview_placement: WindowPlacement,
+    start: usize,
+) -> Result<(), String> {
+    let target = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        start,
+        |event| match event {
+            ObserverEvent::ProfileInputTarget {
+                node,
+                source_path,
+                x,
+                y,
+                sample_count,
+                key,
+            } => Some((
+                node.clone(),
+                source_path.clone(),
+                *x,
+                *y,
+                *sample_count,
+                key.clone(),
+            )),
+            _ => None,
+        },
+    )
+    .map_err(|error| format!("profile input target was not published: {error}"))?;
+    if target.4 != 120
+        || !frame_key_matches_session(events, &target.5, session, ObserverRole::Preview)
+    {
+        return Err(
+            "profile target did not carry the declared count and exact primary preview identity"
+                .to_owned(),
+        );
+    }
+    let seed = profile_seed_text(profile, &target.1)?;
+    let point = locate_target(
+        session,
+        observer,
+        events,
+        ObserverRole::Preview,
+        &target.0,
+        (target.2, target.3),
+        translated_target_candidates(preview_placement, target.2, target.3),
+    )?;
+    session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
+    session.run_driver(&["click", "left"])?;
+    session.run_driver(&["chord", "ctrl", "a"])?;
+
+    let seed_start = events.len();
+    session.run_driver(&["text", &seed])?;
+    let seeded = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        seed_start,
+        |event| match event {
+            ObserverEvent::ProfileInputSeeded {
+                input_sequence,
+                callback_to_host_ns,
+                compile_us,
+                pending_child_artifacts,
+                editor_key,
+                key,
+            } => Some((
+                *input_sequence,
+                *callback_to_host_ns,
+                *compile_us,
+                *pending_child_artifacts,
+                editor_key.clone(),
+                key.clone(),
+            )),
+            _ => None,
+        },
+    )
+    .map_err(|error| format!("profile seed edit did not complete: {error}"))?;
+    require_exact_profile_frame_chain(events, session, seeded.0, seeded.1, &seeded.4, &seeded.5)?;
+
+    for expected_ordinal in 1..=120_u32 {
+        let sample_start = events.len();
+        session.run_driver(&["text", " "])?;
+        let sample =
+            wait_for_value(
+                observer,
+                events,
+                EVENT_TIMEOUT,
+                sample_start,
+                |event| match event {
+                    ObserverEvent::ProfileSample {
+                        ordinal,
+                        input_sequence,
+                        callback_to_host_ns,
+                        editor_key,
+                        key,
+                        ..
+                    } if *ordinal == expected_ordinal => Some((
+                        *input_sequence,
+                        *callback_to_host_ns,
+                        editor_key.clone(),
+                        key.clone(),
+                    )),
+                    _ => None,
+                },
+            )
+            .map_err(|error| {
+                format!("profile text sample {expected_ordinal} did not complete: {error}")
+            })?;
+        require_exact_profile_frame_chain(
+            events, session, sample.0, sample.1, &sample.2, &sample.3,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn profile_seed_text(profile: &VerifierProfile, source_path: &str) -> Result<String, String> {
+    let scenario_path = profile
+        .scenario_proof
+        .as_deref()
+        .ok_or("profile benchmark has no scenario proof")?;
+    let scenario = boon_runtime::parse_scenario(&resolve_profile_input(scenario_path))
+        .map_err(|error| format!("load profile benchmark scenario: {error}"))?;
+    let steps = profile
+        .profile_benchmark_steps
+        .iter()
+        .map(|id| {
+            scenario
+                .steps
+                .iter()
+                .find(|step| step.id == *id)
+                .ok_or_else(|| format!("profile benchmark step `{id}` is absent"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if steps.len() != 2
+        || steps.iter().any(|step| {
+            step.user_action_kind.as_deref() != Some("type_text")
+                || step
+                    .source_event
+                    .as_ref()
+                    .is_none_or(|event| event.source != source_path)
+        })
+    {
+        return Err(
+            "profile benchmark steps do not identify two text edits for the published source"
+                .to_owned(),
+        );
+    }
+    let seed = steps[0]
+        .user_action_text
+        .clone()
+        .ok_or("profile benchmark seed has no text")?;
+    if seed.is_empty()
+        || seed.len() > crate::native_input::ASCII_TEXT_BATCH_MAX_BYTES
+        || !seed.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+    {
+        return Err("profile benchmark seed is not bounded printable ASCII".to_owned());
+    }
+    Ok(seed)
+}
+
+#[cfg(target_os = "linux")]
+fn require_exact_profile_frame_chain(
+    events: &[ObserverEvent],
+    session: &NativeSession,
+    input_sequence: u64,
+    callback_to_host_ns: u64,
+    editor_key: &FrameEvidenceKey,
+    child_key: &FrameEvidenceKey,
+) -> Result<(), String> {
+    let exact = profile_frame_chain_is_exact(
+        events,
+        input_sequence,
+        callback_to_host_ns,
+        editor_key,
+        child_key,
+    ) && frame_key_matches_session(events, editor_key, session, ObserverRole::Preview)
+        && frame_key_matches_session(events, child_key, session, ObserverRole::Preview);
+    if exact {
+        Ok(())
+    } else {
+        Err(
+            "profile sample did not bind one real text callback to exact editor and child frames"
+                .to_owned(),
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn profile_frame_chain_is_exact(
+    events: &[ObserverEvent],
+    input_sequence: u64,
+    callback_to_host_ns: u64,
+    editor_key: &FrameEvidenceKey,
+    child_key: &FrameEvidenceKey,
+) -> bool {
+    let input = events.iter().find_map(|event| match event {
+        ObserverEvent::InputAccepted(input)
+            if input.role == ObserverRole::Preview
+                && input.real_os
+                && input.kind == InputKind::Text
+                && input.event_sequence == input_sequence =>
+        {
+            Some(input)
+        }
+        _ => None,
+    });
+    let editor = events.iter().any(|event| {
+        matches!(event, ObserverEvent::FramePresented(frame)
+            if frame.role == ObserverRole::Preview
+                && frame.key == *editor_key
+                && frame.event_sequence == Some(input_sequence)
+                && frame.input_kind == Some(InputKind::Text))
+    });
+    let child = events.iter().any(|event| {
+        matches!(event, ObserverEvent::FramePresented(frame)
+            if frame.role == ObserverRole::Preview && frame.key == *child_key)
+    });
+    input.is_some_and(|input| {
+        input.callback_to_host_ns == callback_to_host_ns
+            && input.surface_epoch == editor_key.surface_epoch
+    }) && editor
+        && child
+        && editor_key.same_producer_surface(child_key)
+        && child_key.frame_id > editor_key.frame_id
+        && frame_key_matches_metadata(events, editor_key, ObserverRole::Preview)
+        && frame_key_matches_metadata(events, child_key, ObserverRole::Preview)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct RoleRectangle {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[cfg(target_os = "linux")]
+fn drive_responsive_resize(
+    session: &mut NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    placements: &mut BTreeMap<ObserverRole, WindowPlacement>,
+    start: usize,
+) -> Result<(), String> {
+    let ready = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        start,
+        |event| match event {
+            ObserverEvent::ResponsiveResizeReady {
+                desired_width,
+                desired_height,
+                current_width,
+                current_height,
+                key,
+            } => Some((
+                *desired_width,
+                *desired_height,
+                *current_width,
+                *current_height,
+                key.clone(),
+            )),
+            _ => None,
+        },
+    )
+    .map_err(|error| format!("responsive resize target was not published: {error}"))?;
+    if !frame_key_matches_session(events, &ready.4, session, ObserverRole::Preview) {
+        return Err(
+            "responsive resize target has the wrong preview process or session identity".to_owned(),
+        );
+    }
+    if (ready.0, ready.1) == (ready.2, ready.3) {
+        return Err("responsive checkpoint requires a real native size transition".to_owned());
+    }
+
+    let preview_placement =
+        activate_window(session, observer, events, placements, ObserverRole::Preview)?;
+    let dev_placement = activate_window(session, observer, events, placements, ObserverRole::Dev)?;
+    let dev_metadata = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ObserverEvent::RoleMetadata(metadata)
+                if metadata.role == ObserverRole::Dev
+                    && metadata.session_id == session.session_id =>
+            {
+                Some(metadata)
+            }
+            _ => None,
+        })
+        .ok_or("responsive divider proof has no exact dev role metadata")?;
+    let preview = RoleRectangle {
+        x: preview_placement.origin.0,
+        y: preview_placement.origin.1,
+        width: i32::try_from(ready.2).map_err(|_| "preview width is out of range")?,
+        height: i32::try_from(ready.3).map_err(|_| "preview height is out of range")?,
+    };
+    let dev = RoleRectangle {
+        x: dev_placement.origin.0,
+        y: dev_placement.origin.1,
+        width: dev_metadata.logical_width.round() as i32,
+        height: dev_metadata.logical_height.round() as i32,
+    };
+    let (from, to) = divider_drag_points(preview, dev, ready.0, ready.1)?;
+    session.run_driver(&["move", &from.0.to_string(), &from.1.to_string()])?;
+    session.run_driver(&["button", "down", "left"])?;
+    let drag = session.run_driver(&["move", &to.0.to_string(), &to.1.to_string()]);
+    let release = session.run_driver(&["button", "up", "left"]);
+    drag?;
+    release?;
+
+    let observed = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        start,
+        |event| match event {
+            ObserverEvent::ResponsiveResizeObserved {
+                event_sequence,
+                logical_width,
+                logical_height,
+                previous_surface_epoch,
+                key,
+            } if (*logical_width, *logical_height) == (ready.0, ready.1) => {
+                Some((*event_sequence, *previous_surface_epoch, key.clone()))
+            }
+            _ => None,
+        },
+    )
+    .map_err(|error| format!("native divider drag did not reach the declared size: {error}"))?;
+    let exact_resize = observed.2.surface_epoch > observed.1
+        && frame_key_matches_session(events, &observed.2, session, ObserverRole::Preview)
+        && events.iter().any(|event| {
+            matches!(event, ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Preview
+                    && input.real_os
+                    && input.kind == InputKind::Resize
+                    && input.event_sequence == observed.0
+                    && input.surface_epoch == observed.2.surface_epoch)
+        })
+        && events.iter().any(|event| {
+            matches!(event, ObserverEvent::FramePresented(frame)
+                if frame.role == ObserverRole::Preview
+                    && frame.event_sequence == Some(observed.0)
+                    && frame.key == observed.2)
+        })
+        && events.iter().any(|event| {
+            matches!(event, ObserverEvent::ResponsiveLayoutEvidence {
+                resize_sequence,
+                logical_width,
+                logical_height,
+                key,
+                ..
+            } if *resize_sequence == observed.0
+                && (*logical_width, *logical_height) == (ready.0, ready.1)
+                && key == &observed.2)
+        });
+    if !exact_resize {
+        return Err(
+            "responsive checkpoint is not bound to one exact native Resize frame".to_owned(),
+        );
+    }
+    let status = query_isolation_status(&session.launch_id)?;
+    status.require_safe(&session.isolated_seat_name)?;
+    status.require_layout(session.observed_roles.len())?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn divider_drag_points(
+    preview: RoleRectangle,
+    dev: RoleRectangle,
+    desired_width: u32,
+    desired_height: u32,
+) -> Result<((i32, i32), (i32, i32)), String> {
+    let desired_width =
+        i32::try_from(desired_width).map_err(|_| "desired width is out of range")?;
+    let desired_height =
+        i32::try_from(desired_height).map_err(|_| "desired height is out of range")?;
+    let overlap_midpoint =
+        |first_start: i32, first_len: i32, second_start: i32, second_len: i32| {
+            let start = first_start.max(second_start);
+            let end = first_start
+                .saturating_add(first_len)
+                .min(second_start.saturating_add(second_len));
+            (end > start).then_some(start.saturating_add((end - start) / 2))
+        };
+    let gap_tolerance = 48;
+    let preview_right = preview.x.saturating_add(preview.width);
+    let dev_right = dev.x.saturating_add(dev.width);
+    if desired_height == preview.height
+        && (preview_right - dev.x).abs() <= gap_tolerance
+        && let Some(y) = overlap_midpoint(preview.y, preview.height, dev.y, dev.height)
+    {
+        let from = ((preview_right + dev.x) / 2, y);
+        return Ok((from, (from.0 + desired_width - preview.width, y)));
+    }
+    if desired_height == preview.height
+        && (dev_right - preview.x).abs() <= gap_tolerance
+        && let Some(y) = overlap_midpoint(preview.y, preview.height, dev.y, dev.height)
+    {
+        let from = ((dev_right + preview.x) / 2, y);
+        return Ok((from, (from.0 + preview.width - desired_width, y)));
+    }
+    let preview_bottom = preview.y.saturating_add(preview.height);
+    let dev_bottom = dev.y.saturating_add(dev.height);
+    if desired_width == preview.width
+        && (preview_bottom - dev.y).abs() <= gap_tolerance
+        && let Some(x) = overlap_midpoint(preview.x, preview.width, dev.x, dev.width)
+    {
+        let from = (x, (preview_bottom + dev.y) / 2);
+        return Ok((from, (x, from.1 + desired_height - preview.height)));
+    }
+    if desired_width == preview.width
+        && (dev_bottom - preview.y).abs() <= gap_tolerance
+        && let Some(x) = overlap_midpoint(preview.x, preview.width, dev.x, dev.width)
+    {
+        let from = (x, (dev_bottom + preview.y) / 2);
+        return Ok((from, (x, from.1 + preview.height - desired_height)));
+    }
+    Err("declared responsive size cannot be reached through the proven tiled divider".to_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -686,6 +1912,84 @@ fn drive_click_sample(
     session.run_driver(&["click", "left"])?;
     wait_for_visible_present(observer, events, start, InputKind::PointerButton, |input| {
         input.target.as_deref() == Some(target) && input.pointer_button_pressed == Some(false)
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn drive_profile_visible_sample(
+    profile: &VerifierProfile,
+    session: &mut NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    preview_point: (i32, i32),
+    preview_target: &str,
+    off_target: Option<&((i32, i32), Option<String>)>,
+    ordinal: usize,
+) -> Result<u64, String> {
+    if profile.visible_mode == VisibleSampleMode::Click {
+        return drive_click_sample(session, observer, events, preview_point, preview_target);
+    }
+    let alternate = off_target.ok_or("hover profile has no alternate target")?;
+    let (point, expected) = if ordinal % 2 == 0 {
+        (preview_point, Some(preview_target))
+    } else {
+        (alternate.0, alternate.1.as_deref())
+    };
+    drive_visible_sample(
+        session,
+        observer,
+        events,
+        point,
+        InputKind::PointerMove,
+        |input| input.target.as_deref() == expected,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn presented_key_for_sequence(events: &[ObserverEvent], sequence: u64) -> Option<FrameEvidenceKey> {
+    events.iter().rev().find_map(|event| match event {
+        ObserverEvent::FramePresented(frame)
+            if frame.role == ObserverRole::Preview && frame.event_sequence == Some(sequence) =>
+        {
+            Some(frame.key.clone())
+        }
+        _ => None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_evidence_proofs(
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+) -> Result<(), String> {
+    let evidence_keys = events
+        .iter()
+        .filter_map(|event| match event {
+            ObserverEvent::StateMounted { key, .. }
+            | ObserverEvent::ScenarioCheckpoint { key, .. }
+            | ObserverEvent::PersistenceEvidence { key, .. }
+            | ObserverEvent::ResponsiveLayoutEvidence { key, .. }
+            | ObserverEvent::StaleProgramRejected { key, .. }
+            | ObserverEvent::ScrollProofFrame { key, .. } => Some(key.clone()),
+            ObserverEvent::ProfileSample {
+                ordinal: 11, key, ..
+            } => Some(key.clone()),
+            _ => None,
+        })
+        .fold(Vec::<FrameEvidenceKey>::new(), |mut keys, key| {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+            keys
+        });
+    if evidence_keys.is_empty() {
+        return Ok(());
+    }
+    wait_for_count(observer, events, Duration::from_secs(60), |events| {
+        evidence_keys
+            .iter()
+            .all(|key| exact_proof_for_key(events, key).is_some())
     })
 }
 
@@ -738,6 +2042,43 @@ fn wait_for_visible_present(
     })
     .map_err(|error| format!("accepted input {sequence} was not presented: {error}"))?;
     Ok(sequence)
+}
+
+#[cfg(target_os = "linux")]
+fn drive_wheel_attempt(
+    session: &mut NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    amount: i32,
+) -> Result<Option<u64>, String> {
+    let start = events.len();
+    session.run_driver(&["axis", "vertical", &amount.to_string()])?;
+    let accepted =
+        wait_for_value(
+            observer,
+            events,
+            Duration::from_secs(2),
+            start,
+            |event| match event {
+                ObserverEvent::InputAccepted(input)
+                    if input.role == ObserverRole::Preview
+                        && input.real_os
+                        && input.kind == InputKind::Wheel =>
+                {
+                    Some(input.clone())
+                }
+                _ => None,
+            },
+        )?;
+    if !accepted.visible_change {
+        return Ok(None);
+    }
+    wait_for_event(observer, events, Duration::from_secs(2), start, |event| {
+        matches!(event, ObserverEvent::FramePresented(frame)
+                if frame.role == ObserverRole::Preview
+                    && frame.event_sequence == Some(accepted.event_sequence))
+    })?;
+    Ok(Some(accepted.event_sequence))
 }
 
 #[cfg(target_os = "linux")]
@@ -1225,6 +2566,7 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
         ObserverEvent::TestCompleted {
             request_id,
             passed: true,
+            semantic_assertions_proven: true,
             completed_steps,
             ..
         } => Some((*request_id, *completed_steps)),
@@ -1288,14 +2630,22 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
             .iter()
             .filter(|frame| frame.0 == step_index)
             .collect::<Vec<_>>();
-        for required in [
-            TestPointerPhase::Move,
-            TestPointerPhase::Hover,
-            TestPointerPhase::Down,
-            TestPointerPhase::Up,
-            TestPointerPhase::State,
-        ] {
-            if !step_frames.iter().any(|frame| frame.1 == required) {
+        let interactive = step_frames
+            .iter()
+            .any(|frame| frame.1 != TestPointerPhase::State);
+        let required_phases = if interactive {
+            &[
+                TestPointerPhase::Move,
+                TestPointerPhase::Hover,
+                TestPointerPhase::Down,
+                TestPointerPhase::Up,
+                TestPointerPhase::State,
+            ][..]
+        } else {
+            &[TestPointerPhase::State][..]
+        };
+        for required in required_phases {
+            if !step_frames.iter().any(|frame| frame.1 == *required) {
                 return (
                     false,
                     format!(
@@ -1314,7 +2664,7 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
             })
             .filter_map(|frame| frame.4)
             .collect::<BTreeSet<_>>();
-        if interactive_targets.len() != 1 {
+        if interactive && interactive_targets.len() != 1 {
             return (
                 false,
                 format!(
@@ -1324,7 +2674,7 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
         }
         let first_sequence = step_frames.first().map_or(0, |frame| frame.5);
         let final_sequence = step_frames.last().map_or(0, |frame| frame.5);
-        if final_sequence <= first_sequence {
+        if interactive && final_sequence <= first_sequence {
             return (
                 false,
                 format!(
@@ -1348,11 +2698,21 @@ struct Capture {
     checks: Vec<Check>,
     events: Vec<ObserverEvent>,
     samples: ProductSamples,
+    state_root: Option<CapturedStateRoot>,
+    launch_isolation: Vec<LaunchIsolationEvidence>,
+}
+
+#[cfg(target_os = "linux")]
+struct CapturedStateRoot {
+    path: PathBuf,
+    clean_at_start: bool,
+    restart_count: u32,
+    restored_after_restart: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl Capture {
-    fn finalize_checks(&mut self, gate: Gate, roles: RolePids) {
+    fn finalize_checks(&mut self, profile: &VerifierProfile, roles: RolePids) {
         let metadata = role_metadata(&self.events);
         let metadata_ok = metadata.contains_key(&ObserverRole::Preview)
             && metadata.contains_key(&ObserverRole::Dev)
@@ -1377,7 +2737,12 @@ impl Capture {
                     && input.kind == InputKind::PointerButton)
         });
         let test_passed = self.events.iter().any(|event| {
-            matches!(event, ObserverEvent::TestCompleted { passed: true, completed_steps, .. }
+            matches!(event, ObserverEvent::TestCompleted {
+                passed: true,
+                semantic_assertions_proven: true,
+                completed_steps,
+                ..
+            }
                 if *completed_steps > 0)
         });
         self.checks.push(check_result(
@@ -1473,34 +2838,42 @@ impl Capture {
                 visible.len()
             ),
         ));
-        if gate == Gate::Cells {
+        if profile.selection_samples > 0 {
             let clicks = preview_visible_frames(&self.events, &self.samples.clicks);
+            self.checks.push(check_result(
+                "minimum-selection-samples",
+                clicks.len() >= profile.selection_samples,
+                format!("collected {} real selection samples", clicks.len()),
+                format!("collected only {} real selection samples", clicks.len()),
+            ));
+        }
+        if profile.scroll_samples > 0 {
             let scroll = preview_scroll_frames(&self.events, &self.samples.scroll);
             self.checks.push(check_result(
-                "minimum-cells-selection-samples",
-                clicks.len() >= 24,
-                format!("collected {} real cell selection samples", clicks.len()),
-                format!(
-                    "collected only {} real cell selection samples",
-                    clicks.len()
-                ),
-            ));
-            self.checks.push(check_result(
-                "minimum-cells-scroll-samples",
-                scroll.len() >= 140,
+                "minimum-scroll-samples",
+                scroll.len() >= profile.scroll_samples,
                 format!("collected {} real preview scroll samples", scroll.len()),
                 format!(
                     "collected only {} real preview scroll samples",
                     scroll.len()
                 ),
             ));
+            let representative = scroll.get(20).map(|frame| &frame.key);
+            let declared = scroll_proof_key(&self.events, 21);
+            self.checks.push(check_result(
+                "warm-scroll-exact-proof",
+                representative.is_some_and(|key| declared == Some(key)),
+                "scroll ordinal 21 has an exact app-owned proof for its reported frame identity",
+                "scroll ordinal 21 is missing an exact same-surface, process, and session proof",
+            ));
         }
-        if gate == Gate::CounterDev {
+        if profile.switch_samples > 0 {
             let ack = switch_ack_samples(&self.events);
             let final_samples = switch_final_samples(&self.events);
             self.checks.push(check_result(
                 "minimum-example-switch-samples",
-                ack.len() >= 23 && final_samples.len() >= 23,
+                ack.len() >= profile.switch_samples
+                    && final_samples.len() >= profile.switch_samples,
                 format!(
                     "collected {} source acknowledgements and {} final preview switches",
                     ack.len(),
@@ -1522,6 +2895,22 @@ impl Capture {
             "no app-owned proof matched a previously presented product frame identity",
         ));
 
+        let expected_isolation_records = usize::from(profile.restart_required) + 1;
+        let structured_isolation = self.launch_isolation.len() == expected_isolation_records
+            && self
+                .launch_isolation
+                .iter()
+                .all(LaunchIsolationEvidence::is_fail_closed);
+        self.checks.push(check_result(
+            "structured-launch-isolation",
+            structured_isolation,
+            "launch isolation, tiled layout, two-device ownership, and input ordering are recorded as bounded structured values",
+            format!(
+                "structured launch isolation is incomplete: observed={}, expected={expected_isolation_records}",
+                self.launch_isolation.len()
+            ),
+        ));
+
         if let Some(preview) = metadata.get(&ObserverRole::Preview) {
             self.checks.push(check_result(
                 "hardware-adapter",
@@ -1536,10 +2925,11 @@ impl Capture {
                 ),
             ));
         }
-        self.add_budget_checks(gate);
+        self.add_budget_checks(profile);
+        self.add_profile_checks(profile);
     }
 
-    fn add_budget_checks(&mut self, gate: Gate) {
+    fn add_budget_checks(&mut self, profile: &VerifierProfile) {
         let callback_sequences = self.samples.callback_sequences();
         add_budget_check(
             &mut self.checks,
@@ -1560,16 +2950,18 @@ impl Capture {
             16_700,
             33_400,
         );
-        if gate == Gate::Cells {
+        if profile.selection_samples > 0 {
             add_frame_budget_check(
                 &mut self.checks,
-                "cells-selection-budget",
+                "repeated-selection-budget",
                 &preview_visible_frames(&self.events, &self.samples.clicks),
                 4,
                 20,
                 16_700,
                 33_400,
             );
+        }
+        if profile.scroll_samples > 0 {
             add_frame_budget_check(
                 &mut self.checks,
                 "warm-scroll-budget",
@@ -1580,7 +2972,7 @@ impl Capture {
                 33_400,
             );
         }
-        if gate == Gate::CounterDev {
+        if profile.switch_samples > 0 {
             add_switch_budget_check(
                 &mut self.checks,
                 "switch-ack-budget",
@@ -1603,29 +2995,926 @@ impl Capture {
         }
     }
 
-    fn into_evidence(self, gate: Gate) -> GateEvidence {
-        build_gate_evidence(gate, self.checks, &self.events, &self.samples)
+    fn add_profile_checks(&mut self, profile: &VerifierProfile) {
+        let evidence = observed_profile_evidence(
+            profile,
+            scenario_completion(&self.events),
+            &self.events,
+            &self.samples,
+            self.state_root.as_ref(),
+        );
+        if profile.scenario_proof.is_some() {
+            let scenario = evidence.scenario.as_ref();
+            let complete = scenario.is_some_and(|proof| {
+                proof.passed
+                    && proof.executable_steps > 0
+                    && proof.completed_steps == proof.executable_steps
+                    && (!profile.require_semantic_scenario || proof.semantic_assertions_proven)
+            });
+            self.checks.push(check_result(
+                "profile-scenario-proof",
+                complete,
+                "the declared scenario completed with the required semantic assertions",
+                match scenario {
+                    Some(proof) if proof.passed && !proof.semantic_assertions_proven => {
+                        "native TEST playback completed, but observer evidence does not prove the scenario's semantic assertions".to_owned()
+                    }
+                    Some(proof) => format!(
+                        "scenario proof is incomplete: passed={}, completed={}/{}",
+                        proof.passed, proof.completed_steps, proof.executable_steps
+                    ),
+                    None => "the declared scenario could not be read and identified".to_owned(),
+                },
+            ));
+        }
+        if !profile.required_budget_metrics.is_empty() {
+            let direct_samples = self
+                .events
+                .iter()
+                .filter(|event| match event {
+                    ObserverEvent::ProfileSample {
+                        input_sequence,
+                        callback_to_host_ns,
+                        editor_key,
+                        key,
+                        ..
+                    } => profile_frame_chain_is_exact(
+                        &self.events,
+                        *input_sequence,
+                        *callback_to_host_ns,
+                        editor_key,
+                        key,
+                    ),
+                    _ => false,
+                })
+                .count();
+            self.checks.push(check_result(
+                "profile-benchmark-host-boundary",
+                direct_samples == 120,
+                "launch-scoped uinput produced 120 real text callbacks with exact editor-present and child-program-present frame chains",
+                format!(
+                    "profile benchmark emitted {direct_samples}/120 exact kernel-uinput text frame chains"
+                ),
+            ));
+            self.checks.push(match profile_stage_summary(&self.events) {
+                Some(detail) => Check::pass("profile-stage-breakdown", detail),
+                None => Check::fail(
+                    "profile-stage-breakdown",
+                    "profile stage timings were incomplete or did not cover 120 ordered samples",
+                ),
+            });
+            let observed = evidence
+                .budget
+                .as_ref()
+                .map_or(&[][..], |proof| proof.observations.as_slice());
+            let missing = profile
+                .required_budget_metrics
+                .iter()
+                .filter(|metric| {
+                    !observed.iter().any(|observation| {
+                        observation.metric == metric.as_str()
+                            && observation.observed <= observation.limit
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            self.checks.push(check_result(
+                "profile-budget-proof",
+                missing.is_empty(),
+                "all manifest-required budget observations were measured within their limits",
+                format!(
+                    "budget declaration was identified, but measured observations are missing or failing: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        if profile.state_root_policy.is_some() {
+            let state = evidence.state_root.as_ref();
+            let complete = state.is_some_and(|proof| {
+                proof.clean_at_start
+                    && proof.durable_file_count > 0
+                    && (!profile.restart_required
+                        || (proof.restart_count > 0 && proof.restored_after_restart))
+            });
+            self.checks.push(check_result(
+                "profile-state-root-proof",
+                complete,
+                "launch-scoped state began clean, persisted data, and restored after restart",
+                "no app-owned launch-scoped state-root and restart evidence was emitted",
+            ));
+        }
+        if !profile.required_checkpoints.is_empty() {
+            let missing = profile
+                .required_checkpoints
+                .iter()
+                .filter(|required| {
+                    !evidence
+                        .checkpoints
+                        .iter()
+                        .any(|checkpoint| checkpoint.id == required.id)
+                })
+                .map(|required| required.id.clone())
+                .collect::<Vec<_>>();
+            self.checks.push(check_result(
+                "profile-checkpoint-proof",
+                missing.is_empty(),
+                "all manifest-required authoritative state checkpoints were observed",
+                format!(
+                    "missing authoritative state checkpoints: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+    }
+
+    fn into_evidence(self, profile: &VerifierProfile) -> GateEvidence {
+        let profile_evidence = observed_profile_evidence(
+            profile,
+            scenario_completion(&self.events),
+            &self.events,
+            &self.samples,
+            self.state_root.as_ref(),
+        );
+        build_gate_evidence(
+            profile,
+            self.checks,
+            &self.events,
+            &self.samples,
+            profile_evidence,
+            self.launch_isolation,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScenarioCompletion {
+    request_id: u64,
+    passed: bool,
+    semantic_assertions_proven: bool,
+    completed_steps: u32,
+}
+
+#[cfg(target_os = "linux")]
+fn scenario_completion(events: &[ObserverEvent]) -> Option<ScenarioCompletion> {
+    events.iter().rev().find_map(|event| match event {
+        ObserverEvent::TestCompleted {
+            request_id,
+            passed,
+            semantic_assertions_proven,
+            completed_steps,
+            ..
+        } => Some(ScenarioCompletion {
+            request_id: *request_id,
+            passed: *passed,
+            semantic_assertions_proven: *semantic_assertions_proven,
+            completed_steps: *completed_steps,
+        }),
+        _ => None,
+    })
+}
+
+fn profile_evidence(
+    profile: &VerifierProfile,
+    completion: Option<ScenarioCompletion>,
+) -> VerificationProfileEvidence {
+    profile_evidence_with_observations(profile, completion, Vec::new(), None, Vec::new())
+}
+
+fn profile_evidence_with_observations(
+    profile: &VerifierProfile,
+    completion: Option<ScenarioCompletion>,
+    budget_observations: Vec<BudgetObservation>,
+    state_root: Option<StateRootProof>,
+    checkpoints: Vec<StateCheckpointProof>,
+) -> VerificationProfileEvidence {
+    VerificationProfileEvidence {
+        profile_id: profile.id.clone(),
+        profile_digest: profile.digest.clone(),
+        scenario: profile
+            .scenario_proof
+            .as_deref()
+            .and_then(|path| scenario_proof(path, completion).ok()),
+        budget: profile
+            .loaded_budget
+            .as_ref()
+            .map(|budget| budget_proof(budget, budget_observations)),
+        state_root,
+        checkpoints,
     }
 }
 
 #[cfg(target_os = "linux")]
+fn observed_profile_evidence(
+    profile: &VerifierProfile,
+    completion: Option<ScenarioCompletion>,
+    events: &[ObserverEvent],
+    samples: &ProductSamples,
+    state_root: Option<&CapturedStateRoot>,
+) -> VerificationProfileEvidence {
+    profile_evidence_with_observations(
+        profile,
+        completion,
+        budget_observations(profile, events, samples).unwrap_or_default(),
+        state_root.map(|state| StateRootProof {
+            root: state.path.to_string_lossy().into_owned(),
+            policy: profile
+                .state_root_policy
+                .clone()
+                .unwrap_or_else(|| "undeclared".to_owned()),
+            clean_at_start: state.clean_at_start,
+            durable_file_count: count_regular_files(&state.path),
+            restart_count: state.restart_count,
+            restored_after_restart: state.restored_after_restart,
+        }),
+        checkpoint_proofs(profile, completion, events),
+    )
+}
+
+fn scenario_proof(
+    path: &Path,
+    completion: Option<ScenarioCompletion>,
+) -> Result<ScenarioProof, String> {
+    let filesystem_path = resolve_profile_input(path);
+    let source = fs::read_to_string(&filesystem_path)
+        .map_err(|error| format!("read scenario {}: {error}", filesystem_path.display()))?;
+    let value = toml::from_str::<toml::Value>(&source)
+        .map_err(|error| format!("parse scenario {}: {error}", filesystem_path.display()))?;
+    let steps = value
+        .get("step")
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| format!("scenario {} has no steps", path.display()))?;
+    let executable_steps = boon_runtime::parse_scenario(&filesystem_path)
+        .map_err(|error| format!("load scenario semantics {}: {error}", path.display()))?
+        .steps
+        .into_iter()
+        .filter(|step| step.source_event.is_some() || !step.expectations.is_empty())
+        .count();
+    Ok(ScenarioProof {
+        path: path.to_string_lossy().into_owned(),
+        sha256: sha256(source.as_bytes()),
+        boundary: if completion.is_some_and(|value| value.semantic_assertions_proven) {
+            "native-test-playback-and-semantic-assertions"
+        } else {
+            "native-test-playback"
+        },
+        request_id: completion.map(|value| value.request_id),
+        declared_steps: steps.len().try_into().unwrap_or(u32::MAX),
+        executable_steps: executable_steps.try_into().unwrap_or(u32::MAX),
+        completed_steps: completion.map_or(0, |value| value.completed_steps),
+        passed: completion.is_some_and(|value| value.passed),
+        semantic_assertions_proven: completion
+            .is_some_and(|value| value.semantic_assertions_proven),
+    })
+}
+
+fn budget_proof(
+    budget: &LoadedBudgetContract,
+    observations: Vec<BudgetObservation>,
+) -> BudgetProof {
+    BudgetProof {
+        path: budget.declared_path.to_string_lossy().into_owned(),
+        sha256: sha256(budget.source.as_bytes()),
+        observations,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn count_regular_files(root: &Path) -> u32 {
+    let mut pending = vec![root.to_path_buf()];
+    let mut count = 0_u32;
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = fs::read_dir(path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_file() {
+                count = count.saturating_add(1);
+            } else if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    count
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct ProfileStageSample {
+    ordinal: u32,
+    total_us: u64,
+    parent_dispatch_us: u64,
+    parent_executor_us: u64,
+    parent_runtime_document_us: u64,
+    parent_persistence_us: u64,
+    compile_us: u64,
+    completion_us: u64,
+    completion_executor_us: u64,
+    completion_runtime_document_us: u64,
+    completion_persistence_us: u64,
+    document_us: u64,
+    interaction_us: u64,
+    demand_us: u64,
+    present_us: u64,
+    patch_count: u32,
+    full_lowered: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn profile_stage_summary(events: &[ObserverEvent]) -> Option<String> {
+    let mut samples = events
+        .iter()
+        .filter_map(|event| match event {
+            ObserverEvent::ProfileSample {
+                ordinal,
+                input_sequence,
+                callback_to_host_ns,
+                preview_visible_us,
+                compile_us,
+                parent_dispatch_us,
+                parent_executor_us,
+                parent_runtime_document_us,
+                parent_persistence_us,
+                completion_us,
+                completion_executor_us,
+                completion_runtime_document_us,
+                completion_persistence_us,
+                document_us,
+                interaction_us,
+                demand_us,
+                present_us,
+                patch_count,
+                full_lowered,
+                editor_key,
+                key,
+                ..
+            } if profile_frame_chain_is_exact(
+                events,
+                *input_sequence,
+                *callback_to_host_ns,
+                editor_key,
+                key,
+            ) =>
+            {
+                Some(ProfileStageSample {
+                    ordinal: *ordinal,
+                    total_us: *preview_visible_us,
+                    parent_dispatch_us: *parent_dispatch_us,
+                    parent_executor_us: *parent_executor_us,
+                    parent_runtime_document_us: *parent_runtime_document_us,
+                    parent_persistence_us: *parent_persistence_us,
+                    compile_us: *compile_us,
+                    completion_us: *completion_us,
+                    completion_executor_us: *completion_executor_us,
+                    completion_runtime_document_us: *completion_runtime_document_us,
+                    completion_persistence_us: *completion_persistence_us,
+                    document_us: *document_us,
+                    interaction_us: *interaction_us,
+                    demand_us: *demand_us,
+                    present_us: *present_us,
+                    patch_count: *patch_count,
+                    full_lowered: *full_lowered,
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    samples.sort_unstable_by_key(|sample| sample.ordinal);
+    samples.dedup_by_key(|sample| sample.ordinal);
+    if samples.len() != 120
+        || samples
+            .iter()
+            .enumerate()
+            .any(|(index, sample)| sample.ordinal as usize != index + 1)
+    {
+        return None;
+    }
+    let measured = &samples[10..];
+    let summary = |field: fn(&ProfileStageSample) -> u64| {
+        let mut values = measured.iter().map(field).collect::<Vec<_>>();
+        values.sort_unstable();
+        (
+            nearest_rank(&values, 95),
+            values.last().copied().unwrap_or(0),
+        )
+    };
+    let total = summary(|sample| sample.total_us);
+    let parent = summary(|sample| sample.parent_dispatch_us);
+    let parent_executor = summary(|sample| sample.parent_executor_us);
+    let parent_runtime_document = summary(|sample| sample.parent_runtime_document_us);
+    let parent_persistence = summary(|sample| sample.parent_persistence_us);
+    let compile = summary(|sample| sample.compile_us);
+    let completion = summary(|sample| sample.completion_us);
+    let completion_executor = summary(|sample| sample.completion_executor_us);
+    let completion_runtime_document = summary(|sample| sample.completion_runtime_document_us);
+    let completion_persistence = summary(|sample| sample.completion_persistence_us);
+    let document = summary(|sample| sample.document_us);
+    let interaction = summary(|sample| sample.interaction_us);
+    let demand = summary(|sample| sample.demand_us);
+    let present = summary(|sample| sample.present_us);
+    let patches = summary(|sample| u64::from(sample.patch_count));
+    let full_lowers = measured.iter().filter(|sample| sample.full_lowered).count();
+    Some(format!(
+        "110 measured samples after 10 warmup; p95/max us: total={}/{}, parent_dispatch={}/{}, parent_executor={}/{}, parent_runtime_document={}/{}, parent_persistence={}/{}, compile={}/{}, child_completion={}/{}, completion_executor={}/{}, completion_runtime_document={}/{}, completion_persistence={}/{}, retained_document={}/{}, interaction={}/{}, demands={}/{}, present={}/{}; patches p95/max={}/{}; full_lowers={full_lowers}",
+        total.0,
+        total.1,
+        parent.0,
+        parent.1,
+        parent_executor.0,
+        parent_executor.1,
+        parent_runtime_document.0,
+        parent_runtime_document.1,
+        parent_persistence.0,
+        parent_persistence.1,
+        compile.0,
+        compile.1,
+        completion.0,
+        completion.1,
+        completion_executor.0,
+        completion_executor.1,
+        completion_runtime_document.0,
+        completion_runtime_document.1,
+        completion_persistence.0,
+        completion_persistence.1,
+        document.0,
+        document.1,
+        interaction.0,
+        interaction.1,
+        demand.0,
+        demand.1,
+        present.0,
+        present.1,
+        patches.0,
+        patches.1,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn budget_observations(
+    profile: &VerifierProfile,
+    events: &[ObserverEvent],
+    samples: &ProductSamples,
+) -> Result<Vec<BudgetObservation>, String> {
+    const PROFILE_SAMPLES: usize = 120;
+    let Some(budget) = profile.loaded_budget.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut observations = Vec::new();
+    let scroll = preview_scroll_frames(events, &samples.scroll);
+    if scroll.len() >= 140 {
+        let mut values = scroll
+            .iter()
+            .skip(20)
+            .map(|sample| sample.input_to_present_us)
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        observations.push(budget_observation(
+            budget,
+            "passive-preview-scroll-p95",
+            BudgetUnit::Microseconds,
+            nearest_rank(&values, 95),
+        )?);
+    }
+
+    let mut profile_samples = events
+        .iter()
+        .filter_map(|event| match event {
+            ObserverEvent::ProfileSample {
+                ordinal,
+                input_sequence,
+                callback_to_host_ns,
+                editor_visible_us,
+                preview_visible_us,
+                compile_us,
+                interaction_frame_block_us,
+                pending_child_artifacts,
+                trusted_parent_rebuilds,
+                editor_key,
+                key,
+                ..
+            } if profile_frame_chain_is_exact(
+                events,
+                *input_sequence,
+                *callback_to_host_ns,
+                editor_key,
+                key,
+            ) =>
+            {
+                Some((
+                    *ordinal,
+                    *editor_visible_us,
+                    *preview_visible_us,
+                    *compile_us,
+                    *interaction_frame_block_us,
+                    u64::from(*pending_child_artifacts),
+                    u64::from(*trusted_parent_rebuilds),
+                ))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    profile_samples.sort_unstable_by_key(|sample| sample.0);
+    profile_samples.dedup_by_key(|sample| sample.0);
+    let complete_ordinals = profile_samples.len() == PROFILE_SAMPLES
+        && profile_samples
+            .iter()
+            .enumerate()
+            .all(|(index, sample)| sample.0 as usize == index + 1);
+    if !complete_ordinals {
+        return Ok(observations);
+    }
+    let Some(representative_key) = events.iter().find_map(|event| match event {
+        ObserverEvent::ProfileSample {
+            ordinal: 11, key, ..
+        } => Some(key),
+        _ => None,
+    }) else {
+        return Ok(observations);
+    };
+    if exact_proof_for_key(events, representative_key).is_none() {
+        return Ok(observations);
+    }
+    let measured = &profile_samples[10..];
+    let sorted = |field: fn(&(u32, u64, u64, u64, u64, u64, u64)) -> u64| {
+        let mut values = measured.iter().map(field).collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    };
+    let editor = sorted(|sample| sample.1);
+    let preview = sorted(|sample| sample.2);
+    let compile = sorted(|sample| sample.3);
+    observations.extend([
+        budget_observation(
+            budget,
+            "keystroke-to-editor-visible-p95",
+            BudgetUnit::Microseconds,
+            nearest_rank(&editor, 95),
+        )?,
+        budget_observation(
+            budget,
+            "valid-edit-to-preview-visible-p95",
+            BudgetUnit::Microseconds,
+            nearest_rank(&preview, 95),
+        )?,
+        budget_observation(
+            budget,
+            "valid-edit-to-preview-visible-p99",
+            BudgetUnit::Microseconds,
+            nearest_rank(&preview, 99),
+        )?,
+        budget_observation(
+            budget,
+            "bounded-starter-source-compile-p95",
+            BudgetUnit::Microseconds,
+            nearest_rank(&compile, 95),
+        )?,
+        budget_observation(
+            budget,
+            "bounded-starter-source-compile-max",
+            BudgetUnit::Microseconds,
+            compile.last().copied().unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "interaction-frame-block-max",
+            BudgetUnit::Microseconds,
+            measured
+                .iter()
+                .map(|sample| sample.4)
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "pending-child-artifact-max",
+            BudgetUnit::Count,
+            measured
+                .iter()
+                .map(|sample| sample.5)
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "trusted-parent-rebuilds-per-edit",
+            BudgetUnit::Count,
+            measured
+                .iter()
+                .map(|sample| sample.6)
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+    ]);
+    Ok(observations)
+}
+
+fn budget_observation(
+    budget: &LoadedBudgetContract,
+    metric: &str,
+    expected_unit: BudgetUnit,
+    observed: u64,
+) -> Result<BudgetObservation, String> {
+    let limit = budget.contract.limit(metric)?;
+    if limit.unit != expected_unit {
+        return Err(format!(
+            "budget metric `{metric}` has unit {}, expected {}",
+            budget_unit_name(limit.unit),
+            budget_unit_name(expected_unit),
+        ));
+    }
+    Ok(BudgetObservation {
+        metric: metric.to_owned(),
+        unit: budget_unit_name(limit.unit),
+        comparison: "at-most",
+        observed,
+        limit: limit.at_most,
+    })
+}
+
+fn budget_unit_name(unit: BudgetUnit) -> &'static str {
+    match unit {
+        BudgetUnit::Microseconds => "microseconds",
+        BudgetUnit::Bytes => "bytes",
+        BudgetUnit::Count => "count",
+    }
+}
+
+fn observed_budget_unit(metric: &str) -> Option<BudgetUnit> {
+    match metric {
+        "keystroke-to-editor-visible-p95"
+        | "valid-edit-to-preview-visible-p95"
+        | "valid-edit-to-preview-visible-p99"
+        | "bounded-starter-source-compile-p95"
+        | "bounded-starter-source-compile-max"
+        | "passive-preview-scroll-p95"
+        | "interaction-frame-block-max" => Some(BudgetUnit::Microseconds),
+        "pending-child-artifact-max" | "trusted-parent-rebuilds-per-edit" => {
+            Some(BudgetUnit::Count)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn checkpoint_proofs(
+    profile: &VerifierProfile,
+    completion: Option<ScenarioCompletion>,
+    events: &[ObserverEvent],
+) -> Vec<StateCheckpointProof> {
+    profile
+        .required_checkpoints
+        .iter()
+        .filter_map(|required| {
+            checkpoint_proof(profile, required, completion, events).filter(|checkpoint| {
+                exact_proof_for_key(events, &checkpoint.frame.clone().into()).is_some()
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn checkpoint_proof(
+    profile: &VerifierProfile,
+    required: &VerifierCheckpointRequirement,
+    completion: Option<ScenarioCompletion>,
+    events: &[ObserverEvent],
+) -> Option<StateCheckpointProof> {
+    match &required.evidence {
+        VerifierCheckpointRequirementKind::ScenarioStep { scenario_step } => {
+            events.iter().rev().find_map(|event| match event {
+                ObserverEvent::ScenarioCheckpoint {
+                    request_id,
+                    step_id,
+                    assertion_count,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    state_digest,
+                    key,
+                } if step_id == scenario_step
+                    && completion
+                        .is_some_and(|completion| completion.request_id == *request_id)
+                    && *assertion_count > 0
+                    && *durable_turn_sequence > 0 =>
+                {
+                    Some(StateCheckpointProof {
+                        id: required.id.clone(),
+                        source_revision: *source_revision,
+                        runtime_sequence: *runtime_sequence,
+                        durable_epoch: *durable_epoch,
+                        state_digest: state_digest.clone(),
+                        frame: key.clone().into(),
+                        evidence: StateCheckpointEvidence::ScenarioSemanticFrame {
+                            scenario_step: step_id.clone(),
+                            assertion_count: *assertion_count,
+                        },
+                    })
+                }
+                _ => None,
+            })
+        }
+        VerifierCheckpointRequirementKind::ResponsiveLayout {
+            baseline_checkpoint,
+            logical_width,
+            logical_height,
+        } => events.iter().rev().find_map(|event| match event {
+            ObserverEvent::ResponsiveLayoutEvidence {
+                logical_width: observed_width,
+                logical_height: observed_height,
+                action_count,
+                action_digest,
+                state_digest,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                key,
+                ..
+            } if observed_width == logical_width
+                && observed_height == logical_height
+                && *action_count > 0 =>
+            {
+                Some(StateCheckpointProof {
+                    id: required.id.clone(),
+                    source_revision: *source_revision,
+                    runtime_sequence: *runtime_sequence,
+                    durable_epoch: *durable_epoch,
+                    state_digest: state_digest.clone(),
+                    frame: key.clone().into(),
+                    evidence: StateCheckpointEvidence::ResponsiveLayout {
+                        baseline_checkpoint: baseline_checkpoint.clone(),
+                        logical_width: *logical_width,
+                        logical_height: *logical_height,
+                        action_count: *action_count,
+                        action_digest: action_digest.clone(),
+                    },
+                })
+            }
+            _ => None,
+        }),
+        VerifierCheckpointRequirementKind::StaleCompileRejection => {
+            events.iter().rev().find_map(|event| match event {
+                ObserverEvent::StaleProgramRejected {
+                    session,
+                    stale_revision,
+                    latest_revision,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    state_digest,
+                    key,
+                } if stale_revision < latest_revision && *durable_turn_sequence > 0 => {
+                    Some(StateCheckpointProof {
+                        id: required.id.clone(),
+                        source_revision: *source_revision,
+                        runtime_sequence: *runtime_sequence,
+                        durable_epoch: *durable_epoch,
+                        state_digest: state_digest.clone(),
+                        frame: key.clone().into(),
+                        evidence: StateCheckpointEvidence::StaleCompileRejection {
+                            session: session.clone(),
+                            stale_revision: *stale_revision,
+                            latest_revision: *latest_revision,
+                        },
+                    })
+                }
+                _ => None,
+            })
+        }
+        VerifierCheckpointRequirementKind::PersistenceOperation { operation } => {
+            let expected = persistence_event_kind(*operation);
+            events.iter().rev().find_map(|event| match event {
+                ObserverEvent::PersistenceEvidence {
+                    kind,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    before_state_digest,
+                    after_state_digest,
+                    key,
+                } if *kind == expected && *durable_turn_sequence > 0 => {
+                    Some(StateCheckpointProof {
+                        id: required.id.clone(),
+                        source_revision: *source_revision,
+                        runtime_sequence: *runtime_sequence,
+                        durable_epoch: *durable_epoch,
+                        state_digest: after_state_digest.clone(),
+                        frame: key.clone().into(),
+                        evidence: StateCheckpointEvidence::PersistenceOperation {
+                            operation: *operation,
+                            before_state_digest: before_state_digest.clone(),
+                        },
+                    })
+                }
+                _ => None,
+            })
+        }
+        VerifierCheckpointRequirementKind::RestartRestore {
+            baseline_checkpoint,
+        } => {
+            let baseline_requirement = profile.required_checkpoints.iter().find(|checkpoint| {
+                checkpoint.id == *baseline_checkpoint
+                    && matches!(
+                        &checkpoint.evidence,
+                        VerifierCheckpointRequirementKind::ScenarioStep { .. }
+                    )
+            })?;
+            let baseline = checkpoint_proof(profile, baseline_requirement, completion, events)?;
+            events.iter().rev().find_map(|event| match event {
+                ObserverEvent::StateMounted {
+                    disposition: StartupDisposition::Restored,
+                    migration: None,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    state_digest,
+                    key,
+                    ..
+                } if *durable_turn_sequence > 0 && state_digest == &baseline.state_digest => {
+                    Some(StateCheckpointProof {
+                        id: required.id.clone(),
+                        source_revision: *source_revision,
+                        runtime_sequence: *runtime_sequence,
+                        durable_epoch: *durable_epoch,
+                        state_digest: state_digest.clone(),
+                        frame: key.clone().into(),
+                        evidence: StateCheckpointEvidence::RestartRestore {
+                            baseline_checkpoint: baseline_checkpoint.clone(),
+                            before_restart_digest: baseline.state_digest.clone(),
+                            startup_restored: true,
+                        },
+                    })
+                }
+                _ => None,
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn persistence_event_kind(operation: VerifierPersistenceOperation) -> PersistenceEvidenceKind {
+    match operation {
+        VerifierPersistenceOperation::Exported => PersistenceEvidenceKind::Exported,
+        VerifierPersistenceOperation::CorruptionRejected => {
+            PersistenceEvidenceKind::CorruptionRejected
+        }
+        VerifierPersistenceOperation::ClearedAndStartedOver => {
+            PersistenceEvidenceKind::ClearedAndStartedOver
+        }
+        VerifierPersistenceOperation::ImportPreviewed => PersistenceEvidenceKind::ImportPreviewed,
+        VerifierPersistenceOperation::ImportActivated => PersistenceEvidenceKind::ImportActivated,
+        VerifierPersistenceOperation::MigrationActivated => {
+            PersistenceEvidenceKind::MigrationActivated
+        }
+    }
+}
+
+fn resolve_profile_input(path: &Path) -> PathBuf {
+    if path.is_absolute() || path.is_file() {
+        return path.to_path_buf();
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("native playground lives at crates/boon_native_playground")
+        .join(path)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+#[cfg(target_os = "linux")]
 fn build_gate_evidence(
-    gate: Gate,
+    profile: &VerifierProfile,
     checks: Vec<Check>,
     events: &[ObserverEvent],
     samples: &ProductSamples,
+    profile_evidence: VerificationProfileEvidence,
+    launch_isolation: Vec<LaunchIsolationEvidence>,
 ) -> GateEvidence {
     let metadata = role_metadata(events);
     let native = metadata
         .get(&ObserverRole::Preview)
         .zip(metadata.get(&ObserverRole::Dev))
-        .and_then(|(preview, dev)| native_evidence(preview, dev.pid));
-    let proof = exact_proof(events);
+        .and_then(|(preview, dev)| native_evidence(preview, dev.pid, launch_isolation));
+    let proofs = exact_proofs(events);
     let mut product_ux_timings = Vec::new();
 
     let callback_sequences = samples.callback_sequences();
     let callbacks = callback_samples(events, &callback_sequences);
     let visible = preview_visible_frames(events, &samples.visible);
+    let proof = proofs
+        .iter()
+        .find(|proof| visible.iter().any(|frame| frame.key == proof.key))
+        .cloned();
     let proof_frame = proof.as_ref().map(|proof| &proof.key);
     if callbacks.len() >= 70
         && let Some(representative) = representative_callback(&callbacks, &visible, proof_frame)
@@ -1661,7 +3950,7 @@ fn build_gate_evidence(
             summary: TimingSummary::from_values(&values, 16_700),
         });
     }
-    if gate == Gate::Cells {
+    if profile.selection_samples > 0 {
         let clicks = preview_visible_frames(events, &samples.clicks);
         if clicks.len() >= 24 {
             let values = clicks
@@ -1670,28 +3959,33 @@ fn build_gate_evidence(
                 .map(|sample| sample.input_to_present_us)
                 .collect::<Vec<_>>();
             product_ux_timings.push(ProductTimingEvidence {
-                metric: "cells-selection",
+                metric: "repeated-selection",
                 representative_frame: clicks[4].key.clone().into(),
                 representative_sample_ordinal: 5,
                 summary: TimingSummary::from_values(&values, 16_700),
             });
         }
+    }
+    if profile.scroll_samples > 0 {
         let scroll = preview_scroll_frames(events, &samples.scroll);
         if scroll.len() >= 140 {
-            let values = scroll
-                .iter()
-                .skip(20)
-                .map(|sample| sample.input_to_present_us)
-                .collect::<Vec<_>>();
-            product_ux_timings.push(ProductTimingEvidence {
-                metric: "warm-scroll",
-                representative_frame: scroll[20].key.clone().into(),
-                representative_sample_ordinal: 21,
-                summary: TimingSummary::from_values(&values, 16_700),
-            });
+            let representative = &scroll[20];
+            if scroll_proof_key(events, 21) == Some(&representative.key) {
+                let values = scroll
+                    .iter()
+                    .skip(20)
+                    .map(|sample| sample.input_to_present_us)
+                    .collect::<Vec<_>>();
+                product_ux_timings.push(ProductTimingEvidence {
+                    metric: "warm-scroll",
+                    representative_frame: representative.key.clone().into(),
+                    representative_sample_ordinal: 21,
+                    summary: TimingSummary::from_values(&values, 16_700),
+                });
+            }
         }
     }
-    if gate == Gate::CounterDev {
+    if profile.switch_samples > 0 {
         let acknowledgements = switch_ack_samples(events);
         let final_samples = switch_final_samples(events);
         if acknowledgements.len() >= 23 && final_samples.len() >= 23 {
@@ -1716,39 +4010,46 @@ fn build_gate_evidence(
         }
     }
 
-    let (async_proof_timing, artifacts) = proof
-        .map(|proof| {
-            let artifact_id = format!("proof-frame-{}", proof.key.frame_id);
-            let completed_after = proof.completed_after_frame_id.max(proof.key.frame_id);
-            let lag = completed_after.saturating_sub(proof.key.frame_id);
-            let timing = AsyncProofTimingEvidence {
-                linked_product_metric: "warm-visible-interaction",
-                captured_frame: proof.key.clone().into(),
-                completed_after_frame_id: completed_after,
-                proof_lag_frames: lag.try_into().unwrap_or(u32::MAX),
-                artifact_id: artifact_id.clone(),
-                snapshot_prepare_us: proof.snapshot_prepare_us,
-                worker_us: proof.elapsed_us,
-                summary: TimingSummary::from_values(
-                    &[proof.snapshot_prepare_us.saturating_add(proof.elapsed_us)],
-                    500_000,
-                ),
-            };
-            let artifact = ArtifactMetadata {
-                artifact_id,
-                kind: "wgpu-png-readback",
-                path: proof.artifact.path.clone(),
-                sha256: proof.artifact.sha256.clone(),
-                byte_len: proof.artifact.byte_len,
-                frame: proof.key.clone().into(),
-            };
-            (Some(timing), vec![artifact])
+    let artifacts = proofs
+        .iter()
+        .enumerate()
+        .map(|(index, proof)| ArtifactMetadata {
+            artifact_id: format!("proof-{index}-frame-{}", proof.key.frame_id),
+            kind: "wgpu-png-readback",
+            path: proof.artifact.path.clone(),
+            sha256: proof.artifact.sha256.clone(),
+            byte_len: proof.artifact.byte_len,
+            frame: proof.key.clone().into(),
         })
-        .unwrap_or((None, Vec::new()));
+        .collect::<Vec<_>>();
+    let async_proof_timing = proof.map(|proof| {
+        let artifact_id = artifacts
+            .iter()
+            .find(|artifact| artifact.frame == proof.key.clone().into())
+            .map(|artifact| artifact.artifact_id.clone())
+            .unwrap_or_else(|| format!("missing-proof-frame-{}", proof.key.frame_id));
+        let completed_after = proof.completed_after_frame_id.max(proof.key.frame_id);
+        let lag = completed_after.saturating_sub(proof.key.frame_id);
+        let timing = AsyncProofTimingEvidence {
+            linked_product_metric: "warm-visible-interaction",
+            captured_frame: proof.key.clone().into(),
+            completed_after_frame_id: completed_after,
+            proof_lag_frames: lag.try_into().unwrap_or(u32::MAX),
+            artifact_id: artifact_id.clone(),
+            snapshot_prepare_us: proof.snapshot_prepare_us,
+            worker_us: proof.elapsed_us,
+            summary: TimingSummary::from_values(
+                &[proof.snapshot_prepare_us.saturating_add(proof.elapsed_us)],
+                500_000,
+            ),
+        };
+        timing
+    });
 
     GateEvidence {
         checks,
         producer: None,
+        profile: Some(profile_evidence),
         native,
         product_ux_timings,
         async_proof_timing,
@@ -1757,7 +4058,27 @@ fn build_gate_evidence(
 }
 
 #[cfg(target_os = "linux")]
-fn native_evidence(metadata: &RoleMetadata, dev_pid: u32) -> Option<NativeEvidence> {
+fn scroll_proof_key(events: &[ObserverEvent], ordinal: u32) -> Option<&FrameEvidenceKey> {
+    events.iter().find_map(|event| match event {
+        ObserverEvent::ScrollProofFrame {
+            ordinal: observed,
+            key,
+        } if *observed == ordinal
+            && frame_key_matches_metadata(events, key, ObserverRole::Preview)
+            && exact_proof_for_key(events, key).is_some() =>
+        {
+            Some(key)
+        }
+        _ => None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn native_evidence(
+    metadata: &RoleMetadata,
+    dev_pid: u32,
+    launch_isolation: Vec<LaunchIsolationEvidence>,
+) -> Option<NativeEvidence> {
     let adapter_backend = match metadata.adapter_backend.as_str() {
         "vulkan" | "metal" | "dx12" | "gl" => metadata.adapter_backend.clone(),
         _ => return None,
@@ -1788,6 +4109,7 @@ fn native_evidence(metadata: &RoleMetadata, dev_pid: u32) -> Option<NativeEviden
         scenario_boundary: "public-host-event",
         capture_method: "app-owned-wgpu-readback",
         private_runtime_dispatch_used: false,
+        launch_isolation,
     })
 }
 
@@ -1803,6 +4125,34 @@ fn role_metadata(events: &[ObserverEvent]) -> BTreeMap<ObserverRole, RoleMetadat
 }
 
 #[cfg(target_os = "linux")]
+fn frame_key_matches_metadata(
+    events: &[ObserverEvent],
+    key: &FrameEvidenceKey,
+    role: ObserverRole,
+) -> bool {
+    key.is_complete()
+        && events.iter().any(|event| {
+            matches!(event, ObserverEvent::RoleMetadata(metadata)
+                if metadata.role == role
+                    && metadata.pid == key.process_id
+                    && metadata.surface_id == key.surface_id
+                    && metadata.session_id == key.session_id)
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn frame_key_matches_session(
+    events: &[ObserverEvent],
+    key: &FrameEvidenceKey,
+    session: &NativeSession,
+    role: ObserverRole,
+) -> bool {
+    key.session_id == session.session_id
+        && session.observed_roles.contains(&key.process_id)
+        && frame_key_matches_metadata(events, key, role)
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct ExactProof {
     key: FrameEvidenceKey,
@@ -1814,6 +4164,38 @@ struct ExactProof {
 
 #[cfg(target_os = "linux")]
 fn exact_proof(events: &[ObserverEvent]) -> Option<ExactProof> {
+    exact_proof_matching(events, None)
+}
+
+#[cfg(target_os = "linux")]
+fn exact_proofs(events: &[ObserverEvent]) -> Vec<ExactProof> {
+    let mut keys = Vec::<FrameEvidenceKey>::new();
+    for event in events {
+        let ObserverEvent::ProofCompleted { key, .. } = event else {
+            continue;
+        };
+        if !keys.contains(key) && exact_proof_for_key(events, key).is_some() {
+            keys.push(key.clone());
+        }
+    }
+    keys.into_iter()
+        .filter_map(|key| exact_proof_for_key(events, &key))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn exact_proof_for_key(
+    events: &[ObserverEvent],
+    required: &FrameEvidenceKey,
+) -> Option<ExactProof> {
+    exact_proof_matching(events, Some(required))
+}
+
+#[cfg(target_os = "linux")]
+fn exact_proof_matching(
+    events: &[ObserverEvent],
+    required: Option<&FrameEvidenceKey>,
+) -> Option<ExactProof> {
     events.iter().enumerate().find_map(|(index, event)| {
         let ObserverEvent::ProofCompleted {
             key,
@@ -1826,9 +4208,15 @@ fn exact_proof(events: &[ObserverEvent]) -> Option<ExactProof> {
         else {
             return None;
         };
-        let presented_before = events[..index].iter().any(|candidate| {
-            matches!(candidate, ObserverEvent::FramePresented(frame) if frame.key == *key)
-        });
+        if required.is_some_and(|required| required != key) {
+            return None;
+        }
+        let presented_before = events[..index]
+            .iter()
+            .find_map(|candidate| match candidate {
+                ObserverEvent::FramePresented(frame) if frame.key == *key => Some(frame),
+                _ => None,
+            });
         let snapshot_prepare_us =
             events[..index]
                 .iter()
@@ -1845,7 +4233,7 @@ fn exact_proof(events: &[ObserverEvent]) -> Option<ExactProof> {
                 _ => None,
             }
                 });
-        (presented_before
+        (presented_before.is_some_and(|frame| frame_key_matches_metadata(events, key, frame.role))
             && snapshot_prepare_us.is_some()
             && key.is_complete()
             && artifact.byte_len > 0
@@ -1939,9 +4327,11 @@ fn real_frames(
                     matches!(candidate, ObserverEvent::InputAccepted(input)
                         if input.role == frame.role
                             && input.real_os
-                            && Some(input.event_sequence) == frame.event_sequence)
+                            && Some(input.event_sequence) == frame.event_sequence
+                            && input.surface_epoch == frame.key.surface_epoch)
                 });
-                real.then(|| frame.clone())
+                (real && frame_key_matches_metadata(events, &frame.key, frame.role))
+                    .then(|| frame.clone())
             }
             _ => None,
         })
@@ -2467,11 +4857,22 @@ struct NativeSession {
     launch_id: String,
     workspace_name: String,
     isolated_seat_name: String,
+    session_id: String,
+    phase: NativeSessionPhase,
     observed_roles: Vec<u32>,
     input: Option<NativeInput>,
     workspace: Option<WorkspaceGuard>,
     pointer_space: Option<(i32, i32)>,
+    input_authorization: Option<IsolationStatus>,
+    input_started_after_authorization: bool,
     closed: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSessionPhase {
+    Primary,
+    Restart,
 }
 
 #[cfg(target_os = "linux")]
@@ -2483,6 +4884,9 @@ impl NativeSession {
         example: &str,
         observer_socket: &Path,
         artifact_dir: &Path,
+        state_root: Option<&Path>,
+        profile: &VerifierProfile,
+        phase: NativeSessionPhase,
     ) -> Result<Self, String> {
         let ipc = runtime_dir.join("desktop.sock");
         let launch_log = runtime_dir.join("desktop-launch.log");
@@ -2495,7 +4899,14 @@ impl NativeSession {
                 .unwrap_or_default()
                 .as_nanos()
         );
-        let environment = [
+        let session_id = format!(
+            "{workspace_name}:{}",
+            match phase {
+                NativeSessionPhase::Primary => "primary",
+                NativeSessionPhase::Restart => "restart",
+            }
+        );
+        let mut environment = vec![
             (
                 OBSERVER_SOCKET_ENV,
                 observer_socket.to_string_lossy().into_owned(),
@@ -2505,13 +4916,72 @@ impl NativeSession {
                 PROOF_ARTIFACT_DIR_ENV,
                 artifact_dir.to_string_lossy().into_owned(),
             ),
-            (PROOF_SAMPLE_ORDINAL_ENV, "64".to_owned()),
+            (PROOF_SAMPLE_ORDINAL_ENV, "128".to_owned()),
+            (PRODUCT_PROOF_AFTER_TEST_ENV, "1".to_owned()),
+            (NATIVE_SESSION_ID_ENV, session_id.clone()),
             (crate::protocol::VERIFY_BOUNDED_WINDOWS_ENV, "1".to_owned()),
             (
                 "BOON_NATIVE_ROLE_LOG",
                 role_log.to_string_lossy().into_owned(),
             ),
         ];
+        if let Some(state_root) = state_root {
+            environment.push((
+                "BOON_PLAYGROUND_STATE_ROOT",
+                state_root.to_string_lossy().into_owned(),
+            ));
+            environment.push((STATE_MOUNT_EVIDENCE_ENV, "1".to_owned()));
+        }
+        match phase {
+            NativeSessionPhase::Primary => {
+                let checkpoint_steps = profile.scenario_checkpoint_steps();
+                if !checkpoint_steps.is_empty() {
+                    environment.push((STATE_EVIDENCE_STEPS_ENV, checkpoint_steps.join(",")));
+                }
+                if profile.requires_persistence_exercise() {
+                    environment.push((PERSISTENCE_EVIDENCE_ENV, "1".to_owned()));
+                }
+                if profile.requires_migration_exercise() && !profile.restart_required {
+                    environment.push((MIGRATION_EVIDENCE_ENV, "1".to_owned()));
+                }
+                if profile.required_checkpoints.iter().any(|checkpoint| {
+                    matches!(
+                        checkpoint.evidence,
+                        VerifierCheckpointRequirementKind::StaleCompileRejection
+                    )
+                }) {
+                    environment.push((STALE_PROGRAM_EVIDENCE_ENV, "1".to_owned()));
+                }
+                if let Some((width, height)) =
+                    profile.required_checkpoints.iter().find_map(|checkpoint| {
+                        match checkpoint.evidence {
+                            VerifierCheckpointRequirementKind::ResponsiveLayout {
+                                logical_width,
+                                logical_height,
+                                ..
+                            } => Some((logical_width, logical_height)),
+                            _ => None,
+                        }
+                    })
+                {
+                    environment.push((RESPONSIVE_EVIDENCE_SIZE_ENV, format!("{width}x{height}")));
+                }
+                if !profile.required_budget_metrics.is_empty() {
+                    environment.push((PROFILE_BENCHMARK_ENV, "120".to_owned()));
+                    environment.push((
+                        PROFILE_BENCHMARK_STEPS_ENV,
+                        profile.profile_benchmark_steps.join(","),
+                    ));
+                }
+                if profile.scroll_samples > 0 {
+                    environment.push((SCROLL_PROOF_ORDINAL_ENV, "21".to_owned()));
+                }
+            }
+            NativeSessionPhase::Restart if profile.requires_migration_exercise() => {
+                environment.push((MIGRATION_EVIDENCE_ENV, "1".to_owned()));
+            }
+            NativeSessionPhase::Restart => {}
+        }
         let mut launcher = Command::new("cosmic-background-launch");
         launcher
             .current_dir(workspace)
@@ -2577,10 +5047,14 @@ impl NativeSession {
             launch_id,
             workspace_name,
             isolated_seat_name,
+            session_id,
+            phase,
             observed_roles: Vec::new(),
             input: Some(input),
             workspace: None,
             pointer_space: None,
+            input_authorization: None,
+            input_started_after_authorization: false,
             closed: false,
         })
     }
@@ -2589,8 +5063,36 @@ impl NativeSession {
         self.desktop_pid
     }
 
+    fn launch_isolation_evidence(&self) -> Result<LaunchIsolationEvidence, String> {
+        let status = self
+            .input_authorization
+            .as_ref()
+            .ok_or("launch isolation was not authorized")?;
+        status.require_safe(&self.isolated_seat_name)?;
+        status.require_layout(self.observed_roles.len())?;
+        let input_owned = self.input.is_some() && status.device_count == 2;
+        Ok(LaunchIsolationEvidence {
+            phase: match self.phase {
+                NativeSessionPhase::Primary => "primary",
+                NativeSessionPhase::Restart => "restart",
+            },
+            session_id: self.session_id.clone(),
+            seat_name: status.seat_name.clone(),
+            pointer_device_owned: input_owned,
+            keyboard_device_owned: input_owned,
+            owned_device_count: status.device_count,
+            workspace_inactive: !status.workspace_active,
+            mapped_surface_count: status.mapped_surface_count,
+            tiling_enabled: status.tiling_enabled,
+            tiled_window_count: status.tiled_window_count,
+            floating_window_count: status.floating_window_count,
+            maximized_window_count: status.maximized_window_count,
+            ownership_and_layout_preceded_input: self.input_started_after_authorization,
+        })
+    }
+
     fn prepare_background_workspace(&mut self, executable: &Path) -> Result<(), String> {
-        self.reconcile_background_layout()?;
+        let isolation = self.reconcile_background_layout()?;
         let workspace = WorkspaceGuard::start(executable, &self.workspace_name)?;
         let (width, height) = workspace.output_size();
         let input = self
@@ -2598,13 +5100,15 @@ impl NativeSession {
             .as_mut()
             .ok_or("kernel virtual input process is unavailable")?;
         input.set_pointer_space(width, height)?;
+        self.input_authorization = Some(isolation);
         input.prepare_pointer()?;
+        self.input_started_after_authorization = true;
         self.pointer_space = Some((width, height));
         self.workspace = Some(workspace);
         Ok(())
     }
 
-    fn reconcile_background_layout(&self) -> Result<(), String> {
+    fn reconcile_background_layout(&self) -> Result<IsolationStatus, String> {
         let output = Command::new("cosmic-background-launch")
             .args(["--reconcile", &self.launch_id])
             .output()
@@ -2629,7 +5133,7 @@ impl NativeSession {
         let isolation = query_isolation_status(&self.launch_id)?;
         isolation.require_safe(&self.isolated_seat_name)?;
         isolation.require_layout(self.observed_roles.len())?;
-        Ok(())
+        Ok(isolation)
     }
 
     fn wait_for_roles(&mut self, timeout: Duration) -> Result<RolePids, String> {
@@ -2662,6 +5166,15 @@ impl NativeSession {
     }
 
     fn run_driver(&mut self, arguments: &[&str]) -> Result<DriverAck, String> {
+        let authorization = self
+            .input_authorization
+            .as_ref()
+            .ok_or("native input is forbidden before launch isolation and layout authorization")?;
+        authorization.require_safe(&self.isolated_seat_name)?;
+        authorization.require_layout(self.observed_roles.len())?;
+        if !self.input_started_after_authorization {
+            return Err("native input authorization was not established before input".to_owned());
+        }
         let input = self
             .input
             .as_mut()
@@ -2704,6 +5217,10 @@ impl NativeSession {
             }
             ["key", state, key] => {
                 input.key(key_code(key)?, *state == "down")?;
+                Ok(DriverAck::default())
+            }
+            ["text", text] => {
+                input.ascii_text_batch(text)?;
                 Ok(DriverAck::default())
             }
             _ => Err(format!(
@@ -2798,6 +5315,7 @@ impl NativeSession {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct IsolationStatus {
     seat_name: String,
     device_count: usize,
@@ -2957,6 +5475,8 @@ fn pointer_button_code(name: &str) -> Result<u16, String> {
 #[cfg(target_os = "linux")]
 fn key_code(name: &str) -> Result<u16, String> {
     match name {
+        "ctrl" => Ok(29),
+        "a" => Ok(30),
         "tab" => Ok(15),
         "enter" => Ok(28),
         "escape" => Ok(1),
@@ -3135,10 +5655,55 @@ fn write_envelope(path: &Path, envelope: &ProducerEnvelope) -> Result<(), String
 }
 
 fn required<'a>(args: &'a [String], flag: &str) -> Result<&'a str, String> {
+    optional(args, flag).ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn optional<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.windows(2)
         .find(|pair| pair[0] == flag)
         .map(|pair| pair[1].as_str())
-        .ok_or_else(|| format!("{flag} requires a value"))
+}
+
+fn repeated<'a>(args: &'a [String], flag: &str) -> Vec<&'a str> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+fn parse_usize(args: &[String], flag: &str, default: usize) -> Result<usize, String> {
+    optional(args, flag).map_or(Ok(default), |value| {
+        value
+            .parse::<usize>()
+            .map_err(|error| format!("invalid {flag} value `{value}`: {error}"))
+    })
+}
+
+fn parse_bool(args: &[String], flag: &str, default: bool) -> Result<bool, String> {
+    optional(args, flag).map_or(Ok(default), |value| match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("invalid {flag} boolean `{value}`")),
+    })
+}
+
+fn parse_csv(args: &[String], flag: &str) -> Result<Vec<String>, String> {
+    let Some(value) = optional(args, flag) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(String::is_empty) {
+        return Err(format!("{flag} requires non-empty comma-separated values"));
+    }
+    let mut unique = BTreeSet::new();
+    if values.iter().any(|value| !unique.insert(value.as_str())) {
+        return Err(format!("{flag} contains duplicate values"));
+    }
+    Ok(values)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -3186,57 +5751,11 @@ fn check_result(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Gate {
-    CounterDev,
-    TodomvcPhysical,
-    Cells,
-    Novywave,
-    Negative,
-}
-
-impl Gate {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "counter-dev" => Ok(Self::CounterDev),
-            "todomvc-physical" => Ok(Self::TodomvcPhysical),
-            "cells" => Ok(Self::Cells),
-            "novywave" => Ok(Self::Novywave),
-            "negative" => Ok(Self::Negative),
-            _ => Err(format!("unsupported v2 producer gate `{value}`")),
-        }
-    }
-
-    fn slug(self) -> &'static str {
-        match self {
-            Self::CounterDev => "counter-dev",
-            Self::TodomvcPhysical => "todomvc-physical",
-            Self::Cells => "cells",
-            Self::Novywave => "novywave",
-            Self::Negative => "negative",
-        }
-    }
-
-    #[cfg(any(target_os = "linux", test))]
-    fn example_id(self) -> &'static str {
-        match self {
-            Self::CounterDev | Self::Negative => "counter",
-            Self::TodomvcPhysical => "todo_mvc_physical",
-            Self::Cells => "cells",
-            Self::Novywave => "novywave",
-        }
-    }
-
-    fn is_timed(self) -> bool {
-        self != Self::Negative
-    }
-}
-
 #[derive(Serialize)]
 struct ProducerEnvelope {
     format: u16,
     protocol: &'static str,
-    gate: &'static str,
+    gate: String,
     run_id: String,
     source_digest: String,
     evidence: GateEvidence,
@@ -3246,6 +5765,7 @@ struct ProducerEnvelope {
 struct GateEvidence {
     checks: Vec<Check>,
     producer: Option<()>,
+    profile: Option<VerificationProfileEvidence>,
     native: Option<NativeEvidence>,
     product_ux_timings: Vec<ProductTimingEvidence>,
     async_proof_timing: Option<AsyncProofTimingEvidence>,
@@ -3254,16 +5774,108 @@ struct GateEvidence {
 
 impl GateEvidence {
     #[cfg(not(target_os = "linux"))]
-    fn failed(check: Check) -> Self {
+    fn failed(profile: &VerifierProfile, check: Check) -> Self {
         Self {
             checks: vec![check],
             producer: None,
+            profile: Some(profile_evidence(profile, None)),
             native: None,
             product_ux_timings: Vec::new(),
             async_proof_timing: None,
             artifacts: Vec::new(),
         }
     }
+}
+
+#[derive(Serialize)]
+struct VerificationProfileEvidence {
+    profile_id: String,
+    profile_digest: String,
+    scenario: Option<ScenarioProof>,
+    budget: Option<BudgetProof>,
+    state_root: Option<StateRootProof>,
+    checkpoints: Vec<StateCheckpointProof>,
+}
+
+#[derive(Serialize)]
+struct ScenarioProof {
+    path: String,
+    sha256: String,
+    boundary: &'static str,
+    request_id: Option<u64>,
+    declared_steps: u32,
+    executable_steps: u32,
+    completed_steps: u32,
+    passed: bool,
+    semantic_assertions_proven: bool,
+}
+
+#[derive(Serialize)]
+struct BudgetProof {
+    path: String,
+    sha256: String,
+    observations: Vec<BudgetObservation>,
+}
+
+#[derive(Serialize)]
+struct BudgetObservation {
+    metric: String,
+    unit: &'static str,
+    comparison: &'static str,
+    observed: u64,
+    limit: u64,
+}
+
+#[derive(Serialize)]
+struct StateRootProof {
+    root: String,
+    policy: String,
+    clean_at_start: bool,
+    durable_file_count: u32,
+    restart_count: u32,
+    restored_after_restart: bool,
+}
+
+#[derive(Serialize)]
+struct StateCheckpointProof {
+    id: String,
+    source_revision: u64,
+    runtime_sequence: u64,
+    durable_epoch: u64,
+    state_digest: String,
+    frame: ReportFrameEvidenceKey,
+    #[serde(flatten)]
+    evidence: StateCheckpointEvidence,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "boundary", rename_all = "kebab-case")]
+enum StateCheckpointEvidence {
+    ScenarioSemanticFrame {
+        scenario_step: String,
+        assertion_count: u32,
+    },
+    RestartRestore {
+        baseline_checkpoint: String,
+        before_restart_digest: String,
+        startup_restored: bool,
+    },
+    ResponsiveLayout {
+        baseline_checkpoint: String,
+        logical_width: u32,
+        logical_height: u32,
+        action_count: u32,
+        action_digest: String,
+    },
+    StaleCompileRejection {
+        session: String,
+        stale_revision: u64,
+        latest_revision: u64,
+    },
+    PersistenceOperation {
+        operation: VerifierPersistenceOperation,
+        before_state_digest: String,
+    },
 }
 
 #[derive(Serialize)]
@@ -3281,10 +5893,50 @@ struct NativeEvidence {
     scenario_boundary: &'static str,
     capture_method: &'static str,
     private_runtime_dispatch_used: bool,
+    launch_isolation: Vec<LaunchIsolationEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct LaunchIsolationEvidence {
+    phase: &'static str,
+    session_id: String,
+    seat_name: String,
+    pointer_device_owned: bool,
+    keyboard_device_owned: bool,
+    owned_device_count: usize,
+    workspace_inactive: bool,
+    mapped_surface_count: usize,
+    tiling_enabled: bool,
+    tiled_window_count: usize,
+    floating_window_count: usize,
+    maximized_window_count: usize,
+    ownership_and_layout_preceded_input: bool,
+}
+
+impl LaunchIsolationEvidence {
+    fn is_fail_closed(&self) -> bool {
+        !self.session_id.is_empty()
+            && self.session_id.len() <= 1_000
+            && !self.seat_name.is_empty()
+            && self.seat_name.len() <= 1_000
+            && self.pointer_device_owned
+            && self.keyboard_device_owned
+            && self.owned_device_count == 2
+            && self.workspace_inactive
+            && self.mapped_surface_count == self.tiled_window_count
+            && self.tiling_enabled
+            && self.tiled_window_count > 0
+            && self.floating_window_count == 0
+            && self.maximized_window_count == 0
+            && self.ownership_and_layout_preceded_input
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ReportFrameEvidenceKey {
+    surface_id: String,
+    process_id: u32,
+    session_id: String,
     frame_id: u64,
     input_id: u64,
     content_id: u64,
@@ -3299,6 +5951,28 @@ struct ReportFrameEvidenceKey {
 impl From<FrameEvidenceKey> for ReportFrameEvidenceKey {
     fn from(value: FrameEvidenceKey) -> Self {
         Self {
+            surface_id: value.surface_id,
+            process_id: value.process_id,
+            session_id: value.session_id,
+            frame_id: value.frame_id,
+            input_id: value.input_id,
+            content_id: value.content_id,
+            layout_id: value.layout_id,
+            render_id: value.render_id,
+            surface_epoch: value.surface_epoch,
+            present_id: value.present_id,
+            proof_id: value.proof_id,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<ReportFrameEvidenceKey> for FrameEvidenceKey {
+    fn from(value: ReportFrameEvidenceKey) -> Self {
+        Self {
+            surface_id: value.surface_id,
+            process_id: value.process_id,
+            session_id: value.session_id,
             frame_id: value.frame_id,
             input_id: value.input_id,
             content_id: value.content_id,
@@ -3409,20 +6083,131 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gate_mapping_is_generic_and_complete() {
-        for (slug, example, timed) in [
-            ("counter-dev", "counter", true),
-            ("todomvc-physical", "todo_mvc_physical", true),
-            ("cells", "cells", true),
-            ("novywave", "novywave", true),
-            ("negative", "counter", false),
-        ] {
-            let gate = Gate::parse(slug).expect("known gate");
-            assert_eq!(gate.slug(), slug);
-            assert_eq!(gate.example_id(), example);
-            assert_eq!(gate.is_timed(), timed);
-        }
-        assert!(Gate::parse("architecture").is_err());
+    fn manifest_arguments_select_generic_harness_behavior() {
+        let args = profile_args(&[
+            ("--gate", "future-product"),
+            ("--profile", "stateful-workflow-v1"),
+            ("--profile-digest", &"a".repeat(64)),
+            ("--harness", "timed"),
+            ("--example", "persons_pro"),
+            ("--visible-mode", "hover"),
+            ("--visible-samples", "120"),
+            ("--alternate-target", "any"),
+            ("--selection-samples", "0"),
+            ("--scroll-samples", "148"),
+            ("--switch-samples", "0"),
+        ]);
+        let profile = VerifierProfile::parse(&args).unwrap();
+        assert_eq!(profile.gate, "future-product");
+        assert_eq!(profile.example(), "persons_pro");
+        assert_eq!(profile.scroll_samples, 148);
+        assert_eq!(profile.selection_samples, 0);
+        assert_eq!(profile.visible_mode, VisibleSampleMode::Hover);
+    }
+
+    #[test]
+    fn flattened_checkpoint_arguments_remain_strict_and_reference_semantic_baselines() {
+        let args = profile_args(&[
+            ("--gate", "stateful-product"),
+            ("--profile", "stateful-workflow-v1"),
+            ("--profile-digest", &"c".repeat(64)),
+            ("--harness", "timed"),
+            ("--example", "counter"),
+            ("--visible-mode", "hover"),
+            ("--visible-samples", "120"),
+            ("--alternate-target", "any"),
+            ("--state-root-policy", "launch-scoped-clean"),
+            ("--restart-required", "true"),
+            (
+                "--required-checkpoint",
+                r#"{"id":"baseline","kind":"scenario-step","scenario_step":"step-a"}"#,
+            ),
+            (
+                "--required-checkpoint",
+                r#"{"id":"restart","kind":"restart-restore","baseline_checkpoint":"baseline"}"#,
+            ),
+        ]);
+        let profile = VerifierProfile::parse(&args).unwrap();
+        assert_eq!(profile.required_checkpoints.len(), 2);
+        assert!(profile.restart_required);
+
+        let mut invalid = args;
+        let restart = invalid
+            .iter_mut()
+            .find(|value| value.contains("restart-restore"))
+            .unwrap();
+        *restart = r#"{"id":"restart","kind":"restart-restore","baseline_checkpoint":"missing","extra":true}"#.to_owned();
+        assert!(VerifierProfile::parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn declaration_identity_is_not_reported_as_completed_profile_proof() {
+        let args = profile_args(&[
+            ("--gate", "persons-pro"),
+            ("--profile", "stateful-workflow-v1"),
+            ("--profile-digest", &"b".repeat(64)),
+            ("--harness", "timed"),
+            ("--example", "persons_pro"),
+            ("--visible-mode", "hover"),
+            ("--visible-samples", "120"),
+            ("--alternate-target", "any"),
+            ("--selection-samples", "0"),
+            ("--scroll-samples", "148"),
+            ("--switch-samples", "0"),
+            ("--scenario-proof", "examples/persons_pro.scn"),
+            ("--require-semantic-scenario", "true"),
+            ("--budget-proof", "examples/persons_pro.budget.toml"),
+            (
+                "--profile-benchmark-steps",
+                "valid-edit-preview,corrected-edit-preview",
+            ),
+            (
+                "--required-budget-metrics",
+                "keystroke-to-editor-visible-p95",
+            ),
+            ("--state-root-policy", "launch-scoped-clean"),
+            ("--restart-required", "true"),
+            ("--required-checkpoints", "fresh-anonymous-workspace"),
+        ]);
+        let profile = VerifierProfile::parse(&args).unwrap();
+        let evidence = profile_evidence(&profile, None);
+        let scenario = evidence.scenario.expect("scenario declaration identity");
+        assert!(!scenario.passed);
+        assert!(!scenario.semantic_assertions_proven);
+        assert_eq!(scenario.boundary, "native-test-playback");
+        let observations = evidence.budget.unwrap().observations;
+        assert!(observations.is_empty());
+        assert!(
+            !observations
+                .iter()
+                .any(|value| value.metric == "trusted-parent-rebuilds-per-edit")
+        );
+        assert!(evidence.state_root.is_none());
+        assert!(evidence.checkpoints.is_empty());
+
+        let completion = ScenarioCompletion {
+            request_id: 41,
+            passed: true,
+            semantic_assertions_proven: true,
+            completed_steps: 21,
+        };
+        let scenario = profile_evidence(&profile, Some(completion))
+            .scenario
+            .expect("completed scenario evidence");
+        assert!(scenario.passed);
+        assert!(scenario.semantic_assertions_proven);
+        assert_eq!(
+            scenario.boundary,
+            "native-test-playback-and-semantic-assertions"
+        );
+        assert_eq!(scenario.request_id, Some(41));
+    }
+
+    fn profile_args(values: &[(&str, &str)]) -> Vec<String> {
+        values
+            .iter()
+            .flat_map(|(flag, value)| [(*flag).to_owned(), (*value).to_owned()])
+            .collect()
     }
 
     #[test]
@@ -3484,5 +6269,113 @@ mod tests {
             observed_role_target(&events, ObserverRole::Dev, DEV_EDITOR_INPUT_TARGET),
             Some((520.0, 420.0))
         );
+    }
+
+    #[test]
+    fn budget_observations_use_the_loaded_typed_contract_and_fail_closed() {
+        let source = "[latency_ms]\nkeystroke_to_editor_visible_p95 = 12.5\n";
+        let loaded = LoadedBudgetContract {
+            declared_path: PathBuf::from("bounded.budget.toml"),
+            source: source.to_owned(),
+            contract: BudgetContract::parse(source).unwrap(),
+        };
+        let observation = budget_observation(
+            &loaded,
+            "keystroke-to-editor-visible-p95",
+            BudgetUnit::Microseconds,
+            11_000,
+        )
+        .unwrap();
+        assert_eq!(observation.unit, "microseconds");
+        assert_eq!(observation.limit, 12_500);
+        assert_eq!(
+            budget_proof(&loaded, Vec::new()).sha256,
+            sha256(source.as_bytes())
+        );
+        assert!(
+            budget_observation(
+                &loaded,
+                "keystroke-to-editor-visible-p95",
+                BudgetUnit::Count,
+                1,
+            )
+            .is_err()
+        );
+        assert!(budget_observation(&loaded, "missing", BudgetUnit::Count, 1).is_err());
+    }
+
+    #[test]
+    fn launch_isolation_structured_values_fail_closed() {
+        let valid = LaunchIsolationEvidence {
+            phase: "primary",
+            session_id: "opaque-session".to_owned(),
+            seat_name: "opaque-seat".to_owned(),
+            pointer_device_owned: true,
+            keyboard_device_owned: true,
+            owned_device_count: 2,
+            workspace_inactive: true,
+            mapped_surface_count: 2,
+            tiling_enabled: true,
+            tiled_window_count: 2,
+            floating_window_count: 0,
+            maximized_window_count: 0,
+            ownership_and_layout_preceded_input: true,
+        };
+        assert!(valid.is_fail_closed());
+        let mut shared_seat = valid.clone();
+        shared_seat.workspace_inactive = false;
+        assert!(!shared_seat.is_fail_closed());
+        let mut missing_keyboard = valid.clone();
+        missing_keyboard.keyboard_device_owned = false;
+        assert!(!missing_keyboard.is_fail_closed());
+        let mut input_before_layout = valid.clone();
+        input_before_layout.ownership_and_layout_preceded_input = false;
+        assert!(!input_before_layout.is_fail_closed());
+        let mut floating = valid;
+        floating.floating_window_count = 1;
+        assert!(!floating.is_fail_closed());
+    }
+
+    #[test]
+    fn tiled_divider_drag_is_derived_from_role_rectangles() {
+        let preview = RoleRectangle {
+            x: 0,
+            y: 0,
+            width: 900,
+            height: 844,
+        };
+        let dev = RoleRectangle {
+            x: 900,
+            y: 0,
+            width: 900,
+            height: 844,
+        };
+        let (from, to) = divider_drag_points(preview, dev, 390, 844).unwrap();
+        assert_eq!(from, (900, 422));
+        assert_eq!(to, (390, 422));
+        assert!(divider_drag_points(preview, dev, 390, 700).is_err());
+    }
+
+    #[test]
+    fn report_frame_keys_preserve_surface_process_and_session_identity() {
+        let key = FrameEvidenceKey {
+            surface_id: "surface-a".to_owned(),
+            process_id: 42,
+            session_id: "primary".to_owned(),
+            frame_id: 1,
+            input_id: 2,
+            content_id: 3,
+            layout_id: 4,
+            render_id: 5,
+            surface_epoch: 6,
+            present_id: 7,
+            proof_id: 8,
+        };
+        let report: ReportFrameEvidenceKey = key.clone().into();
+        let restored: FrameEvidenceKey = report.into();
+        assert_eq!(restored, key);
+        let mut restart = restored;
+        restart.session_id = "restart".to_owned();
+        assert!(!key.same_producer_surface(&restart));
     }
 }

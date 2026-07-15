@@ -6,11 +6,13 @@ use super::codec::{
 };
 use super::{
     ActivationAck, ActivationBatch, BarrierAck, CheckpointBatch, CommitAck, CompactAck,
-    DecodeLimits, DurableChange, DurableOutboxItem, OutboxItemId, PersistenceCommand,
-    PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult, ResetApplicationAck,
-    ResetApplicationBatch, RestoreImage, ShutdownAck, StoreError, StoredList, StoredRow,
-    encode_restore_image, hash_application, validate_activation, validate_checkpoint,
-    validate_initial_image, validate_list,
+    ContentArtifact, ContentArtifactId, DecodeLimits, DurableChange, DurableOutboxItem,
+    LoadContentArtifactRequest, OutboxItemId, PersistenceCommand, PersistenceDriver,
+    PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
+    PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
+    ShutdownAck, StoreError, StoredList, StoredRow, encode_restore_image, hash_application,
+    validate_activation, validate_checkpoint, validate_content_artifact, validate_initial_image,
+    validate_list,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
 use minicbor::{Decoder, Encoder};
@@ -31,6 +33,7 @@ const CHECKPOINTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("CHECKPO
 const MIGRATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("MIGRATIONS");
 const OUTBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("OUTBOX");
 const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("BLOBS");
+const ARTIFACTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ARTIFACTS");
 
 const COMPONENT_FORMAT: u32 = 1;
 const MAX_CHECKPOINT_RECORDS_PER_APPLICATION: usize = 64;
@@ -367,7 +370,7 @@ impl RedbDriver {
         let app = application_key(&batch.application);
         let current_outbox = self.load_outbox(&batch.application)?;
         let mut candidate_outbox = current_outbox.clone();
-        super::apply_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
+        super::apply_durable_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
         super::validate_outbox(&candidate_outbox)?;
         let database = self.database()?;
         let mut transaction = database.begin_write().map_err(backend)?;
@@ -468,6 +471,10 @@ impl RedbDriver {
             )?;
             delete_prefix(&mut transaction.open_table(OUTBOX).map_err(backend)?, &app)?;
             delete_prefix(&mut transaction.open_table(BLOBS).map_err(backend)?, &app)?;
+            delete_prefix(
+                &mut transaction.open_table(ARTIFACTS).map_err(backend)?,
+                &app,
+            )?;
             let mut checkpoints = transaction.open_table(CHECKPOINTS).map_err(backend)?;
             delete_prefix(&mut checkpoints, &app)?;
             record_checkpoint(
@@ -632,6 +639,8 @@ impl RedbDriver {
         let (_, outbox_bytes) =
             prefix_stats(&transaction.open_table(OUTBOX).map_err(backend)?, &app)?;
         let (_, blob_bytes) = prefix_stats(&transaction.open_table(BLOBS).map_err(backend)?, &app)?;
+        let (content_artifact_count, content_artifact_bytes) =
+            prefix_stats(&transaction.open_table(ARTIFACTS).map_err(backend)?, &app)?;
         let encoded_value_bytes = [
             scalar_bytes,
             list_bytes,
@@ -641,6 +650,7 @@ impl RedbDriver {
             checkpoint_bytes,
             outbox_bytes,
             blob_bytes,
+            content_artifact_bytes,
         ]
         .into_iter()
         .try_fold(0u64, u64::checked_add)
@@ -670,6 +680,8 @@ impl RedbDriver {
             scalar_count,
             list_count,
             row_count,
+            content_artifact_count,
+            content_artifact_bytes,
             encoded_value_bytes: Some(encoded_value_bytes),
             completed_migration_count,
             outbox_pending_count: outbox_snapshot.outbox_pending_count,
@@ -707,6 +719,75 @@ impl RedbDriver {
             .compact()
             .map_err(backend)?;
         Ok(CompactAck { epoch })
+    }
+
+    fn put_content_artifact(
+        &self,
+        request: PutContentArtifactRequest,
+    ) -> Result<PutContentArtifactAck, StoreError> {
+        validate_content_artifact(&request.artifact)?;
+        let database = self.database()?;
+        let mut transaction = database.begin_write().map_err(backend)?;
+        immediate(&mut transaction)?;
+        let already_present;
+        {
+            let meta = transaction.open_table(META).map_err(backend)?;
+            if read_meta_write(&meta, &request.application, self.limits)?.is_none() {
+                return Err(StoreError::MissingApplication);
+            }
+            let app = application_key(&request.application);
+            let key = content_artifact_storage_key(&app, request.artifact.id);
+            let mut artifacts = transaction.open_table(ARTIFACTS).map_err(backend)?;
+            let existing = artifacts
+                .get(key.as_slice())
+                .map_err(backend)?
+                .map(|value| value.value().to_vec());
+            already_present = match existing {
+                Some(existing) => {
+                    let decoded =
+                        decode_content_artifact(request.artifact.id, &existing, self.limits)?;
+                    if decoded != request.artifact {
+                        return Err(StoreError::InvalidContentArtifact(
+                            "content digest collides with different artifact bytes".to_owned(),
+                        ));
+                    }
+                    true
+                }
+                None => {
+                    let bytes = encode_content_artifact(&request.artifact)?;
+                    artifacts
+                        .insert(key.as_slice(), bytes.as_slice())
+                        .map_err(backend)?;
+                    false
+                }
+            };
+        }
+        transaction.commit().map_err(backend)?;
+        Ok(PutContentArtifactAck {
+            id: request.artifact.id,
+            stored_bytes: request.artifact.bytes.len().try_into().unwrap_or(u64::MAX),
+            already_present,
+        })
+    }
+
+    fn load_content_artifact(
+        &self,
+        request: LoadContentArtifactRequest,
+    ) -> Result<Option<ContentArtifact>, StoreError> {
+        let transaction = self.database()?.begin_read().map_err(backend)?;
+        let meta = transaction.open_table(META).map_err(backend)?;
+        if read_meta(&meta, &request.application, self.limits)?.is_none() {
+            return Err(StoreError::MissingApplication);
+        }
+        let app = application_key(&request.application);
+        let key = content_artifact_storage_key(&app, request.id);
+        transaction
+            .open_table(ARTIFACTS)
+            .map_err(backend)?
+            .get(key.as_slice())
+            .map_err(backend)?
+            .map(|value| decode_content_artifact(request.id, value.value(), self.limits))
+            .transpose()
     }
 
     fn mark_clean_shutdown(&self) -> Result<(), StoreError> {
@@ -808,6 +889,12 @@ impl PersistenceDriver for RedbDriver {
             PersistenceCommand::Compact(request) => {
                 PersistenceResult::Compacted(self.compact(&request.application))
             }
+            PersistenceCommand::PutContentArtifact(request) => {
+                PersistenceResult::ContentArtifactStored(self.put_content_artifact(request))
+            }
+            PersistenceCommand::LoadContentArtifact(request) => {
+                PersistenceResult::ContentArtifactLoaded(self.load_content_artifact(request))
+            }
             PersistenceCommand::Shutdown(_) => {
                 let result = self.mark_clean_shutdown();
                 self.database.take();
@@ -826,6 +913,7 @@ fn create_tables(transaction: &WriteTransaction) -> Result<(), StoreError> {
     transaction.open_table(MIGRATIONS).map_err(backend)?;
     transaction.open_table(OUTBOX).map_err(backend)?;
     transaction.open_table(BLOBS).map_err(backend)?;
+    transaction.open_table(ARTIFACTS).map_err(backend)?;
     Ok(())
 }
 
@@ -1776,6 +1864,48 @@ fn encode_checkpoint_record(record: &CheckpointRecord) -> Result<Vec<u8>, StoreE
     Ok(bytes)
 }
 
+fn encode_content_artifact(artifact: &ContentArtifact) -> Result<Vec<u8>, StoreError> {
+    validate_content_artifact(artifact)?;
+    let mut bytes = Vec::new();
+    Encoder::new(&mut bytes)
+        .array(3)
+        .and_then(|encoder| encoder.u32(COMPONENT_FORMAT))
+        .and_then(|encoder| encoder.str(&artifact.media_type))
+        .and_then(|encoder| encoder.bytes(&artifact.bytes))
+        .map_err(cbor_encode)?;
+    Ok(bytes)
+}
+
+fn decode_content_artifact(
+    id: ContentArtifactId,
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<ContentArtifact, StoreError> {
+    if bytes.len() > limits.max_total_bytes {
+        return Err(corrupt(
+            "encoded content artifact exceeds decode byte limit",
+        ));
+    }
+    let mut decoder = Decoder::new(bytes);
+    if decoder.array().map_err(cbor_decode)? != Some(3)
+        || decoder.u32().map_err(cbor_decode)? != COMPONENT_FORMAT
+    {
+        return Err(corrupt("unsupported content artifact record format"));
+    }
+    let media_type = decoder.str().map_err(cbor_decode)?.to_owned();
+    let payload = decoder.bytes().map_err(cbor_decode)?.to_vec();
+    if decoder.position() != bytes.len() {
+        return Err(corrupt("content artifact record has trailing bytes"));
+    }
+    let artifact = ContentArtifact {
+        id,
+        media_type,
+        bytes: payload,
+    };
+    validate_content_artifact(&artifact)?;
+    Ok(artifact)
+}
+
 fn restore_checksum(image: &RestoreImage) -> Result<[u8; 32], StoreError> {
     let bytes = encode_restore_image(image).map_err(codec)?;
     Ok(Sha256::digest(bytes).into())
@@ -1827,6 +1957,13 @@ fn blob_storage_key(app: &[u8; 32], digest: BlobDigest) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(app);
     key[32..].copy_from_slice(&digest.0);
+    key
+}
+
+fn content_artifact_storage_key(app: &[u8; 32], artifact: ContentArtifactId) -> [u8; 64] {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(app);
+    key[32..].copy_from_slice(artifact.as_bytes());
     key
 }
 
@@ -1951,8 +2088,8 @@ fn corrupt(detail: impl Into<String>) -> StoreError {
 mod tests {
     use super::*;
     use crate::{
-        CompactRequest, DurableOutboxState, PersistenceCommand, PersistenceResult, RestoreRequest,
-        ShutdownRequest, StoredScalar, StoredValue,
+        CompactRequest, DurableOutboxState, InspectRequest, PersistenceCommand, PersistenceResult,
+        RestoreRequest, ShutdownRequest, StoredScalar, StoredValue,
     };
     use boon_plan::{EffectId, MemoryKind, MemoryLeafId, MemoryOwnerPath};
     use redb::TableHandle;
@@ -2062,6 +2199,7 @@ mod tests {
             assert_eq!(
                 names,
                 BTreeSet::from([
+                    "ARTIFACTS".to_owned(),
                     "BLOBS".to_owned(),
                     "CHECKPOINTS".to_owned(),
                     "LISTS".to_owned(),
@@ -2077,6 +2215,87 @@ mod tests {
         }
         let mut driver = RedbDriver::open(&path).unwrap();
         assert_eq!(load(&mut driver, application()), image);
+    }
+
+    #[test]
+    fn content_artifact_survives_reopen_is_idempotent_and_reset_removes_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.redb");
+        let app = application();
+        let artifact = ContentArtifact::new(
+            "application/vnd.boon.test-artifact",
+            b"durable immutable program".to_vec(),
+        )
+        .unwrap();
+        {
+            let mut driver = RedbDriver::open(&path).unwrap();
+            initialize(&mut driver, RestoreImage::empty(app.clone(), 1, [4; 32]));
+            assert!(matches!(
+                driver.execute(PersistenceCommand::PutContentArtifact(
+                    PutContentArtifactRequest {
+                        application: app.clone(),
+                        artifact: artifact.clone(),
+                    }
+                )),
+                PersistenceResult::ContentArtifactStored(Ok(PutContentArtifactAck {
+                    already_present: false,
+                    ..
+                }))
+            ));
+        }
+
+        let mut driver = RedbDriver::open(&path).unwrap();
+        assert_eq!(
+            driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: app.clone(),
+                    id: artifact.id,
+                }
+            )),
+            PersistenceResult::ContentArtifactLoaded(Ok(Some(artifact.clone())))
+        );
+        let snapshot = match driver.execute(PersistenceCommand::Inspect(InspectRequest {
+            application: app.clone(),
+        })) {
+            PersistenceResult::Inspected(Ok(Some(snapshot))) => snapshot,
+            result => panic!("unexpected inspector result: {result:?}"),
+        };
+        assert_eq!(snapshot.content_artifact_count, 1);
+        assert!(snapshot.content_artifact_bytes >= artifact.bytes.len() as u64);
+        assert!(matches!(
+            driver.execute(PersistenceCommand::PutContentArtifact(
+                PutContentArtifactRequest {
+                    application: app.clone(),
+                    artifact: artifact.clone(),
+                }
+            )),
+            PersistenceResult::ContentArtifactStored(Ok(PutContentArtifactAck {
+                already_present: true,
+                ..
+            }))
+        ));
+        let reset = ResetApplicationBatch {
+            application: app.clone(),
+            expected_base_epoch: 0,
+            next_epoch: 1,
+            source_schema_hash: [4; 32],
+            default_image: RestoreImage::empty(app.clone(), 1, [4; 32]),
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            driver.execute(PersistenceCommand::ResetApplication(reset)),
+            PersistenceResult::ApplicationReset(Ok(_))
+        ));
+        assert_eq!(
+            driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: app,
+                    id: artifact.id,
+                }
+            )),
+            PersistenceResult::ContentArtifactLoaded(Ok(None))
+        );
     }
 
     #[test]
@@ -2693,7 +2912,7 @@ mod tests {
         assert!(reset.outbox.is_empty());
         assert!(reset.completed_migration_edges.is_empty());
         let transaction = driver.database().unwrap().begin_read().unwrap();
-        for definition in [SLOTS, LISTS, ROWS, MIGRATIONS, OUTBOX, BLOBS] {
+        for definition in [SLOTS, LISTS, ROWS, MIGRATIONS, OUTBOX, BLOBS, ARTIFACTS] {
             let table = transaction.open_table(definition).unwrap();
             assert_eq!(count_prefix(&table, &application_key(&app)).unwrap(), 0);
         }

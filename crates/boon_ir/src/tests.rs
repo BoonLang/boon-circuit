@@ -36,7 +36,7 @@ store: [
 effects: [
     sign_in: [
         on: store.authenticate
-        perform: Passkey/authenticate(
+        perform: DevelopmentPasskey/authenticate(
             account_id: store.account_id
             credential_count: store.credential_count
             simulation: store.simulation
@@ -55,7 +55,7 @@ effects: [
     assert_eq!(typed.host_effects.len(), 1);
     let effect = &typed.host_effects[0];
     assert_eq!(effect.name, "sign_in");
-    assert_eq!(effect.operation, "Passkey/authenticate");
+    assert_eq!(effect.operation, "DevelopmentPasskey/authenticate");
     let SemanticDataType::Variant { variants } = &effect
         .intent_fields
         .iter()

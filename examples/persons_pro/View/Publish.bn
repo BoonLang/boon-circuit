@@ -23,3 +23,78 @@ FUNCTION controls() {
         }
     )
 }
+
+FUNCTION compiler() {
+    PASSED.store.has_publish_request |> WHEN {
+        True => Scene/Element/program(
+            element: [event: PASSED.store.elements.publish_candidate_program]
+            style: [width: 0, height: 0, paint: False]
+            source: PASSED.store.publish_candidate_source
+            revision: PASSED.store.publish_request_sequence
+            capability_profile: PublicDocument
+            persist_artifact: True
+            session_key: TEXT { persons-public-candidate }
+            mount: False
+        )
+        False => NoElement
+    }
+}
+
+FUNCTION root() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 12
+        style: [
+            ...PersonsTheme/panel(mode: PASSED.store.mode)
+            width: Fill
+            height: 700
+            padding: 14
+        ]
+        items: LIST {
+            Scene/Element/stripe(
+                element: []
+                direction: Row
+                gap: 8
+                style: [width: Fill, paint: False]
+                items: LIST {
+                    Components/text(
+                        PASS: [store: PASSED.store]
+                        value: TEXT { Publication }
+                        of: Heading
+                    )
+                    controls()
+                }
+            )
+            Components/text(
+                PASS: [store: PASSED.store]
+                value: Workspace/public_label(
+                    has_published_revision: PASSED.store.has_published_revision
+                    revision: PASSED.store.published_revision
+                )
+                of: Muted
+            )
+            publication_diagnostic()
+            Preview/published_program(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION publication_diagnostic() {
+    PASSED.store.publish_state |> WHEN {
+        Failed => Scene/Element/text(
+            element: []
+            style: [
+                ...PersonsTheme/body(mode: PASSED.store.mode)
+                width: Fill
+                text_wrap: True
+                padding: 10
+                rounded_corners: 5
+                background: [color: PersonsTheme/diagnostic_background(mode: PASSED.store.mode)]
+                color: PersonsTheme/diagnostic_text(mode: PASSED.store.mode)
+            ]
+            text: PASSED.store.publish_diagnostic
+        )
+        __ => NoElement
+    }
+}

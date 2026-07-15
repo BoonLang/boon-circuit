@@ -8,12 +8,23 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub const OBSERVER_SOCKET_ENV: &str = "BOON_VERIFY_OBSERVER_SOCKET";
+pub const NATIVE_SESSION_ID_ENV: &str = "BOON_VERIFY_NATIVE_SESSION_ID";
 pub const PROOF_MODE_ENV: &str = "BOON_VERIFY_PROOF_MODE";
 pub const PROOF_ARTIFACT_DIR_ENV: &str = "BOON_VERIFY_PROOF_ARTIFACT_DIR";
 pub const PROOF_SAMPLE_ORDINAL_ENV: &str = "BOON_VERIFY_PROOF_SAMPLE_ORDINAL";
+pub const STATE_EVIDENCE_STEPS_ENV: &str = "BOON_VERIFY_STATE_EVIDENCE_STEPS";
+pub const STATE_MOUNT_EVIDENCE_ENV: &str = "BOON_VERIFY_STATE_MOUNT_EVIDENCE";
+pub const PERSISTENCE_EVIDENCE_ENV: &str = "BOON_VERIFY_PERSISTENCE_EVIDENCE";
+pub const MIGRATION_EVIDENCE_ENV: &str = "BOON_VERIFY_MIGRATION_EVIDENCE";
+pub const PROFILE_BENCHMARK_ENV: &str = "BOON_VERIFY_PROFILE_BENCHMARK";
+pub const PROFILE_BENCHMARK_STEPS_ENV: &str = "BOON_VERIFY_PROFILE_BENCHMARK_STEPS";
+pub const PRODUCT_PROOF_AFTER_TEST_ENV: &str = "BOON_VERIFY_PRODUCT_PROOF_AFTER_TEST";
+pub const RESPONSIVE_EVIDENCE_SIZE_ENV: &str = "BOON_VERIFY_RESPONSIVE_EVIDENCE_SIZE";
+pub const SCROLL_PROOF_ORDINAL_ENV: &str = "BOON_VERIFY_SCROLL_PROOF_ORDINAL";
+pub const STALE_PROGRAM_EVIDENCE_ENV: &str = "BOON_VERIFY_STALE_PROGRAM_EVIDENCE";
 
 const MAGIC: [u8; 4] = *b"BNVO";
-const VERSION: u16 = 2;
+const VERSION: u16 = 6;
 const HEADER_BYTES: usize = 7;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024;
@@ -34,6 +45,62 @@ pub enum TestPointerPhase {
     Down = 3,
     Up = 4,
     State = 5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PersistenceEvidenceKind {
+    Exported = 1,
+    CorruptionRejected = 2,
+    ClearedAndStartedOver = 3,
+    ImportPreviewed = 4,
+    ImportActivated = 5,
+    MigrationActivated = 6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum StartupDisposition {
+    Fresh = 1,
+    Restored = 2,
+    Migrated = 3,
+}
+
+impl StartupDisposition {
+    fn decode(value: u8) -> Result<Self, ObserverError> {
+        match value {
+            1 => Ok(Self::Fresh),
+            2 => Ok(Self::Restored),
+            3 => Ok(Self::Migrated),
+            _ => Err(ObserverError::InvalidEnum("startup disposition", value)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupMigrationEvidence {
+    pub source_schema_version: u64,
+    pub source_schema_hash: String,
+    pub target_schema_version: u64,
+    pub target_schema_hash: String,
+    pub step_count: u32,
+}
+
+impl PersistenceEvidenceKind {
+    fn decode(value: u8) -> Result<Self, ObserverError> {
+        match value {
+            1 => Ok(Self::Exported),
+            2 => Ok(Self::CorruptionRejected),
+            3 => Ok(Self::ClearedAndStartedOver),
+            4 => Ok(Self::ImportPreviewed),
+            5 => Ok(Self::ImportActivated),
+            6 => Ok(Self::MigrationActivated),
+            _ => Err(ObserverError::InvalidEnum(
+                "persistence evidence kind",
+                value,
+            )),
+        }
+    }
 }
 
 impl TestPointerPhase {
@@ -96,6 +163,9 @@ impl InputKind {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FrameEvidenceKey {
+    pub surface_id: String,
+    pub process_id: u32,
+    pub session_id: String,
     pub frame_id: u64,
     pub input_id: u64,
     pub content_id: u64,
@@ -108,7 +178,12 @@ pub struct FrameEvidenceKey {
 
 impl FrameEvidenceKey {
     pub fn is_complete(&self) -> bool {
-        self.frame_id != 0
+        !self.surface_id.is_empty()
+            && self.surface_id.len() <= MAX_STRING_BYTES
+            && self.process_id != 0
+            && !self.session_id.is_empty()
+            && self.session_id.len() <= MAX_STRING_BYTES
+            && self.frame_id != 0
             && self.input_id != 0
             && self.content_id != 0
             && self.layout_id != 0
@@ -118,7 +193,16 @@ impl FrameEvidenceKey {
             && self.proof_id != 0
     }
 
-    fn encode(&self, out: &mut Encoder) {
+    pub fn same_producer_surface(&self, other: &Self) -> bool {
+        self.surface_id == other.surface_id
+            && self.process_id == other.process_id
+            && self.session_id == other.session_id
+    }
+
+    fn encode(&self, out: &mut Encoder) -> Result<(), ObserverError> {
+        out.string(&self.surface_id)?;
+        out.u32(self.process_id);
+        out.string(&self.session_id)?;
         out.u64(self.frame_id);
         out.u64(self.input_id);
         out.u64(self.content_id);
@@ -127,10 +211,14 @@ impl FrameEvidenceKey {
         out.u64(self.surface_epoch);
         out.u64(self.present_id);
         out.u64(self.proof_id);
+        Ok(())
     }
 
     fn decode(input: &mut Decoder<'_>) -> Result<Self, ObserverError> {
         Ok(Self {
+            surface_id: input.string()?,
+            process_id: input.u32()?,
+            session_id: input.string()?,
             frame_id: input.u64()?,
             input_id: input.u64()?,
             content_id: input.u64()?,
@@ -148,6 +236,7 @@ pub struct RoleMetadata {
     pub role: ObserverRole,
     pub pid: u32,
     pub surface_id: String,
+    pub session_id: String,
     pub surface_epoch: u64,
     pub logical_width: f32,
     pub logical_height: f32,
@@ -243,6 +332,7 @@ pub enum ObserverEvent {
     TestCompleted {
         request_id: u64,
         passed: bool,
+        semantic_assertions_proven: bool,
         completed_steps: u32,
         message: String,
     },
@@ -280,6 +370,125 @@ pub enum ObserverEvent {
         stage: String,
         message: String,
     },
+    StateMounted {
+        disposition: StartupDisposition,
+        schema_version: u64,
+        schema_hash: String,
+        migration: Option<StartupMigrationEvidence>,
+        source_revision: u64,
+        runtime_sequence: u64,
+        durable_epoch: u64,
+        durable_turn_sequence: u64,
+        state_digest: String,
+        key: FrameEvidenceKey,
+    },
+    ScenarioCheckpoint {
+        request_id: u64,
+        step_id: String,
+        assertion_count: u32,
+        source_revision: u64,
+        runtime_sequence: u64,
+        durable_epoch: u64,
+        durable_turn_sequence: u64,
+        state_digest: String,
+        key: FrameEvidenceKey,
+    },
+    PersistenceEvidence {
+        kind: PersistenceEvidenceKind,
+        source_revision: u64,
+        runtime_sequence: u64,
+        durable_epoch: u64,
+        durable_turn_sequence: u64,
+        before_state_digest: String,
+        after_state_digest: String,
+        key: FrameEvidenceKey,
+    },
+    ResponsiveLayoutEvidence {
+        resize_sequence: u64,
+        logical_width: u32,
+        logical_height: u32,
+        action_count: u32,
+        action_digest: String,
+        state_digest: String,
+        source_revision: u64,
+        runtime_sequence: u64,
+        durable_epoch: u64,
+        key: FrameEvidenceKey,
+    },
+    ProfileSample {
+        ordinal: u32,
+        input_sequence: u64,
+        callback_to_host_ns: u64,
+        editor_visible_us: u64,
+        preview_visible_us: u64,
+        compile_us: u64,
+        parent_dispatch_us: u64,
+        parent_executor_us: u64,
+        parent_runtime_document_us: u64,
+        parent_persistence_us: u64,
+        completion_us: u64,
+        completion_executor_us: u64,
+        completion_runtime_document_us: u64,
+        completion_persistence_us: u64,
+        document_us: u64,
+        interaction_us: u64,
+        demand_us: u64,
+        present_us: u64,
+        patch_count: u32,
+        full_lowered: bool,
+        interaction_frame_block_us: u64,
+        pending_child_artifacts: u32,
+        trusted_parent_rebuilds: u32,
+        source_revision: u64,
+        runtime_sequence: u64,
+        editor_key: FrameEvidenceKey,
+        key: FrameEvidenceKey,
+    },
+    StaleProgramRejected {
+        session: String,
+        stale_revision: u64,
+        latest_revision: u64,
+        source_revision: u64,
+        runtime_sequence: u64,
+        durable_epoch: u64,
+        durable_turn_sequence: u64,
+        state_digest: String,
+        key: FrameEvidenceKey,
+    },
+    ProfileInputTarget {
+        node: String,
+        source_path: String,
+        x: f32,
+        y: f32,
+        sample_count: u32,
+        key: FrameEvidenceKey,
+    },
+    ProfileInputSeeded {
+        input_sequence: u64,
+        callback_to_host_ns: u64,
+        compile_us: u64,
+        pending_child_artifacts: u32,
+        editor_key: FrameEvidenceKey,
+        key: FrameEvidenceKey,
+    },
+    ResponsiveResizeReady {
+        desired_width: u32,
+        desired_height: u32,
+        current_width: u32,
+        current_height: u32,
+        key: FrameEvidenceKey,
+    },
+    ResponsiveResizeObserved {
+        event_sequence: u64,
+        logical_width: u32,
+        logical_height: u32,
+        previous_surface_epoch: u64,
+        key: FrameEvidenceKey,
+    },
+    ScrollProofFrame {
+        ordinal: u32,
+        key: FrameEvidenceKey,
+    },
 }
 
 impl ObserverEvent {
@@ -297,6 +506,17 @@ impl ObserverEvent {
             Self::RoleTarget { .. } => 10,
             Self::SourceFailed { .. } => 11,
             Self::TestPointerFrame { .. } => 12,
+            Self::StateMounted { .. } => 13,
+            Self::ScenarioCheckpoint { .. } => 14,
+            Self::PersistenceEvidence { .. } => 15,
+            Self::ResponsiveLayoutEvidence { .. } => 16,
+            Self::ProfileSample { .. } => 17,
+            Self::StaleProgramRejected { .. } => 18,
+            Self::ProfileInputTarget { .. } => 19,
+            Self::ProfileInputSeeded { .. } => 20,
+            Self::ResponsiveResizeReady { .. } => 21,
+            Self::ResponsiveResizeObserved { .. } => 22,
+            Self::ScrollProofFrame { .. } => 23,
         }
     }
 
@@ -306,6 +526,7 @@ impl ObserverEvent {
                 out.u8(value.role as u8);
                 out.u32(value.pid);
                 out.string(&value.surface_id)?;
+                out.string(&value.session_id)?;
                 out.u64(value.surface_epoch);
                 out.f32(value.logical_width);
                 out.f32(value.logical_height);
@@ -340,7 +561,7 @@ impl ObserverEvent {
             }
             Self::FramePresented(value) => {
                 out.u8(value.role as u8);
-                value.key.encode(out);
+                value.key.encode(out)?;
                 out.optional_u64(value.event_sequence);
                 out.optional_u8(value.input_kind.map(|kind| kind as u8));
                 out.u64(value.callback_to_host_ns);
@@ -382,7 +603,7 @@ impl ObserverEvent {
                 out.u64(*elapsed_us);
                 out.u64(*compile_us);
                 out.u64(*post_compile_us);
-                key.encode(out);
+                key.encode(out)?;
             }
             Self::TestTarget {
                 request_id,
@@ -400,11 +621,13 @@ impl ObserverEvent {
             Self::TestCompleted {
                 request_id,
                 passed,
+                semantic_assertions_proven,
                 completed_steps,
                 message,
             } => {
                 out.u64(*request_id);
                 out.bool(*passed);
+                out.bool(*semantic_assertions_proven);
                 out.u32(*completed_steps);
                 out.string(message)?;
             }
@@ -425,13 +648,13 @@ impl ObserverEvent {
                 out.f32(*y);
                 out.optional_string(target.as_deref())?;
                 out.u64(*runtime_sequence);
-                key.encode(out);
+                key.encode(out)?;
             }
             Self::ProofRequested {
                 key,
                 snapshot_prepare_us,
             } => {
-                key.encode(out);
+                key.encode(out)?;
                 out.u64(*snapshot_prepare_us);
             }
             Self::ProofCompleted {
@@ -443,7 +666,7 @@ impl ObserverEvent {
                 artifact,
                 error,
             } => {
-                key.encode(out);
+                key.encode(out)?;
                 out.u64(*completed_after_frame_id);
                 out.u64(*elapsed_us);
                 out.u64(*replaced_count);
@@ -474,6 +697,237 @@ impl ObserverEvent {
                 out.string(stage)?;
                 out.string(message)?;
             }
+            Self::StateMounted {
+                disposition,
+                schema_version,
+                schema_hash,
+                migration,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                durable_turn_sequence,
+                state_digest,
+                key,
+            } => {
+                out.u8(*disposition as u8);
+                out.u64(*schema_version);
+                out.string(schema_hash)?;
+                out.bool(migration.is_some());
+                if let Some(migration) = migration {
+                    out.u64(migration.source_schema_version);
+                    out.string(&migration.source_schema_hash)?;
+                    out.u64(migration.target_schema_version);
+                    out.string(&migration.target_schema_hash)?;
+                    out.u32(migration.step_count);
+                }
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                out.u64(*durable_epoch);
+                out.u64(*durable_turn_sequence);
+                out.string(state_digest)?;
+                key.encode(out)?;
+            }
+            Self::ScenarioCheckpoint {
+                request_id,
+                step_id,
+                assertion_count,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                durable_turn_sequence,
+                state_digest,
+                key,
+            } => {
+                out.u64(*request_id);
+                out.string(step_id)?;
+                out.u32(*assertion_count);
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                out.u64(*durable_epoch);
+                out.u64(*durable_turn_sequence);
+                out.string(state_digest)?;
+                key.encode(out)?;
+            }
+            Self::PersistenceEvidence {
+                kind,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                durable_turn_sequence,
+                before_state_digest,
+                after_state_digest,
+                key,
+            } => {
+                out.u8(*kind as u8);
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                out.u64(*durable_epoch);
+                out.u64(*durable_turn_sequence);
+                out.string(before_state_digest)?;
+                out.string(after_state_digest)?;
+                key.encode(out)?;
+            }
+            Self::ResponsiveLayoutEvidence {
+                resize_sequence,
+                logical_width,
+                logical_height,
+                action_count,
+                action_digest,
+                state_digest,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                key,
+            } => {
+                out.u64(*resize_sequence);
+                out.u32(*logical_width);
+                out.u32(*logical_height);
+                out.u32(*action_count);
+                out.string(action_digest)?;
+                out.string(state_digest)?;
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                out.u64(*durable_epoch);
+                key.encode(out)?;
+            }
+            Self::ProfileSample {
+                ordinal,
+                input_sequence,
+                callback_to_host_ns,
+                editor_visible_us,
+                preview_visible_us,
+                compile_us,
+                parent_dispatch_us,
+                parent_executor_us,
+                parent_runtime_document_us,
+                parent_persistence_us,
+                completion_us,
+                completion_executor_us,
+                completion_runtime_document_us,
+                completion_persistence_us,
+                document_us,
+                interaction_us,
+                demand_us,
+                present_us,
+                patch_count,
+                full_lowered,
+                interaction_frame_block_us,
+                pending_child_artifacts,
+                trusted_parent_rebuilds,
+                source_revision,
+                runtime_sequence,
+                editor_key,
+                key,
+            } => {
+                out.u32(*ordinal);
+                out.u64(*input_sequence);
+                out.u64(*callback_to_host_ns);
+                out.u64(*editor_visible_us);
+                out.u64(*preview_visible_us);
+                out.u64(*compile_us);
+                out.u64(*parent_dispatch_us);
+                out.u64(*parent_executor_us);
+                out.u64(*parent_runtime_document_us);
+                out.u64(*parent_persistence_us);
+                out.u64(*completion_us);
+                out.u64(*completion_executor_us);
+                out.u64(*completion_runtime_document_us);
+                out.u64(*completion_persistence_us);
+                out.u64(*document_us);
+                out.u64(*interaction_us);
+                out.u64(*demand_us);
+                out.u64(*present_us);
+                out.u32(*patch_count);
+                out.bool(*full_lowered);
+                out.u64(*interaction_frame_block_us);
+                out.u32(*pending_child_artifacts);
+                out.u32(*trusted_parent_rebuilds);
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                editor_key.encode(out)?;
+                key.encode(out)?;
+            }
+            Self::StaleProgramRejected {
+                session,
+                stale_revision,
+                latest_revision,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                durable_turn_sequence,
+                state_digest,
+                key,
+            } => {
+                out.string(session)?;
+                out.u64(*stale_revision);
+                out.u64(*latest_revision);
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                out.u64(*durable_epoch);
+                out.u64(*durable_turn_sequence);
+                out.string(state_digest)?;
+                key.encode(out)?;
+            }
+            Self::ProfileInputTarget {
+                node,
+                source_path,
+                x,
+                y,
+                sample_count,
+                key,
+            } => {
+                out.string(node)?;
+                out.string(source_path)?;
+                out.f32(*x);
+                out.f32(*y);
+                out.u32(*sample_count);
+                key.encode(out)?;
+            }
+            Self::ProfileInputSeeded {
+                input_sequence,
+                callback_to_host_ns,
+                compile_us,
+                pending_child_artifacts,
+                editor_key,
+                key,
+            } => {
+                out.u64(*input_sequence);
+                out.u64(*callback_to_host_ns);
+                out.u64(*compile_us);
+                out.u32(*pending_child_artifacts);
+                editor_key.encode(out)?;
+                key.encode(out)?;
+            }
+            Self::ResponsiveResizeReady {
+                desired_width,
+                desired_height,
+                current_width,
+                current_height,
+                key,
+            } => {
+                out.u32(*desired_width);
+                out.u32(*desired_height);
+                out.u32(*current_width);
+                out.u32(*current_height);
+                key.encode(out)?;
+            }
+            Self::ResponsiveResizeObserved {
+                event_sequence,
+                logical_width,
+                logical_height,
+                previous_surface_epoch,
+                key,
+            } => {
+                out.u64(*event_sequence);
+                out.u32(*logical_width);
+                out.u32(*logical_height);
+                out.u64(*previous_surface_epoch);
+                key.encode(out)?;
+            }
+            Self::ScrollProofFrame { ordinal, key } => {
+                out.u32(*ordinal);
+                key.encode(out)?;
+            }
         }
         Ok(())
     }
@@ -484,6 +938,7 @@ impl ObserverEvent {
                 role: ObserverRole::decode(input.u8()?)?,
                 pid: input.u32()?,
                 surface_id: input.string()?,
+                session_id: input.string()?,
                 surface_epoch: input.u64()?,
                 logical_width: input.f32()?,
                 logical_height: input.f32()?,
@@ -564,6 +1019,7 @@ impl ObserverEvent {
             7 => Self::TestCompleted {
                 request_id: input.u64()?,
                 passed: input.bool()?,
+                semantic_assertions_proven: input.bool()?,
                 completed_steps: input.u32()?,
                 message: input.string()?,
             },
@@ -618,6 +1074,135 @@ impl ObserverEvent {
                 y: input.f32()?,
                 target: input.optional_string()?,
                 runtime_sequence: input.u64()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            13 => Self::StateMounted {
+                disposition: StartupDisposition::decode(input.u8()?)?,
+                schema_version: input.u64()?,
+                schema_hash: input.string()?,
+                migration: if input.bool()? {
+                    Some(StartupMigrationEvidence {
+                        source_schema_version: input.u64()?,
+                        source_schema_hash: input.string()?,
+                        target_schema_version: input.u64()?,
+                        target_schema_hash: input.string()?,
+                        step_count: input.u32()?,
+                    })
+                } else {
+                    None
+                },
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                durable_epoch: input.u64()?,
+                durable_turn_sequence: input.u64()?,
+                state_digest: input.string()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            14 => Self::ScenarioCheckpoint {
+                request_id: input.u64()?,
+                step_id: input.string()?,
+                assertion_count: input.u32()?,
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                durable_epoch: input.u64()?,
+                durable_turn_sequence: input.u64()?,
+                state_digest: input.string()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            15 => Self::PersistenceEvidence {
+                kind: PersistenceEvidenceKind::decode(input.u8()?)?,
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                durable_epoch: input.u64()?,
+                durable_turn_sequence: input.u64()?,
+                before_state_digest: input.string()?,
+                after_state_digest: input.string()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            16 => Self::ResponsiveLayoutEvidence {
+                resize_sequence: input.u64()?,
+                logical_width: input.u32()?,
+                logical_height: input.u32()?,
+                action_count: input.u32()?,
+                action_digest: input.string()?,
+                state_digest: input.string()?,
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                durable_epoch: input.u64()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            17 => Self::ProfileSample {
+                ordinal: input.u32()?,
+                input_sequence: input.u64()?,
+                callback_to_host_ns: input.u64()?,
+                editor_visible_us: input.u64()?,
+                preview_visible_us: input.u64()?,
+                compile_us: input.u64()?,
+                parent_dispatch_us: input.u64()?,
+                parent_executor_us: input.u64()?,
+                parent_runtime_document_us: input.u64()?,
+                parent_persistence_us: input.u64()?,
+                completion_us: input.u64()?,
+                completion_executor_us: input.u64()?,
+                completion_runtime_document_us: input.u64()?,
+                completion_persistence_us: input.u64()?,
+                document_us: input.u64()?,
+                interaction_us: input.u64()?,
+                demand_us: input.u64()?,
+                present_us: input.u64()?,
+                patch_count: input.u32()?,
+                full_lowered: input.bool()?,
+                interaction_frame_block_us: input.u64()?,
+                pending_child_artifacts: input.u32()?,
+                trusted_parent_rebuilds: input.u32()?,
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                editor_key: FrameEvidenceKey::decode(input)?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            18 => Self::StaleProgramRejected {
+                session: input.string()?,
+                stale_revision: input.u64()?,
+                latest_revision: input.u64()?,
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                durable_epoch: input.u64()?,
+                durable_turn_sequence: input.u64()?,
+                state_digest: input.string()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            19 => Self::ProfileInputTarget {
+                node: input.string()?,
+                source_path: input.string()?,
+                x: input.f32()?,
+                y: input.f32()?,
+                sample_count: input.u32()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            20 => Self::ProfileInputSeeded {
+                input_sequence: input.u64()?,
+                callback_to_host_ns: input.u64()?,
+                compile_us: input.u64()?,
+                pending_child_artifacts: input.u32()?,
+                editor_key: FrameEvidenceKey::decode(input)?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            21 => Self::ResponsiveResizeReady {
+                desired_width: input.u32()?,
+                desired_height: input.u32()?,
+                current_width: input.u32()?,
+                current_height: input.u32()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            22 => Self::ResponsiveResizeObserved {
+                event_sequence: input.u64()?,
+                logical_width: input.u32()?,
+                logical_height: input.u32()?,
+                previous_surface_epoch: input.u64()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            23 => Self::ScrollProofFrame {
+                ordinal: input.u32()?,
                 key: FrameEvidenceKey::decode(input)?,
             },
             _ => return Err(ObserverError::UnknownEvent(tag)),
@@ -984,6 +1569,9 @@ mod tests {
 
     fn key(frame: u64) -> FrameEvidenceKey {
         FrameEvidenceKey {
+            surface_id: "preview-surface".to_owned(),
+            process_id: 41,
+            session_id: "launch-primary".to_owned(),
             frame_id: frame,
             input_id: frame + 1,
             content_id: frame + 2,
@@ -1016,6 +1604,25 @@ mod tests {
             target: Some("dev.test".to_owned()),
             target_source_path: None,
             visible_change: true,
+        }));
+        roundtrip(ObserverEvent::RoleMetadata(RoleMetadata {
+            role: ObserverRole::Preview,
+            pid: 41,
+            surface_id: "preview-surface".to_owned(),
+            session_id: "launch-primary".to_owned(),
+            surface_epoch: 2,
+            logical_width: 390.0,
+            logical_height: 844.0,
+            physical_width: 390,
+            physical_height: 844,
+            scale: 1.0,
+            adapter_name: "adapter".to_owned(),
+            adapter_backend: "vulkan".to_owned(),
+            adapter_device_type: "discrete-gpu".to_owned(),
+            software_adapter: false,
+            surface_format: "rgba8".to_owned(),
+            present_mode: "fifo".to_owned(),
+            window_backend: "wayland".to_owned(),
         }));
         roundtrip(ObserverEvent::FramePresented(FramePresented {
             role: ObserverRole::Preview,
@@ -1076,10 +1683,142 @@ mod tests {
             runtime_sequence: 3,
             key: key(30),
         });
+        roundtrip(ObserverEvent::TestCompleted {
+            request_id: 7,
+            passed: true,
+            semantic_assertions_proven: true,
+            completed_steps: 3,
+            message: "host input and semantic assertions passed".to_owned(),
+        });
         roundtrip(ObserverEvent::SourceFailed {
             revision: 9,
             stage: "runtime-mount".to_owned(),
             message: "invalid retained document".to_owned(),
+        });
+        roundtrip(ObserverEvent::StateMounted {
+            disposition: StartupDisposition::Migrated,
+            schema_version: 2,
+            schema_hash: "a".repeat(64),
+            migration: Some(StartupMigrationEvidence {
+                source_schema_version: 1,
+                source_schema_hash: "b".repeat(64),
+                target_schema_version: 2,
+                target_schema_hash: "a".repeat(64),
+                step_count: 1,
+            }),
+            source_revision: 4,
+            runtime_sequence: 8,
+            durable_epoch: 7,
+            durable_turn_sequence: 6,
+            state_digest: "b".repeat(64),
+            key: key(40),
+        });
+        roundtrip(ObserverEvent::ScenarioCheckpoint {
+            request_id: 7,
+            step_id: "publish-success".to_owned(),
+            assertion_count: 4,
+            source_revision: 4,
+            runtime_sequence: 9,
+            durable_epoch: 8,
+            durable_turn_sequence: 7,
+            state_digest: "c".repeat(64),
+            key: key(41),
+        });
+        roundtrip(ObserverEvent::PersistenceEvidence {
+            kind: PersistenceEvidenceKind::ImportActivated,
+            source_revision: 4,
+            runtime_sequence: 10,
+            durable_epoch: 9,
+            durable_turn_sequence: 8,
+            before_state_digest: "d".repeat(64),
+            after_state_digest: "e".repeat(64),
+            key: key(42),
+        });
+        roundtrip(ObserverEvent::ResponsiveLayoutEvidence {
+            resize_sequence: 12,
+            logical_width: 390,
+            logical_height: 844,
+            action_count: 12,
+            action_digest: "f".repeat(64),
+            state_digest: "0".repeat(64),
+            source_revision: 4,
+            runtime_sequence: 10,
+            durable_epoch: 9,
+            key: key(43),
+        });
+        roundtrip(ObserverEvent::ProfileSample {
+            ordinal: 17,
+            input_sequence: 18,
+            callback_to_host_ns: 900,
+            editor_visible_us: 1_200,
+            preview_visible_us: 4_200,
+            compile_us: 1_900,
+            parent_dispatch_us: 900,
+            parent_executor_us: 500,
+            parent_runtime_document_us: 300,
+            parent_persistence_us: 20,
+            completion_us: 700,
+            completion_executor_us: 350,
+            completion_runtime_document_us: 220,
+            completion_persistence_us: 15,
+            document_us: 600,
+            interaction_us: 100,
+            demand_us: 50,
+            present_us: 500,
+            patch_count: 4,
+            full_lowered: false,
+            interaction_frame_block_us: 2_100,
+            pending_child_artifacts: 1,
+            trusted_parent_rebuilds: 0,
+            source_revision: 4,
+            runtime_sequence: 11,
+            editor_key: key(43),
+            key: key(44),
+        });
+        roundtrip(ObserverEvent::ProfileInputTarget {
+            node: "source-editor".to_owned(),
+            source_path: "store.elements.source_editor".to_owned(),
+            x: 120.0,
+            y: 80.0,
+            sample_count: 120,
+            key: key(45),
+        });
+        roundtrip(ObserverEvent::ProfileInputSeeded {
+            input_sequence: 19,
+            callback_to_host_ns: 700,
+            compile_us: 800,
+            pending_child_artifacts: 1,
+            editor_key: key(46),
+            key: key(47),
+        });
+        roundtrip(ObserverEvent::ResponsiveResizeReady {
+            desired_width: 390,
+            desired_height: 844,
+            current_width: 960,
+            current_height: 844,
+            key: key(48),
+        });
+        roundtrip(ObserverEvent::ResponsiveResizeObserved {
+            event_sequence: 20,
+            logical_width: 390,
+            logical_height: 844,
+            previous_surface_epoch: 2,
+            key: key(49),
+        });
+        roundtrip(ObserverEvent::ScrollProofFrame {
+            ordinal: 21,
+            key: key(50),
+        });
+        roundtrip(ObserverEvent::StaleProgramRejected {
+            session: "profile-draft".to_owned(),
+            stale_revision: 11,
+            latest_revision: 12,
+            source_revision: 4,
+            runtime_sequence: 12,
+            durable_epoch: 10,
+            durable_turn_sequence: 9,
+            state_digest: "1".repeat(64),
+            key: key(45),
         });
     }
 
@@ -1087,6 +1826,18 @@ mod tests {
     fn evidence_key_rejects_zero_identity_components() {
         assert!(key(1).is_complete());
         assert!(!key(0).is_complete());
+        let mut missing_surface = key(1);
+        missing_surface.surface_id.clear();
+        assert!(!missing_surface.is_complete());
+        let mut missing_process = key(1);
+        missing_process.process_id = 0;
+        assert!(!missing_process.is_complete());
+        let mut missing_session = key(1);
+        missing_session.session_id.clear();
+        assert!(!missing_session.is_complete());
+        let mut restart = key(1);
+        restart.session_id = "launch-restart".to_owned();
+        assert!(!key(1).same_producer_surface(&restart));
     }
 
     #[test]

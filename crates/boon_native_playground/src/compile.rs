@@ -36,6 +36,7 @@ pub struct CompiledPreview {
     pub elapsed: Duration,
     pub source_key: String,
     pub plan: Arc<MachinePlan>,
+    pub units: Vec<SourceUnit>,
     pub test_steps: Vec<TestStep>,
 }
 
@@ -102,12 +103,26 @@ impl Drop for CompileWorker {
 pub struct ProgramCompileOutcome {
     pub request_id: ProgramRequestId,
     pub session: ProgramSessionId,
+    pub revision: u64,
+    pub elapsed: Duration,
+    pub pending_depth: u32,
     pub result: Result<ProgramArtifact, ProgramDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramCompileReceipt {
+    pub accepted: bool,
+    pub pending_depth: u32,
+}
+
+struct PendingProgramCompile {
+    request: ProgramHostRequest,
+    pending_depth: u32,
 }
 
 #[derive(Default)]
 struct ProgramCompileState {
-    pending: BTreeMap<ProgramSessionId, ProgramHostRequest>,
+    pending: BTreeMap<ProgramSessionId, PendingProgramCompile>,
     closing: bool,
     replaced: u64,
 }
@@ -135,17 +150,44 @@ impl ProgramCompileWorker {
         )
     }
 
-    pub fn replace(&self, request: ProgramHostRequest) {
+    pub fn replace(&self, request: ProgramHostRequest) -> ProgramCompileReceipt {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().expect("program compile worker lock");
-        if state
-            .pending
-            .insert(request.session.clone(), request)
-            .is_some()
-        {
+        let replace = state.pending.get(&request.session).is_none_or(|current| {
+            (request.compile.revision, request.request_id.0.as_str())
+                > (
+                    current.request.compile.revision,
+                    current.request.request_id.0.as_str(),
+                )
+        });
+        if state.pending.contains_key(&request.session) {
             state.replaced = state.replaced.saturating_add(1);
         }
-        wake.notify_one();
+        if replace {
+            let session = request.session.clone();
+            state.pending.insert(
+                session.clone(),
+                PendingProgramCompile {
+                    request,
+                    pending_depth: 0,
+                },
+            );
+            let pending_depth = state.pending.len().try_into().unwrap_or(u32::MAX);
+            state
+                .pending
+                .get_mut(&session)
+                .expect("inserted child program compile")
+                .pending_depth = pending_depth;
+            wake.notify_one();
+            return ProgramCompileReceipt {
+                accepted: true,
+                pending_depth,
+            };
+        }
+        ProgramCompileReceipt {
+            accepted: false,
+            pending_depth: state.pending.len().try_into().unwrap_or(u32::MAX),
+        }
     }
 
     #[cfg(test)]
@@ -194,13 +236,23 @@ fn program_compile_loop(
                 .remove(&session)
                 .expect("program compile request")
         };
+        let PendingProgramCompile {
+            request,
+            pending_depth,
+        } = request;
         let request_id = request.request_id;
         let session = request.session;
+        let revision = request.compile.revision;
+        let started = Instant::now();
         let result = compile_program_artifact(&request.compile);
+        let elapsed = started.elapsed();
         if output
             .unbounded_send(ProgramCompileOutcome {
                 request_id,
                 session,
+                revision,
+                elapsed,
+                pending_depth,
                 result,
             })
             .is_err()
@@ -287,6 +339,7 @@ fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
         elapsed: started.elapsed(),
         source_key,
         plan,
+        units: request.units,
         test_steps: request.test_steps,
     })
 }
@@ -414,7 +467,7 @@ mod tests {
         };
         let host = boon_document_model::DocumentNodeId("program-host".to_owned());
         let session = ProgramSessionId("public-page".to_owned());
-        for revision in 1..=4 {
+        for revision in [4, 1, 3, 2] {
             worker.replace(ProgramHostRequest {
                 request_id: ProgramRequestId(format!("request-{revision}")),
                 session: session.clone(),
@@ -430,13 +483,16 @@ mod tests {
                     capability_profile:
                         boon_document_model::ProgramCapabilityProfile::PublicDocument,
                 },
+                artifact_id: None,
+                persist_artifact: false,
             });
         }
 
         assert_eq!(worker.replaced_count(), 3);
         let state = worker.state.0.lock().unwrap();
         assert_eq!(state.pending.len(), 1);
-        assert_eq!(state.pending[&session].compile.revision, 4);
+        assert_eq!(state.pending[&session].request.compile.revision, 4);
+        assert_eq!(state.pending[&session].pending_depth, 1);
     }
 
     #[test]

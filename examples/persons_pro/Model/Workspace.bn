@@ -1,7 +1,9 @@
 FUNCTION publish_label(state, revision) {
     state |> WHEN {
         Draft => TEXT { Draft r{revision} }
+        Building => TEXT { Building r{revision} }
         Published => TEXT { Published r{revision} }
+        Failed => TEXT { Publish failed }
         __ => TEXT { Draft }
     }
 }
@@ -9,13 +11,45 @@ FUNCTION publish_label(state, revision) {
 FUNCTION publish_tone(state) {
     state |> WHEN {
         Published => Success
+        Failed => Danger
         __ => Warning
     }
 }
 
-FUNCTION public_label(state, name) {
-    state |> WHEN {
-        Published => TEXT { Public revision: {name} }
-        __ => TEXT { No public revision yet }
+FUNCTION public_label(has_published_revision, revision) {
+    has_published_revision |> WHEN {
+        True => TEXT { Public revision r{revision} }
+        False => TEXT { No public revision yet }
     }
+}
+
+FUNCTION compile_label(state, revision) {
+    state |> WHEN {
+        Ready => TEXT { Ready r{revision} }
+        Compiling => TEXT { Compiling r{revision} }
+        Invalid => TEXT { Invalid r{revision} }
+        __ => TEXT { Compiling }
+    }
+}
+
+FUNCTION compile_tone(state) {
+    state |> WHEN {
+        Ready => Success
+        Invalid => Danger
+        __ => Neutral
+    }
+}
+
+FUNCTION published_revision(revision) {
+    [
+        request: revision.request
+        draft_revision: revision.draft_revision
+        source: revision.source
+        source_digest: revision.source_digest
+        artifact_id: revision.artifact_id
+        plan_digest: revision.plan_digest
+        compiler: revision.compiler
+        target: revision.target
+        capability_profile: revision.capability_profile
+    ]
 }

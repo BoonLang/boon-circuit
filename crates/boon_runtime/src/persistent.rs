@@ -4,16 +4,19 @@ use super::effects::{
 };
 use super::{DocumentPatch, LiveRuntime, RuntimeTurn};
 use boon_persistence::{
-    ActivationAck, ActivationBatch, AuthorityTurn, BarrierAck, CommitAck, CompactAck, DecodeLimits,
-    DurableOutboxItem, DurableOutboxState, OutboxItemId, PersistenceControlError,
-    PersistenceCoordinator, PersistenceDriver, PersistenceInspectorSnapshot, PersistenceStartup,
-    PersistenceWorkerConfig, PersistenceWorkerStartError, PersistenceWorkerStatus,
-    ResetApplicationAck, ResetApplicationBatch, StoredValue, TurnEnqueueError,
-    TurnReservationError, decode_restore_image, encode_restore_image, stage_migration,
+    ActivationAck, ActivationBatch, AuthorityTurn, BarrierAck, CommitAck, CompactAck,
+    ContentArtifact, ContentArtifactId, ContentArtifactStoreCompletion,
+    ContentArtifactStoreEnqueueError, ContentArtifactStoreTicket, DecodeLimits,
+    DurableOutboxChange, DurableOutboxItem, DurableOutboxState, OutboxItemId,
+    PersistenceControlError, PersistenceCoordinator, PersistenceDriver,
+    PersistenceInspectorSnapshot, PersistenceWorkerConfig, PersistenceWorkerStartError,
+    PersistenceWorkerStatus, PutContentArtifactAck, ResetApplicationAck, ResetApplicationBatch,
+    RestoreImage, StoredValue, TurnEnqueueError, TurnReservationError,
+    apply_durable_outbox_changes, decode_restore_image, encode_restore_image, stage_migration,
 };
 use boon_plan::{MachinePlan, MemoryKind};
 use boon_plan_executor::{SessionOptions, SourceEvent, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -122,7 +125,6 @@ pub struct EffectWorkItem {
 
 #[derive(Debug)]
 pub enum PersistentEffectError {
-    Persistence(PersistenceControlError),
     Runtime(String),
     MissingItem(OutboxItemId),
     CommitFailed {
@@ -134,7 +136,6 @@ pub enum PersistentEffectError {
 impl fmt::Display for PersistentEffectError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Persistence(error) => write!(formatter, "effect persistence failed: {error}"),
             Self::Runtime(detail) => write!(formatter, "effect runtime failed: {detail}"),
             Self::MissingItem(item) => write!(formatter, "outbox item {item} does not exist"),
             Self::CommitFailed {
@@ -204,7 +205,79 @@ impl std::error::Error for PersistentActivationError {}
 pub struct PersistentRuntime {
     runtime: LiveRuntime,
     persistence: PersistenceCoordinator,
+    effect_work: EffectWorkIndex,
     last_rebuild_derived_us: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct EffectWorkIndex {
+    items: BTreeMap<OutboxItemId, DurableOutboxItem>,
+    unfinished_count: usize,
+}
+
+impl EffectWorkIndex {
+    fn from_items(items: BTreeMap<OutboxItemId, DurableOutboxItem>) -> Self {
+        let unfinished_count = items
+            .values()
+            .filter(|item| !matches!(item.state, DurableOutboxState::Completed { .. }))
+            .count();
+        Self {
+            items,
+            unfinished_count,
+        }
+    }
+
+    fn applying(&self, changes: &[DurableOutboxChange]) -> Result<Self, String> {
+        if changes.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut items = self.items.clone();
+        apply_durable_outbox_changes(&mut items, changes).map_err(|error| error.to_string())?;
+        Ok(Self::from_items(items))
+    }
+
+    fn has_work(&self) -> bool {
+        self.unfinished_count != 0
+    }
+
+    fn work_items(&self) -> Vec<EffectWorkItem> {
+        self.items.values().filter_map(effect_work_item).collect()
+    }
+
+    fn next_work(&self) -> Option<EffectWorkItem> {
+        self.items.values().find_map(effect_work_item)
+    }
+
+    fn item(&self, item_id: OutboxItemId) -> Option<&DurableOutboxItem> {
+        self.items.get(&item_id)
+    }
+}
+
+fn effect_work_item(item: &DurableOutboxItem) -> Option<EffectWorkItem> {
+    let kind = match item.state {
+        DurableOutboxState::Pending => EffectWorkKind::Dispatch,
+        DurableOutboxState::Dispatching { .. }
+        | DurableOutboxState::ReconciliationRequired { .. } => EffectWorkKind::Reconcile,
+        DurableOutboxState::Completed { .. } => return None,
+    };
+    Some(EffectWorkItem {
+        kind,
+        item: item.clone(),
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PersistentRuntimeStartupDisposition {
+    Fresh,
+    Restored,
+    Migrated(boon_persistence::MigrationPreview),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistentRuntimeStartup {
+    pub restore_image: RestoreImage,
+    pub disposition: PersistentRuntimeStartupDisposition,
 }
 
 pub struct PersistentPlanActivation {
@@ -252,7 +325,7 @@ impl PersistentRuntime {
         options: SessionOptions,
         driver: D,
         config: PersistenceWorkerConfig,
-    ) -> Result<(Self, PersistenceStartup), PersistentRuntimeStartError>
+    ) -> Result<(Self, PersistentRuntimeStartup), PersistentRuntimeStartError>
     where
         D: PersistenceDriver + Send + 'static,
     {
@@ -264,7 +337,7 @@ impl PersistentRuntime {
         options: SessionOptions,
         driver: D,
         config: PersistenceWorkerConfig,
-    ) -> Result<(Self, PersistenceStartup), PersistentRuntimeStartError>
+    ) -> Result<(Self, PersistentRuntimeStartup), PersistentRuntimeStartError>
     where
         D: PersistenceDriver + Send + 'static,
     {
@@ -280,8 +353,8 @@ impl PersistentRuntime {
             PersistenceCoordinator::start(driver, initial_image, config)
                 .map_err(PersistentRuntimeStartError::Persistence)?;
 
-        let runtime = if startup.initialized {
-            default_runtime
+        let (runtime, disposition) = if startup.initialized {
+            (default_runtime, PersistentRuntimeStartupDisposition::Fresh)
         } else if startup.restore_image.schema_version == plan.persistence.schema_version
             && startup.restore_image.schema_hash == plan.persistence.schema_hash
         {
@@ -293,7 +366,7 @@ impl PersistentRuntime {
             )
             .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
             last_rebuild_derived_us = duration_us(rebuild_started.elapsed());
-            runtime
+            (runtime, PersistentRuntimeStartupDisposition::Restored)
         } else {
             let staged = match stage_migration(&startup.restore_image, &plan) {
                 Ok(staged) => staged,
@@ -322,17 +395,28 @@ impl PersistentRuntime {
                     return Err(PersistentRuntimeStartError::Activation(error));
                 }
             };
+            let preview = staged.preview;
             startup.restore_image = staged.candidate;
             startup.restore_image.epoch = acknowledgement.epoch;
-            startup.initialized = false;
-            candidate
+            (
+                candidate,
+                PersistentRuntimeStartupDisposition::Migrated(preview),
+            )
         };
+
+        let startup = PersistentRuntimeStartup {
+            restore_image: startup.restore_image,
+            disposition,
+        };
+        let effect_work = EffectWorkIndex::from_items(startup.restore_image.outbox.clone());
 
         Ok((
             Self {
                 runtime,
                 persistence,
+                effect_work,
                 last_rebuild_derived_us,
+                generation: 1,
             },
             startup,
         ))
@@ -388,6 +472,7 @@ impl PersistentRuntime {
             .runtime
             .dispatch_unsettled(event)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
+        let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
             .with_outbox_changes(turn.outbox_changes.clone());
@@ -408,6 +493,7 @@ impl PersistentRuntime {
                 });
             }
             turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+            self.effect_work = next_effect_work.expect("effect changes staged an outbox index");
             self.runtime.settle_turn();
             return Ok(turn);
         }
@@ -442,6 +528,7 @@ impl PersistentRuntime {
             .runtime
             .dispatch_unsettled(event)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
+        let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
             .with_outbox_changes(turn.outbox_changes.clone());
@@ -463,11 +550,39 @@ impl PersistentRuntime {
             }
         };
         turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+        if let Some(next_effect_work) = next_effect_work {
+            self.effect_work = next_effect_work;
+        }
         self.runtime.settle_turn();
         Ok(DurablyAcknowledgedTurn {
             turn,
             acknowledgement,
         })
+    }
+
+    fn stage_effect_work_for_unsettled_turn(
+        &mut self,
+        turn: &RuntimeTurn,
+    ) -> Result<Option<EffectWorkIndex>, PersistentDispatchError> {
+        if turn.outbox_changes.is_empty() {
+            return Ok(None);
+        }
+        match self.effect_work.applying(&turn.outbox_changes) {
+            Ok(next) => Ok(Some(next)),
+            Err(error) => {
+                let rollback_error = self
+                    .runtime
+                    .rollback_unsettled_turn()
+                    .err()
+                    .map(|error| error.to_string());
+                let rollback = rollback_error.map_or_else(String::new, |rollback| {
+                    format!("; runtime rollback also failed: {rollback}")
+                });
+                Err(PersistentDispatchError::Runtime(format!(
+                    "runtime produced invalid durable effect transitions: {error}{rollback}"
+                )))
+            }
+        }
     }
 
     pub fn status(&self) -> PersistenceWorkerStatus {
@@ -476,6 +591,10 @@ impl PersistentRuntime {
 
     pub fn last_rebuild_derived_us(&self) -> u64 {
         self.last_rebuild_derived_us
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn barrier(&self) -> Result<BarrierAck, PersistenceControlError> {
@@ -488,6 +607,31 @@ impl PersistentRuntime {
 
     pub fn compact(&self) -> Result<CompactAck, PersistenceControlError> {
         self.persistence.compact()
+    }
+
+    pub fn put_content_artifact(
+        &self,
+        artifact: ContentArtifact,
+    ) -> Result<PutContentArtifactAck, PersistenceControlError> {
+        self.persistence.put_content_artifact(artifact)
+    }
+
+    pub fn try_put_content_artifact(
+        &self,
+        artifact: ContentArtifact,
+    ) -> Result<ContentArtifactStoreTicket, ContentArtifactStoreEnqueueError> {
+        self.persistence.try_put_content_artifact(artifact)
+    }
+
+    pub fn take_content_artifact_store_completions(&self) -> Vec<ContentArtifactStoreCompletion> {
+        self.persistence.take_content_artifact_store_completions()
+    }
+
+    pub fn load_content_artifact(
+        &self,
+        id: ContentArtifactId,
+    ) -> Result<Option<ContentArtifact>, PersistenceControlError> {
+        self.persistence.load_content_artifact(id)
     }
 
     pub fn inspect(&self) -> Result<Option<PersistenceInspectorSnapshot>, PersistenceControlError> {
@@ -700,43 +844,24 @@ impl PersistentRuntime {
         self.persistence.load()
     }
 
+    /// Returns whether acknowledged durable effect work is ready locally.
+    ///
+    /// This is the scheduler hot-path query. It never talks to the persistence
+    /// worker; restart recovery initialized the index from the durable image,
+    /// and successful outbox commits advance it in lockstep.
+    pub fn has_effect_work(&self) -> bool {
+        self.effect_work.has_work()
+    }
+
     pub fn effect_work_items(&self) -> Result<Vec<EffectWorkItem>, PersistentEffectError> {
-        let image = self
-            .persistence
-            .load()
-            .map_err(PersistentEffectError::Persistence)?
-            .ok_or_else(|| {
-                PersistentEffectError::Runtime(
-                    "persistence worker has no durable application state".to_owned(),
-                )
-            })?;
-        Ok(image
-            .outbox
-            .into_values()
-            .filter_map(|item| {
-                let kind = match item.state {
-                    DurableOutboxState::Pending => EffectWorkKind::Dispatch,
-                    DurableOutboxState::Dispatching { .. }
-                    | DurableOutboxState::ReconciliationRequired { .. } => {
-                        EffectWorkKind::Reconcile
-                    }
-                    DurableOutboxState::Completed { .. } => return None,
-                };
-                Some(EffectWorkItem { kind, item })
-            })
-            .collect())
+        Ok(self.effect_work.work_items())
     }
 
     pub fn drive_effect_work_once(
         &mut self,
         driver: &mut impl HostEffectDriver,
     ) -> Result<Option<RuntimeTurn>, PersistentEffectDriveError> {
-        let Some(work) = self
-            .effect_work_items()
-            .map_err(PersistentEffectDriveError::Runtime)?
-            .into_iter()
-            .next()
-        else {
+        let Some(work) = self.effect_work.next_work() else {
             return Ok(None);
         };
         match work.kind {
@@ -821,12 +946,7 @@ impl PersistentRuntime {
         if worker.is_busy() {
             return Ok(None);
         }
-        let Some(work) = self
-            .effect_work_items()
-            .map_err(PersistentEffectDriveError::Runtime)?
-            .into_iter()
-            .next()
-        else {
+        let Some(work) = self.effect_work.next_work() else {
             return Ok(None);
         };
         match work.kind {
@@ -943,14 +1063,29 @@ impl PersistentRuntime {
         &self,
         item_id: OutboxItemId,
     ) -> Result<DurableOutboxItem, PersistentEffectError> {
-        self.persistence
-            .load()
-            .map_err(PersistentEffectError::Persistence)?
-            .and_then(|image| image.outbox.get(&item_id).cloned())
+        self.effect_work
+            .item(item_id)
+            .cloned()
             .ok_or(PersistentEffectError::MissingItem(item_id))
     }
 
     fn commit_effect_turn(&mut self, turn: &RuntimeTurn) -> Result<(), PersistentEffectError> {
+        let next_effect_work = match self.effect_work.applying(&turn.outbox_changes) {
+            Ok(next) => next,
+            Err(error) => {
+                let rollback_error = self
+                    .runtime
+                    .rollback_unsettled_turn()
+                    .err()
+                    .map(|error| error.to_string());
+                let rollback = rollback_error.map_or_else(String::new, |rollback| {
+                    format!("; runtime rollback also failed: {rollback}")
+                });
+                return Err(PersistentEffectError::Runtime(format!(
+                    "runtime produced invalid durable effect transitions: {error}{rollback}"
+                )));
+            }
+        };
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
             .with_outbox_changes(turn.outbox_changes.clone());
         if let Err(error) = self.persistence.commit_immediate(authority) {
@@ -964,6 +1099,7 @@ impl PersistentRuntime {
                 rollback_error,
             });
         }
+        self.effect_work = next_effect_work;
         Ok(())
     }
 
@@ -990,6 +1126,7 @@ impl PersistentRuntime {
             .activate(batch)
             .map_err(PersistentActivationError::Persistence)?;
         self.runtime = candidate;
+        self.generation = self.generation.saturating_add(1);
         Ok(acknowledgement)
     }
 
@@ -1035,6 +1172,7 @@ impl PersistentRuntime {
             .map_err(PersistentActivationError::Persistence)?;
         self.runtime = candidate;
         self.last_rebuild_derived_us = rebuild_derived_us;
+        self.generation = self.generation.saturating_add(1);
         Ok(PersistentPlanActivation {
             mount,
             acknowledgement,
@@ -1101,6 +1239,7 @@ impl PersistentRuntime {
             .load()
             .map_err(PersistentActivationError::Persistence)?
             .ok_or(PersistentActivationError::MissingDurableState)?;
+        reject_unfinished_outbox(&current, "start over")?;
         let defaults = LiveRuntime::from_shared_machine_plan(Arc::clone(&plan), options.clone())
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         let default_image = defaults
@@ -1137,7 +1276,9 @@ impl PersistentRuntime {
             .reset_application(batch)
             .map_err(PersistentActivationError::Persistence)?;
         self.runtime = candidate;
+        self.effect_work = EffectWorkIndex::default();
         self.last_rebuild_derived_us = rebuild_derived_us;
+        self.generation = self.generation.saturating_add(1);
         Ok(PersistentPlanReset {
             mount,
             acknowledgement,
@@ -1191,7 +1332,7 @@ mod tests {
     use boon_plan_executor::SourcePayload;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FailingActivationDriver {
         inner: InMemoryDriver,
@@ -1215,10 +1356,14 @@ mod tests {
     struct SharedPersistenceDriver {
         inner: Arc<Mutex<InMemoryDriver>>,
         fail_next_commit: Arc<AtomicBool>,
+        load_count: Arc<AtomicUsize>,
     }
 
     impl PersistenceDriver for SharedPersistenceDriver {
         fn execute(&mut self, command: PersistenceCommand) -> PersistenceResult {
+            if matches!(command, PersistenceCommand::Load(_)) {
+                self.load_count.fetch_add(1, Ordering::AcqRel);
+            }
             if matches!(command, PersistenceCommand::Shutdown(_)) {
                 return PersistenceResult::ShutdownComplete(Ok(ShutdownAck));
             }
@@ -1319,7 +1464,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(startup.initialized);
+        assert_eq!(runtime.generation(), 1);
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Fresh
+        );
 
         let event = runtime
             .runtime()
@@ -1341,6 +1490,46 @@ mod tests {
         let inspection = runtime.inspect().unwrap().unwrap();
         assert_eq!(inspection.through_turn_sequence, 1);
         assert_eq!(inspection.scalar_count, 1);
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn ordinary_dispatch_and_effect_schedule_query_do_not_load_durable_state() {
+        let compiled = LiveRuntime::from_source_with_identity(
+            "persistent-counter-no-effect-load.bn",
+            include_str!("../../../examples/counter.bn"),
+            boon_plan::ApplicationIdentity::new(
+                "dev.boon.persistent-no-effect-load",
+                "test",
+                "local",
+            ),
+        )
+        .unwrap();
+        let storage = SharedPersistenceDriver::default();
+        let load_count = Arc::clone(&storage.load_count);
+        let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
+            compiled.shared_machine_plan(),
+            SessionOptions::default(),
+            storage,
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        let startup_loads = load_count.load(Ordering::Acquire);
+
+        let event = runtime
+            .runtime()
+            .source_event(
+                1,
+                "store.sources.increment_button.press",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        runtime.dispatch(event).unwrap();
+        assert!(!runtime.has_effect_work());
+        assert!(runtime.effect_work_items().unwrap().is_empty());
+        assert_eq!(load_count.load(Ordering::Acquire), startup_loads);
+
         runtime.shutdown().unwrap();
     }
 
@@ -1459,7 +1648,10 @@ mod tests {
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
-        assert!(!startup.initialized);
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Restored
+        );
         assert!(
             restored
                 .runtime
@@ -1543,7 +1735,10 @@ mod tests {
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
-        assert!(!startup.initialized);
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Restored
+        );
         assert_eq!(
             restored
                 .runtime
@@ -1618,7 +1813,10 @@ mod tests {
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
-        assert!(!startup.initialized);
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Restored
+        );
         let Value::List(rows) = restored.inspect_value_current("todo.title", 8).unwrap() else {
             panic!("todo.title inspection must return row values");
         };
@@ -1696,7 +1894,10 @@ mod tests {
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
-        assert!(!startup.initialized);
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Restored
+        );
         for (path, expected) in [
             ("store.locale", Value::Text("nb-NO".to_owned())),
             ("store.basemap", Value::Text("Satellite".to_owned())),
@@ -1729,6 +1930,7 @@ mod tests {
         );
         let plan = effect_plan(identity);
         let storage = SharedPersistenceDriver::default();
+        let load_count = Arc::clone(&storage.load_count);
         let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
             Arc::clone(&plan),
             SessionOptions::default(),
@@ -1736,11 +1938,18 @@ mod tests {
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
-        assert!(startup.initialized);
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Fresh
+        );
         assert_eq!(
             runtime.runtime.root_value_current("store.result").unwrap(),
             Value::Text("not written".to_owned())
         );
+        let startup_loads = load_count.load(Ordering::Acquire);
+        assert!(!runtime.has_effect_work());
+        assert!(runtime.effect_work_items().unwrap().is_empty());
+        assert_eq!(load_count.load(Ordering::Acquire), startup_loads);
 
         let turn = runtime.dispatch(effect_source_event(&runtime, 1)).unwrap();
         assert_eq!(turn.source_sequence, Some(1));
@@ -1752,11 +1961,14 @@ mod tests {
         let pending = runtime.effect_work_items().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].kind, EffectWorkKind::Dispatch);
+        assert!(runtime.has_effect_work());
+        assert_eq!(load_count.load(Ordering::Acquire), startup_loads);
         assert!(matches!(
             runtime.clear_authority_path("store.result", SessionOptions::default()),
             Err(PersistentActivationError::Runtime(detail))
                 if detail.contains("effects are unfinished")
         ));
+        let before_claim_loads = load_count.load(Ordering::Acquire);
 
         let claimed = runtime
             .claim_effect_for_dispatch(pending[0].item.item_id)
@@ -1765,6 +1977,7 @@ mod tests {
             claimed.state,
             DurableOutboxState::Dispatching { attempt: 1 }
         ));
+        assert_eq!(load_count.load(Ordering::Acquire), before_claim_loads);
         let mut host = RecordingEffectDriver::default();
         host.dispatch(&HostEffectRequest::from(&claimed)).unwrap();
         runtime.shutdown().unwrap();
@@ -1776,7 +1989,11 @@ mod tests {
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
-        assert!(!startup.initialized);
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Restored
+        );
+        let restart_loads = load_count.load(Ordering::Acquire);
         assert_eq!(
             restarted
                 .runtime
@@ -1788,6 +2005,8 @@ mod tests {
             restarted.effect_work_items().unwrap()[0].kind,
             EffectWorkKind::Reconcile
         );
+        assert!(restarted.has_effect_work());
+        assert_eq!(load_count.load(Ordering::Acquire), restart_loads);
 
         let completion = restarted
             .drive_effect_work_once(&mut host)
@@ -1804,7 +2023,10 @@ mod tests {
             Value::Text("output.bin".to_owned())
         );
         assert!(restarted.effect_work_items().unwrap().is_empty());
+        assert!(!restarted.has_effect_work());
+        assert_eq!(load_count.load(Ordering::Acquire), restart_loads);
         let durable = restarted.load_durable_image().unwrap().unwrap();
+        assert_eq!(load_count.load(Ordering::Acquire), restart_loads + 1);
         assert!(matches!(
             durable.outbox.values().next().map(|item| &item.state),
             Some(DurableOutboxState::Completed { attempt: 1, .. })
@@ -2071,6 +2293,7 @@ mod tests {
             .unwrap();
         runtime.dispatch(increment).unwrap();
         runtime.barrier().unwrap();
+        assert_eq!(runtime.generation(), 1);
         let before = runtime.load_durable_image().unwrap().unwrap();
         assert_eq!(before.through_turn_sequence, 1);
         assert!(!before.scalars.is_empty());
@@ -2078,6 +2301,7 @@ mod tests {
         let reset = runtime
             .start_over_machine_plan(Arc::clone(&plan), SessionOptions::default())
             .unwrap();
+        assert_eq!(runtime.generation(), 2);
         assert_eq!(reset.acknowledgement.epoch, before.epoch + 1);
         assert_eq!(reset.acknowledgement.through_turn_sequence, 1);
         let after = runtime.load_durable_image().unwrap().unwrap();
@@ -2103,6 +2327,7 @@ mod tests {
             .unwrap();
         runtime.dispatch(increment).unwrap();
         runtime.barrier().unwrap();
+        assert_eq!(runtime.generation(), 2);
         assert_eq!(
             runtime
                 .load_durable_image()
@@ -2111,6 +2336,48 @@ mod tests {
                 .through_turn_sequence,
             2
         );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn start_over_rejects_unfinished_consequential_effects() {
+        let identity = boon_plan::ApplicationIdentity::new(
+            "dev.boon.persistent-start-over-effect",
+            "test",
+            "local",
+        );
+        let plan = effect_plan(identity);
+        let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(&plan),
+            SessionOptions::default(),
+            InMemoryDriver::default(),
+            PersistenceWorkerConfig {
+                coalesce_delay: std::time::Duration::ZERO,
+                ..PersistenceWorkerConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(runtime.generation(), 1);
+        runtime.dispatch(effect_source_event(&runtime, 1)).unwrap();
+        runtime.barrier().unwrap();
+        let before = runtime.load_durable_image().unwrap().unwrap();
+        assert!(
+            before
+                .outbox
+                .values()
+                .any(|item| !matches!(item.state, DurableOutboxState::Completed { .. }))
+        );
+
+        let error = match runtime.start_over_machine_plan(plan, SessionOptions::default()) {
+            Ok(_) => panic!("start over must reject an unfinished effect"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("cannot start over while consequential effects are unfinished")
+        );
+        assert_eq!(runtime.load_durable_image().unwrap(), Some(before));
         runtime.shutdown().unwrap();
     }
 
@@ -2151,6 +2418,7 @@ mod tests {
         let artifact = runtime.export_state_artifact().unwrap();
         runtime.dispatch(increment(&runtime, 2)).unwrap();
         runtime.barrier().unwrap();
+        assert_eq!(runtime.generation(), 1);
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
             Value::Number(2)
@@ -2170,6 +2438,7 @@ mod tests {
         let activation = runtime
             .activate_state_artifact(&artifact, SessionOptions::default())
             .unwrap();
+        assert_eq!(runtime.generation(), 2);
         assert!(activation.acknowledgement.epoch > 0);
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
@@ -2178,6 +2447,7 @@ mod tests {
         runtime
             .clear_authority_path("store.count", SessionOptions::default())
             .unwrap();
+        assert_eq!(runtime.generation(), 3);
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
             Value::Number(0)
@@ -2191,5 +2461,81 @@ mod tests {
                 .is_empty()
         );
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn persistent_runtime_restores_bare_root_latest_without_storing_derived_fields() {
+        let compiled = LiveRuntime::from_source_with_identity(
+            "persistent-root-latest.bn",
+            r#"
+store: [
+    pulse: SOURCE
+    count:
+        LATEST {
+            0
+            pulse |> THEN { count + 1 }
+        }
+    transient:
+        LATEST {
+            pulse |> THEN { count + 10 }
+        }
+    derived: count + 20
+]
+"#,
+            boon_plan::ApplicationIdentity::new("dev.boon.persistent-root-latest", "test", "local"),
+        )
+        .unwrap();
+        let plan = compiled.shared_machine_plan();
+        assert_eq!(
+            plan.persistence
+                .memory
+                .iter()
+                .map(|memory| memory.semantic_path.as_str())
+                .collect::<Vec<_>>(),
+            ["store.count"]
+        );
+        let storage = SharedPersistenceDriver::default();
+        let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(&plan),
+            SessionOptions::default(),
+            storage.clone(),
+            PersistenceWorkerConfig {
+                coalesce_delay: std::time::Duration::ZERO,
+                ..PersistenceWorkerConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Fresh
+        );
+        let pulse = runtime
+            .runtime()
+            .source_event(1, "store.pulse", None, SourcePayload::default())
+            .unwrap();
+        runtime.dispatch(pulse).unwrap();
+        runtime.barrier().unwrap();
+        let durable = runtime.load_durable_image().unwrap().unwrap();
+        assert_eq!(durable.scalars.len(), 1);
+        assert_eq!(durable.through_turn_sequence, 1);
+        runtime.shutdown().unwrap();
+
+        let (mut restored, startup) = PersistentRuntime::from_shared_machine_plan(
+            plan,
+            SessionOptions::default(),
+            storage,
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            startup.disposition,
+            PersistentRuntimeStartupDisposition::Restored
+        );
+        assert_eq!(startup.restore_image.scalars.len(), 1);
+        assert_eq!(
+            restored.runtime.root_value_current("store.count").unwrap(),
+            Value::Number(1)
+        );
+        restored.shutdown().unwrap();
     }
 }

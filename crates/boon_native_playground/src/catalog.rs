@@ -164,41 +164,50 @@ fn load_migration_bundle(
 }
 
 fn ordinary_test_steps(path: &str) -> RuntimeResult<Vec<TestStep>> {
-    Ok(boon_runtime::parse_scenario(Path::new(path))?
+    boon_runtime::parse_scenario(Path::new(path))?
         .steps
         .into_iter()
-        .filter_map(|step| {
-            step.user_action_kind
-                .zip(step.source_event)
-                .map(|(action_kind, event)| {
-                    (
-                        Some(action_kind),
-                        step.user_action_text,
-                        step.user_action_key,
-                        event,
-                    )
-                })
+        .filter_map(|step| match (step.user_action_kind, step.source_event) {
+            (Some(action_kind), Some(event)) => Some(Ok({
+                let pointer_x = payload_field_text(&event.payload, "pointer_x");
+                let pointer_y = payload_field_text(&event.payload, "pointer_y");
+                let pointer_width = payload_field_text(&event.payload, "pointer_width");
+                let pointer_height = payload_field_text(&event.payload, "pointer_height");
+                TestStep {
+                    id: step.id,
+                    source_path: event.source,
+                    action_kind: Some(action_kind),
+                    target_text: event.target_text,
+                    text: step.user_action_text,
+                    key: step.user_action_key,
+                    address: event.payload.address,
+                    target_occurrence: event.target_occurrence.map(|value| value as u64),
+                    pointer_x,
+                    pointer_y,
+                    pointer_width,
+                    pointer_height,
+                    expectations: step.expectations,
+                }
+            })),
+            (None, None) if !step.expectations.is_empty() => Some(Ok(TestStep {
+                id: step.id,
+                source_path: String::new(),
+                action_kind: None,
+                target_text: None,
+                text: None,
+                key: None,
+                address: None,
+                target_occurrence: None,
+                pointer_x: None,
+                pointer_y: None,
+                pointer_width: None,
+                pointer_height: None,
+                expectations: step.expectations,
+            })),
+            (None, None) => None,
+            (None, Some(_)) | (Some(_), None) => None,
         })
-        .map(|(action_kind, action_text, action_key, event)| {
-            let pointer_x = payload_field_text(&event.payload, "pointer_x");
-            let pointer_y = payload_field_text(&event.payload, "pointer_y");
-            let pointer_width = payload_field_text(&event.payload, "pointer_width");
-            let pointer_height = payload_field_text(&event.payload, "pointer_height");
-            TestStep {
-                source_path: event.source,
-                action_kind,
-                target_text: event.target_text,
-                text: action_text,
-                key: action_key,
-                address: event.payload.address,
-                target_occurrence: event.target_occurrence.map(|value| value as u64),
-                pointer_x,
-                pointer_y,
-                pointer_width,
-                pointer_height,
-            }
-        })
-        .collect())
+        .collect()
 }
 
 fn built_in_application_identity(entry: &ExampleManifestEntry) -> ApplicationIdentity {
@@ -302,6 +311,28 @@ mod tests {
         assert!(example.units.iter().all(|unit| !unit.path.is_empty()));
         assert!(example.units.iter().all(|unit| !unit.source.is_empty()));
         assert!(!example.test_steps.is_empty());
+        assert!(
+            example
+                .test_steps
+                .iter()
+                .all(|step| !step.expectations.is_empty())
+        );
+        assert!(example.test_steps[0].action_kind.is_none());
+        assert!(matches!(
+            example.test_steps[0].expectations.as_slice(),
+            [boon_runtime::ScenarioExpectation::RootText { name, value }]
+                if name == "store.count" && value == "0"
+        ));
+        let first_action = example
+            .test_steps
+            .iter()
+            .find(|step| step.action_kind.is_some())
+            .expect("counter action step");
+        assert!(matches!(
+            first_action.expectations.as_slice(),
+            [boon_runtime::ScenarioExpectation::RootText { name, value }]
+                if name == "store.count" && value == "1"
+        ));
         assert_eq!(
             example.application.state_namespace,
             "builtin:example:counter"
@@ -351,10 +382,7 @@ mod tests {
 
         let persons = catalog.open("persons_pro").expect("Persons.pro sources");
         assert_eq!(persons.label, "Persons.pro");
-        assert_eq!(
-            persons.application.package_id,
-            "pro.persons.workspace"
-        );
+        assert_eq!(persons.application.package_id, "pro.persons.workspace");
         assert_eq!(persons.application.state_namespace, "local-first-v1");
         assert!(
             persons
@@ -362,7 +390,25 @@ mod tests {
                 .last()
                 .is_some_and(|unit| unit.path.ends_with("persons_pro/RUN.bn"))
         );
-        assert_eq!(persons.test_steps.len(), 9);
+        assert_eq!(persons.test_steps.len(), 26);
+        let persons_step_ids = persons
+            .test_steps
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            "fresh-anonymous-workspace-and-starter-preview",
+            "passkey-cancel-preserves-anonymous",
+            "passkey-registration-failure-preserves-anonymous",
+            "first-passkey-protects",
+            "duplicate-credential-is-rejected",
+            "second-passkey-same-account",
+            "authentication-cancellation-preserves-sign-out",
+            "authentication-failure-preserves-sign-out",
+            "passkey-sign-in-restores-access",
+        ] {
+            assert!(persons_step_ids.contains(expected), "missing {expected}");
+        }
 
         let items = catalog.items();
         for (id, label) in [

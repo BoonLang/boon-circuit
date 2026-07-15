@@ -16,11 +16,16 @@ pub const MANIFEST_RELATIVE_PATH: &str = "docs/architecture/native_gpu_handoff_m
 pub const MAX_MANIFEST_BYTES: u64 = 32 * 1024;
 pub const MAX_REPORT_BYTES: u64 = 512 * 1024;
 pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_SIDECAR_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHECKS: usize = 64;
 const MAX_PRODUCT_CHECKS: usize = 60;
 const MAX_BLOCKERS: usize = 16;
-const MAX_ARTIFACTS: usize = 8;
 const MAX_PRODUCT_METRICS: usize = 8;
+const MAX_PROFILE_ARGUMENTS: usize = 24;
+const MAX_PROFILE_CHECKPOINTS: usize = 32;
+const MAX_ARTIFACTS: usize = MAX_PROFILE_CHECKPOINTS + MAX_PRODUCT_METRICS;
+const MAX_BUDGET_METRICS: usize = 32;
+const MAX_HANDOFF_GATES: usize = 32;
 const REPORT_PROTOCOL: &str = "boon-gate-evidence-v2";
 const TOOL_CONTRACT: &str = "boon-xtask-report-v2";
 
@@ -172,90 +177,98 @@ impl<'de> Deserialize<'de> for GitCommit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GateName {
-    Architecture,
-    CounterDev,
-    TodomvcPhysical,
-    Cells,
-    Novywave,
-    Negative,
-}
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GateName(BoundedString<64>);
 
 impl GateName {
-    pub const ALL: [Self; 6] = [
-        Self::Architecture,
-        Self::CounterDev,
-        Self::TodomvcPhysical,
-        Self::Cells,
-        Self::Novywave,
-        Self::Negative,
-    ];
-
-    pub fn command(self) -> GateCommand {
-        match self {
-            Self::Architecture => GateCommand::Architecture,
-            Self::CounterDev => GateCommand::CounterDev,
-            Self::TodomvcPhysical => GateCommand::TodomvcPhysical,
-            Self::Cells => GateCommand::Cells,
-            Self::Novywave => GateCommand::Novywave,
-            Self::Negative => GateCommand::Negative,
-        }
+    pub fn new(value: impl Into<String>) -> ValidationResult<Self> {
+        let value = BoundedString::new(value)?;
+        validate_kebab_identifier(value.as_str(), "gate")?;
+        Ok(Self(value))
     }
 
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::Architecture => "architecture",
-            Self::CounterDev => "counter-dev",
-            Self::TodomvcPhysical => "todomvc-physical",
-            Self::Cells => "cells",
-            Self::Novywave => "novywave",
-            Self::Negative => "negative",
-        }
+    pub fn slug(&self) -> &str {
+        self.0.as_str()
     }
 
-    pub fn is_timed_product(self) -> bool {
-        matches!(
-            self,
-            Self::CounterDev | Self::TodomvcPhysical | Self::Cells | Self::Novywave
-        )
+    fn verifier_command(&self) -> ValidationResult<GateCommand> {
+        GateCommand::new(format!("verify-{}", self.slug()))
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub enum GateCommand {
-    #[serde(rename = "verify-architecture")]
-    Architecture,
-    #[serde(rename = "verify-counter-dev")]
-    CounterDev,
-    #[serde(rename = "verify-todomvc-physical")]
-    TodomvcPhysical,
-    #[serde(rename = "verify-cells")]
-    Cells,
-    #[serde(rename = "verify-novywave")]
-    Novywave,
-    #[serde(rename = "verify-negative")]
-    Negative,
+impl Serialize for GateName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.slug())
+    }
 }
+
+impl<'de> Deserialize<'de> for GateName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GateCommand(BoundedString<96>);
 
 impl GateCommand {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Architecture => "verify-architecture",
-            Self::CounterDev => "verify-counter-dev",
-            Self::TodomvcPhysical => "verify-todomvc-physical",
-            Self::Cells => "verify-cells",
-            Self::Novywave => "verify-novywave",
-            Self::Negative => "verify-negative",
-        }
+    pub fn new(value: impl Into<String>) -> ValidationResult<Self> {
+        let value = BoundedString::new(value)?;
+        let Some(suffix) = value.as_str().strip_prefix("verify-") else {
+            return Err("gate verifier command must start with verify-".to_owned());
+        };
+        validate_kebab_identifier(suffix, "gate verifier suffix")?;
+        Ok(Self(value))
     }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Serialize for GateCommand {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for GateCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GateRunner {
+    Architecture,
+    NativeProduct,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AggregateCommand {
     #[serde(rename = "verify-all")]
     VerifyAll,
+}
+
+impl AggregateCommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifyAll => "verify-all",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -272,10 +285,129 @@ pub struct HandoffManifest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestGate {
+    pub order: u16,
     pub gate: GateName,
     pub verifier: GateCommand,
+    pub runner: GateRunner,
     pub output: RelativePath,
     pub byte_limit: u64,
+    pub sidecar_byte_limit: u64,
+    #[serde(default)]
+    pub profile: Option<VerifierProfile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierProfile {
+    pub id: BoundedId,
+    pub arguments: Vec<VerifierArgument>,
+    pub measurements: Vec<TimingMetric>,
+    #[serde(default)]
+    pub proof_requirements: ProfileProofRequirements,
+}
+
+impl VerifierProfile {
+    pub fn digest(&self) -> Sha256Digest {
+        let bytes = serde_json::to_vec(self).expect("validated verifier profile serializes");
+        sha256_bytes(&bytes)
+    }
+
+    pub fn argument(&self, flag: &str) -> Option<&str> {
+        self.arguments
+            .iter()
+            .find(|argument| argument.flag.as_str() == flag)
+            .map(|argument| argument.value.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierArgument {
+    pub flag: BoundedString<64>,
+    pub value: RelativePath,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileProofRequirements {
+    pub scenario: Option<ScenarioRequirement>,
+    pub budget: Option<BudgetRequirement>,
+    pub state_root: Option<StateRootRequirement>,
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointRequirement>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckpointRequirement {
+    pub id: BoundedId,
+    #[serde(flatten)]
+    pub evidence: CheckpointEvidenceRequirement,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CheckpointEvidenceRequirement {
+    ScenarioStep {
+        scenario_step: BoundedId,
+    },
+    RestartRestore {
+        baseline_checkpoint: BoundedId,
+    },
+    ResponsiveLayout {
+        baseline_checkpoint: BoundedId,
+        logical_width: u32,
+        logical_height: u32,
+    },
+    StaleCompileRejection,
+    PersistenceOperation {
+        operation: PersistenceEvidenceOperation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PersistenceEvidenceOperation {
+    Exported,
+    CorruptionRejected,
+    ClearedAndStartedOver,
+    ImportPreviewed,
+    ImportActivated,
+    MigrationActivated,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioRequirement {
+    pub path: RelativePath,
+    pub semantic_assertions: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetRequirement {
+    pub path: RelativePath,
+    pub metrics: Vec<BoundedId>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateRootPolicy {
+    LaunchScopedClean,
+}
+
+impl StateRootPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LaunchScopedClean => "launch-scoped-clean",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateRootRequirement {
+    pub policy: StateRootPolicy,
+    pub restart_required: bool,
 }
 
 impl HandoffManifest {
@@ -289,39 +421,93 @@ impl HandoffManifest {
         if self.id.as_str() != "boon-native-handoff-v2" {
             return Err("manifest id must be boon-native-handoff-v2".to_owned());
         }
-        if self.gates.len() != GateName::ALL.len() {
+        if self.gates.is_empty() || self.gates.len() > MAX_HANDOFF_GATES {
             return Err(format!(
-                "manifest must contain exactly {} gates",
-                GateName::ALL.len()
+                "manifest gates must contain 1..={MAX_HANDOFF_GATES} entries"
             ));
         }
         validate_relative_json_path(&self.aggregate_output)?;
         validate_byte_limit(self.aggregate_byte_limit)?;
 
+        let mut gate_names = BTreeSet::new();
+        let mut verifiers = BTreeSet::new();
         let mut outputs = BTreeSet::new();
-        for (entry, expected_gate) in self.gates.iter().zip(GateName::ALL) {
-            if entry.gate != expected_gate {
+        let mut architecture_runners = 0;
+        for (index, entry) in self.gates.iter().enumerate() {
+            if usize::from(entry.order) != index {
                 return Err(format!(
-                    "manifest gate order mismatch: expected {}, found {}",
-                    expected_gate.slug(),
-                    entry.gate.slug()
+                    "manifest gate {} has order {}; expected {index}",
+                    entry.gate.slug(),
+                    entry.order
                 ));
             }
-            if entry.verifier != entry.gate.command() {
+            if !gate_names.insert(entry.gate.slug()) {
+                return Err(format!("manifest gate {} is duplicated", entry.gate.slug()));
+            }
+            if !verifiers.insert(entry.verifier.as_str()) {
+                return Err(format!(
+                    "manifest verifier {} is duplicated",
+                    entry.verifier.as_str()
+                ));
+            }
+            let expected_verifier = entry.gate.verifier_command()?;
+            if entry.verifier != expected_verifier {
                 return Err(format!(
                     "manifest gate {} must use {}",
                     entry.gate.slug(),
-                    entry.gate.command().as_str()
+                    expected_verifier.as_str()
+                ));
+            }
+            if entry.verifier.as_str() == self.aggregate.as_str()
+                || entry.verifier.as_str() == "shaders"
+            {
+                return Err(format!(
+                    "manifest verifier {} conflicts with a fixed xtask command",
+                    entry.verifier.as_str()
                 ));
             }
             validate_relative_json_path(&entry.output)?;
             validate_byte_limit(entry.byte_limit)?;
+            validate_sidecar_byte_limit(entry.sidecar_byte_limit)?;
             if !outputs.insert(entry.output.as_str()) {
                 return Err(format!(
                     "manifest output {} is duplicated",
                     entry.output.as_str()
                 ));
             }
+            match (entry.runner, &entry.profile) {
+                (GateRunner::Architecture, None) => {
+                    architecture_runners += 1;
+                    if index != 0 {
+                        return Err(
+                            "the architecture runner must be the first manifest gate".to_owned()
+                        );
+                    }
+                    if entry.sidecar_byte_limit != 0 {
+                        return Err(
+                            "the architecture runner must have a zero sidecar byte limit"
+                                .to_owned(),
+                        );
+                    }
+                }
+                (GateRunner::NativeProduct, None) => {
+                    return Err(format!(
+                        "manifest gate {} requires a verifier profile",
+                        entry.gate.slug()
+                    ));
+                }
+                (GateRunner::Architecture, Some(_)) => {
+                    return Err(
+                        "the architecture runner must not launch a verifier profile".to_owned()
+                    );
+                }
+                (GateRunner::NativeProduct, Some(profile)) => {
+                    profile.validate(entry.sidecar_byte_limit)?
+                }
+            }
+        }
+        if architecture_runners != 1 {
+            return Err("manifest must contain exactly one architecture runner".to_owned());
         }
         if outputs.contains(self.aggregate_output.as_str()) {
             return Err("aggregate output must differ from every gate output".to_owned());
@@ -329,12 +515,396 @@ impl HandoffManifest {
         Ok(())
     }
 
-    pub fn gate(&self, gate: GateName) -> &ManifestGate {
+    pub fn gate(&self, gate: &GateName) -> &ManifestGate {
         self.gates
             .iter()
-            .find(|entry| entry.gate == gate)
-            .expect("validated manifest contains every v2 gate")
+            .find(|entry| &entry.gate == gate)
+            .expect("validated manifest contains the selected gate")
     }
+
+    pub fn gate_for_verifier(&self, verifier: &str) -> Option<&ManifestGate> {
+        self.gates
+            .iter()
+            .find(|entry| entry.verifier.as_str() == verifier)
+    }
+}
+
+impl VerifierProfile {
+    fn validate(&self, sidecar_byte_limit: u64) -> ValidationResult<()> {
+        const ALLOWED_ARGUMENTS: [&str; 9] = [
+            "--harness",
+            "--example",
+            "--visible-mode",
+            "--visible-samples",
+            "--alternate-target",
+            "--selection-samples",
+            "--scroll-samples",
+            "--switch-samples",
+            "--profile-benchmark-steps",
+        ];
+        const REQUIRED_TIMED_ARGUMENTS: [&str; 8] = [
+            "--harness",
+            "--example",
+            "--visible-mode",
+            "--visible-samples",
+            "--alternate-target",
+            "--selection-samples",
+            "--scroll-samples",
+            "--switch-samples",
+        ];
+        if self.arguments.is_empty() || self.arguments.len() > MAX_PROFILE_ARGUMENTS {
+            return Err(format!(
+                "verifier profile {} arguments must contain 1..={MAX_PROFILE_ARGUMENTS} entries",
+                self.id
+            ));
+        }
+        let mut flags = BTreeSet::new();
+        for argument in &self.arguments {
+            validate_profile_flag(&argument.flag)?;
+            if !ALLOWED_ARGUMENTS.contains(&argument.flag.as_str()) {
+                return Err(format!(
+                    "verifier profile {} has unsupported argument {}",
+                    self.id, argument.flag
+                ));
+            }
+            if !flags.insert(argument.flag.as_str()) {
+                return Err(format!(
+                    "verifier profile {} duplicates argument {}",
+                    self.id, argument.flag
+                ));
+            }
+        }
+        let harness = self
+            .argument("--harness")
+            .ok_or_else(|| format!("verifier profile {} requires --harness", self.id))?;
+        match harness {
+            "timed" => {
+                if self.argument("--example").is_none_or(str::is_empty) {
+                    return Err(format!(
+                        "timed verifier profile {} requires --example",
+                        self.id
+                    ));
+                }
+                for required in REQUIRED_TIMED_ARGUMENTS {
+                    if self.argument(required).is_none() {
+                        return Err(format!(
+                            "timed verifier profile {} requires {required}",
+                            self.id
+                        ));
+                    }
+                }
+                if self.measurements.is_empty() {
+                    return Err(format!(
+                        "timed verifier profile {} requires product measurements",
+                        self.id
+                    ));
+                }
+                if sidecar_byte_limit == 0 {
+                    return Err(format!(
+                        "timed verifier profile {} requires a non-zero sidecar byte limit",
+                        self.id
+                    ));
+                }
+            }
+            "negative" => {
+                if self.arguments.len() != 1 {
+                    return Err(format!(
+                        "negative verifier profile {} may contain only --harness",
+                        self.id
+                    ));
+                }
+                if !self.measurements.is_empty() {
+                    return Err(format!(
+                        "negative verifier profile {} cannot require product measurements",
+                        self.id
+                    ));
+                }
+                if sidecar_byte_limit != 0 {
+                    return Err(format!(
+                        "negative verifier profile {} must have a zero sidecar byte limit",
+                        self.id
+                    ));
+                }
+                if !self.proof_requirements.is_empty() {
+                    return Err(format!(
+                        "negative verifier profile {} cannot require product proof",
+                        self.id
+                    ));
+                }
+            }
+            value => {
+                return Err(format!(
+                    "verifier profile {} has unsupported --harness value {value}",
+                    self.id
+                ));
+            }
+        }
+
+        if self.measurements.len() > MAX_PRODUCT_METRICS {
+            return Err(format!(
+                "verifier profile {} measurements exceed {MAX_PRODUCT_METRICS} entries",
+                self.id
+            ));
+        }
+        let mut measurements = BTreeSet::new();
+        for metric in &self.measurements {
+            if *metric == TimingMetric::AsyncProof {
+                return Err("async-proof is implicit and must not be a product metric".to_owned());
+            }
+            if !measurements.insert(*metric) {
+                return Err(format!(
+                    "verifier profile {} duplicates measurement {}",
+                    self.id,
+                    metric_name(*metric)
+                ));
+            }
+        }
+        if harness == "timed" {
+            let has_profile_benchmark = self.argument("--profile-benchmark-steps").is_some();
+            if has_profile_benchmark != self.proof_requirements.budget.is_some() {
+                return Err(format!(
+                    "verifier profile {} must declare profile benchmark steps exactly when it declares budget proof",
+                    self.id
+                ));
+            }
+            let visible_mode = self.argument("--visible-mode").expect("required above");
+            let alternate_target = self.argument("--alternate-target").expect("required above");
+            if !matches!(visible_mode, "click" | "hover") {
+                return Err(format!(
+                    "verifier profile {} has unsupported visible mode {visible_mode}",
+                    self.id
+                ));
+            }
+            if !matches!(alternate_target, "none" | "any" | "same-source") {
+                return Err(format!(
+                    "verifier profile {} has unsupported alternate target {alternate_target}",
+                    self.id
+                ));
+            }
+            if (visible_mode == "click" && alternate_target != "none")
+                || (visible_mode == "hover" && alternate_target == "none")
+            {
+                return Err(format!(
+                    "verifier profile {} has an incompatible visible/alternate target policy",
+                    self.id
+                ));
+            }
+            let visible_samples = self.argument_usize("--visible-samples")?;
+            let selection_samples = self.argument_usize("--selection-samples")?;
+            let scroll_samples = self.argument_usize("--scroll-samples")?;
+            let switch_samples = self.argument_usize("--switch-samples")?;
+            if !(70..=256).contains(&visible_samples) {
+                return Err(format!(
+                    "verifier profile {} visible samples must be within 70..=256",
+                    self.id
+                ));
+            }
+            validate_optional_profile_samples(&self.id, "selection", selection_samples, 24, 128)?;
+            validate_optional_profile_samples(&self.id, "scroll", scroll_samples, 140, 256)?;
+            validate_optional_profile_samples(&self.id, "switch", switch_samples, 23, 64)?;
+            if selection_samples > 0 && alternate_target == "none" {
+                return Err(format!(
+                    "verifier profile {} selection samples require an alternate target",
+                    self.id
+                ));
+            }
+
+            let mut expected = BTreeSet::from([
+                TimingMetric::CallbackToHostEvent,
+                TimingMetric::WarmVisibleInteraction,
+            ]);
+            if selection_samples > 0 {
+                expected.insert(TimingMetric::RepeatedSelection);
+            }
+            if scroll_samples > 0 {
+                expected.insert(TimingMetric::WarmScroll);
+            }
+            if switch_samples > 0 {
+                expected.insert(TimingMetric::ExampleSwitchAcknowledgement);
+                expected.insert(TimingMetric::ExampleSwitchFinalPreview);
+            }
+            if measurements != expected {
+                return Err(format!(
+                    "verifier profile {} measurements do not match its sampling arguments",
+                    self.id
+                ));
+            }
+        }
+        self.proof_requirements.validate()?;
+        Ok(())
+    }
+
+    fn argument_usize(&self, flag: &str) -> ValidationResult<usize> {
+        let value = self
+            .argument(flag)
+            .expect("validated required profile argument");
+        value.parse::<usize>().map_err(|error| {
+            format!(
+                "verifier profile {} has invalid {flag} value {value}: {error}",
+                self.id
+            )
+        })
+    }
+}
+
+fn validate_optional_profile_samples(
+    profile: &BoundedId,
+    label: &str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+) -> ValidationResult<()> {
+    if value != 0 && !(minimum..=maximum).contains(&value) {
+        return Err(format!(
+            "verifier profile {profile} {label} samples must be zero or within {minimum}..={maximum}"
+        ));
+    }
+    Ok(())
+}
+
+impl ProfileProofRequirements {
+    fn is_empty(&self) -> bool {
+        self.scenario.is_none()
+            && self.budget.is_none()
+            && self.state_root.is_none()
+            && self.checkpoints.is_empty()
+    }
+
+    fn validate(&self) -> ValidationResult<()> {
+        if let Some(requirement) = &self.scenario {
+            validate_relative_extension(&requirement.path, "scn", "scenario")?;
+        }
+        if let Some(requirement) = &self.budget {
+            validate_relative_extension(&requirement.path, "toml", "budget")?;
+            if requirement.metrics.is_empty() || requirement.metrics.len() > MAX_BUDGET_METRICS {
+                return Err(format!(
+                    "budget proof metrics must contain 1..={MAX_BUDGET_METRICS} entries"
+                ));
+            }
+            let mut metrics = BTreeSet::new();
+            for metric in &requirement.metrics {
+                if !metrics.insert(metric.as_str()) {
+                    return Err(format!("budget proof duplicates metric {metric}"));
+                }
+            }
+        }
+        if self.checkpoints.len() > MAX_PROFILE_CHECKPOINTS {
+            return Err(format!(
+                "profile checkpoints exceed {MAX_PROFILE_CHECKPOINTS} entries"
+            ));
+        }
+        let mut checkpoints = BTreeSet::new();
+        for checkpoint in &self.checkpoints {
+            if !checkpoints.insert(checkpoint.id.as_str()) {
+                return Err(format!("profile duplicates checkpoint {}", checkpoint.id));
+            }
+            match &checkpoint.evidence {
+                CheckpointEvidenceRequirement::ScenarioStep { .. } if self.scenario.is_none() => {
+                    return Err(format!(
+                        "scenario checkpoint {} requires a scenario proof",
+                        checkpoint.id
+                    ));
+                }
+                CheckpointEvidenceRequirement::RestartRestore { .. }
+                | CheckpointEvidenceRequirement::PersistenceOperation { .. }
+                    if self.state_root.is_none() =>
+                {
+                    return Err(format!(
+                        "durable checkpoint {} requires a state-root proof",
+                        checkpoint.id
+                    ));
+                }
+                CheckpointEvidenceRequirement::ResponsiveLayout {
+                    logical_width,
+                    logical_height,
+                    ..
+                } if !(240..=1_920).contains(logical_width)
+                    || !(320..=2_160).contains(logical_height) =>
+                {
+                    return Err(format!(
+                        "responsive checkpoint {} has unsupported logical size {}x{}",
+                        checkpoint.id, logical_width, logical_height
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for checkpoint in &self.checkpoints {
+            let baseline = match &checkpoint.evidence {
+                CheckpointEvidenceRequirement::RestartRestore {
+                    baseline_checkpoint,
+                }
+                | CheckpointEvidenceRequirement::ResponsiveLayout {
+                    baseline_checkpoint,
+                    ..
+                } => Some(baseline_checkpoint),
+                _ => None,
+            };
+            if baseline.is_some_and(|baseline| !checkpoints.contains(baseline.as_str())) {
+                return Err(format!(
+                    "checkpoint {} references an undeclared baseline {}",
+                    checkpoint.id,
+                    baseline.expect("checked Some")
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_kebab_identifier(value: &str, kind: &str) -> ValidationResult<()> {
+    let bytes = value.as_bytes();
+    let bounded_by_alphanumeric = bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes
+            .last()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit());
+    if !bounded_by_alphanumeric
+        || bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && *byte != b'-')
+        || value.contains("--")
+    {
+        return Err(format!(
+            "{kind} {value:?} must be a lowercase kebab-case identifier"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_flag(flag: &BoundedString<64>) -> ValidationResult<()> {
+    const RESERVED: [&str; 16] = [
+        "--role",
+        "--gate",
+        "--evidence-output",
+        "--artifact-dir",
+        "--run-id",
+        "--source-digest",
+        "--profile",
+        "--profile-digest",
+        "--report",
+        "--scenario-proof",
+        "--require-semantic-scenario",
+        "--budget-proof",
+        "--required-budget-metrics",
+        "--state-root-policy",
+        "--restart-required",
+        "--required-checkpoints",
+    ];
+    let value = flag.as_str();
+    if RESERVED.contains(&value) {
+        return Err(format!(
+            "verifier profile cannot override reserved argument {value}"
+        ));
+    }
+    if !value.starts_with("--")
+        || value.len() <= 2
+        || !value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(format!("invalid verifier profile argument flag {value}"));
+    }
+    Ok(())
 }
 
 fn validate_byte_limit(limit: u64) -> ValidationResult<()> {
@@ -342,6 +912,31 @@ fn validate_byte_limit(limit: u64) -> ValidationResult<()> {
         return Err(format!(
             "report byte limit must be between 1 and {MAX_REPORT_BYTES}, found {limit}"
         ));
+    }
+    Ok(())
+}
+
+fn validate_sidecar_byte_limit(limit: u64) -> ValidationResult<()> {
+    if limit > MAX_SIDECAR_BYTES {
+        return Err(format!(
+            "sidecar byte limit must be at most {MAX_SIDECAR_BYTES}, found {limit}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_extension(
+    path: &RelativePath,
+    extension: &str,
+    kind: &str,
+) -> ValidationResult<()> {
+    validate_relative_path(path)?;
+    if Path::new(path.as_str())
+        .extension()
+        .and_then(|value| value.to_str())
+        != Some(extension)
+    {
+        return Err(format!("{kind} path {path} must end in .{extension}"));
     }
     Ok(())
 }
@@ -616,7 +1211,7 @@ impl NativeEvidence {
 pub enum TimingMetric {
     CallbackToHostEvent,
     WarmVisibleInteraction,
-    CellsSelection,
+    RepeatedSelection,
     WarmScroll,
     ExampleSwitchAcknowledgement,
     ExampleSwitchFinalPreview,
@@ -817,11 +1412,445 @@ impl ProducerEvidence {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScenarioBoundary {
+    NativeTestPlayback,
+    NativeTestPlaybackAndSemanticAssertions,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioProof {
+    pub path: RelativePath,
+    pub sha256: Sha256Digest,
+    pub boundary: ScenarioBoundary,
+    pub request_id: Option<u64>,
+    pub declared_steps: u32,
+    pub executable_steps: u32,
+    pub completed_steps: u32,
+    pub passed: bool,
+    pub semantic_assertions_proven: bool,
+}
+
+impl ScenarioProof {
+    fn validate(&self) -> ValidationResult<()> {
+        validate_relative_extension(&self.path, "scn", "scenario proof")?;
+        if self.executable_steps > self.declared_steps {
+            return Err("scenario executable steps exceed declared steps".to_owned());
+        }
+        if self.completed_steps > self.executable_steps {
+            return Err("scenario completed steps exceed executable steps".to_owned());
+        }
+        if self.passed
+            && (self.request_id.is_none()
+                || self.executable_steps == 0
+                || self.completed_steps != self.executable_steps)
+        {
+            return Err(
+                "passing scenario proof requires a request and every executable step".to_owned(),
+            );
+        }
+        if self.semantic_assertions_proven
+            != matches!(
+                self.boundary,
+                ScenarioBoundary::NativeTestPlaybackAndSemanticAssertions
+            )
+        {
+            return Err(
+                "scenario semantic assertion claim does not match its proof boundary".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BudgetUnit {
+    Microseconds,
+    Bytes,
+    Count,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BudgetComparison {
+    AtMost,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetObservation {
+    pub metric: BoundedId,
+    pub unit: BudgetUnit,
+    pub comparison: BudgetComparison,
+    pub observed: u64,
+    pub limit: u64,
+}
+
+impl BudgetObservation {
+    fn passes(&self) -> bool {
+        match self.comparison {
+            BudgetComparison::AtMost => self.observed <= self.limit,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetProof {
+    pub path: RelativePath,
+    pub sha256: Sha256Digest,
+    pub observations: Vec<BudgetObservation>,
+}
+
+impl BudgetProof {
+    fn validate(&self) -> ValidationResult<()> {
+        validate_relative_extension(&self.path, "toml", "budget proof")?;
+        if self.observations.len() > MAX_BUDGET_METRICS {
+            return Err(format!(
+                "budget proof observations exceed {MAX_BUDGET_METRICS} entries"
+            ));
+        }
+        let mut metrics = BTreeSet::new();
+        for observation in &self.observations {
+            if !metrics.insert(observation.metric.as_str()) {
+                return Err(format!(
+                    "budget proof duplicates observation {}",
+                    observation.metric
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateRootProof {
+    pub root: ShortText,
+    pub policy: StateRootPolicy,
+    pub clean_at_start: bool,
+    pub durable_file_count: u32,
+    pub restart_count: u32,
+    pub restored_after_restart: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StateCheckpointProof {
+    pub id: BoundedId,
+    pub source_revision: u64,
+    pub runtime_sequence: u64,
+    pub durable_epoch: u64,
+    pub state_digest: Sha256Digest,
+    pub frame: FrameEvidenceKey,
+    #[serde(flatten)]
+    pub evidence: StateCheckpointEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "boundary", rename_all = "kebab-case")]
+pub enum StateCheckpointEvidence {
+    ScenarioSemanticFrame {
+        scenario_step: BoundedId,
+        assertion_count: u32,
+    },
+    RestartRestore {
+        baseline_checkpoint: BoundedId,
+        before_restart_digest: Sha256Digest,
+        startup_restored: bool,
+    },
+    ResponsiveLayout {
+        baseline_checkpoint: BoundedId,
+        logical_width: u32,
+        logical_height: u32,
+        action_count: u32,
+        action_digest: Sha256Digest,
+    },
+    StaleCompileRejection {
+        session: BoundedId,
+        stale_revision: u64,
+        latest_revision: u64,
+    },
+    PersistenceOperation {
+        operation: PersistenceEvidenceOperation,
+        before_state_digest: Sha256Digest,
+    },
+}
+
+impl StateCheckpointProof {
+    fn validate(&self) -> ValidationResult<()> {
+        if self.source_revision == 0 || self.runtime_sequence == 0 || self.durable_epoch == 0 {
+            return Err(format!(
+                "state checkpoint {} requires non-zero source, runtime, and durable identities",
+                self.id
+            ));
+        }
+        self.frame.validate()?;
+        match &self.evidence {
+            StateCheckpointEvidence::ScenarioSemanticFrame {
+                assertion_count, ..
+            } if *assertion_count == 0 => {
+                return Err(format!(
+                    "scenario checkpoint {} proves no semantic assertions",
+                    self.id
+                ));
+            }
+            StateCheckpointEvidence::RestartRestore {
+                before_restart_digest,
+                startup_restored,
+                ..
+            } if !startup_restored || before_restart_digest != &self.state_digest => {
+                return Err(format!(
+                    "restart checkpoint {} does not prove the same restored authority",
+                    self.id
+                ));
+            }
+            StateCheckpointEvidence::ResponsiveLayout {
+                logical_width,
+                logical_height,
+                action_count,
+                ..
+            } if !(240..=1_920).contains(logical_width)
+                || !(320..=2_160).contains(logical_height)
+                || *action_count == 0 =>
+            {
+                return Err(format!(
+                    "responsive checkpoint {} has invalid layout evidence",
+                    self.id
+                ));
+            }
+            StateCheckpointEvidence::StaleCompileRejection {
+                stale_revision,
+                latest_revision,
+                ..
+            } if stale_revision >= latest_revision => {
+                return Err(format!(
+                    "stale checkpoint {} has non-increasing revisions",
+                    self.id
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationProfileEvidence {
+    pub profile_id: BoundedId,
+    pub profile_digest: Sha256Digest,
+    pub scenario: Option<ScenarioProof>,
+    pub budget: Option<BudgetProof>,
+    pub state_root: Option<StateRootProof>,
+    pub checkpoints: Vec<StateCheckpointProof>,
+}
+
+impl VerificationProfileEvidence {
+    fn validate_shape(&self) -> ValidationResult<()> {
+        if let Some(scenario) = &self.scenario {
+            scenario.validate()?;
+        }
+        if let Some(budget) = &self.budget {
+            budget.validate()?;
+        }
+        if self.checkpoints.len() > MAX_PROFILE_CHECKPOINTS {
+            return Err(format!(
+                "profile evidence checkpoints exceed {MAX_PROFILE_CHECKPOINTS} entries"
+            ));
+        }
+        let mut checkpoints = BTreeSet::new();
+        for checkpoint in &self.checkpoints {
+            checkpoint.validate()?;
+            if !checkpoints.insert(checkpoint.id.as_str()) {
+                return Err(format!(
+                    "profile evidence duplicates checkpoint {}",
+                    checkpoint.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_for(
+        &self,
+        profile: &VerifierProfile,
+        report_status: ReportStatus,
+    ) -> ValidationResult<()> {
+        self.validate_shape()?;
+        if self.profile_id != profile.id || self.profile_digest != profile.digest() {
+            return Err("verifier profile evidence identity mismatch".to_owned());
+        }
+        let require_complete = report_status == ReportStatus::Pass;
+        let requirements = &profile.proof_requirements;
+
+        if let Some(requirement) = &requirements.scenario {
+            match &self.scenario {
+                Some(proof) => {
+                    if proof.path != requirement.path {
+                        return Err("scenario proof path differs from verifier profile".to_owned());
+                    }
+                    if require_complete
+                        && (!proof.passed
+                            || proof.completed_steps != proof.executable_steps
+                            || (requirement.semantic_assertions
+                                && !proof.semantic_assertions_proven))
+                    {
+                        return Err(
+                            "passing profile requires complete semantic scenario proof".to_owned()
+                        );
+                    }
+                }
+                None if require_complete => {
+                    return Err("passing profile requires scenario proof".to_owned());
+                }
+                None => {}
+            }
+        } else if self.scenario.is_some() {
+            return Err("profile evidence includes an undeclared scenario proof".to_owned());
+        }
+
+        if let Some(requirement) = &requirements.budget {
+            match &self.budget {
+                Some(proof) => {
+                    if proof.path != requirement.path {
+                        return Err("budget proof path differs from verifier profile".to_owned());
+                    }
+                    if require_complete {
+                        for metric in &requirement.metrics {
+                            let observation = proof
+                                .observations
+                                .iter()
+                                .find(|observation| observation.metric == *metric)
+                                .ok_or_else(|| format!("missing budget observation {metric}"))?;
+                            if !observation.passes() {
+                                return Err(format!(
+                                    "budget observation {metric} exceeds its limit"
+                                ));
+                            }
+                        }
+                    }
+                }
+                None if require_complete => {
+                    return Err("passing profile requires budget proof".to_owned());
+                }
+                None => {}
+            }
+        } else if self.budget.is_some() {
+            return Err("profile evidence includes an undeclared budget proof".to_owned());
+        }
+
+        if let Some(requirement) = &requirements.state_root {
+            match &self.state_root {
+                Some(proof) if require_complete => {
+                    if proof.policy != requirement.policy
+                        || !proof.clean_at_start
+                        || proof.durable_file_count == 0
+                        || (requirement.restart_required
+                            && (proof.restart_count == 0 || !proof.restored_after_restart))
+                    {
+                        return Err(
+                            "passing profile requires clean launch-scoped durable state and restore proof"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Some(proof) if proof.policy != requirement.policy => {
+                    return Err("state-root proof policy differs from verifier profile".to_owned());
+                }
+                Some(_) => {}
+                None if require_complete => {
+                    return Err("passing profile requires state-root proof".to_owned());
+                }
+                None => {}
+            }
+        } else if self.state_root.is_some() {
+            return Err("profile evidence includes an undeclared state-root proof".to_owned());
+        }
+
+        if require_complete {
+            for required in &requirements.checkpoints {
+                let proof = self
+                    .checkpoints
+                    .iter()
+                    .find(|checkpoint| checkpoint.id == required.id)
+                    .ok_or_else(|| format!("missing required state checkpoint {}", required.id))?;
+                validate_checkpoint_requirement(required, proof)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_checkpoint_requirement(
+    requirement: &CheckpointRequirement,
+    proof: &StateCheckpointProof,
+) -> ValidationResult<()> {
+    let matches = match (&requirement.evidence, &proof.evidence) {
+        (
+            CheckpointEvidenceRequirement::ScenarioStep { scenario_step },
+            StateCheckpointEvidence::ScenarioSemanticFrame {
+                scenario_step: observed,
+                ..
+            },
+        ) => scenario_step == observed,
+        (
+            CheckpointEvidenceRequirement::RestartRestore {
+                baseline_checkpoint,
+            },
+            StateCheckpointEvidence::RestartRestore {
+                baseline_checkpoint: observed,
+                ..
+            },
+        ) => baseline_checkpoint == observed,
+        (
+            CheckpointEvidenceRequirement::ResponsiveLayout {
+                baseline_checkpoint,
+                logical_width,
+                logical_height,
+            },
+            StateCheckpointEvidence::ResponsiveLayout {
+                baseline_checkpoint: observed,
+                logical_width: observed_width,
+                logical_height: observed_height,
+                ..
+            },
+        ) => {
+            baseline_checkpoint == observed
+                && logical_width == observed_width
+                && logical_height == observed_height
+        }
+        (
+            CheckpointEvidenceRequirement::StaleCompileRejection,
+            StateCheckpointEvidence::StaleCompileRejection { .. },
+        ) => true,
+        (
+            CheckpointEvidenceRequirement::PersistenceOperation { operation },
+            StateCheckpointEvidence::PersistenceOperation {
+                operation: observed,
+                ..
+            },
+        ) => operation == observed,
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "state checkpoint {} uses the wrong evidence boundary",
+            requirement.id
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateEvidence {
     pub checks: Vec<CheckEvidence>,
     pub producer: Option<ProducerEvidence>,
+    pub profile: Option<VerificationProfileEvidence>,
     pub native: Option<NativeEvidence>,
     pub product_ux_timings: Vec<ProductTimingEvidence>,
     pub async_proof_timing: Option<AsyncProofTimingEvidence>,
@@ -831,7 +1860,6 @@ pub struct GateEvidence {
 impl GateEvidence {
     fn validate(
         &self,
-        gate: GateName,
         report_status: ReportStatus,
         measurement: &MeasurementContract,
     ) -> ValidationResult<()> {
@@ -861,8 +1889,9 @@ impl GateEvidence {
         }
         if let Some(producer) = &self.producer {
             producer.validate(report_status)?;
-        } else if report_status == ReportStatus::Pass && gate != GateName::Architecture {
-            return Err("passing process gate requires producer metadata".to_owned());
+        }
+        if let Some(profile) = &self.profile {
+            profile.validate_shape()?;
         }
 
         match measurement {
@@ -879,6 +1908,55 @@ impl GateEvidence {
                 async_proof,
             } => {
                 self.validate_timed_evidence(report_status, product_ux, async_proof)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_profile(
+        &self,
+        manifest_gate: &ManifestGate,
+        report_status: ReportStatus,
+    ) -> ValidationResult<()> {
+        match manifest_gate.runner {
+            GateRunner::Architecture if self.producer.is_some() => {
+                return Err("architecture runner cannot carry producer metadata".to_owned());
+            }
+            GateRunner::NativeProduct
+                if report_status == ReportStatus::Pass && self.producer.is_none() =>
+            {
+                return Err("passing process gate requires producer metadata".to_owned());
+            }
+            GateRunner::Architecture | GateRunner::NativeProduct => {}
+        }
+        let result = match (&manifest_gate.profile, &self.profile) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(format!(
+                "{} report carries verifier profile evidence for a profile-less gate",
+                manifest_gate.gate.slug()
+            )),
+            (Some(profile), Some(evidence)) => evidence.validate_for(profile, report_status),
+            (Some(_), None) if report_status == ReportStatus::Pass => Err(format!(
+                "passing {} report requires verifier profile evidence",
+                manifest_gate.gate.slug()
+            )),
+            (Some(_), None) => Ok(()),
+        };
+        result?;
+        if report_status == ReportStatus::Pass
+            && let Some(profile) = &self.profile
+        {
+            for checkpoint in &profile.checkpoints {
+                if !self
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.frame == checkpoint.frame)
+                {
+                    return Err(format!(
+                        "state checkpoint {} has no matching app-owned WGPU readback artifact",
+                        checkpoint.id
+                    ));
+                }
             }
         }
         Ok(())
@@ -1032,8 +2110,7 @@ impl GateReport {
         if self.blockers.len() > MAX_BLOCKERS {
             return Err(format!("blockers exceed {MAX_BLOCKERS} entries"));
         }
-        self.evidence
-            .validate(self.identity.gate, self.status, &self.measurement)?;
+        self.evidence.validate(self.status, &self.measurement)?;
         let failed_checks = self
             .evidence
             .checks
@@ -1064,6 +2141,14 @@ impl GateReport {
                 manifest_gate.gate.slug()
             ));
         }
+        let expected_measurement = measurement_contract(manifest_gate);
+        if self.measurement != expected_measurement {
+            return Err(format!(
+                "{} report measurement contract differs from the manifest profile",
+                manifest_gate.gate.slug()
+            ));
+        }
+        self.evidence.validate_profile(manifest_gate, self.status)?;
         if self.identity.source != expected.source {
             return Err(format!(
                 "{} report has a stale source identity",
@@ -1079,7 +2164,25 @@ impl GateReport {
         Ok(())
     }
 
-    pub fn validate_artifacts(&self, workspace: &Path) -> ValidationResult<()> {
+    pub fn validate_artifacts(
+        &self,
+        workspace: &Path,
+        sidecar_byte_limit: u64,
+    ) -> ValidationResult<()> {
+        let total_bytes = self
+            .evidence
+            .artifacts
+            .iter()
+            .try_fold(0_u64, |total, artifact| {
+                total
+                    .checked_add(artifact.byte_len)
+                    .ok_or_else(|| "proof artifact byte total overflows".to_owned())
+            })?;
+        if total_bytes > sidecar_byte_limit {
+            return Err(format!(
+                "proof artifacts total {total_bytes} bytes; manifest sidecar limit is {sidecar_byte_limit}"
+            ));
+        }
         for artifact in &self.evidence.artifacts {
             validate_artifact_file(workspace, artifact)?;
         }
@@ -1107,7 +2210,7 @@ pub struct ProducerEnvelope {
 impl ProducerEnvelope {
     pub fn validate_for(
         &self,
-        gate: GateName,
+        manifest_gate: &ManifestGate,
         run_id: &BoundedId,
         source: &SourceIdentity,
     ) -> ValidationResult<()> {
@@ -1117,11 +2220,11 @@ impl ProducerEnvelope {
                 self.format
             ));
         }
-        if self.gate != gate {
+        if self.gate != manifest_gate.gate {
             return Err(format!(
                 "producer returned {} evidence for {}",
                 self.gate.slug(),
-                gate.slug()
+                manifest_gate.gate.slug()
             ));
         }
         if &self.run_id != run_id {
@@ -1138,6 +2241,8 @@ impl ProducerEnvelope {
                 "producer checks exceed reserved limit {MAX_PRODUCT_CHECKS}"
             ));
         }
+        self.evidence
+            .validate_profile(manifest_gate, ReportStatus::Fail)?;
         Ok(())
     }
 }
@@ -1236,7 +2341,10 @@ impl AggregateReport {
             return Err("aggregate manifest identity mismatch".to_owned());
         }
         if self.gates.len() != handoff.gates.len() {
-            return Err("aggregate must contain exactly six gate results".to_owned());
+            return Err(format!(
+                "aggregate must contain exactly {} gate results",
+                handoff.gates.len()
+            ));
         }
         if self.blockers.len() > MAX_BLOCKERS {
             return Err(format!("aggregate blockers exceed {MAX_BLOCKERS} entries"));
@@ -1316,86 +2424,26 @@ impl AggregateReport {
     }
 }
 
-pub fn measurement_contract(gate: GateName) -> MeasurementContract {
-    if !gate.is_timed_product() {
+pub fn measurement_contract(gate: &ManifestGate) -> MeasurementContract {
+    let Some(profile) = &gate.profile else {
+        return MeasurementContract::NotApplicable {
+            reason: ShortText::new("structural or rejection gate has no product timing samples")
+                .expect("static reason is bounded"),
+        };
+    };
+    if profile.measurements.is_empty() {
         return MeasurementContract::NotApplicable {
             reason: ShortText::new("structural or rejection gate has no product timing samples")
                 .expect("static reason is bounded"),
         };
     }
 
-    let mut product_ux = vec![
-        metric_definition(
-            TimingMetric::CallbackToHostEvent,
-            MetricBoundaryPoint::WindowCallbackObserved,
-            MetricBoundaryPoint::HostEventAccepted,
-            1_000,
-            None,
-            Some(1_000),
-            2_000,
-            60,
-            10,
-        ),
-        metric_definition(
-            TimingMetric::WarmVisibleInteraction,
-            MetricBoundaryPoint::HostEventAccepted,
-            MetricBoundaryPoint::FramePresented,
-            16_700,
-            Some(16_700),
-            None,
-            33_400,
-            60,
-            10,
-        ),
-    ];
-    if gate == GateName::Cells {
-        product_ux.push(metric_definition(
-            TimingMetric::CellsSelection,
-            MetricBoundaryPoint::HostEventAccepted,
-            MetricBoundaryPoint::FramePresented,
-            16_700,
-            Some(16_700),
-            None,
-            33_400,
-            20,
-            4,
-        ));
-        product_ux.push(metric_definition(
-            TimingMetric::WarmScroll,
-            MetricBoundaryPoint::HostEventAccepted,
-            MetricBoundaryPoint::FramePresented,
-            16_700,
-            Some(16_700),
-            None,
-            33_400,
-            120,
-            20,
-        ));
-    }
-    if gate == GateName::CounterDev {
-        product_ux.push(metric_definition(
-            TimingMetric::ExampleSwitchAcknowledgement,
-            MetricBoundaryPoint::ExampleSwitchRequested,
-            MetricBoundaryPoint::ExampleSwitchAcknowledged,
-            16_700,
-            Some(16_700),
-            None,
-            33_400,
-            20,
-            3,
-        ));
-        product_ux.push(metric_definition(
-            TimingMetric::ExampleSwitchFinalPreview,
-            MetricBoundaryPoint::ExampleSwitchRequested,
-            MetricBoundaryPoint::FramePresented,
-            250_000,
-            Some(250_000),
-            None,
-            500_000,
-            20,
-            3,
-        ));
-    }
+    let product_ux = profile
+        .measurements
+        .iter()
+        .copied()
+        .map(metric_definition_for)
+        .collect();
     let async_proof = MetricDefinition {
         metric: TimingMetric::AsyncProof,
         boundary: MetricBoundary {
@@ -1419,6 +2467,80 @@ pub fn measurement_contract(gate: GateName) -> MeasurementContract {
     MeasurementContract::Timed {
         product_ux,
         async_proof,
+    }
+}
+
+fn metric_definition_for(metric: TimingMetric) -> MetricDefinition {
+    match metric {
+        TimingMetric::CallbackToHostEvent => metric_definition(
+            TimingMetric::CallbackToHostEvent,
+            MetricBoundaryPoint::WindowCallbackObserved,
+            MetricBoundaryPoint::HostEventAccepted,
+            1_000,
+            None,
+            Some(1_000),
+            2_000,
+            60,
+            10,
+        ),
+        TimingMetric::WarmVisibleInteraction => metric_definition(
+            TimingMetric::WarmVisibleInteraction,
+            MetricBoundaryPoint::HostEventAccepted,
+            MetricBoundaryPoint::FramePresented,
+            16_700,
+            Some(16_700),
+            None,
+            33_400,
+            60,
+            10,
+        ),
+        TimingMetric::RepeatedSelection => metric_definition(
+            TimingMetric::RepeatedSelection,
+            MetricBoundaryPoint::HostEventAccepted,
+            MetricBoundaryPoint::FramePresented,
+            16_700,
+            Some(16_700),
+            None,
+            33_400,
+            20,
+            4,
+        ),
+        TimingMetric::WarmScroll => metric_definition(
+            TimingMetric::WarmScroll,
+            MetricBoundaryPoint::HostEventAccepted,
+            MetricBoundaryPoint::FramePresented,
+            16_700,
+            Some(16_700),
+            None,
+            33_400,
+            120,
+            20,
+        ),
+        TimingMetric::ExampleSwitchAcknowledgement => metric_definition(
+            TimingMetric::ExampleSwitchAcknowledgement,
+            MetricBoundaryPoint::ExampleSwitchRequested,
+            MetricBoundaryPoint::ExampleSwitchAcknowledged,
+            16_700,
+            Some(16_700),
+            None,
+            33_400,
+            20,
+            3,
+        ),
+        TimingMetric::ExampleSwitchFinalPreview => metric_definition(
+            TimingMetric::ExampleSwitchFinalPreview,
+            MetricBoundaryPoint::ExampleSwitchRequested,
+            MetricBoundaryPoint::FramePresented,
+            250_000,
+            Some(250_000),
+            None,
+            500_000,
+            20,
+            3,
+        ),
+        TimingMetric::AsyncProof => {
+            unreachable!("async proof has a dedicated measurement definition")
+        }
     }
 }
 
@@ -1457,7 +2579,7 @@ fn metric_name(metric: TimingMetric) -> &'static str {
     match metric {
         TimingMetric::CallbackToHostEvent => "callback-to-host-event",
         TimingMetric::WarmVisibleInteraction => "warm-visible-interaction",
-        TimingMetric::CellsSelection => "cells-selection",
+        TimingMetric::RepeatedSelection => "repeated-selection",
         TimingMetric::WarmScroll => "warm-scroll",
         TimingMetric::ExampleSwitchAcknowledgement => "example-switch-acknowledgement",
         TimingMetric::ExampleSwitchFinalPreview => "example-switch-final-preview",
@@ -1758,6 +2880,7 @@ pub fn empty_evidence(checks: Vec<CheckEvidence>) -> GateEvidence {
     GateEvidence {
         checks,
         producer: None,
+        profile: None,
         native: None,
         product_ux_timings: Vec::new(),
         async_proof_timing: None,
@@ -1766,7 +2889,7 @@ pub fn empty_evidence(checks: Vec<CheckEvidence>) -> GateEvidence {
 }
 
 pub fn gate_report(
-    gate: GateName,
+    manifest_gate: &ManifestGate,
     run_id: BoundedId,
     expected: ExpectedIdentity,
     status: ReportStatus,
@@ -1777,19 +2900,22 @@ pub fn gate_report(
         format: FORMAT_VERSION,
         kind: GateReportKind::Gate,
         identity: GateIdentity {
-            report_id: make_report_id(&run_id, gate.slug())?,
+            report_id: make_report_id(&run_id, manifest_gate.gate.slug())?,
             run_id,
-            gate,
+            gate: manifest_gate.gate.clone(),
             source: expected.source,
             tooling: expected.tooling,
             generated_unix_ms: unix_time_ms(),
         },
         status,
-        measurement: measurement_contract(gate),
+        measurement: measurement_contract(manifest_gate),
         evidence,
         blockers,
     };
     report.validate_shape()?;
+    report
+        .evidence
+        .validate_profile(manifest_gate, report.status)?;
     Ok(report)
 }
 

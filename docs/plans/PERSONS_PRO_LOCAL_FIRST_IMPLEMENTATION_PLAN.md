@@ -1,8 +1,8 @@
 # Persons.pro Local-First Implementation Plan
 
-Date: 2026-07-14
+Date: 2026-07-15
 
-Status: active architecture and implementation guide
+Status: local-first implementation checkpoint; final native handoff evidence pending
 
 Persons.pro is a Boon-hosted personal publishing workspace. A visitor receives
 an immediately usable anonymous workspace, edits a small Boon program, sees the
@@ -406,10 +406,11 @@ compiler fixes cover function-wrapped HOLD constants, quoted-string newline
 escapes, and function-body SOURCE continuations rather than hiding those engine
 limitations in the example.
 
-This checkpoint does not complete the local-first milestone. Durable workspace
-restore, publishing and authentication adapters, native app-owned visual
-evidence, and release performance budgets remain governed by the later slices
-and the stop conditions below.
+This checkpoint did not by itself complete the local-first milestone. The
+2026-07-15 checkpoint below records the subsequent durable workspace,
+publishing, authentication, and migration implementation. Native app-owned
+visual evidence and release performance budgets remain governed by the stop
+conditions below.
 
 ### Slice 3: Durable local workspace
 
@@ -423,6 +424,51 @@ and the stop conditions below.
 - Implement the generic deterministic passkey development adapter.
 - Complete protect, second-passkey, sign-out, sign-in, and failure flows.
 - Publish immutable local revisions from the exact source digest.
+
+Implementation checkpoint (2026-07-15): Slices 3 and 4 are implemented in
+commits `442e7c4` through `4ca8a3d`. The generic redb-backed runtime restores
+acknowledged authority and immutable child artifacts before the first product
+frame, keeps persistence/artifact workers bounded, and supports restart,
+selected clear, start-over, canonical export/import preview and activation,
+and fail-closed corruption handling. Persons.pro has an exact semantic-memory
+allowlist; compiler diagnostics, documents, layouts, render scenes, GPU data,
+proof data, private passkey material, and other reconstructable machinery are
+not stored.
+
+The typed `DevelopmentPasskey` adapter covers registration and authentication
+success, cancellation, failure, duplicate credentials, a second credential,
+sign-out, and sign-in through the durable effect outbox. It binds the anonymous
+workspace grant explicitly and remains labeled as a simulator. Publishing
+recompiles the exact candidate source, stores the immutable artifact closure,
+and advances the public pointer only after the durable success outcome; failed
+or stale completions preserve the previous pointer. The published view mounts
+that child artifact rather than a parent-owned duplicate.
+
+The versioned manifest now carries a source-controlled Persons.pro migration
+sequence from V1 through V3. V2 uses `DRAINING` and `DRAIN` to rename the
+published source digest, V3 removes obsolete authority, and deterministic tests
+cover incremental and skipped activation, restart, exact deletion, and stable
+canonical module identity. The native verifier code also carries generic
+frame-bound workflow checkpoints for restart, asynchronous artifact load,
+responsive desktop/narrow layouts, migration activation, scrolling, and
+visible TEST cursor playback.
+
+Current local evidence at commit `23f7d96`:
+
+- `cargo fmt --all -- --check` passes.
+- `cargo check --workspace --all-targets` passes without warnings.
+- `cargo test --workspace --all-targets` passes after all 112 native
+  playground tests and every compiler/runtime/persistence/xtask test complete.
+- `cargo build --release -p boon_native_playground` passes.
+- repository scans find no Python source and no Persons.pro literal in
+  production compiler, runtime, persistence, document, renderer, playground,
+  or verifier control flow; Persons literals remain only in fixtures and tests.
+
+This is not final native evidence. The installed compositor contains the
+launch-scoped isolated-seat tiled-resize fix, but the compositor process running
+when this checkpoint was recorded still mapped the prior deleted binary. A
+session restart is required before rerunning `verify-persons-pro`; stale reports
+must not be used to satisfy the stop conditions.
 
 ### Slice 5: Browser host
 

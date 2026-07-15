@@ -252,6 +252,7 @@ fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
                 ("account_id", DataTypePlan::Text),
                 ("credential_count", DataTypePlan::Number),
                 ("simulation", simulation_type()),
+                ("workspace_grant_id", DataTypePlan::Text),
                 ("workspace_id", DataTypePlan::Text),
             ],
             vec![
@@ -277,6 +278,7 @@ fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
                         ("account_id", DataTypePlan::Text),
                         ("credential_id", DataTypePlan::Text),
                         ("label", DataTypePlan::Text),
+                        ("workspace_grant_bound", DataTypePlan::Bool),
                     ],
                 ),
             ],

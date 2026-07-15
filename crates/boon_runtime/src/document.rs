@@ -1,7 +1,8 @@
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
-    DocumentPatch, EmbeddedProgramDescriptor, MaterializedRange, ProgramCapabilityProfile,
-    SourceBinding, SourceBindingId, StyleMap, StylePatch, StyleValue, TextValue,
+    DocumentPatch, EmbeddedProgramDescriptor, MaterializedRange, ProgramArtifactRetention,
+    ProgramCapabilityProfile, SourceBinding, SourceBindingId, StyleMap, StylePatch, StyleValue,
+    TextValue,
 };
 use boon_plan::{
     DocumentArgumentRole, DocumentBuiltin, DocumentConstantId, DocumentConstantValue,
@@ -3146,8 +3147,12 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
             "artifact_id" => {
                 program.artifact_id = value.text();
             }
-            "persist_artifact" => {
-                program.persist_artifact = value.truthy();
+            "artifact_retention" => {
+                program.artifact_retention = match value.text().as_str() {
+                    "Replaceable" | "replaceable" => ProgramArtifactRetention::Replaceable,
+                    "Archive" | "archive" => ProgramArtifactRetention::Archive,
+                    _ => ProgramArtifactRetention::Ephemeral,
+                };
             }
             "bootstrap_source" => {
                 program.bootstrap_source = value.text();
@@ -3181,7 +3186,7 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
             "source"
                 | "revision"
                 | "artifact_id"
-                | "persist_artifact"
+                | "artifact_retention"
                 | "bootstrap_source"
                 | "bootstrap_artifact_id"
                 | "bootstrap_revision"

@@ -10,8 +10,10 @@ use super::codec::{
     scalar_component_blob_references,
 };
 use super::{
-    ActivationBatch, CheckpointBatch, DecodeLimits, DurableChange, DurableOutboxChange,
-    OutboxItemId, PersistenceResult, RestoreImage, StoreError, StoredRow, encode_restore_image,
+    ActivationBatch, CheckpointBatch, ContentArtifact, ContentArtifactBinding, ContentArtifactId,
+    ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
+    DurableChange, DurableOutboxChange, OutboxItemId, PersistenceResult, RestoreImage, StoreError,
+    StoredRow, encode_restore_image, validate_content_artifact,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
 use minicbor::{Decoder, Encoder};
@@ -22,9 +24,14 @@ use std::fmt;
 
 #[cfg(target_arch = "wasm32")]
 use super::{
-    ActivationAck, BarrierAck, BarrierRequest, CommitAck, CompactAck, CompactRequest,
-    InspectRequest, PersistenceCommand, PersistenceInspectorSnapshot, ResetApplicationAck,
-    ResetApplicationBatch, RestoreRequest, ShutdownAck, StoredList,
+    ActivationAck, ApplicationTransfer, BarrierAck, BarrierRequest, CommitAck, CompactAck,
+    CompactRequest, DurableContentArtifactChange, ExportApplicationRequest, InspectRequest,
+    LoadContentArtifactRequest, PersistenceCommand, PersistenceInspectorSnapshot,
+    PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch,
+    RestoreRequest, ShutdownAck, StoredList, apply_durable_content_artifact_changes,
+    exact_content_artifact_closure, inspector_snapshot_with_artifacts,
+    validate_application_transfer, validate_content_artifact_manifest,
+    validate_content_artifact_storage,
 };
 #[cfg(target_arch = "wasm32")]
 use futures::channel::{mpsc, oneshot};
@@ -47,7 +54,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{DomException, StorageManager, WorkerGlobalScope};
 
-const DATABASE_VERSION: u32 = 1;
+const DATABASE_VERSION: u32 = 2;
 const COMPONENT_FORMAT: u32 = 1;
 const MAX_CHECKPOINT_RECORDS_PER_APPLICATION: usize = 64;
 const DEFAULT_UPGRADE_TIMEOUT_MS: u32 = 15_000;
@@ -65,8 +72,10 @@ const CHECKPOINTS: &str = "checkpoints";
 const MIGRATIONS: &str = "migrations";
 const OUTBOX: &str = "outbox";
 const BLOBS: &str = "blobs";
+const ARTIFACTS: &str = "artifacts";
+const ARTIFACT_OWNERS: &str = "artifact_owners";
 
-const STORE_NAMES: [&str; 8] = [
+const STORE_NAMES: [&str; 10] = [
     META,
     SLOTS,
     LISTS,
@@ -75,8 +84,20 @@ const STORE_NAMES: [&str; 8] = [
     MIGRATIONS,
     OUTBOX,
     BLOBS,
+    ARTIFACTS,
+    ARTIFACT_OWNERS,
 ];
-const LOAD_STORES: [&str; 7] = [META, SLOTS, LISTS, ROWS, MIGRATIONS, OUTBOX, BLOBS];
+const LOAD_STORES: [&str; 9] = [
+    META,
+    SLOTS,
+    LISTS,
+    ROWS,
+    MIGRATIONS,
+    OUTBOX,
+    BLOBS,
+    ARTIFACTS,
+    ARTIFACT_OWNERS,
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,6 +201,9 @@ impl BrowserStorageStatus {
                 | PersistenceResult::ApplicationReset(Err(StoreError::MissingApplication))
                 | PersistenceResult::BarrierComplete(Err(StoreError::MissingApplication))
                 | PersistenceResult::Compacted(Err(StoreError::MissingApplication))
+                | PersistenceResult::ApplicationExported(Err(StoreError::MissingApplication))
+                | PersistenceResult::ContentArtifactStored(Err(StoreError::MissingApplication))
+                | PersistenceResult::ContentArtifactLoaded(Err(StoreError::MissingApplication))
         );
         if self.missing_or_evicted {
             self.last_operation_failure = Some(BrowserFailureKind::MissingOrEvicted);
@@ -294,11 +318,14 @@ impl SparseTransactionPlan {
         if !batch.outbox_changes.is_empty() {
             plan.stores.insert(OUTBOX);
         }
+        if !batch.content_artifact_changes.is_empty() {
+            plan.stores.extend([ARTIFACTS, ARTIFACT_OWNERS]);
+        }
         plan
     }
 
     fn activation(batch: &ActivationBatch) -> Self {
-        let mut plan = Self::with_required([META, CHECKPOINTS]);
+        let mut plan = Self::with_required([META, CHECKPOINTS, ARTIFACTS, ARTIFACT_OWNERS]);
         for change in &batch.authority_changes {
             plan.include_authority_change(change);
         }
@@ -471,6 +498,96 @@ fn encode_checkpoint_record(record: &CheckpointRecord) -> Result<Vec<u8>, Compon
         .and_then(|encoder| encoder.bool(true))
         .map_err(encode_error)?;
     Ok(bytes)
+}
+
+fn encode_content_artifact(artifact: &ContentArtifact) -> Result<Vec<u8>, ComponentCodecError> {
+    validate_content_artifact(artifact)
+        .map_err(|error| ComponentCodecError::new(error.to_string()))?;
+    let mut bytes = Vec::new();
+    Encoder::new(&mut bytes)
+        .array(3)
+        .and_then(|encoder| encoder.u32(COMPONENT_FORMAT))
+        .and_then(|encoder| encoder.str(&artifact.media_type))
+        .and_then(|encoder| encoder.bytes(&artifact.bytes))
+        .map_err(encode_error)?;
+    Ok(bytes)
+}
+
+fn decode_content_artifact(
+    id: ContentArtifactId,
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<ContentArtifact, ComponentCodecError> {
+    component_size(bytes, limits, "content artifact")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 3, "content artifact")?;
+    expect_format(&mut decoder, "content artifact")?;
+    let media_type = decoder.str().map_err(decode_error)?;
+    if media_type.len() > super::MAX_CONTENT_ARTIFACT_MEDIA_TYPE_BYTES {
+        return Err(ComponentCodecError::new(
+            "content artifact media type exceeds byte limit",
+        ));
+    }
+    let media_type = media_type.to_owned();
+    let payload = decoder.bytes().map_err(decode_error)?;
+    if payload.len() > super::MAX_CONTENT_ARTIFACT_BYTES {
+        return Err(ComponentCodecError::new(
+            "content artifact payload exceeds byte limit",
+        ));
+    }
+    let payload = payload.to_vec();
+    reject_trailing(&decoder, bytes, "content artifact")?;
+    let artifact = ContentArtifact {
+        id,
+        media_type,
+        bytes: payload,
+    };
+    validate_content_artifact(&artifact)
+        .map_err(|error| ComponentCodecError::new(error.to_string()))?;
+    Ok(artifact)
+}
+
+fn encode_content_artifact_binding(
+    binding: ContentArtifactBinding,
+) -> Result<Vec<u8>, ComponentCodecError> {
+    let mut bytes = Vec::new();
+    Encoder::new(&mut bytes)
+        .array(3)
+        .and_then(|encoder| encoder.u32(COMPONENT_FORMAT))
+        .and_then(|encoder| encoder.bytes(binding.artifact_id.as_bytes()))
+        .and_then(|encoder| {
+            encoder.u8(match binding.retention {
+                ContentArtifactRetention::Replaceable => 0,
+                ContentArtifactRetention::Immutable => 1,
+            })
+        })
+        .map_err(encode_error)?;
+    Ok(bytes)
+}
+
+fn decode_content_artifact_binding(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<ContentArtifactBinding, ComponentCodecError> {
+    component_size(bytes, limits, "content artifact binding")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 3, "content artifact binding")?;
+    expect_format(&mut decoder, "content artifact binding")?;
+    let artifact_id = ContentArtifactId(decode_digest(&mut decoder)?);
+    let retention = match decoder.u8().map_err(decode_error)? {
+        0 => ContentArtifactRetention::Replaceable,
+        1 => ContentArtifactRetention::Immutable,
+        tag => {
+            return Err(ComponentCodecError::new(format!(
+                "unknown content artifact retention tag {tag}"
+            )));
+        }
+    };
+    reject_trailing(&decoder, bytes, "content artifact binding")?;
+    Ok(ContentArtifactBinding {
+        artifact_id,
+        retention,
+    })
 }
 
 fn decode_digest(decoder: &mut Decoder<'_>) -> Result<[u8; 32], ComponentCodecError> {
@@ -704,6 +821,28 @@ fn blob_storage_key(application: &ApplicationIdentity, digest: BlobDigest) -> St
     )
 }
 
+fn content_artifact_storage_key(
+    application: &ApplicationIdentity,
+    artifact_id: ContentArtifactId,
+) -> String {
+    format!(
+        "{}{}",
+        application_storage_key(application),
+        encode_hex(artifact_id.as_bytes())
+    )
+}
+
+fn content_artifact_owner_storage_key(
+    application: &ApplicationIdentity,
+    owner_id: ContentArtifactOwnerId,
+) -> String {
+    format!(
+        "{}{}",
+        application_storage_key(application),
+        encode_hex(owner_id.as_bytes())
+    )
+}
+
 fn outbox_from_storage_key(key: &str) -> Result<OutboxItemId, StoreError> {
     if key.len() != 128 {
         return Err(corrupt("invalid outbox key"));
@@ -716,6 +855,22 @@ fn blob_from_storage_key(key: &str) -> Result<BlobDigest, StoreError> {
         return Err(corrupt("invalid blob key"));
     }
     Ok(BlobDigest(decode_hex_digest(&key[64..])?))
+}
+
+fn content_artifact_from_storage_key(key: &str) -> Result<ContentArtifactId, StoreError> {
+    if key.len() != 128 {
+        return Err(corrupt("invalid content artifact key"));
+    }
+    Ok(ContentArtifactId(decode_hex_digest(&key[64..])?))
+}
+
+fn content_artifact_owner_from_storage_key(
+    key: &str,
+) -> Result<ContentArtifactOwnerId, StoreError> {
+    if key.len() != 128 {
+        return Err(corrupt("invalid content artifact owner key"));
+    }
+    Ok(ContentArtifactOwnerId(decode_hex_digest(&key[64..])?))
 }
 
 fn merge_blob_references(
@@ -1202,23 +1357,14 @@ impl IndexedDbBackend {
             PersistenceCommand::Compact(request) => {
                 PersistenceResult::Compacted(self.compact(request).await)
             }
-            PersistenceCommand::ExportApplication(_) => {
-                PersistenceResult::ApplicationExported(Err(StoreError::Backend(
-                    "browser content-artifact transfer belongs to the later browser-host milestone"
-                        .to_owned(),
-                )))
+            PersistenceCommand::ExportApplication(request) => {
+                PersistenceResult::ApplicationExported(self.export_application(request).await)
             }
-            PersistenceCommand::PutContentArtifact(_) => {
-                PersistenceResult::ContentArtifactStored(Err(StoreError::Backend(
-                    "browser content artifacts belong to the later browser-host milestone"
-                        .to_owned(),
-                )))
+            PersistenceCommand::PutContentArtifact(request) => {
+                PersistenceResult::ContentArtifactStored(self.put_content_artifact(request).await)
             }
-            PersistenceCommand::LoadContentArtifact(_) => {
-                PersistenceResult::ContentArtifactLoaded(Err(StoreError::Backend(
-                    "browser content artifacts belong to the later browser-host milestone"
-                        .to_owned(),
-                )))
+            PersistenceCommand::LoadContentArtifact(request) => {
+                PersistenceResult::ContentArtifactLoaded(self.load_content_artifact(request).await)
             }
             PersistenceCommand::Shutdown(_) => {
                 PersistenceResult::ShutdownComplete(self.shutdown().await)
@@ -1360,6 +1506,17 @@ impl IndexedDbBackend {
         {
             return abort_with(transaction, error).await;
         }
+        if !batch.content_artifact_changes.is_empty()
+            && let Err(error) = apply_sparse_content_artifact_changes(
+                &transaction,
+                &batch.application,
+                &batch.content_artifact_changes,
+                self.limits,
+            )
+            .await
+        {
+            return abort_with(transaction, error).await;
+        }
 
         let checkpoint = CheckpointRecord {
             kind: CheckpointKind::Checkpoint,
@@ -1402,12 +1559,6 @@ impl IndexedDbBackend {
 
     async fn activate(&self, batch: ActivationBatch) -> Result<ActivationAck, StoreError> {
         super::validate_activation(&batch)?;
-        if !batch.content_artifacts.is_empty() {
-            return Err(StoreError::Backend(
-                "browser atomic content-artifact activation belongs to the later browser-host milestone"
-                    .to_owned(),
-            ));
-        }
         let plan = SparseTransactionPlan::activation(&batch);
         let store_names = plan.store_names();
         let transaction = self
@@ -1420,6 +1571,17 @@ impl IndexedDbBackend {
             Err(error) => return abort_with(transaction, error).await,
         };
         if let Err(error) = validate_activation_header(&meta, &batch) {
+            return abort_with(transaction, error).await;
+        }
+        if let Err(error) = replace_activation_content_artifacts(
+            &transaction,
+            &batch.application,
+            &batch.target_content_artifact_manifest,
+            &batch.content_artifacts,
+            self.limits,
+        )
+        .await
+        {
             return abort_with(transaction, error).await;
         }
         if let Err(error) = apply_sparse_changes(
@@ -1523,7 +1685,17 @@ impl IndexedDbBackend {
             return abort_with(transaction, StoreError::SchemaMismatch).await;
         }
         let prefix = application_storage_key(&batch.application);
-        for store in [SLOTS, LISTS, ROWS, MIGRATIONS, OUTBOX, BLOBS, CHECKPOINTS] {
+        for store in [
+            SLOTS,
+            LISTS,
+            ROWS,
+            MIGRATIONS,
+            OUTBOX,
+            BLOBS,
+            ARTIFACTS,
+            ARTIFACT_OWNERS,
+            CHECKPOINTS,
+        ] {
             if let Err(error) =
                 delete_prefix_records(&transaction, store, &prefix, self.limits).await
             {
@@ -1615,7 +1787,15 @@ impl IndexedDbBackend {
         let transaction = self
             .database()?
             .transaction(
-                &[META, CHECKPOINTS, SLOTS, ROWS, BLOBS],
+                &[
+                    META,
+                    CHECKPOINTS,
+                    SLOTS,
+                    ROWS,
+                    BLOBS,
+                    ARTIFACTS,
+                    ARTIFACT_OWNERS,
+                ],
                 TransactionMode::ReadWrite,
             )
             .map_err(|error| indexed_db_error("start compact transaction", error))?;
@@ -1633,10 +1813,151 @@ impl IndexedDbBackend {
             Ok(blob_mutations) => mutations.extend(blob_mutations),
             Err(error) => return abort_with(transaction, error).await,
         }
+        match stage_content_artifact_reclamation(&transaction, &request.application, self.limits)
+            .await
+        {
+            Ok(artifact_mutations) => mutations.extend(artifact_mutations),
+            Err(error) => return abort_with(transaction, error).await,
+        }
         if let Err(error) = apply_mutations(&transaction, mutations).await {
             return abort_with(transaction, error).await;
         }
         commit_with(transaction, CompactAck { epoch: meta.epoch }).await
+    }
+
+    async fn put_content_artifact(
+        &self,
+        request: PutContentArtifactRequest,
+    ) -> Result<PutContentArtifactAck, StoreError> {
+        validate_content_artifact(&request.artifact)?;
+        let transaction = self
+            .database()?
+            .transaction(
+                &[META, ARTIFACTS, ARTIFACT_OWNERS],
+                TransactionMode::ReadWrite,
+            )
+            .map_err(|error| indexed_db_error("start artifact staging transaction", error))?;
+        match read_meta(&transaction, &request.application, self.limits).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return abort_with(transaction, StoreError::MissingApplication).await,
+            Err(error) => return abort_with(transaction, error).await,
+        }
+        let manifest =
+            match load_content_artifact_manifest(&transaction, &request.application, self.limits)
+                .await
+            {
+                Ok(manifest) => manifest,
+                Err(error) => return abort_with(transaction, error).await,
+            };
+        let mut artifacts =
+            match load_content_artifacts(&transaction, &request.application, self.limits).await {
+                Ok(artifacts) => artifacts,
+                Err(error) => return abort_with(transaction, error).await,
+            };
+        let already_present = match artifacts.get(&request.artifact.id) {
+            Some(existing) if existing == &request.artifact => true,
+            Some(_) => {
+                return abort_with(
+                    transaction,
+                    StoreError::InvalidContentArtifact(
+                        "content digest collides with different artifact bytes".to_owned(),
+                    ),
+                )
+                .await;
+            }
+            None => {
+                artifacts.insert(request.artifact.id, request.artifact.clone());
+                false
+            }
+        };
+        if let Err(error) = validate_content_artifact_storage(&manifest, &artifacts) {
+            return abort_with(transaction, error).await;
+        }
+        if !already_present {
+            let mutation = StoreMutation::Put {
+                store: ARTIFACTS,
+                key: content_artifact_storage_key(&request.application, request.artifact.id),
+                value: match encode_content_artifact(&request.artifact) {
+                    Ok(value) => value,
+                    Err(error) => return abort_with(transaction, codec_backend(error)).await,
+                },
+            };
+            if let Err(error) = apply_mutations(&transaction, vec![mutation]).await {
+                return abort_with(transaction, error).await;
+            }
+        }
+        commit_with(
+            transaction,
+            PutContentArtifactAck {
+                id: request.artifact.id,
+                stored_bytes: request.artifact.bytes.len().try_into().unwrap_or(u64::MAX),
+                already_present,
+            },
+        )
+        .await
+    }
+
+    async fn load_content_artifact(
+        &self,
+        request: LoadContentArtifactRequest,
+    ) -> Result<Option<ContentArtifact>, StoreError> {
+        let transaction = self
+            .database()?
+            .transaction(&[META, ARTIFACTS], TransactionMode::ReadOnly)
+            .map_err(|error| indexed_db_error("start artifact load transaction", error))?;
+        match read_meta(&transaction, &request.application, self.limits).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return abort_with(transaction, StoreError::MissingApplication).await,
+            Err(error) => return abort_with(transaction, error).await,
+        }
+        let key = content_artifact_storage_key(&request.application, request.id);
+        let bytes = match read_store_bytes(&transaction, ARTIFACTS, &key).await {
+            Ok(bytes) => bytes,
+            Err(error) => return abort_with(transaction, error).await,
+        };
+        let artifact = match bytes {
+            Some(bytes) => match decode_content_artifact(request.id, &bytes, self.limits) {
+                Ok(artifact) => Some(artifact),
+                Err(error) => return abort_with(transaction, codec_backend(error)).await,
+            },
+            None => None,
+        };
+        commit_with(transaction, artifact).await
+    }
+
+    async fn export_application(
+        &self,
+        request: ExportApplicationRequest,
+    ) -> Result<ApplicationTransfer, StoreError> {
+        let transaction = self
+            .database()?
+            .transaction(&LOAD_STORES, TransactionMode::ReadOnly)
+            .map_err(|error| indexed_db_error("start export transaction", error))?;
+        let loaded = match load_application(&transaction, &request.application, self.limits).await {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => return abort_with(transaction, StoreError::MissingApplication).await,
+            Err(error) => return abort_with(transaction, error).await,
+        };
+        let available =
+            match load_content_artifacts(&transaction, &request.application, self.limits).await {
+                Ok(artifacts) => artifacts,
+                Err(error) => return abort_with(transaction, error).await,
+            };
+        let content_artifacts = match exact_content_artifact_closure(
+            &loaded.image.content_artifact_manifest,
+            &available,
+        ) {
+            Ok(artifacts) => artifacts,
+            Err(error) => return abort_with(transaction, error).await,
+        };
+        let transfer = ApplicationTransfer {
+            restore_image: loaded.image,
+            content_artifacts,
+        };
+        if let Err(error) = validate_application_transfer(&transfer) {
+            return abort_with(transaction, error).await;
+        }
+        commit_with(transaction, transfer).await
     }
 
     async fn shutdown(&mut self) -> Result<ShutdownAck, StoreError> {
@@ -2442,6 +2763,11 @@ async fn inspect_application(
         }
     }
     super::validate_outbox(&outbox)?;
+    let content_artifact_manifest =
+        load_content_artifact_manifest(transaction, application, limits).await?;
+    let content_artifacts = load_content_artifacts(transaction, application, limits).await?;
+    let artifact_stats =
+        validate_content_artifact_storage(&content_artifact_manifest, &content_artifacts)?;
     let mut image = RestoreImage::empty(
         meta.application.clone(),
         meta.schema_version,
@@ -2450,7 +2776,8 @@ async fn inspect_application(
     image.epoch = meta.epoch;
     image.through_turn_sequence = meta.through_turn_sequence;
     image.outbox = outbox;
-    let mut snapshot = super::inspector_snapshot(&image);
+    image.content_artifact_manifest = content_artifact_manifest;
+    let mut snapshot = inspector_snapshot_with_artifacts(&image, artifact_stats);
     snapshot.scalar_count = scalar_count;
     snapshot.list_count = list_count;
     snapshot.row_count = row_count;
@@ -2514,6 +2841,26 @@ async fn stage_blob_reclamation(
         }
     }
     Ok(mutations)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn stage_content_artifact_reclamation(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    limits: DecodeLimits,
+) -> Result<Vec<StoreMutation>, StoreError> {
+    let manifest = load_content_artifact_manifest(transaction, application, limits).await?;
+    let artifacts = load_content_artifacts(transaction, application, limits).await?;
+    exact_content_artifact_closure(&manifest, &artifacts)?;
+    let reachable = manifest.reachable_artifact_ids();
+    Ok(artifacts
+        .keys()
+        .filter(|id| !reachable.contains(id))
+        .map(|id| StoreMutation::Delete {
+            store: ARTIFACTS,
+            key: content_artifact_storage_key(application, *id),
+        })
+        .collect())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2690,6 +3037,150 @@ fn js_error_detail(error: &JsValue) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn load_content_artifact_manifest(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    limits: DecodeLimits,
+) -> Result<ContentArtifactManifest, StoreError> {
+    let prefix = application_storage_key(application);
+    let mut bindings = BTreeMap::new();
+    let mut decoded_bytes = 0usize;
+    let owner_limits = DecodeLimits {
+        max_collection_items: super::MAX_CONTENT_ARTIFACT_OWNERS,
+        ..limits
+    };
+    for (key, bytes) in scan_prefix(transaction, ARTIFACT_OWNERS, &prefix, owner_limits).await? {
+        add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+        let owner_id = content_artifact_owner_from_storage_key(&key)?;
+        let binding = decode_content_artifact_binding(&bytes, limits).map_err(codec_backend)?;
+        if bindings.insert(owner_id, binding).is_some() {
+            return Err(corrupt("duplicate content artifact owner key"));
+        }
+    }
+    let manifest = ContentArtifactManifest { bindings };
+    validate_content_artifact_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_content_artifacts(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    limits: DecodeLimits,
+) -> Result<BTreeMap<ContentArtifactId, ContentArtifact>, StoreError> {
+    let prefix = application_storage_key(application);
+    let mut artifacts = BTreeMap::new();
+    let artifact_limits = DecodeLimits {
+        max_collection_items: super::MAX_RETAINED_CONTENT_ARTIFACTS
+            + super::MAX_STAGED_CONTENT_ARTIFACTS,
+        ..limits
+    };
+    let mut total_bytes = 0usize;
+    for (key, bytes) in scan_prefix(transaction, ARTIFACTS, &prefix, artifact_limits).await? {
+        let id = content_artifact_from_storage_key(&key)?;
+        let artifact = decode_content_artifact(id, &bytes, limits).map_err(codec_backend)?;
+        total_bytes = total_bytes
+            .checked_add(artifact.bytes.len())
+            .ok_or_else(|| corrupt("content artifact byte count overflow"))?;
+        if total_bytes
+            > super::MAX_RETAINED_CONTENT_ARTIFACT_BYTES + super::MAX_STAGED_CONTENT_ARTIFACT_BYTES
+        {
+            return Err(corrupt("content artifact store exceeds bounded byte count"));
+        }
+        if artifacts.insert(id, artifact).is_some() {
+            return Err(corrupt("duplicate content artifact key"));
+        }
+        if artifacts.len()
+            > super::MAX_RETAINED_CONTENT_ARTIFACTS + super::MAX_STAGED_CONTENT_ARTIFACTS
+        {
+            return Err(corrupt(
+                "content artifact store exceeds bounded record count",
+            ));
+        }
+    }
+    Ok(artifacts)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn apply_sparse_content_artifact_changes(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    changes: &[DurableContentArtifactChange],
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let current = load_content_artifact_manifest(transaction, application, limits).await?;
+    let mut candidate = current.clone();
+    apply_durable_content_artifact_changes(&mut candidate, changes)?;
+    let artifacts = load_content_artifacts(transaction, application, limits).await?;
+    validate_content_artifact_storage(&candidate, &artifacts)?;
+    let mut mutations = Vec::new();
+    for owner_id in current.bindings.keys() {
+        if !candidate.bindings.contains_key(owner_id) {
+            mutations.push(StoreMutation::Delete {
+                store: ARTIFACT_OWNERS,
+                key: content_artifact_owner_storage_key(application, *owner_id),
+            });
+        }
+    }
+    for (owner_id, binding) in &candidate.bindings {
+        if current.bindings.get(owner_id) == Some(binding) {
+            continue;
+        }
+        mutations.push(StoreMutation::Put {
+            store: ARTIFACT_OWNERS,
+            key: content_artifact_owner_storage_key(application, *owner_id),
+            value: encode_content_artifact_binding(*binding).map_err(codec_backend)?,
+        });
+    }
+    apply_mutations(transaction, mutations).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn replace_activation_content_artifacts(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    target_manifest: &ContentArtifactManifest,
+    supplied: &BTreeMap<ContentArtifactId, ContentArtifact>,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let mut available = load_content_artifacts(transaction, application, limits).await?;
+    for (id, artifact) in supplied {
+        match available.get(id) {
+            Some(existing) if existing == artifact => {}
+            Some(_) => {
+                return Err(StoreError::InvalidContentArtifact(
+                    "content digest collides with different artifact bytes".to_owned(),
+                ));
+            }
+            None => {
+                available.insert(*id, artifact.clone());
+            }
+        }
+    }
+    let target_artifacts = exact_content_artifact_closure(target_manifest, &available)?;
+    validate_content_artifact_storage(target_manifest, &target_artifacts)?;
+    let prefix = application_storage_key(application);
+    delete_prefix_records(transaction, ARTIFACTS, &prefix, limits).await?;
+    delete_prefix_records(transaction, ARTIFACT_OWNERS, &prefix, limits).await?;
+    let mut mutations = Vec::with_capacity(target_artifacts.len() + target_manifest.bindings.len());
+    for (id, artifact) in target_artifacts {
+        mutations.push(StoreMutation::Put {
+            store: ARTIFACTS,
+            key: content_artifact_storage_key(application, id),
+            value: encode_content_artifact(&artifact).map_err(codec_backend)?,
+        });
+    }
+    for (owner_id, binding) in &target_manifest.bindings {
+        mutations.push(StoreMutation::Put {
+            store: ARTIFACT_OWNERS,
+            key: content_artifact_owner_storage_key(application, *owner_id),
+            value: encode_content_artifact_binding(*binding).map_err(codec_backend)?,
+        });
+    }
+    apply_mutations(transaction, mutations).await
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn load_application(
     transaction: &Transaction,
     application: &ApplicationIdentity,
@@ -2798,6 +3289,10 @@ async fn load_application(
         }
     }
     super::validate_outbox(&outbox)?;
+    let content_artifact_manifest =
+        load_content_artifact_manifest(transaction, application, limits).await?;
+    let content_artifacts = load_content_artifacts(transaction, application, limits).await?;
+    validate_content_artifact_storage(&content_artifact_manifest, &content_artifacts)?;
     validate_blob_reference_counts(&blobs, &actual_blob_references)?;
 
     let image = RestoreImage {
@@ -2810,6 +3305,7 @@ async fn load_application(
         lists,
         completed_migration_edges,
         outbox,
+        content_artifact_manifest,
     };
     Ok(Some(LoadedApplication { image, meta }))
 }
@@ -3021,6 +3517,13 @@ fn stage_initial_image(image: &RestoreImage) -> Result<Vec<StoreMutation>, Store
             store: BLOBS,
             key: blob_storage_key(application, digest),
             value: encode_blob_record(&record).map_err(codec_backend)?,
+        });
+    }
+    for (owner_id, binding) in &image.content_artifact_manifest.bindings {
+        mutations.push(StoreMutation::Put {
+            store: ARTIFACT_OWNERS,
+            key: content_artifact_owner_storage_key(application, *owner_id),
+            value: encode_content_artifact_binding(*binding).map_err(codec_backend)?,
         });
     }
     Ok(mutations)
@@ -3360,9 +3863,9 @@ mod tests {
     use super::*;
     #[cfg(not(target_arch = "wasm32"))]
     use crate::codec::{decode_blob_record, decode_outbox_record};
+    use crate::{DurableContentArtifactChange, StoredScalar, StoredValue};
     #[cfg(not(target_arch = "wasm32"))]
     use crate::{DurableEffectRow, DurableOutboxItem, StoredList, StoredRow};
-    use crate::{StoredScalar, StoredValue};
     use boon_plan::MemoryLeafId;
     #[cfg(not(target_arch = "wasm32"))]
     use boon_plan::{EffectId, EffectInvocationId, MemoryKind, MemoryOwnerPath};
@@ -3539,6 +4042,41 @@ mod tests {
     }
 
     #[test]
+    fn browser_artifact_owner_records_and_keys_are_canonical() {
+        let artifact = ContentArtifact::new("text/plain", b"browser artifact".to_vec()).unwrap();
+        let owner_id = ContentArtifactOwnerId([0x44; 32]);
+        let binding = ContentArtifactBinding {
+            artifact_id: artifact.id,
+            retention: ContentArtifactRetention::Immutable,
+        };
+        let artifact_bytes = encode_content_artifact(&artifact).unwrap();
+        let binding_bytes = encode_content_artifact_binding(binding).unwrap();
+        assert_eq!(
+            decode_content_artifact(artifact.id, &artifact_bytes, DecodeLimits::default()).unwrap(),
+            artifact
+        );
+        assert_eq!(
+            decode_content_artifact_binding(&binding_bytes, DecodeLimits::default()).unwrap(),
+            binding
+        );
+        assert_eq!(encode_content_artifact(&artifact).unwrap(), artifact_bytes);
+        assert_eq!(
+            encode_content_artifact_binding(binding).unwrap(),
+            binding_bytes
+        );
+        let artifact_key = content_artifact_storage_key(&application(), artifact.id);
+        let owner_key = content_artifact_owner_storage_key(&application(), owner_id);
+        assert_eq!(
+            content_artifact_from_storage_key(&artifact_key).unwrap(),
+            artifact.id
+        );
+        assert_eq!(
+            content_artifact_owner_from_storage_key(&owner_key).unwrap(),
+            owner_id
+        );
+    }
+
+    #[test]
     fn indexeddb_prefix_ranges_and_scan_caps_are_deterministic() {
         let range = prefix_range("09af").unwrap();
         assert_eq!(range.lower, "09af");
@@ -3590,11 +4128,25 @@ mod tests {
                 attempt: 1,
                 turn_sequence: 8,
             }],
+            content_artifact_changes: vec![DurableContentArtifactChange::SetReplaceable {
+                owner_id: ContentArtifactOwnerId([0x42; 32]),
+                artifact_id: ContentArtifactId([0x43; 32]),
+            }],
             checksum: [0; 32],
         };
         assert_eq!(
             SparseTransactionPlan::checkpoint(&checkpoint).stores,
-            BTreeSet::from([META, SLOTS, LISTS, ROWS, CHECKPOINTS, OUTBOX, BLOBS])
+            BTreeSet::from([
+                META,
+                SLOTS,
+                LISTS,
+                ROWS,
+                CHECKPOINTS,
+                OUTBOX,
+                BLOBS,
+                ARTIFACTS,
+                ARTIFACT_OWNERS,
+            ])
         );
 
         let activation = ActivationBatch {
@@ -3608,12 +4160,23 @@ mod tests {
             authority_changes: Vec::new(),
             completed_migration_edges: vec![MigrationEdgeId([0x51; 32])],
             deleted_memory: vec![memory],
+            target_content_artifact_manifest: ContentArtifactManifest::default(),
             content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         };
         assert_eq!(
             SparseTransactionPlan::activation(&activation).stores,
-            BTreeSet::from([META, SLOTS, LISTS, ROWS, CHECKPOINTS, MIGRATIONS, BLOBS])
+            BTreeSet::from([
+                META,
+                SLOTS,
+                LISTS,
+                ROWS,
+                CHECKPOINTS,
+                MIGRATIONS,
+                BLOBS,
+                ARTIFACTS,
+                ARTIFACT_OWNERS,
+            ])
         );
     }
 

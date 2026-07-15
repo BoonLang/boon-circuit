@@ -4,11 +4,12 @@ use super::effects::{
 };
 use super::{DocumentPatch, LiveRuntime, RuntimeTurn};
 use boon_persistence::{
-    ActivationAck, ActivationBatch, AuthorityTurn, BarrierAck, CommitAck, CompactAck,
-    ContentArtifact, ContentArtifactId, ContentArtifactStoreCompletion,
+    ActivationAck, ActivationBatch, AuthorityTurn, AuthorityTurnReservation, BarrierAck,
+    CommitAck, CompactAck, ContentArtifact, ContentArtifactId, ContentArtifactManifest,
+    ContentArtifactStoreCompletion,
     ContentArtifactStoreEnqueueError, ContentArtifactStoreTicket, DecodeLimits,
-    DurableOutboxChange, DurableOutboxItem, DurableOutboxState, OutboxItemId,
-    PersistenceControlError, PersistenceCoordinator, PersistenceDriver,
+    DurableContentArtifactChange, DurableOutboxChange, DurableOutboxItem, DurableOutboxState,
+    OutboxItemId, PersistenceControlError, PersistenceCoordinator, PersistenceDriver,
     PersistenceInspectorSnapshot, PersistenceWorkerConfig, PersistenceWorkerStartError,
     PersistenceWorkerStatus, PutContentArtifactAck, ResetApplicationAck, ResetApplicationBatch,
     RestoreImage, StoredValue, TurnEnqueueError, TurnReservationError,
@@ -17,7 +18,7 @@ use boon_persistence::{
 };
 use boon_plan::{MachinePlan, MemoryKind};
 use boon_plan_executor::{SessionOptions, SourceEvent, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -206,9 +207,29 @@ impl std::error::Error for PersistentActivationError {}
 pub struct PersistentRuntime {
     runtime: LiveRuntime,
     persistence: PersistenceCoordinator,
+    /// Latest successfully admitted effect state, including turns not yet durable.
     effect_work: EffectWorkIndex,
+    /// Effect state covered by the persistence worker's durable watermark.
+    durable_effect_work: EffectWorkIndex,
+    pending_effect_durability: VecDeque<PendingEffectDurability>,
+    ready_effect_actions: VecDeque<DeferredEffectAction>,
     last_rebuild_derived_us: u64,
     generation: u64,
+}
+
+const MAX_PENDING_EFFECT_DURABILITY: usize = 8;
+
+#[derive(Clone, Debug)]
+struct PendingEffectDurability {
+    turn_sequence: u64,
+    durable_effect_work: EffectWorkIndex,
+    after_acknowledgement: Option<DeferredEffectAction>,
+}
+
+#[derive(Clone, Debug)]
+enum DeferredEffectAction {
+    Dispatch(DurableOutboxItem),
+    Reconcile(DurableOutboxItem),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -320,6 +341,12 @@ pub struct DurablyAcknowledgedTurn {
     pub acknowledgement: CommitAck,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DurabilityTicket {
+    pub generation: u64,
+    pub turn_sequence: u64,
+}
+
 impl PersistentRuntime {
     pub fn from_machine_plan<D>(
         plan: MachinePlan,
@@ -415,7 +442,10 @@ impl PersistentRuntime {
             Self {
                 runtime,
                 persistence,
+                durable_effect_work: effect_work.clone(),
                 effect_work,
+                pending_effect_durability: VecDeque::new(),
+                ready_effect_actions: VecDeque::new(),
                 last_rebuild_derived_us,
                 generation: 1,
             },
@@ -474,30 +504,25 @@ impl PersistentRuntime {
             .dispatch_unsettled(event)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
         let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
+        if next_effect_work.is_some()
+            && self.pending_effect_durability.len() >= MAX_PENDING_EFFECT_DURABILITY
+        {
+            let rollback_error = self
+                .runtime
+                .rollback_unsettled_turn()
+                .err()
+                .map(|error| error.to_string());
+            let rollback = rollback_error.map_or_else(String::new, |rollback| {
+                format!("; runtime rollback also failed: {rollback}")
+            });
+            return Err(PersistentDispatchError::Runtime(format!(
+                "durable effect lane has {} pending turns, limit is {MAX_PENDING_EFFECT_DURABILITY}{rollback}",
+                self.pending_effect_durability.len()
+            )));
+        }
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
             .with_outbox_changes(turn.outbox_changes.clone());
-        if !turn.outbox_changes.is_empty() {
-            drop(reservation);
-            if let Err(error) = self.persistence.commit_immediate(authority) {
-                turn.phase_timings.persistence_enqueue_us =
-                    duration_us(persistence_started.elapsed());
-                let rollback_error = self
-                    .runtime
-                    .rollback_unsettled_turn()
-                    .err()
-                    .map(|error| error.to_string());
-                return Err(PersistentDispatchError::ImmediateCommitFailed {
-                    turn: Box::new(turn),
-                    error,
-                    rollback_error,
-                });
-            }
-            turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
-            self.effect_work = next_effect_work.expect("effect changes staged an outbox index");
-            self.runtime.settle_turn();
-            return Ok(turn);
-        }
         if let Err(error) = reservation.enqueue(authority) {
             turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
             let rollback_error = self
@@ -512,8 +537,77 @@ impl PersistentRuntime {
             });
         }
         turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+        if let Some(next_effect_work) = next_effect_work {
+            self.effect_work = next_effect_work.clone();
+            self.pending_effect_durability
+                .push_back(PendingEffectDurability {
+                    turn_sequence: turn.sequence,
+                    durable_effect_work: next_effect_work,
+                    after_acknowledgement: None,
+                });
+        }
         self.runtime.settle_turn();
         Ok(turn)
+    }
+
+    /// Admits a program-artifact ownership transition to the existing bounded
+    /// authority queue without waiting for storage. The caller may expose
+    /// compile progress immediately, but must not activate the corresponding
+    /// child program until `durability_ticket_is_acknowledged` returns true.
+    pub fn dispatch_with_content_artifact_changes(
+        &mut self,
+        event: SourceEvent,
+        content_artifact_changes: Vec<DurableContentArtifactChange>,
+    ) -> Result<(RuntimeTurn, DurabilityTicket), PersistentDispatchError> {
+        let reservation = self
+            .persistence
+            .try_reserve_turn()
+            .map_err(PersistentDispatchError::Backpressure)?;
+        let mut turn = self
+            .runtime
+            .dispatch_unsettled(event)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
+        if !turn.outbox_changes.is_empty() {
+            let rollback_error = self
+                .runtime
+                .rollback_unsettled_turn()
+                .err()
+                .map(|error| error.to_string());
+            let rollback = rollback_error.map_or_else(String::new, |rollback| {
+                format!("; runtime rollback also failed: {rollback}")
+            });
+            return Err(PersistentDispatchError::Runtime(format!(
+                "program artifact lifecycle turn cannot also start a host effect{rollback}"
+            )));
+        }
+        let persistence_started = Instant::now();
+        let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
+            .with_content_artifact_changes(content_artifact_changes);
+        if let Err(error) = reservation.enqueue(authority) {
+            turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+            let rollback_error = self
+                .runtime
+                .rollback_unsettled_turn()
+                .err()
+                .map(|error| error.to_string());
+            return Err(PersistentDispatchError::PersistenceAdmissionFailed {
+                turn: Box::new(turn),
+                error,
+                rollback_error,
+            });
+        }
+        turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+        let ticket = DurabilityTicket {
+            generation: self.generation,
+            turn_sequence: turn.sequence,
+        };
+        self.runtime.settle_turn();
+        Ok((turn, ticket))
+    }
+
+    pub fn durability_ticket_is_acknowledged(&self, ticket: DurabilityTicket) -> bool {
+        ticket.generation == self.generation
+            && self.persistence.status().durable_through_turn_sequence >= ticket.turn_sequence
     }
 
     /// Executes a source turn and returns only after that exact authority turn
@@ -551,8 +645,10 @@ impl PersistentRuntime {
             }
         };
         turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+        self.promote_effect_durability();
         if let Some(next_effect_work) = next_effect_work {
-            self.effect_work = next_effect_work;
+            self.effect_work = next_effect_work.clone();
+            self.durable_effect_work = next_effect_work;
         }
         self.runtime.settle_turn();
         Ok(DurablyAcknowledgedTurn {
@@ -656,7 +752,7 @@ impl PersistentRuntime {
         artifact: &[u8],
         options: SessionOptions,
     ) -> Result<PersistentStateArtifactPreview, PersistentActivationError> {
-        let (_, preview, _, _, _) = self.prepare_state_artifact(artifact, options)?;
+        let (_, preview, _, _, _, _) = self.prepare_state_artifact(artifact, options)?;
         Ok(preview)
     }
 
@@ -665,13 +761,20 @@ impl PersistentRuntime {
         artifact: &[u8],
         options: SessionOptions,
     ) -> Result<PersistentStateArtifactActivation, PersistentActivationError> {
-        let (candidate, preview, completed_migration_edges, content_artifacts, rebuild_derived_us) =
-            self.prepare_state_artifact(artifact, options)?;
+        let (
+            candidate,
+            preview,
+            completed_migration_edges,
+            content_artifact_manifest,
+            content_artifacts,
+            rebuild_derived_us,
+        ) = self.prepare_state_artifact(artifact, options)?;
         self.last_rebuild_derived_us = rebuild_derived_us;
         let mount = candidate.mount();
         let acknowledgement = self.activate_settled_candidate_with_artifacts(
             candidate,
             completed_migration_edges,
+            Some(content_artifact_manifest),
             content_artifacts,
         )?;
         Ok(PersistentStateArtifactActivation {
@@ -769,6 +872,7 @@ impl PersistentRuntime {
             LiveRuntime,
             PersistentStateArtifactPreview,
             BTreeSet<boon_plan::MigrationEdgeId>,
+            ContentArtifactManifest,
             BTreeMap<ContentArtifactId, ContentArtifact>,
             u64,
         ),
@@ -793,6 +897,7 @@ impl PersistentRuntime {
         }
         reject_unfinished_outbox(&imported, "import state artifact")?;
         let source_schema_version = imported.schema_version;
+        let content_artifact_manifest = imported.content_artifact_manifest.clone();
         let plan = self.runtime.shared_machine_plan();
         let (mut candidate_image, migration) = if imported.schema_version
             == plan.persistence.schema_version
@@ -839,6 +944,7 @@ impl PersistentRuntime {
             candidate,
             preview,
             completed_migration_edges,
+            content_artifact_manifest,
             transfer.content_artifacts,
             rebuild_derived_us,
         ))
@@ -856,11 +962,31 @@ impl PersistentRuntime {
     /// worker; restart recovery initialized the index from the durable image,
     /// and successful outbox commits advance it in lockstep.
     pub fn has_effect_work(&self) -> bool {
-        self.effect_work.has_work()
+        self.durable_effect_work.has_work()
+            || !self.pending_effect_durability.is_empty()
+            || !self.ready_effect_actions.is_empty()
     }
 
     pub fn effect_work_items(&self) -> Result<Vec<EffectWorkItem>, PersistentEffectError> {
         Ok(self.effect_work.work_items())
+    }
+
+    fn promote_effect_durability(&mut self) {
+        let durable_turn = self.persistence.status().durable_through_turn_sequence;
+        while self
+            .pending_effect_durability
+            .front()
+            .is_some_and(|pending| pending.turn_sequence <= durable_turn)
+        {
+            let pending = self
+                .pending_effect_durability
+                .pop_front()
+                .expect("durable effect transition exists");
+            self.durable_effect_work = pending.durable_effect_work;
+            if let Some(action) = pending.after_acknowledgement {
+                self.ready_effect_actions.push_back(action);
+            }
+        }
     }
 
     pub fn drive_effect_work_once(
@@ -911,38 +1037,31 @@ impl PersistentRuntime {
         &mut self,
         worker: &mut HostEffectWorker,
     ) -> Result<Option<RuntimeTurn>, PersistentEffectDriveError> {
+        self.promote_effect_durability();
         if let Some(result) = worker.try_result().map_err(|error| {
             PersistentEffectDriveError::Runtime(PersistentEffectError::Runtime(error.to_string()))
         })? {
             return match result.outcome {
                 HostEffectWorkerOutcome::Dispatched(Ok(outcome)) => self
-                    .complete_effect(result.request.item_id, outcome)
+                    .complete_effect_async(result.request.item_id, outcome)
                     .map(Some)
                     .map_err(PersistentEffectDriveError::Runtime),
                 HostEffectWorkerOutcome::Dispatched(Err(host)) => {
-                    match self.mark_effect_reconciliation(result.request.item_id) {
-                        Ok(_) => Err(PersistentEffectDriveError::Host(host)),
-                        Err(recovery) => {
-                            Err(PersistentEffectDriveError::HostAndRecovery { host, recovery })
-                        }
-                    }
+                    let _ = host;
+                    self.mark_effect_reconciliation_async(result.request.item_id)
+                        .map(Some)
+                        .map_err(PersistentEffectDriveError::Runtime)
                 }
                 HostEffectWorkerOutcome::Reconciled(Ok(HostEffectReconciliation::Applied(
                     outcome,
                 ))) => self
-                    .complete_effect(result.request.item_id, outcome)
+                    .complete_effect_async(result.request.item_id, outcome)
                     .map(Some)
                     .map_err(PersistentEffectDriveError::Runtime),
                 HostEffectWorkerOutcome::Reconciled(Ok(HostEffectReconciliation::NotApplied)) => {
-                    let claimed = self
-                        .claim_effect_for_dispatch(result.request.item_id)
-                        .map_err(PersistentEffectDriveError::Runtime)?;
-                    submit_background_effect(
-                        worker,
-                        HostEffectWorkerOperation::Dispatch,
-                        &claimed,
-                    )?;
-                    Ok(None)
+                    self.claim_effect_for_dispatch_async(result.request.item_id)
+                        .map(Some)
+                        .map_err(PersistentEffectDriveError::Runtime)
                 }
                 HostEffectWorkerOutcome::Reconciled(Err(host)) => {
                     Err(PersistentEffectDriveError::Host(host))
@@ -952,24 +1071,43 @@ impl PersistentRuntime {
         if worker.is_busy() {
             return Ok(None);
         }
-        let Some(work) = self.effect_work.next_work() else {
+        if let Some(action) = self.ready_effect_actions.pop_front() {
+            match action {
+                DeferredEffectAction::Dispatch(item) => {
+                    submit_background_effect(worker, HostEffectWorkerOperation::Dispatch, &item)?
+                }
+                DeferredEffectAction::Reconcile(item) => {
+                    submit_background_effect(worker, HostEffectWorkerOperation::Reconcile, &item)?
+                }
+            }
+            return Ok(None);
+        }
+        if !self.pending_effect_durability.is_empty() {
+            return Ok(None);
+        }
+        let Some(work) = self.durable_effect_work.next_work() else {
             return Ok(None);
         };
         match work.kind {
             EffectWorkKind::Dispatch => {
-                let claimed = self
-                    .claim_effect_for_dispatch(work.item.item_id)
-                    .map_err(PersistentEffectDriveError::Runtime)?;
-                submit_background_effect(worker, HostEffectWorkerOperation::Dispatch, &claimed)?;
+                return self
+                    .claim_effect_for_dispatch_async(work.item.item_id)
+                    .map(Some)
+                    .map_err(PersistentEffectDriveError::Runtime);
             }
             EffectWorkKind::Reconcile => {
-                let item = if matches!(work.item.state, DurableOutboxState::Dispatching { .. }) {
-                    self.mark_effect_reconciliation(work.item.item_id)
-                        .map_err(PersistentEffectDriveError::Runtime)?
+                if matches!(work.item.state, DurableOutboxState::Dispatching { .. }) {
+                    return self
+                        .mark_effect_reconciliation_async(work.item.item_id)
+                        .map(Some)
+                        .map_err(PersistentEffectDriveError::Runtime);
                 } else {
-                    work.item
-                };
-                submit_background_effect(worker, HostEffectWorkerOperation::Reconcile, &item)?;
+                    submit_background_effect(
+                        worker,
+                        HostEffectWorkerOperation::Reconcile,
+                        &work.item,
+                    )?;
+                }
             }
         }
         Ok(None)
@@ -992,6 +1130,147 @@ impl PersistentRuntime {
                 }
             },
         }
+    }
+
+    fn claim_effect_for_dispatch_async(
+        &mut self,
+        item_id: OutboxItemId,
+    ) -> Result<RuntimeTurn, PersistentEffectError> {
+        let reservation = self.reserve_effect_turn()?;
+        let item = self.load_effect_item(item_id)?;
+        let turn = self
+            .runtime
+            .begin_effect_dispatch_unsettled(&item)
+            .map_err(|error| PersistentEffectError::Runtime(error.to_string()))?;
+        let mut claimed = item;
+        let attempt = match claimed.state {
+            DurableOutboxState::Pending => 1,
+            DurableOutboxState::ReconciliationRequired { attempt } => {
+                attempt.checked_add(1).ok_or_else(|| {
+                    PersistentEffectError::Runtime("effect attempt overflow".to_owned())
+                })?
+            }
+            _ => {
+                let rollback = self
+                    .runtime
+                    .rollback_unsettled_turn()
+                    .err()
+                    .map(|error| format!("; runtime rollback also failed: {error}"))
+                    .unwrap_or_default();
+                return Err(PersistentEffectError::Runtime(format!(
+                    "effect item changed state while claiming dispatch{rollback}"
+                )));
+            }
+        };
+        claimed.revision = claimed
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| PersistentEffectError::Runtime("outbox revision overflow".to_owned()))?;
+        claimed.updated_turn_sequence = turn.sequence;
+        claimed.state = DurableOutboxState::Dispatching { attempt };
+        self.enqueue_effect_turn_async(
+            reservation,
+            turn,
+            Some(DeferredEffectAction::Dispatch(claimed)),
+        )
+    }
+
+    fn mark_effect_reconciliation_async(
+        &mut self,
+        item_id: OutboxItemId,
+    ) -> Result<RuntimeTurn, PersistentEffectError> {
+        let reservation = self.reserve_effect_turn()?;
+        let item = self.load_effect_item(item_id)?;
+        let attempt = item.state.attempt();
+        let turn = self
+            .runtime
+            .require_effect_reconciliation_unsettled(&item)
+            .map_err(|error| PersistentEffectError::Runtime(error.to_string()))?;
+        let mut next = item;
+        next.revision = next
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| PersistentEffectError::Runtime("outbox revision overflow".to_owned()))?;
+        next.updated_turn_sequence = turn.sequence;
+        next.state = DurableOutboxState::ReconciliationRequired { attempt };
+        self.enqueue_effect_turn_async(
+            reservation,
+            turn,
+            Some(DeferredEffectAction::Reconcile(next)),
+        )
+    }
+
+    fn complete_effect_async(
+        &mut self,
+        item_id: OutboxItemId,
+        outcome: StoredValue,
+    ) -> Result<RuntimeTurn, PersistentEffectError> {
+        let reservation = self.reserve_effect_turn()?;
+        let item = self.load_effect_item(item_id)?;
+        let turn = self
+            .runtime
+            .complete_effect_unsettled(&item, outcome)
+            .map_err(|error| PersistentEffectError::Runtime(error.to_string()))?;
+        self.enqueue_effect_turn_async(reservation, turn, None)
+    }
+
+    fn reserve_effect_turn(&self) -> Result<AuthorityTurnReservation, PersistentEffectError> {
+        if self.pending_effect_durability.len() >= MAX_PENDING_EFFECT_DURABILITY {
+            return Err(PersistentEffectError::Runtime(format!(
+                "durable effect lane has {} pending turns, limit is {MAX_PENDING_EFFECT_DURABILITY}",
+                self.pending_effect_durability.len()
+            )));
+        }
+        self.persistence
+            .try_reserve_turn()
+            .map_err(|error| PersistentEffectError::Runtime(error.to_string()))
+    }
+
+    fn enqueue_effect_turn_async(
+        &mut self,
+        reservation: AuthorityTurnReservation,
+        mut turn: RuntimeTurn,
+        after_acknowledgement: Option<DeferredEffectAction>,
+    ) -> Result<RuntimeTurn, PersistentEffectError> {
+        let next_effect_work = match self.effect_work.applying(&turn.outbox_changes) {
+            Ok(next) => next,
+            Err(error) => {
+                let rollback = self
+                    .runtime
+                    .rollback_unsettled_turn()
+                    .err()
+                    .map(|error| format!("; runtime rollback also failed: {error}"))
+                    .unwrap_or_default();
+                return Err(PersistentEffectError::Runtime(format!(
+                    "runtime produced invalid durable effect transitions: {error}{rollback}"
+                )));
+            }
+        };
+        let persistence_started = Instant::now();
+        let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
+            .with_outbox_changes(turn.outbox_changes.clone());
+        if let Err(error) = reservation.enqueue(authority) {
+            turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+            let rollback = self
+                .runtime
+                .rollback_unsettled_turn()
+                .err()
+                .map(|error| format!("; runtime rollback also failed: {error}"))
+                .unwrap_or_default();
+            return Err(PersistentEffectError::Runtime(format!(
+                "persistence rejected a durable effect transition: {error}{rollback}"
+            )));
+        }
+        turn.phase_timings.persistence_enqueue_us = duration_us(persistence_started.elapsed());
+        self.effect_work = next_effect_work.clone();
+        self.pending_effect_durability
+            .push_back(PendingEffectDurability {
+                turn_sequence: turn.sequence,
+                durable_effect_work: next_effect_work,
+                after_acknowledgement,
+            });
+        self.runtime.settle_turn();
+        Ok(turn)
     }
 
     pub fn claim_effect_for_dispatch(
@@ -1105,7 +1384,9 @@ impl PersistentRuntime {
                 rollback_error,
             });
         }
-        self.effect_work = next_effect_work;
+        self.promote_effect_durability();
+        self.effect_work = next_effect_work.clone();
+        self.durable_effect_work = next_effect_work;
         Ok(())
     }
 
@@ -1119,6 +1400,7 @@ impl PersistentRuntime {
         self.activate_settled_candidate_with_artifacts(
             candidate,
             completed_migration_edges,
+            None,
             BTreeMap::new(),
         )
     }
@@ -1127,6 +1409,7 @@ impl PersistentRuntime {
         &mut self,
         candidate: LiveRuntime,
         completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
+        target_content_artifact_manifest: Option<ContentArtifactManifest>,
         content_artifacts: BTreeMap<ContentArtifactId, ContentArtifact>,
     ) -> Result<ActivationAck, PersistentActivationError> {
         let current = self
@@ -1138,6 +1421,9 @@ impl PersistentRuntime {
             .durable_restore_image(current.epoch, completed_migration_edges)
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         candidate_image.outbox = current.outbox.clone();
+        candidate_image.content_artifact_manifest = target_content_artifact_manifest
+            .unwrap_or_else(|| current.content_artifact_manifest.clone());
+        let next_effect_work = EffectWorkIndex::from_items(candidate_image.outbox.clone());
         let mut batch = ActivationBatch::between(&current, &candidate_image)
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         batch.content_artifacts = content_artifacts;
@@ -1147,6 +1433,10 @@ impl PersistentRuntime {
             .activate(batch)
             .map_err(PersistentActivationError::Persistence)?;
         self.runtime = candidate;
+        self.effect_work = next_effect_work.clone();
+        self.durable_effect_work = next_effect_work;
+        self.pending_effect_durability.clear();
+        self.ready_effect_actions.clear();
         self.generation = self.generation.saturating_add(1);
         Ok(acknowledgement)
     }
@@ -1181,6 +1471,7 @@ impl PersistentRuntime {
                 Some(staged.preview),
             )
         };
+        let replacement_effect_work = EffectWorkIndex::from_items(restore.outbox.clone());
         let rebuild_started = Instant::now();
         let candidate =
             LiveRuntime::from_shared_machine_plan_with_restore(plan, options, Some(restore))
@@ -1192,6 +1483,10 @@ impl PersistentRuntime {
             .transpose()
             .map_err(PersistentActivationError::Persistence)?;
         self.runtime = candidate;
+        self.effect_work = replacement_effect_work.clone();
+        self.durable_effect_work = replacement_effect_work;
+        self.pending_effect_durability.clear();
+        self.ready_effect_actions.clear();
         self.last_rebuild_derived_us = rebuild_derived_us;
         self.generation = self.generation.saturating_add(1);
         Ok(PersistentPlanActivation {
@@ -1298,6 +1593,9 @@ impl PersistentRuntime {
             .map_err(PersistentActivationError::Persistence)?;
         self.runtime = candidate;
         self.effect_work = EffectWorkIndex::default();
+        self.durable_effect_work = EffectWorkIndex::default();
+        self.pending_effect_durability.clear();
+        self.ready_effect_actions.clear();
         self.last_rebuild_derived_us = rebuild_derived_us;
         self.generation = self.generation.saturating_add(1);
         Ok(PersistentPlanReset {
@@ -1348,12 +1646,13 @@ mod tests {
     use super::*;
     use crate::FileEffectDriver;
     use boon_persistence::{
-        InMemoryDriver, PersistenceCommand, PersistenceResult, ShutdownAck, StoreError,
+        CheckpointBatch, ContentArtifactOwnerId, InMemoryDriver, PersistenceCommand,
+        PersistenceResult, ShutdownAck, StoreError,
     };
     use boon_plan_executor::SourcePayload;
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
 
     struct FailingActivationDriver {
         inner: InMemoryDriver,
@@ -1400,6 +1699,38 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .execute(command)
         }
+    }
+
+    struct BlockingCommitDriver {
+        inner: InMemoryDriver,
+        entered: Arc<AtomicBool>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl PersistenceDriver for BlockingCommitDriver {
+        fn execute(&mut self, command: PersistenceCommand) -> PersistenceResult {
+            if matches!(command, PersistenceCommand::Commit(_)) {
+                self.entered.store(true, Ordering::Release);
+                let (released, changed) = &*self.gate;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+            }
+            self.inner.execute(command)
+        }
+    }
+
+    fn release_commit_gate(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, changed) = &**gate;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
     }
 
     #[derive(Default)]
@@ -2142,18 +2473,26 @@ mod tests {
         let mut worker = HostEffectWorker::start(FileEffectDriver::new(&root).unwrap()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
 
-        let completion = loop {
+        let mut completion = None;
+        loop {
             if let Some(turn) = runtime.poll_effect_worker(&mut worker).unwrap() {
-                break turn;
+                completion = Some(turn);
+            }
+            if root.join("output.bin").is_file()
+                && runtime.runtime.root_value_current("store.result").unwrap()
+                    == Value::Text("output.bin".to_owned())
+                && !runtime.has_effect_work()
+            {
+                break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "background effect did not complete"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
-        };
+        }
 
-        assert_eq!(completion.source_sequence, None);
+        assert_eq!(completion.unwrap().source_sequence, None);
         assert_eq!(
             std::fs::read(root.join("output.bin")).unwrap(),
             [1, 2, 3, 4]
@@ -2162,6 +2501,77 @@ mod tests {
             runtime.runtime.root_value_current("store.result").unwrap(),
             Value::Text("output.bin".to_owned())
         );
+        worker.shutdown().unwrap();
+        runtime.shutdown().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blocked_persistence_neither_blocks_dispatch_nor_releases_host_effects() {
+        let identity = boon_plan::ApplicationIdentity::new(
+            "dev.boon.persistent-effect-durability-gate",
+            "test",
+            "local",
+        );
+        let root = std::env::temp_dir().join(format!(
+            "boon-persistent-effect-durability-gate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let entered = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let driver = BlockingCommitDriver {
+            inner: InMemoryDriver::default(),
+            entered: Arc::clone(&entered),
+            gate: Arc::clone(&gate),
+        };
+        let (mut runtime, _) = PersistentRuntime::from_shared_machine_plan(
+            effect_plan(identity),
+            SessionOptions::default(),
+            driver,
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        let safety_gate = Arc::clone(&gate);
+        let safety_release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            release_commit_gate(&safety_gate);
+        });
+
+        let started = std::time::Instant::now();
+        runtime.dispatch(effect_source_event(&runtime, 1)).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "dispatch waited for the blocked persistence driver"
+        );
+        let entered_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !entered.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < entered_deadline,
+                "persistence worker did not enter the blocked commit"
+            );
+            std::thread::yield_now();
+        }
+        let mut worker = HostEffectWorker::start(FileEffectDriver::new(&root).unwrap()).unwrap();
+        assert!(runtime.poll_effect_worker(&mut worker).unwrap().is_none());
+        assert!(!root.join("output.bin").exists());
+
+        release_commit_gate(&gate);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while runtime.has_effect_work() || worker.is_busy() {
+            let _ = runtime.poll_effect_worker(&mut worker).unwrap();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durable effect did not settle after releasing persistence"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            std::fs::read(root.join("output.bin")).unwrap(),
+            [1, 2, 3, 4]
+        );
+
+        safety_release.join().unwrap();
         worker.shutdown().unwrap();
         runtime.shutdown().unwrap();
         std::fs::remove_dir_all(root).unwrap();
@@ -2513,6 +2923,27 @@ mod tests {
                 },
             )),
             boon_persistence::PersistenceResult::ContentArtifactStored(Ok(_))
+        ));
+        let owner_id = ContentArtifactOwnerId([7; 32]);
+        let binding = CheckpointBatch {
+            application: plan.application.identity.clone(),
+            schema_hash: plan.persistence.schema_hash,
+            base_epoch: 0,
+            next_epoch: 1,
+            first_turn_sequence: 1,
+            last_turn_sequence: 1,
+            changes: Vec::new(),
+            outbox_changes: Vec::new(),
+            content_artifact_changes: vec![DurableContentArtifactChange::InsertImmutable {
+                owner_id,
+                artifact_id: content.id,
+            }],
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            source_driver.execute(boon_persistence::PersistenceCommand::Commit(binding)),
+            boon_persistence::PersistenceResult::Committed(Ok(_))
         ));
         let (mut source_runtime, _) = PersistentRuntime::from_shared_machine_plan(
             Arc::clone(&plan),

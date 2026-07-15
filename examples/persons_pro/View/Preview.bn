@@ -71,7 +71,7 @@ FUNCTION draft_compiler() {
         style: [width: 0, height: 0, paint: False]
         source: PASSED.store.source_draft
         revision: PASSED.store.draft_revision
-        persist_artifact: True
+        artifact_retention: Replaceable
         bootstrap_source:
             Text/is_empty(PASSED.store.last_valid_draft_artifact_id) |> WHEN {
                 True => PASSED.store.last_valid_draft_source
@@ -94,7 +94,7 @@ FUNCTION draft_program() {
         ]
         source: PASSED.store.source_draft
         revision: PASSED.store.draft_revision
-        persist_artifact: True
+        artifact_retention: Replaceable
         bootstrap_source:
             Text/is_empty(PASSED.store.last_valid_draft_artifact_id) |> WHEN {
                 True => PASSED.store.last_valid_draft_source

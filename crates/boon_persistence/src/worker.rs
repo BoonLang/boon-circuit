@@ -1,13 +1,14 @@
 use super::{
     ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, BarrierRequest,
     CheckpointBatch, CommitAck, CompactAck, CompactRequest, ContentArtifact, ContentArtifactId,
-    DurableChange, DurableOutboxChange, ExportApplicationRequest, InspectRequest,
-    LoadContentArtifactRequest, PersistenceCommand, PersistenceDriver,
+    DurableChange, DurableContentArtifactChange, DurableOutboxChange, ExportApplicationRequest,
+    InspectRequest, LoadContentArtifactRequest, PersistenceCommand, PersistenceDriver,
     PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
     PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
     RestoreRequest, ShutdownAck, ShutdownRequest, StoreError,
 };
 use boon_plan::ApplicationIdentity;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -21,11 +22,13 @@ use std::time::{Duration, Instant};
 /// Turns are the unit of admission and recovery. A turn is either returned to
 /// the caller unchanged or accepted in full; the coordinator never admits a
 /// prefix of its changes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuthorityTurn {
     pub turn_sequence: u64,
     pub changes: Vec<DurableChange>,
     pub outbox_changes: Vec<DurableOutboxChange>,
+    #[serde(default)]
+    pub content_artifact_changes: Vec<DurableContentArtifactChange>,
 }
 
 impl AuthorityTurn {
@@ -34,11 +37,20 @@ impl AuthorityTurn {
             turn_sequence,
             changes,
             outbox_changes: Vec::new(),
+            content_artifact_changes: Vec::new(),
         }
     }
 
     pub fn with_outbox_changes(mut self, changes: Vec<DurableOutboxChange>) -> Self {
         self.outbox_changes = changes;
+        self
+    }
+
+    pub fn with_content_artifact_changes(
+        mut self,
+        changes: Vec<DurableContentArtifactChange>,
+    ) -> Self {
+        self.content_artifact_changes = changes;
         self
     }
 }
@@ -1155,6 +1167,10 @@ where
         .iter()
         .flat_map(|queued| queued.turn.outbox_changes.iter().cloned())
         .collect();
+    let content_artifact_changes = pending
+        .iter()
+        .flat_map(|queued| queued.turn.content_artifact_changes.iter().cloned())
+        .collect();
     let batch = CheckpointBatch {
         application: durable.application.clone(),
         schema_hash: durable.schema_hash,
@@ -1164,6 +1180,7 @@ where
         last_turn_sequence,
         changes,
         outbox_changes,
+        content_artifact_changes,
         checksum: [0; 32],
     }
     .seal();
@@ -1234,6 +1251,7 @@ where
         last_turn_sequence: turn.turn_sequence,
         changes: turn.changes,
         outbox_changes: turn.outbox_changes,
+        content_artifact_changes: turn.content_artifact_changes,
         checksum: [0; 32],
     }
     .seal();
@@ -1724,6 +1742,53 @@ mod tests {
 
         assert_eq!(&*lock(&trace.commits), &[(1, 3)]);
         assert_eq!(coordinator.status().durable_through_turn_sequence, 3);
+        coordinator.shutdown().unwrap();
+    }
+
+    #[test]
+    fn worker_batches_content_artifact_changes_with_their_authority_turns() {
+        let (coordinator, trace) = coordinator(8, Duration::from_millis(50), None);
+        let first = ContentArtifact::new("text/plain", b"first owner".to_vec()).unwrap();
+        let second = ContentArtifact::new("text/plain", b"second owner".to_vec()).unwrap();
+        coordinator.put_content_artifact(first.clone()).unwrap();
+        coordinator.put_content_artifact(second.clone()).unwrap();
+        let first_owner = super::super::ContentArtifactOwnerId([0x21; 32]);
+        let second_owner = super::super::ContentArtifactOwnerId([0x22; 32]);
+        coordinator
+            .try_enqueue_turn(
+                AuthorityTurn::new(1, Vec::new()).with_content_artifact_changes(vec![
+                    DurableContentArtifactChange::SetReplaceable {
+                        owner_id: first_owner,
+                        artifact_id: first.id,
+                    },
+                ]),
+            )
+            .unwrap();
+        coordinator
+            .try_enqueue_turn(
+                AuthorityTurn::new(2, Vec::new()).with_content_artifact_changes(vec![
+                    DurableContentArtifactChange::InsertImmutable {
+                        owner_id: second_owner,
+                        artifact_id: second.id,
+                    },
+                ]),
+            )
+            .unwrap();
+        coordinator.barrier().unwrap();
+
+        assert_eq!(&*lock(&trace.commits), &[(1, 2)]);
+        let restored = coordinator.load().unwrap().unwrap();
+        assert_eq!(
+            restored.content_artifact_manifest.bindings[&first_owner].artifact_id,
+            first.id
+        );
+        assert_eq!(
+            restored.content_artifact_manifest.bindings[&second_owner].artifact_id,
+            second.id
+        );
+        let snapshot = coordinator.inspect().unwrap().unwrap();
+        assert_eq!(snapshot.content_artifact_owner_count, 2);
+        assert_eq!(snapshot.content_artifact_retained_count, 2);
         coordinator.shutdown().unwrap();
     }
 

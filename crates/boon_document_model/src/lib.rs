@@ -60,6 +60,25 @@ impl ProgramCapabilityProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramArtifactRetention {
+    #[default]
+    Ephemeral,
+    Replaceable,
+    Archive,
+}
+
+impl ProgramArtifactRetention {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ephemeral => "ephemeral",
+            Self::Replaceable => "replaceable",
+            Self::Archive => "archive",
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq, Deserialize)]
 pub struct EmbeddedProgramDescriptor {
     #[serde(default)]
@@ -69,7 +88,7 @@ pub struct EmbeddedProgramDescriptor {
     #[serde(default)]
     pub artifact_id: String,
     #[serde(default)]
-    pub persist_artifact: bool,
+    pub artifact_retention: ProgramArtifactRetention,
     #[serde(default)]
     pub bootstrap_source: String,
     #[serde(default)]
@@ -92,7 +111,7 @@ impl Default for EmbeddedProgramDescriptor {
             source_digest: String::new(),
             revision: 0,
             artifact_id: String::new(),
-            persist_artifact: false,
+            artifact_retention: ProgramArtifactRetention::default(),
             bootstrap_source: String::new(),
             bootstrap_source_digest: String::new(),
             bootstrap_artifact_id: String::new(),
@@ -112,7 +131,7 @@ impl Debug for EmbeddedProgramDescriptor {
             .field("source_bytes", &self.source.len())
             .field("revision", &self.revision)
             .field("artifact_id", &self.artifact_id)
-            .field("persist_artifact", &self.persist_artifact)
+            .field("artifact_retention", &self.artifact_retention)
             .field("bootstrap_source_digest", &self.bootstrap_source_digest)
             .field("bootstrap_source_bytes", &self.bootstrap_source.len())
             .field("bootstrap_artifact_id", &self.bootstrap_artifact_id)
@@ -135,7 +154,7 @@ impl Serialize for EmbeddedProgramDescriptor {
             source_bytes: usize,
             revision: u64,
             artifact_id: &'a str,
-            persist_artifact: bool,
+            artifact_retention: ProgramArtifactRetention,
             bootstrap_source_digest: &'a str,
             bootstrap_source_bytes: usize,
             bootstrap_artifact_id: &'a str,
@@ -150,7 +169,7 @@ impl Serialize for EmbeddedProgramDescriptor {
             source_bytes: self.source.len(),
             revision: self.revision,
             artifact_id: &self.artifact_id,
-            persist_artifact: self.persist_artifact,
+            artifact_retention: self.artifact_retention,
             bootstrap_source_digest: &self.bootstrap_source_digest,
             bootstrap_source_bytes: self.bootstrap_source.len(),
             bootstrap_artifact_id: &self.bootstrap_artifact_id,

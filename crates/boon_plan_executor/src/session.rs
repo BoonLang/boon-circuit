@@ -1845,6 +1845,7 @@ impl Session {
             lists,
             completed_migration_edges,
             outbox: BTreeMap::new(),
+            content_artifact_manifest: boon_persistence::ContentArtifactManifest::default(),
         })
     }
 

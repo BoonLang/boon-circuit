@@ -7,11 +7,16 @@ use boon_compiler::{
     compile_runtime_source_units_to_machine_plan_with_identity, diagnose_runtime_source_units,
 };
 use boon_document_model::{
-    DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor, ScrollRootId, SourceBindingId,
+    DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor, ProgramArtifactRetention,
+    ScrollRootId, SourceBindingId,
 };
-use boon_persistence::{ContentArtifact, ContentArtifactId, validate_content_artifact};
+use boon_persistence::{
+    ContentArtifact, ContentArtifactId, ContentArtifactOwnerId, ContentArtifactRetention,
+    validate_content_artifact,
+};
 use boon_plan::{DocumentConstructor, MachinePlan, OutputContractKind, TargetProfile};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Range;
@@ -194,6 +199,10 @@ impl ProgramArtifact {
 
     pub fn to_content_artifact(&self) -> ContentArtifact {
         self.content.as_ref().clone()
+    }
+
+    pub fn content_bytes_len(&self) -> usize {
+        self.content.bytes.len()
     }
 
     pub fn from_content_artifact(
@@ -768,6 +777,12 @@ pub struct ProgramRequestId(pub String);
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProgramSessionId(pub String);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProgramArtifactOwnership {
+    pub owner: ContentArtifactOwnerId,
+    pub retention: ContentArtifactRetention,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramHostRequest {
     pub request_id: ProgramRequestId,
@@ -775,7 +790,7 @@ pub struct ProgramHostRequest {
     pub host: DocumentNodeId,
     pub compile: ProgramCompileRequest,
     pub artifact_id: Option<ContentArtifactId>,
-    pub persist_artifact: bool,
+    pub artifact_ownership: Option<ProgramArtifactOwnership>,
 }
 
 impl ProgramHostRequest {
@@ -844,7 +859,7 @@ struct HostedProgram {
     request_diagnostic: Option<ProgramDiagnostic>,
     latest_request_id: Option<ProgramRequestId>,
     latest_request_artifact_id: Option<ContentArtifactId>,
-    latest_request_persists_artifact: bool,
+    latest_request_artifact_ownership: Option<ProgramArtifactOwnership>,
     bootstrapping: bool,
 }
 
@@ -1045,7 +1060,7 @@ impl ProgramDocumentHost {
                     request_diagnostic: None,
                     latest_request_id: None,
                     latest_request_artifact_id: None,
-                    latest_request_persists_artifact: false,
+                    latest_request_artifact_ownership: None,
                     bootstrapping: false,
                 });
             if let Some((conflicting_host, conflicting)) = descriptors
@@ -1102,9 +1117,15 @@ impl ProgramDocumentHost {
                     program.request_diagnostic = None;
                     let request_id =
                         program_request_id(&self.parent_application, &session, &request_descriptor);
+                    let artifact_ownership = program_artifact_ownership(
+                        &self.parent_application,
+                        &session,
+                        &request_id,
+                        request_descriptor.artifact_retention,
+                    );
                     program.latest_request_id = Some(request_id.clone());
                     program.latest_request_artifact_id = artifact_id;
-                    program.latest_request_persists_artifact = request_descriptor.persist_artifact;
+                    program.latest_request_artifact_ownership = artifact_ownership;
                     let units = artifact_id.map_or_else(
                         || {
                             vec![RuntimeSourceUnit {
@@ -1126,7 +1147,7 @@ impl ProgramDocumentHost {
                             capability_profile: request_descriptor.capability_profile,
                         },
                         artifact_id,
-                        persist_artifact: request_descriptor.persist_artifact,
+                        artifact_ownership,
                     });
                 }
                 Err(diagnostic) => program.request_diagnostic = Some(diagnostic),
@@ -1353,14 +1374,15 @@ impl ProgramDocumentHost {
             .map(ProgramSession::artifact)
     }
 
-    pub fn request_persists_artifact(
+    pub fn request_artifact_ownership(
         &self,
         session: &ProgramSessionId,
         request_id: &ProgramRequestId,
-    ) -> bool {
-        self.programs.get(session).is_some_and(|program| {
-            program.latest_request_id.as_ref() == Some(request_id)
-                && program.latest_request_persists_artifact
+    ) -> Option<ProgramArtifactOwnership> {
+        self.programs.get(session).and_then(|program| {
+            (program.latest_request_id.as_ref() == Some(request_id))
+                .then_some(program.latest_request_artifact_ownership)
+                .flatten()
         })
     }
 
@@ -1724,6 +1746,49 @@ fn program_request_id(
     ]))
 }
 
+fn program_artifact_ownership(
+    parent: &ApplicationIdentity,
+    session: &ProgramSessionId,
+    request: &ProgramRequestId,
+    retention: ProgramArtifactRetention,
+) -> Option<ProgramArtifactOwnership> {
+    let (domain, retention, include_request) = match retention {
+        ProgramArtifactRetention::Ephemeral => return None,
+        ProgramArtifactRetention::Replaceable => (
+            b"boon.program.slot.v1".as_slice(),
+            ContentArtifactRetention::Replaceable,
+            false,
+        ),
+        ProgramArtifactRetention::Archive => (
+            b"boon.program.archive.v1".as_slice(),
+            ContentArtifactRetention::Immutable,
+            true,
+        ),
+    };
+    let mut hasher = Sha256::new();
+    hash_owner_part(&mut hasher, domain);
+    for part in [
+        parent.package_id.as_bytes(),
+        parent.state_namespace.as_bytes(),
+        parent.deployment_domain.as_bytes(),
+        session.0.as_bytes(),
+    ] {
+        hash_owner_part(&mut hasher, part);
+    }
+    if include_request {
+        hash_owner_part(&mut hasher, request.0.as_bytes());
+    }
+    Some(ProgramArtifactOwnership {
+        owner: ContentArtifactOwnerId(hasher.finalize().into()),
+        retention,
+    })
+}
+
+fn hash_owner_part(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
 fn program_session_id(
     host: &DocumentNodeId,
     descriptor: &EmbeddedProgramDescriptor,
@@ -1742,7 +1807,7 @@ fn same_program_definition(
 ) -> bool {
     left.source_digest == right.source_digest
         && left.artifact_id == right.artifact_id
-        && left.persist_artifact == right.persist_artifact
+        && left.artifact_retention == right.artifact_retention
         && left.revision == right.revision
         && left.bootstrap_source_digest == right.bootstrap_source_digest
         && left.bootstrap_artifact_id == right.bootstrap_artifact_id
@@ -1756,7 +1821,7 @@ fn same_current_program_definition(
 ) -> bool {
     left.source_digest == right.source_digest
         && left.artifact_id == right.artifact_id
-        && left.persist_artifact == right.persist_artifact
+        && left.artifact_retention == right.artifact_retention
         && left.revision == right.revision
         && left.capability_profile == right.capability_profile
 }
@@ -1799,7 +1864,7 @@ fn bootstrap_descriptor(
         descriptor.bootstrap_source_digest.clone()
     };
     bootstrap.artifact_id = descriptor.bootstrap_artifact_id.clone();
-    bootstrap.persist_artifact = false;
+    bootstrap.artifact_retention = ProgramArtifactRetention::Ephemeral;
     bootstrap.revision = descriptor.bootstrap_revision;
     bootstrap.bootstrap_source.clear();
     bootstrap.bootstrap_source_digest.clear();
@@ -1829,11 +1894,11 @@ fn descriptor_artifact_id(
             "artifact-backed embedded program cannot also provide source",
         ));
     }
-    if descriptor.persist_artifact {
+    if descriptor.artifact_retention != ProgramArtifactRetention::Ephemeral {
         return Err(ProgramDiagnostic::new(
             descriptor.revision,
             ProgramDiagnosticPhase::Request,
-            "artifact-backed embedded program cannot persist an already stored artifact",
+            "artifact-backed embedded program cannot retain an already stored artifact",
         ));
     }
     ContentArtifactId::from_hex(artifact_id)
@@ -1922,6 +1987,69 @@ mod tests {
         format!(
             "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT {{ {label} }})\n"
         )
+    }
+
+    #[test]
+    fn replaceable_artifact_owner_is_stable_per_parent_session() {
+        let parent = ApplicationIdentity::new("dev.boon.parent", "owner-test", "local");
+        let session = ProgramSessionId("public-page".to_owned());
+        let first = program_artifact_ownership(
+            &parent,
+            &session,
+            &ProgramRequestId("first".to_owned()),
+            ProgramArtifactRetention::Replaceable,
+        )
+        .unwrap();
+        let second = program_artifact_ownership(
+            &parent,
+            &session,
+            &ProgramRequestId("second".to_owned()),
+            ProgramArtifactRetention::Replaceable,
+        )
+        .unwrap();
+        let other_session = program_artifact_ownership(
+            &parent,
+            &ProgramSessionId("other-page".to_owned()),
+            &ProgramRequestId("first".to_owned()),
+            ProgramArtifactRetention::Replaceable,
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.retention, ContentArtifactRetention::Replaceable);
+        assert_ne!(first.owner, other_session.owner);
+    }
+
+    #[test]
+    fn archived_artifact_owner_is_stable_per_request() {
+        let parent = ApplicationIdentity::new("dev.boon.parent", "archive-test", "local");
+        let session = ProgramSessionId("public-page".to_owned());
+        let request = ProgramRequestId("revision-7".to_owned());
+        let first = program_artifact_ownership(
+            &parent,
+            &session,
+            &request,
+            ProgramArtifactRetention::Archive,
+        )
+        .unwrap();
+        let repeated = program_artifact_ownership(
+            &parent,
+            &session,
+            &request,
+            ProgramArtifactRetention::Archive,
+        )
+        .unwrap();
+        let next = program_artifact_ownership(
+            &parent,
+            &session,
+            &ProgramRequestId("revision-8".to_owned()),
+            ProgramArtifactRetention::Archive,
+        )
+        .unwrap();
+
+        assert_eq!(first, repeated);
+        assert_eq!(first.retention, ContentArtifactRetention::Immutable);
+        assert_ne!(first.owner, next.owner);
     }
 
     fn interactive_child_source() -> &'static str {
@@ -2580,7 +2708,10 @@ scene: Scene/Element/program(
         assert_eq!(requests[0].artifact_id, Some(artifact.id()));
         assert!(requests[0].compile.units.is_empty());
         assert!(host.request_is_artifact_load(&requests[0].session, &requests[0].request_id));
-        assert!(!host.request_persists_artifact(&requests[0].session, &requests[0].request_id));
+        assert!(
+            host.request_artifact_ownership(&requests[0].session, &requests[0].request_id)
+                .is_none()
+        );
         let (completion, update) =
             host.complete(&requests[0].session, &requests[0].request_id, Ok(artifact));
         assert_eq!(

@@ -237,6 +237,8 @@ pub struct RestoreImage {
     pub lists: BTreeMap<MemoryId, StoredList>,
     pub completed_migration_edges: BTreeSet<MigrationEdgeId>,
     pub outbox: BTreeMap<OutboxItemId, DurableOutboxItem>,
+    #[serde(default)]
+    pub content_artifact_manifest: ContentArtifactManifest,
 }
 
 impl RestoreImage {
@@ -255,6 +257,7 @@ impl RestoreImage {
             lists: BTreeMap::new(),
             completed_migration_edges: BTreeSet::new(),
             outbox: BTreeMap::new(),
+            content_artifact_manifest: ContentArtifactManifest::default(),
         }
     }
 }
@@ -307,6 +310,8 @@ pub struct CheckpointBatch {
     pub last_turn_sequence: u64,
     pub changes: Vec<DurableChange>,
     pub outbox_changes: Vec<DurableOutboxChange>,
+    #[serde(default)]
+    pub content_artifact_changes: Vec<DurableContentArtifactChange>,
     pub checksum: [u8; 32],
 }
 
@@ -346,8 +351,11 @@ pub struct ActivationBatch {
     pub authority_changes: Vec<DurableChange>,
     pub completed_migration_edges: Vec<MigrationEdgeId>,
     pub deleted_memory: Vec<MemoryId>,
-    /// Immutable content that must become visible atomically with this authority.
-    /// Existing content-addressed artifacts are retained.
+    #[serde(default)]
+    pub target_content_artifact_manifest: ContentArtifactManifest,
+    /// Content supplied atomically with this authority. The activated store keeps
+    /// exactly the target manifest's reachable closure, reusing identical content
+    /// that is already present when it is omitted here.
     pub content_artifacts: BTreeMap<ContentArtifactId, ContentArtifact>,
     pub checksum: [u8; 32],
 }
@@ -368,6 +376,7 @@ impl ActivationBatch {
         for list in candidate.lists.values() {
             validate_list(list)?;
         }
+        validate_content_artifact_manifest(&candidate.content_artifact_manifest)?;
         if candidate
             .scalars
             .keys()
@@ -426,6 +435,7 @@ impl ActivationBatch {
             authority_changes,
             completed_migration_edges,
             deleted_memory,
+            target_content_artifact_manifest: candidate.content_artifact_manifest.clone(),
             content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         }
@@ -457,8 +467,76 @@ pub struct CompactRequest {
 
 pub const MAX_CONTENT_ARTIFACT_MEDIA_TYPE_BYTES: usize = 128;
 pub const MAX_CONTENT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CONTENT_ARTIFACT_OWNERS: usize = 4_096;
+pub const MAX_RETAINED_CONTENT_ARTIFACTS: usize = 4_096;
+pub const MAX_RETAINED_CONTENT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_STAGED_CONTENT_ARTIFACTS: usize = 4_096;
+pub const MAX_STAGED_CONTENT_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_APPLICATION_TRANSFER_ARTIFACTS: usize = 4_096;
 pub const MAX_APPLICATION_TRANSFER_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[repr(transparent)]
+pub struct ContentArtifactOwnerId(pub [u8; 32]);
+
+impl ContentArtifactOwnerId {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ContentArtifactOwnerId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentArtifactRetention {
+    Replaceable,
+    Immutable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContentArtifactBinding {
+    pub artifact_id: ContentArtifactId,
+    pub retention: ContentArtifactRetention,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContentArtifactManifest {
+    pub bindings: BTreeMap<ContentArtifactOwnerId, ContentArtifactBinding>,
+}
+
+impl ContentArtifactManifest {
+    pub fn reachable_artifact_ids(&self) -> BTreeSet<ContentArtifactId> {
+        self.bindings
+            .values()
+            .map(|binding| binding.artifact_id)
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DurableContentArtifactChange {
+    SetReplaceable {
+        owner_id: ContentArtifactOwnerId,
+        artifact_id: ContentArtifactId,
+    },
+    InsertImmutable {
+        owner_id: ContentArtifactOwnerId,
+        artifact_id: ContentArtifactId,
+    },
+    Release {
+        owner_id: ContentArtifactOwnerId,
+        expected_artifact_id: ContentArtifactId,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -535,9 +613,9 @@ impl ContentArtifact {
 
 /// A portable, self-contained snapshot of one application namespace.
 ///
-/// The restore image remains the sole semantic authority. Content artifacts are
-/// immutable dependencies referenced by that authority, bundled so activation
-/// cannot create dangling artifact pointers on another store.
+/// The restore image and its manifest remain the semantic authority. Immutable
+/// artifact bytes are bundled as the manifest's exact reachable closure so an
+/// activation cannot create dangling ownership on another store.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApplicationTransfer {
     pub restore_image: RestoreImage,
@@ -625,6 +703,16 @@ pub struct PersistenceInspectorSnapshot {
     pub row_count: usize,
     pub content_artifact_count: usize,
     pub content_artifact_bytes: u64,
+    #[serde(default)]
+    pub content_artifact_owner_count: usize,
+    #[serde(default)]
+    pub content_artifact_retained_count: usize,
+    #[serde(default)]
+    pub content_artifact_retained_bytes: u64,
+    #[serde(default)]
+    pub content_artifact_orphan_count: usize,
+    #[serde(default)]
+    pub content_artifact_orphan_bytes: u64,
     /// Encoded backend bytes when the driver can report them without loading
     /// or serializing the complete application. `None` is an honest unknown.
     pub encoded_value_bytes: Option<u64>,
@@ -754,12 +842,42 @@ impl InMemoryDriver {
         self.applications.get(application)
     }
 
+    fn application_artifacts(
+        &self,
+        application: &ApplicationIdentity,
+    ) -> BTreeMap<ContentArtifactId, ContentArtifact> {
+        self.artifacts
+            .iter()
+            .filter_map(|((candidate, id), artifact)| {
+                (candidate == application).then_some((*id, artifact.clone()))
+            })
+            .collect()
+    }
+
+    fn replace_application_artifacts(
+        &mut self,
+        application: &ApplicationIdentity,
+        artifacts: BTreeMap<ContentArtifactId, ContentArtifact>,
+    ) {
+        self.artifacts
+            .retain(|(candidate, _), _| candidate != application);
+        self.artifacts.extend(
+            artifacts
+                .into_iter()
+                .map(|(id, artifact)| ((application.clone(), id), artifact)),
+        );
+    }
+
     fn load(&self, request: RestoreRequest) -> Result<Option<RestoreImage>, StoreError> {
         let image = self.applications.get(&request.application).cloned();
         if let (Some(expected), Some(image)) = (request.expected_schema_hash, image.as_ref())
             && expected != image.schema_hash
         {
             return Err(StoreError::SchemaMismatch);
+        }
+        if let Some(image) = &image {
+            let artifacts = self.application_artifacts(&request.application);
+            validate_content_artifact_storage(&image.content_artifact_manifest, &artifacts)?;
         }
         Ok(image)
     }
@@ -784,11 +902,16 @@ impl InMemoryDriver {
     }
 
     fn commit(&mut self, batch: CheckpointBatch) -> Result<CommitAck, StoreError> {
-        let image = self
+        let mut candidate = self
             .applications
-            .get_mut(&batch.application)
+            .get(&batch.application)
+            .cloned()
             .ok_or(StoreError::MissingApplication)?;
-        apply_checkpoint_to_image(image, &batch)
+        let ack = apply_checkpoint_to_image(&mut candidate, &batch)?;
+        let artifacts = self.application_artifacts(&batch.application);
+        validate_content_artifact_storage(&candidate.content_artifact_manifest, &artifacts)?;
+        self.applications.insert(batch.application, candidate);
+        Ok(ack)
     }
 
     fn activate(&mut self, batch: ActivationBatch) -> Result<ActivationAck, StoreError> {
@@ -803,10 +926,9 @@ impl InMemoryDriver {
             .get(&batch.application)
             .cloned()
             .ok_or(StoreError::MissingApplication)?;
-        let mut candidate_artifacts = self.artifacts.clone();
+        let mut available_artifacts = self.application_artifacts(&batch.application);
         for (id, artifact) in &batch.content_artifacts {
-            let key = (batch.application.clone(), *id);
-            match candidate_artifacts.get(&key) {
+            match available_artifacts.get(id) {
                 Some(existing) if existing == artifact => {}
                 Some(_) => {
                     return Err(StoreError::InvalidContentArtifact(
@@ -814,14 +936,22 @@ impl InMemoryDriver {
                     ));
                 }
                 None => {
-                    candidate_artifacts.insert(key, artifact.clone());
+                    available_artifacts.insert(*id, artifact.clone());
                 }
             }
         }
         let (candidate, ack) = apply_activation_to_image(current, &batch)?;
+        let candidate_artifacts = exact_content_artifact_closure(
+            &candidate.content_artifact_manifest,
+            &available_artifacts,
+        )?;
+        validate_content_artifact_storage(
+            &candidate.content_artifact_manifest,
+            &candidate_artifacts,
+        )?;
         self.applications
             .insert(batch.application.clone(), candidate);
-        self.artifacts = candidate_artifacts;
+        self.replace_application_artifacts(&batch.application, candidate_artifacts);
         Ok(ack)
     }
 
@@ -846,11 +976,14 @@ impl InMemoryDriver {
         request: PutContentArtifactRequest,
     ) -> Result<PutContentArtifactAck, StoreError> {
         validate_content_artifact(&request.artifact)?;
-        if !self.applications.contains_key(&request.application) {
-            return Err(StoreError::MissingApplication);
-        }
-        let key = (request.application, request.artifact.id);
-        let already_present = match self.artifacts.get(&key) {
+        let manifest = self
+            .applications
+            .get(&request.application)
+            .ok_or(StoreError::MissingApplication)?
+            .content_artifact_manifest
+            .clone();
+        let mut artifacts = self.application_artifacts(&request.application);
+        let already_present = match artifacts.get(&request.artifact.id) {
             Some(existing) if existing == &request.artifact => true,
             Some(_) => {
                 return Err(StoreError::InvalidContentArtifact(
@@ -858,10 +991,12 @@ impl InMemoryDriver {
                 ));
             }
             None => {
-                self.artifacts.insert(key, request.artifact.clone());
+                artifacts.insert(request.artifact.id, request.artifact.clone());
                 false
             }
         };
+        validate_content_artifact_storage(&manifest, &artifacts)?;
+        self.replace_application_artifacts(&request.application, artifacts);
         Ok(PutContentArtifactAck {
             id: request.artifact.id,
             stored_bytes: request.artifact.bytes.len().try_into().unwrap_or(u64::MAX),
@@ -895,13 +1030,9 @@ impl InMemoryDriver {
             .get(&request.application)
             .cloned()
             .ok_or(StoreError::MissingApplication)?;
-        let content_artifacts = self
-            .artifacts
-            .iter()
-            .filter_map(|((application, id), artifact)| {
-                (application == &request.application).then_some((*id, artifact.clone()))
-            })
-            .collect();
+        let available = self.application_artifacts(&request.application);
+        let content_artifacts =
+            exact_content_artifact_closure(&restore_image.content_artifact_manifest, &available)?;
         let transfer = ApplicationTransfer {
             restore_image,
             content_artifacts,
@@ -941,31 +1072,28 @@ impl PersistenceDriver for InMemoryDriver {
                 PersistenceResult::BarrierComplete(result)
             }
             PersistenceCommand::Inspect(request) => {
-                let snapshot = self
-                    .applications
-                    .get(&request.application)
-                    .map(inspector_snapshot)
-                    .map(|mut snapshot| {
-                        for ((application, _), artifact) in &self.artifacts {
-                            if application == &request.application {
-                                snapshot.content_artifact_count =
-                                    snapshot.content_artifact_count.saturating_add(1);
-                                snapshot.content_artifact_bytes =
-                                    snapshot.content_artifact_bytes.saturating_add(
-                                        artifact.bytes.len().try_into().unwrap_or(u64::MAX),
-                                    );
-                            }
-                        }
-                        snapshot
-                    });
-                PersistenceResult::Inspected(Ok(snapshot))
+                let snapshot = self.applications.get(&request.application).map(|image| {
+                    let artifacts = self.application_artifacts(&request.application);
+                    validate_content_artifact_storage(&image.content_artifact_manifest, &artifacts)
+                        .map(|stats| inspector_snapshot_with_artifacts(image, stats))
+                });
+                PersistenceResult::Inspected(snapshot.transpose())
             }
             PersistenceCommand::Compact(request) => {
                 let result = self
                     .applications
                     .get(&request.application)
-                    .map(|image| CompactAck { epoch: image.epoch })
-                    .ok_or(StoreError::MissingApplication);
+                    .cloned()
+                    .ok_or(StoreError::MissingApplication)
+                    .and_then(|image| {
+                        let available = self.application_artifacts(&request.application);
+                        let retained = exact_content_artifact_closure(
+                            &image.content_artifact_manifest,
+                            &available,
+                        )?;
+                        self.replace_application_artifacts(&request.application, retained);
+                        Ok(CompactAck { epoch: image.epoch })
+                    });
                 PersistenceResult::Compacted(result)
             }
             PersistenceCommand::ExportApplication(request) => {
@@ -1447,6 +1575,191 @@ fn validate_stored_fields(
     Ok(())
 }
 
+pub fn apply_durable_content_artifact_changes(
+    manifest: &mut ContentArtifactManifest,
+    changes: &[DurableContentArtifactChange],
+) -> Result<(), StoreError> {
+    let mut candidate = manifest.clone();
+    for change in changes {
+        match *change {
+            DurableContentArtifactChange::SetReplaceable {
+                owner_id,
+                artifact_id,
+            } => {
+                if matches!(
+                    candidate.bindings.get(&owner_id),
+                    Some(ContentArtifactBinding {
+                        retention: ContentArtifactRetention::Immutable,
+                        ..
+                    })
+                ) {
+                    return Err(StoreError::InvalidContentArtifact(format!(
+                        "cannot replace immutable artifact owner {owner_id}"
+                    )));
+                }
+                candidate.bindings.insert(
+                    owner_id,
+                    ContentArtifactBinding {
+                        artifact_id,
+                        retention: ContentArtifactRetention::Replaceable,
+                    },
+                );
+            }
+            DurableContentArtifactChange::InsertImmutable {
+                owner_id,
+                artifact_id,
+            } => match candidate.bindings.get(&owner_id) {
+                None => {
+                    candidate.bindings.insert(
+                        owner_id,
+                        ContentArtifactBinding {
+                            artifact_id,
+                            retention: ContentArtifactRetention::Immutable,
+                        },
+                    );
+                }
+                Some(ContentArtifactBinding {
+                    artifact_id: existing,
+                    retention: ContentArtifactRetention::Immutable,
+                }) if *existing == artifact_id => {}
+                Some(_) => {
+                    return Err(StoreError::InvalidContentArtifact(format!(
+                        "cannot retarget immutable artifact owner {owner_id}"
+                    )));
+                }
+            },
+            DurableContentArtifactChange::Release {
+                owner_id,
+                expected_artifact_id,
+            } => match candidate.bindings.get(&owner_id) {
+                Some(ContentArtifactBinding {
+                    artifact_id,
+                    retention: ContentArtifactRetention::Replaceable,
+                }) if *artifact_id == expected_artifact_id => {
+                    candidate.bindings.remove(&owner_id);
+                }
+                Some(ContentArtifactBinding {
+                    retention: ContentArtifactRetention::Immutable,
+                    ..
+                }) => {
+                    return Err(StoreError::InvalidContentArtifact(format!(
+                        "cannot release immutable artifact owner {owner_id}"
+                    )));
+                }
+                Some(_) | None => {
+                    return Err(StoreError::InvalidContentArtifact(format!(
+                        "artifact owner {owner_id} does not match compare-and-release artifact {expected_artifact_id}"
+                    )));
+                }
+            },
+        }
+    }
+    validate_content_artifact_manifest(&candidate)?;
+    *manifest = candidate;
+    Ok(())
+}
+
+pub(crate) fn validate_content_artifact_manifest(
+    manifest: &ContentArtifactManifest,
+) -> Result<(), StoreError> {
+    if manifest.bindings.len() > MAX_CONTENT_ARTIFACT_OWNERS {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "content artifact manifest contains {} owners, limit is {MAX_CONTENT_ARTIFACT_OWNERS}",
+            manifest.bindings.len()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ContentArtifactStorageStats {
+    pub total_count: usize,
+    pub total_bytes: u64,
+    pub owner_count: usize,
+    pub retained_count: usize,
+    pub retained_bytes: u64,
+    pub orphan_count: usize,
+    pub orphan_bytes: u64,
+}
+
+pub(crate) fn validate_content_artifact_storage(
+    manifest: &ContentArtifactManifest,
+    artifacts: &BTreeMap<ContentArtifactId, ContentArtifact>,
+) -> Result<ContentArtifactStorageStats, StoreError> {
+    validate_content_artifact_manifest(manifest)?;
+    let reachable = manifest.reachable_artifact_ids();
+    let mut stats = ContentArtifactStorageStats {
+        owner_count: manifest.bindings.len(),
+        ..ContentArtifactStorageStats::default()
+    };
+    for (id, artifact) in artifacts {
+        if id != &artifact.id {
+            return Err(StoreError::InvalidContentArtifact(
+                "stored artifact key does not match its content ID".to_owned(),
+            ));
+        }
+        validate_content_artifact(artifact)?;
+        let bytes = u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX);
+        stats.total_count = stats.total_count.saturating_add(1);
+        stats.total_bytes = stats.total_bytes.checked_add(bytes).ok_or_else(|| {
+            StoreError::InvalidContentArtifact("stored artifact byte count overflow".to_owned())
+        })?;
+        if reachable.contains(id) {
+            stats.retained_count = stats.retained_count.saturating_add(1);
+            stats.retained_bytes = stats.retained_bytes.checked_add(bytes).ok_or_else(|| {
+                StoreError::InvalidContentArtifact(
+                    "retained artifact byte count overflow".to_owned(),
+                )
+            })?;
+        } else {
+            stats.orphan_count = stats.orphan_count.saturating_add(1);
+            stats.orphan_bytes = stats.orphan_bytes.checked_add(bytes).ok_or_else(|| {
+                StoreError::InvalidContentArtifact("staged artifact byte count overflow".to_owned())
+            })?;
+        }
+    }
+    if reachable.iter().any(|id| !artifacts.contains_key(id)) {
+        return Err(StoreError::InvalidContentArtifact(
+            "content artifact manifest contains a dangling binding".to_owned(),
+        ));
+    }
+    if stats.retained_count > MAX_RETAINED_CONTENT_ARTIFACTS
+        || stats.retained_bytes > MAX_RETAINED_CONTENT_ARTIFACT_BYTES as u64
+    {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "retained artifact closure contains {} artifacts and {} bytes, limits are {MAX_RETAINED_CONTENT_ARTIFACTS} artifacts and {MAX_RETAINED_CONTENT_ARTIFACT_BYTES} bytes",
+            stats.retained_count, stats.retained_bytes
+        )));
+    }
+    if stats.orphan_count > MAX_STAGED_CONTENT_ARTIFACTS
+        || stats.orphan_bytes > MAX_STAGED_CONTENT_ARTIFACT_BYTES as u64
+    {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "staged unowned artifacts contain {} artifacts and {} bytes, limits are {MAX_STAGED_CONTENT_ARTIFACTS} artifacts and {MAX_STAGED_CONTENT_ARTIFACT_BYTES} bytes",
+            stats.orphan_count, stats.orphan_bytes
+        )));
+    }
+    Ok(stats)
+}
+
+pub(crate) fn exact_content_artifact_closure(
+    manifest: &ContentArtifactManifest,
+    artifacts: &BTreeMap<ContentArtifactId, ContentArtifact>,
+) -> Result<BTreeMap<ContentArtifactId, ContentArtifact>, StoreError> {
+    validate_content_artifact_manifest(manifest)?;
+    let mut closure = BTreeMap::new();
+    for id in manifest.reachable_artifact_ids() {
+        let artifact = artifacts.get(&id).cloned().ok_or_else(|| {
+            StoreError::InvalidContentArtifact(format!(
+                "content artifact manifest references missing artifact {id}"
+            ))
+        })?;
+        closure.insert(id, artifact);
+    }
+    validate_content_artifact_map(&closure)?;
+    Ok(closure)
+}
+
 fn apply_checkpoint_to_image(
     image: &mut RestoreImage,
     batch: &CheckpointBatch,
@@ -1469,6 +1782,10 @@ fn apply_checkpoint_to_image(
     let mut candidate = image.clone();
     apply_changes(&mut candidate, &batch.changes)?;
     apply_durable_outbox_changes(&mut candidate.outbox, &batch.outbox_changes)?;
+    apply_durable_content_artifact_changes(
+        &mut candidate.content_artifact_manifest,
+        &batch.content_artifact_changes,
+    )?;
     validate_outbox(&candidate.outbox)?;
     candidate.epoch = batch.next_epoch;
     candidate.through_turn_sequence = batch.last_turn_sequence;
@@ -1547,6 +1864,7 @@ fn apply_activation_to_image(
     candidate.schema_hash = batch.target_schema_hash;
     candidate.epoch = batch.next_epoch;
     candidate.through_turn_sequence = batch.through_turn_sequence;
+    candidate.content_artifact_manifest = batch.target_content_artifact_manifest.clone();
 
     let ack = ActivationAck {
         epoch: candidate.epoch,
@@ -1635,6 +1953,13 @@ fn validate_initial_image(image: &RestoreImage) -> Result<(), StoreError> {
         validate_list(list)?;
     }
     validate_outbox(&image.outbox)?;
+    validate_content_artifact_manifest(&image.content_artifact_manifest)?;
+    if !image.content_artifact_manifest.bindings.is_empty() {
+        return Err(StoreError::InvalidContentArtifact(
+            "initial restore image cannot contain artifact bindings without an atomic artifact closure"
+                .to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1650,6 +1975,11 @@ fn validate_reset(batch: &ResetApplicationBatch) -> Result<(), StoreError> {
         || !batch.default_image.lists.is_empty()
         || !batch.default_image.completed_migration_edges.is_empty()
         || !batch.default_image.outbox.is_empty()
+        || !batch
+            .default_image
+            .content_artifact_manifest
+            .bindings
+            .is_empty()
     {
         return Err(StoreError::InvalidAuthority(
             "start-over default image must contain no durable authority, migration history, or outbox work"
@@ -1673,7 +2003,20 @@ fn validate_activation(batch: &ActivationBatch) -> Result<(), StoreError> {
             "target schema version must be positive".to_owned(),
         ));
     }
+    validate_content_artifact_manifest(&batch.target_content_artifact_manifest)?;
     validate_content_artifact_map(&batch.content_artifacts)?;
+    let reachable = batch
+        .target_content_artifact_manifest
+        .reachable_artifact_ids();
+    if let Some(extra) = batch
+        .content_artifacts
+        .keys()
+        .find(|id| !reachable.contains(id))
+    {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "activation supplies unreferenced artifact {extra}"
+        )));
+    }
     Ok(())
 }
 
@@ -1682,7 +2025,25 @@ pub fn validate_application_transfer(transfer: &ApplicationTransfer) -> Result<(
         validate_list(list)?;
     }
     validate_outbox(&transfer.restore_image.outbox)?;
-    validate_content_artifact_map(&transfer.content_artifacts)
+    validate_content_artifact_manifest(&transfer.restore_image.content_artifact_manifest)?;
+    validate_content_artifact_map(&transfer.content_artifacts)?;
+    let reachable = transfer
+        .restore_image
+        .content_artifact_manifest
+        .reachable_artifact_ids();
+    let supplied = transfer
+        .content_artifacts
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if reachable != supplied {
+        let missing = reachable.difference(&supplied).count();
+        let extra = supplied.difference(&reachable).count();
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "application transfer artifact closure has {missing} missing and {extra} extra artifacts"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_content_artifact_map(
@@ -1753,6 +2114,7 @@ fn checkpoint_checksum(batch: &CheckpointBatch) -> [u8; 32] {
     hasher.update(batch.last_turn_sequence.to_be_bytes());
     hash_changes(&mut hasher, &batch.changes);
     hash_outbox_changes(&mut hasher, &batch.outbox_changes);
+    hash_content_artifact_changes(&mut hasher, &batch.content_artifact_changes);
     hasher.finalize().into()
 }
 
@@ -1768,12 +2130,13 @@ fn reset_checksum(batch: &ResetApplicationBatch) -> [u8; 32] {
     hasher.update(batch.default_image.schema_hash);
     hasher.update(batch.default_image.epoch.to_be_bytes());
     hasher.update(batch.default_image.through_turn_sequence.to_be_bytes());
+    hash_content_artifact_manifest(&mut hasher, &batch.default_image.content_artifact_manifest);
     hasher.finalize().into()
 }
 
 fn activation_checksum(batch: &ActivationBatch) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"boon.persistence.activation.v2");
+    hasher.update(b"boon.persistence.activation.v3");
     hash_application(&mut hasher, &batch.application);
     hasher.update(batch.expected_base_epoch.to_be_bytes());
     hasher.update(batch.next_epoch.to_be_bytes());
@@ -1788,6 +2151,7 @@ fn activation_checksum(batch: &ActivationBatch) -> [u8; 32] {
     for memory in &batch.deleted_memory {
         hasher.update(memory.as_bytes());
     }
+    hash_content_artifact_manifest(&mut hasher, &batch.target_content_artifact_manifest);
     for (id, artifact) in &batch.content_artifacts {
         hasher.update(id.as_bytes());
         hasher.update((artifact.media_type.len() as u64).to_be_bytes());
@@ -1796,6 +2160,50 @@ fn activation_checksum(batch: &ActivationBatch) -> [u8; 32] {
         hasher.update(&artifact.bytes);
     }
     hasher.finalize().into()
+}
+
+fn hash_content_artifact_manifest(hasher: &mut Sha256, manifest: &ContentArtifactManifest) {
+    hasher.update((manifest.bindings.len() as u64).to_be_bytes());
+    for (owner_id, binding) in &manifest.bindings {
+        hasher.update(owner_id.as_bytes());
+        hasher.update(binding.artifact_id.as_bytes());
+        hasher.update([match binding.retention {
+            ContentArtifactRetention::Replaceable => 0,
+            ContentArtifactRetention::Immutable => 1,
+        }]);
+    }
+}
+
+fn hash_content_artifact_changes(hasher: &mut Sha256, changes: &[DurableContentArtifactChange]) {
+    hasher.update((changes.len() as u64).to_be_bytes());
+    for change in changes {
+        match change {
+            DurableContentArtifactChange::SetReplaceable {
+                owner_id,
+                artifact_id,
+            } => {
+                hasher.update([0]);
+                hasher.update(owner_id.as_bytes());
+                hasher.update(artifact_id.as_bytes());
+            }
+            DurableContentArtifactChange::InsertImmutable {
+                owner_id,
+                artifact_id,
+            } => {
+                hasher.update([1]);
+                hasher.update(owner_id.as_bytes());
+                hasher.update(artifact_id.as_bytes());
+            }
+            DurableContentArtifactChange::Release {
+                owner_id,
+                expected_artifact_id,
+            } => {
+                hasher.update([2]);
+                hasher.update(owner_id.as_bytes());
+                hasher.update(expected_artifact_id.as_bytes());
+            }
+        }
+    }
 }
 
 fn hash_application(hasher: &mut Sha256, application: &ApplicationIdentity) {
@@ -2113,6 +2521,11 @@ fn inspector_snapshot(image: &RestoreImage) -> PersistenceInspectorSnapshot {
         row_count: image.lists.values().map(|list| list.rows.len()).sum(),
         content_artifact_count: 0,
         content_artifact_bytes: 0,
+        content_artifact_owner_count: image.content_artifact_manifest.bindings.len(),
+        content_artifact_retained_count: 0,
+        content_artifact_retained_bytes: 0,
+        content_artifact_orphan_count: 0,
+        content_artifact_orphan_bytes: 0,
         encoded_value_bytes: None,
         completed_migration_count: image.completed_migration_edges.len(),
         outbox_pending_count,
@@ -2121,6 +2534,21 @@ fn inspector_snapshot(image: &RestoreImage) -> PersistenceInspectorSnapshot {
         outbox_completed_count,
         outbox_samples,
     }
+}
+
+pub(crate) fn inspector_snapshot_with_artifacts(
+    image: &RestoreImage,
+    stats: ContentArtifactStorageStats,
+) -> PersistenceInspectorSnapshot {
+    let mut snapshot = inspector_snapshot(image);
+    snapshot.content_artifact_count = stats.total_count;
+    snapshot.content_artifact_bytes = stats.total_bytes;
+    snapshot.content_artifact_owner_count = stats.owner_count;
+    snapshot.content_artifact_retained_count = stats.retained_count;
+    snapshot.content_artifact_retained_bytes = stats.retained_bytes;
+    snapshot.content_artifact_orphan_count = stats.orphan_count;
+    snapshot.content_artifact_orphan_bytes = stats.orphan_bytes;
+    snapshot
 }
 
 fn error_result(command: PersistenceCommand, error: StoreError) -> PersistenceResult {
@@ -2273,6 +2701,354 @@ mod tests {
         assert_eq!(snapshot.content_artifact_bytes, 0);
     }
 
+    fn put_artifact(driver: &mut InMemoryDriver, artifact: &ContentArtifact) {
+        assert!(matches!(
+            driver.execute(PersistenceCommand::PutContentArtifact(
+                PutContentArtifactRequest {
+                    application: application(),
+                    artifact: artifact.clone(),
+                }
+            )),
+            PersistenceResult::ContentArtifactStored(Ok(_))
+        ));
+    }
+
+    fn artifact_checkpoint(
+        base_epoch: u64,
+        turn_sequence: u64,
+        changes: Vec<DurableContentArtifactChange>,
+        authority_changes: Vec<DurableChange>,
+    ) -> CheckpointBatch {
+        CheckpointBatch {
+            application: application(),
+            schema_hash: [1; 32],
+            base_epoch,
+            next_epoch: base_epoch + 1,
+            first_turn_sequence: turn_sequence,
+            last_turn_sequence: turn_sequence,
+            changes: authority_changes,
+            outbox_changes: Vec::new(),
+            content_artifact_changes: changes,
+            checksum: [0; 32],
+        }
+        .seal()
+    }
+
+    #[test]
+    fn in_memory_ownership_is_exact_shared_bounded_and_atomic() {
+        let mut driver = seeded_driver();
+        let first = ContentArtifact::new("text/plain", b"first".to_vec()).unwrap();
+        let second = ContentArtifact::new("text/plain", b"second".to_vec()).unwrap();
+        let excluded = ContentArtifact::new("text/plain", b"excluded".to_vec()).unwrap();
+        for artifact in [&first, &second, &excluded] {
+            put_artifact(&mut driver, artifact);
+        }
+        let replaceable = ContentArtifactOwnerId([1; 32]);
+        let shared = ContentArtifactOwnerId([2; 32]);
+        let immutable = ContentArtifactOwnerId([3; 32]);
+        let establish = artifact_checkpoint(
+            0,
+            1,
+            vec![
+                DurableContentArtifactChange::SetReplaceable {
+                    owner_id: replaceable,
+                    artifact_id: first.id,
+                },
+                DurableContentArtifactChange::SetReplaceable {
+                    owner_id: shared,
+                    artifact_id: first.id,
+                },
+                DurableContentArtifactChange::InsertImmutable {
+                    owner_id: immutable,
+                    artifact_id: second.id,
+                },
+            ],
+            Vec::new(),
+        );
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(establish)),
+            PersistenceResult::Committed(Ok(_))
+        ));
+
+        let snapshot = match driver.execute(PersistenceCommand::Inspect(InspectRequest {
+            application: application(),
+        })) {
+            PersistenceResult::Inspected(Ok(Some(snapshot))) => snapshot,
+            result => panic!("unexpected inspector result: {result:?}"),
+        };
+        assert_eq!(snapshot.content_artifact_owner_count, 3);
+        assert_eq!(snapshot.content_artifact_retained_count, 2);
+        assert_eq!(
+            snapshot.content_artifact_retained_bytes,
+            (first.bytes.len() + second.bytes.len()) as u64
+        );
+        assert_eq!(snapshot.content_artifact_orphan_count, 1);
+
+        let transfer = match driver.execute(PersistenceCommand::ExportApplication(
+            ExportApplicationRequest {
+                application: application(),
+            },
+        )) {
+            PersistenceResult::ApplicationExported(Ok(transfer)) => transfer,
+            result => panic!("unexpected export result: {result:?}"),
+        };
+        assert_eq!(
+            transfer
+                .content_artifacts
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first.id, second.id])
+        );
+
+        let before_failure = driver.image(&application()).unwrap().clone();
+        let failing = artifact_checkpoint(
+            1,
+            2,
+            vec![DurableContentArtifactChange::InsertImmutable {
+                owner_id: immutable,
+                artifact_id: first.id,
+            }],
+            vec![DurableChange::SetScalar {
+                memory_id: memory("must_not_commit"),
+                value: StoredScalar {
+                    touched: true,
+                    value: StoredValue::Bool(true),
+                },
+            }],
+        );
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(failing)),
+            PersistenceResult::Committed(Err(StoreError::InvalidContentArtifact(_)))
+        ));
+        assert_eq!(driver.image(&application()), Some(&before_failure));
+
+        let replace = artifact_checkpoint(
+            1,
+            2,
+            vec![DurableContentArtifactChange::SetReplaceable {
+                owner_id: replaceable,
+                artifact_id: second.id,
+            }],
+            Vec::new(),
+        );
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(replace)),
+            PersistenceResult::Committed(Ok(_))
+        ));
+        assert_eq!(
+            driver
+                .image(&application())
+                .unwrap()
+                .content_artifact_manifest
+                .bindings[&replaceable]
+                .artifact_id,
+            second.id
+        );
+
+        let compare_failure = artifact_checkpoint(
+            2,
+            3,
+            vec![DurableContentArtifactChange::Release {
+                owner_id: replaceable,
+                expected_artifact_id: first.id,
+            }],
+            Vec::new(),
+        );
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(compare_failure)),
+            PersistenceResult::Committed(Err(StoreError::InvalidContentArtifact(_)))
+        ));
+        let release = artifact_checkpoint(
+            2,
+            3,
+            vec![DurableContentArtifactChange::Release {
+                owner_id: replaceable,
+                expected_artifact_id: second.id,
+            }],
+            Vec::new(),
+        );
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(release)),
+            PersistenceResult::Committed(Ok(_))
+        ));
+        assert!(
+            !driver
+                .image(&application())
+                .unwrap()
+                .content_artifact_manifest
+                .bindings
+                .contains_key(&replaceable)
+        );
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Compact(CompactRequest {
+                application: application(),
+            })),
+            PersistenceResult::Compacted(Ok(_))
+        ));
+        assert!(matches!(
+            driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: application(),
+                    id: excluded.id,
+                }
+            )),
+            PersistenceResult::ContentArtifactLoaded(Ok(None))
+        ));
+    }
+
+    #[test]
+    fn ownership_limits_allow_4096_shared_owners_and_count_payload_once() {
+        let artifact = ContentArtifact::new("text/plain", b"shared".to_vec()).unwrap();
+        let mut manifest = ContentArtifactManifest::default();
+        for index in 0..MAX_CONTENT_ARTIFACT_OWNERS as u32 {
+            let mut owner = [0; 32];
+            owner[28..].copy_from_slice(&index.to_be_bytes());
+            manifest.bindings.insert(
+                ContentArtifactOwnerId(owner),
+                ContentArtifactBinding {
+                    artifact_id: artifact.id,
+                    retention: ContentArtifactRetention::Immutable,
+                },
+            );
+        }
+        let stats = validate_content_artifact_storage(
+            &manifest,
+            &BTreeMap::from([(artifact.id, artifact.clone())]),
+        )
+        .unwrap();
+        assert_eq!(stats.owner_count, MAX_CONTENT_ARTIFACT_OWNERS);
+        assert_eq!(stats.retained_count, 1);
+        assert_eq!(stats.retained_bytes, artifact.bytes.len() as u64);
+
+        manifest.bindings.insert(
+            ContentArtifactOwnerId([0xff; 32]),
+            ContentArtifactBinding {
+                artifact_id: artifact.id,
+                retention: ContentArtifactRetention::Immutable,
+            },
+        );
+        assert!(matches!(
+            validate_content_artifact_storage(
+                &manifest,
+                &BTreeMap::from([(artifact.id, artifact)])
+            ),
+            Err(StoreError::InvalidContentArtifact(_))
+        ));
+    }
+
+    #[test]
+    fn activation_replaces_manifest_and_exact_artifact_closure() {
+        let mut driver = seeded_driver();
+        let old = ContentArtifact::new("text/plain", b"old".to_vec()).unwrap();
+        let staged = ContentArtifact::new("text/plain", b"staged".to_vec()).unwrap();
+        let new = ContentArtifact::new("text/plain", b"new".to_vec()).unwrap();
+        put_artifact(&mut driver, &old);
+        put_artifact(&mut driver, &staged);
+        let owner = ContentArtifactOwnerId([9; 32]);
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(artifact_checkpoint(
+                0,
+                1,
+                vec![DurableContentArtifactChange::SetReplaceable {
+                    owner_id: owner,
+                    artifact_id: old.id,
+                }],
+                Vec::new(),
+            ))),
+            PersistenceResult::Committed(Ok(_))
+        ));
+
+        let target_manifest = ContentArtifactManifest {
+            bindings: BTreeMap::from([(
+                owner,
+                ContentArtifactBinding {
+                    artifact_id: new.id,
+                    retention: ContentArtifactRetention::Replaceable,
+                },
+            )]),
+        };
+        let activation = ActivationBatch {
+            application: application(),
+            expected_base_epoch: 1,
+            next_epoch: 2,
+            source_schema_hash: [1; 32],
+            target_schema_version: 2,
+            target_schema_hash: [2; 32],
+            through_turn_sequence: 1,
+            authority_changes: Vec::new(),
+            completed_migration_edges: Vec::new(),
+            deleted_memory: Vec::new(),
+            target_content_artifact_manifest: target_manifest.clone(),
+            content_artifacts: BTreeMap::from([(new.id, new.clone())]),
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Activate(activation)),
+            PersistenceResult::Activated(Ok(_))
+        ));
+        assert_eq!(
+            driver
+                .image(&application())
+                .unwrap()
+                .content_artifact_manifest,
+            target_manifest
+        );
+        for removed in [&old, &staged] {
+            assert!(matches!(
+                driver.execute(PersistenceCommand::LoadContentArtifact(
+                    LoadContentArtifactRequest {
+                        application: application(),
+                        id: removed.id,
+                    }
+                )),
+                PersistenceResult::ContentArtifactLoaded(Ok(None))
+            ));
+        }
+        assert!(matches!(
+            driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: application(),
+                    id: new.id,
+                }
+            )),
+            PersistenceResult::ContentArtifactLoaded(Ok(Some(_)))
+        ));
+
+        let before_failure = driver.image(&application()).unwrap().clone();
+        let missing = ContentArtifactId([0xee; 32]);
+        let invalid = ActivationBatch {
+            application: application(),
+            expected_base_epoch: 2,
+            next_epoch: 3,
+            source_schema_hash: [2; 32],
+            target_schema_version: 3,
+            target_schema_hash: [3; 32],
+            through_turn_sequence: 1,
+            authority_changes: Vec::new(),
+            completed_migration_edges: Vec::new(),
+            deleted_memory: Vec::new(),
+            target_content_artifact_manifest: ContentArtifactManifest {
+                bindings: BTreeMap::from([(
+                    owner,
+                    ContentArtifactBinding {
+                        artifact_id: missing,
+                        retention: ContentArtifactRetention::Replaceable,
+                    },
+                )]),
+            },
+            content_artifacts: BTreeMap::new(),
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Activate(invalid)),
+            PersistenceResult::Activated(Err(StoreError::InvalidContentArtifact(_)))
+        ));
+        assert_eq!(driver.image(&application()), Some(&before_failure));
+    }
+
     fn effect() -> EffectId {
         EffectId::from_host_operation("Test/send").unwrap()
     }
@@ -2340,6 +3116,7 @@ mod tests {
                 },
             }],
             outbox_changes: Vec::new(),
+            content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -2382,6 +3159,7 @@ mod tests {
                 },
             ],
             outbox_changes: Vec::new(),
+            content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -2422,6 +3200,7 @@ mod tests {
             }],
             completed_migration_edges: Vec::new(),
             deleted_memory: vec![memory("count")],
+            target_content_artifact_manifest: ContentArtifactManifest::default(),
             content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         }
@@ -2467,6 +3246,7 @@ mod tests {
             }],
             completed_migration_edges: Vec::new(),
             deleted_memory: vec![old_memory],
+            target_content_artifact_manifest: ContentArtifactManifest::default(),
             content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         }
@@ -2509,11 +3289,22 @@ mod tests {
                 value: StoredValue::Number(3),
             },
         );
+        candidate.content_artifact_manifest.bindings.insert(
+            ContentArtifactOwnerId([0x71; 32]),
+            ContentArtifactBinding {
+                artifact_id: ContentArtifactId([0x72; 32]),
+                retention: ContentArtifactRetention::Immutable,
+            },
+        );
 
         let batch = ActivationBatch::between(&current, &candidate).unwrap();
         assert_eq!(batch.expected_base_epoch, 4);
         assert_eq!(batch.next_epoch, 5);
         assert_eq!(batch.deleted_memory, vec![old_memory]);
+        assert_eq!(
+            batch.target_content_artifact_manifest,
+            candidate.content_artifact_manifest
+        );
         assert!(matches!(
             batch.authority_changes.as_slice(),
             [DurableChange::SetScalar { memory_id, .. }] if *memory_id == new_memory
@@ -2522,6 +3313,10 @@ mod tests {
         assert_eq!(ack.epoch, 5);
         assert!(!activated.scalars.contains_key(&old_memory));
         assert_eq!(activated.scalars[&new_memory].value, StoredValue::Number(3));
+        assert_eq!(
+            activated.content_artifact_manifest,
+            candidate.content_artifact_manifest
+        );
     }
 
     #[test]
@@ -2548,6 +3343,7 @@ mod tests {
             last_turn_sequence: 1,
             changes: Vec::new(),
             outbox_changes,
+            content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -2580,6 +3376,7 @@ mod tests {
             last_turn_sequence: 2,
             changes: Vec::new(),
             outbox_changes: vec![dispatch.clone(), dispatch],
+            content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -2614,6 +3411,7 @@ mod tests {
                 attempt: 1,
                 turn_sequence: 3,
             }],
+            content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -2659,6 +3457,7 @@ mod tests {
                 },
             }],
             outbox_changes: completions,
+            content_artifact_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();

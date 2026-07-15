@@ -141,6 +141,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         outbox_changes: vec![DurableOutboxChange::Enqueue {
             item: outbox_item.clone(),
         }],
+        content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
     .seal();
@@ -234,6 +235,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
                 item: second_outbox_item,
             },
         ],
+        content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
     .seal();
@@ -286,6 +288,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
             attempt: 1,
             turn_sequence: 3,
         }],
+        content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
     .seal();
@@ -325,6 +328,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
             },
         ],
         outbox_changes: Vec::new(),
+        content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
     .seal();
@@ -417,6 +421,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
             outcome: StoredValue::Text("done".to_owned()),
             turn_sequence: 4,
         }],
+        content_artifact_changes: Vec::new(),
         checksum: [0; 32],
     }
     .seal();

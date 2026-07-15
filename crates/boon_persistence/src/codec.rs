@@ -1,7 +1,9 @@
 use super::{
-    ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactId, DurableChange,
-    DurableEffectRow, DurableOutboxChange, DurableOutboxItem, DurableOutboxState, OutboxItemId,
-    RestoreImage, StoredList, StoredRow, StoredScalar, StoredValue, validate_application_transfer,
+    ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactBinding,
+    ContentArtifactId, ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention,
+    DurableChange, DurableContentArtifactChange, DurableEffectRow, DurableOutboxChange,
+    DurableOutboxItem, DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow,
+    StoredScalar, StoredValue, validate_application_transfer, validate_content_artifact_manifest,
 };
 use boon_plan::{
     ApplicationIdentity, EffectId, EffectInvocationId, MemoryId, MemoryLeafId, MigrationEdgeId,
@@ -11,12 +13,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 3;
-const APPLICATION_TRANSFER_FORMAT: u32 = 1;
-const CHECKPOINT_BATCH_FORMAT: u32 = 2;
+const RESTORE_IMAGE_FORMAT: u32 = 4;
+const APPLICATION_TRANSFER_FORMAT: u32 = 2;
+const CHECKPOINT_BATCH_FORMAT: u32 = 3;
 const OUTBOX_RECORD_FORMAT: u32 = 2;
 const BLOB_RECORD_FORMAT: u32 = 1;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
+const DEFAULT_MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024;
 type CborEncoder<'a> = Encoder<&'a mut Vec<u8>>;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -55,7 +58,7 @@ pub struct DecodeLimits {
 impl Default for DecodeLimits {
     fn default() -> Self {
         Self {
-            max_total_bytes: 64 * 1024 * 1024,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
             max_text_bytes: 1024 * 1024,
             max_blob_bytes: 32 * 1024 * 1024,
             max_collection_items: 1_000_000,
@@ -85,7 +88,7 @@ pub fn encode_restore_image(image: &RestoreImage) -> Result<Vec<u8>, CodecError>
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(10)
+        .array(11)
         .and_then(|encoder| encoder.u32(RESTORE_IMAGE_FORMAT))
         .map_err(encode_error)?;
     encode_application(&mut encoder, &image.application)?;
@@ -125,6 +128,7 @@ pub fn encode_restore_image(image: &RestoreImage) -> Result<Vec<u8>, CodecError>
         encode_digest(&mut encoder, item_id.as_bytes())?;
         encode_outbox_item(&mut encoder, item)?;
     }
+    encode_content_artifact_manifest(&mut encoder, &image.content_artifact_manifest)?;
     Ok(bytes)
 }
 
@@ -138,7 +142,10 @@ pub fn decode_restore_image(
     let mut decoder = Decoder::new(bytes);
     let root_len = definite_len(decoder.array().map_err(decode_error)?, "restore image")?;
     let format = decoder.u32().map_err(decode_error)?;
-    if !matches!((format, root_len), (1, 9) | (RESTORE_IMAGE_FORMAT, 10)) {
+    if !matches!(
+        (format, root_len),
+        (1, 9) | (3, 10) | (RESTORE_IMAGE_FORMAT, 11)
+    ) {
         return Err(CodecError::new(format!(
             "unsupported restore image format {format} with {root_len} fields"
         )));
@@ -193,6 +200,11 @@ pub fn decode_restore_image(
             }
         }
     }
+    let content_artifact_manifest = if format >= 4 {
+        decode_content_artifact_manifest(&mut decoder, limits)?
+    } else {
+        ContentArtifactManifest::default()
+    };
     if decoder.position() != bytes.len() {
         return Err(CodecError::new("restore image has trailing bytes"));
     }
@@ -207,6 +219,7 @@ pub fn decode_restore_image(
         lists,
         completed_migration_edges,
         outbox,
+        content_artifact_manifest,
     })
 }
 
@@ -260,6 +273,11 @@ pub fn decode_application_transfer(
     }
     let restore_image = decode_restore_image(restore_bytes, limits)?;
     let artifact_count = collection_len(&mut decoder, limits, "content artifact map", false)?;
+    if artifact_count > super::MAX_APPLICATION_TRANSFER_ARTIFACTS {
+        return Err(CodecError::new(
+            "application transfer exceeds content artifact count limit",
+        ));
+    }
     let mut content_artifacts = BTreeMap::new();
     let mut artifact_bytes = 0usize;
     for _ in 0..artifact_count {
@@ -272,11 +290,20 @@ pub fn decode_application_transfer(
         }
         let media_type = decode_text(&mut decoder, limits)?;
         let payload = decoder.bytes().map_err(decode_error)?;
+        if payload.len() > super::MAX_CONTENT_ARTIFACT_BYTES {
+            return Err(CodecError::new(
+                "content artifact exceeds per-artifact byte limit",
+            ));
+        }
         artifact_bytes = artifact_bytes
             .checked_add(payload.len())
             .ok_or_else(|| CodecError::new("content artifact byte count overflow"))?;
-        if artifact_bytes > limits.max_total_bytes {
-            return Err(CodecError::new("content artifacts exceed total byte limit"));
+        if artifact_bytes > limits.max_total_bytes
+            || artifact_bytes > super::MAX_APPLICATION_TRANSFER_ARTIFACT_BYTES
+        {
+            return Err(CodecError::new(
+                "content artifacts exceed transfer byte limit",
+            ));
         }
         let artifact = ContentArtifact {
             id,
@@ -304,7 +331,7 @@ pub fn encode_checkpoint_batch(batch: &CheckpointBatch) -> Result<Vec<u8>, Codec
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(10)
+        .array(11)
         .and_then(|encoder| encoder.u32(CHECKPOINT_BATCH_FORMAT))
         .map_err(encode_error)?;
     encode_application(&mut encoder, &batch.application)?;
@@ -325,6 +352,12 @@ pub fn encode_checkpoint_batch(batch: &CheckpointBatch) -> Result<Vec<u8>, Codec
     for change in &batch.outbox_changes {
         encode_outbox_change(&mut encoder, change)?;
     }
+    encoder
+        .array(batch.content_artifact_changes.len() as u64)
+        .map_err(encode_error)?;
+    for change in &batch.content_artifact_changes {
+        encode_content_artifact_change(&mut encoder, change)?;
+    }
     encoder.bytes(&batch.checksum).map_err(encode_error)?;
     Ok(bytes)
 }
@@ -335,11 +368,11 @@ pub fn decode_checkpoint_batch(
 ) -> Result<CheckpointBatch, CodecError> {
     component_size(bytes, limits, "checkpoint batch")?;
     let mut decoder = Decoder::new(bytes);
-    expect_array(&mut decoder, 10, "checkpoint batch")?;
+    let root_len = definite_len(decoder.array().map_err(decode_error)?, "checkpoint batch")?;
     let format = decoder.u32().map_err(decode_error)?;
-    if format != CHECKPOINT_BATCH_FORMAT {
+    if !matches!((format, root_len), (2, 10) | (CHECKPOINT_BATCH_FORMAT, 11)) {
         return Err(CodecError::new(format!(
-            "unsupported checkpoint batch format {format}"
+            "unsupported checkpoint batch format {format} with {root_len} fields"
         )));
     }
     let application = decode_application(&mut decoder, limits)?;
@@ -358,6 +391,15 @@ pub fn decode_checkpoint_batch(
     for _ in 0..outbox_count {
         outbox_changes.push(decode_outbox_change(&mut decoder, limits)?);
     }
+    let mut content_artifact_changes = Vec::new();
+    if format >= 3 {
+        let artifact_change_count =
+            collection_len(&mut decoder, limits, "content artifact changes", true)?;
+        content_artifact_changes.reserve(artifact_change_count);
+        for _ in 0..artifact_change_count {
+            content_artifact_changes.push(decode_content_artifact_change(&mut decoder)?);
+        }
+    }
     let checksum = decode_digest(&mut decoder)?;
     reject_trailing(&decoder, bytes, "checkpoint batch")?;
     Ok(CheckpointBatch {
@@ -369,6 +411,7 @@ pub fn decode_checkpoint_batch(
         last_turn_sequence,
         changes,
         outbox_changes,
+        content_artifact_changes,
         checksum,
     })
 }
@@ -618,6 +661,126 @@ fn reject_trailing(decoder: &Decoder<'_>, bytes: &[u8], label: &str) -> Result<(
         return Err(CodecError::new(format!("{label} has trailing bytes")));
     }
     Ok(())
+}
+
+fn encode_content_artifact_manifest(
+    encoder: &mut CborEncoder<'_>,
+    manifest: &ContentArtifactManifest,
+) -> Result<(), CodecError> {
+    validate_content_artifact_manifest(manifest)
+        .map_err(|error| CodecError::new(error.to_string()))?;
+    encoder
+        .map(manifest.bindings.len() as u64)
+        .map_err(encode_error)?;
+    for (owner_id, binding) in &manifest.bindings {
+        encode_digest(encoder, owner_id.as_bytes())?;
+        encoder.array(2).map_err(encode_error)?;
+        encode_digest(encoder, binding.artifact_id.as_bytes())?;
+        encoder
+            .u8(match binding.retention {
+                ContentArtifactRetention::Replaceable => 0,
+                ContentArtifactRetention::Immutable => 1,
+            })
+            .map_err(encode_error)?;
+    }
+    Ok(())
+}
+
+fn decode_content_artifact_manifest(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+) -> Result<ContentArtifactManifest, CodecError> {
+    let binding_count = collection_len(decoder, limits, "content artifact manifest", false)?;
+    if binding_count > super::MAX_CONTENT_ARTIFACT_OWNERS {
+        return Err(CodecError::new(
+            "content artifact manifest exceeds owner count limit",
+        ));
+    }
+    let mut bindings = BTreeMap::new();
+    for _ in 0..binding_count {
+        let owner_id = ContentArtifactOwnerId(decode_digest(decoder)?);
+        expect_array(decoder, 2, "content artifact binding")?;
+        let artifact_id = ContentArtifactId(decode_digest(decoder)?);
+        let retention = match decoder.u8().map_err(decode_error)? {
+            0 => ContentArtifactRetention::Replaceable,
+            1 => ContentArtifactRetention::Immutable,
+            tag => {
+                return Err(CodecError::new(format!(
+                    "unknown content artifact retention tag {tag}"
+                )));
+            }
+        };
+        if bindings
+            .insert(
+                owner_id,
+                ContentArtifactBinding {
+                    artifact_id,
+                    retention,
+                },
+            )
+            .is_some()
+        {
+            return Err(CodecError::new(
+                "content artifact manifest repeats an owner ID",
+            ));
+        }
+    }
+    let manifest = ContentArtifactManifest { bindings };
+    validate_content_artifact_manifest(&manifest)
+        .map_err(|error| CodecError::new(error.to_string()))?;
+    Ok(manifest)
+}
+
+fn encode_content_artifact_change(
+    encoder: &mut CborEncoder<'_>,
+    change: &DurableContentArtifactChange,
+) -> Result<(), CodecError> {
+    let (tag, owner_id, artifact_id) = match change {
+        DurableContentArtifactChange::SetReplaceable {
+            owner_id,
+            artifact_id,
+        } => (0, owner_id, artifact_id),
+        DurableContentArtifactChange::InsertImmutable {
+            owner_id,
+            artifact_id,
+        } => (1, owner_id, artifact_id),
+        DurableContentArtifactChange::Release {
+            owner_id,
+            expected_artifact_id,
+        } => (2, owner_id, expected_artifact_id),
+    };
+    encoder
+        .array(3)
+        .and_then(|encoder| encoder.u8(tag))
+        .map_err(encode_error)?;
+    encode_digest(encoder, owner_id.as_bytes())?;
+    encode_digest(encoder, artifact_id.as_bytes())
+}
+
+fn decode_content_artifact_change(
+    decoder: &mut Decoder<'_>,
+) -> Result<DurableContentArtifactChange, CodecError> {
+    expect_array(decoder, 3, "content artifact change")?;
+    let tag = decoder.u8().map_err(decode_error)?;
+    let owner_id = ContentArtifactOwnerId(decode_digest(decoder)?);
+    let artifact_id = ContentArtifactId(decode_digest(decoder)?);
+    match tag {
+        0 => Ok(DurableContentArtifactChange::SetReplaceable {
+            owner_id,
+            artifact_id,
+        }),
+        1 => Ok(DurableContentArtifactChange::InsertImmutable {
+            owner_id,
+            artifact_id,
+        }),
+        2 => Ok(DurableContentArtifactChange::Release {
+            owner_id,
+            expected_artifact_id: artifact_id,
+        }),
+        _ => Err(CodecError::new(format!(
+            "unknown content artifact change tag {tag}"
+        ))),
+    }
 }
 
 fn encode_durable_change(
@@ -1637,6 +1800,13 @@ mod tests {
         );
         let item = outbox_item(9);
         image.outbox.insert(item.item_id, item);
+        image.content_artifact_manifest.bindings.insert(
+            ContentArtifactOwnerId([0x31; 32]),
+            ContentArtifactBinding {
+                artifact_id: ContentArtifactId([0x41; 32]),
+                retention: ContentArtifactRetention::Replaceable,
+            },
+        );
         let bytes = encode_restore_image(&image).unwrap();
         assert_eq!(
             decode_restore_image(&bytes, DecodeLimits::default()).unwrap(),
@@ -1671,6 +1841,22 @@ mod tests {
             b"second immutable program".to_vec(),
         )
         .unwrap();
+        restore_image.content_artifact_manifest.bindings.extend([
+            (
+                ContentArtifactOwnerId([1; 32]),
+                ContentArtifactBinding {
+                    artifact_id: first.id,
+                    retention: ContentArtifactRetention::Replaceable,
+                },
+            ),
+            (
+                ContentArtifactOwnerId([2; 32]),
+                ContentArtifactBinding {
+                    artifact_id: second.id,
+                    retention: ContentArtifactRetention::Immutable,
+                },
+            ),
+        ]);
         let transfer = ApplicationTransfer {
             restore_image,
             content_artifacts: BTreeMap::from([
@@ -1684,6 +1870,22 @@ mod tests {
             transfer
         );
         assert_eq!(encode_application_transfer(&transfer).unwrap(), bytes);
+
+        let mut missing = transfer.clone();
+        missing.content_artifacts.remove(&first.id);
+        assert!(matches!(
+            validate_application_transfer(&missing),
+            Err(crate::StoreError::InvalidContentArtifact(_))
+        ));
+        let mut extra = transfer.clone();
+        let unreferenced = ContentArtifact::new("text/plain", b"extra".to_vec()).unwrap();
+        extra
+            .content_artifacts
+            .insert(unreferenced.id, unreferenced);
+        assert!(matches!(
+            validate_application_transfer(&extra),
+            Err(crate::StoreError::InvalidContentArtifact(_))
+        ));
 
         let mut corrupt = bytes;
         let payload = corrupt
@@ -1734,6 +1936,16 @@ mod tests {
                 },
             }],
             outbox_changes: vec![DurableOutboxChange::Enqueue { item }],
+            content_artifact_changes: vec![
+                DurableContentArtifactChange::SetReplaceable {
+                    owner_id: ContentArtifactOwnerId([0x51; 32]),
+                    artifact_id: ContentArtifactId([0x61; 32]),
+                },
+                DurableContentArtifactChange::Release {
+                    owner_id: ContentArtifactOwnerId([0x51; 32]),
+                    expected_artifact_id: ContentArtifactId([0x61; 32]),
+                },
+            ],
             checksum: [0; 32],
         }
         .seal();

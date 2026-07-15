@@ -32,7 +32,7 @@ FUNCTION compiler() {
             source: PASSED.store.publish_candidate_source
             revision: PASSED.store.publish_request_sequence
             capability_profile: PublicDocument
-            persist_artifact: True
+            artifact_retention: Archive
             session_key: TEXT { persons-public-candidate }
             mount: False
         )

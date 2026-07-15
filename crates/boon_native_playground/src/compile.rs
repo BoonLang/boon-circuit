@@ -484,7 +484,7 @@ mod tests {
                         boon_document_model::ProgramCapabilityProfile::PublicDocument,
                 },
                 artifact_id: None,
-                persist_artifact: false,
+                artifact_ownership: None,
             });
         }
 

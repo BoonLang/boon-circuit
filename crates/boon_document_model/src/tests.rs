@@ -85,3 +85,31 @@ fn sensitive_text_input_artifacts_are_fixed_redactions() {
         Some(SENSITIVE_INPUT_REDACTED_GLYPHS)
     );
 }
+
+#[test]
+fn older_document_nodes_default_typed_focus_metadata_to_absent() {
+    let node = DocumentNode::new("input", DocumentNodeKind::TextInput);
+    let serialized = toml::to_string(&node).unwrap();
+    assert!(!serialized.contains("text_input_id"));
+    assert!(!serialized.contains("activation_focus"));
+    let decoded: DocumentNode = toml::from_str(&serialized).unwrap();
+    assert_eq!(decoded.text_input_id, None);
+    assert_eq!(decoded.activation_focus, None);
+}
+
+#[test]
+fn typed_focus_patch_has_a_stable_tagged_round_trip() {
+    let patch = DocumentPatch::SetTextInputFocus {
+        id: DocumentNodeId("diagnostic".to_owned()),
+        text_input_id: None,
+        activation_focus: Some(TextInputFocusRequest {
+            input_id: TextInputId("profile-source".to_owned()),
+            line: 8,
+            column: 3,
+        }),
+    };
+    let serialized = toml::to_string(&patch).unwrap();
+    assert!(serialized.contains("kind = \"set_text_input_focus\""));
+    assert!(serialized.contains("profile-source"));
+    assert_eq!(toml::from_str::<DocumentPatch>(&serialized).unwrap(), patch);
+}

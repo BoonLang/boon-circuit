@@ -513,6 +513,116 @@ fn retained_document_scrolls_descendants_without_full_lowering() {
 }
 
 #[test]
+fn retained_document_scrolls_leaf_text_content_caret_and_hit_position_together() {
+    let mut input = node("input", DocumentNodeKind::TextInput, Some("root"));
+    input.text = Some(TextValue {
+        text: "zero\none\ntwo\nthree\nfour".to_owned(),
+    });
+    for (key, value) in [
+        ("width", StyleValue::Number(180.0)),
+        ("height", StyleValue::Number(60.0)),
+        ("size", StyleValue::Number(10.0)),
+        ("line_height", StyleValue::Number(20.0)),
+        ("text_inset", StyleValue::Number(0.0)),
+        ("multiline", StyleValue::Bool(true)),
+        ("scroll_y", StyleValue::Bool(true)),
+        ("caret_visible", StyleValue::Bool(true)),
+        ("caret_line", StyleValue::Number(2.0)),
+        ("caret_column", StyleValue::Number(1.0)),
+    ] {
+        input.style.insert(key.to_owned(), value);
+    }
+    input.style.insert(
+        "vertical_align".to_owned(),
+        StyleValue::Text("Top".to_owned()),
+    );
+    input.scroll = Some(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
+    let mut state = DocumentState::new("root");
+    state.apply_patch(DocumentPatch::UpsertNode(input)).unwrap();
+    let viewport = Viewport {
+        surface: 1,
+        width: 240.0,
+        height: 120.0,
+        scale: 1.0,
+    };
+    let mut columns = render_scene::ApproximateTextColumnMeasurer;
+    let mut retained = RetainedDocument::new(state.into_frame(), viewport, &mut columns).unwrap();
+    retained
+        .set_interaction_state(
+            None,
+            Some(DocumentNodeId("input".to_owned())),
+            &mut columns,
+        )
+        .unwrap();
+    let before_run_y = retained
+        .scene()
+        .text_runs
+        .iter()
+        .find(|run| run.node.0 == "input")
+        .unwrap()
+        .bounds
+        .y;
+    let before_caret_y = retained
+        .scene()
+        .visual_primitives
+        .iter()
+        .find(|primitive| {
+            primitive.node.0 == "input"
+                && primitive.primitive == RenderVisualPrimitiveKind::TextInputCaret
+        })
+        .unwrap()
+        .bounds
+        .y;
+
+    let update = retained
+        .apply_patches(
+            vec![DocumentPatch::SetScroll {
+                id: DocumentNodeId("input".to_owned()),
+                scroll: boon_document_model::ScrollState { x: 0.0, y: 20.0 },
+            }],
+            &mut columns,
+        )
+        .unwrap();
+    let item = retained
+        .layout()
+        .display_list
+        .iter()
+        .find(|item| item.node.0 == "input")
+        .unwrap();
+    let after_run = retained
+        .scene()
+        .text_runs
+        .iter()
+        .find(|run| run.node.0 == "input")
+        .unwrap();
+    let after_caret = retained
+        .scene()
+        .visual_primitives
+        .iter()
+        .find(|primitive| {
+            primitive.node.0 == "input"
+                && primitive.primitive == RenderVisualPrimitiveKind::TextInputCaret
+        })
+        .unwrap();
+
+    assert!(!update.full_lowered);
+    assert!(update.render_changed);
+    assert_eq!(after_run.bounds.y, before_run_y - 20.0);
+    assert_eq!(after_caret.bounds.y, before_caret_y - 20.0);
+    assert_eq!(after_caret.clip, Some(item.bounds));
+    assert_eq!(
+        render_scene::text_position_at(
+            item,
+            item.bounds.x + 2.0,
+            item.bounds.y + 2.0,
+            &mut columns,
+        )
+        .0,
+        1
+    );
+}
+
+#[test]
 fn verified_nonstructural_batch_preflights_before_mutation() {
     let mut label = node("label", DocumentNodeKind::Text, Some("root"));
     label.text = Some(TextValue {

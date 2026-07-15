@@ -10,6 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+use unicode_segmentation::UnicodeSegmentation;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
@@ -76,7 +77,7 @@ pub fn diagnose_runtime_source_units(
             CompilerDiagnostic {
                 path,
                 line: Some(line),
-                column: byte_column(&parsed.source, diagnostic.line, diagnostic.start),
+                column: grapheme_column(&parsed.source, diagnostic.line, diagnostic.start),
                 start: Some(diagnostic.start),
                 end: Some(diagnostic.end),
                 message: diagnostic.message,
@@ -104,13 +105,16 @@ fn source_file_location(parsed: &ParsedProgram, global_line: usize) -> (String, 
         )
 }
 
-fn byte_column(source: &str, line: usize, byte: usize) -> Option<usize> {
+fn grapheme_column(source: &str, line: usize, byte: usize) -> Option<usize> {
     let line_start = source
         .split_inclusive('\n')
         .take(line.saturating_sub(1))
         .map(str::len)
         .sum::<usize>();
-    (byte >= line_start && byte <= source.len()).then_some(byte - line_start + 1)
+    (byte >= line_start && byte <= source.len())
+        .then(|| source.get(line_start..byte.min(source.len())))
+        .flatten()
+        .map(|prefix| prefix.graphemes(true).count().saturating_add(1))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

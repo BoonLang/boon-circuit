@@ -58,6 +58,7 @@ struct Snapshot {
 pub struct Buffer {
     rope: Rope,
     selection: Selection,
+    preferred_column: Option<usize>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     revision: u64,
@@ -68,6 +69,7 @@ impl Buffer {
         Self {
             rope: Rope::from_str(text),
             selection: Selection::collapsed(Position::default()),
+            preferred_column: None,
             undo: Vec::new(),
             redo: Vec::new(),
             revision: 1,
@@ -121,6 +123,7 @@ impl Buffer {
         };
         let changed = next != self.selection;
         self.selection = next;
+        self.preferred_column = None;
         changed
     }
 
@@ -136,6 +139,7 @@ impl Buffer {
         };
         let changed = next != self.selection;
         self.selection = next;
+        self.preferred_column = None;
         changed
     }
 
@@ -161,7 +165,28 @@ impl Buffer {
         self.push_undo();
         self.rope = Rope::from_str(text);
         self.selection = Selection::collapsed(Position::default());
+        self.preferred_column = None;
         self.bump_revision();
+    }
+
+    pub fn delete_surrounding_bytes(&mut self, before: usize, after: usize) -> bool {
+        let (selection_start, selection_end) = self.selection_byte_range();
+        if before == 0 && after == 0 && selection_start == selection_end {
+            return false;
+        }
+        let text = self.text();
+        let mut start = selection_start.saturating_sub(before);
+        while start > 0 && !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = selection_end.saturating_add(after).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if start == end {
+            return false;
+        }
+        self.replace_byte_range(start, end, "")
     }
 
     pub fn apply(&mut self, command: Command) -> bool {
@@ -248,6 +273,7 @@ impl Buffer {
             let caret = start + text.chars().count();
             self.selection = Selection::collapsed(self.position_for_char(caret));
         }
+        self.preferred_column = None;
         self.bump_revision();
         true
     }
@@ -288,6 +314,7 @@ impl Buffer {
         self.rope.insert(start_char, replacement);
         self.selection =
             Selection::collapsed(self.position_for_char(start_char + replacement.chars().count()));
+        self.preferred_column = None;
         self.bump_revision();
         true
     }
@@ -309,15 +336,25 @@ impl Buffer {
 
     fn move_lines(&mut self, delta: isize, extend: bool) -> bool {
         let caret = self.caret();
+        let preferred_column = self.preferred_column.unwrap_or(caret.column);
         let last = self.line_count().saturating_sub(1) as isize;
         let line = (caret.line as isize + delta).clamp(0, last) as usize;
-        self.set_caret(
-            Position {
-                line,
-                column: caret.column.min(self.line_columns(line)),
-            },
-            extend,
-        )
+        let position = Position {
+            line,
+            column: preferred_column.min(self.line_columns(line)),
+        };
+        let next = if extend {
+            Selection {
+                anchor: self.selection.anchor,
+                head: position,
+            }
+        } else {
+            Selection::collapsed(position)
+        };
+        let changed = next != self.selection;
+        self.selection = next;
+        self.preferred_column = Some(preferred_column);
+        changed
     }
 
     fn indent(&mut self, unindent: bool) -> bool {
@@ -351,6 +388,7 @@ impl Buffer {
             anchor: self.clamp_position(adjust(self.selection.anchor)),
             head: self.clamp_position(adjust(self.selection.head)),
         };
+        self.preferred_column = None;
         self.bump_revision();
         true
     }
@@ -388,6 +426,7 @@ impl Buffer {
     fn restore(&mut self, snapshot: Snapshot) {
         self.rope = snapshot.rope;
         self.selection = snapshot.selection;
+        self.preferred_column = None;
         self.bump_revision();
     }
 
@@ -509,5 +548,24 @@ mod tests {
         buffer.apply(Command::Insert(")".to_owned()));
         assert_eq!(buffer.text(), "(value)");
         assert_eq!(buffer.caret().column, 7);
+    }
+
+    #[test]
+    fn vertical_navigation_preserves_the_preferred_column() {
+        let mut buffer = Buffer::new("abcdefgh\nx\nabcdefgh");
+        buffer.set_caret(Position { line: 0, column: 6 }, false);
+        assert!(buffer.apply(Command::MoveDown { extend: false }));
+        assert_eq!(buffer.caret(), Position { line: 1, column: 1 });
+        assert!(buffer.apply(Command::MoveDown { extend: false }));
+        assert_eq!(buffer.caret(), Position { line: 2, column: 6 });
+    }
+
+    #[test]
+    fn ime_surrounding_deletion_uses_utf8_byte_counts() {
+        let mut buffer = Buffer::new("a🙂bc");
+        buffer.set_caret(Position { line: 0, column: 2 }, false);
+        assert!(buffer.delete_surrounding_bytes(4, 1));
+        assert_eq!(buffer.text(), "ac");
+        assert_eq!(buffer.caret(), Position { line: 0, column: 1 });
     }
 }

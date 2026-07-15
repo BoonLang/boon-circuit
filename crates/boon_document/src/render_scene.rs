@@ -1,7 +1,7 @@
 use crate::{
     ComputedStyleIdentity, DisplayItem, DocumentHotIdTable, DocumentNodeId, DocumentNodeKind,
-    DocumentRetainedLayoutKeyTable, LayoutFrame, PatchApplyError, Rect, StyleEditorTypeHint,
-    StyleMap, StyleRichTextSpan, StyleValue,
+    DocumentRetainedLayoutKeyTable, LayoutFrame, PatchApplyError, Rect, ScrollState,
+    StyleEditorTypeHint, StyleMap, StyleRichTextSpan, StyleValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,6 +11,8 @@ use std::ops::Range;
 pub const DEFAULT_DOCUMENT_FONT_FAMILY: &str = "Nimbus Sans";
 pub const DEFAULT_EDITOR_FONT_FAMILY: &str = "JetBrains Mono";
 pub const DEFAULT_EDITOR_FONT_FEATURES: &str = "zero,calt";
+pub(crate) const TEXT_SCROLL_X_STYLE_KEY: &str = "__text_scroll_x";
+pub(crate) const TEXT_SCROLL_Y_STYLE_KEY: &str = "__text_scroll_y";
 
 pub trait RenderTextColumnMeasurer {
     fn column_edges(&mut self, text: &str, style: &StyleMap, line_height: f32) -> Vec<f32>;
@@ -44,22 +46,61 @@ pub fn text_position_at(
     let line_height = style_line_height(&item.style, font_size).max(1.0);
     let text_bounds = text_content_bounds_for_item(item);
     let text_inset = style_number(&item.style, "text_inset").unwrap_or(4.0);
+    let scroll_x = style_number(&item.style, TEXT_SCROLL_X_STYLE_KEY)
+        .unwrap_or(0.0)
+        .max(0.0);
+    let scroll_y = style_number(&item.style, TEXT_SCROLL_Y_STYLE_KEY)
+        .unwrap_or(0.0)
+        .max(0.0);
     let top = text_top_for_parts(
         text_bounds,
         line_height * lines.len().max(1) as f32,
         text_inset,
         text_vertical_align(&item.kind, &item.style),
     );
-    let line =
-        (((y - top) / line_height).floor().max(0.0) as usize).min(lines.len().saturating_sub(1));
+    let line = (((y + scroll_y - top) / line_height).floor().max(0.0) as usize)
+        .min(lines.len().saturating_sub(1));
     let line_text = lines.get(line).copied().unwrap_or_default();
     let edges = columns.column_edges(line_text, &item.style, line_height);
-    let local_x = x - text_left_for_width(item, edges.last().copied().unwrap_or_default());
+    let local_x =
+        x + scroll_x - text_left_for_width(item, edges.last().copied().unwrap_or_default());
     let column = edges
         .windows(2)
         .position(|edge| local_x < (edge[0] + edge[1]) * 0.5)
         .unwrap_or_else(|| edges.len().saturating_sub(1));
     (line, column)
+}
+
+pub fn text_scroll_limits(
+    item: &DisplayItem,
+    columns: &mut impl RenderTextColumnMeasurer,
+) -> ScrollState {
+    let text = item.text.as_deref().unwrap_or_default();
+    let lines = text.split('\n').collect::<Vec<_>>();
+    let font_size = style_number(&item.style, "size").unwrap_or(14.0);
+    let line_height = style_line_height(&item.style, font_size).max(1.0);
+    let text_inset = style_number(&item.style, "text_inset").unwrap_or(4.0);
+    let viewport = text_content_bounds_for_item(item);
+    let content_width = lines
+        .iter()
+        .map(|line| {
+            columns
+                .column_edges(line, &item.style, line_height)
+                .last()
+                .copied()
+                .unwrap_or_default()
+        })
+        .fold(0.0_f32, f32::max)
+        + text_inset * 2.0;
+    let content_height = line_height * lines.len().max(1) as f32 + text_inset * 2.0;
+    ScrollState {
+        x: if style_bool(&item.style, "text_wrap") == Some(true) {
+            0.0
+        } else {
+            (content_width - viewport.width).max(0.0)
+        },
+        y: (content_height - viewport.height).max(0.0),
+    }
 }
 
 #[derive(Default)]
@@ -2057,7 +2098,12 @@ fn text_overlay_primitives(
             line_height * lines.len().max(1) as f32,
             text_inset,
             vertical_align,
-        );
+        ) - style_number(&item.style, TEXT_SCROLL_Y_STYLE_KEY)
+            .unwrap_or(0.0)
+            .max(0.0);
+        let scroll_x = style_number(&item.style, TEXT_SCROLL_X_STYLE_KEY)
+            .unwrap_or(0.0)
+            .max(0.0);
         let mut x_for_line_column = |line: usize, column: f32| {
             let line = lines.get(line).copied().unwrap_or_default();
             let edges = columns.column_edges(line, &item.style, line_height);
@@ -2075,7 +2121,7 @@ fn text_overlay_primitives(
                 .copied()
                 .or_else(|| edges.last().copied())
                 .unwrap_or(lower_x);
-            left + lower_x + (upper_x - lower_x) * fraction
+            left + lower_x + (upper_x - lower_x) * fraction - scroll_x
         };
         if let (Some(start), Some(end)) = (
             style_number(&item.style, "selection_start"),

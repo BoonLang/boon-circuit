@@ -25,6 +25,12 @@ expected_source_event = { source = "store.elements.source_editor", text = "scene
 expect_root_text = { "store.source_draft" = "scene: Missing/constructor(", "store.draft_revision" = "3", "store.draft_compile_state" = "Invalid", "store.last_valid_draft_revision" = "2", "store.publish_state" = "Draft" }
 
 [[step]]
+id = "diagnostic-focuses-source-location"
+user_action = { kind = "click", target = "draft diagnostic" }
+expected_source_event = { source = "store.elements.focus_diagnostic" }
+expect_root_text = { "store.draft_compile_state" = "Invalid", "store.last_valid_draft_revision" = "2" }
+
+[[step]]
 id = "corrected-edit-preview"
 user_action = { kind = "type_text", target = "profile source", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }
 expected_source_event = { source = "store.elements.source_editor", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Corrected page })" }

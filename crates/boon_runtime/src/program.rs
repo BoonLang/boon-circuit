@@ -1686,6 +1686,7 @@ fn parent_patch_is_nonstructural(patch: &DocumentPatch) -> bool {
             | DocumentPatch::SetEmbeddedProgram { .. }
             | DocumentPatch::SetBinding { .. }
             | DocumentPatch::SetBindingAt { .. }
+            | DocumentPatch::SetTextInputFocus { .. }
             | DocumentPatch::SetScroll { .. }
             | DocumentPatch::SetListMaterialization { .. }
     )
@@ -1698,6 +1699,7 @@ fn parent_patch_target(patch: &DocumentPatch) -> Option<&DocumentNodeId> {
         | DocumentPatch::SetEmbeddedProgram { id, .. }
         | DocumentPatch::SetBinding { id, .. }
         | DocumentPatch::SetBindingAt { id, .. }
+        | DocumentPatch::SetTextInputFocus { id, .. }
         | DocumentPatch::SetScroll { id, .. }
         | DocumentPatch::SetListMaterialization { id, .. } => Some(id),
         DocumentPatch::UpsertNode(_)

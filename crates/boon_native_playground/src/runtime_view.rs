@@ -84,6 +84,14 @@ struct TextInputState {
     buffer: Buffer,
     caret_visible: bool,
     next_blink_at: Option<Instant>,
+    viewport_width: Option<f32>,
+    viewport_height: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct ActivationFocusRequest {
+    input_id: boon_document::TextInputId,
+    position: Position,
 }
 
 impl TextInputState {
@@ -92,6 +100,8 @@ impl TextInputState {
             buffer: Buffer::new(text),
             caret_visible: true,
             next_blink_at: None,
+            viewport_width: None,
+            viewport_height: None,
         }
     }
 
@@ -141,6 +151,8 @@ pub struct RuntimeView {
     text_inputs: std::collections::BTreeMap<String, TextInputState>,
     text_drag: Option<String>,
     modifiers: InputModifiers,
+    clipboard_fallback: Option<String>,
+    clipboard_system_synchronized: bool,
     scroll_offsets: std::collections::BTreeMap<String, boon_document_model::ScrollState>,
     materialization_overscan: std::collections::BTreeMap<u64, std::ops::Range<u64>>,
     pending_patches: Vec<DocumentPatch>,
@@ -559,6 +571,8 @@ impl RuntimeView {
             text_inputs,
             text_drag: None,
             modifiers: InputModifiers::default(),
+            clipboard_fallback: None,
+            clipboard_system_synchronized: false,
             scroll_offsets: std::collections::BTreeMap::new(),
             materialization_overscan: std::collections::BTreeMap::new(),
             pending_patches: Vec::new(),
@@ -2190,15 +2204,30 @@ impl RuntimeView {
                         self.focused.as_deref() == Some(target.node.as_str())
                             && self.target_is_text_input(target)
                     }) {
-                        self.sync_text_input_from_document(
+                        self.set_text_input_viewport(
                             &target.node,
-                            target
-                                .text_line
-                                .zip(target.text_column)
-                                .map(|(line, column)| Position { line, column }),
+                            target.bounds_width,
+                            target.bounds_height,
                         );
+                        let position = target
+                            .text_line
+                            .zip(target.text_column)
+                            .map(|(line, column)| Position { line, column });
+                        let extended = !changed
+                            && self.modifiers.shift
+                            && position.is_some_and(|position| {
+                                self.set_text_input_caret(
+                                    &target.node,
+                                    position.line,
+                                    position.column,
+                                    true,
+                                )
+                            });
+                        if !extended {
+                            self.sync_text_input_from_document(&target.node, position);
+                            self.queue_text_input_overlay(&target.node);
+                        }
                         self.text_drag = Some(target.node.clone());
-                        self.queue_text_input_overlay(&target.node);
                     } else {
                         self.text_drag = None;
                     }
@@ -2233,10 +2262,15 @@ impl RuntimeView {
                         if pointer_activation_intent(target.source_intent.as_deref())
                             && !self.bare_source_is_text_input(&target)
                         {
-                            return self.dispatch_target(
+                            let focus_request = self.activation_focus_request(&target.node);
+                            let mut changed = self.dispatch_target(
                                 &target,
                                 pointer_source_payload(pointer, &target),
-                            );
+                            )?;
+                            if let Some(request) = focus_request {
+                                changed |= self.apply_activation_focus_request(request)?;
+                            }
+                            return Ok(changed);
                         }
                     }
                     Ok(false)
@@ -2244,7 +2278,10 @@ impl RuntimeView {
                 _ => Ok(false),
             },
             HostEvent::Wheel(wheel) => {
-                let Some(root) = target.and_then(|target| target.scroll_root) else {
+                let Some(target) = target else {
+                    return Ok(false);
+                };
+                let Some(root) = target.scroll_root.clone() else {
                     return Ok(false);
                 };
                 let root = DocumentNodeId(root);
@@ -2260,8 +2297,8 @@ impl RuntimeView {
                     })
                     .unwrap_or(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
                 let previous = scroll;
-                scroll.x = (scroll.x + wheel.delta_x).max(0.0);
-                scroll.y = (scroll.y + wheel.delta_y).max(0.0);
+                scroll.x = (scroll.x + wheel.delta_x).clamp(0.0, target.scroll_max_x.max(0.0));
+                scroll.y = (scroll.y + wheel.delta_y).clamp(0.0, target.scroll_max_y.max(0.0));
                 if scroll == previous {
                     return Ok(false);
                 }
@@ -2348,6 +2385,8 @@ impl RuntimeView {
             bounds_y: 0.0,
             bounds_width: 0.0,
             bounds_height: 0.0,
+            scroll_max_x: 0.0,
+            scroll_max_y: 0.0,
             text_line: None,
             text_column: None,
         };
@@ -2583,14 +2622,10 @@ impl RuntimeView {
         let Some(state) = self.text_inputs.get_mut(&focused) else {
             return Ok(false);
         };
-        let mut changed = false;
-        for _ in 0..before_bytes {
-            changed |= state.buffer.apply(Command::DeleteBackward);
-        }
-        for _ in 0..after_bytes {
-            changed |= state.buffer.apply(Command::DeleteForward);
-        }
-        if !changed {
+        if !state
+            .buffer
+            .delete_surrounding_bytes(before_bytes as usize, after_bytes as usize)
+        {
             return Ok(false);
         }
         state.reset_blink();
@@ -2636,9 +2671,7 @@ impl RuntimeView {
                 }
                 "x" => return self.copy_selection_to_clipboard(&focused, true),
                 "v" => {
-                    if let Ok(mut clipboard) = arboard::Clipboard::new()
-                        && let Ok(text) = clipboard.get_text()
-                    {
+                    if let Some(text) = self.clipboard_text() {
                         let text = if self.focused_is_multiline() {
                             text
                         } else {
@@ -2665,6 +2698,8 @@ impl RuntimeView {
             "down" => Some(Command::MoveDown { extend }),
             "home" => Some(Command::MoveHome { extend }),
             "end" => Some(Command::MoveEnd { extend }),
+            "pageup" => Some(Command::PageUp { extend, lines: 20 }),
+            "pagedown" => Some(Command::PageDown { extend, lines: 20 }),
             "backspace" => Some(Command::DeleteBackward),
             "delete" => Some(Command::DeleteForward),
             _ => None,
@@ -2723,21 +2758,89 @@ impl RuntimeView {
     }
 
     fn copy_selection_to_clipboard(&mut self, focused: &str, cut: bool) -> ViewResult<bool> {
-        let Some(state) = self.text_inputs.get_mut(focused) else {
+        let Some(selected) = self
+            .text_inputs
+            .get(focused)
+            .map(|state| state.buffer.selected_text())
+        else {
             return Ok(false);
         };
-        let selected = state.buffer.selected_text();
         if selected.is_empty() {
             return Ok(false);
         }
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let _ = clipboard.set_text(selected);
-        }
+        self.clipboard_system_synchronized = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(selected.clone()))
+            .is_ok();
+        self.clipboard_fallback = Some(selected);
+        let Some(state) = self.text_inputs.get_mut(focused) else {
+            return Ok(false);
+        };
         if !cut || !state.buffer.apply(Command::InsertPlain(String::new())) {
             return Ok(false);
         }
         state.reset_blink();
         self.finish_focused_edit(focused)
+    }
+
+    fn clipboard_text(&self) -> Option<String> {
+        let platform = (self.clipboard_system_synchronized || self.clipboard_fallback.is_none())
+            .then(|| {
+                arboard::Clipboard::new()
+                    .and_then(|mut clipboard| clipboard.get_text())
+                    .ok()
+            })
+            .flatten();
+        platform.or_else(|| self.clipboard_fallback.clone())
+    }
+
+    fn activation_focus_request(&self, source: &str) -> Option<ActivationFocusRequest> {
+        let node = self
+            .retained_frame()
+            .nodes
+            .get(&DocumentNodeId(source.to_owned()))?;
+        let request = node.activation_focus.as_ref()?;
+        let line = request
+            .line
+            .saturating_sub(1)
+            .try_into()
+            .unwrap_or(usize::MAX);
+        let column = request
+            .column
+            .saturating_sub(1)
+            .try_into()
+            .unwrap_or(usize::MAX);
+        Some(ActivationFocusRequest {
+            input_id: request.input_id.clone(),
+            position: Position { line, column },
+        })
+    }
+
+    fn apply_activation_focus_request(
+        &mut self,
+        request: ActivationFocusRequest,
+    ) -> ViewResult<bool> {
+        let Some(target) = unique_text_input(self.retained_frame(), &request.input_id) else {
+            return Ok(false);
+        };
+        let focus_changed = self.focused.as_deref() != Some(target.as_str());
+        if focus_changed && let Some(previous) = self.focused.clone() {
+            self.dispatch_node_intent(&previous, &["blur", "source"], SourcePayload::default())?;
+            self.sync_text_input_from_document(&previous, None);
+            self.queue_text_input_overlay(&previous);
+        }
+        self.focused = Some(target.clone());
+        self.text_drag = None;
+        self.sync_text_input_from_document(&target, Some(request.position));
+        self.queue_text_input_overlay(&target);
+        Ok(true)
+    }
+
+    fn set_text_input_viewport(&mut self, id: &str, width: f32, height: f32) {
+        let Some(state) = self.text_inputs.get_mut(id) else {
+            return;
+        };
+        state.viewport_width = (width.is_finite() && width > 0.0).then_some(width);
+        state.viewport_height = (height.is_finite() && height > 0.0).then_some(height);
     }
 
     fn sync_text_input_from_document(&mut self, id: &str, position: Option<Position>) {
@@ -2824,6 +2927,84 @@ impl RuntimeView {
         self.pending_patches.push(DocumentPatch::SetStyle {
             id: DocumentNodeId(id.to_owned()),
             patch,
+        });
+        self.queue_text_input_caret_reveal(id);
+    }
+
+    fn queue_text_input_caret_reveal(&mut self, id: &str) {
+        let Some(node) = self
+            .retained_frame()
+            .nodes
+            .get(&DocumentNodeId(id.to_owned()))
+        else {
+            return;
+        };
+        if !style_flag(node, &["scroll", "scroll_x", "scroll_y", "scrollbars"]) {
+            return;
+        }
+        let Some(state) = self.text_inputs.get(id) else {
+            return;
+        };
+        let Some(viewport_width) = state.viewport_width else {
+            return;
+        };
+        let Some(viewport_height) = state.viewport_height else {
+            return;
+        };
+        let font_size = style_number(node, &["size"]).unwrap_or(14.0).max(1.0) as f32;
+        let line_height = style_number(node, &["line_height"])
+            .map(|value| {
+                if value > 0.0 && value < 4.0 {
+                    value as f32 * font_size
+                } else {
+                    value as f32
+                }
+            })
+            .unwrap_or(font_size * 1.25)
+            .max(1.0);
+        let padding = style_number(node, &["padding"]).unwrap_or(0.0).max(0.0) as f32;
+        let inset = style_number(node, &["text_inset"]).unwrap_or(4.0).max(0.0) as f32;
+        let visible_width = (viewport_width - padding * 2.0).max(font_size);
+        let visible_height = (viewport_height - padding * 2.0).max(line_height);
+        let caret = state.buffer.caret();
+        let content_height = state.buffer.line_count() as f32 * line_height + inset * 2.0;
+        let max_y = (content_height - visible_height).max(0.0);
+        let advance = font_size * 0.62;
+        let content_width = state.buffer.max_line_columns() as f32 * advance + inset * 2.0;
+        let max_x = if style_flag(node, &["text_wrap"]) {
+            0.0
+        } else {
+            (content_width - visible_width).max(0.0)
+        };
+        let mut scroll = self
+            .scroll_offsets
+            .get(id)
+            .copied()
+            .or(node.scroll)
+            .unwrap_or(boon_document_model::ScrollState { x: 0.0, y: 0.0 });
+        let previous = scroll;
+        let caret_top = inset + caret.line as f32 * line_height;
+        let caret_bottom = caret_top + line_height;
+        if caret_top < scroll.y + line_height {
+            scroll.y = (caret_top - line_height).max(0.0);
+        } else if caret_bottom > scroll.y + visible_height - line_height {
+            scroll.y = caret_bottom - visible_height + line_height;
+        }
+        let caret_x = inset + caret.column as f32 * advance;
+        if caret_x < scroll.x + advance {
+            scroll.x = (caret_x - advance).max(0.0);
+        } else if caret_x + advance > scroll.x + visible_width - advance {
+            scroll.x = caret_x + advance - visible_width + advance;
+        }
+        scroll.x = scroll.x.clamp(0.0, max_x);
+        scroll.y = scroll.y.clamp(0.0, max_y);
+        if scroll == previous {
+            return;
+        }
+        self.scroll_offsets.insert(id.to_owned(), scroll);
+        self.pending_patches.push(DocumentPatch::SetScroll {
+            id: DocumentNodeId(id.to_owned()),
+            scroll,
         });
     }
 
@@ -3231,6 +3412,8 @@ fn normalize_key(value: &str) -> String {
     match value.to_ascii_lowercase().as_str() {
         "arrowleft" | "leftarrow" => "left".to_owned(),
         "arrowright" | "rightarrow" => "right".to_owned(),
+        "arrowup" | "uparrow" => "up".to_owned(),
+        "arrowdown" | "downarrow" => "down".to_owned(),
         "back_space" => "backspace".to_owned(),
         "return" | "kp_enter" => "enter".to_owned(),
         value => value.to_owned(),
@@ -3454,6 +3637,42 @@ fn style_u64(node: &boon_document::DocumentNode, keys: &[&str]) -> Option<u64> {
         Some(StyleValue::Text(value)) => value.parse().ok(),
         _ => None,
     })
+}
+
+fn style_number(node: &boon_document::DocumentNode, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| match node.style.get(*key) {
+        Some(StyleValue::Number(value)) if value.is_finite() => Some(*value),
+        Some(StyleValue::Text(value)) => value.parse().ok(),
+        _ => None,
+    })
+}
+
+fn style_flag(node: &boon_document::DocumentNode, keys: &[&str]) -> bool {
+    keys.iter().any(|key| match node.style.get(*key) {
+        Some(StyleValue::Bool(value)) => *value,
+        Some(StyleValue::Number(value)) => *value != 0.0,
+        Some(StyleValue::Text(value)) => value.eq_ignore_ascii_case("true"),
+        Some(StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_)) | None => false,
+    })
+}
+
+fn unique_text_input(
+    frame: &DocumentFrame,
+    input_id: &boon_document::TextInputId,
+) -> Option<String> {
+    let mut candidates = frame
+        .nodes
+        .values()
+        .filter(|node| {
+            node.kind == DocumentNodeKind::TextInput
+                && node.text_input_id.as_ref() == Some(input_id)
+        })
+        .map(|node| node.id.0.clone());
+    let target = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(target)
 }
 
 #[cfg(test)]
@@ -4383,24 +4602,92 @@ document: Document/new(
         model.take_patches();
 
         let surface = SurfaceId("preview".to_owned());
-        let source_editor = view
+        let editor = view
             .target_for_source("store.elements.source_editor", None)
             .expect("Persons.pro source editor target");
-        for phase in [PointerPhase::Down, PointerPhase::Up] {
+        let text_y = editor.bounds_y + 16.0;
+        let selection_start = view
+            .hit_target_with_text_column(editor.bounds_x + 2.0, text_y, &mut columns)
+            .expect("source editor first-line start");
+        let selection_end = view
+            .hit_target_with_text_column(
+                editor.bounds_x + editor.bounds_width - 15.0,
+                text_y,
+                &mut columns,
+            )
+            .expect("source editor first-line end");
+        assert_eq!(selection_start.node, editor.node);
+        assert_eq!(selection_end.node, editor.node);
+        assert_eq!(selection_start.text_line, Some(0));
+        assert_eq!(selection_end.text_line, Some(0));
+        for (phase, target) in [
+            (PointerPhase::Down, selection_start.clone()),
+            (PointerPhase::Move, selection_end.clone()),
+            (PointerPhase::Up, selection_end),
+        ] {
             model
                 .handle_event(
                     &HostEvent::Pointer(PointerEvent {
                         surface: surface.clone(),
-                        x: source_editor.center_x,
-                        y: source_editor.center_y,
+                        x: target.center_x,
+                        y: target.center_y,
                         phase,
-                        button: Some(PointerButton::Primary),
+                        button: (phase != PointerPhase::Move).then_some(PointerButton::Primary),
                     }),
-                    Some(source_editor.clone()),
+                    Some(target),
                 )
                 .unwrap();
         }
         let focused = model.focused().expect("source editor focused").to_owned();
+        let starter_source = model.text_inputs[&focused].buffer.text();
+        assert_eq!(
+            model.text_inputs[&focused].buffer.selected_text(),
+            "profile: ["
+        );
+        control_character(&mut model, &surface, "c");
+        assert!(control_character(&mut model, &surface, "v"));
+        assert_eq!(model.text_inputs[&focused].buffer.text(), starter_source);
+
+        assert!(tap_named_key(&mut model, &surface, "PageDown"));
+        assert!(model.text_inputs[&focused].buffer.caret().line > 0);
+        assert!(tap_named_key(&mut model, &surface, "PageUp"));
+        assert_eq!(model.text_inputs[&focused].buffer.caret().line, 0);
+        assert!(tap_named_key(&mut model, &surface, "End"));
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: surface.clone(),
+                        text: " ".to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(tap_named_key(&mut model, &surface, "BackSpace"));
+        assert_eq!(model.text_inputs[&focused].buffer.text(), starter_source);
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: surface.clone(),
+                        text: " ".to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(tap_named_key(&mut model, &surface, "Left"));
+        assert!(tap_named_key(&mut model, &surface, "Delete"));
+        assert_eq!(model.text_inputs[&focused].buffer.text(), starter_source);
+        assert!(complete_pending_programs_successfully(&mut model) >= 1);
+        assert_eq!(model.focused(), Some(focused.as_str()));
+        let patches = model.take_patches();
+        if !patches.is_empty() {
+            view.apply_patches(patches, &mut columns).unwrap();
+        }
+        view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
+            .unwrap();
 
         for (logical_key, pressed) in [
             (LogicalKey::Named("Control_L".to_owned()), true),
@@ -4449,11 +4736,31 @@ document: Document/new(
             )
             .unwrap();
         assert_eq!(model.program_diagnostics().len(), 1);
+        let diagnostic = model.program_diagnostics()[0].diagnostic.clone();
         assert!(model.retained_frame().nodes.values().any(|node| {
             node.text
                 .as_ref()
                 .is_some_and(|text| text.text == "Your name")
         }));
+        let patches = model.take_patches();
+        if !patches.is_empty() {
+            view.apply_patches(patches, &mut columns).unwrap();
+        }
+        view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
+            .unwrap();
+        let diagnostic_target = view
+            .target_for_source("store.elements.focus_diagnostic", None)
+            .expect("source-located diagnostic target");
+        click_target(&mut model, &mut view, &mut columns, diagnostic_target);
+        assert_eq!(model.focused(), Some(focused.as_str()));
+        assert_eq!(
+            model.text_inputs[&focused].buffer.caret(),
+            Position {
+                line: diagnostic.line.saturating_sub(1),
+                column: diagnostic.column.saturating_sub(1),
+            }
+        );
+        assert_eq!(model.text_inputs[&focused].buffer.text(), invalid_source);
 
         for (logical_key, pressed) in [
             (LogicalKey::Named("Control_L".to_owned()), true),
@@ -4512,6 +4819,7 @@ document: Document/new(
         assert!(!completion.changed);
         assert!(settle_program_artifact_stores(&mut model) >= 1);
         complete_pending_programs_successfully(&mut model);
+        assert_eq!(model.focused(), Some(focused.as_str()));
         assert!(model.program_diagnostics().is_empty());
         assert!(model.retained_frame().nodes.values().any(|node| {
             node.text
@@ -4614,6 +4922,166 @@ document: Document/new(
             view.target_for_source("store.elements.publish", Some("Publish"))
                 .is_some()
         );
+        assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
+    }
+
+    #[test]
+    fn persons_narrow_workflow_edits_publishes_authenticates_and_scrolls() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        assert!(complete_pending_programs_successfully(&mut model) >= 1);
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 390.0,
+                height: 844.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        converge_test_demands(&mut model, &mut view, &mut columns);
+        let surface = SurfaceId("preview".to_owned());
+        let initial_source = model
+            .runtime
+            .inspect_value_current("store.source_draft", 8)
+            .unwrap();
+
+        let editor = view
+            .target_for_source("store.elements.source_editor", None)
+            .expect("narrow source editor");
+        click_target(&mut model, &mut view, &mut columns, editor);
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::TextInput(TextInputEvent {
+                        surface: surface.clone(),
+                        text: " ".to_owned(),
+                    }),
+                    None,
+                )
+                .unwrap()
+        );
+        assert!(tap_named_key(&mut model, &surface, "BackSpace"));
+        settle_scenario_runtime(&mut model, &mut view, &mut columns);
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.source_draft", initial_source),
+                ("store.draft_compile_state", Value::Text("Ready".to_owned())),
+            ],
+        );
+
+        let publish = view
+            .target_for_source("store.elements.publish", Some("Publish"))
+            .expect("narrow Publish action");
+        click_target(&mut model, &mut view, &mut columns, publish);
+        settle_scenario_runtime(&mut model, &mut view, &mut columns);
+        assert_current_values(
+            &mut model,
+            &[
+                ("store.publish_state", Value::Text("Published".to_owned())),
+                ("store.published_revision_count", Value::Number(1)),
+            ],
+        );
+
+        let preview = view
+            .target_for_source("store.elements.show_preview", Some("Preview"))
+            .expect("narrow Preview tab");
+        click_target(&mut model, &mut view, &mut columns, preview);
+        let published = view
+            .target_for_source("store.elements.show_published_page", Some("Published"))
+            .expect("narrow published-artifact action");
+        click_target(&mut model, &mut view, &mut columns, published.clone());
+        settle_scenario_runtime(&mut model, &mut view, &mut columns);
+        assert_current_values(
+            &mut model,
+            &[(
+                "store.preview_surface",
+                Value::Text("PublishedPage".to_owned()),
+            )],
+        );
+
+        let phone = view
+            .target_for_source("store.elements.preview_phone", Some("Phone"))
+            .expect("narrow phone preview action");
+        click_target(&mut model, &mut view, &mut columns, phone);
+        assert_current_values(
+            &mut model,
+            &[("store.preview_width_mode", Value::Text("Phone".to_owned()))],
+        );
+        let automatic = view
+            .target_for_source("store.elements.preview_desktop", Some("Auto"))
+            .expect("narrow automatic preview action");
+        click_target(&mut model, &mut view, &mut columns, automatic);
+
+        for (source, label, expected) in [
+            (
+                "store.elements.register_passkey",
+                "Protect workspace",
+                "OnePasskey",
+            ),
+            (
+                "store.elements.register_passkey",
+                "Add passkey",
+                "TwoPasskeys",
+            ),
+            ("store.elements.sign_out", "Sign out", "SignedOut"),
+            ("store.elements.sign_in", "Sign in", "TwoPasskeys"),
+        ] {
+            let target = view
+                .target_for_source(source, Some(label))
+                .unwrap_or_else(|| panic!("narrow authentication action {label:?}"));
+            click_target(&mut model, &mut view, &mut columns, target);
+            settle_scenario_runtime(&mut model, &mut view, &mut columns);
+            assert_current_values(
+                &mut model,
+                &[("store.account_state", Value::Text(expected.to_owned()))],
+            );
+        }
+
+        let wheel_target = view
+            .wheel_target(
+                published.center_x,
+                published.center_y,
+                0.0,
+                160.0,
+                &mut columns,
+            )
+            .filter(|target| target.scroll_root.is_some())
+            .expect("narrow preview retains a vertical scroll owner");
+        assert!(
+            model
+                .handle_event(
+                    &HostEvent::Wheel(WheelEvent {
+                        surface,
+                        x: published.center_x,
+                        y: published.center_y,
+                        delta_x: 0.0,
+                        delta_y: 160.0,
+                    }),
+                    Some(wheel_target),
+                )
+                .unwrap()
+        );
+        let update = view
+            .apply_patches(model.take_patches(), &mut columns)
+            .unwrap();
+        assert!(update.layout_changed || update.render_changed);
         assert_scene_has_no_horizontal_overflow(view.scene(), 390.0);
     }
 
@@ -6143,6 +6611,8 @@ document: Document/new(
                 bounds_y: bounds.y,
                 bounds_width: bounds.width,
                 bounds_height: bounds.height,
+                scroll_max_x: 0.0,
+                scroll_max_y: 0.0,
                 text_line: None,
                 text_column: None,
             },
@@ -6374,6 +6844,50 @@ document: Document/new(
         }
     }
 
+    fn send_key(
+        model: &mut RuntimeView,
+        surface: &SurfaceId,
+        logical_key: LogicalKey,
+        pressed: bool,
+    ) -> bool {
+        model
+            .handle_event(
+                &HostEvent::Keyboard(KeyEvent {
+                    surface: surface.clone(),
+                    physical_key: None,
+                    logical_key,
+                    pressed,
+                }),
+                None,
+            )
+            .unwrap()
+    }
+
+    fn tap_named_key(model: &mut RuntimeView, surface: &SurfaceId, key: &str) -> bool {
+        let key = LogicalKey::Named(key.to_owned());
+        let changed = send_key(model, surface, key.clone(), true);
+        changed | send_key(model, surface, key, false)
+    }
+
+    fn control_character(model: &mut RuntimeView, surface: &SurfaceId, character: &str) -> bool {
+        let mut changed = send_key(
+            model,
+            surface,
+            LogicalKey::Named("Control_L".to_owned()),
+            true,
+        );
+        let key = LogicalKey::Character(character.to_owned());
+        changed |= send_key(model, surface, key.clone(), true);
+        changed |= send_key(model, surface, key, false);
+        changed |= send_key(
+            model,
+            surface,
+            LogicalKey::Named("Control_L".to_owned()),
+            false,
+        );
+        changed
+    }
+
     fn assert_scene_has_no_horizontal_overflow(scene: &boon_document::RenderScene, width: f32) {
         for item in &scene.items {
             if item.bounds.y >= scene.viewport.height || item.bounds.y + item.bounds.height <= 0.0 {
@@ -6485,7 +6999,9 @@ document: Document/new(
             .target_for_source("cell.sources.editor.select", Some("15"))
             .expect("visible A2 target");
         assert!(target.scroll_root.is_some());
-        let scroll_target = target.clone();
+        let scroll_target = view
+            .wheel_target(target.center_x, target.center_y, 0.0, 52.0, &mut columns)
+            .expect("visible A2 scroll target");
         let full_lowers = view.retained_stats().full_lower_count;
         assert!(
             !model
@@ -6497,7 +7013,7 @@ document: Document/new(
                         delta_x: 0.0,
                         delta_y: -4.0,
                     }),
-                    Some(target.clone()),
+                    Some(scroll_target.clone()),
                 )
                 .unwrap(),
             "wheel movement beyond the top boundary must be a no-op"
@@ -6512,7 +7028,7 @@ document: Document/new(
                     delta_x: 0.0,
                     delta_y: 52.0,
                 }),
-                Some(target),
+                Some(scroll_target.clone()),
             )
             .unwrap();
         assert!(changed);
@@ -6554,6 +7070,29 @@ document: Document/new(
         view.apply_patches(model.take_patches(), &mut columns)
             .unwrap();
         assert!(!model.apply_layout_demands(view.demands()).unwrap());
+    }
+
+    #[test]
+    fn typed_text_input_identity_resolution_requires_exactly_one_target() {
+        let input_id = boon_document::TextInputId("editor".to_owned());
+        let mut frame = DocumentFrame::empty("root");
+        let mut first = boon_document::DocumentNode::new("first", DocumentNodeKind::TextInput);
+        first.text_input_id = Some(input_id.clone());
+        frame.nodes.insert(first.id.clone(), first);
+        assert_eq!(
+            unique_text_input(&frame, &input_id).as_deref(),
+            Some("first")
+        );
+
+        let mut duplicate =
+            boon_document::DocumentNode::new("duplicate", DocumentNodeKind::TextInput);
+        duplicate.text_input_id = Some(input_id.clone());
+        frame.nodes.insert(duplicate.id.clone(), duplicate);
+        assert_eq!(unique_text_input(&frame, &input_id), None);
+        assert_eq!(
+            unique_text_input(&frame, &boon_document::TextInputId("missing".to_owned())),
+            None
+        );
     }
 
     #[test]
@@ -7101,7 +7640,7 @@ document: Document/new(
                 view.set_interaction_state(model.hovered(), model.focused(), &mut columns)
                     .unwrap();
                 let wheel_target = view
-                    .wheel_target(target.center_x, target.center_y, 0.0, 4.0)
+                    .wheel_target(target.center_x, target.center_y, 0.0, 4.0, &mut columns)
                     .filter(|target| target.scroll_root.is_some())
                     .expect("post-TEST hovered Cells target must retain a vertical scroll owner");
                 assert!(
@@ -7826,6 +8365,8 @@ document: Document/new(
             bounds_y: link_bounds.y,
             bounds_width: link_bounds.width,
             bounds_height: link_bounds.height,
+            scroll_max_x: 0.0,
+            scroll_max_y: 0.0,
             text_line: None,
             text_column: None,
         };

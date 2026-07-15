@@ -162,7 +162,10 @@ FUNCTION desktop_workspace() {
             paint: False
         ]
         items: LIST {
-            Editor/root(PASS: [store: PASSED.store])
+            Editor/root(
+                PASS: [store: PASSED.store]
+                input_id: TEXT { desktop profile source }
+            )
             preview_frame()
         }
     )
@@ -183,10 +186,16 @@ FUNCTION mobile_workspace() {
             mobile_actions()
             mobile_tabs()
             PASSED.store.active_view |> WHEN {
-                Code => Editor/root(PASS: [store: PASSED.store])
+                Code => Editor/root(
+                    PASS: [store: PASSED.store]
+                    input_id: TEXT { mobile profile source }
+                )
                 Preview => preview_frame()
                 Publish => Publish/root(PASS: [store: PASSED.store])
-                __ => Editor/root(PASS: [store: PASSED.store])
+                __ => Editor/root(
+                    PASS: [store: PASSED.store]
+                    input_id: TEXT { mobile profile source }
+                )
             }
         }
     )

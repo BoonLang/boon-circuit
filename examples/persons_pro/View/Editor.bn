@@ -1,4 +1,4 @@
-FUNCTION root() {
+FUNCTION root(input_id) {
     Scene/Element/stripe(
         element: []
         direction: Column
@@ -11,8 +11,8 @@ FUNCTION root() {
         ]
         items: LIST {
             header()
-            diagnostic()
-            source_panel()
+            diagnostic(input_id: input_id)
+            source_panel(input_id: input_id)
         }
     )
 }
@@ -37,12 +37,15 @@ FUNCTION header() {
     )
 }
 
-FUNCTION diagnostic() {
+FUNCTION diagnostic(input_id) {
     PASSED.store.draft_compile_state |> WHEN {
-        Invalid => Scene/Element/stripe(
-            element: []
-            direction: Column
-            gap: 3
+        Invalid => Scene/Element/button(
+            element: [event: [press: SOURCE]]
+            activate_focus: [
+                input_id: input_id
+                line: PASSED.store.draft_compile_line
+                column: PASSED.store.draft_compile_column
+            ]
             style: [
                 width: Fill
                 padding: 10
@@ -50,50 +53,63 @@ FUNCTION diagnostic() {
                 background: [color: PersonsTheme/diagnostic_background(mode: PASSED.store.mode)]
                 border: [color: PersonsTheme/diagnostic_border(mode: PASSED.store.mode)]
                 border_width: 1
+                target: TEXT { draft diagnostic }
             ]
-            items: LIST {
-                Scene/Element/text(
-                    element: []
-                    style: [
-                        ...PersonsTheme/body(mode: PASSED.store.mode)
-                        width: Fill
-                        height: 20
-                        size: 13
-                        weight: 700
-                        color: PersonsTheme/diagnostic_text(mode: PASSED.store.mode)
-                    ]
-                    text: TEXT { {PASSED.store.draft_compile_path}:{PASSED.store.draft_compile_line}:{PASSED.store.draft_compile_column} }
-                )
-                Scene/Element/text(
-                    element: []
-                    style: [
-                        ...PersonsTheme/body(mode: PASSED.store.mode)
-                        width: Fill
-                        text_wrap: True
-                        size: 13
-                        color: PersonsTheme/diagnostic_text(mode: PASSED.store.mode)
-                    ]
-                    text: PASSED.store.draft_compile_diagnostic
-                )
-                Scene/Element/text(
-                    element: []
-                    style: [
-                        ...PersonsTheme/muted(mode: PASSED.store.mode)
-                        width: Fill
-                        height: 18
-                        size: 12
-                    ]
-                    text: TEXT { Showing last valid preview r{PASSED.store.last_valid_draft_revision} }
-                )
-            }
+            label: diagnostic_content()
         )
+            |> SOURCE { PASSED.store.elements.focus_diagnostic }
         __ => NoElement
     }
 }
 
-FUNCTION source_panel() {
+FUNCTION diagnostic_content() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 3
+        style: [width: Fill, paint: False]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...PersonsTheme/body(mode: PASSED.store.mode)
+                    width: Fill
+                    height: 20
+                    size: 13
+                    weight: 700
+                    color: PersonsTheme/diagnostic_text(mode: PASSED.store.mode)
+                ]
+                text: TEXT { {PASSED.store.draft_compile_path}:{PASSED.store.draft_compile_line}:{PASSED.store.draft_compile_column} }
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...PersonsTheme/body(mode: PASSED.store.mode)
+                    width: Fill
+                    text_wrap: True
+                    size: 13
+                    color: PersonsTheme/diagnostic_text(mode: PASSED.store.mode)
+                ]
+                text: PASSED.store.draft_compile_diagnostic
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...PersonsTheme/muted(mode: PASSED.store.mode)
+                    width: Fill
+                    height: 18
+                    size: 12
+                ]
+                text: TEXT { Showing last valid preview r{PASSED.store.last_valid_draft_revision} }
+            )
+        }
+    )
+}
+
+FUNCTION source_panel(input_id) {
     Scene/Element/text_input(
         element: [event: [change: SOURCE]]
+        input_id: input_id
         style: [
             ...PersonsTheme/inset(mode: PASSED.store.mode)
             ...PersonsTheme/code(mode: PASSED.store.mode)

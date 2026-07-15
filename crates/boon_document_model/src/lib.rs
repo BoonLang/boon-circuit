@@ -18,7 +18,7 @@ macro_rules! string_ids {
     };
 }
 
-string_ids!(DocumentNodeId, SourceBindingId, ScrollRootId);
+string_ids!(DocumentNodeId, SourceBindingId, ScrollRootId, TextInputId);
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
@@ -373,6 +373,13 @@ pub struct ScrollState {
     pub y: f32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextInputFocusRequest {
+    pub input_id: TextInputId,
+    pub line: u64,
+    pub column: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Axis {
@@ -402,6 +409,10 @@ pub struct DocumentNode {
     pub embedded_program: Option<EmbeddedProgramDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_bindings: Vec<SourceBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_input_id: Option<TextInputId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_focus: Option<TextInputFocusRequest>,
     pub scroll: Option<ScrollState>,
     pub materialized: Vec<MaterializedRange>,
 }
@@ -419,6 +430,8 @@ impl DocumentNode {
             style: StyleMap::new(),
             embedded_program,
             source_bindings: Vec::new(),
+            text_input_id: None,
+            activation_focus: None,
             scroll: None,
             materialized: Vec::new(),
         }
@@ -511,6 +524,8 @@ impl Debug for DocumentNode {
             .field("style", &self.artifact_style())
             .field("embedded_program", &self.embedded_program)
             .field("source_bindings", &self.source_bindings)
+            .field("text_input_id", &self.text_input_id)
+            .field("activation_focus", &self.activation_focus)
             .field("scroll", &self.scroll)
             .field("materialized", &self.materialized)
             .finish()
@@ -534,6 +549,10 @@ impl Serialize for DocumentNode {
             embedded_program: &'a Option<EmbeddedProgramDescriptor>,
             #[serde(default, skip_serializing_if = "<[SourceBinding]>::is_empty")]
             source_bindings: &'a [SourceBinding],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            text_input_id: &'a Option<TextInputId>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            activation_focus: &'a Option<TextInputFocusRequest>,
             scroll: &'a Option<ScrollState>,
             materialized: &'a [MaterializedRange],
         }
@@ -547,6 +566,8 @@ impl Serialize for DocumentNode {
             style: self.artifact_style(),
             embedded_program: &self.embedded_program,
             source_bindings: &self.source_bindings,
+            text_input_id: &self.text_input_id,
+            activation_focus: &self.activation_focus,
             scroll: &self.scroll,
             materialized: &self.materialized,
         }
@@ -604,6 +625,11 @@ pub enum DocumentPatch {
         id: DocumentNodeId,
         ordinal: u32,
         binding: SourceBinding,
+    },
+    SetTextInputFocus {
+        id: DocumentNodeId,
+        text_input_id: Option<TextInputId>,
+        activation_focus: Option<TextInputFocusRequest>,
     },
     SetScroll {
         id: DocumentNodeId,

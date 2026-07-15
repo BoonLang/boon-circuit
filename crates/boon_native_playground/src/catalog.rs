@@ -390,14 +390,15 @@ mod tests {
                 .last()
                 .is_some_and(|unit| unit.path.ends_with("persons_pro/RUN.bn"))
         );
-        assert_eq!(persons.test_steps.len(), 26);
         let persons_step_ids = persons
             .test_steps
             .iter()
             .map(|step| step.id.as_str())
             .collect::<BTreeSet<_>>();
+        assert_eq!(persons_step_ids.len(), persons.test_steps.len());
         for expected in [
             "fresh-anonymous-workspace-and-starter-preview",
+            "diagnostic-focuses-source-location",
             "passkey-cancel-preserves-anonymous",
             "passkey-registration-failure-preserves-anonymous",
             "first-passkey-protects",
@@ -406,6 +407,8 @@ mod tests {
             "authentication-cancellation-preserves-sign-out",
             "authentication-failure-preserves-sign-out",
             "passkey-sign-in-restores-access",
+            "phone-preview-width",
+            "restore-auto-preview-width",
         ] {
             assert!(persons_step_ids.contains(expected), "missing {expected}");
         }

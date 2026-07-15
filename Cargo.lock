@@ -542,6 +542,7 @@ dependencies = [
  "serde",
  "sha2",
  "toml",
+ "unicode-segmentation",
  "web-time",
 ]
 

@@ -3,8 +3,9 @@ pub use boon_document_model::{
     DocumentPatch, EmbeddedProgramDescriptor, LayoutStylePatch, MaterialStylePatch,
     MaterializedRange, PaintStylePatch, ProgramCapabilityProfile, Rect,
     SENSITIVE_INPUT_REDACTED_GLYPHS, SENSITIVE_INPUT_REDACTED_VALUE, SENSITIVE_INPUT_STYLE_KEY,
-    ScrollRootId, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch, StyleRichTextSpan,
-    StyleValue, TextStylePatch, TextValue, UiSemanticChange,
+    ScrollRootId, ScrollState, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch,
+    StyleRichTextSpan, StyleValue, TextInputFocusRequest, TextInputId, TextStylePatch, TextValue,
+    UiSemanticChange,
 };
 pub mod render_scene;
 use boon_host::Viewport;
@@ -3174,6 +3175,15 @@ pub fn diff_document_frames(previous: &DocumentFrame, next: &DocumentFrame) -> V
                 });
             }
         }
+        if previous_node.text_input_id != next_node.text_input_id
+            || previous_node.activation_focus != next_node.activation_focus
+        {
+            patches.push(DocumentPatch::SetTextInputFocus {
+                id: id.clone(),
+                text_input_id: next_node.text_input_id.clone(),
+                activation_focus: next_node.activation_focus.clone(),
+            });
+        }
         if previous_node.scroll != next_node.scroll
             && let Some(scroll) = next_node.scroll
         {
@@ -3630,6 +3640,7 @@ impl RetainedDocument {
                 item.style
                     .insert("__focused".to_owned(), StyleValue::Bool(true));
             }
+            apply_direct_text_scroll_metadata_to_item(node, item);
             item.style_identity = ComputedStyleIdentity::from_style(&item.style);
         }
     }
@@ -3691,6 +3702,7 @@ fn lower_retained_document(
         capabilities: RenderCapabilities::fake_portable(),
     })?;
     apply_all_scroll_offsets(document, &mut layout);
+    apply_direct_text_scroll_metadata(document, &mut layout);
     refresh_scroll_demands(document, &mut layout);
     let hits = indexes.try_hit_side_table(document, &layout)?;
     let width = viewport.width.max(1.0).round() as u32;
@@ -4114,10 +4126,55 @@ fn apply_direct_text_scroll(
     }
 }
 
+fn apply_direct_text_scroll_metadata(document: &DocumentFrame, layout: &mut LayoutFrame) {
+    for item in &mut layout.display_list {
+        let Some(node) = document.nodes.get(&item.node) else {
+            continue;
+        };
+        apply_direct_text_scroll_metadata_to_item(node, item);
+    }
+}
+
+fn apply_direct_text_scroll_metadata_to_item(node: &DocumentNode, item: &mut DisplayItem) {
+    let Some(scroll) = node.scroll else {
+        item.style.remove(render_scene::TEXT_SCROLL_X_STYLE_KEY);
+        item.style.remove(render_scene::TEXT_SCROLL_Y_STYLE_KEY);
+        return;
+    };
+    if item.text.is_none() && node.kind != DocumentNodeKind::TextInput {
+        return;
+    }
+    item.style.insert(
+        render_scene::TEXT_SCROLL_X_STYLE_KEY.to_owned(),
+        StyleValue::Number(f64::from(scroll.x.max(0.0))),
+    );
+    item.style.insert(
+        render_scene::TEXT_SCROLL_Y_STYLE_KEY.to_owned(),
+        StyleValue::Number(f64::from(scroll.y.max(0.0))),
+    );
+    let clip = item_clip_rect(item)
+        .and_then(|existing| rect_intersection(existing, item.bounds))
+        .unwrap_or(item.bounds);
+    item.style
+        .insert("__clip_x".to_owned(), StyleValue::Number(f64::from(clip.x)));
+    item.style
+        .insert("__clip_y".to_owned(), StyleValue::Number(f64::from(clip.y)));
+    item.style.insert(
+        "__clip_width".to_owned(),
+        StyleValue::Number(f64::from(clip.width)),
+    );
+    item.style.insert(
+        "__clip_height".to_owned(),
+        StyleValue::Number(f64::from(clip.height)),
+    );
+    item.style_identity = ComputedStyleIdentity::from_style(&item.style);
+}
+
 fn patch_preserves_layout_geometry(frame: &DocumentFrame, patch: &DocumentPatch) -> bool {
     match patch {
         DocumentPatch::SetBinding { .. }
         | DocumentPatch::SetBindingAt { .. }
+        | DocumentPatch::SetTextInputFocus { .. }
         | DocumentPatch::SetEmbeddedProgram { .. } => true,
         DocumentPatch::SetText { id, .. } => frame
             .nodes
@@ -4149,9 +4206,9 @@ fn patch_render_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
     patches
         .iter()
         .filter_map(|patch| match patch {
-            DocumentPatch::SetText { id, .. } | DocumentPatch::SetStyle { id, .. } => {
-                Some(id.clone())
-            }
+            DocumentPatch::SetText { id, .. }
+            | DocumentPatch::SetStyle { id, .. }
+            | DocumentPatch::SetScroll { id, .. } => Some(id.clone()),
             DocumentPatch::UpsertNode(_)
             | DocumentPatch::RemoveNode { .. }
             | DocumentPatch::InsertChild { .. }
@@ -4159,8 +4216,8 @@ fn patch_render_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
             | DocumentPatch::MoveChild { .. }
             | DocumentPatch::SetBinding { .. }
             | DocumentPatch::SetBindingAt { .. }
+            | DocumentPatch::SetTextInputFocus { .. }
             | DocumentPatch::SetEmbeddedProgram { .. }
-            | DocumentPatch::SetScroll { .. }
             | DocumentPatch::SetListMaterialization { .. } => None,
         })
         .collect()
@@ -4180,6 +4237,7 @@ fn patch_hit_metadata_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeI
             }
             DocumentPatch::SetText { .. }
             | DocumentPatch::SetStyle { .. }
+            | DocumentPatch::SetTextInputFocus { .. }
             | DocumentPatch::SetEmbeddedProgram { .. }
             | DocumentPatch::SetScroll { .. }
             | DocumentPatch::SetListMaterialization { .. }
@@ -4285,6 +4343,7 @@ fn document_patch_structural_kind(patch: &DocumentPatch) -> Option<&'static str>
         | DocumentPatch::SetEmbeddedProgram { .. }
         | DocumentPatch::SetBinding { .. }
         | DocumentPatch::SetBindingAt { .. }
+        | DocumentPatch::SetTextInputFocus { .. }
         | DocumentPatch::SetScroll { .. }
         | DocumentPatch::SetListMaterialization { .. } => None,
     }
@@ -4321,6 +4380,7 @@ fn verify_nonstructural_patch(
             }
             return Ok(());
         }
+        DocumentPatch::SetTextInputFocus { id, .. } => ("set_text_input_focus", id),
         DocumentPatch::SetScroll { id, .. } => ("set_scroll", id),
         DocumentPatch::SetListMaterialization { id, .. } => ("set_list_materialization", id),
         DocumentPatch::UpsertNode(_)
@@ -4508,6 +4568,23 @@ fn apply_document_patch_unchecked(
                 patch_kind: "set_binding_at",
                 target: Some(id),
                 invalidation: source_binding_invalidation(),
+                removed_nodes: Vec::new(),
+                node_count_after: frame.nodes.len(),
+                materialization: None,
+            })
+        }
+        DocumentPatch::SetTextInputFocus {
+            id,
+            text_input_id,
+            activation_focus,
+        } => {
+            let node = required_node_mut(frame, "set_text_input_focus", &id)?;
+            node.text_input_id = text_input_id;
+            node.activation_focus = activation_focus;
+            Ok(PatchApplyReport {
+                patch_kind: "set_text_input_focus",
+                target: Some(id),
+                invalidation: vec![PatchInvalidationClass::Binding],
                 removed_nodes: Vec::new(),
                 node_count_after: frame.nodes.len(),
                 materialization: None,

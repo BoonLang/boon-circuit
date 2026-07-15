@@ -2,6 +2,14 @@ use super::*;
 use std::collections::BTreeSet;
 
 #[test]
+fn compiler_diagnostic_columns_match_editor_grapheme_positions() {
+    let source = "first\ne\u{301}🙂value";
+    let byte = source.find("value").unwrap();
+    assert_eq!(grapheme_column(source, 2, byte), Some(3));
+    assert_eq!(grapheme_column(source, 2, byte + 1), Some(4));
+}
+
+#[test]
 fn root_value_comparison_lowers_both_typed_operands() {
     let compiled = compile_source_text_to_machine_plan(
         "root-value-comparison.bn",

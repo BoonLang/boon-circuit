@@ -12,6 +12,7 @@ host: [
 store: [
     elements: [
         source_editor: SOURCE
+        focus_diagnostic: SOURCE
         draft_program: [
             compiled: SOURCE
             rejected: SOURCE

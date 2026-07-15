@@ -20,6 +20,8 @@ pub struct HitTarget {
     pub bounds_y: f32,
     pub bounds_width: f32,
     pub bounds_height: f32,
+    pub scroll_max_x: f32,
+    pub scroll_max_y: f32,
     pub text_line: Option<usize>,
     pub text_column: Option<usize>,
 }
@@ -217,7 +219,14 @@ impl RetainedView {
         Some(target)
     }
 
-    pub fn wheel_target(&self, x: f32, y: f32, delta_x: f32, delta_y: f32) -> Option<HitTarget> {
+    pub fn wheel_target(
+        &self,
+        x: f32,
+        y: f32,
+        delta_x: f32,
+        delta_y: f32,
+        columns: &mut impl RenderTextColumnMeasurer,
+    ) -> Option<HitTarget> {
         let mut target = self.hit_target(x, y);
         let axis = if delta_y != 0.0 && delta_y.abs() >= delta_x.abs() {
             Axis::Vertical
@@ -241,11 +250,26 @@ impl RetainedView {
                     bounds_y: y,
                     bounds_width: 0.0,
                     bounds_height: 0.0,
+                    scroll_max_x: 0.0,
+                    scroll_max_y: 0.0,
                     text_line: None,
                     text_column: None,
                 });
             }
             _ => {}
+        }
+        let measured_root = target
+            .as_ref()
+            .and_then(|target| target.scroll_root.clone());
+        if let (Some(target), Some(root)) = (&mut target, measured_root) {
+            let limits = scroll_limits(
+                self.retained.frame(),
+                self.retained.layout(),
+                &DocumentNodeId(root),
+                columns,
+            );
+            target.scroll_max_x = limits.x;
+            target.scroll_max_y = limits.y;
         }
         target
     }
@@ -466,9 +490,81 @@ fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
         bounds_y: entry.bounds.y,
         bounds_width: entry.bounds.width,
         bounds_height: entry.bounds.height,
+        scroll_max_x: 0.0,
+        scroll_max_y: 0.0,
         text_line: None,
         text_column: None,
     }
+}
+
+fn scroll_limits(
+    document: &DocumentFrame,
+    layout: &boon_document::LayoutFrame,
+    root: &DocumentNodeId,
+    columns: &mut impl RenderTextColumnMeasurer,
+) -> boon_document::ScrollState {
+    let Some(root_item) = layout.display_list.iter().find(|item| &item.node == root) else {
+        return boon_document::ScrollState { x: 0.0, y: 0.0 };
+    };
+    let current = document
+        .nodes
+        .get(root)
+        .and_then(|node| node.scroll)
+        .unwrap_or(boon_document::ScrollState { x: 0.0, y: 0.0 });
+    let mut max_right = root_item.bounds.x + root_item.bounds.width;
+    let mut max_bottom = root_item.bounds.y + root_item.bounds.height;
+    for item in &layout.display_list {
+        if item.node != *root && document_node_is_below(document, &item.node, root) {
+            max_right = max_right.max(item.bounds.x + item.bounds.width + current.x);
+            max_bottom = max_bottom.max(item.bounds.y + item.bounds.height + current.y);
+        }
+    }
+    let text = boon_document::render_scene::text_scroll_limits(root_item, columns);
+    let mut limits = boon_document::ScrollState {
+        x: text
+            .x
+            .max(max_right - (root_item.bounds.x + root_item.bounds.width)),
+        y: text
+            .y
+            .max(max_bottom - (root_item.bounds.y + root_item.bounds.height)),
+    };
+    for demand in &layout.demands {
+        if demand.node != *root && !document_node_is_below(document, &demand.node, root) {
+            continue;
+        }
+        let Some(item_extent) = demand
+            .item_extent_milli
+            .map(|extent| extent as f32 / 1_000.0)
+        else {
+            continue;
+        };
+        let viewport_extent = demand.viewport_extent_milli as f32 / 1_000.0;
+        let logical_extent = item_extent * demand.logical_item_count as f32;
+        let maximum = (logical_extent - viewport_extent).max(0.0);
+        match demand.axis {
+            Axis::Horizontal => limits.x = limits.x.max(maximum),
+            Axis::Vertical => limits.y = limits.y.max(maximum),
+        }
+    }
+    limits
+}
+
+fn document_node_is_below(
+    document: &DocumentFrame,
+    node: &DocumentNodeId,
+    ancestor: &DocumentNodeId,
+) -> bool {
+    let mut current = document
+        .nodes
+        .get(node)
+        .and_then(|node| node.parent.as_ref());
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        current = document.nodes.get(id).and_then(|node| node.parent.as_ref());
+    }
+    false
 }
 
 fn scroll_root_at(

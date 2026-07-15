@@ -2,7 +2,7 @@ use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
     DocumentPatch, EmbeddedProgramDescriptor, EmbeddedProgramSourceUnit, MaterializedRange,
     ProgramArtifactRetention, ProgramCapabilityProfile, SourceBinding, SourceBindingId, StyleMap,
-    StylePatch, StyleValue, TextValue,
+    StylePatch, StyleValue, TextInputFocusRequest, TextInputId, TextValue,
 };
 use boon_plan::{
     DocumentArgumentRole, DocumentBuiltin, DocumentConstantId, DocumentConstantValue,
@@ -3132,6 +3132,16 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
     if name == "items" || name == "children" || name == "child" || name == "root" {
         return;
     }
+    if name == "input_id" {
+        if node.kind == DocumentNodeKind::TextInput {
+            node.text_input_id = nonempty_text(&value).map(TextInputId);
+        }
+        return;
+    }
+    if name == "activate_focus" {
+        node.activation_focus = text_input_focus_request(&value);
+        return;
+    }
     if node.kind == DocumentNodeKind::EmbeddedProgram {
         let program = node
             .embedded_program
@@ -3208,6 +3218,31 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
         };
         node.style.insert(key.to_owned(), style);
     }
+}
+
+fn nonempty_text(value: &EvalValue) -> Option<String> {
+    let text = value.text();
+    (!text.is_empty()).then_some(text)
+}
+
+fn text_input_focus_request(value: &EvalValue) -> Option<TextInputFocusRequest> {
+    let fields = record_fields(value)?;
+    let input_id = fields
+        .get("input_id")
+        .and_then(nonempty_text)
+        .map(TextInputId)?;
+    let coordinate = |name: &str| fields.get(name).and_then(positive_integral_u64);
+    Some(TextInputFocusRequest {
+        input_id,
+        line: coordinate("line")?,
+        column: coordinate("column")?,
+    })
+}
+
+fn positive_integral_u64(value: &EvalValue) -> Option<u64> {
+    let value = value.number()?;
+    (value.is_finite() && value >= 1.0 && value <= u64::MAX as f64 && value.fract() == 0.0)
+        .then_some(value as u64)
 }
 
 fn embedded_program_source_units(value: &EvalValue) -> Vec<EmbeddedProgramSourceUnit> {
@@ -3894,6 +3929,15 @@ fn diff_node(previous: &DocumentNode, next: &DocumentNode) -> Vec<DocumentPatch>
             });
         }
     }
+    if previous.text_input_id != next.text_input_id
+        || previous.activation_focus != next.activation_focus
+    {
+        patches.push(DocumentPatch::SetTextInputFocus {
+            id: next.id.clone(),
+            text_input_id: next.text_input_id.clone(),
+            activation_focus: next.activation_focus.clone(),
+        });
+    }
     if previous.scroll != next.scroll
         && let Some(scroll) = next.scroll
     {
@@ -4011,6 +4055,15 @@ pub(crate) fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec
                 });
             }
         }
+        if previous_node.text_input_id != next_node.text_input_id
+            || previous_node.activation_focus != next_node.activation_focus
+        {
+            patches.push(DocumentPatch::SetTextInputFocus {
+                id: id.clone(),
+                text_input_id: next_node.text_input_id.clone(),
+                activation_focus: next_node.activation_focus.clone(),
+            });
+        }
         if previous_node.scroll != next_node.scroll
             && let Some(scroll) = next_node.scroll
         {
@@ -4092,6 +4145,96 @@ mod tests {
             diff_frames(&previous, &next).as_slice(),
             [DocumentPatch::SetEmbeddedProgram { id, program }]
                 if id.0 == "program" && program.revision == 2
+        ));
+    }
+
+    #[test]
+    fn value_arguments_lower_typed_text_input_focus_without_style_metadata() {
+        let mut input = DocumentNode::new("input", DocumentNodeKind::TextInput);
+        apply_value_argument(
+            &mut input,
+            "input_id",
+            EvalValue::Text("profile-source".to_owned()),
+        );
+        assert_eq!(
+            input.text_input_id,
+            Some(TextInputId("profile-source".to_owned()))
+        );
+        assert!(!input.style.contains_key("input_id"));
+
+        let mut diagnostic = DocumentNode::new("diagnostic", DocumentNodeKind::Button);
+        apply_value_argument(
+            &mut diagnostic,
+            "activate_focus",
+            EvalValue::Record(BTreeMap::from([
+                (
+                    "input_id".to_owned(),
+                    EvalValue::Text("profile-source".to_owned()),
+                ),
+                ("line".to_owned(), EvalValue::Number(7.0)),
+                ("column".to_owned(), EvalValue::Text("3".to_owned())),
+            ])),
+        );
+        assert_eq!(
+            diagnostic.activation_focus,
+            Some(TextInputFocusRequest {
+                input_id: TextInputId("profile-source".to_owned()),
+                line: 7,
+                column: 3,
+            })
+        );
+        assert!(!diagnostic.style.contains_key("activate_focus"));
+
+        for invalid_line in [EvalValue::Number(0.0), EvalValue::Number(1.5)] {
+            let mut invalid = DocumentNode::new("invalid", DocumentNodeKind::Button);
+            apply_value_argument(
+                &mut invalid,
+                "activate_focus",
+                EvalValue::Record(BTreeMap::from([
+                    (
+                        "input_id".to_owned(),
+                        EvalValue::Text("profile-source".to_owned()),
+                    ),
+                    ("line".to_owned(), invalid_line),
+                    ("column".to_owned(), EvalValue::Number(1.0)),
+                ])),
+            );
+            assert_eq!(invalid.activation_focus, None);
+        }
+    }
+
+    #[test]
+    fn frame_diff_emits_nonstructural_text_input_focus_changes() {
+        let mut previous = DocumentFrame::empty("root");
+        let mut diagnostic = DocumentNode::new("diagnostic", DocumentNodeKind::Button);
+        diagnostic.parent = Some(previous.root.clone());
+        previous
+            .nodes
+            .get_mut(&previous.root)
+            .unwrap()
+            .children
+            .push(diagnostic.id.clone());
+        previous.nodes.insert(diagnostic.id.clone(), diagnostic);
+        let mut next = previous.clone();
+        next.nodes
+            .get_mut(&FrameNodeId("diagnostic".to_owned()))
+            .unwrap()
+            .activation_focus = Some(TextInputFocusRequest {
+            input_id: TextInputId("profile-source".to_owned()),
+            line: 9,
+            column: 4,
+        });
+
+        assert!(matches!(
+            diff_frames(&previous, &next).as_slice(),
+            [DocumentPatch::SetTextInputFocus {
+                id,
+                text_input_id: None,
+                activation_focus: Some(request),
+            }] if id.0 == "diagnostic"
+                && request.input_id.0 == "profile-source"
+                && request.line == 9
+                && request.column == 4
         ));
     }
 

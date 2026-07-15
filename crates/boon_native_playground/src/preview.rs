@@ -4400,7 +4400,7 @@ fn event_target(
             view.hit_target_with_text_column(pointer.x, pointer.y, columns)
         }
         HostEvent::Wheel(wheel) => {
-            view.wheel_target(wheel.x, wheel.y, wheel.delta_x, wheel.delta_y)
+            view.wheel_target(wheel.x, wheel.y, wheel.delta_x, wheel.delta_y, columns)
         }
         _ => None,
     }

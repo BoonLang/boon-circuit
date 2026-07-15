@@ -16,6 +16,7 @@ const AXIS_MAX: i32 = 65_535;
 const DEFAULT_POINTER_SPACE: (i32, i32) = (2_400, 1_200);
 const DEVICE_SETTLE: Duration = Duration::from_millis(500);
 const CLICK_HOLD: Duration = Duration::from_millis(32);
+const TEXT_KEY_INTERVAL: Duration = Duration::from_millis(2);
 const UINPUT_NAME_MAX_BYTES: usize = 79;
 pub const ASCII_TEXT_BATCH_MAX_BYTES: usize = 256;
 
@@ -342,9 +343,9 @@ impl Devices {
                 "text batch is not bounded printable ASCII",
             ));
         }
-        let mut events = Vec::with_capacity(text.len().saturating_mul(4).saturating_add(2));
         for byte in text {
             let (key, shifted) = ascii_key(*byte).expect("validated printable ASCII");
+            let mut events = Vec::with_capacity(4);
             if shifted {
                 events.push(key_event(KeyCode::KEY_LEFTSHIFT, true));
             }
@@ -353,10 +354,13 @@ impl Devices {
             if shifted {
                 events.push(key_event(KeyCode::KEY_LEFTSHIFT, false));
             }
+            self.keyboard.emit(&events)?;
+            thread::sleep(TEXT_KEY_INTERVAL);
         }
-        events.push(key_event(KeyCode::KEY_F24, true));
-        events.push(key_event(KeyCode::KEY_F24, false));
-        self.keyboard.emit(&events)
+        self.keyboard.emit(&[
+            key_event(KeyCode::KEY_F24, true),
+            key_event(KeyCode::KEY_F24, false),
+        ])
     }
 }
 

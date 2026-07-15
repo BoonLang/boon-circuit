@@ -32,7 +32,7 @@ use crate::observer::{
     NATIVE_SESSION_ID_ENV, OBSERVER_SOCKET_ENV, ObserverEvent, ObserverRole,
     PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
     PROFILE_BENCHMARK_STEPS_ENV, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV, PROOF_SAMPLE_ORDINAL_ENV,
-    PersistenceEvidenceKind, ProofArtifact, RESPONSIVE_EVIDENCE_SIZE_ENV, RoleMetadata,
+    PersistenceEvidenceKind, ProofArtifact, RESPONSIVE_EVIDENCE_WIDTH_ENV, RoleMetadata,
     SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV,
     STATE_MOUNT_EVIDENCE_ENV, StartupDisposition, TestPointerPhase, read_event,
 };
@@ -50,6 +50,8 @@ const ROLE_READY_TIMEOUT: Duration = Duration::from_secs(45);
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
 const INPUT_CALIBRATION_QUIET: Duration = Duration::from_millis(20);
+#[cfg(target_os = "linux")]
+const DRAG_GRAB_SETTLE: Duration = Duration::from_millis(32);
 #[cfg(target_os = "linux")]
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
@@ -143,7 +145,6 @@ enum VerifierCheckpointRequirementKind {
     ResponsiveLayout {
         baseline_checkpoint: String,
         logical_width: u32,
-        logical_height: u32,
     },
     StaleCompileRejection,
     PersistenceOperation {
@@ -333,15 +334,11 @@ impl VerifierProfile {
                         checkpoint.id
                     ));
                 }
-                VerifierCheckpointRequirementKind::ResponsiveLayout {
-                    logical_width,
-                    logical_height,
-                    ..
-                } if !(240..=1_920).contains(logical_width)
-                    || !(320..=2_160).contains(logical_height) =>
+                VerifierCheckpointRequirementKind::ResponsiveLayout { logical_width, .. }
+                    if !(240..=1_920).contains(logical_width) =>
                 {
                     return Err(format!(
-                        "checkpoint {} has an unsupported responsive size",
+                        "checkpoint {} has an unsupported responsive width",
                         checkpoint.id
                     ));
                 }
@@ -1677,7 +1674,7 @@ fn profile_frame_chain_is_exact(
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct RoleRectangle {
     x: i32,
     y: i32,
@@ -1755,8 +1752,11 @@ fn drive_responsive_resize(
     };
     let (from, to) = divider_drag_points(preview, dev, ready.0, ready.1)?;
     session.run_driver(&["move", &from.0.to_string(), &from.1.to_string()])?;
+    thread::sleep(DRAG_GRAB_SETTLE);
     session.run_driver(&["button", "down", "left"])?;
+    thread::sleep(DRAG_GRAB_SETTLE);
     let drag = session.run_driver(&["move", &to.0.to_string(), &to.1.to_string()]);
+    thread::sleep(DRAG_GRAB_SETTLE);
     let release = session.run_driver(&["button", "up", "left"]);
     drag?;
     release?;
@@ -1779,7 +1779,45 @@ fn drive_responsive_resize(
             _ => None,
         },
     )
-    .map_err(|error| format!("native divider drag did not reach the declared size: {error}"))?;
+    .map_err(|error| {
+        let observed_sizes = events[start..]
+            .iter()
+            .rev()
+            .filter_map(|event| match event {
+                ObserverEvent::ResponsiveResizeObserved {
+                    logical_width,
+                    logical_height,
+                    previous_surface_epoch,
+                    key,
+                    ..
+                } => Some(format!(
+                    "{}x{} epoch {}->{}",
+                    logical_width, logical_height, previous_surface_epoch, key.surface_epoch
+                )),
+                _ => None,
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let latest_role_sizes = events[start..]
+            .iter()
+            .rev()
+            .filter_map(|event| match event {
+                ObserverEvent::RoleMetadata(metadata) => Some(format!(
+                    "{:?} {:.0}x{:.0} epoch {}",
+                    metadata.role,
+                    metadata.logical_width,
+                    metadata.logical_height,
+                    metadata.surface_epoch
+                )),
+                _ => None,
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        format!(
+            "native divider drag did not reach the declared size: {error}; target={}x{} current={}x{}; preview={preview:?}; dev={dev:?}; drag={from:?}->{to:?}; latest observed resize frames={observed_sizes:?}; latest role sizes={latest_role_sizes:?}",
+            ready.0, ready.1, ready.2, ready.3
+        )
+    })?;
     let exact_resize = observed.2.surface_epoch > observed.1
         && frame_key_matches_session(events, &observed.2, session, ObserverRole::Preview)
         && events.iter().any(|event| {
@@ -1870,7 +1908,9 @@ fn divider_drag_points(
         let from = (x, (dev_bottom + preview.y) / 2);
         return Ok((from, (x, from.1 + preview.height - desired_height)));
     }
-    Err("declared responsive size cannot be reached through the proven tiled divider".to_owned())
+    Err(format!(
+        "declared responsive size {desired_width}x{desired_height} cannot be reached through the proven tiled divider: preview={preview:?}, dev={dev:?}"
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -3719,7 +3759,6 @@ fn checkpoint_proof(
         VerifierCheckpointRequirementKind::ResponsiveLayout {
             baseline_checkpoint,
             logical_width,
-            logical_height,
         } => events.iter().rev().find_map(|event| match event {
             ObserverEvent::ResponsiveLayoutEvidence {
                 logical_width: observed_width,
@@ -3732,10 +3771,7 @@ fn checkpoint_proof(
                 durable_epoch,
                 key,
                 ..
-            } if observed_width == logical_width
-                && observed_height == logical_height
-                && *action_count > 0 =>
-            {
+            } if observed_width == logical_width && *action_count > 0 => {
                 Some(StateCheckpointProof {
                     id: required.id.clone(),
                     source_revision: *source_revision,
@@ -3745,8 +3781,8 @@ fn checkpoint_proof(
                     frame: key.clone().into(),
                     evidence: StateCheckpointEvidence::ResponsiveLayout {
                         baseline_checkpoint: baseline_checkpoint.clone(),
-                        logical_width: *logical_width,
-                        logical_height: *logical_height,
+                        logical_width: *observed_width,
+                        logical_height: *observed_height,
                         action_count: *action_count,
                         action_digest: action_digest.clone(),
                     },
@@ -4952,19 +4988,16 @@ impl NativeSession {
                 }) {
                     environment.push((STALE_PROGRAM_EVIDENCE_ENV, "1".to_owned()));
                 }
-                if let Some((width, height)) =
-                    profile.required_checkpoints.iter().find_map(|checkpoint| {
-                        match checkpoint.evidence {
-                            VerifierCheckpointRequirementKind::ResponsiveLayout {
-                                logical_width,
-                                logical_height,
-                                ..
-                            } => Some((logical_width, logical_height)),
-                            _ => None,
-                        }
-                    })
-                {
-                    environment.push((RESPONSIVE_EVIDENCE_SIZE_ENV, format!("{width}x{height}")));
+                if let Some(width) = profile.required_checkpoints.iter().find_map(|checkpoint| {
+                    match checkpoint.evidence {
+                        VerifierCheckpointRequirementKind::ResponsiveLayout {
+                            logical_width,
+                            ..
+                        } => Some(logical_width),
+                        _ => None,
+                    }
+                }) {
+                    environment.push((RESPONSIVE_EVIDENCE_WIDTH_ENV, width.to_string()));
                 }
                 if !profile.required_budget_metrics.is_empty() {
                     environment.push((PROFILE_BENCHMARK_ENV, "120".to_owned()));

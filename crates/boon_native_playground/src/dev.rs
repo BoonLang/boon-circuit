@@ -311,8 +311,14 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                 for accepted in drain_native_events(&mut host, event).await? {
                     let envelope = &accepted.envelope;
                     let target_name = native_target_name(&view, &envelope.event, &state);
-                    let visible_input = if matches!(envelope.event, HostEvent::Resize(_)) {
+                    let visible_input = if let HostEvent::Resize(resize) = &envelope.event {
                         view.resize(viewport(&host), &mut columns)?;
+                        emit(
+                            &observer,
+                            ObserverEvent::RoleMetadata(
+                                product.current_role_metadata(&host, resize.epoch),
+                            ),
+                        );
                         frame_changed = true;
                         true
                     } else {

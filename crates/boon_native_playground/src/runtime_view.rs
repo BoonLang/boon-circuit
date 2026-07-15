@@ -1029,6 +1029,11 @@ impl RuntimeView {
         std::mem::take(&mut self.pending_program_requests)
     }
 
+    pub fn has_pending_program_artifact_store(&self) -> bool {
+        !self.pending_program_artifact_stores.is_empty()
+            || self.retry_program_artifact_store.is_some()
+    }
+
     pub fn complete_program(
         &mut self,
         session: &ProgramSessionId,

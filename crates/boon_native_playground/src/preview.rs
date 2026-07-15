@@ -34,7 +34,7 @@ use crate::native_input::{ASCII_BATCH_END_PHYSICAL_KEY, ASCII_TEXT_BATCH_MAX_BYT
 use crate::observer::{
     InputAccepted, MIGRATION_EVIDENCE_ENV, ObserverClient, ObserverEvent, ObserverRole,
     PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
-    PROFILE_BENCHMARK_STEPS_ENV, PersistenceEvidenceKind, RESPONSIVE_EVIDENCE_SIZE_ENV,
+    PROFILE_BENCHMARK_STEPS_ENV, PersistenceEvidenceKind, RESPONSIVE_EVIDENCE_WIDTH_ENV,
     SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV,
     STATE_MOUNT_EVIDENCE_ENV, StartupDisposition, StartupMigrationEvidence, TestPointerPhase,
 };
@@ -112,6 +112,7 @@ struct ProductProfileCandidate {
     completion_phase: RuntimePhaseTimings,
     completion_update: RuntimeUpdateMeasurement,
     completed_requests: BTreeSet<(String, String)>,
+    invalid_completion: bool,
     child_frame: Option<PresentedFrame>,
     preview_visible_us: Option<u64>,
 }
@@ -143,7 +144,7 @@ struct StateEvidenceConfig {
     migration_exercise: bool,
     profile_samples: usize,
     profile_steps: Vec<String>,
-    responsive_size: Option<(u32, u32)>,
+    responsive_width: Option<u32>,
     stale_program: bool,
 }
 
@@ -206,20 +207,16 @@ impl StateEvidenceConfig {
                 "{PROFILE_BENCHMARK_STEPS_ENV} must identify exactly two bounded steps when profiling"
             ));
         }
-        let responsive_size = std::env::var(RESPONSIVE_EVIDENCE_SIZE_ENV)
+        let responsive_width = std::env::var(RESPONSIVE_EVIDENCE_WIDTH_ENV)
             .ok()
             .map(|value| {
-                let (width, height) = value.split_once('x').ok_or_else(|| {
-                    format!("invalid {RESPONSIVE_EVIDENCE_SIZE_ENV} value `{value}`")
-                })?;
-                let width = width.parse::<u32>().map_err(|error| error.to_string())?;
-                let height = height.parse::<u32>().map_err(|error| error.to_string())?;
-                if !(240..=1_920).contains(&width) || !(320..=2_160).contains(&height) {
+                let width = value.parse::<u32>().map_err(|error| error.to_string())?;
+                if !(240..=1_920).contains(&width) {
                     return Err(format!(
-                        "{RESPONSIVE_EVIDENCE_SIZE_ENV} is outside 240x320..1920x2160"
+                        "{RESPONSIVE_EVIDENCE_WIDTH_ENV} is outside 240..1920"
                     ));
                 }
-                Ok((width, height))
+                Ok(width)
             })
             .transpose()?;
         let stale_program = std::env::var_os(STALE_PROGRAM_EVIDENCE_ENV).is_some();
@@ -230,7 +227,7 @@ impl StateEvidenceConfig {
             migration_exercise,
             profile_samples,
             profile_steps,
-            responsive_size,
+            responsive_width,
             stale_program,
         })
     }
@@ -241,7 +238,7 @@ impl StateEvidenceConfig {
             || self.persistence_exercise
             || self.migration_exercise
             || self.profile_samples != 0
-            || self.responsive_size.is_some()
+            || self.responsive_width.is_some()
             || self.stale_program
     }
 }
@@ -580,6 +577,12 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                     let dirty = if let HostEvent::Resize(resize) = &envelope.event {
                         let started = Instant::now();
                         view.resize(viewport(&host), &mut columns)?;
+                        emit(
+                            &observer,
+                            ObserverEvent::RoleMetadata(
+                                product.current_role_metadata(&host, resize.epoch),
+                            ),
+                        );
                         if let Some(model) = runtime.as_mut() {
                             converge_document_demands(model, &mut view, &mut columns)?;
                         }
@@ -666,12 +669,12 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 }
                 if let Some(presented) = transaction.present(&mut product, &mut host, &view).await?
                 {
-                    proof_eligible_ordinal = proof_eligible_ordinal.saturating_add(1);
-                    let proof_request = prepare_proof_request(
+                    let proof_request = prepare_product_proof_request(
+                        profile_benchmark.as_ref(),
                         proof.as_ref(),
                         proof_config.as_ref(),
                         &mut proof_requested,
-                        proof_eligible_ordinal,
+                        &mut proof_eligible_ordinal,
                         &presented,
                         &view,
                         &host,
@@ -766,6 +769,25 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         &mut last_stats_sent,
                         false,
                     )?;
+                }
+                if let (Some(benchmark), Some(model)) =
+                    (profile_benchmark.as_mut(), runtime.as_mut())
+                {
+                    finalize_ready_profile_candidate(
+                        &observer,
+                        source_revision,
+                        model,
+                        benchmark,
+                        &mut view,
+                        &mut product,
+                        &mut host,
+                        &mut columns,
+                        proof.as_ref(),
+                        &mut queued_evidence_proofs,
+                        &mut evidence_proof_in_flight,
+                        &program_compiler,
+                    )
+                    .await?;
                 }
                 if let Some(runtime_sequence) = latest_runtime_sequence {
                     output.send(Message::PreviewRuntimeChanged {
@@ -1292,12 +1314,11 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                                             last_key.clone(),
                                                         )?);
                                                 }
-                                                if let Some((width, height)) =
-                                                    state_evidence.responsive_size
+                                                if let Some(width) = state_evidence.responsive_width
                                                 {
                                                     responsive_evidence =
                                                         Some(arm_responsive_evidence(
-                                                            &observer, &view, &host, width, height,
+                                                            &observer, &view, &host, width,
                                                             last_key,
                                                         )?);
                                                 }
@@ -1446,9 +1467,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         outcome.revision,
                     )
                 });
-                if profile_request && outcome.result.is_err() {
-                    return Err("profile uinput edit produced an invalid child program".into());
-                }
+                let profile_result_invalid = profile_request && outcome.result.is_err();
                 let completion_started = Instant::now();
                 let observed = model.complete_program_observed(
                     &outcome.session,
@@ -1468,12 +1487,12 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 let mut child_frame = None;
                 if changed {
                     if let Some(presented) = product.present(&mut host, &view).await? {
-                        proof_eligible_ordinal = proof_eligible_ordinal.saturating_add(1);
-                        let proof_request = prepare_proof_request(
+                        let proof_request = prepare_product_proof_request(
+                            profile_benchmark.as_ref(),
                             proof.as_ref(),
                             proof_config.as_ref(),
                             &mut proof_requested,
-                            proof_eligible_ordinal,
+                            &mut proof_eligible_ordinal,
                             &presented,
                             &view,
                             &host,
@@ -1485,65 +1504,51 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 }
                 if profile_request {
                     let benchmark = profile_benchmark.as_mut().expect("profile benchmark");
-                    let completion = match observed.completion {
-                        ProgramCompletionObservation::Host(completion) => completion,
-                        ProgramCompletionObservation::ArtifactStorePending { .. } => {
+                    if profile_result_invalid {
+                        if record_profile_invalid_completion(benchmark)? {
                             return Err(
-                                "profile child compile unexpectedly required artifact persistence"
+                                "profile uinput batch produced an invalid final child program"
                                     .into(),
                             );
                         }
-                    };
-                    record_profile_program_completion(
-                        benchmark,
-                        &outcome.session,
-                        &outcome.request_id,
-                        outcome.revision,
-                        duration_us(outcome.elapsed),
-                        outcome.pending_depth,
-                        completion_us,
-                        completion_phase,
-                        update,
-                        completion,
-                        child_frame,
-                    )?;
-                    if profile_candidate_is_ready(benchmark) {
-                        let finalized = finalize_profile_candidate(
+                    } else {
+                        let completion = match observed.completion {
+                            ProgramCompletionObservation::Host(completion) => completion,
+                            ProgramCompletionObservation::ArtifactStorePending { .. } => {
+                                return Err(
+                                    "profile child compile unexpectedly required artifact persistence"
+                                        .into(),
+                                );
+                            }
+                        };
+                        record_profile_program_completion(
+                            benchmark,
+                            &outcome.session,
+                            &outcome.request_id,
+                            outcome.revision,
+                            duration_us(outcome.elapsed),
+                            outcome.pending_depth,
+                            completion_us,
+                            completion_phase,
+                            update,
+                            completion,
+                            child_frame,
+                        )?;
+                        finalize_ready_profile_candidate(
                             &observer,
                             source_revision,
                             model,
                             benchmark,
-                            &view,
-                            &host,
-                        )?;
-                        if let Some(request) = finalized.proof_request {
-                            queue_evidence_proofs(
-                                &observer,
-                                proof.as_ref(),
-                                &mut queued_evidence_proofs,
-                                &mut evidence_proof_in_flight,
-                                [request],
-                            )?;
-                        }
-                        if let Some(baseline) = finalized.restore_baseline {
-                            model.activate_state_artifact(&baseline)?;
-                            if let Some(restored) = present_runtime(
-                                model,
-                                &mut view,
-                                &mut product,
-                                &mut host,
-                                &mut columns,
-                            )
-                            .await?
-                            {
-                                emit_presented(&observer, &restored);
-                            }
-                            model.resolve_program_artifact_requests()?;
-                            submit_program_requests(
-                                model.take_program_requests(),
-                                &program_compiler,
-                            );
-                        }
+                            &mut view,
+                            &mut product,
+                            &mut host,
+                            &mut columns,
+                            proof.as_ref(),
+                            &mut queued_evidence_proofs,
+                            &mut evidence_proof_in_flight,
+                            &program_compiler,
+                        )
+                        .await?;
                     }
                 }
                 send_program_status(&output, Some(model), source_revision)?;
@@ -2365,6 +2370,28 @@ struct PreparedProofRequest {
     snapshot_prepare_us: u64,
 }
 
+fn product_proof_is_eligible(benchmark: Option<&ProductProfileBenchmark>) -> bool {
+    benchmark.is_none_or(|benchmark| matches!(benchmark.phase, ProductProfilePhase::Complete))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_product_proof_request(
+    benchmark: Option<&ProductProfileBenchmark>,
+    proof: Option<&ProofWorker>,
+    config: Option<&ProofConfig>,
+    requested: &mut bool,
+    ordinal: &mut u64,
+    presented: &PresentedFrame,
+    view: &RetainedView,
+    host: &NativeSurfaceHost,
+) -> Option<PreparedProofRequest> {
+    if !product_proof_is_eligible(benchmark) {
+        return None;
+    }
+    *ordinal = ordinal.saturating_add(1);
+    prepare_proof_request(proof, config, requested, *ordinal, presented, view, host)
+}
+
 fn prepare_proof_request(
     proof: Option<&ProofWorker>,
     config: Option<&ProofConfig>,
@@ -2846,7 +2873,6 @@ fn arm_responsive_evidence(
     view: &RetainedView,
     host: &NativeSurfaceHost,
     desired_width: u32,
-    desired_height: u32,
     key: crate::observer::FrameEvidenceKey,
 ) -> Result<ResponsiveEvidenceState, Box<dyn std::error::Error + Send + Sync>> {
     let expected_actions = document_action_paths(view.frame());
@@ -2854,19 +2880,24 @@ fn arm_responsive_evidence(
         return Err("responsive evidence found no public document actions".into());
     }
     let current = host.viewport().logical_size;
+    let current_width = current.width.round().max(0.0) as u32;
+    let current_height = current.height.round().max(0.0) as u32;
+    if !(320..=2_160).contains(&current_height) {
+        return Err("responsive evidence has an unsupported tiled height".into());
+    }
     emit(
         observer,
         ObserverEvent::ResponsiveResizeReady {
             desired_width,
-            desired_height,
-            current_width: current.width.round().max(0.0) as u32,
-            current_height: current.height.round().max(0.0) as u32,
+            desired_height: current_height,
+            current_width,
+            current_height,
             key: key.clone(),
         },
     );
     Ok(ResponsiveEvidenceState {
         desired_width,
-        desired_height,
+        desired_height: current_height,
         expected_actions,
         last_surface_epoch: key.surface_epoch,
         complete: false,
@@ -3665,6 +3696,7 @@ fn record_profile_text_input(
         completion_phase: RuntimePhaseTimings::default(),
         completion_update: RuntimeUpdateMeasurement::default(),
         completed_requests: BTreeSet::new(),
+        invalid_completion: false,
         child_frame: None,
         preview_visible_us: None,
     });
@@ -3696,7 +3728,21 @@ fn close_profile_input_batch(
         return Err("profile batch marker did not close the declared ASCII edit".into());
     }
     candidate.closed = true;
+    if candidate.invalid_completion {
+        return Err("profile uinput batch closed after an invalid final child program".into());
+    }
     Ok(())
+}
+
+fn record_profile_invalid_completion(
+    benchmark: &mut ProductProfileBenchmark,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let candidate = benchmark
+        .candidate
+        .as_mut()
+        .ok_or("profile invalid completion has no pending input batch")?;
+    candidate.invalid_completion = true;
+    Ok(candidate.closed)
 }
 
 fn profile_candidate_has_request(
@@ -3919,6 +3965,46 @@ fn finalize_profile_candidate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finalize_ready_profile_candidate(
+    observer: &Option<ObserverClient>,
+    source_revision: u64,
+    runtime: &mut RuntimeView,
+    benchmark: &mut ProductProfileBenchmark,
+    view: &mut RetainedView,
+    product: &mut ProductFrame,
+    host: &mut NativeSurfaceHost,
+    columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
+    proof: Option<&ProofWorker>,
+    queued_evidence_proofs: &mut VecDeque<PreparedProofRequest>,
+    evidence_proof_in_flight: &mut Option<crate::observer::FrameEvidenceKey>,
+    program_compiler: &ProgramCompileWorker,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !profile_candidate_is_ready(benchmark) {
+        return Ok(());
+    }
+    let finalized =
+        finalize_profile_candidate(observer, source_revision, runtime, benchmark, view, host)?;
+    if let Some(request) = finalized.proof_request {
+        queue_evidence_proofs(
+            observer,
+            proof,
+            queued_evidence_proofs,
+            evidence_proof_in_flight,
+            [request],
+        )?;
+    }
+    if let Some(baseline) = finalized.restore_baseline {
+        runtime.activate_state_artifact(&baseline)?;
+        if let Some(restored) = present_runtime(runtime, view, product, host, columns).await? {
+            emit_presented(observer, &restored);
+        }
+        runtime.resolve_program_artifact_requests()?;
+        submit_program_requests(runtime.take_program_requests(), program_compiler);
+    }
+    Ok(())
+}
+
 fn retain_latest_program_request(
     latest: &mut BTreeMap<ProgramSessionId, ProgramHostRequest>,
     request: ProgramHostRequest,
@@ -4020,6 +4106,7 @@ fn settle_test_runtime(
             .into());
         }
 
+        let mut changed = runtime.resolve_program_artifact_requests()?;
         let requests = runtime.take_program_requests();
         if requests.len() > TEST_SETTLE_PROGRAM_LIMIT {
             return Err(format!(
@@ -4034,11 +4121,15 @@ fn settle_test_runtime(
             retain_latest_program_request(&mut latest, request);
         }
 
-        let mut changed = false;
         for request in latest.into_values() {
+            if request.is_artifact_load() {
+                return Err("stored artifact request reached the TEST compiler".into());
+            }
             let result = compile_program_artifact(&request.compile);
             changed |= runtime.complete_program(&request.session, &request.request_id, result)?;
         }
+
+        changed |= runtime.poll_program_artifact_stores()?;
 
         if let Some(deadline) = runtime.effect_poll_deadline() {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -4051,8 +4142,15 @@ fn settle_test_runtime(
         if changed {
             apply_runtime_update(runtime, view, columns)?;
         }
-        if !had_program_requests && runtime.effect_poll_deadline().is_none() {
+        let artifact_store_pending = runtime.has_pending_program_artifact_store();
+        if !had_program_requests
+            && !artifact_store_pending
+            && runtime.effect_poll_deadline().is_none()
+        {
             return Ok(());
+        }
+        if artifact_store_pending {
+            thread::sleep(Duration::from_millis(1));
         }
     }
     Err(format!(
@@ -4434,6 +4532,130 @@ mod tests {
             pair[0].0 <= pair[1].0 && pair[0].1 <= pair[1].1 && pair[0] != pair[1]
         }));
         assert_eq!(test_cursor_path((80.0, 40.0), (80.0, 40.0)), [(80.0, 40.0)]);
+    }
+
+    fn profile_test_frame(
+        frame_id: u64,
+        event_sequence: Option<u64>,
+        input_kind: Option<crate::observer::InputKind>,
+    ) -> PresentedFrame {
+        PresentedFrame {
+            key: crate::observer::FrameEvidenceKey {
+                surface_id: "test-preview".to_owned(),
+                process_id: 1,
+                session_id: "test-session".to_owned(),
+                frame_id,
+                input_id: frame_id,
+                content_id: frame_id,
+                layout_id: frame_id,
+                render_id: frame_id,
+                surface_epoch: 1,
+                present_id: frame_id,
+                proof_id: frame_id,
+            },
+            event_sequence,
+            input_kind,
+            callback_to_host_ns: 1,
+            input_to_present_us: 1,
+            event_dispatch_us: 1,
+            executor_us: 1,
+            runtime_document_us: 1,
+            document_update_us: 1,
+            render_us: 1,
+            document_scene_convert_us: 1,
+            scene_key_us: 1,
+            rect_vertices_us: 1,
+            asset_prepare_us: 1,
+            quad_batch_key_us: 1,
+            quad_upload_us: 1,
+            draw_pass_us: 1,
+            retained_metrics_us: 1,
+            text_render_us: 1,
+            submit_us: 1,
+            present_us: 1,
+            frame_us: 1,
+        }
+    }
+
+    fn profile_test_benchmark(batch_text: &str, completed: bool) -> ProductProfileBenchmark {
+        let request = SubmittedProgramRequest {
+            session: ProgramSessionId("profile-child".to_owned()),
+            request_id: ProgramRequestId("request-7".to_owned()),
+            revision: 7,
+            pending_depth: 1,
+        };
+        let mut completed_requests = BTreeSet::new();
+        if completed {
+            completed_requests.insert((request.session.0.clone(), request.request_id.0.clone()));
+        }
+        ProductProfileBenchmark {
+            baseline: Vec::new(),
+            source_path: "store.source".to_owned(),
+            target_node: "editor".to_owned(),
+            seed_text: "seed".to_owned(),
+            sample_count: 1,
+            completed_samples: 0,
+            phase: ProductProfilePhase::Seed,
+            candidate: Some(ProductProfileCandidate {
+                batch_text: batch_text.to_owned(),
+                input_sequence: 11,
+                callback_to_host_ns: 1,
+                accepted_at: Instant::now(),
+                parent_generation_before: 1,
+                parent_dispatch_us: 1,
+                parent_phase: RuntimePhaseTimings::default(),
+                update: RuntimeUpdateMeasurement::default(),
+                requests: vec![request],
+                closed: false,
+                editor_frame: completed.then(|| {
+                    profile_test_frame(1, Some(11), Some(crate::observer::InputKind::Text))
+                }),
+                editor_visible_us: completed.then_some(1),
+                compile_us: 1,
+                pending_depth: 1,
+                completion_us: 1,
+                completion_phase: RuntimePhaseTimings::default(),
+                completion_update: RuntimeUpdateMeasurement::default(),
+                completed_requests,
+                invalid_completion: false,
+                child_frame: completed.then(|| profile_test_frame(2, None, None)),
+                preview_visible_us: completed.then_some(1),
+            }),
+        }
+    }
+
+    #[test]
+    fn profile_batch_becomes_ready_when_marker_follows_completion() {
+        let mut benchmark = profile_test_benchmark("seed", true);
+
+        assert!(!product_proof_is_eligible(Some(&benchmark)));
+        assert!(!profile_candidate_is_ready(&benchmark));
+        close_profile_input_batch(&mut benchmark).unwrap();
+        assert!(profile_candidate_is_ready(&benchmark));
+        benchmark.phase = ProductProfilePhase::Complete;
+        assert!(product_proof_is_eligible(Some(&benchmark)));
+    }
+
+    #[test]
+    fn profile_open_batch_tolerates_an_invalid_intermediate_compile() {
+        let mut intermediate = profile_test_benchmark("see", false);
+
+        assert!(!record_profile_invalid_completion(&mut intermediate).unwrap());
+        assert!(
+            intermediate
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.invalid_completion)
+        );
+
+        let mut final_candidate = profile_test_benchmark("seed", false);
+        assert!(!record_profile_invalid_completion(&mut final_candidate).unwrap());
+        assert!(
+            close_profile_input_batch(&mut final_candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid final child program")
+        );
     }
 
     #[test]

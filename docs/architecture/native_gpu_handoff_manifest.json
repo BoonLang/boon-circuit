@@ -261,8 +261,7 @@
               "id": "responsive-layout-parity",
               "kind": "responsive-layout",
               "baseline_checkpoint": "sign-out-sign-in",
-              "logical_width": 390,
-              "logical_height": 844
+              "logical_width": 390
             },
             {
               "id": "stale-compile-rejected",

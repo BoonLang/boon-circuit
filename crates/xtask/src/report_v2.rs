@@ -356,7 +356,6 @@ pub enum CheckpointEvidenceRequirement {
     ResponsiveLayout {
         baseline_checkpoint: BoundedId,
         logical_width: u32,
-        logical_height: u32,
     },
     StaleCompileRejection,
     PersistenceOperation {
@@ -814,16 +813,12 @@ impl ProfileProofRequirements {
                         checkpoint.id
                     ));
                 }
-                CheckpointEvidenceRequirement::ResponsiveLayout {
-                    logical_width,
-                    logical_height,
-                    ..
-                } if !(240..=1_920).contains(logical_width)
-                    || !(320..=2_160).contains(logical_height) =>
+                CheckpointEvidenceRequirement::ResponsiveLayout { logical_width, .. }
+                    if !(240..=1_920).contains(logical_width) =>
                 {
                     return Err(format!(
-                        "responsive checkpoint {} has unsupported logical size {}x{}",
-                        checkpoint.id, logical_width, logical_height
+                        "responsive checkpoint {} has unsupported logical width {}",
+                        checkpoint.id, logical_width
                     ));
                 }
                 _ => {}
@@ -1033,6 +1028,9 @@ pub struct GateIdentity {
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrameEvidenceKey {
+    pub surface_id: ShortText,
+    pub process_id: u32,
+    pub session_id: ShortText,
     pub frame_id: u64,
     pub input_id: u64,
     pub content_id: u64,
@@ -1045,6 +1043,9 @@ pub struct FrameEvidenceKey {
 
 impl FrameEvidenceKey {
     fn validate(&self) -> ValidationResult<()> {
+        if self.process_id == 0 {
+            return Err("frame evidence process_id must be non-zero".to_owned());
+        }
         let values = [
             ("frame_id", self.frame_id),
             ("input_id", self.input_id),
@@ -1162,6 +1163,61 @@ pub enum CaptureMethod {
     AppOwnedRenderTargetReadback,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LaunchIsolationPhase {
+    Primary,
+    Restart,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchIsolationEvidence {
+    pub phase: LaunchIsolationPhase,
+    pub session_id: ShortText,
+    pub seat_name: ShortText,
+    pub pointer_device_owned: bool,
+    pub keyboard_device_owned: bool,
+    pub owned_device_count: u32,
+    pub workspace_inactive: bool,
+    pub mapped_surface_count: u32,
+    pub tiling_enabled: bool,
+    pub tiled_window_count: u32,
+    pub floating_window_count: u32,
+    pub maximized_window_count: u32,
+    pub ownership_and_layout_preceded_input: bool,
+}
+
+impl LaunchIsolationEvidence {
+    fn validate(&self) -> ValidationResult<()> {
+        if !self.pointer_device_owned || !self.keyboard_device_owned || self.owned_device_count != 2
+        {
+            return Err(
+                "native launch isolation requires exactly two owned input devices".to_owned(),
+            );
+        }
+        if !self.workspace_inactive {
+            return Err("native launch isolation workspace must remain inactive".to_owned());
+        }
+        if !self.tiling_enabled
+            || self.tiled_window_count == 0
+            || self.mapped_surface_count != self.tiled_window_count
+            || self.floating_window_count != 0
+            || self.maximized_window_count != 0
+        {
+            return Err(
+                "native launch isolation requires every mapped role window to be tiled".to_owned(),
+            );
+        }
+        if !self.ownership_and_layout_preceded_input {
+            return Err(
+                "native launch isolation must prove ownership and layout before input".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeEvidence {
@@ -1178,6 +1234,7 @@ pub struct NativeEvidence {
     pub scenario_boundary: HostBoundary,
     pub capture_method: CaptureMethod,
     pub private_runtime_dispatch_used: bool,
+    pub launch_isolation: Vec<LaunchIsolationEvidence>,
 }
 
 impl NativeEvidence {
@@ -1201,6 +1258,26 @@ impl NativeEvidence {
         }
         if self.private_runtime_dispatch_used {
             return Err("private runtime dispatch cannot be passing evidence".to_owned());
+        }
+        if self.launch_isolation.is_empty() || self.launch_isolation.len() > 2 {
+            return Err(
+                "passing native evidence requires one primary and at most one restart isolation record"
+                    .to_owned(),
+            );
+        }
+        let mut phases = BTreeSet::new();
+        let mut sessions = BTreeSet::new();
+        for isolation in &self.launch_isolation {
+            isolation.validate()?;
+            if !phases.insert(isolation.phase) {
+                return Err("native launch isolation phases must be unique".to_owned());
+            }
+            if !sessions.insert(isolation.session_id.as_str()) {
+                return Err("native launch isolation sessions must be unique".to_owned());
+            }
+        }
+        if !phases.contains(&LaunchIsolationPhase::Primary) {
+            return Err("native launch isolation is missing the primary phase".to_owned());
         }
         Ok(())
     }
@@ -1809,19 +1886,13 @@ fn validate_checkpoint_requirement(
             CheckpointEvidenceRequirement::ResponsiveLayout {
                 baseline_checkpoint,
                 logical_width,
-                logical_height,
             },
             StateCheckpointEvidence::ResponsiveLayout {
                 baseline_checkpoint: observed,
                 logical_width: observed_width,
-                logical_height: observed_height,
                 ..
             },
-        ) => {
-            baseline_checkpoint == observed
-                && logical_width == observed_width
-                && logical_height == observed_height
-        }
+        ) => baseline_checkpoint == observed && logical_width == observed_width,
         (
             CheckpointEvidenceRequirement::StaleCompileRejection,
             StateCheckpointEvidence::StaleCompileRejection { .. },

@@ -301,6 +301,22 @@ impl ProductFrame {
         self.metadata.clone()
     }
 
+    pub fn current_role_metadata(
+        &self,
+        host: &NativeSurfaceHost,
+        surface_epoch: u64,
+    ) -> RoleMetadata {
+        let mut metadata = self.metadata.clone();
+        let viewport = host.viewport();
+        metadata.surface_epoch = surface_epoch;
+        metadata.logical_width = viewport.logical_size.width;
+        metadata.logical_height = viewport.logical_size.height;
+        metadata.physical_width = viewport.physical_size.width;
+        metadata.physical_height = viewport.physical_size.height;
+        metadata.scale = viewport.scale;
+        metadata
+    }
+
     pub fn accept_visible_input(
         &mut self,
         envelope: &HostEventEnvelope,

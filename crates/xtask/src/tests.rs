@@ -5,12 +5,12 @@ use crate::report_v2::{
     BoundedId, BoundedString, BudgetComparison, BudgetObservation, BudgetProof, BudgetUnit,
     CaptureMethod, CheckOutcome, CheckpointEvidenceRequirement, ChildValidation, ExpectedIdentity,
     FORMAT_VERSION, FrameEvidenceKey, GateCommand, GateEvidence, GateName, GateRunner,
-    HostBoundary, InputDelivery, ManifestGate, ManifestIdentity, MeasurementContract,
-    NativeEvidence, PresentMode, ProducerEvidence, ProductTimingEvidence, RelativePath,
-    ReportFileMetadata, ReportStatus, ScenarioBoundary, ScenarioProof, Sha256Digest, ShortText,
-    SourceIdentity, StateCheckpointEvidence, StateCheckpointProof, StateRootProof, TimingSummary,
-    ToolIdentity, VerificationProfileEvidence, WindowBackend, check, detail, gate_report,
-    load_manifest, measurement_contract, protocol_name,
+    HostBoundary, InputDelivery, LaunchIsolationEvidence, LaunchIsolationPhase, ManifestGate,
+    ManifestIdentity, MeasurementContract, NativeEvidence, PresentMode, ProducerEvidence,
+    ProductTimingEvidence, RelativePath, ReportFileMetadata, ReportStatus, ScenarioBoundary,
+    ScenarioProof, Sha256Digest, ShortText, SourceIdentity, StateCheckpointEvidence,
+    StateCheckpointProof, StateRootProof, TimingSummary, ToolIdentity, VerificationProfileEvidence,
+    WindowBackend, check, detail, gate_report, load_manifest, measurement_contract, protocol_name,
 };
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -560,11 +560,10 @@ fn complete_profile_evidence(entry: &ManifestGate) -> VerificationProfileEvidenc
                     CheckpointEvidenceRequirement::ResponsiveLayout {
                         baseline_checkpoint,
                         logical_width,
-                        logical_height,
                     } => StateCheckpointEvidence::ResponsiveLayout {
                         baseline_checkpoint,
                         logical_width,
-                        logical_height,
+                        logical_height: 844,
                         action_count: 1,
                         action_digest: digest('7'),
                     },
@@ -661,6 +660,21 @@ fn native_evidence() -> NativeEvidence {
         scenario_boundary: HostBoundary::PublicHostEvent,
         capture_method: CaptureMethod::AppOwnedWgpuReadback,
         private_runtime_dispatch_used: false,
+        launch_isolation: vec![LaunchIsolationEvidence {
+            phase: LaunchIsolationPhase::Primary,
+            session_id: ShortText::new("session-primary").unwrap(),
+            seat_name: ShortText::new("boon-verifier-seat").unwrap(),
+            pointer_device_owned: true,
+            keyboard_device_owned: true,
+            owned_device_count: 2,
+            workspace_inactive: true,
+            mapped_surface_count: 2,
+            tiling_enabled: true,
+            tiled_window_count: 2,
+            floating_window_count: 0,
+            maximized_window_count: 0,
+            ownership_and_layout_preceded_input: true,
+        }],
     }
 }
 
@@ -675,6 +689,9 @@ fn producer(exit_code: Option<i32>) -> ProducerEvidence {
 
 fn frame_key() -> FrameEvidenceKey {
     FrameEvidenceKey {
+        surface_id: ShortText::new("preview-surface").unwrap(),
+        process_id: 100,
+        session_id: ShortText::new("session-primary").unwrap(),
         frame_id: 100,
         input_id: 20,
         content_id: 30,

@@ -1653,7 +1653,9 @@ pub struct AsyncProofTimingEvidence {
     pub proof_lag_frames: u32,
     pub artifact_id: BoundedId,
     pub snapshot_prepare_us: u64,
+    pub queue_wait_us: u64,
     pub worker_us: u64,
+    pub apply_us: u64,
     pub summary: TimingSummary,
 }
 
@@ -1679,7 +1681,7 @@ impl AsyncLaneKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AsyncLaneOutcome {
     Applied,
@@ -1932,7 +1934,6 @@ pub enum StateCheckpointEvidence {
         input_last_sequence: u64,
         input_event_count: u32,
         input_event_digest: Sha256Digest,
-        durable_turn_sequence: u64,
         durable_acked: bool,
         assertion_count: u32,
     },
@@ -1980,13 +1981,12 @@ impl StateCheckpointProof {
                 input_first_sequence,
                 input_last_sequence,
                 input_event_count,
-                durable_turn_sequence,
                 durable_acked,
                 assertion_count,
                 ..
             } if *request_id == 0
                 || *assertion_count == 0
-                || *durable_turn_sequence == 0
+                || self.durable_turn_sequence == 0
                 || !durable_acked
                 || (*action_kind == NativeWorkflowActionKind::AssertionOnly
                     && (*input_first_sequence != 0
@@ -2468,10 +2468,11 @@ impl GateEvidence {
         let mut async_lanes = BTreeSet::new();
         for lane in &self.async_lanes {
             lane.validate()?;
-            if !async_lanes.insert(lane.lane) {
+            if !async_lanes.insert((lane.lane, lane.outcome)) {
                 return Err(format!(
-                    "duplicate async lane evidence {}",
-                    lane.lane.as_str()
+                    "duplicate async lane evidence {} with outcome {:?}",
+                    lane.lane.as_str(),
+                    lane.outcome,
                 ));
             }
         }
@@ -2643,7 +2644,11 @@ impl GateEvidence {
                 return Err("async proof definition has the wrong metric".to_owned());
             }
             proof.summary.validate(proof_definition, require_complete)?;
-            let accounted_us = proof.snapshot_prepare_us.saturating_add(proof.worker_us);
+            let accounted_us = proof
+                .snapshot_prepare_us
+                .saturating_add(proof.queue_wait_us)
+                .saturating_add(proof.worker_us)
+                .saturating_add(proof.apply_us);
             if proof.summary.sample_count != 1
                 || proof.summary.p50_us != accounted_us
                 || proof.summary.p95_us != accounted_us
@@ -2651,7 +2656,7 @@ impl GateEvidence {
                 || proof.summary.max_us != accounted_us
             {
                 return Err(
-                    "async proof summary must account for snapshot preparation plus worker time"
+                    "async proof summary must account for snapshot preparation, queue wait, worker, and apply time"
                         .to_owned(),
                 );
             }

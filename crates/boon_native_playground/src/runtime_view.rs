@@ -214,6 +214,7 @@ struct PendingProgramArtifactStore {
     request_id: ProgramRequestId,
     artifact: ProgramArtifact,
     ownership: ProgramArtifactOwnership,
+    activated_before_store: bool,
     queued_at: Instant,
     queue_depth: u32,
     queue_wait_us: u64,
@@ -1547,25 +1548,49 @@ impl RuntimeView {
         if request_is_current && let Some(ownership) = artifact_ownership {
             return match result {
                 Ok(artifact) => {
-                    let candidate_sequence = self.program_artifact_store_lane.next_sequence();
-                    let pending = PendingProgramArtifactStore {
-                        candidate_sequence,
-                        mount_epoch: self.program_artifact_store_lane.mount_epoch,
-                        session: session.clone(),
-                        request_id: request_id.clone(),
-                        artifact,
+                    let activate_before_store =
+                        ownership.retention == ContentArtifactRetention::Replaceable;
+                    let pending = self.pending_program_artifact_store(
+                        session,
+                        request_id,
+                        artifact.clone(),
                         ownership,
-                        queued_at: Instant::now(),
-                        queue_depth: self
-                            .program_artifact_store_lane
-                            .session_count()
-                            .saturating_add(1)
-                            .try_into()
-                            .unwrap_or(u32::MAX),
-                        queue_wait_us: 0,
-                        worker_us: 0,
-                    };
-                    self.enqueue_program_artifact_store(pending)
+                        activate_before_store,
+                    );
+                    if !activate_before_store {
+                        return self.enqueue_program_artifact_store(pending);
+                    }
+
+                    let activated = self.finish_program_completion_observed(
+                        session,
+                        request_id,
+                        Ok(artifact),
+                        false,
+                        true,
+                    )?;
+                    if !matches!(
+                        activated.completion,
+                        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+                            ProgramCompletion::Activated { .. }
+                        ))
+                    ) {
+                        return Ok(activated);
+                    }
+                    let queued = self.enqueue_program_artifact_store(pending)?;
+                    if matches!(
+                        queued.completion,
+                        ProgramCompletionObservation::ArtifactStorePending { .. }
+                    ) {
+                        Ok(ObservedProgramCompletion {
+                            changed: activated.changed || queued.changed,
+                            completion: activated.completion,
+                        })
+                    } else {
+                        Ok(ObservedProgramCompletion {
+                            changed: activated.changed || queued.changed,
+                            completion: queued.completion,
+                        })
+                    }
                 }
                 Err(diagnostic) => self.finish_program_completion_observed(
                     session,
@@ -1577,6 +1602,34 @@ impl RuntimeView {
             };
         }
         self.finish_program_completion_observed(session, request_id, result, artifact_load, false)
+    }
+
+    fn pending_program_artifact_store(
+        &mut self,
+        session: &ProgramSessionId,
+        request_id: &ProgramRequestId,
+        artifact: ProgramArtifact,
+        ownership: ProgramArtifactOwnership,
+        activated_before_store: bool,
+    ) -> PendingProgramArtifactStore {
+        PendingProgramArtifactStore {
+            candidate_sequence: self.program_artifact_store_lane.next_sequence(),
+            mount_epoch: self.program_artifact_store_lane.mount_epoch,
+            session: session.clone(),
+            request_id: request_id.clone(),
+            artifact,
+            ownership,
+            activated_before_store,
+            queued_at: Instant::now(),
+            queue_depth: self
+                .program_artifact_store_lane
+                .session_count()
+                .saturating_add(1)
+                .try_into()
+                .unwrap_or(u32::MAX),
+            queue_wait_us: 0,
+            worker_us: 0,
+        }
     }
 
     fn enqueue_program_artifact_store(
@@ -1904,7 +1957,7 @@ impl RuntimeView {
                 self.program_artifact_store_lane
                     .remove_waiter_bytes(&pending);
                 changed |= self
-                    .finish_program_artifact_store_observed(pending, Ok(()), true)?
+                    .finish_program_artifact_store_observed(pending, Ok(()), false)?
                     .changed;
                 continue;
             }
@@ -2052,7 +2105,7 @@ impl RuntimeView {
         &mut self,
         pending: PendingProgramArtifactStore,
         result: Result<(), ProgramDiagnostic>,
-        superseded_after_store: bool,
+        authority_committed: bool,
     ) -> ViewResult<ObservedProgramCompletion> {
         let request_id = pending.request_id.0.clone();
         let revision = pending.artifact.revision();
@@ -2062,13 +2115,30 @@ impl RuntimeView {
         let queued_at = pending.queued_at;
         let failed = result.is_err();
         let apply_started = Instant::now();
-        let observed = self.finish_program_completion_observed(
-            &pending.session,
-            &pending.request_id,
-            result.map(|()| pending.artifact),
-            false,
-            superseded_after_store,
-        )?;
+        let observed = if !pending.activated_before_store || result.is_err() {
+            self.finish_program_completion_observed(
+                &pending.session,
+                &pending.request_id,
+                result.map(|()| pending.artifact),
+                false,
+                authority_committed,
+            )?
+        } else if !authority_committed {
+            ObservedProgramCompletion {
+                changed: false,
+                completion: ProgramCompletionObservation::Host(ProgramHostCompletion::Superseded {
+                    session: pending.session,
+                    request_id: pending.request_id,
+                }),
+            }
+        } else {
+            ObservedProgramCompletion {
+                changed: false,
+                completion: ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+                    ProgramCompletion::Activated { revision },
+                )),
+            }
+        };
         self.async_lane_observations
             .push(RuntimeAsyncLaneObservation {
                 lane: RuntimeAsyncLaneKind::ProgramArtifactStore,
@@ -2133,7 +2203,12 @@ impl RuntimeView {
                 | ProgramHostCompletion::Removed { .. } => None,
             }
         };
-        let mut changed = self.queue_program_update(update.patches, update.requests);
+        let program_state_changed = matches!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Activated { .. })
+        );
+        let mut changed =
+            self.queue_program_update(update.patches, update.requests) || program_state_changed;
         if let Some((intent, payload)) = lifecycle {
             for path in self.program_host.lifecycle_source_paths(session, intent) {
                 changed |= self.dispatch_source(&path, None, payload.clone())?;
@@ -5055,9 +5130,16 @@ document: Document/new(
             .unwrap();
         assert!(matches!(
             completion.completion,
-            ProgramCompletionObservation::ArtifactStorePending { .. }
+            ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+                ProgramCompletion::Activated { .. }
+            ))
         ));
-        assert!(!completion.changed);
+        assert!(completion.changed);
+        assert!(model.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Corrected page")
+        }));
         assert!(settle_program_artifact_stores(&mut model) >= 1);
         complete_pending_programs_successfully(&mut model);
         assert_eq!(model.focused(), Some(focused.as_str()));

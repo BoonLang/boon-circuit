@@ -1387,18 +1387,8 @@ fn exercise_native_roles(
                         .to_owned(),
                 );
             }
-            wait_for_event(observer, events, EVENT_TIMEOUT, 0, |event| {
-                matches!(event, ObserverEvent::ProofCompleted {
-                    key: completed,
-                    artifact: Some(_),
-                    error: None,
-                    ..
-                } if completed == &key)
-            })
-            .map_err(|error| format!("product-frame proof did not complete: {error}"))?;
-            if exact_proof_for_key(events, &key).is_none() {
-                return Err("product-frame proof lacks exact presented-frame evidence".to_owned());
-            }
+            wait_for_exact_proof(observer, events, EVENT_TIMEOUT, &key)
+                .map_err(|error| format!("product-frame proof did not complete: {error}"))?;
             break;
         }
     }
@@ -1989,8 +1979,51 @@ fn drive_native_workflow(
                 (target.1, target.2),
                 translated_target_candidates(preview_placement, target.1, target.2),
             )?;
+            let pointer_start = events.len();
             session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
-            session.run_driver(&["click", "left"])?;
+            wait_for_native_workflow_pointer_phase(
+                session,
+                observer,
+                events,
+                pointer_start,
+                test_request_id,
+                index,
+                TestPointerPhase::Move,
+            )?;
+            wait_for_native_workflow_pointer_phase(
+                session,
+                observer,
+                events,
+                pointer_start,
+                test_request_id,
+                index,
+                TestPointerPhase::Hover,
+            )?;
+            let pointer_cycles = usize::from(action.action_kind == "double_click") + 1;
+            for _ in 0..pointer_cycles {
+                let down_start = events.len();
+                session.run_driver(&["button", "down", "left"])?;
+                wait_for_native_workflow_pointer_phase(
+                    session,
+                    observer,
+                    events,
+                    down_start,
+                    test_request_id,
+                    index,
+                    TestPointerPhase::Down,
+                )?;
+                let up_start = events.len();
+                session.run_driver(&["button", "up", "left"])?;
+                wait_for_native_workflow_pointer_phase(
+                    session,
+                    observer,
+                    events,
+                    up_start,
+                    test_request_id,
+                    index,
+                    TestPointerPhase::Up,
+                )?;
+            }
             match action.action_kind.as_str() {
                 "type_text" => {
                     session.run_driver(&["chord", "ctrl", "a"])?;
@@ -2002,9 +2035,7 @@ fn drive_native_workflow(
                             .expect("validated native workflow text"),
                     ])?;
                 }
-                "double_click" => {
-                    session.run_driver(&["click", "left"])?;
-                }
+                "double_click" => {}
                 "key" => {
                     let key = action.key.as_deref().ok_or_else(|| {
                         format!("native workflow key step `{}` has no key", action.id)
@@ -2138,26 +2169,14 @@ fn drive_native_workflow(
             .required_native_workflow_proof_steps
             .contains(&action.id)
         {
-            wait_for_event(observer, events, EVENT_TIMEOUT, action_start, |event| {
-                matches!(event, ObserverEvent::ProofCompleted {
-                    key,
-                    artifact: Some(_),
-                    error: None,
-                    ..
-                } if key == &completed.16)
-            })
-            .map_err(|error| {
-                format!(
-                    "native workflow proof `{}` did not complete: {error}",
-                    action.id
-                )
-            })?;
-            if exact_proof_for_key(events, &completed.16).is_none() {
-                return Err(format!(
-                    "native workflow proof `{}` is not bound to its exact presented frame",
-                    action.id
-                ));
-            }
+            wait_for_exact_proof(observer, events, EVENT_TIMEOUT, &completed.16).map_err(
+                |error| {
+                    format!(
+                        "native workflow proof `{}` did not complete: {error}",
+                        action.id
+                    )
+                },
+            )?;
         }
     }
     let completed = wait_for_value(
@@ -2192,6 +2211,50 @@ fn drive_native_workflow(
         return Err("native workflow completion evidence is incomplete".to_owned());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_native_workflow_pointer_phase(
+    session: &NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    start: usize,
+    request_id: u64,
+    step_index: usize,
+    phase: TestPointerPhase,
+) -> Result<FrameEvidenceKey, String> {
+    let key = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        start,
+        |event| match event {
+            ObserverEvent::TestPointerFrame {
+                request_id: observed_request,
+                step_index: observed_step,
+                phase: observed_phase,
+                key,
+                ..
+            } if *observed_request == request_id
+                && *observed_step as usize == step_index
+                && *observed_phase == phase =>
+            {
+                Some(key.clone())
+            }
+            _ => None,
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "native workflow step {step_index} did not present its {phase:?} cursor frame: {error}"
+        )
+    })?;
+    if !frame_key_matches_session(events, &key, session, ObserverRole::Preview) {
+        return Err(format!(
+            "native workflow step {step_index} {phase:?} cursor frame belongs to another session"
+        ));
+    }
+    Ok(key)
 }
 
 #[cfg(target_os = "linux")]
@@ -2661,6 +2724,7 @@ fn wait_for_evidence_proofs(
             | ObserverEvent::PersistenceEvidence { key, .. }
             | ObserverEvent::ResponsiveLayoutEvidence { key, .. }
             | ObserverEvent::StaleProgramRejected { key, .. }
+            | ObserverEvent::NativeWorkflowStep { key, .. }
             | ObserverEvent::ScrollProofFrame { key, .. } => Some(key.clone()),
             ObserverEvent::ProfileSample {
                 ordinal: 11, key, ..
@@ -2672,7 +2736,14 @@ fn wait_for_evidence_proofs(
                 keys.push(key);
             }
             keys
-        });
+        })
+        .into_iter()
+        .filter(|key| {
+            events.iter().any(
+                |event| matches!(event, ObserverEvent::ProofRequested { key: requested, .. } if requested == key),
+            )
+        })
+        .collect::<Vec<_>>();
     if evidence_keys.is_empty() {
         return Ok(());
     }
@@ -2680,6 +2751,18 @@ fn wait_for_evidence_proofs(
         evidence_keys
             .iter()
             .all(|key| exact_proof_for_key(events, key).is_some())
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_exact_proof(
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    timeout: Duration,
+    key: &FrameEvidenceKey,
+) -> Result<(), String> {
+    wait_for_count(observer, events, timeout, |events| {
+        exact_proof_for_key(events, key).is_some()
     })
 }
 
@@ -4857,7 +4940,6 @@ fn checkpoint_proof(
                             input_last_sequence: *input_last_sequence,
                             input_event_count: *input_event_count,
                             input_event_digest: input_event_digest.clone(),
-                            durable_turn_sequence: *durable_turn_sequence,
                             durable_acked: *durable_acked,
                             assertion_count: *assertion_count,
                         },
@@ -5061,9 +5143,15 @@ fn build_gate_evidence(
             proof_lag_frames: lag.try_into().unwrap_or(u32::MAX),
             artifact_id: artifact_id.clone(),
             snapshot_prepare_us: proof.snapshot_prepare_us,
-            worker_us: proof.elapsed_us,
+            queue_wait_us: proof.queue_wait_us,
+            worker_us: proof.worker_us,
+            apply_us: proof.apply_us,
             summary: TimingSummary::from_values(
-                &[proof.snapshot_prepare_us.saturating_add(proof.elapsed_us)],
+                &[proof
+                    .snapshot_prepare_us
+                    .saturating_add(proof.queue_wait_us)
+                    .saturating_add(proof.worker_us)
+                    .saturating_add(proof.apply_us)],
                 500_000,
             ),
         }
@@ -5182,8 +5270,10 @@ fn frame_key_matches_session(
 struct ExactProof {
     key: FrameEvidenceKey,
     completed_after_key: FrameEvidenceKey,
-    elapsed_us: u64,
     snapshot_prepare_us: u64,
+    queue_wait_us: u64,
+    worker_us: u64,
+    apply_us: u64,
     artifact: ProofArtifact,
 }
 
@@ -5258,8 +5348,37 @@ fn exact_proof_matching(
                 _ => None,
             }
                 });
+        let request_id = format!("proof-{}", key.proof_id);
+        let proof_lane = events[index + 1..].iter().find_map(|candidate| {
+            let ObserverEvent::AsyncLaneCompleted {
+                lane: AsyncLaneKind::ProofReadback,
+                request_id: candidate_request_id,
+                revision,
+                queue_depth,
+                queue_wait_us,
+                worker_us,
+                apply_us,
+                end_to_end_us,
+                outcome: AsyncLaneOutcome::Applied,
+                key: candidate_completed_key,
+            } = candidate
+            else {
+                return None;
+            };
+            (candidate_request_id == &request_id
+                && *revision == key.frame_id
+                && *queue_depth > 0
+                && *worker_us == *elapsed_us
+                && *end_to_end_us
+                    >= queue_wait_us
+                        .saturating_add(*worker_us)
+                        .saturating_add(*apply_us)
+                && candidate_completed_key == completed_after_key)
+                .then_some((*queue_wait_us, *worker_us, *apply_us))
+        });
         (presented_before.is_some_and(|frame| frame_key_matches_metadata(events, key, frame.role))
             && snapshot_prepare_us.is_some()
+            && proof_lane.is_some()
             && key.is_complete()
             && completed_after_key.is_complete()
             && key.same_producer_surface(completed_after_key)
@@ -5273,8 +5392,10 @@ fn exact_proof_matching(
             .then(|| ExactProof {
                 key: key.clone(),
                 completed_after_key: completed_after_key.clone(),
-                elapsed_us: *elapsed_us,
                 snapshot_prepare_us: snapshot_prepare_us.unwrap_or_default(),
+                queue_wait_us: proof_lane.unwrap_or_default().0,
+                worker_us: proof_lane.unwrap_or_default().1,
+                apply_us: proof_lane.unwrap_or_default().2,
                 artifact: artifact.clone(),
             })
     })
@@ -5282,7 +5403,7 @@ fn exact_proof_matching(
 
 #[cfg(target_os = "linux")]
 fn async_lane_evidence(events: &[ObserverEvent]) -> Vec<AsyncLaneEvidence> {
-    let mut selected = BTreeMap::<AsyncLaneKind, AsyncLaneEvidence>::new();
+    let mut selected = BTreeMap::<(AsyncLaneKind, AsyncLaneOutcome), AsyncLaneEvidence>::new();
     for event in events {
         let ObserverEvent::AsyncLaneCompleted {
             lane,
@@ -5318,12 +5439,12 @@ fn async_lane_evidence(events: &[ObserverEvent]) -> Vec<AsyncLaneEvidence> {
             },
             frame: key.clone().into(),
         };
-        let replace = selected.get(lane).is_none_or(|current| {
-            (candidate.outcome == "applied", candidate.end_to_end_us)
-                > (current.outcome == "applied", current.end_to_end_us)
-        });
+        let selection_key = (*lane, *outcome);
+        let replace = selected
+            .get(&selection_key)
+            .is_none_or(|current| candidate.end_to_end_us > current.end_to_end_us);
         if replace {
-            selected.insert(*lane, candidate);
+            selected.insert(selection_key, candidate);
         }
     }
     selected.into_values().collect()
@@ -5344,6 +5465,12 @@ fn async_lane_event_is_valid(event: &ObserverEvent, events: &[ObserverEvent]) ->
     else {
         return false;
     };
+    let Some(event_index) = events
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, event))
+    else {
+        return false;
+    };
     *revision > 0
         && *queue_depth > 0
         && *end_to_end_us
@@ -5351,6 +5478,9 @@ fn async_lane_event_is_valid(event: &ObserverEvent, events: &[ObserverEvent]) ->
                 .saturating_add(*worker_us)
                 .saturating_add(*apply_us)
         && frame_key_matches_metadata(events, key, ObserverRole::Preview)
+        && events[..event_index].iter().any(
+            |candidate| matches!(candidate, ObserverEvent::FramePresented(frame) if frame.role == ObserverRole::Preview && frame.key == *key),
+        )
 }
 
 #[cfg(target_os = "linux")]
@@ -7071,7 +7201,6 @@ enum StateCheckpointEvidence {
         input_last_sequence: u64,
         input_event_count: u32,
         input_event_digest: String,
-        durable_turn_sequence: u64,
         durable_acked: bool,
         assertion_count: u32,
     },
@@ -7200,7 +7329,9 @@ struct AsyncProofTimingEvidence {
     proof_lag_frames: u32,
     artifact_id: String,
     snapshot_prepare_us: u64,
+    queue_wait_us: u64,
     worker_us: u64,
+    apply_us: u64,
     summary: TimingSummary,
 }
 

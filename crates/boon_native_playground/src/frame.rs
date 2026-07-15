@@ -331,7 +331,10 @@ impl ProductFrame {
             frame_id: 0,
             accepted_input: None,
             interaction_samples: Vec::with_capacity(256),
-            stats: PreviewPerfStats::default(),
+            stats: PreviewPerfStats {
+                proof_enabled,
+                ..PreviewPerfStats::default()
+            },
             virtual_cursor: None,
             present_target: None,
             last_presented_key: None,

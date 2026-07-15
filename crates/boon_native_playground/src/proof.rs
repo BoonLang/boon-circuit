@@ -59,6 +59,7 @@ pub struct ProofRequest {
     pub key: FrameEvidenceKey,
     pub readback: PresentedReadbackTicket,
     pub queued_at: Instant,
+    pub queue_depth: u32,
 }
 
 pub struct ProofResult {
@@ -66,6 +67,7 @@ pub struct ProofResult {
     pub elapsed: Duration,
     pub queue_wait: Duration,
     pub end_to_end: Duration,
+    pub queue_depth: u32,
     pub proof: Result<RenderProof, String>,
 }
 
@@ -155,6 +157,9 @@ impl ProofWorker {
         }
         if request.key != request.readback.key {
             return Err("proof request key differs from its production readback".to_owned());
+        }
+        if request.queue_depth == 0 {
+            return Err("proof request has a zero queue depth".to_owned());
         }
         if !request
             .readback
@@ -247,6 +252,7 @@ fn proof_loop(
                 elapsed: started.elapsed(),
                 queue_wait,
                 end_to_end: request.queued_at.elapsed(),
+                queue_depth: request.queue_depth,
                 proof,
             })
             .is_err()

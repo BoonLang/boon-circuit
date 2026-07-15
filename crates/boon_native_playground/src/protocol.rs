@@ -1829,6 +1829,10 @@ impl Encoder {
                     self.string(name)?;
                     self.string(value)?;
                 }
+                ScenarioExpectation::RootNonEmpty { name } => {
+                    self.u8(9);
+                    self.string(name)?;
+                }
                 ScenarioExpectation::ListTexts {
                     list,
                     field,
@@ -2496,6 +2500,9 @@ impl<'a> Decoder<'a> {
                 }),
                 7 => Ok(ScenarioExpectation::SemanticDeltaContains(self.string()?)),
                 8 => Ok(ScenarioExpectation::DocumentChanged),
+                9 => Ok(ScenarioExpectation::RootNonEmpty {
+                    name: self.string()?,
+                }),
                 value => Err(ProtocolError::InvalidEnum("test expectation", value)),
             })
             .collect()

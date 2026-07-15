@@ -632,8 +632,10 @@ fn passing_timed_report(gate: &str) -> crate::report_v2::GateReport {
                 proof_lag_frames: 2,
                 artifact_id: artifact_id.clone(),
                 snapshot_prepare_us: 100,
+                queue_wait_us: 200,
                 worker_us: 900,
-                summary: summary(async_proof.samples.minimum_samples, 1_000),
+                apply_us: 100,
+                summary: summary(async_proof.samples.minimum_samples, 1_300),
             }),
             async_lanes: entry
                 .profile
@@ -870,7 +872,6 @@ fn complete_profile_evidence(entry: &ManifestGate) -> VerificationProfileEvidenc
                                 input_last_sequence: if assertion_only { 0 } else { 2 },
                                 input_event_count: if assertion_only { 0 } else { 2 },
                                 input_event_digest: digest('8'),
-                                durable_turn_sequence: 1,
                                 durable_acked: true,
                                 assertion_count: 1,
                             }

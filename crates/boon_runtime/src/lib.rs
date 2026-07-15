@@ -697,6 +697,12 @@ impl LiveRuntime {
                 Ok((actual != *value)
                     .then(|| format!("root `{name}` expected `{value}`, got `{actual}`")))
             }
+            ScenarioExpectation::RootNonEmpty { name } => {
+                let actual = scenario_value_text(&self.session.root_value_current(name)?)?;
+                Ok(actual
+                    .is_empty()
+                    .then(|| format!("root `{name}` expected a non-empty value")))
+            }
             ScenarioExpectation::ListTexts {
                 list,
                 field,
@@ -1124,6 +1130,9 @@ pub enum ScenarioExpectation {
         name: String,
         value: String,
     },
+    RootNonEmpty {
+        name: String,
+    },
     ListTexts {
         list: String,
         field: String,
@@ -1193,6 +1202,8 @@ struct ScenarioFileStep {
     _source_intent_exemption: Option<String>,
     #[serde(default)]
     expect_root_text: BTreeMap<String, String>,
+    #[serde(default)]
+    expect_root_nonempty: Vec<String>,
     expect_titles: Option<Vec<String>>,
     expect_completed_titles: Option<Vec<String>>,
     expect_visible_titles: Option<Vec<String>>,
@@ -1317,6 +1328,12 @@ fn scenario_expectations(step: &ScenarioFileStep) -> RuntimeResult<Vec<ScenarioE
             value: value.clone(),
         })
         .collect::<Vec<_>>();
+    expectations.extend(
+        step.expect_root_nonempty
+            .iter()
+            .cloned()
+            .map(|name| ScenarioExpectation::RootNonEmpty { name }),
+    );
     let list_texts =
         |field: &str, filter: Option<(&str, &str)>, values: &[String]| -> ScenarioExpectation {
             ScenarioExpectation::ListTexts {

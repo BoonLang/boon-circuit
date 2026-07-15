@@ -45,7 +45,7 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const PERSISTENCE_ACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATE_DIRECTORY: &str = "playground/state";
-const STATE_ROOT_ENV: &str = "BOON_PLAYGROUND_STATE_ROOT";
+pub(crate) const STATE_ROOT_ENV: &str = "BOON_PLAYGROUND_STATE_ROOT";
 const EFFECT_DIRECTORY: &str = "playground/effects";
 const EFFECT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const HOST_LIFECYCLE_STARTED_SOURCE: &str = "host.lifecycle.started";
@@ -440,6 +440,17 @@ impl RuntimeView {
             plan,
             state_root,
             HostIdentityMode::Interactive,
+        )
+    }
+
+    pub(crate) fn open_with_state_root_deterministic(
+        plan: Arc<MachinePlan>,
+        state_root: impl AsRef<Path>,
+    ) -> ViewResult<Self> {
+        Self::open_with_state_root_and_identity_mode(
+            plan,
+            state_root,
+            HostIdentityMode::Deterministic,
         )
     }
 
@@ -4007,16 +4018,12 @@ mod tests {
     use boon_host::{KeyEvent, LogicalKey, PointerEvent, SurfaceId, TextInputEvent, WheelEvent};
     use boon_runtime::RuntimeSourceUnit;
 
-    fn persons_plan(
-        schema_version: u64,
-        predecessor: Option<&MachinePlan>,
-        additive_source: Option<&str>,
-    ) -> Arc<MachinePlan> {
+    fn persons_plan(schema_version: u64, predecessor: Option<&MachinePlan>) -> Arc<MachinePlan> {
         let example = crate::catalog::Catalog::load()
             .unwrap()
             .open("persons_pro")
             .unwrap();
-        let mut units = example
+        let units = example
             .units
             .into_iter()
             .map(|unit| boon_compiler::CompilerSourceUnit {
@@ -4024,12 +4031,6 @@ mod tests {
                 source: unit.source,
             })
             .collect::<Vec<_>>();
-        if let Some(source) = additive_source {
-            units.push(boon_compiler::CompilerSourceUnit {
-                path: "examples/persons_pro/MigrationProbe.bn".to_owned(),
-                source: source.to_owned(),
-            });
-        }
         let predecessors = predecessor
             .map(boon_plan::MigrationPredecessorBinding::from_machine_plan)
             .into_iter()
@@ -4403,7 +4404,7 @@ document: Document/new(
 
     #[test]
     fn persons_semantic_memory_is_an_exact_authoritative_allowlist() {
-        let plan = persons_plan(1, None, None);
+        let plan = persons_plan(1, None);
         let scalar_paths = plan
             .persistence
             .memory
@@ -4429,7 +4430,7 @@ document: Document/new(
                 "store.published_capability_profile",
                 "store.published_artifact_id",
                 "store.published_compiler",
-                "store.published_digest",
+                "store.published_source_digest",
                 "store.published_plan_digest",
                 "store.published_revision",
                 "store.published_source",
@@ -4794,7 +4795,7 @@ document: Document/new(
                 ("store.has_published_revision", Value::Bool(false)),
                 ("store.published_revision", Value::Number(0)),
                 ("store.published_revision_count", Value::Number(0)),
-                ("store.published_digest", Value::Text(String::new())),
+                ("store.published_source_digest", Value::Text(String::new())),
             ],
         );
         assert!(model.retained_frame().nodes.values().any(|node| {
@@ -5512,7 +5513,10 @@ document: Document/new(
                 "store.published_source",
                 Value::Text(first_source.to_owned()),
             ),
-            ("store.published_digest", Value::Text(first_digest.clone())),
+            (
+                "store.published_source_digest",
+                Value::Text(first_digest.clone()),
+            ),
             (
                 "store.published_artifact_id",
                 Value::Text(first_artifact_id.clone()),
@@ -5612,7 +5616,10 @@ document: Document/new(
                     "store.published_source",
                     Value::Text(second_source.to_owned()),
                 ),
-                ("store.published_digest", Value::Text(second_digest.clone())),
+                (
+                    "store.published_source_digest",
+                    Value::Text(second_digest.clone()),
+                ),
                 (
                     "store.published_artifact_id",
                     Value::Text(second_artifact_id.clone()),
@@ -5734,7 +5741,10 @@ document: Document/new(
                 "store.published_source",
                 Value::Text(second_source.to_owned()),
             ),
-            ("store.published_digest", Value::Text(second_digest.clone())),
+            (
+                "store.published_source_digest",
+                Value::Text(second_digest.clone()),
+            ),
             ("store.published_revision_count", Value::Number(2)),
         ] {
             assert_eq!(
@@ -6083,7 +6093,7 @@ document: Document/new(
     #[test]
     fn persons_restart_restores_authority_before_the_first_frame_and_rebuilds_diagnostics() {
         let state_root = unique_state_root("persons-restart-first-frame");
-        let plan = persons_plan(1, None, None);
+        let plan = persons_plan(1, None);
         let valid_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Restart-safe page })\n";
         let invalid_source = "scene: Missing/constructor(\n";
 
@@ -6134,7 +6144,7 @@ document: Document/new(
             )
             .unwrap();
         settle_program_artifact_stores(&mut first);
-        let published_digest = boon_runtime::sha256_bytes(valid_source.as_bytes());
+        let published_source_digest = boon_runtime::sha256_bytes(valid_source.as_bytes());
         let published_artifact_id = match first
             .runtime
             .inspect_value_current("store.published_artifact_id", 1)
@@ -6174,8 +6184,8 @@ document: Document/new(
                     Value::Text(valid_source.to_owned()),
                 ),
                 (
-                    "store.published_digest",
-                    Value::Text(published_digest.clone()),
+                    "store.published_source_digest",
+                    Value::Text(published_source_digest.clone()),
                 ),
                 ("store.published_revision_count", Value::Number(1)),
                 ("store.account_id", account_id.clone()),
@@ -6207,7 +6217,10 @@ document: Document/new(
                     "store.published_source",
                     Value::Text(valid_source.to_owned()),
                 ),
-                ("store.published_digest", Value::Text(published_digest)),
+                (
+                    "store.published_source_digest",
+                    Value::Text(published_source_digest),
+                ),
                 ("store.published_revision_count", Value::Number(1)),
                 ("store.account_id", account_id),
                 ("store.workspace_id", workspace_id.clone()),
@@ -6386,7 +6399,7 @@ document: Document/new(
     #[test]
     fn persons_restart_resumes_only_unsettled_publish_work() {
         let state_root = unique_state_root("persons-publish-resume");
-        let plan = persons_plan(1, None, None);
+        let plan = persons_plan(1, None);
 
         let mut first = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root).unwrap();
         complete_pending_programs_successfully(&mut first);
@@ -6458,12 +6471,12 @@ document: Document/new(
     }
 
     #[test]
-    fn persons_host_control_scenario_covers_restart_clear_export_import_corruption_and_migration() {
+    fn persons_host_control_scenario_covers_restart_clear_export_import_and_corruption() {
         let state_root = unique_state_root("persons-redb-lifecycle");
-        let plan_v1 = persons_plan(1, None, None);
+        let plan = persons_plan(1, None);
         let edited_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Durable profile })\n";
 
-        let mut first = RuntimeView::open_with_state_root(Arc::clone(&plan_v1), &state_root)
+        let mut first = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root)
             .expect("open isolated Persons.pro redb store");
         let workspace_id = match first
             .runtime
@@ -6551,19 +6564,19 @@ document: Document/new(
                 ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
                 ("store.credential_count", Value::Number(2)),
                 ("store.published_revision_count", Value::Number(1)),
-                ("store.published_digest", Value::Text(digest.clone())),
+                ("store.published_source_digest", Value::Text(digest.clone())),
             ],
         );
-        let acknowledged_authority = authoritative_semantic_snapshot(&mut first, &plan_v1);
+        let acknowledged_authority = authoritative_semantic_snapshot(&mut first, &plan);
         first.runtime.barrier().unwrap();
         let artifact = first.export_state_artifact().unwrap();
         first.runtime.shutdown().unwrap();
         drop(first);
 
-        let mut restored = RuntimeView::open_with_state_root(Arc::clone(&plan_v1), &state_root)
+        let mut restored = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root)
             .expect("reopen acknowledged Persons.pro state");
         assert_eq!(
-            authoritative_semantic_snapshot(&mut restored, &plan_v1),
+            authoritative_semantic_snapshot(&mut restored, &plan),
             acknowledged_authority,
             "restart changed complete acknowledged authority"
         );
@@ -6674,7 +6687,7 @@ document: Document/new(
         );
         restored.activate_state_artifact(&artifact).unwrap();
         assert_eq!(
-            authoritative_semantic_snapshot(&mut restored, &plan_v1),
+            authoritative_semantic_snapshot(&mut restored, &plan),
             acknowledged_authority,
             "import activation did not restore complete acknowledged authority"
         );
@@ -6701,7 +6714,7 @@ document: Document/new(
         );
         restored.activate_state_artifact(&artifact).unwrap();
         assert_eq!(
-            authoritative_semantic_snapshot(&mut restored, &plan_v1),
+            authoritative_semantic_snapshot(&mut restored, &plan),
             acknowledged_authority,
             "start-over followed by import did not restore complete authority"
         );
@@ -6717,59 +6730,11 @@ document: Document/new(
         restored.runtime.shutdown().unwrap();
         drop(restored);
 
-        let plan_v2 = persons_plan(
-            2,
-            Some(&plan_v1),
-            Some("migration_probe: TEXT { v2 } |> HOLD migration_probe { LATEST {} }\n"),
-        );
-        let mut migrated = RuntimeView::open_with_state_root(Arc::clone(&plan_v2), &state_root)
-            .expect("migrate Persons.pro state to additive v2 schema");
-        assert_eq!(migrated.persistence_schema_version(), 2);
-        assert!(
-            migrated
-                .persistence_inspector
-                .as_ref()
-                .is_some_and(|inspector| inspector.completed_migration_count >= 1),
-            "additive Persons migration was not recorded by the durable store"
-        );
-        assert_eq!(
-            authoritative_semantic_snapshot(&mut migrated, &plan_v1),
-            acknowledged_authority,
-            "schema migration changed pre-existing semantic authority"
-        );
-        assert_eq!(
-            migrated
-                .runtime
-                .inspect_value_current("store.source_draft", 1)
-                .unwrap(),
-            Value::Text(edited_source.to_owned())
-        );
-        migrated.runtime.barrier().unwrap();
-        migrated.runtime.shutdown().unwrap();
-        drop(migrated);
-
-        let mut reopened_v2 = RuntimeView::open_with_state_root(Arc::clone(&plan_v2), &state_root)
-            .expect("reopen migrated v2 state");
-        assert_eq!(
-            authoritative_semantic_snapshot(&mut reopened_v2, &plan_v1),
-            acknowledged_authority,
-            "reopening the migrated store changed pre-existing semantic authority"
-        );
-        assert_eq!(
-            reopened_v2
-                .runtime
-                .inspect_value_current("store.source_draft", 1)
-                .unwrap(),
-            Value::Text(edited_source.to_owned())
-        );
-        reopened_v2.runtime.shutdown().unwrap();
-        drop(reopened_v2);
-
         let database_path =
-            state_database_path_in(&state_root, &plan_v2.application.identity).unwrap();
+            state_database_path_in(&state_root, &plan.application.identity).unwrap();
         let corrupt_database = b"not-a-redb-database".to_vec();
         fs::write(&database_path, &corrupt_database).unwrap();
-        assert!(RuntimeView::open_with_state_root(plan_v2, &state_root).is_err());
+        assert!(RuntimeView::open_with_state_root(plan, &state_root).is_err());
         assert_eq!(fs::read(&database_path).unwrap(), corrupt_database);
         fs::remove_dir_all(&state_root).unwrap();
     }

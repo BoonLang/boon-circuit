@@ -1,0 +1,42 @@
+-- Persons.pro V2: publication authority receives the renamed source digest.
+
+store: [
+    sources: [
+        seed: SOURCE
+    ]
+
+    source_draft:
+        TEXT { scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { V1 page }) }
+        |> HOLD source_draft {
+            sources.seed.text
+        }
+
+    draft_compile_digest:
+        TEXT { compile-v1 }
+        |> HOLD draft_compile_digest {
+            sources.seed.compile_digest
+        }
+
+    last_valid_draft_source:
+        TEXT { scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { V1 page }) }
+        |> HOLD last_valid_draft_source {
+            sources.seed.last_valid_source
+        }
+
+    published_digest:
+        Text/empty()
+        |> HOLD published_digest { LATEST {} }
+        |> DRAINING
+
+    published_source_digest:
+        DRAIN { published_digest }
+        |> HOLD published_source_digest {
+            sources.seed.published_digest
+        }
+]
+
+scene: Scene/Element/text(
+    element: []
+    style: [width: Fill]
+    text: Support/migration_label(value: store.source_draft)
+)

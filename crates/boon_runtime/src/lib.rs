@@ -7,7 +7,7 @@ use boon_compiler::{
 pub use boon_document_model::{DocumentFrame, DocumentPatch, ProgramCapabilityProfile};
 use boon_example_manifest::ExampleManifest;
 pub use boon_example_manifest::{
-    ExampleEntry as ExampleManifestEntry, MigrationScenario, MigrationSequence,
+    ExampleEntry as ExampleManifestEntry, MigrationScenario, MigrationSequence, MigrationTestDriver,
 };
 pub use boon_persistence::{DurableChange, RestoreImage};
 pub use boon_plan::{ApplicationIdentity, MachinePlan};

@@ -1,6 +1,6 @@
 use crate::protocol::{
-    ApplicationIdentity, AssetBlob, CatalogItem, MigrationBundle, MigrationStage, SourceUnit,
-    TestStep,
+    ApplicationIdentity, AssetBlob, CatalogItem, MigrationBundle, MigrationStage,
+    MigrationTestDriver, SourceUnit, TestStep,
 };
 use boon_runtime::{ExampleManifestEntry, RuntimeResult};
 use std::collections::BTreeSet;
@@ -84,11 +84,11 @@ impl Catalog {
             .transpose()?;
         let units = match migration.as_ref() {
             Some(migration) => migration
-                .initial()
+                .launch()
                 .ok_or_else(|| {
                     format!(
-                        "migration initial stage `{}` is absent after validation",
-                        migration.initial_stage
+                        "migration launch stage `{}` is absent after validation",
+                        migration.launch_stage
                     )
                 })?
                 .units
@@ -101,10 +101,9 @@ impl Catalog {
                 })
                 .collect(),
         };
-        let test_steps = if migration.is_some() {
-            Vec::new()
-        } else {
-            ordinary_test_steps(&entry.scenario)?
+        let test_steps = match migration.as_ref().map(|migration| migration.test_driver) {
+            Some(MigrationTestDriver::Migration) => Vec::new(),
+            Some(MigrationTestDriver::Example) | None => ordinary_test_steps(&entry.scenario)?,
         };
         let mut assets = entry
             .asset_files
@@ -131,6 +130,7 @@ fn load_migration_bundle(
     sequence: boon_runtime::MigrationSequence,
     scenario: boon_runtime::MigrationScenario,
 ) -> RuntimeResult<MigrationBundle> {
+    let launch_stage = sequence.launch_stage().to_owned();
     let stages = sequence
         .stages
         .iter()
@@ -157,6 +157,8 @@ fn load_migration_bundle(
         .collect::<RuntimeResult<Vec<_>>>()?;
     Ok(MigrationBundle {
         initial_stage: sequence.initial_stage,
+        launch_stage,
+        test_driver: sequence.test_driver,
         scenario_path: sequence.scenario,
         stages,
         scenario,
@@ -357,6 +359,8 @@ mod tests {
             .as_ref()
             .expect("typed migration metadata");
         assert_eq!(migration_bundle.initial_stage, "v1");
+        assert_eq!(migration_bundle.launch_stage, "v1");
+        assert_eq!(migration_bundle.test_driver, MigrationTestDriver::Migration);
         assert_eq!(migration_bundle.stages.len(), 3);
         assert!(!migration_bundle.scenario.steps.is_empty());
         assert_eq!(
@@ -384,6 +388,20 @@ mod tests {
         assert_eq!(persons.label, "Persons.pro");
         assert_eq!(persons.application.package_id, "pro.persons.workspace");
         assert_eq!(persons.application.state_namespace, "local-first-v1");
+        let persons_migration = persons
+            .migration
+            .as_ref()
+            .expect("Persons.pro source-controlled migration sequence");
+        assert_eq!(persons_migration.initial_stage, "v1");
+        assert_eq!(persons_migration.launch_stage, "v3");
+        assert_eq!(persons_migration.test_driver, MigrationTestDriver::Example);
+        assert_eq!(
+            persons.units,
+            persons_migration
+                .launch()
+                .expect("Persons.pro launch stage")
+                .units
+        );
         assert!(
             persons
                 .units

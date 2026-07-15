@@ -1,0 +1,39 @@
+initial_stage = "v1"
+launch_stage = "v3"
+test_driver = "example"
+scenario = "examples/migrations/persons_pro/migration.scn"
+
+[[stage]]
+id = "v1"
+label = "Persons.pro Local Workspace V1"
+schema_version = 1
+source = "examples/migrations/persons_pro/v1/RUN.bn"
+source_files = ["examples/migrations/persons_pro/Support.bn"]
+
+[[stage]]
+id = "v2"
+label = "Persons.pro Publication Authority V2"
+schema_version = 2
+source = "examples/migrations/persons_pro/v2/RUN.bn"
+source_files = ["examples/migrations/persons_pro/Support.bn"]
+
+[[stage]]
+id = "v3"
+label = "Persons.pro Local-First Product V3"
+schema_version = 3
+source = "examples/persons_pro/RUN.bn"
+source_files = [
+  "examples/persons_pro/Model/Workspace.bn",
+  "examples/persons_pro/Model/Account.bn",
+  "examples/persons_pro/Templates/Profile.bn",
+  "examples/persons_pro/Templates/ProfilePage.bn",
+  "examples/persons_pro/Theme/PersonsTheme.bn",
+  "examples/persons_pro/View/Components.bn",
+  "examples/persons_pro/View/Editor.bn",
+  "examples/persons_pro/View/Preview.bn",
+  "examples/persons_pro/View/Auth.bn",
+  "examples/persons_pro/View/Publish.bn",
+  "examples/persons_pro/View/Shell.bn",
+  "examples/persons_pro/App.bn",
+  "examples/persons_pro/RUN.bn",
+]

@@ -1894,4 +1894,51 @@ mod tests {
                 && step.durable_stage.as_deref() == Some("v7")
         }));
     }
+
+    #[test]
+    fn persons_source_controlled_migration_preserves_authority_across_paths() {
+        let (sequence, scenario) = fixture("persons_pro");
+        let expected_step_count = scenario.steps.len();
+        let prepared = MigrationScenarioRunner::new(
+            sequence.clone(),
+            scenario.clone(),
+            identity("persons-plan-identity"),
+        )
+        .expect("prepare Persons.pro migration stages");
+        let compiled = prepared
+            .compile_stages(identity("persons-plan-identity"))
+            .expect("compile Persons.pro migration stages");
+        let source_draft_memory = ["v1", "v2", "v3"].map(|stage| {
+            scalar_memory(&compiled.plan(stage).unwrap(), "store.source_draft")
+                .unwrap()
+                .clone()
+        });
+        assert_eq!(
+            source_draft_memory[0].memory_id,
+            source_draft_memory[1].memory_id
+        );
+        assert_eq!(
+            source_draft_memory[1].memory_id, source_draft_memory[2].memory_id,
+            "v2 owner {:?}; v3 owner {:?}",
+            source_draft_memory[1].owner, source_draft_memory[2].owner,
+        );
+        let first =
+            run_migration_scenario(sequence.clone(), scenario.clone(), identity("persons-pro"))
+                .expect("first Persons.pro migration scenario run");
+        let second = run_migration_scenario(sequence, scenario, identity("persons-pro"))
+            .expect("second Persons.pro migration scenario run");
+
+        assert_eq!(first, second);
+        assert_eq!(first.steps.len(), expected_step_count);
+        assert_eq!(
+            first.steps.last().map(|step| {
+                (
+                    step.current_stage.as_deref(),
+                    step.durable_stage.as_deref(),
+                    step.preview_stage.as_deref(),
+                )
+            }),
+            Some((Some("v3"), Some("v3"), None))
+        );
+    }
 }

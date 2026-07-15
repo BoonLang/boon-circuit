@@ -7,12 +7,12 @@ use std::time::Duration;
 use serde::Serialize;
 
 pub use boon_runtime::{
-    ApplicationIdentity, MigrationScenario, MigrationSequence, ScenarioExpectation,
-    ScenarioFieldMatch,
+    ApplicationIdentity, MigrationScenario, MigrationSequence, MigrationTestDriver,
+    ScenarioExpectation, ScenarioFieldMatch,
 };
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 10;
+const VERSION: u16 = 11;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -102,6 +102,8 @@ pub struct MigrationStage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MigrationBundle {
     pub initial_stage: String,
+    pub launch_stage: String,
+    pub test_driver: MigrationTestDriver,
     pub scenario_path: String,
     pub stages: Vec<MigrationStage>,
     pub scenario: MigrationScenario,
@@ -116,10 +118,16 @@ impl MigrationBundle {
         self.stage(&self.initial_stage)
     }
 
+    pub fn launch(&self) -> Option<&MigrationStage> {
+        self.stage(&self.launch_stage)
+    }
+
     pub fn manifest_sequence(&self) -> Result<MigrationSequence, String> {
         #[derive(Serialize)]
         struct SequenceDocument<'a> {
             initial_stage: &'a str,
+            launch_stage: &'a str,
+            test_driver: MigrationTestDriver,
             scenario: &'a str,
             #[serde(rename = "stage")]
             stages: Vec<StageDocument<'a>>,
@@ -136,6 +144,8 @@ impl MigrationBundle {
 
         let document = SequenceDocument {
             initial_stage: &self.initial_stage,
+            launch_stage: &self.launch_stage,
+            test_driver: self.test_driver,
             scenario: &self.scenario_path,
             stages: self
                 .stages
@@ -161,6 +171,7 @@ impl MigrationBundle {
             ));
         }
         validate_migration_id("initial migration stage", &self.initial_stage)?;
+        validate_migration_id("migration launch stage", &self.launch_stage)?;
         if self.scenario_path.is_empty() {
             return Err(ProtocolError::InvalidMigration(
                 "migration scenario path is empty".to_owned(),
@@ -205,6 +216,12 @@ impl MigrationBundle {
             return Err(ProtocolError::InvalidMigration(format!(
                 "initial migration stage `{}` is absent",
                 self.initial_stage
+            )));
+        }
+        if !ids.contains(self.launch_stage.as_str()) {
+            return Err(ProtocolError::InvalidMigration(format!(
+                "migration launch stage `{}` is absent",
+                self.launch_stage
             )));
         }
         let sequence = self
@@ -1471,6 +1488,11 @@ impl Encoder {
     fn migration_bundle(&mut self, migration: &MigrationBundle) -> Result<(), ProtocolError> {
         migration.validate()?;
         self.string(&migration.initial_stage)?;
+        self.string(&migration.launch_stage)?;
+        self.u8(match migration.test_driver {
+            MigrationTestDriver::Migration => 1,
+            MigrationTestDriver::Example => 2,
+        });
         self.string(&migration.scenario_path)?;
         self.u32(migration.stages.len() as u32);
         for stage in &migration.stages {
@@ -2057,6 +2079,12 @@ impl<'a> Decoder<'a> {
 
     fn migration_bundle(&mut self) -> Result<MigrationBundle, ProtocolError> {
         let initial_stage = self.string()?;
+        let launch_stage = self.string()?;
+        let test_driver = match self.u8()? {
+            1 => MigrationTestDriver::Migration,
+            2 => MigrationTestDriver::Example,
+            value => return Err(ProtocolError::InvalidEnum("migration test driver", value)),
+        };
         let scenario_path = self.string()?;
         let count = self.u32()? as usize;
         if count > MAX_MIGRATION_STAGES {
@@ -2085,6 +2113,8 @@ impl<'a> Decoder<'a> {
             .map_err(|error| ProtocolError::InvalidMigration(error.to_string()))?;
         let migration = MigrationBundle {
             initial_stage,
+            launch_stage,
+            test_driver,
             scenario_path,
             stages,
             scenario,

@@ -326,8 +326,8 @@ store: [
             elements.publish_candidate_program.compiled |> THEN { publish_candidate_source }
         }
 
-    published_digest:
-        Text/empty() |> HOLD published_digest {
+    published_source_digest:
+        Text/empty() |> HOLD published_source_digest {
             elements.publish_candidate_program.compiled
                 |> THEN { elements.publish_candidate_program.compiled.source_digest }
         }

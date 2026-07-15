@@ -11,7 +11,6 @@ use boon_host::{
 };
 use boon_native_app_window::{NativeRoleResult, NativeSurfaceHost, SensitiveInputTarget};
 use boon_persistence::{DecodeLimits, encode_restore_image};
-use boon_plan::MigrationPredecessorBinding;
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt, pin_mut, select};
 use sha2::{Digest, Sha256};
@@ -44,12 +43,12 @@ use crate::protocol::{
     ApplicationIdentity, AssetBlob, CanonicalStateArtifact, Connection, FrameMode,
     MAX_PERSISTENCE_ARTIFACT_BYTES, Message, MigrationBundle, MigrationCommand, MigrationOperation,
     MigrationStatus, PersistenceCommand, PersistenceOperation, PersistenceOperationStatus,
-    PreviewIntent, PreviewStats, ProofMode, Role, SourceUnit, StateArtifactFormat,
-    StateArtifactPreviewSummary, TestStep,
+    PreviewIntent, PreviewStats, ProofMode, Role, StateArtifactFormat, StateArtifactPreviewSummary,
+    TestStep,
 };
 use crate::runtime_view::{
     ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneOutcome,
-    RuntimeStartupDisposition, RuntimeView, digest_hex,
+    RuntimeStartupDisposition, RuntimeView, STATE_ROOT_ENV, digest_hex,
 };
 use crate::view::{HitTarget, RetainedView};
 
@@ -1102,6 +1101,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         }
                         if intent == PreviewIntent::Test
                             && let Some(bundle) = incoming_migration.as_ref()
+                            && bundle.test_driver == crate::protocol::MigrationTestDriver::Migration
                         {
                             let request_id = request_id.unwrap_or(0);
                             let result = if revision == source_revision {
@@ -1390,7 +1390,6 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         let request_id = compiled_preview.request_id.unwrap_or(0);
                         let steps = compiled_preview.test_steps.clone();
                         let key = compiled_preview.source_key.clone();
-                        let compiled_units = compiled_preview.units.clone();
                         let revision = compiled_preview.revision;
                         let post_compile_started = Instant::now();
                         let deterministic_runtime =
@@ -1466,7 +1465,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             &mut product,
                                             &mut host,
                                             &mut columns,
-                                            &compiled_units,
+                                            migration.as_ref().ok_or(
+                                                "migration evidence requires a source-controlled migration bundle",
+                                            )?,
                                         )
                                         .await?;
                                         queue_evidence_proofs(
@@ -3749,63 +3750,63 @@ async fn run_schema_migration_evidence(
     product: &mut ProductFrame,
     host: &mut NativeSurfaceHost,
     columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
-    source_units: &[SourceUnit],
+    migration: &MigrationBundle,
 ) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
-    let current = runtime.shared_machine_plan();
-    let target_schema_version = current
-        .persistence
-        .schema_version
-        .checked_add(1)
-        .ok_or("persistence schema version overflow")?;
-    let root_source = source_units
-        .last()
-        .ok_or("schema migration evidence has no active source units")?
-        .path
-        .clone();
-    let probe_name = format!("native_migration_probe_{target_schema_version}");
-    if source_units
-        .iter()
-        .any(|unit| unit.source.contains(&format!("{probe_name}:")))
-    {
-        return Err("schema migration evidence probe collides with product source".into());
-    }
-    let mut target_units = source_units
-        .iter()
-        .map(|unit| boon_compiler::CompilerSourceUnit {
-            path: unit.path.clone(),
-            source: unit.source.clone(),
-        })
-        .collect::<Vec<_>>();
-    target_units.push(boon_compiler::CompilerSourceUnit {
-        path: format!("migration-evidence-v{target_schema_version}.bn"),
-        source: format!(
-            "{probe_name}: TEXT {{ schema-{target_schema_version} }} |> HOLD {probe_name} {{ LATEST {{}} }}\n"
-        ),
-    });
-    let predecessor = MigrationPredecessorBinding::from_machine_plan(&current);
-    let target = Arc::new(
-        boon_compiler::compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
-            &root_source,
-            &target_units,
-            current.target_profile,
-            current.application.identity.clone(),
-            target_schema_version,
-            &[predecessor],
-        )
-        .map_err(|error| error.to_string())?
-        .plan,
-    );
-    if target.persistence.schema_hash == current.persistence.schema_hash {
-        return Err("schema migration evidence compiled an unchanged persistence schema".into());
+    let target_stage = if migration.launch_stage != migration.initial_stage {
+        migration.launch_stage.as_str()
+    } else {
+        migration
+            .stages
+            .last()
+            .map(|stage| stage.id.as_str())
+            .ok_or("migration evidence has no stages")?
+    };
+    if target_stage == migration.initial_stage {
+        return Err("migration evidence requires distinct initial and target stages".into());
     }
 
-    let baseline = authoritative_state_evidence(runtime)?;
-    let preview = runtime.preview_machine_plan(Arc::clone(&target))?;
+    let current = runtime.shared_machine_plan();
+    let mut evidence_application = current.application.identity.clone();
+    evidence_application.state_namespace = format!(
+        "{}:migration-evidence",
+        evidence_application.state_namespace
+    );
+    let completed = run_migration_test(
+        migration,
+        &evidence_application,
+        source_revision,
+        source_revision,
+    )?;
+    if completed != migration.scenario.steps.len() {
+        return Err(format!(
+            "migration scenario completed {completed} of {} source-controlled steps",
+            migration.scenario.steps.len()
+        )
+        .into());
+    }
+
+    let state_root = std::env::var_os(STATE_ROOT_ENV)
+        .ok_or("migration evidence requires a launch-scoped playground state root")?;
+    let evidence_root = std::path::PathBuf::from(state_root)
+        .join(format!("migration-evidence-{}", std::process::id()));
+    let initial =
+        compile_migration_stage(&evidence_application, migration, &migration.initial_stage)?;
+    let target = compile_migration_stage(&evidence_application, migration, target_stage)?;
+    let target_schema_version = target.persistence.schema_version;
+    let mut evidence_runtime =
+        RuntimeView::open_with_state_root_deterministic(initial, &evidence_root)?;
+
+    let baseline = authoritative_state_evidence(&mut evidence_runtime)?;
+    let preview = evidence_runtime.preview_machine_plan(Arc::clone(&target))?;
     let preview_migration = preview
         .migration
         .as_ref()
         .ok_or("schema migration preview did not produce a migration")?;
-    if preview_migration.source_schema_version != current.persistence.schema_version
+    if preview_migration.source_schema_version
+        != migration
+            .initial()
+            .ok_or("migration initial stage is absent")?
+            .schema_version
         || preview.target_schema_version != target_schema_version
         || preview_migration.steps.is_empty()
     {
@@ -3814,7 +3815,7 @@ async fn run_schema_migration_evidence(
         );
     }
 
-    let activation = runtime.activate_machine_plan(target)?;
+    let activation = evidence_runtime.activate_machine_plan(target)?;
     let activated_migration = activation
         .migration
         .as_ref()
@@ -3824,11 +3825,12 @@ async fn run_schema_migration_evidence(
     {
         return Err("schema migration activation has incomplete version or step evidence".into());
     }
-    let presented = present_runtime(runtime, view, product, host, columns)
+    settle_test_runtime(&mut evidence_runtime, view, columns)?;
+    let presented = present_runtime(&mut evidence_runtime, view, product, host, columns)
         .await?
         .ok_or("schema migration activation did not present")?;
     emit_presented(observer, &presented);
-    let activated = authoritative_state_evidence(runtime)?;
+    let activated = authoritative_state_evidence(&mut evidence_runtime)?;
     if activated.digest == baseline.digest
         || activated.durable_epoch < activation.durable_epoch
         || activated.durable_turn_sequence < activation.through_turn_sequence
@@ -3841,7 +3843,7 @@ async fn run_schema_migration_evidence(
         observer,
         PersistenceEvidenceKind::MigrationActivated,
         source_revision,
-        runtime,
+        &evidence_runtime,
         &baseline,
         &activated,
         presented.key.clone(),
@@ -6029,6 +6031,22 @@ scene: Scene/Element/program(
     fn migration_test_uses_the_generic_runner_with_temporary_namespaces() {
         let (example, migration) = counter_migration();
         let completed = run_migration_test(&migration, &example.application, 41, 3).unwrap();
+        assert_eq!(completed, migration.scenario.steps.len());
+    }
+
+    #[test]
+    fn persons_product_carries_source_controlled_migration_without_replacing_test_driver() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let migration = example.migration.as_ref().expect("migration bundle");
+        assert_eq!(
+            migration.test_driver,
+            crate::protocol::MigrationTestDriver::Example
+        );
+        assert!(!example.test_steps.is_empty());
+        let completed = run_migration_test(migration, &example.application, 42, 3).unwrap();
         assert_eq!(completed, migration.scenario.steps.len());
     }
 

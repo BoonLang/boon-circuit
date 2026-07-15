@@ -441,7 +441,7 @@ impl SourceState {
         let migration_stage = active
             .migration
             .as_ref()
-            .map(|migration| migration.initial_stage.clone());
+            .map(|migration| migration.launch_stage.clone());
         Self {
             working_units: baseline_units.clone(),
             active,
@@ -461,7 +461,7 @@ impl SourceState {
         self.migration_stage = active
             .migration
             .as_ref()
-            .map(|migration| migration.initial_stage.clone());
+            .map(|migration| migration.launch_stage.clone());
         self.active = active;
         self.test_steps = self.active.test_steps.clone();
     }

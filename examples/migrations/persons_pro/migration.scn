@@ -1,0 +1,155 @@
+name = "persons-pro-source-controlled-migration"
+
+[[step]]
+id = "start-incremental-v1"
+action = { kind = "start", stage = "v1", namespace = "persons-incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+
+[[step]]
+id = "seed-incremental-v1"
+action = { kind = "dispatch", public_source = "store.sources.seed", payload = { text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Migrated profile })", compile_digest = "compile-old-authority", last_valid_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Last valid profile })", published_digest = "sha256:migrated-source" } }
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.source_draft"
+  value = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Migrated profile })"
+  touched = true
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.published_digest"
+  value = "sha256:migrated-source"
+  touched = true
+
+[[step]]
+id = "checkpoint-incremental-v1"
+action = { kind = "checkpoint" }
+
+[[step]]
+id = "restart-incremental-v1"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.draft_compile_digest"
+  value = "compile-old-authority"
+  touched = true
+
+[[step]]
+id = "preview-incremental-v2"
+action = { kind = "preview", stage = "v2" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v1"
+  durable_stage = "v1"
+  preview_stage = "v2"
+
+[[step]]
+id = "activate-incremental-v2"
+action = { kind = "activate", stage = "v2", mode = "incremental" }
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v1"
+  to_stage = "v2"
+  applied = [{ from_stage = "v1", to_stage = "v2" }]
+  [[step.assert]]
+  kind = "current_absent"
+  path = "store.published_digest"
+  [[step.assert]]
+  kind = "durable_absent"
+  path = "store.published_digest"
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.published_source_digest"
+  value = "sha256:migrated-source"
+  touched = true
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.source_draft"
+  value = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Migrated profile })"
+  touched = true
+
+[[step]]
+id = "activate-incremental-v3"
+action = { kind = "activate", stage = "v3", mode = "incremental" }
+  [[step.assert]]
+  kind = "schema"
+  current_stage = "v3"
+  durable_stage = "v3"
+  [[step.assert]]
+  kind = "edges"
+  mode = "incremental"
+  from_stage = "v2"
+  to_stage = "v3"
+  applied = [{ from_stage = "v2", to_stage = "v3" }]
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.source_draft"
+  value = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Migrated profile })"
+  touched = true
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.source_draft"
+  value = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Migrated profile })"
+  touched = true
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.published_source_digest"
+  value = "sha256:migrated-source"
+  touched = true
+  [[step.assert]]
+  kind = "current_absent"
+  path = "store.draft_compile_digest"
+  [[step.assert]]
+  kind = "durable_absent"
+  path = "store.last_valid_draft_source"
+
+[[step]]
+id = "restart-incremental-v3"
+action = { kind = "restart" }
+  [[step.assert]]
+  kind = "durable_value"
+  path = "store.published_source_digest"
+  value = "sha256:migrated-source"
+  touched = true
+
+[[step]]
+id = "start-skipped-v1"
+action = { kind = "start", stage = "v1", namespace = "persons-skipped" }
+
+[[step]]
+id = "seed-skipped-v1"
+action = { kind = "dispatch", public_source = "store.sources.seed", payload = { text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Migrated profile })", compile_digest = "compile-old-authority", last_valid_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Last valid profile })", published_digest = "sha256:migrated-source" } }
+
+[[step]]
+id = "checkpoint-skipped-v1"
+action = { kind = "checkpoint" }
+
+[[step]]
+id = "activate-skipped-v3"
+action = { kind = "activate", stage = "v3", mode = "skipped" }
+  [[step.assert]]
+  kind = "edges"
+  mode = "skipped"
+  from_stage = "v1"
+  to_stage = "v3"
+  applied = [
+    { from_stage = "v1", to_stage = "v2" },
+    { from_stage = "v2", to_stage = "v3" },
+  ]
+  [[step.assert]]
+  kind = "current_value"
+  path = "store.published_source_digest"
+  value = "sha256:migrated-source"
+  touched = true
+  [[step.assert]]
+  kind = "current_absent"
+  path = "store.published_digest"
+  [[step.assert]]
+  kind = "current_absent"
+  path = "store.draft_compile_digest"
+  [[step.assert]]
+  kind = "namespace_equivalent"
+  namespace = "persons-incremental"
+  other_namespace = "persons-skipped"

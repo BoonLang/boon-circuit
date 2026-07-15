@@ -36,7 +36,6 @@ pub struct CompiledPreview {
     pub elapsed: Duration,
     pub source_key: String,
     pub plan: Arc<MachinePlan>,
-    pub units: Vec<SourceUnit>,
     pub test_steps: Vec<TestStep>,
 }
 
@@ -350,7 +349,6 @@ fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
         elapsed: started.elapsed(),
         source_key,
         plan,
-        units: request.units,
         test_steps: request.test_steps,
     })
 }

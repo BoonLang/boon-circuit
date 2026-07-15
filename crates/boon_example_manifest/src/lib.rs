@@ -187,9 +187,27 @@ impl From<&ApplicationManifest> for ApplicationIdentity {
 #[serde(deny_unknown_fields)]
 pub struct MigrationSequence {
     pub initial_stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_stage: Option<String>,
+    #[serde(default)]
+    pub test_driver: MigrationTestDriver,
     pub scenario: String,
     #[serde(default, rename = "stage")]
     pub stages: Vec<MigrationStage>,
+}
+
+impl MigrationSequence {
+    pub fn launch_stage(&self) -> &str {
+        self.launch_stage.as_deref().unwrap_or(&self.initial_stage)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationTestDriver {
+    #[default]
+    Migration,
+    Example,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -598,6 +616,14 @@ impl MigrationSequence {
                     self.initial_stage
                 )));
             }
+        }
+
+        let launch_stage = self.launch_stage();
+        validate_required_text(&context, "migration launch stage", launch_stage)?;
+        if !self.stages.iter().any(|stage| stage.id == launch_stage) {
+            return Err(context.invalid(format!(
+                "migration launch stage `{launch_stage}` does not exist"
+            )));
         }
 
         MigrationScenario::from_path(scenario_path, self)?;
@@ -1946,6 +1972,45 @@ mod tests {
             vec![("v1", 1), ("v2", 2), ("v4", 4)]
         );
         assert_eq!(sequence.stages[1].source_project().source_files.len(), 1);
+        assert_eq!(sequence.launch_stage(), "v1");
+        assert_eq!(sequence.test_driver, MigrationTestDriver::Migration);
+    }
+
+    #[test]
+    fn migration_sequence_can_launch_current_product_with_example_test_driver() {
+        let tree = TestTree::new();
+        write_migration_files(&tree);
+        let sequence_text = valid_sequence_text().replacen(
+            "initial_stage = \"v1\"\n",
+            concat!(
+                "initial_stage = \"v1\"\n",
+                "launch_stage = \"v4\"\n",
+                "test_driver = \"example\"\n",
+            ),
+            1,
+        );
+        tree.write("examples/migration/sequence.toml", &sequence_text);
+
+        let sequence = MigrationSequence::from_path(
+            tree.examples.join("migration/sequence.toml"),
+            &tree.examples,
+        )
+        .expect("load product migration sequence");
+        assert_eq!(sequence.launch_stage(), "v4");
+        assert_eq!(sequence.test_driver, MigrationTestDriver::Example);
+
+        let missing_launch =
+            sequence_text.replace("launch_stage = \"v4\"", "launch_stage = \"missing\"");
+        let sequence: MigrationSequence =
+            toml::from_str(&missing_launch).expect("parse missing launch stage");
+        let error = sequence
+            .validate(&tree.examples)
+            .expect_err("reject missing launch stage");
+        assert!(
+            error
+                .to_string()
+                .contains("migration launch stage `missing`")
+        );
     }
 
     #[test]

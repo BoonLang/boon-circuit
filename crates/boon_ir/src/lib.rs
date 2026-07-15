@@ -633,6 +633,10 @@ pub enum UpdateValueExpression {
         input: String,
         arms: Vec<UpdateValueMatchArm>,
     },
+    MatchTextIsEmptyConst {
+        input: String,
+        arms: Vec<UpdateValueMatchArm>,
+    },
     NumberInfix {
         left: String,
         op: String,
@@ -5042,6 +5046,21 @@ fn verify_update_value_expression(
             }
             Ok(())
         }
+        UpdateValueExpression::MatchTextIsEmptyConst { input, arms } => {
+            require_known_symbol(
+                &format!("{context} text-is-empty input"),
+                input,
+                known_symbols,
+            )?;
+            for arm in arms {
+                verify_update_value_expression(
+                    &arm.output,
+                    known_symbols,
+                    "nested text-is-empty arm",
+                )?;
+            }
+            Ok(())
+        }
         UpdateValueExpression::NumberInfix { left, op, right } => {
             require_supported_numeric_update_op(op, &format!("{context} number infix"))?;
             if left.parse::<i64>().is_err() {
@@ -5591,6 +5610,14 @@ fn reject_update_value_expression_identity(value: &UpdateValueExpression) -> Res
         }
         UpdateValueExpression::MatchConst { input, arms } => {
             reject_hidden_identity_identifier("match output match input", input)?;
+            for arm in arms {
+                reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
+                reject_update_value_expression_identity(&arm.output)?;
+            }
+            Ok(())
+        }
+        UpdateValueExpression::MatchTextIsEmptyConst { input, arms } => {
+            reject_hidden_identity_identifier("match output text-is-empty input", input)?;
             for arm in arms {
                 reject_hidden_identity_identifier("match pattern", &arm.pattern)?;
                 reject_update_value_expression_identity(&arm.output)?;
@@ -9798,6 +9825,20 @@ fn guarded_match_value_arms_after_when_expr(
     when_expr_id: usize,
     source: &str,
 ) -> Vec<UpdateValueMatchArm> {
+    let mut arms = Vec::new();
+    collect_guarded_match_value_arms_for_when(
+        program,
+        field,
+        target,
+        fields,
+        &field.statement,
+        when_expr_id,
+        source,
+        &mut arms,
+    );
+    if !arms.is_empty() {
+        return arms;
+    }
     let Some(when_expr) = field_expr(field, when_expr_id) else {
         return Vec::new();
     };
@@ -9822,6 +9863,55 @@ fn guarded_match_value_arms_after_when_expr(
             guarded_match_value_arm_expr(program, field, target, fields, expr, source)
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_guarded_match_value_arms_for_when(
+    program: &ParsedProgram,
+    field: &FieldDef,
+    target: &str,
+    fields: &[FieldDef],
+    statement: &AstStatement,
+    when_expr_id: usize,
+    source: &str,
+    arms: &mut Vec<UpdateValueMatchArm>,
+) -> bool {
+    let statement_contains_when = statement.expr.is_some_and(|expr_id| {
+        expr_id == when_expr_id || expr_contains_expr_id(field, expr_id, when_expr_id)
+    });
+    if statement_contains_when {
+        for child in &statement.children {
+            let Some(expr_id) = child.expr else {
+                continue;
+            };
+            let Some(expr) = field_expr(field, expr_id) else {
+                continue;
+            };
+            if let Some(arm) =
+                guarded_match_value_arm_expr(program, field, target, fields, expr, source)
+            {
+                arms.push(arm);
+            }
+        }
+        if !arms.is_empty() {
+            return true;
+        }
+    }
+    for child in &statement.children {
+        if collect_guarded_match_value_arms_for_when(
+            program,
+            field,
+            target,
+            fields,
+            child,
+            when_expr_id,
+            source,
+            arms,
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn guarded_match_value_arm_expr(
@@ -10783,6 +10873,20 @@ fn update_value_expression_from_expr(
             update_value_match_infix_from_input(field, target, fields, input, expr.id, source)
         {
             return Some(expression);
+        }
+        if let Some(raw_input) = text_is_empty_input_path(field, input) {
+            let input = source.map_or_else(
+                || canonical_scalar_update_path_with_fields(field, target, &raw_input, fields),
+                |source| {
+                    canonical_scalar_update_path_for_source(
+                        field, target, &raw_input, fields, source,
+                    )
+                },
+            );
+            let arms = match_value_arms_for_when(field, target, fields, expr.id, source);
+            if !arms.is_empty() {
+                return Some(UpdateValueExpression::MatchTextIsEmptyConst { input, arms });
+            }
         }
         let raw_input = ast_argument_value(field, input)?;
         let input = source.map_or_else(

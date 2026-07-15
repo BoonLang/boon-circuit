@@ -6577,10 +6577,10 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
                     || actual.open
             })
         }
-        (Type::VariantSet(actual), Type::VariantSet(expected)) => expected.iter().all(|expected| {
-            actual
+        (Type::VariantSet(actual), Type::VariantSet(expected)) => actual.iter().all(|actual| {
+            expected
                 .iter()
-                .any(|actual| variant_is_assignable_to(actual, expected))
+                .any(|expected| variant_is_assignable_to(actual, expected))
         }),
         _ => false,
     }

@@ -2288,6 +2288,7 @@ store: [
     simulate_failure: SOURCE
     simulate_duplicate: SOURCE
     workspace_id: TEXT { workspace-1 } |> HOLD workspace_id
+    workspace_grant_id: TEXT { grant-1 } |> HOLD workspace_grant_id
     account_id: TEXT { account-1 } |> HOLD account_id
     credential_count: 1 |> HOLD credential_count
     simulation:
@@ -2360,6 +2361,7 @@ effects: [
         on: store.register
         perform: DevelopmentPasskey/register(
             workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
             account_id: store.account_id
             credential_count: store.credential_count
             simulation: store.simulation
@@ -2506,6 +2508,10 @@ fn correlated_effect_completion_routes_each_registration_variant_with_typed_fiel
                     (
                         "label",
                         boon_persistence::StoredValue::Text("Primary".to_owned()),
+                    ),
+                    (
+                        "workspace_grant_bound",
+                        boon_persistence::StoredValue::Bool(true),
                     ),
                 ],
             ),
@@ -2727,6 +2733,10 @@ fn reconciliation_completion_routes_result_after_session_restart() {
                 "label",
                 boon_persistence::StoredValue::Text("Restored".to_owned()),
             ),
+            (
+                "workspace_grant_bound",
+                boon_persistence::StoredValue::Bool(true),
+            ),
         ],
     );
     let completion = restored.complete_effect(&reconciling, outcome).unwrap();
@@ -2749,6 +2759,51 @@ fn reconciliation_completion_routes_result_after_session_restart() {
         snapshot.states[&state_id(&machine, "store.result_account_id")],
         Value::Text("restored-account".to_owned())
     );
+}
+
+#[test]
+fn generated_plan_executes_nested_text_is_empty_match_updates() {
+    let machine = boon_compiler::compile_source_text_to_machine_plan(
+        "nested-text-empty-update.bn",
+        r#"
+store: [
+    pulse: SOURCE
+    ownership: AnonymousGrant |> HOLD ownership
+    grant:
+        TEXT { } |> HOLD grant {
+            pulse |> THEN {
+                ownership == AccountOwned |> WHEN {
+                    True => TEXT { }
+                    False => Text/is_empty(grant) |> WHEN {
+                        True => TEXT { generated-grant }
+                        False => grant
+                    }
+                }
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan;
+    let pulse = source_id(&machine, "store.pulse");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+
+    for sequence in 1..=2 {
+        session
+            .apply(SourceEvent {
+                sequence,
+                source: pulse,
+                target: None,
+                payload: SourcePayload::default(),
+            })
+            .unwrap();
+        assert_eq!(
+            session.root_value_current("store.grant").unwrap(),
+            Value::Text("generated-grant".to_owned())
+        );
+    }
 }
 
 #[test]

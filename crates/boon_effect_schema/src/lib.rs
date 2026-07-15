@@ -131,6 +131,7 @@ fn development_passkey_registration() -> HostEffectSpec {
         durable_schema: Some(DurableSchema {
             intent: record([
                 field("workspace_id", ValueType::Text),
+                field("workspace_grant_id", ValueType::Text),
                 field("account_id", ValueType::Text),
                 field("credential_count", ValueType::Number),
                 field("simulation", development_simulation()),
@@ -143,6 +144,7 @@ fn development_passkey_registration() -> HostEffectSpec {
                             field("account_id", ValueType::Text),
                             field("credential_id", ValueType::Text),
                             field("label", ValueType::Text),
+                            field("workspace_grant_bound", ValueType::Bool),
                         ],
                     ),
                     variant("RegistrationCancelled", []),
@@ -252,5 +254,40 @@ mod tests {
             assert!(matches!(schema.result, ValueType::Variant { .. }));
         }
         assert!(host_effect_spec("Passkey/register").is_none());
+    }
+
+    #[test]
+    fn development_registration_binds_an_explicit_workspace_grant() {
+        let schema = host_effect_spec("DevelopmentPasskey/register")
+            .unwrap()
+            .durable_schema
+            .unwrap();
+        let ValueType::Record {
+            fields,
+            open: false,
+        } = schema.intent
+        else {
+            panic!("registration intent must be a closed record");
+        };
+        assert_eq!(
+            fields.iter().map(|field| field.name).collect::<Vec<_>>(),
+            [
+                "workspace_id",
+                "workspace_grant_id",
+                "account_id",
+                "credential_count",
+                "simulation",
+            ]
+        );
+        let ValueType::Variant { variants } = schema.result else {
+            panic!("registration result must be a closed variant");
+        };
+        let success = variants
+            .iter()
+            .find(|variant| variant.tag == "RegistrationSucceeded")
+            .unwrap();
+        assert!(success.fields.iter().any(|field| {
+            field.name == "workspace_grant_bound" && field.value_type == ValueType::Bool
+        }));
     }
 }

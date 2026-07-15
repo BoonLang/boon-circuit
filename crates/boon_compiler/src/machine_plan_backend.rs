@@ -10485,6 +10485,7 @@ fn infix_operand_value_ref(
             resolve_update_value_ref(index, source, target, indexed, path)
         }
         UpdateValueExpression::MatchConst { .. }
+        | UpdateValueExpression::MatchTextIsEmptyConst { .. }
         | UpdateValueExpression::NumberInfix { .. }
         | UpdateValueExpression::MatchInfixConst { .. } => None,
     }
@@ -10513,6 +10514,7 @@ fn update_value_expression_value_ref(
             resolve_update_value_ref(index, source, target, indexed, path)
         }
         UpdateValueExpression::MatchConst { .. }
+        | UpdateValueExpression::MatchTextIsEmptyConst { .. }
         | UpdateValueExpression::NumberInfix { .. }
         | UpdateValueExpression::MatchInfixConst { .. } => None,
     }
@@ -10544,6 +10546,42 @@ fn ordered_update_value_expression_inputs(
                 constants,
                 PlanConstantValue::Text {
                     value: "match_const".to_owned(),
+                },
+            );
+            let input_ref = resolve_update_value_ref(index, source, target, indexed, input)?;
+            let arm_count = i64::try_from(arms.len()).ok()?;
+            let arm_count_constant_id =
+                push_plan_constant(constants, PlanConstantValue::Number { value: arm_count });
+            let mut refs = vec![
+                ValueRef::Constant(tag_constant_id),
+                input_ref,
+                ValueRef::Constant(arm_count_constant_id),
+            ];
+            for arm in arms {
+                let pattern_constant_id = push_plan_constant(
+                    constants,
+                    PlanConstantValue::Text {
+                        value: arm.pattern.clone(),
+                    },
+                );
+                let mut output_refs = ordered_update_value_expression_inputs(
+                    index,
+                    constants,
+                    source,
+                    target,
+                    indexed,
+                    &arm.output,
+                )?;
+                refs.push(ValueRef::Constant(pattern_constant_id));
+                refs.append(&mut output_refs);
+            }
+            Some(refs)
+        }
+        UpdateValueExpression::MatchTextIsEmptyConst { input, arms } => {
+            let tag_constant_id = push_plan_constant(
+                constants,
+                PlanConstantValue::Text {
+                    value: "match_text_is_empty_const".to_owned(),
                 },
             );
             let input_ref = resolve_update_value_ref(index, source, target, indexed, input)?;
@@ -10723,6 +10761,22 @@ fn collect_update_value_expression_refs(
             resolve_update_path(index, source, target, indexed, path, refs, unresolved)
         }
         UpdateValueExpression::MatchConst { input, arms } => {
+            let mut count =
+                resolve_update_path(index, source, target, indexed, input, refs, unresolved);
+            for arm in arms {
+                count += collect_update_value_expression_refs(
+                    index,
+                    source,
+                    target,
+                    indexed,
+                    &arm.output,
+                    refs,
+                    unresolved,
+                );
+            }
+            count
+        }
+        UpdateValueExpression::MatchTextIsEmptyConst { input, arms } => {
             let mut count =
                 resolve_update_path(index, source, target, indexed, input, refs, unresolved);
             for arm in arms {

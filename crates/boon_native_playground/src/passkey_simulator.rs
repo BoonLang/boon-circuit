@@ -76,11 +76,23 @@ fn registration_result(
     intent: &BTreeMap<String, StoredValue>,
 ) -> Result<StoredValue, HostEffectError> {
     let workspace_id = text_field(intent, "workspace_id")?;
+    let workspace_grant_id = text_field(intent, "workspace_grant_id")?;
     let account_id = text_field(intent, "account_id")?;
     let credential_count = number_field(intent, "credential_count")?;
     let simulation = variant_tag_field(intent, "simulation")?;
-    let account_id = if account_id.is_empty() {
-        stable_public_id("account", workspace_id, 0)
+    if workspace_id.is_empty() {
+        return Err(HostEffectError::rejected(
+            "passkey registration requires a workspace identity",
+        ));
+    }
+    if account_id.is_empty() && workspace_grant_id.is_empty() {
+        return Err(HostEffectError::rejected(
+            "first passkey registration requires an anonymous workspace grant",
+        ));
+    }
+    let first_registration = account_id.is_empty();
+    let account_id = if first_registration {
+        stable_public_id("account", workspace_grant_id, 0)
     } else {
         account_id.to_owned()
     };
@@ -118,6 +130,10 @@ fn registration_result(
                     (
                         "label",
                         StoredValue::Text(format!("Development passkey {ordinal}")),
+                    ),
+                    (
+                        "workspace_grant_bound",
+                        StoredValue::Bool(first_registration),
                     ),
                 ],
             )
@@ -278,6 +294,10 @@ mod tests {
                             "workspace_id".to_owned(),
                             StoredValue::Text("workspace-test".to_owned()),
                         ),
+                        (
+                            "workspace_grant_id".to_owned(),
+                            StoredValue::Text("grant-test".to_owned()),
+                        ),
                         ("account_id".to_owned(), StoredValue::Text(String::new())),
                         ("credential_count".to_owned(), StoredValue::Number(count)),
                         ("simulation".to_owned(), variant(simulation, [])),
@@ -286,6 +306,71 @@ mod tests {
                 .unwrap();
             assert!(matches!(outcome, StoredValue::Variant { ref tag, .. } if tag == expected));
         }
+    }
+
+    #[test]
+    fn registration_binds_private_grant_only_for_the_first_account_credential() {
+        let mut simulator = DevelopmentPasskeySimulator::registration();
+        let first = simulator
+            .dispatch(&request(
+                REGISTER_OPERATION,
+                BTreeMap::from([
+                    (
+                        "workspace_id".to_owned(),
+                        StoredValue::Text("workspace-public".to_owned()),
+                    ),
+                    (
+                        "workspace_grant_id".to_owned(),
+                        StoredValue::Text("workspace-private-grant".to_owned()),
+                    ),
+                    ("account_id".to_owned(), StoredValue::Text(String::new())),
+                    ("credential_count".to_owned(), StoredValue::Number(0)),
+                    ("simulation".to_owned(), variant("Success", [])),
+                ]),
+            ))
+            .unwrap();
+        let StoredValue::Variant {
+            tag,
+            fields: first_fields,
+        } = first
+        else {
+            panic!("registration result must be a variant");
+        };
+        assert_eq!(tag, "RegistrationSucceeded");
+        assert_eq!(
+            first_fields["workspace_grant_bound"],
+            StoredValue::Bool(true)
+        );
+        let StoredValue::Text(account_id) = &first_fields["account_id"] else {
+            panic!("first registration must create a public account id");
+        };
+
+        let second = simulator
+            .dispatch(&request(
+                REGISTER_OPERATION,
+                BTreeMap::from([
+                    (
+                        "workspace_id".to_owned(),
+                        StoredValue::Text("workspace-public".to_owned()),
+                    ),
+                    (
+                        "workspace_grant_id".to_owned(),
+                        StoredValue::Text(String::new()),
+                    ),
+                    (
+                        "account_id".to_owned(),
+                        StoredValue::Text(account_id.clone()),
+                    ),
+                    ("credential_count".to_owned(), StoredValue::Number(1)),
+                    ("simulation".to_owned(), variant("Success", [])),
+                ]),
+            ))
+            .unwrap();
+        let StoredValue::Variant { tag, fields } = second else {
+            panic!("registration result must be a variant");
+        };
+        assert_eq!(tag, "RegistrationSucceeded");
+        assert_eq!(fields["workspace_grant_bound"], StoredValue::Bool(false));
     }
 
     #[test]

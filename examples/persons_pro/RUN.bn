@@ -36,10 +36,11 @@ store: [
         register_passkey: SOURCE
         sign_out: SOURCE
         sign_in: SOURCE
-        simulate_success: SOURCE
-        simulate_cancel: SOURCE
-        simulate_failure: SOURCE
-        simulate_duplicate: SOURCE
+        simulate_registration_cancel: SOURCE
+        simulate_registration_failure: SOURCE
+        simulate_registration_duplicate: SOURCE
+        simulate_authentication_cancel: SOURCE
+        simulate_authentication_failure: SOURCE
         publish: SOURCE
         theme_toggle: SOURCE
     ]
@@ -64,6 +65,29 @@ store: [
             }
         }
     workspace_path: TEXT { persons.pro/p/{workspace_id} }
+    workspace_grant_state:
+        AnonymousGrant |> HOLD workspace_grant_state {
+            passkey.registration_succeeded |> THEN {
+                passkey.registration_succeeded.workspace_grant_bound |> WHEN {
+                    True => PendingRevocation
+                    False => workspace_grant_state
+                }
+            }
+            passkey.authentication_succeeded |> THEN { AccountOwned }
+        }
+    workspace_grant_id:
+        Text/empty() |> HOLD workspace_grant_id {
+            host.lifecycle.started |> THEN {
+                workspace_grant_state == AccountOwned |> WHEN {
+                    True => Text/empty()
+                    False => Text/is_empty(workspace_grant_id) |> WHEN {
+                        True => host.lifecycle.started.grant_id
+                        False => workspace_grant_id
+                    }
+                }
+            }
+            passkey.authentication_succeeded |> THEN { Text/empty() }
+        }
     implementation_stage: LocalFirst
 
     source_draft:
@@ -83,12 +107,6 @@ store: [
             elements.source_editor.event.change |> THEN { Compiling }
             elements.draft_program.compiled |> THEN { Ready }
             elements.draft_program.rejected |> THEN { Invalid }
-        }
-
-    draft_compile_digest:
-        Text/empty() |> HOLD draft_compile_digest {
-            elements.draft_program.compiled
-                |> THEN { elements.draft_program.compiled.source_digest }
         }
 
     draft_compile_diagnostic:
@@ -130,16 +148,6 @@ store: [
             }
         }
 
-    last_valid_draft_source:
-        Profile/starter_source() |> HOLD last_valid_draft_source {
-            elements.draft_program.compiled |> THEN {
-                elements.draft_program.compiled.bootstrap |> WHEN {
-                    True => last_valid_draft_source
-                    False => source_draft
-                }
-            }
-        }
-
     last_valid_draft_artifact_id:
         Text/empty() |> HOLD last_valid_draft_artifact_id {
             elements.draft_program.compiled |> THEN {
@@ -173,19 +181,14 @@ store: [
             elements.preview_desktop.event.press |> THEN { Desktop }
         }
 
-    passkey_simulation:
-        LATEST {
-            Success
-            elements.simulate_success.event.press |> THEN { Success }
-            elements.simulate_cancel.event.press |> THEN { Cancel }
-            elements.simulate_failure.event.press |> THEN { Failure }
-            elements.simulate_duplicate.event.press |> THEN { Duplicate }
-        }
-
     account_id:
         Text/empty() |> HOLD account_id {
-            passkey.registration_succeeded
-                |> THEN { passkey.registration_succeeded.account_id }
+            passkey.registration_succeeded |> THEN {
+                passkey.registration_succeeded.workspace_grant_bound |> WHEN {
+                    True => passkey.registration_succeeded.account_id
+                    False => account_id
+                }
+            }
         }
 
     registered_credential:
@@ -239,7 +242,12 @@ store: [
         LATEST {
             Idle
             elements.register_passkey.event.press |> THEN { Registering }
+            elements.simulate_registration_cancel.event.press |> THEN { Registering }
+            elements.simulate_registration_failure.event.press |> THEN { Registering }
+            elements.simulate_registration_duplicate.event.press |> THEN { Registering }
             elements.sign_in.event.press |> THEN { Authenticating }
+            elements.simulate_authentication_cancel.event.press |> THEN { Authenticating }
+            elements.simulate_authentication_failure.event.press |> THEN { Authenticating }
             passkey.registration_succeeded |> THEN { Registered }
             passkey.registration_cancelled |> THEN { Cancelled }
             passkey.registration_failed |> THEN { Failed }
@@ -403,9 +411,58 @@ effects: [
         on: store.elements.register_passkey
         perform: DevelopmentPasskey/register(
             workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
             account_id: store.account_id
             credential_count: store.credential_count
-            simulation: store.passkey_simulation
+            simulation: Success
+        )
+        results: [
+            RegistrationSucceeded: store.passkey.registration_succeeded
+            RegistrationCancelled: store.passkey.registration_cancelled
+            RegistrationFailed: store.passkey.registration_failed
+            DuplicateCredential: store.passkey.duplicate_credential
+        ]
+    ]
+    register_passkey_cancel: [
+        on: store.elements.simulate_registration_cancel
+        perform: DevelopmentPasskey/register(
+            workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: Cancel
+        )
+        results: [
+            RegistrationSucceeded: store.passkey.registration_succeeded
+            RegistrationCancelled: store.passkey.registration_cancelled
+            RegistrationFailed: store.passkey.registration_failed
+            DuplicateCredential: store.passkey.duplicate_credential
+        ]
+    ]
+    register_passkey_failure: [
+        on: store.elements.simulate_registration_failure
+        perform: DevelopmentPasskey/register(
+            workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: Failure
+        )
+        results: [
+            RegistrationSucceeded: store.passkey.registration_succeeded
+            RegistrationCancelled: store.passkey.registration_cancelled
+            RegistrationFailed: store.passkey.registration_failed
+            DuplicateCredential: store.passkey.duplicate_credential
+        ]
+    ]
+    register_passkey_duplicate: [
+        on: store.elements.simulate_registration_duplicate
+        perform: DevelopmentPasskey/register(
+            workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: Duplicate
         )
         results: [
             RegistrationSucceeded: store.passkey.registration_succeeded
@@ -419,7 +476,33 @@ effects: [
         perform: DevelopmentPasskey/authenticate(
             account_id: store.account_id
             credential_count: store.credential_count
-            simulation: store.passkey_simulation
+            simulation: Success
+        )
+        results: [
+            AuthenticationSucceeded: store.passkey.authentication_succeeded
+            AuthenticationCancelled: store.passkey.authentication_cancelled
+            AuthenticationFailed: store.passkey.authentication_failed
+        ]
+    ]
+    authenticate_cancel: [
+        on: store.elements.simulate_authentication_cancel
+        perform: DevelopmentPasskey/authenticate(
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: Cancel
+        )
+        results: [
+            AuthenticationSucceeded: store.passkey.authentication_succeeded
+            AuthenticationCancelled: store.passkey.authentication_cancelled
+            AuthenticationFailed: store.passkey.authentication_failed
+        ]
+    ]
+    authenticate_failure: [
+        on: store.elements.simulate_authentication_failure
+        perform: DevelopmentPasskey/authenticate(
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: Failure
         )
         results: [
             AuthenticationSucceeded: store.passkey.authentication_succeeded

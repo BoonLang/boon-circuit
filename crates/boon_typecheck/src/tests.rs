@@ -18,6 +18,7 @@ store: [
     simulate_failure: SOURCE
     simulate_duplicate: SOURCE
     workspace_id: TEXT { workspace-1 }
+    workspace_grant_id: TEXT { grant-1 }
     account_id: TEXT {}
     credential_count: 0
     simulation:
@@ -35,6 +36,7 @@ effects: [
         on: store.register
         perform: DevelopmentPasskey/register(
             workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
             account_id: store.account_id
             credential_count: store.credential_count
             simulation: store.simulation
@@ -89,6 +91,7 @@ fn passkey_effect_declaration_has_closed_named_intent_and_typed_result_sources()
             .collect::<Vec<_>>(),
         [
             "workspace_id",
+            "workspace_grant_id",
             "account_id",
             "credential_count",
             "simulation"
@@ -123,6 +126,89 @@ fn passkey_effect_declaration_has_closed_named_intent_and_typed_result_sources()
             ("message", Type::Text),
             ("retryable", true_false_type()),
         ])
+    );
+}
+
+#[test]
+fn variant_assignment_accepts_narrow_values_and_rejects_wider_values() {
+    let success = Type::VariantSet(vec![Variant::Tag("Success".to_owned())]);
+    let development_outcome = Type::VariantSet(vec![
+        Variant::Tag("Cancel".to_owned()),
+        Variant::Tag("Duplicate".to_owned()),
+        Variant::Tag("Failure".to_owned()),
+        Variant::Tag("Success".to_owned()),
+    ]);
+
+    assert!(type_is_assignable_to(&success, &development_outcome));
+    assert!(!type_is_assignable_to(&development_outcome, &success));
+}
+
+#[test]
+fn typed_host_effect_allows_multiple_declarations_for_one_operation() {
+    let parsed = boon_parser::parse_source(
+        "repeated-typed-host-effect.bn",
+        r#"
+store: [
+    register_success: SOURCE
+    register_cancel: SOURCE
+    registration_succeeded: SOURCE
+    registration_cancelled: SOURCE
+    registration_failed: SOURCE
+    duplicate_credential: SOURCE
+    workspace_id: TEXT { workspace-1 }
+    workspace_grant_id: TEXT { grant-1 }
+    account_id: TEXT {}
+    credential_count: 0
+]
+
+effects: [
+    success: [
+        on: store.register_success
+        perform: DevelopmentPasskey/register(
+            workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: Success
+        )
+        results: [
+            RegistrationSucceeded: store.registration_succeeded
+            RegistrationCancelled: store.registration_cancelled
+            RegistrationFailed: store.registration_failed
+            DuplicateCredential: store.duplicate_credential
+        ]
+    ]
+    cancel: [
+        on: store.register_cancel
+        perform: DevelopmentPasskey/register(
+            workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: Cancel
+        )
+        results: [
+            RegistrationSucceeded: store.registration_succeeded
+            RegistrationCancelled: store.registration_cancelled
+            RegistrationFailed: store.registration_failed
+            DuplicateCredential: store.duplicate_credential
+        ]
+    ]
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(report.host_effect_table.declarations.len(), 2);
+    assert_ne!(
+        report.host_effect_table.declarations[0].perform_expr_id,
+        report.host_effect_table.declarations[1].perform_expr_id
     );
 }
 
@@ -164,6 +250,7 @@ store: [
     simulation: Success
     invalid:
         store.workspace_id |> DevelopmentPasskey/register(
+            workspace_grant_id: TEXT { grant-1 }
             account_id: store.account_id
             credential_count: store.credential_count
             simulation: store.simulation

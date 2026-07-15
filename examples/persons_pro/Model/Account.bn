@@ -24,6 +24,23 @@ FUNCTION credential(credential) {
     ]
 }
 
+FUNCTION grant_status_label(state) {
+    state |> WHEN {
+        AnonymousGrant => TEXT { Anonymous grant active }
+        PendingRevocation => TEXT { Grant retained until sign-in }
+        AccountOwned => TEXT { Account-owned workspace }
+        __ => TEXT { Authority unavailable }
+    }
+}
+
+FUNCTION grant_status_tone(state) {
+    state |> WHEN {
+        PendingRevocation => Warning
+        AccountOwned => Success
+        __ => Neutral
+    }
+}
+
 FUNCTION workflow_label(state) {
     state |> WHEN {
         Registering => TEXT { Registering }

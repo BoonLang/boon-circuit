@@ -6933,7 +6933,7 @@ impl Session {
                 let right = EvalValue::Value(self.eval_update_ref(right, row, event, work)?);
                 eval_number_infix(&operator, &left, &right)
             }
-            "match_const" => {
+            "match_const" | "match_text_is_empty_const" => {
                 let input = inputs
                     .get(*cursor)
                     .ok_or_else(|| Error::InvalidPlan("encoded match has no input".to_owned()))?;
@@ -6942,6 +6942,11 @@ impl Session {
                 })?;
                 *cursor += 2;
                 let input = value_to_text(&self.eval_update_ref(input, row, event, work)?)?;
+                let input = if tag == "match_text_is_empty_const" {
+                    if input.is_empty() { "True" } else { "False" }
+                } else {
+                    input.as_str()
+                };
                 let arm_count = nonnegative_usize(
                     value_to_number(&self.eval_update_ref(arm_count, row, event, work)?)?,
                     "encoded match arm count",

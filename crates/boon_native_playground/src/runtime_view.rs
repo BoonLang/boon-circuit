@@ -3463,19 +3463,29 @@ fn has_host_lifecycle_started_source(runtime: &LiveRuntime) -> bool {
 }
 
 fn host_lifecycle_started_payload(mode: HostIdentityMode, generation: u64) -> SourcePayload {
-    let instance_id = match mode {
-        HostIdentityMode::Interactive => uuid::Uuid::new_v4().hyphenated().to_string(),
-        HostIdentityMode::Deterministic => {
+    let (instance_id, grant_id) = match mode {
+        HostIdentityMode::Interactive => (
+            uuid::Uuid::new_v4().hyphenated().to_string(),
+            uuid::Uuid::new_v4().hyphenated().to_string(),
+        ),
+        HostIdentityMode::Deterministic => (
             format!(
                 "00000000-0000-4000-8000-{:012x}",
                 generation.min(0xffff_ffff_ffff)
-            )
-        }
+            ),
+            format!(
+                "10000000-0000-4000-8000-{:012x}",
+                generation.min(0xffff_ffff_ffff)
+            ),
+        ),
     };
     SourcePayload {
-        fields: [("instance_id".to_owned(), Value::Text(instance_id))]
-            .into_iter()
-            .collect(),
+        fields: [
+            ("instance_id".to_owned(), Value::Text(instance_id)),
+            ("grant_id".to_owned(), Value::Text(grant_id)),
+        ]
+        .into_iter()
+        .collect(),
         ..SourcePayload::default()
     }
 }
@@ -4405,13 +4415,10 @@ document: Document/new(
             [
                 "store.account_id",
                 "store.active_view",
-                "store.draft_compile_digest",
                 "store.draft_revision",
                 "store.last_valid_draft_artifact_id",
                 "store.last_valid_draft_revision",
-                "store.last_valid_draft_source",
                 "store.mode",
-                "store.passkey_simulation",
                 "store.passkey_workflow_state",
                 "store.preview_surface",
                 "store.preview_width_mode",
@@ -4429,6 +4436,8 @@ document: Document/new(
                 "store.published_target",
                 "store.signed_out",
                 "store.source_draft",
+                "store.workspace_grant_id",
+                "store.workspace_grant_state",
                 "store.workspace_id",
             ]
             .into_iter()
@@ -4508,14 +4517,24 @@ document: Document/new(
         let mut model = RuntimeView::open_in_memory(runtime).unwrap();
         complete_pending_programs_successfully(&mut model);
 
-        for (mode_source, expected_state) in [
-            ("store.elements.simulate_cancel", "Cancelled"),
-            ("store.elements.simulate_failure", "Failed"),
+        let initial_grant = model
+            .runtime
+            .inspect_value_current("store.workspace_grant_id", 1)
+            .unwrap();
+        assert!(matches!(&initial_grant, Value::Text(value) if !value.is_empty()));
+        assert_current_values(
+            &mut model,
+            &[(
+                "store.workspace_grant_state",
+                Value::Text("AnonymousGrant".to_owned()),
+            )],
+        );
+
+        for (action_source, expected_state) in [
+            ("store.elements.simulate_registration_cancel", "Cancelled"),
+            ("store.elements.simulate_registration_failure", "Failed"),
         ] {
-            model
-                .dispatch_source(mode_source, None, SourcePayload::default())
-                .unwrap();
-            dispatch_effect_action(&mut model, "store.elements.register_passkey");
+            dispatch_effect_action(&mut model, action_source);
             assert_current_values(
                 &mut model,
                 &[
@@ -4526,17 +4545,15 @@ document: Document/new(
                     ("store.account_state", Value::Text("Anonymous".to_owned())),
                     ("store.account_id", Value::Text(String::new())),
                     ("store.credential_count", Value::Number(0)),
+                    ("store.workspace_grant_id", initial_grant.clone()),
+                    (
+                        "store.workspace_grant_state",
+                        Value::Text("AnonymousGrant".to_owned()),
+                    ),
                 ],
             );
         }
 
-        model
-            .dispatch_source(
-                "store.elements.simulate_success",
-                None,
-                SourcePayload::default(),
-            )
-            .unwrap();
         dispatch_effect_action(&mut model, "store.elements.register_passkey");
         let account_id = model
             .runtime
@@ -4555,17 +4572,15 @@ document: Document/new(
                 ),
                 ("store.account_state", Value::Text("OnePasskey".to_owned())),
                 ("store.credential_count", Value::Number(1)),
+                ("store.workspace_grant_id", initial_grant.clone()),
+                (
+                    "store.workspace_grant_state",
+                    Value::Text("PendingRevocation".to_owned()),
+                ),
             ],
         );
 
-        model
-            .dispatch_source(
-                "store.elements.simulate_duplicate",
-                None,
-                SourcePayload::default(),
-            )
-            .unwrap();
-        dispatch_effect_action(&mut model, "store.elements.register_passkey");
+        dispatch_effect_action(&mut model, "store.elements.simulate_registration_duplicate");
         assert_current_values(
             &mut model,
             &[
@@ -4575,16 +4590,10 @@ document: Document/new(
                 ),
                 ("store.account_id", account_id.clone()),
                 ("store.credential_count", Value::Number(1)),
+                ("store.workspace_grant_id", initial_grant.clone()),
             ],
         );
 
-        model
-            .dispatch_source(
-                "store.elements.simulate_success",
-                None,
-                SourcePayload::default(),
-            )
-            .unwrap();
         dispatch_effect_action(&mut model, "store.elements.register_passkey");
         assert_current_values(
             &mut model,
@@ -4592,20 +4601,22 @@ document: Document/new(
                 ("store.account_id", account_id.clone()),
                 ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
                 ("store.credential_count", Value::Number(2)),
+                ("store.workspace_grant_id", initial_grant.clone()),
+                (
+                    "store.workspace_grant_state",
+                    Value::Text("PendingRevocation".to_owned()),
+                ),
             ],
         );
 
         model
             .dispatch_source("store.elements.sign_out", None, SourcePayload::default())
             .unwrap();
-        for (mode_source, expected_state) in [
-            ("store.elements.simulate_cancel", "Cancelled"),
-            ("store.elements.simulate_failure", "Failed"),
+        for (action_source, expected_state) in [
+            ("store.elements.simulate_authentication_cancel", "Cancelled"),
+            ("store.elements.simulate_authentication_failure", "Failed"),
         ] {
-            model
-                .dispatch_source(mode_source, None, SourcePayload::default())
-                .unwrap();
-            dispatch_effect_action(&mut model, "store.elements.sign_in");
+            dispatch_effect_action(&mut model, action_source);
             assert_current_values(
                 &mut model,
                 &[
@@ -4616,17 +4627,15 @@ document: Document/new(
                     ("store.account_state", Value::Text("SignedOut".to_owned())),
                     ("store.account_id", account_id.clone()),
                     ("store.credential_count", Value::Number(2)),
+                    ("store.workspace_grant_id", initial_grant.clone()),
+                    (
+                        "store.workspace_grant_state",
+                        Value::Text("PendingRevocation".to_owned()),
+                    ),
                 ],
             );
         }
 
-        model
-            .dispatch_source(
-                "store.elements.simulate_success",
-                None,
-                SourcePayload::default(),
-            )
-            .unwrap();
         dispatch_effect_action(&mut model, "store.elements.sign_in");
         assert_current_values(
             &mut model,
@@ -4638,6 +4647,11 @@ document: Document/new(
                 ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
                 ("store.account_id", account_id),
                 ("store.credential_count", Value::Number(2)),
+                ("store.workspace_grant_id", Value::Text(String::new())),
+                (
+                    "store.workspace_grant_state",
+                    Value::Text("AccountOwned".to_owned()),
+                ),
             ],
         );
     }
@@ -4880,7 +4894,7 @@ document: Document/new(
         assert!(model.retained_frame().nodes.values().any(|node| {
             node.text
                 .as_ref()
-                .is_some_and(|text| text.text == "Development passkey simulator")
+                .is_some_and(|text| text.text == "Development passkey outcomes")
         }));
         let source_paths = model
             .retained_frame()
@@ -5928,12 +5942,15 @@ document: Document/new(
             .expect("newer draft request");
         assert_ne!(newer.request_id, older.request_id);
 
+        let active_before_stale = model
+            .program_host
+            .active_artifact(&older.session)
+            .map(ProgramArtifact::id_text)
+            .expect("invalid draft retained a last-valid child artifact");
+        let older_artifact = boon_runtime::compile_program_artifact(&older.compile).unwrap();
+        let older_artifact_id = older_artifact.id_text();
         let stale = model
-            .complete_program_observed(
-                &older.session,
-                &older.request_id,
-                boon_runtime::compile_program_artifact(&older.compile),
-            )
+            .complete_program_observed(&older.session, &older.request_id, Ok(older_artifact))
             .unwrap();
         assert!(!stale.changed);
         assert_eq!(
@@ -5943,28 +5960,33 @@ document: Document/new(
                 request_id: older.request_id.clone(),
             })
         );
+        assert_eq!(
+            model
+                .program_host
+                .active_artifact(&older.session)
+                .map(ProgramArtifact::id_text),
+            Some(active_before_stale)
+        );
         assert_ne!(
             model
-                .runtime
-                .inspect_value_current("store.last_valid_draft_source", 1)
-                .unwrap(),
-            Value::Text(older_source.to_owned())
+                .program_host
+                .active_artifact(&older.session)
+                .map(ProgramArtifact::id_text),
+            Some(older_artifact_id)
         );
 
+        let newer_artifact = boon_runtime::compile_program_artifact(&newer.compile).unwrap();
+        let newer_artifact_id = newer_artifact.id_text();
         model
-            .complete_program(
-                &newer.session,
-                &newer.request_id,
-                boon_runtime::compile_program_artifact(&newer.compile),
-            )
+            .complete_program(&newer.session, &newer.request_id, Ok(newer_artifact))
             .unwrap();
         complete_pending_programs_successfully(&mut model);
         assert_eq!(
             model
-                .runtime
-                .inspect_value_current("store.last_valid_draft_source", 1)
-                .unwrap(),
-            Value::Text(newer_source.to_owned())
+                .program_host
+                .active_artifact(&newer.session)
+                .map(ProgramArtifact::id_text),
+            Some(newer_artifact_id)
         );
         assert!(model.retained_frame().nodes.values().any(|node| {
             node.text
@@ -6071,6 +6093,10 @@ document: Document/new(
             .runtime
             .inspect_value_current("store.workspace_id", 1)
             .unwrap();
+        let workspace_grant_id = first
+            .runtime
+            .inspect_value_current("store.workspace_grant_id", 1)
+            .unwrap();
         for _ in 0..2 {
             dispatch_effect_action(&mut first, "store.elements.register_passkey");
         }
@@ -6144,10 +6170,6 @@ document: Document/new(
             &[
                 ("store.source_draft", Value::Text(invalid_source.to_owned())),
                 (
-                    "store.last_valid_draft_source",
-                    Value::Text(valid_source.to_owned()),
-                ),
-                (
                     "store.published_source",
                     Value::Text(valid_source.to_owned()),
                 ),
@@ -6158,6 +6180,11 @@ document: Document/new(
                 ("store.published_revision_count", Value::Number(1)),
                 ("store.account_id", account_id.clone()),
                 ("store.credential_count", Value::Number(2)),
+                ("store.workspace_grant_id", workspace_grant_id.clone()),
+                (
+                    "store.workspace_grant_state",
+                    Value::Text("PendingRevocation".to_owned()),
+                ),
             ],
         );
         let acknowledged_authority = authoritative_semantic_snapshot(&mut first, &plan);
@@ -6177,10 +6204,6 @@ document: Document/new(
             &[
                 ("store.source_draft", Value::Text(invalid_source.to_owned())),
                 (
-                    "store.last_valid_draft_source",
-                    Value::Text(valid_source.to_owned()),
-                ),
-                (
                     "store.published_source",
                     Value::Text(valid_source.to_owned()),
                 ),
@@ -6188,6 +6211,11 @@ document: Document/new(
                 ("store.published_revision_count", Value::Number(1)),
                 ("store.account_id", account_id),
                 ("store.workspace_id", workspace_id.clone()),
+                ("store.workspace_grant_id", workspace_grant_id.clone()),
+                (
+                    "store.workspace_grant_state",
+                    Value::Text("PendingRevocation".to_owned()),
+                ),
                 ("store.credential_count", Value::Number(2)),
                 ("store.account_state", Value::Text("TwoPasskeys".to_owned())),
                 ("store.publish_state", Value::Text("Published".to_owned())),
@@ -6313,9 +6341,10 @@ document: Document/new(
             &[
                 ("store.workspace_id", workspace_id),
                 ("store.source_draft", Value::Text(invalid_source.to_owned())),
+                ("store.workspace_grant_id", workspace_grant_id),
                 (
-                    "store.last_valid_draft_source",
-                    Value::Text(valid_source.to_owned()),
+                    "store.workspace_grant_state",
+                    Value::Text("PendingRevocation".to_owned()),
                 ),
                 (
                     "store.published_source",
@@ -6476,21 +6505,26 @@ document: Document/new(
             .into_iter()
             .find(|request| request.session.0 == "persons-public-draft")
             .expect("edited draft compile request");
+        let edited_artifact = boon_runtime::compile_program_artifact(&edited.compile).unwrap();
+        let edited_artifact_id = edited_artifact.id_text();
         first
-            .complete_program(
-                &edited.session,
-                &edited.request_id,
-                boon_runtime::compile_program_artifact(&edited.compile),
-            )
+            .complete_program(&edited.session, &edited.request_id, Ok(edited_artifact))
             .unwrap();
         complete_pending_programs_successfully(&mut first);
         let digest = boon_runtime::sha256_bytes(edited_source.as_bytes());
         assert_eq!(
             first
                 .runtime
-                .inspect_value_current("store.draft_compile_digest", 1)
+                .inspect_value_current("store.last_valid_draft_artifact_id", 1)
                 .unwrap(),
-            Value::Text(digest.clone())
+            Value::Text(edited_artifact_id.clone())
+        );
+        assert_eq!(
+            first
+                .program_host
+                .active_artifact(&ProgramSessionId("persons-public-draft".to_owned()))
+                .map(ProgramArtifact::source_digest),
+            Some(digest.as_str())
         );
         for _ in 0..2 {
             dispatch_effect_action(&mut first, "store.elements.register_passkey");
@@ -6543,9 +6577,16 @@ document: Document/new(
         assert_eq!(
             restored
                 .runtime
-                .inspect_value_current("store.draft_compile_digest", 1)
+                .inspect_value_current("store.last_valid_draft_artifact_id", 1)
                 .unwrap(),
-            Value::Text(digest.clone())
+            Value::Text(edited_artifact_id)
+        );
+        assert_eq!(
+            restored
+                .program_host
+                .active_artifact(&ProgramSessionId("persons-public-draft".to_owned()))
+                .map(ProgramArtifact::source_digest),
+            Some(digest.as_str())
         );
         assert_eq!(
             restored

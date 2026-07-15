@@ -591,6 +591,7 @@ store: [
     simulate_failure: SOURCE
     simulate_duplicate: SOURCE
     workspace_id: TEXT { workspace-1 } |> HOLD workspace_id
+    workspace_grant_id: TEXT { grant-1 } |> HOLD workspace_grant_id
     account_id: TEXT { account-1 } |> HOLD account_id
     credential_count: 1 |> HOLD credential_count
     simulation:
@@ -608,6 +609,7 @@ effects: [
         on: store.register
         perform: DevelopmentPasskey/register(
             workspace_id: store.workspace_id
+            workspace_grant_id: store.workspace_grant_id
             account_id: store.account_id
             credential_count: store.credential_count
             simulation: store.simulation
@@ -695,6 +697,7 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
             "account_id",
             "credential_count",
             "simulation",
+            "workspace_grant_id",
             "workspace_id"
         ]
     );

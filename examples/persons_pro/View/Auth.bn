@@ -10,6 +10,11 @@ FUNCTION controls() {
                 label: Account/status_label(state: PASSED.store.account_state)
                 tone: Account/status_tone(state: PASSED.store.account_state)
             )
+            Components/status(
+                PASS: [store: PASSED.store]
+                label: Account/grant_status_label(state: PASSED.store.workspace_grant_state)
+                tone: Account/grant_status_tone(state: PASSED.store.workspace_grant_state)
+            )
             PASSED.store.account_state |> WHEN {
                 Anonymous => Components/button(
                     PASS: [store: PASSED.store]
@@ -66,7 +71,7 @@ FUNCTION development_panel() {
                 items: LIST {
                     Components/text(
                         PASS: [store: PASSED.store]
-                        value: TEXT { Development passkey simulator }
+                        value: TEXT { Development passkey outcomes }
                         of: SmallHeading
                     )
                     Components/status(
@@ -76,7 +81,7 @@ FUNCTION development_panel() {
                     )
                 }
             )
-            simulation_modes()
+            development_outcomes()
             Components/text(
                 PASS: [store: PASSED.store]
                 value: PASSED.store.passkey_message
@@ -86,57 +91,66 @@ FUNCTION development_panel() {
     )
 }
 
-FUNCTION simulation_modes() {
+FUNCTION development_outcomes() {
     Scene/Element/stripe(
         element: []
         direction: Column
         gap: 6
         style: [width: Fill, paint: False]
         items: LIST {
-            Scene/Element/stripe(
-                element: []
-                direction: Row
-                gap: 6
-                style: [width: Fill, paint: False]
-                items: LIST {
-                    Components/button(
-                        PASS: [store: PASSED.store]
-                        label: TEXT { Success }
-                        tone: Neutral
-                        selected: PASSED.store.passkey_simulation == Success
-                    )
-                        |> SOURCE { PASSED.store.elements.simulate_success }
-                    Components/button(
-                        PASS: [store: PASSED.store]
-                        label: TEXT { Cancel }
-                        tone: Neutral
-                        selected: PASSED.store.passkey_simulation == Cancel
-                    )
-                        |> SOURCE { PASSED.store.elements.simulate_cancel }
-                }
-            )
-            Scene/Element/stripe(
-                element: []
-                direction: Row
-                gap: 6
-                style: [width: Fill, paint: False]
-                items: LIST {
-                    Components/button(
-                        PASS: [store: PASSED.store]
-                        label: TEXT { Failure }
-                        tone: Neutral
-                        selected: PASSED.store.passkey_simulation == Failure
-                    )
-                        |> SOURCE { PASSED.store.elements.simulate_failure }
-                    Components/button(
-                        PASS: [store: PASSED.store]
-                        label: TEXT { Duplicate }
-                        tone: Neutral
-                        selected: PASSED.store.passkey_simulation == Duplicate
-                    )
-                        |> SOURCE { PASSED.store.elements.simulate_duplicate }
-                }
-            )
+            PASSED.store.account_state |> WHEN {
+                SignedOut => Scene/Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 6
+                    style: [width: Fill, paint: False]
+                    items: LIST {
+                        Components/button(
+                            PASS: [store: PASSED.store]
+                            label: TEXT { Cancel sign-in }
+                            tone: Neutral
+                            selected: False
+                        )
+                            |> SOURCE { PASSED.store.elements.simulate_authentication_cancel }
+                        Components/button(
+                            PASS: [store: PASSED.store]
+                            label: TEXT { Fail sign-in }
+                            tone: Neutral
+                            selected: False
+                        )
+                            |> SOURCE { PASSED.store.elements.simulate_authentication_failure }
+                    }
+                )
+                __ => Scene/Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 6
+                    style: [width: Fill, paint: False]
+                    items: LIST {
+                        Components/button(
+                            PASS: [store: PASSED.store]
+                            label: TEXT { Cancel registration }
+                            tone: Neutral
+                            selected: False
+                        )
+                            |> SOURCE { PASSED.store.elements.simulate_registration_cancel }
+                        Components/button(
+                            PASS: [store: PASSED.store]
+                            label: TEXT { Fail registration }
+                            tone: Neutral
+                            selected: False
+                        )
+                            |> SOURCE { PASSED.store.elements.simulate_registration_failure }
+                        Components/button(
+                            PASS: [store: PASSED.store]
+                            label: TEXT { Duplicate credential }
+                            tone: Neutral
+                            selected: False
+                        )
+                            |> SOURCE { PASSED.store.elements.simulate_registration_duplicate }
+                    }
+                )
+            }
         }
     )
 }

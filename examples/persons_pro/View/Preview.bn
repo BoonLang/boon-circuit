@@ -79,7 +79,7 @@ FUNCTION draft_compiler() {
         artifact_retention: Replaceable
         bootstrap_source:
             Text/is_empty(PASSED.store.last_valid_draft_artifact_id) |> WHEN {
-                True => PASSED.store.last_valid_draft_source
+                True => Profile/starter_source()
                 False => Text/empty()
             }
         bootstrap_artifact_id: PASSED.store.last_valid_draft_artifact_id
@@ -103,7 +103,7 @@ FUNCTION draft_program() {
         artifact_retention: Replaceable
         bootstrap_source:
             Text/is_empty(PASSED.store.last_valid_draft_artifact_id) |> WHEN {
-                True => PASSED.store.last_valid_draft_source
+                True => Profile/starter_source()
                 False => Text/empty()
             }
         bootstrap_artifact_id: PASSED.store.last_valid_draft_artifact_id

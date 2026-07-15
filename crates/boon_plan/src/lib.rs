@@ -6912,6 +6912,15 @@ fn root_encoded_update_supported(
             cursor,
             false,
         ),
+        "match_text_is_empty_const" => root_encoded_nested_match_supported(
+            scalar_slots,
+            constants,
+            op,
+            output_type,
+            inputs,
+            cursor,
+            false,
+        ),
         "match_infix_const" => root_encoded_nested_match_supported(
             scalar_slots,
             constants,

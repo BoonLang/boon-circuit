@@ -25,17 +25,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::budget::{BudgetContract, BudgetUnit};
+use crate::observer::AsyncLaneKind;
 
 #[cfg(target_os = "linux")]
 use crate::observer::{
-    FrameEvidenceKey, FramePresented, InputAccepted, InputKind, MIGRATION_EVIDENCE_ENV,
-    NATIVE_SESSION_ID_ENV, OBSERVER_SOCKET_ENV, ObserverEvent, ObserverRole,
+    AsyncLaneOutcome, FrameEvidenceKey, FramePresented, InputAccepted, InputKind,
+    MIGRATION_EVIDENCE_ENV, NATIVE_SESSION_ID_ENV, NATIVE_WORKFLOW_PROOF_STEPS_ENV,
+    NATIVE_WORKFLOW_STEPS_ENV, OBSERVER_SOCKET_ENV, ObserverEvent, ObserverRole,
     PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
     PROFILE_BENCHMARK_STEPS_ENV, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV, PROOF_SAMPLE_ORDINAL_ENV,
     PersistenceEvidenceKind, ProofArtifact, RESPONSIVE_EVIDENCE_WIDTH_ENV, RoleMetadata,
     SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV,
     STATE_MOUNT_EVIDENCE_ENV, StartupDisposition, TestPointerPhase, read_event,
 };
+#[cfg(target_os = "linux")]
+use crate::proof::frame_capture_token_digest;
 #[cfg(target_os = "linux")]
 use crate::{
     native_input::NativeInput, ui::DEV_EDITOR_INPUT_TARGET, workspace_control::WorkspaceGuard,
@@ -98,10 +102,17 @@ struct VerifierProfile {
     budget_proof: Option<PathBuf>,
     loaded_budget: Option<LoadedBudgetContract>,
     required_budget_metrics: Vec<String>,
+    required_async_lanes: Vec<AsyncLaneKind>,
     profile_benchmark_steps: Vec<String>,
     state_root_policy: Option<String>,
     restart_required: bool,
     required_checkpoints: Vec<VerifierCheckpointRequirement>,
+    required_native_workflow_steps: Vec<String>,
+    required_native_workflow_proof_steps: BTreeSet<String>,
+    native_workflow_delivery: Option<String>,
+    native_workflow_scenario_boundary: Option<String>,
+    native_workflow_capture_method: Option<String>,
+    native_workflow_durability: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +160,9 @@ enum VerifierCheckpointRequirementKind {
     StaleCompileRejection,
     PersistenceOperation {
         operation: VerifierPersistenceOperation,
+    },
+    NativeWorkflowStep {
+        scenario_step: String,
     },
 }
 
@@ -203,6 +217,7 @@ impl VerifierProfile {
             budget_proof,
             loaded_budget,
             required_budget_metrics: parse_csv(args, "--required-budget-metrics")?,
+            required_async_lanes: parse_async_lanes(args)?,
             profile_benchmark_steps: parse_csv(args, "--profile-benchmark-steps")?,
             state_root_policy: optional(args, "--state-root-policy").map(str::to_owned),
             restart_required: parse_bool(args, "--restart-required", false)?,
@@ -213,6 +228,24 @@ impl VerifierProfile {
                         .map_err(|error| format!("invalid --required-checkpoint JSON: {error}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            required_native_workflow_steps: parse_csv(args, "--required-native-workflow-steps")?,
+            required_native_workflow_proof_steps: parse_csv(
+                args,
+                "--required-native-workflow-proof-steps",
+            )?
+            .into_iter()
+            .collect(),
+            native_workflow_delivery: optional(args, "--native-workflow-delivery")
+                .map(str::to_owned),
+            native_workflow_scenario_boundary: optional(
+                args,
+                "--native-workflow-scenario-boundary",
+            )
+            .map(str::to_owned),
+            native_workflow_capture_method: optional(args, "--native-workflow-capture-method")
+                .map(str::to_owned),
+            native_workflow_durability: optional(args, "--native-workflow-durability")
+                .map(str::to_owned),
         };
         profile.validate()?;
         Ok(profile)
@@ -272,6 +305,9 @@ impl VerifierProfile {
         if !self.required_budget_metrics.is_empty() && self.budget_proof.is_none() {
             return Err("required budget metrics require --budget-proof".to_owned());
         }
+        if self.required_async_lanes.len() > 16 {
+            return Err("required async lane count exceeds 16".to_owned());
+        }
         if self.budget_proof.is_some() != self.loaded_budget.is_some() {
             return Err("budget proof did not load its typed contract".to_owned());
         }
@@ -317,6 +353,49 @@ impl VerifierProfile {
         if self.required_checkpoints.len() > 32 {
             return Err("required checkpoint count exceeds 32".to_owned());
         }
+        if self.required_native_workflow_steps.len() > 32
+            || self
+                .required_native_workflow_steps
+                .iter()
+                .any(|step| !safe_evidence_id(step))
+            || self
+                .required_native_workflow_steps
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.required_native_workflow_steps.len()
+            || self
+                .required_native_workflow_proof_steps
+                .iter()
+                .any(|step| {
+                    !self
+                        .required_native_workflow_steps
+                        .iter()
+                        .any(|required| required == step)
+                })
+            || (self.required_native_workflow_steps.is_empty()
+                != self.required_native_workflow_proof_steps.is_empty())
+            || (!self.required_native_workflow_steps.is_empty() && self.scenario_proof.is_none())
+            || (!self.required_native_workflow_steps.is_empty()
+                && (self.native_workflow_delivery.as_deref()
+                    != Some("kernel-uinput-isolated-seat")
+                    || self.native_workflow_scenario_boundary.as_deref()
+                        != Some("kernel-uinput-and-semantic-assertions")
+                    || self.native_workflow_capture_method.as_deref()
+                        != Some("app-owned-render-target-readback")
+                    || self.native_workflow_durability.as_deref()
+                        != Some("state-changing-steps-acked")))
+            || (self.required_native_workflow_steps.is_empty()
+                && (self.native_workflow_delivery.is_some()
+                    || self.native_workflow_scenario_boundary.is_some()
+                    || self.native_workflow_capture_method.is_some()
+                    || self.native_workflow_durability.is_some()))
+        {
+            return Err(
+                "native workflow steps must be unique, scenario-backed, and carry a non-empty proof subset"
+                    .to_owned(),
+            );
+        }
         let mut checkpoint_ids = BTreeSet::new();
         for checkpoint in &self.required_checkpoints {
             if !safe_evidence_id(&checkpoint.id) || !checkpoint_ids.insert(checkpoint.id.as_str()) {
@@ -342,6 +421,16 @@ impl VerifierProfile {
                         checkpoint.id
                     ));
                 }
+                VerifierCheckpointRequirementKind::NativeWorkflowStep { scenario_step }
+                    if !self
+                        .required_native_workflow_proof_steps
+                        .contains(scenario_step) =>
+                {
+                    return Err(format!(
+                        "checkpoint {} references an undeclared native workflow proof step",
+                        checkpoint.id
+                    ));
+                }
                 _ => {}
             }
         }
@@ -355,6 +444,7 @@ impl VerifierProfile {
                         && matches!(
                             &candidate.evidence,
                             VerifierCheckpointRequirementKind::ScenarioStep { .. }
+                                | VerifierCheckpointRequirementKind::NativeWorkflowStep { .. }
                         )
                 });
                 if !valid_baseline {
@@ -488,6 +578,7 @@ fn negative_evidence(profile: &VerifierProfile) -> GateEvidence {
         native: None,
         product_ux_timings: Vec::new(),
         async_proof_timing: None,
+        async_lanes: Vec::new(),
         artifacts: Vec::new(),
     }
 }
@@ -691,7 +782,7 @@ fn run_linux_harness(profile: &VerifierProfile, run_id: &str, artifact_dir: &Pat
         ));
     }
     if exercise_succeeded && profile.restart_required {
-        let baseline = restart_baseline_digest(profile, &capture.events);
+        let baseline = restart_baseline(profile, &capture.events);
         let primary_shutdown = session.shutdown();
         match (baseline, primary_shutdown) {
             (Ok(baseline), Ok(())) => match run_restart_phase(
@@ -748,10 +839,22 @@ fn run_linux_harness(profile: &VerifierProfile, run_id: &str, artifact_dir: &Pat
 }
 
 #[cfg(target_os = "linux")]
-fn restart_baseline_digest(
+#[derive(Clone, Debug)]
+struct RestartBaseline {
+    checkpoint_id: String,
+    source_revision: u64,
+    runtime_sequence: u64,
+    durable_epoch: u64,
+    durable_turn_sequence: u64,
+    state_digest: String,
+    frame: FrameEvidenceKey,
+}
+
+#[cfg(target_os = "linux")]
+fn restart_baseline(
     profile: &VerifierProfile,
     events: &[ObserverEvent],
-) -> Result<String, String> {
+) -> Result<RestartBaseline, String> {
     let baseline_checkpoint = profile
         .required_checkpoints
         .iter()
@@ -762,40 +865,75 @@ fn restart_baseline_digest(
             _ => None,
         })
         .ok_or("restart profile has no restart-restore checkpoint")?;
-    let baseline_step = profile
+    let baseline = profile
         .required_checkpoints
         .iter()
         .find(|checkpoint| checkpoint.id == baseline_checkpoint)
-        .and_then(|checkpoint| match &checkpoint.evidence {
-            VerifierCheckpointRequirementKind::ScenarioStep { scenario_step } => {
-                Some(scenario_step.as_str())
-            }
-            _ => None,
-        })
         .ok_or_else(|| {
-            format!(
-                "restart baseline checkpoint `{baseline_checkpoint}` is not a scenario checkpoint"
-            )
+            format!("restart baseline checkpoint `{baseline_checkpoint}` is undeclared")
         })?;
-    events
+    let baseline = events
         .iter()
         .rev()
-        .find_map(|event| match event {
-            ObserverEvent::ScenarioCheckpoint {
-                step_id,
-                durable_turn_sequence,
-                state_digest,
-                ..
-            } if step_id == baseline_step && *durable_turn_sequence > 0 => {
-                Some(state_digest.clone())
-            }
+        .find_map(|event| match (&baseline.evidence, event) {
+            (
+                VerifierCheckpointRequirementKind::ScenarioStep { scenario_step },
+                ObserverEvent::ScenarioCheckpoint {
+                    step_id,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    state_digest,
+                    key,
+                    ..
+                },
+            ) if step_id == scenario_step && *durable_turn_sequence > 0 => Some(RestartBaseline {
+                checkpoint_id: baseline_checkpoint.to_owned(),
+                source_revision: *source_revision,
+                runtime_sequence: *runtime_sequence,
+                durable_epoch: *durable_epoch,
+                durable_turn_sequence: *durable_turn_sequence,
+                state_digest: state_digest.clone(),
+                frame: key.clone(),
+            }),
+            (
+                VerifierCheckpointRequirementKind::NativeWorkflowStep { scenario_step },
+                ObserverEvent::NativeWorkflowStep {
+                    step_id,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    durable_acked: true,
+                    state_digest,
+                    key,
+                    ..
+                },
+            ) if step_id == scenario_step && *durable_turn_sequence > 0 => Some(RestartBaseline {
+                checkpoint_id: baseline_checkpoint.to_owned(),
+                source_revision: *source_revision,
+                runtime_sequence: *runtime_sequence,
+                durable_epoch: *durable_epoch,
+                durable_turn_sequence: *durable_turn_sequence,
+                state_digest: state_digest.clone(),
+                frame: key.clone(),
+            }),
             _ => None,
         })
         .ok_or_else(|| {
-            format!(
-                "restart baseline scenario `{baseline_step}` has no acknowledged state checkpoint"
-            )
-        })
+            format!("restart baseline `{baseline_checkpoint}` has no acknowledged state checkpoint")
+        })?;
+    if baseline.source_revision == 0
+        || baseline.runtime_sequence == 0
+        || baseline.durable_epoch == 0
+        || !baseline.frame.is_complete()
+    {
+        return Err(format!(
+            "restart baseline `{baseline_checkpoint}` has incomplete revision, durability, or frame identity"
+        ));
+    }
+    Ok(baseline)
 }
 
 #[cfg(target_os = "linux")]
@@ -810,7 +948,7 @@ fn run_restart_phase(
     state_root: &Path,
     observer: &mut ObserverServer,
     events: &mut Vec<ObserverEvent>,
-    baseline_digest: &str,
+    baseline: &RestartBaseline,
 ) -> Result<(NativeSession, RolePids), String> {
     let start = events.len();
     let mut session = NativeSession::start(
@@ -826,6 +964,13 @@ fn run_restart_phase(
     )?;
     let result = (|| {
         let roles = session.wait_for_roles(ROLE_READY_TIMEOUT)?;
+        if roles.preview == baseline.frame.process_id
+            || session.session_id == baseline.frame.session_id
+        {
+            return Err(
+                "restart reused the primary preview process or native session identity".to_owned(),
+            );
+        }
         session.prepare_background_workspace(executable)?;
         let mounted = wait_for_value(
             observer,
@@ -870,16 +1015,17 @@ fn run_restart_phase(
             || mounted.1 == 0
             || mounted.2.len() != 64
             || mounted.3
-            || mounted.4 == 0
+            || mounted.4 != baseline.source_revision
             || mounted.5 == 0
-            || mounted.6 == 0
-            || mounted.7 == 0
-            || mounted.8 != baseline_digest
+            || mounted.6 < baseline.durable_epoch
+            || mounted.7 < baseline.durable_turn_sequence
+            || mounted.8 != baseline.state_digest
             || !mounted.9.is_complete()
             || !frame_key_matches_session(events, &mounted.9, &session, ObserverRole::Preview)
         {
             return Err(format!(
-                "restart mount did not restore the exact baseline: disposition={:?}, schema_version={}, schema_hash={}, migration={}, source_revision={}, runtime_sequence={}, durable_epoch={}, durable_turn={}, digest={}, expected={baseline_digest}",
+                "restart mount did not restore the exact durable baseline `{}`: disposition={:?}, schema_version={}, schema_hash={}, migration={}, source_revision={}, runtime_sequence={}, durable_epoch={} (expected >= {}), durable_turn={} (expected >= {}), digest={}, expected={}",
+                baseline.checkpoint_id,
                 mounted.0,
                 mounted.1,
                 mounted.2,
@@ -887,9 +1033,34 @@ fn run_restart_phase(
                 mounted.4,
                 mounted.5,
                 mounted.6,
+                baseline.durable_epoch,
                 mounted.7,
+                baseline.durable_turn_sequence,
                 mounted.8,
+                baseline.state_digest,
             ));
+        }
+        let first_preview_frame = events[start..].iter().find_map(|event| match event {
+            ObserverEvent::FramePresented(frame) if frame.role == ObserverRole::Preview => {
+                Some(frame.key.clone())
+            }
+            _ => None,
+        });
+        let source_switch_frame = events[start..].iter().find_map(|event| match event {
+            ObserverEvent::SourceSwitchFinal { key, .. }
+                if key.process_id == mounted.9.process_id =>
+            {
+                Some(key.clone())
+            }
+            _ => None,
+        });
+        if first_preview_frame.as_ref() != Some(&mounted.9)
+            || source_switch_frame.as_ref() != Some(&mounted.9)
+        {
+            return Err(
+                "restart authority was not linked to the first presented preview frame and source-switch commit"
+                    .to_owned(),
+            );
         }
         if profile.requires_migration_exercise() {
             let migration =
@@ -919,7 +1090,7 @@ fn run_restart_phase(
                 )?;
             if migration.0 == 0
                 || migration.1 == 0
-                || migration.2 != baseline_digest
+                || migration.2 != baseline.state_digest
                 || migration.3 == migration.2
                 || !migration.4.is_complete()
                 || !frame_key_matches_session(events, &migration.4, &session, ObserverRole::Preview)
@@ -1111,44 +1282,12 @@ fn exercise_native_roles(
         &mut placements,
         ObserverRole::Preview,
     )?;
-    let completion =
-        wait_for_value(
-            observer,
-            events,
-            EVENT_TIMEOUT,
-            before_test,
-            |event| match event {
-                ObserverEvent::TestCompleted {
-                    request_id,
-                    passed,
-                    semantic_assertions_proven,
-                    completed_steps,
-                    message,
-                } if *request_id == test_target.0 => Some((
-                    *passed,
-                    *semantic_assertions_proven,
-                    *completed_steps,
-                    message.clone(),
-                )),
-                _ => None,
-            },
-        )
-        .map_err(|error| format!("preview TEST did not complete: {error}"))?;
-    if !completion.0 {
-        return Err(format!(
-            "preview TEST failed after {} steps: {}",
-            completion.2, completion.3
-        ));
+    if profile.required_native_workflow_steps.is_empty() {
+        require_test_completion(observer, events, before_test, test_target.0, None)?;
+        drain_events(observer, events, Duration::from_millis(250));
+        wait_for_evidence_proofs(observer, events)
+            .map_err(|error| format!("checkpoint proof lane did not drain: {error}"))?;
     }
-    if !completion.1 {
-        return Err(format!(
-            "preview TEST completed {} host-input steps without proving semantic assertions: {}",
-            completion.2, completion.3
-        ));
-    }
-    drain_events(observer, events, Duration::from_millis(250));
-    wait_for_evidence_proofs(observer, events)
-        .map_err(|error| format!("checkpoint proof lane did not drain: {error}"))?;
 
     if !profile.required_budget_metrics.is_empty() {
         drive_product_profile_benchmark(
@@ -1161,6 +1300,27 @@ fn exercise_native_roles(
         )?;
         wait_for_evidence_proofs(observer, events)
             .map_err(|error| format!("profile proof lane did not drain: {error}"))?;
+    }
+    if !profile.required_native_workflow_steps.is_empty() {
+        drive_native_workflow(
+            profile,
+            session,
+            observer,
+            events,
+            preview_placement,
+            before_test,
+            test_target.0,
+        )?;
+        require_test_completion(
+            observer,
+            events,
+            before_test,
+            test_target.0,
+            Some(profile.required_native_workflow_steps.len()),
+        )?;
+        drain_events(observer, events, Duration::from_millis(250));
+        wait_for_evidence_proofs(observer, events)
+            .map_err(|error| format!("native workflow proof lane did not drain: {error}"))?;
     }
 
     let preview_candidates =
@@ -1603,6 +1763,496 @@ fn profile_seed_text(profile: &VerifierProfile, source_path: &str) -> Result<Str
         return Err("profile benchmark seed is not bounded printable ASCII".to_owned());
     }
     Ok(seed)
+}
+
+#[cfg(target_os = "linux")]
+fn require_test_completion(
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    start: usize,
+    request_id: u64,
+    expected_steps: Option<usize>,
+) -> Result<(), String> {
+    let completion = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        start,
+        |event| match event {
+            ObserverEvent::TestCompleted {
+                request_id: observed_request,
+                passed,
+                semantic_assertions_proven,
+                completed_steps,
+                message,
+            } if *observed_request == request_id => Some((
+                *passed,
+                *semantic_assertions_proven,
+                *completed_steps,
+                message.clone(),
+            )),
+            _ => None,
+        },
+    )
+    .map_err(|error| format!("preview TEST did not complete: {error}"))?;
+    if !completion.0 {
+        return Err(format!(
+            "preview TEST failed after {} steps: {}",
+            completion.2, completion.3
+        ));
+    }
+    if !completion.1 {
+        return Err(format!(
+            "preview TEST completed {} steps without proving semantic assertions: {}",
+            completion.2, completion.3
+        ));
+    }
+    if let Some(expected) = expected_steps
+        && completion.2 as usize != expected
+    {
+        return Err(format!(
+            "preview TEST completed {} steps, expected {expected}",
+            completion.2
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct NativeWorkflowAction {
+    id: String,
+    source_path: String,
+    action_kind: String,
+    action_digest: String,
+    text: Option<String>,
+    key: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn native_workflow_request_id(test_request_id: u64, ordinal: usize) -> u64 {
+    test_request_id
+        .saturating_mul(64)
+        .saturating_add(ordinal.try_into().unwrap_or(u64::MAX))
+        .max(1)
+}
+
+#[cfg(target_os = "linux")]
+fn declared_native_workflow(
+    profile: &VerifierProfile,
+) -> Result<Vec<NativeWorkflowAction>, String> {
+    let scenario_path = profile
+        .scenario_proof
+        .as_deref()
+        .ok_or("native workflow has no scenario proof")?;
+    let scenario_path = resolve_profile_input(scenario_path);
+    let scenario = crate::catalog::ordinary_test_steps(&scenario_path.to_string_lossy())
+        .map_err(|error| format!("load native workflow scenario: {error}"))?;
+    profile
+        .required_native_workflow_steps
+        .iter()
+        .map(|id| {
+            let step = scenario
+                .iter()
+                .find(|step| step.id == *id)
+                .ok_or_else(|| format!("native workflow step `{id}` is absent"))?;
+            if step.expectations.is_empty() {
+                return Err(format!(
+                    "native workflow step `{id}` has no semantic assertions"
+                ));
+            }
+            let action_kind = step
+                .action_kind
+                .clone()
+                .unwrap_or_else(|| "assertion_only".to_owned());
+            if !matches!(
+                action_kind.as_str(),
+                "assertion_only" | "click" | "type_text" | "double_click" | "key" | "blur"
+            ) {
+                return Err(format!(
+                    "native workflow step `{id}` has unsupported action `{action_kind}`"
+                ));
+            }
+            if action_kind == "assertion_only" && !step.source_path.is_empty() {
+                return Err(format!(
+                    "native workflow assertion-only step `{id}` unexpectedly has a source"
+                ));
+            }
+            if action_kind == "type_text" {
+                let text = step
+                    .text
+                    .as_deref()
+                    .ok_or_else(|| format!("native workflow step `{id}` has no text"))?;
+                if text.is_empty()
+                    || text.len() > crate::native_input::ASCII_TEXT_BATCH_MAX_BYTES
+                    || !text.bytes().all(|byte| (b' '..=b'~').contains(&byte))
+                {
+                    return Err(format!(
+                        "native workflow step `{id}` text is not bounded printable ASCII"
+                    ));
+                }
+            }
+            Ok(NativeWorkflowAction {
+                id: id.clone(),
+                source_path: if action_kind == "assertion_only" {
+                    "assertion-only".to_owned()
+                } else {
+                    step.source_path.clone()
+                },
+                action_kind,
+                action_digest: crate::preview::native_workflow_action_digest(step),
+                text: step.text.clone(),
+                key: step.key.clone(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn drive_native_workflow(
+    profile: &VerifierProfile,
+    session: &mut NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    preview_placement: WindowPlacement,
+    start: usize,
+    test_request_id: u64,
+) -> Result<(), String> {
+    let actions = declared_native_workflow(profile)?;
+    let ready = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        start,
+        |event| match event {
+            ObserverEvent::NativeWorkflowReady {
+                test_request_id,
+                step_count,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                state_digest,
+                key,
+            } => Some((
+                *test_request_id,
+                *step_count,
+                *source_revision,
+                *runtime_sequence,
+                *durable_epoch,
+                state_digest.clone(),
+                key.clone(),
+            )),
+            _ => None,
+        },
+    )
+    .map_err(|error| format!("native workflow did not become ready: {error}"))?;
+    if ready.0 != test_request_id
+        || ready.1 as usize != actions.len()
+        || ready.2 == 0
+        || ready.3 == 0
+        || ready.4 == 0
+        || ready.5.len() != 64
+        || !frame_key_matches_session(events, &ready.6, session, ObserverRole::Preview)
+    {
+        return Err(
+            "native workflow reset evidence is incomplete or belongs to another session".to_owned(),
+        );
+    }
+
+    let mut previous_frame_id = ready.6.frame_id;
+    let mut previous_state_digest = ready.5.clone();
+    for (index, action) in actions.iter().enumerate() {
+        let ordinal = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        let expected_request_id = native_workflow_request_id(test_request_id, index + 1);
+        let action_start = events.len();
+        if action.action_kind != "assertion_only" {
+            let target = wait_for_native_workflow_target(
+                session,
+                observer,
+                events,
+                ordinal,
+                expected_request_id,
+                action,
+            )?;
+            if !frame_key_matches_session(events, &target.3, session, ObserverRole::Preview) {
+                return Err(format!(
+                    "native workflow target `{}` belongs to another preview session",
+                    action.id
+                ));
+            }
+            let point = locate_target(
+                session,
+                observer,
+                events,
+                ObserverRole::Preview,
+                &target.0,
+                (target.1, target.2),
+                translated_target_candidates(preview_placement, target.1, target.2),
+            )?;
+            session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
+            session.run_driver(&["click", "left"])?;
+            match action.action_kind.as_str() {
+                "type_text" => {
+                    session.run_driver(&["chord", "ctrl", "a"])?;
+                    session.run_driver(&[
+                        "text",
+                        action
+                            .text
+                            .as_deref()
+                            .expect("validated native workflow text"),
+                    ])?;
+                }
+                "double_click" => {
+                    session.run_driver(&["click", "left"])?;
+                }
+                "key" => {
+                    let key = action.key.as_deref().ok_or_else(|| {
+                        format!("native workflow key step `{}` has no key", action.id)
+                    })?;
+                    session.run_driver(&["key", "down", key])?;
+                    session.run_driver(&["key", "up", key])?;
+                }
+                "blur" => {
+                    session.run_driver(&["key", "down", "tab"])?;
+                    session.run_driver(&["key", "up", "tab"])?;
+                }
+                "click" => {}
+                other => return Err(format!("unsupported native workflow action `{other}`")),
+            }
+        }
+        let completed =
+            wait_for_value(
+                observer,
+                events,
+                EVENT_TIMEOUT,
+                action_start,
+                |event| match event {
+                    ObserverEvent::NativeWorkflowStep {
+                        request_id,
+                        ordinal: observed,
+                        step_id,
+                        source_path,
+                        action_kind,
+                        action_digest,
+                        input_first_sequence,
+                        input_last_sequence,
+                        input_event_count,
+                        input_event_digest,
+                        assertion_count,
+                        source_revision,
+                        runtime_sequence,
+                        durable_epoch,
+                        durable_turn_sequence,
+                        durable_acked,
+                        before_state_digest,
+                        state_digest,
+                        key,
+                    } if *observed == ordinal && step_id == &action.id => Some((
+                        *request_id,
+                        source_path.clone(),
+                        action_kind.clone(),
+                        action_digest.clone(),
+                        *input_first_sequence,
+                        *input_last_sequence,
+                        *input_event_count,
+                        input_event_digest.clone(),
+                        *assertion_count,
+                        *source_revision,
+                        *runtime_sequence,
+                        *durable_epoch,
+                        *durable_turn_sequence,
+                        *durable_acked,
+                        before_state_digest.clone(),
+                        state_digest.clone(),
+                        key.clone(),
+                    )),
+                    _ => None,
+                },
+            )
+            .map_err(|error| {
+                format!(
+                    "native workflow step `{}` did not complete: {error}",
+                    action.id
+                )
+            })?;
+        let mut input_events = events[action_start..]
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::InputAccepted(input)
+                    if input.role == ObserverRole::Preview
+                        && input.real_os
+                        && input.event_sequence >= completed.4
+                        && input.event_sequence <= completed.5 =>
+                {
+                    Some(input)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        input_events.sort_by_key(|input| input.event_sequence);
+        let observed_input_digest = crate::preview::native_workflow_input_digest(
+            &input_events
+                .iter()
+                .map(|input| input.event_digest.clone())
+                .collect::<Vec<_>>(),
+        );
+        let assertion_only = action.action_kind == "assertion_only";
+        let input_span_valid = if assertion_only {
+            completed.4 == 0 && completed.5 == 0 && completed.6 == 0 && input_events.is_empty()
+        } else {
+            completed.4 > 0
+                && completed.5 >= completed.4
+                && completed.6 as usize == input_events.len()
+                && input_events
+                    .first()
+                    .is_some_and(|input| input.event_sequence == completed.4)
+                && input_events
+                    .last()
+                    .is_some_and(|input| input.event_sequence == completed.5)
+        };
+        if completed.0 != expected_request_id
+            || completed.1 != action.source_path
+            || completed.2 != action.action_kind
+            || completed.3 != action.action_digest
+            || !input_span_valid
+            || completed.7 != observed_input_digest
+            || completed.8 == 0
+            || completed.9 == 0
+            || completed.10 == 0
+            || completed.11 == 0
+            || completed.12 == 0
+            || !completed.13
+            || completed.14 != previous_state_digest
+            || completed.15.len() != 64
+            || completed.16.frame_id <= previous_frame_id
+            || !frame_key_matches_session(events, &completed.16, session, ObserverRole::Preview)
+        {
+            return Err(format!(
+                "native workflow step `{}` lacks exact action-span, durable, semantic, or frame evidence",
+                action.id
+            ));
+        }
+        previous_frame_id = completed.16.frame_id;
+        previous_state_digest.clone_from(&completed.15);
+        if profile
+            .required_native_workflow_proof_steps
+            .contains(&action.id)
+        {
+            wait_for_event(observer, events, EVENT_TIMEOUT, action_start, |event| {
+                matches!(event, ObserverEvent::ProofCompleted {
+                    key,
+                    artifact: Some(_),
+                    error: None,
+                    ..
+                } if key == &completed.16)
+            })
+            .map_err(|error| {
+                format!(
+                    "native workflow proof `{}` did not complete: {error}",
+                    action.id
+                )
+            })?;
+            if exact_proof_for_key(events, &completed.16).is_none() {
+                return Err(format!(
+                    "native workflow proof `{}` is not bound to its exact presented frame",
+                    action.id
+                ));
+            }
+        }
+    }
+    let completed = wait_for_value(
+        observer,
+        events,
+        EVENT_TIMEOUT,
+        start,
+        |event| match event {
+            ObserverEvent::NativeWorkflowCompleted {
+                test_request_id,
+                step_count,
+                initial_state_digest,
+                final_state_digest,
+                key,
+            } => Some((
+                *test_request_id,
+                *step_count,
+                initial_state_digest.clone(),
+                final_state_digest.clone(),
+                key.clone(),
+            )),
+            _ => None,
+        },
+    )?;
+    if completed.0 != test_request_id
+        || completed.1 as usize != actions.len()
+        || completed.2 != ready.5
+        || completed.3 != previous_state_digest
+        || completed.4.frame_id != previous_frame_id
+        || !frame_key_matches_session(events, &completed.4, session, ObserverRole::Preview)
+    {
+        return Err("native workflow completion evidence is incomplete".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_native_workflow_target(
+    session: &mut NativeSession,
+    observer: &mut ObserverServer,
+    events: &mut Vec<ObserverEvent>,
+    ordinal: u32,
+    expected_request_id: u64,
+    action: &NativeWorkflowAction,
+) -> Result<(String, f32, f32, FrameEvidenceKey), String> {
+    for attempt in 0..24 {
+        if let Ok(target) = wait_for_value(
+            observer,
+            events,
+            Duration::from_millis(250),
+            0,
+            |event| match event {
+                ObserverEvent::NativeWorkflowTarget {
+                    request_id,
+                    ordinal: observed,
+                    step_id,
+                    source_path,
+                    action_kind,
+                    action_digest,
+                    node,
+                    x,
+                    y,
+                    key,
+                } if *observed == ordinal && step_id == &action.id => Some((
+                    *request_id,
+                    node.clone(),
+                    *x,
+                    *y,
+                    source_path.clone(),
+                    action_kind.clone(),
+                    action_digest.clone(),
+                    key.clone(),
+                )),
+                _ => None,
+            },
+        ) {
+            if target.0 != expected_request_id
+                || target.4 != action.source_path
+                || target.5 != action.action_kind
+                || target.6 != action.action_digest
+            {
+                return Err(format!(
+                    "native workflow target `{}` does not match its scenario declaration",
+                    action.id
+                ));
+            }
+            return Ok((target.1, target.2, target.3, target.7));
+        }
+        let amount = if attempt < 12 { -4 } else { 4 };
+        session.run_driver(&["axis", "vertical", &amount.to_string()])?;
+    }
+    Err(format!(
+        "native workflow target `{}` did not become visible after bounded real scrolling",
+        action.id
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -3128,6 +3778,32 @@ impl Capture {
                 ),
             ));
         }
+        if !profile.required_async_lanes.is_empty() {
+            let missing = profile
+                .required_async_lanes
+                .iter()
+                .copied()
+                .filter(|required| {
+                    !self.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            ObserverEvent::AsyncLaneCompleted {
+                                lane,
+                                outcome: AsyncLaneOutcome::Applied,
+                                ..
+                            } if lane == required && async_lane_event_is_valid(event, &self.events)
+                        )
+                    })
+                })
+                .map(async_lane_name)
+                .collect::<Vec<_>>();
+            self.checks.push(check_result(
+                "profile-async-lane-proof",
+                missing.is_empty(),
+                "every manifest-required async lane completed off the product frame and applied to an exact presented frame",
+                format!("missing valid applied async lane evidence: {}", missing.join(", ")),
+            ));
+        }
         if profile.state_root_policy.is_some() {
             let state = evidence.state_root.as_ref();
             let complete = state.is_some_and(|proof| {
@@ -3141,6 +3817,24 @@ impl Capture {
                 complete,
                 "launch-scoped state began clean, persisted data, and restored after restart",
                 "no app-owned launch-scoped state-root and restart evidence was emitted",
+            ));
+        }
+        if !profile.required_native_workflow_steps.is_empty() {
+            let workflow = evidence.native_workflow.as_ref();
+            let complete = workflow.is_some_and(|proof| {
+                proof.input_delivery == "native-os-app-window-callback"
+                    && proof.steps.len() == profile.required_native_workflow_steps.len()
+                    && proof
+                        .steps
+                        .iter()
+                        .zip(&profile.required_native_workflow_steps)
+                        .all(|(observed, required)| &observed.scenario_step == required)
+            });
+            self.checks.push(check_result(
+                "profile-native-workflow-proof",
+                complete,
+                "every declared product workflow action entered through launch-scoped real OS input and reached its semantic state",
+                "the manifest-declared native workflow is incomplete or not bound to real OS input",
             ));
         }
         if !profile.required_checkpoints.is_empty() {
@@ -3217,7 +3911,7 @@ fn profile_evidence(
     profile: &VerifierProfile,
     completion: Option<ScenarioCompletion>,
 ) -> VerificationProfileEvidence {
-    profile_evidence_with_observations(profile, completion, Vec::new(), None, Vec::new())
+    profile_evidence_with_observations(profile, completion, Vec::new(), None, None, Vec::new())
 }
 
 fn profile_evidence_with_observations(
@@ -3225,20 +3919,26 @@ fn profile_evidence_with_observations(
     completion: Option<ScenarioCompletion>,
     budget_observations: Vec<BudgetObservation>,
     state_root: Option<StateRootProof>,
+    native_workflow: Option<NativeWorkflowProof>,
     checkpoints: Vec<StateCheckpointProof>,
 ) -> VerificationProfileEvidence {
     VerificationProfileEvidence {
         profile_id: profile.id.clone(),
         profile_digest: profile.digest.clone(),
-        scenario: profile
-            .scenario_proof
-            .as_deref()
-            .and_then(|path| scenario_proof(path, completion).ok()),
+        scenario: profile.scenario_proof.as_deref().and_then(|path| {
+            scenario_proof(
+                path,
+                completion,
+                !profile.required_native_workflow_steps.is_empty(),
+            )
+            .ok()
+        }),
         budget: profile
             .loaded_budget
             .as_ref()
             .map(|budget| budget_proof(budget, budget_observations)),
         state_root,
+        native_workflow,
         checkpoints,
     }
 }
@@ -3266,13 +3966,118 @@ fn observed_profile_evidence(
             restart_count: state.restart_count,
             restored_after_restart: state.restored_after_restart,
         }),
+        native_workflow_proof(profile, events),
         checkpoint_proofs(profile, completion, events),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn native_workflow_proof(
+    profile: &VerifierProfile,
+    events: &[ObserverEvent],
+) -> Option<NativeWorkflowProof> {
+    if profile.required_native_workflow_steps.is_empty() {
+        return None;
+    }
+    let (test_request_id, initial_state_digest, ready_key) =
+        events.iter().find_map(|event| match event {
+            ObserverEvent::NativeWorkflowReady {
+                test_request_id,
+                state_digest,
+                key,
+                ..
+            } => Some((*test_request_id, state_digest.clone(), key.clone())),
+            _ => None,
+        })?;
+    let (completed_request_id, step_count, completed_initial, final_state_digest, final_key) =
+        events.iter().rev().find_map(|event| match event {
+            ObserverEvent::NativeWorkflowCompleted {
+                test_request_id,
+                step_count,
+                initial_state_digest,
+                final_state_digest,
+                key,
+            } => Some((
+                *test_request_id,
+                *step_count,
+                initial_state_digest.clone(),
+                final_state_digest.clone(),
+                key.clone(),
+            )),
+            _ => None,
+        })?;
+    if completed_request_id != test_request_id
+        || completed_initial != initial_state_digest
+        || step_count as usize != profile.required_native_workflow_steps.len()
+    {
+        return None;
+    }
+    let mut steps = Vec::with_capacity(profile.required_native_workflow_steps.len());
+    for (index, required) in profile.required_native_workflow_steps.iter().enumerate() {
+        let ordinal = u32::try_from(index + 1).ok()?;
+        let step = events.iter().find_map(|event| match event {
+            ObserverEvent::NativeWorkflowStep {
+                request_id,
+                ordinal: observed,
+                step_id,
+                source_path,
+                action_kind,
+                action_digest,
+                input_first_sequence,
+                input_last_sequence,
+                input_event_count,
+                input_event_digest,
+                assertion_count,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                durable_turn_sequence,
+                durable_acked,
+                before_state_digest,
+                state_digest,
+                key,
+                ..
+            } if *observed == ordinal && step_id == required => Some(NativeWorkflowStepProof {
+                request_id: *request_id,
+                ordinal,
+                scenario_step: step_id.clone(),
+                source_path: source_path.clone(),
+                action_kind: action_kind.clone(),
+                action_digest: action_digest.clone(),
+                input_first_sequence: *input_first_sequence,
+                input_last_sequence: *input_last_sequence,
+                input_event_count: *input_event_count,
+                input_event_digest: input_event_digest.clone(),
+                assertion_count: *assertion_count,
+                source_revision: *source_revision,
+                runtime_sequence: *runtime_sequence,
+                durable_epoch: *durable_epoch,
+                durable_turn_sequence: *durable_turn_sequence,
+                durable_acked: *durable_acked,
+                before_state_digest: before_state_digest.clone(),
+                state_digest: state_digest.clone(),
+                frame: key.clone().into(),
+            }),
+            _ => None,
+        })?;
+        steps.push(step);
+    }
+    Some(NativeWorkflowProof {
+        input_delivery: "native-os-app-window-callback",
+        scenario_boundary: "kernel-uinput-and-semantic-assertions",
+        test_request_id,
+        initial_state_digest,
+        final_state_digest,
+        ready_frame: ready_key.into(),
+        final_frame: final_key.into(),
+        steps,
+    })
 }
 
 fn scenario_proof(
     path: &Path,
     completion: Option<ScenarioCompletion>,
+    kernel_uinput_workflow: bool,
 ) -> Result<ScenarioProof, String> {
     let filesystem_path = resolve_profile_input(path);
     let source = fs::read_to_string(&filesystem_path)
@@ -3292,7 +4097,11 @@ fn scenario_proof(
     Ok(ScenarioProof {
         path: path.to_string_lossy().into_owned(),
         sha256: sha256(source.as_bytes()),
-        boundary: if completion.is_some_and(|value| value.semantic_assertions_proven) {
+        boundary: if kernel_uinput_workflow
+            && completion.is_some_and(|value| value.semantic_assertions_proven)
+        {
+            "kernel-uinput-workflow-and-semantic-assertions"
+        } else if completion.is_some_and(|value| value.semantic_assertions_proven) {
             "native-test-playback-and-semantic-assertions"
         } else {
             "native-test-playback"
@@ -3530,6 +4339,11 @@ fn budget_observations(
                 compile_us,
                 interaction_frame_block_us,
                 pending_child_artifacts,
+                pending_program_artifact_stores,
+                pending_program_artifact_loads,
+                pending_persistence_artifact_stores,
+                pending_persistence_artifact_loads,
+                pending_durable_turns,
                 trusted_parent_rebuilds,
                 editor_key,
                 key,
@@ -3544,12 +4358,19 @@ fn budget_observations(
             {
                 Some((
                     *ordinal,
-                    *editor_visible_us,
-                    *preview_visible_us,
-                    *compile_us,
-                    *interaction_frame_block_us,
-                    u64::from(*pending_child_artifacts),
-                    u64::from(*trusted_parent_rebuilds),
+                    [
+                        *editor_visible_us,
+                        *preview_visible_us,
+                        *compile_us,
+                        *interaction_frame_block_us,
+                        u64::from(*pending_child_artifacts),
+                        u64::from(*pending_program_artifact_stores),
+                        u64::from(*pending_program_artifact_loads),
+                        u64::from(*pending_persistence_artifact_stores),
+                        u64::from(*pending_persistence_artifact_loads),
+                        u64::from(*pending_durable_turns),
+                        u64::from(*trusted_parent_rebuilds),
+                    ],
                 ))
             }
             _ => None,
@@ -3577,14 +4398,17 @@ fn budget_observations(
         return Ok(observations);
     }
     let measured = &profile_samples[10..];
-    let sorted = |field: fn(&(u32, u64, u64, u64, u64, u64, u64)) -> u64| {
-        let mut values = measured.iter().map(field).collect::<Vec<_>>();
+    let sorted = |index: usize| {
+        let mut values = measured
+            .iter()
+            .map(|sample| sample.1[index])
+            .collect::<Vec<_>>();
         values.sort_unstable();
         values
     };
-    let editor = sorted(|sample| sample.1);
-    let preview = sorted(|sample| sample.2);
-    let compile = sorted(|sample| sample.3);
+    let editor = sorted(0);
+    let preview = sorted(1);
+    let compile = sorted(2);
     observations.extend([
         budget_observation(
             budget,
@@ -3622,7 +4446,7 @@ fn budget_observations(
             BudgetUnit::Microseconds,
             measured
                 .iter()
-                .map(|sample| sample.4)
+                .map(|sample| sample.1[3])
                 .max()
                 .unwrap_or(u64::MAX),
         )?,
@@ -3632,9 +4456,87 @@ fn budget_observations(
             BudgetUnit::Count,
             measured
                 .iter()
-                .map(|sample| sample.5)
+                .map(|sample| sample.1[4])
                 .max()
                 .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "pending-program-artifact-store-max",
+            BudgetUnit::Count,
+            measured
+                .iter()
+                .map(|sample| sample.1[5])
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "pending-program-artifact-load-max",
+            BudgetUnit::Count,
+            measured
+                .iter()
+                .map(|sample| sample.1[6])
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "pending-persistence-artifact-store-max",
+            BudgetUnit::Count,
+            measured
+                .iter()
+                .map(|sample| sample.1[7])
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "pending-persistence-artifact-load-max",
+            BudgetUnit::Count,
+            measured
+                .iter()
+                .map(|sample| sample.1[8])
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "pending-durable-turn-max",
+            BudgetUnit::Count,
+            measured
+                .iter()
+                .map(|sample| sample.1[9])
+                .max()
+                .unwrap_or(u64::MAX),
+        )?,
+        budget_observation(
+            budget,
+            "proof-replacement-max",
+            BudgetUnit::Count,
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ObserverEvent::ProofCompleted { replaced_count, .. } => Some(*replaced_count),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0),
+        )?,
+        budget_observation(
+            budget,
+            "proof-result-drop-max",
+            BudgetUnit::Count,
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    ObserverEvent::ProofCompleted {
+                        result_drop_count, ..
+                    } => Some(*result_drop_count),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0),
         )?,
         budget_observation(
             budget,
@@ -3642,7 +4544,7 @@ fn budget_observations(
             BudgetUnit::Count,
             measured
                 .iter()
-                .map(|sample| sample.6)
+                .map(|sample| sample.1[10])
                 .max()
                 .unwrap_or(u64::MAX),
         )?,
@@ -3690,9 +4592,15 @@ fn observed_budget_unit(metric: &str) -> Option<BudgetUnit> {
         | "bounded-starter-source-compile-max"
         | "passive-preview-scroll-p95"
         | "interaction-frame-block-max" => Some(BudgetUnit::Microseconds),
-        "pending-child-artifact-max" | "trusted-parent-rebuilds-per-edit" => {
-            Some(BudgetUnit::Count)
-        }
+        "pending-child-artifact-max"
+        | "pending-program-artifact-store-max"
+        | "pending-program-artifact-load-max"
+        | "pending-persistence-artifact-store-max"
+        | "pending-persistence-artifact-load-max"
+        | "pending-durable-turn-max"
+        | "proof-replacement-max"
+        | "proof-result-drop-max"
+        | "trusted-parent-rebuilds-per-edit" => Some(BudgetUnit::Count),
         _ => None,
     }
 }
@@ -3745,6 +4653,7 @@ fn checkpoint_proof(
                         source_revision: *source_revision,
                         runtime_sequence: *runtime_sequence,
                         durable_epoch: *durable_epoch,
+                        durable_turn_sequence: *durable_turn_sequence,
                         state_digest: state_digest.clone(),
                         frame: key.clone().into(),
                         evidence: StateCheckpointEvidence::ScenarioSemanticFrame {
@@ -3769,6 +4678,7 @@ fn checkpoint_proof(
                 source_revision,
                 runtime_sequence,
                 durable_epoch,
+                durable_turn_sequence,
                 key,
                 ..
             } if observed_width == logical_width && *action_count > 0 => {
@@ -3777,6 +4687,7 @@ fn checkpoint_proof(
                     source_revision: *source_revision,
                     runtime_sequence: *runtime_sequence,
                     durable_epoch: *durable_epoch,
+                    durable_turn_sequence: *durable_turn_sequence,
                     state_digest: state_digest.clone(),
                     frame: key.clone().into(),
                     evidence: StateCheckpointEvidence::ResponsiveLayout {
@@ -3808,6 +4719,7 @@ fn checkpoint_proof(
                         source_revision: *source_revision,
                         runtime_sequence: *runtime_sequence,
                         durable_epoch: *durable_epoch,
+                        durable_turn_sequence: *durable_turn_sequence,
                         state_digest: state_digest.clone(),
                         frame: key.clone().into(),
                         evidence: StateCheckpointEvidence::StaleCompileRejection {
@@ -3838,6 +4750,7 @@ fn checkpoint_proof(
                         source_revision: *source_revision,
                         runtime_sequence: *runtime_sequence,
                         durable_epoch: *durable_epoch,
+                        durable_turn_sequence: *durable_turn_sequence,
                         state_digest: after_state_digest.clone(),
                         frame: key.clone().into(),
                         evidence: StateCheckpointEvidence::PersistenceOperation {
@@ -3857,6 +4770,7 @@ fn checkpoint_proof(
                     && matches!(
                         &checkpoint.evidence,
                         VerifierCheckpointRequirementKind::ScenarioStep { .. }
+                            | VerifierCheckpointRequirementKind::NativeWorkflowStep { .. }
                     )
             })?;
             let baseline = checkpoint_proof(profile, baseline_requirement, completion, events)?;
@@ -3872,17 +4786,80 @@ fn checkpoint_proof(
                     key,
                     ..
                 } if *durable_turn_sequence > 0 && state_digest == &baseline.state_digest => {
+                    let first_observable_frame = events.iter().find_map(|event| match event {
+                        ObserverEvent::FramePresented(frame)
+                            if frame.role == ObserverRole::Preview
+                                && frame.key.process_id == key.process_id =>
+                        {
+                            Some(frame.key.clone())
+                        }
+                        _ => None,
+                    });
                     Some(StateCheckpointProof {
                         id: required.id.clone(),
                         source_revision: *source_revision,
                         runtime_sequence: *runtime_sequence,
                         durable_epoch: *durable_epoch,
+                        durable_turn_sequence: *durable_turn_sequence,
                         state_digest: state_digest.clone(),
                         frame: key.clone().into(),
                         evidence: StateCheckpointEvidence::RestartRestore {
                             baseline_checkpoint: baseline_checkpoint.clone(),
                             before_restart_digest: baseline.state_digest.clone(),
+                            baseline_durable_epoch: baseline.durable_epoch,
+                            baseline_durable_turn_sequence: baseline.durable_turn_sequence,
+                            baseline_frame: baseline.frame.clone(),
+                            process_replaced: baseline.frame.process_id != key.process_id,
+                            session_replaced: baseline.frame.session_id != key.session_id,
+                            first_observable_frame: first_observable_frame.as_ref() == Some(key),
                             startup_restored: true,
+                        },
+                    })
+                }
+                _ => None,
+            })
+        }
+        VerifierCheckpointRequirementKind::NativeWorkflowStep { scenario_step } => {
+            events.iter().rev().find_map(|event| match event {
+                ObserverEvent::NativeWorkflowStep {
+                    request_id,
+                    step_id,
+                    action_kind,
+                    action_digest,
+                    input_first_sequence,
+                    input_last_sequence,
+                    input_event_count,
+                    input_event_digest,
+                    assertion_count,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    durable_acked,
+                    state_digest,
+                    key,
+                    ..
+                } if step_id == scenario_step && *request_id > 0 && *assertion_count > 0 => {
+                    Some(StateCheckpointProof {
+                        id: required.id.clone(),
+                        source_revision: *source_revision,
+                        runtime_sequence: *runtime_sequence,
+                        durable_epoch: *durable_epoch,
+                        durable_turn_sequence: *durable_turn_sequence,
+                        state_digest: state_digest.clone(),
+                        frame: key.clone().into(),
+                        evidence: StateCheckpointEvidence::NativeWorkflowFrame {
+                            scenario_step: step_id.clone(),
+                            action_kind: action_kind.clone(),
+                            request_id: *request_id,
+                            action_digest: action_digest.clone(),
+                            input_first_sequence: *input_first_sequence,
+                            input_last_sequence: *input_last_sequence,
+                            input_event_count: *input_event_count,
+                            input_event_digest: input_event_digest.clone(),
+                            durable_turn_sequence: *durable_turn_sequence,
+                            durable_acked: *durable_acked,
+                            assertion_count: *assertion_count,
                         },
                     })
                 }
@@ -3937,11 +4914,18 @@ fn build_gate_evidence(
     launch_isolation: Vec<LaunchIsolationEvidence>,
 ) -> GateEvidence {
     let metadata = role_metadata(events);
+    let proofs = exact_proofs(events);
     let native = metadata
         .get(&ObserverRole::Preview)
         .zip(metadata.get(&ObserverRole::Dev))
-        .and_then(|(preview, dev)| native_evidence(preview, dev.pid, launch_isolation));
-    let proofs = exact_proofs(events);
+        .and_then(|(preview, dev)| {
+            native_evidence(
+                preview,
+                dev.pid,
+                launch_isolation,
+                proofs.first()?.artifact.capture_method.clone(),
+            )
+        });
     let mut product_ux_timings = Vec::new();
 
     let callback_sequences = samples.callback_sequences();
@@ -4055,6 +5039,10 @@ fn build_gate_evidence(
             path: proof.artifact.path.clone(),
             sha256: proof.artifact.sha256.clone(),
             byte_len: proof.artifact.byte_len,
+            capture_method: proof.artifact.capture_method.clone(),
+            capture_token_digest: proof.artifact.capture_token_digest.clone(),
+            nonblank_samples: proof.artifact.nonblank_samples,
+            unique_rgba_values: proof.artifact.unique_rgba_values,
             frame: proof.key.clone().into(),
         })
         .collect::<Vec<_>>();
@@ -4064,12 +5052,12 @@ fn build_gate_evidence(
             .find(|artifact| artifact.frame == proof.key.clone().into())
             .map(|artifact| artifact.artifact_id.clone())
             .unwrap_or_else(|| format!("missing-proof-frame-{}", proof.key.frame_id));
-        let completed_after = proof.completed_after_frame_id.max(proof.key.frame_id);
-        let lag = completed_after.saturating_sub(proof.key.frame_id);
-        let timing = AsyncProofTimingEvidence {
+        let completed_after = proof.completed_after_key.clone();
+        let lag = completed_after.frame_id.saturating_sub(proof.key.frame_id);
+        AsyncProofTimingEvidence {
             linked_product_metric: "warm-visible-interaction",
             captured_frame: proof.key.clone().into(),
-            completed_after_frame_id: completed_after,
+            completed_after_frame: completed_after.into(),
             proof_lag_frames: lag.try_into().unwrap_or(u32::MAX),
             artifact_id: artifact_id.clone(),
             snapshot_prepare_us: proof.snapshot_prepare_us,
@@ -4078,8 +5066,7 @@ fn build_gate_evidence(
                 &[proof.snapshot_prepare_us.saturating_add(proof.elapsed_us)],
                 500_000,
             ),
-        };
-        timing
+        }
     });
 
     GateEvidence {
@@ -4089,6 +5076,7 @@ fn build_gate_evidence(
         native,
         product_ux_timings,
         async_proof_timing,
+        async_lanes: async_lane_evidence(events),
         artifacts,
     }
 }
@@ -4114,6 +5102,7 @@ fn native_evidence(
     metadata: &RoleMetadata,
     dev_pid: u32,
     launch_isolation: Vec<LaunchIsolationEvidence>,
+    capture_method: String,
 ) -> Option<NativeEvidence> {
     let adapter_backend = match metadata.adapter_backend.as_str() {
         "vulkan" | "metal" | "dx12" | "gl" => metadata.adapter_backend.clone(),
@@ -4143,7 +5132,7 @@ fn native_evidence(
         dev_pid,
         input_delivery: "native-os-app-window-callback",
         scenario_boundary: "public-host-event",
-        capture_method: "app-owned-wgpu-readback",
+        capture_method,
         private_runtime_dispatch_used: false,
         launch_isolation,
     })
@@ -4192,7 +5181,7 @@ fn frame_key_matches_session(
 #[derive(Clone)]
 struct ExactProof {
     key: FrameEvidenceKey,
-    completed_after_frame_id: u64,
+    completed_after_key: FrameEvidenceKey,
     elapsed_us: u64,
     snapshot_prepare_us: u64,
     artifact: ProofArtifact,
@@ -4235,7 +5224,7 @@ fn exact_proof_matching(
     events.iter().enumerate().find_map(|(index, event)| {
         let ObserverEvent::ProofCompleted {
             key,
-            completed_after_frame_id,
+            completed_after_key,
             elapsed_us,
             artifact: Some(artifact),
             error: None,
@@ -4272,17 +5261,107 @@ fn exact_proof_matching(
         (presented_before.is_some_and(|frame| frame_key_matches_metadata(events, key, frame.role))
             && snapshot_prepare_us.is_some()
             && key.is_complete()
+            && completed_after_key.is_complete()
+            && key.same_producer_surface(completed_after_key)
+            && completed_after_key.frame_id >= key.frame_id
+            && completed_after_key.present_id >= key.present_id
             && artifact.byte_len > 0
+            && artifact.capture_method == "app-owned-render-target-readback"
+            && artifact.capture_token_digest == frame_capture_token_digest(key)
             && artifact.nonblank_samples > 0
             && artifact.unique_rgba_values > 1)
             .then(|| ExactProof {
                 key: key.clone(),
-                completed_after_frame_id: *completed_after_frame_id,
+                completed_after_key: completed_after_key.clone(),
                 elapsed_us: *elapsed_us,
                 snapshot_prepare_us: snapshot_prepare_us.unwrap_or_default(),
                 artifact: artifact.clone(),
             })
     })
+}
+
+#[cfg(target_os = "linux")]
+fn async_lane_evidence(events: &[ObserverEvent]) -> Vec<AsyncLaneEvidence> {
+    let mut selected = BTreeMap::<AsyncLaneKind, AsyncLaneEvidence>::new();
+    for event in events {
+        let ObserverEvent::AsyncLaneCompleted {
+            lane,
+            request_id,
+            revision,
+            queue_depth,
+            queue_wait_us,
+            worker_us,
+            apply_us,
+            end_to_end_us,
+            outcome,
+            key,
+        } = event
+        else {
+            continue;
+        };
+        if !async_lane_event_is_valid(event, events) {
+            continue;
+        }
+        let candidate = AsyncLaneEvidence {
+            lane: async_lane_name(*lane),
+            request_id: request_id.clone(),
+            revision: *revision,
+            queue_depth: *queue_depth,
+            queue_wait_us: *queue_wait_us,
+            worker_us: *worker_us,
+            apply_us: *apply_us,
+            end_to_end_us: *end_to_end_us,
+            outcome: match outcome {
+                AsyncLaneOutcome::Applied => "applied",
+                AsyncLaneOutcome::StaleRejected => "stale-rejected",
+                AsyncLaneOutcome::Failed => "failed",
+            },
+            frame: key.clone().into(),
+        };
+        let replace = selected.get(lane).is_none_or(|current| {
+            (candidate.outcome == "applied", candidate.end_to_end_us)
+                > (current.outcome == "applied", current.end_to_end_us)
+        });
+        if replace {
+            selected.insert(*lane, candidate);
+        }
+    }
+    selected.into_values().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn async_lane_event_is_valid(event: &ObserverEvent, events: &[ObserverEvent]) -> bool {
+    let ObserverEvent::AsyncLaneCompleted {
+        revision,
+        queue_depth,
+        queue_wait_us,
+        worker_us,
+        apply_us,
+        end_to_end_us,
+        key,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    *revision > 0
+        && *queue_depth > 0
+        && *end_to_end_us
+            >= queue_wait_us
+                .saturating_add(*worker_us)
+                .saturating_add(*apply_us)
+        && frame_key_matches_metadata(events, key, ObserverRole::Preview)
+}
+
+#[cfg(target_os = "linux")]
+fn async_lane_name(lane: AsyncLaneKind) -> &'static str {
+    match lane {
+        AsyncLaneKind::ChildProgramCompile => "child-program-compile",
+        AsyncLaneKind::PersistenceTurn => "persistence-turn",
+        AsyncLaneKind::ProgramArtifactStore => "program-artifact-store",
+        AsyncLaneKind::ProgramArtifactLoad => "program-artifact-load",
+        AsyncLaneKind::ProofReadback => "proof-readback",
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -5004,6 +6083,21 @@ impl NativeSession {
                     environment.push((
                         PROFILE_BENCHMARK_STEPS_ENV,
                         profile.profile_benchmark_steps.join(","),
+                    ));
+                }
+                if !profile.required_native_workflow_steps.is_empty() {
+                    environment.push((
+                        NATIVE_WORKFLOW_STEPS_ENV,
+                        profile.required_native_workflow_steps.join(","),
+                    ));
+                    environment.push((
+                        NATIVE_WORKFLOW_PROOF_STEPS_ENV,
+                        profile
+                            .required_native_workflow_proof_steps
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
                     ));
                 }
                 if profile.scroll_samples > 0 {
@@ -5739,6 +6833,20 @@ fn parse_csv(args: &[String], flag: &str) -> Result<Vec<String>, String> {
     Ok(values)
 }
 
+fn parse_async_lanes(args: &[String]) -> Result<Vec<AsyncLaneKind>, String> {
+    parse_csv(args, "--required-async-lanes")?
+        .into_iter()
+        .map(|lane| match lane.as_str() {
+            "child-program-compile" => Ok(AsyncLaneKind::ChildProgramCompile),
+            "persistence-turn" => Ok(AsyncLaneKind::PersistenceTurn),
+            "program-artifact-store" => Ok(AsyncLaneKind::ProgramArtifactStore),
+            "program-artifact-load" => Ok(AsyncLaneKind::ProgramArtifactLoad),
+            "proof-readback" => Ok(AsyncLaneKind::ProofReadback),
+            _ => Err(format!("unsupported async lane `{lane}`")),
+        })
+        .collect()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn safe_component(value: &str) -> String {
     let value = value
@@ -5802,6 +6910,7 @@ struct GateEvidence {
     native: Option<NativeEvidence>,
     product_ux_timings: Vec<ProductTimingEvidence>,
     async_proof_timing: Option<AsyncProofTimingEvidence>,
+    async_lanes: Vec<AsyncLaneEvidence>,
     artifacts: Vec<ArtifactMetadata>,
 }
 
@@ -5815,6 +6924,7 @@ impl GateEvidence {
             native: None,
             product_ux_timings: Vec::new(),
             async_proof_timing: None,
+            async_lanes: Vec::new(),
             artifacts: Vec::new(),
         }
     }
@@ -5827,7 +6937,43 @@ struct VerificationProfileEvidence {
     scenario: Option<ScenarioProof>,
     budget: Option<BudgetProof>,
     state_root: Option<StateRootProof>,
+    native_workflow: Option<NativeWorkflowProof>,
     checkpoints: Vec<StateCheckpointProof>,
+}
+
+#[derive(Serialize)]
+struct NativeWorkflowProof {
+    input_delivery: &'static str,
+    scenario_boundary: &'static str,
+    test_request_id: u64,
+    initial_state_digest: String,
+    final_state_digest: String,
+    ready_frame: ReportFrameEvidenceKey,
+    final_frame: ReportFrameEvidenceKey,
+    steps: Vec<NativeWorkflowStepProof>,
+}
+
+#[derive(Serialize)]
+struct NativeWorkflowStepProof {
+    request_id: u64,
+    ordinal: u32,
+    scenario_step: String,
+    source_path: String,
+    action_kind: String,
+    action_digest: String,
+    input_first_sequence: u64,
+    input_last_sequence: u64,
+    input_event_count: u32,
+    input_event_digest: String,
+    assertion_count: u32,
+    source_revision: u64,
+    runtime_sequence: u64,
+    durable_epoch: u64,
+    durable_turn_sequence: u64,
+    durable_acked: bool,
+    before_state_digest: String,
+    state_digest: String,
+    frame: ReportFrameEvidenceKey,
 }
 
 #[derive(Serialize)]
@@ -5875,6 +7021,7 @@ struct StateCheckpointProof {
     source_revision: u64,
     runtime_sequence: u64,
     durable_epoch: u64,
+    durable_turn_sequence: u64,
     state_digest: String,
     frame: ReportFrameEvidenceKey,
     #[serde(flatten)]
@@ -5891,6 +7038,12 @@ enum StateCheckpointEvidence {
     RestartRestore {
         baseline_checkpoint: String,
         before_restart_digest: String,
+        baseline_durable_epoch: u64,
+        baseline_durable_turn_sequence: u64,
+        baseline_frame: ReportFrameEvidenceKey,
+        process_replaced: bool,
+        session_replaced: bool,
+        first_observable_frame: bool,
         startup_restored: bool,
     },
     ResponsiveLayout {
@@ -5909,6 +7062,19 @@ enum StateCheckpointEvidence {
         operation: VerifierPersistenceOperation,
         before_state_digest: String,
     },
+    NativeWorkflowFrame {
+        scenario_step: String,
+        action_kind: String,
+        request_id: u64,
+        action_digest: String,
+        input_first_sequence: u64,
+        input_last_sequence: u64,
+        input_event_count: u32,
+        input_event_digest: String,
+        durable_turn_sequence: u64,
+        durable_acked: bool,
+        assertion_count: u32,
+    },
 }
 
 #[derive(Serialize)]
@@ -5924,7 +7090,7 @@ struct NativeEvidence {
     dev_pid: u32,
     input_delivery: &'static str,
     scenario_boundary: &'static str,
-    capture_method: &'static str,
+    capture_method: String,
     private_runtime_dispatch_used: bool,
     launch_isolation: Vec<LaunchIsolationEvidence>,
 }
@@ -6030,12 +7196,26 @@ struct ProductTimingEvidence {
 struct AsyncProofTimingEvidence {
     linked_product_metric: &'static str,
     captured_frame: ReportFrameEvidenceKey,
-    completed_after_frame_id: u64,
+    completed_after_frame: ReportFrameEvidenceKey,
     proof_lag_frames: u32,
     artifact_id: String,
     snapshot_prepare_us: u64,
     worker_us: u64,
     summary: TimingSummary,
+}
+
+#[derive(Serialize)]
+struct AsyncLaneEvidence {
+    lane: &'static str,
+    request_id: String,
+    revision: u64,
+    queue_depth: u32,
+    queue_wait_us: u64,
+    worker_us: u64,
+    apply_us: u64,
+    end_to_end_us: u64,
+    outcome: &'static str,
+    frame: ReportFrameEvidenceKey,
 }
 
 #[derive(Serialize)]
@@ -6045,6 +7225,10 @@ struct ArtifactMetadata {
     path: String,
     sha256: String,
     byte_len: u64,
+    capture_method: String,
+    capture_token_digest: String,
+    nonblank_samples: u64,
+    unique_rgba_values: u64,
     frame: ReportFrameEvidenceKey,
 }
 

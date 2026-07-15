@@ -27,13 +27,14 @@ use crate::compile::{
     compile_migration_stage, project_key_for_stage,
 };
 use crate::frame::{
-    NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, input_kind,
-    pointer_button_pressed, role_message_frame,
+    NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, host_event_digest,
+    input_kind, pointer_button_pressed, role_message_frame,
 };
 use crate::native_input::{ASCII_BATCH_END_PHYSICAL_KEY, ASCII_TEXT_BATCH_MAX_BYTES};
 use crate::observer::{
-    InputAccepted, MIGRATION_EVIDENCE_ENV, ObserverClient, ObserverEvent, ObserverRole,
-    PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
+    AsyncLaneKind, AsyncLaneOutcome, InputAccepted, MIGRATION_EVIDENCE_ENV,
+    NATIVE_WORKFLOW_PROOF_STEPS_ENV, NATIVE_WORKFLOW_STEPS_ENV, ObserverClient, ObserverEvent,
+    ObserverRole, PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
     PROFILE_BENCHMARK_STEPS_ENV, PersistenceEvidenceKind, RESPONSIVE_EVIDENCE_WIDTH_ENV,
     SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV,
     STATE_MOUNT_EVIDENCE_ENV, StartupDisposition, StartupMigrationEvidence, TestPointerPhase,
@@ -47,7 +48,8 @@ use crate::protocol::{
     StateArtifactPreviewSummary, TestStep,
 };
 use crate::runtime_view::{
-    ProgramCompletionObservation, RuntimeStartupDisposition, RuntimeView, digest_hex,
+    ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneOutcome,
+    RuntimeStartupDisposition, RuntimeView, digest_hex,
 };
 use crate::view::{HitTarget, RetainedView};
 
@@ -93,6 +95,12 @@ enum ProductProfilePhase {
     Complete,
 }
 
+impl ProductProfilePhase {
+    fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
 struct ProductProfileCandidate {
     batch_text: String,
     input_sequence: u64,
@@ -136,6 +144,123 @@ struct ResponsiveEvidenceState {
     complete: bool,
 }
 
+struct NativeWorkflowPending {
+    request_id: u64,
+    action_digest: String,
+    before_state_digest: String,
+    started_at: Option<Instant>,
+    first_sequence: Option<u64>,
+    last_sequence: Option<u64>,
+    event_digests: Vec<String>,
+    batch_text: String,
+    pointer_up_count: u8,
+    action_complete: bool,
+}
+
+struct NativeWorkflowState {
+    test_request_id: u64,
+    steps: Vec<TestStep>,
+    proof_steps: BTreeSet<String>,
+    prepared: bool,
+    host_evidence_complete: bool,
+    completed: usize,
+    initial_state_digest: Option<String>,
+    current_state_digest: Option<String>,
+    pending: Option<NativeWorkflowPending>,
+    test_completed_emitted: bool,
+}
+
+impl NativeWorkflowState {
+    fn from_test_steps(
+        test_request_id: u64,
+        all_steps: &[TestStep],
+        required_steps: &[String],
+        proof_steps: &BTreeSet<String>,
+    ) -> Result<Option<Self>, String> {
+        if required_steps.is_empty() {
+            return Ok(None);
+        }
+        let steps = required_steps
+            .iter()
+            .map(|id| {
+                all_steps
+                    .iter()
+                    .find(|step| step.id == *id)
+                    .cloned()
+                    .ok_or_else(|| format!("native workflow step `{id}` is absent"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if steps.iter().any(|step| match step.action_kind.as_deref() {
+            None => !step.source_path.is_empty() || step.expectations.is_empty(),
+            Some("click" | "type_text" | "double_click" | "key" | "blur") => {
+                step.source_path.is_empty() || step.expectations.is_empty()
+            }
+            Some(_) => true,
+        }) {
+            return Err(
+                "native workflow requires assertion-only or typed native actions with semantic assertions"
+                    .to_owned()
+            );
+        }
+        if proof_steps
+            .iter()
+            .any(|id| !required_steps.iter().any(|required| required == id))
+        {
+            return Err("native workflow proof steps must be part of the workflow".to_owned());
+        }
+        Ok(Some(Self {
+            test_request_id,
+            steps,
+            proof_steps: proof_steps.clone(),
+            prepared: false,
+            host_evidence_complete: false,
+            completed: 0,
+            initial_state_digest: None,
+            current_state_digest: None,
+            pending: None,
+            test_completed_emitted: false,
+        }))
+    }
+
+    fn complete(&self) -> bool {
+        self.prepared && self.completed == self.steps.len()
+    }
+
+    fn current(&self) -> Option<&TestStep> {
+        self.prepared
+            .then(|| self.steps.get(self.completed))
+            .flatten()
+    }
+}
+
+pub(crate) fn native_workflow_action_digest(step: &TestStep) -> String {
+    let canonical = format!(
+        "id={};source={};kind={:?};target={:?};text={:?};key={:?};address={:?};occurrence={:?};pointer={:?},{:?},{:?},{:?}",
+        step.id,
+        step.source_path,
+        step.action_kind,
+        step.target_text,
+        step.text,
+        step.key,
+        step.address,
+        step.target_occurrence,
+        step.pointer_x,
+        step.pointer_y,
+        step.pointer_width,
+        step.pointer_height,
+    );
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+pub(crate) fn native_workflow_input_digest(event_digests: &[String]) -> String {
+    let mut hasher = Sha256::new();
+    for digest in event_digests {
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Default)]
 struct StateEvidenceConfig {
     mount: bool,
@@ -146,6 +271,8 @@ struct StateEvidenceConfig {
     profile_steps: Vec<String>,
     responsive_width: Option<u32>,
     stale_program: bool,
+    native_workflow_steps: Vec<String>,
+    native_workflow_proof_steps: BTreeSet<String>,
 }
 
 impl StateEvidenceConfig {
@@ -220,6 +347,18 @@ impl StateEvidenceConfig {
             })
             .transpose()?;
         let stale_program = std::env::var_os(STALE_PROGRAM_EVIDENCE_ENV).is_some();
+        let native_workflow_steps = bounded_evidence_ids(NATIVE_WORKFLOW_STEPS_ENV)?;
+        let native_workflow_proof_steps = bounded_evidence_ids(NATIVE_WORKFLOW_PROOF_STEPS_ENV)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if native_workflow_proof_steps
+            .iter()
+            .any(|id| !native_workflow_steps.iter().any(|step| step == id))
+        {
+            return Err(format!(
+                "{NATIVE_WORKFLOW_PROOF_STEPS_ENV} must be a subset of {NATIVE_WORKFLOW_STEPS_ENV}"
+            ));
+        }
         Ok(Self {
             mount,
             scenario_steps,
@@ -229,6 +368,8 @@ impl StateEvidenceConfig {
             profile_steps,
             responsive_width,
             stale_program,
+            native_workflow_steps,
+            native_workflow_proof_steps,
         })
     }
 
@@ -240,7 +381,30 @@ impl StateEvidenceConfig {
             || self.profile_samples != 0
             || self.responsive_width.is_some()
             || self.stale_program
+            || !self.native_workflow_steps.is_empty()
     }
+}
+
+fn bounded_evidence_ids(name: &str) -> Result<Vec<String>, String> {
+    let values = std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if values.len() > TEST_STEP_LIMIT
+        || values
+            .iter()
+            .any(|value| value.is_empty() || value.len() > 96)
+        || values.iter().collect::<BTreeSet<_>>().len() != values.len()
+    {
+        return Err(format!("{name} exceeds the bounded unique step contract"));
+    }
+    Ok(values)
 }
 
 struct AuthoritativeStateEvidence {
@@ -432,8 +596,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
         .transpose()
         .map_err(|error| format!("proof worker: {error}"))?;
 
-    let mut product = ProductFrame::attach(&mut host, ObserverRole::Preview).await?;
-    product.set_proof_enabled(proof.is_some());
+    let mut product =
+        ProductFrame::attach(&mut host, ObserverRole::Preview, proof.is_some()).await?;
     emit(
         &observer,
         ObserverEvent::RoleMetadata(product.role_metadata()),
@@ -494,6 +658,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
     let mut migration_evidence_completed = false;
     let mut profile_benchmark = None::<ProductProfileBenchmark>;
     let mut responsive_evidence = None::<ResponsiveEvidenceState>;
+    let mut native_workflow = None::<NativeWorkflowState>;
+    let mut latest_presented_key = None::<crate::observer::FrameEvidenceKey>;
     let mut scroll_frame_ordinal = 0_u32;
     let mut scroll_proof_requested = false;
 
@@ -502,7 +668,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             runtime.resolve_program_artifact_requests()?;
             submit_program_requests(runtime.take_program_requests(), &program_compiler);
         }
-        deadline_scheduler.schedule(runtime.as_ref().and_then(|runtime| {
+        let runtime_deadline = runtime.as_ref().and_then(|runtime| {
             [
                 runtime.caret_blink_deadline(),
                 runtime.scheduled_source_deadline(),
@@ -512,7 +678,18 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             .into_iter()
             .flatten()
             .min()
-        }));
+        });
+        let workflow_deadline = native_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.pending.as_ref())
+            .and_then(|pending| pending.started_at)
+            .map(|started| started + TEST_SETTLE_TIMEOUT);
+        deadline_scheduler.schedule(
+            [runtime_deadline, workflow_deadline]
+                .into_iter()
+                .flatten()
+                .min(),
+        );
         enum Wake {
             Native(Result<HostEventEnvelope, boon_native_app_window::NativeHostError>),
             Ipc(Option<Result<Message, String>>),
@@ -564,6 +741,12 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         observe_input(&observer, envelope, None, None, false);
                         let _ = output.send(Message::Shutdown);
                         return Ok(());
+                    }
+                    if let (Some(x), Some(y)) = event_position(&envelope.event) {
+                        cursor = (x, y);
+                        if native_workflow.is_some() {
+                            product.set_virtual_cursor(Some(cursor));
+                        }
                     }
                     let target = event_target(&view, &envelope.event, &mut columns);
                     let target_name = target.as_ref().map(|target| target.node.clone());
@@ -647,6 +830,14 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 submitted,
                             )?;
                         }
+                        if let Some(workflow) = native_workflow.as_mut() {
+                            observe_native_workflow_input(
+                                workflow,
+                                envelope,
+                                target_source_path.as_deref(),
+                                model.last_dispatched_source(),
+                            )?;
+                        }
                         changed
                     } else {
                         false
@@ -671,15 +862,16 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 {
                     let proof_request = prepare_product_proof_request(
                         profile_benchmark.as_ref(),
+                        native_workflow.as_ref(),
                         proof.as_ref(),
                         proof_config.as_ref(),
                         &mut proof_requested,
                         &mut proof_eligible_ordinal,
                         &presented,
-                        &view,
-                        &host,
-                    );
+                        &mut product,
+                    )?;
                     emit_presented(&observer, &presented);
+                    latest_presented_key = Some(presented.key.clone());
                     submit_proof_request(&observer, proof.as_ref(), proof_request)?;
                     if let Some(benchmark) = profile_benchmark.as_mut()
                         && benchmark.candidate.as_ref().is_some_and(|candidate| {
@@ -712,9 +904,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 [prepare_evidence_proof(
                                     "warm-scroll",
                                     presented.key.clone(),
-                                    &view,
-                                    &host,
-                                )],
+                                    &mut product,
+                                )?],
                             )?;
                         }
                     }
@@ -744,7 +935,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                     .as_mut()
                                     .ok_or("responsive evidence has no runtime")?,
                                 &view,
-                                &host,
+                                &mut product,
                                 state,
                                 sequence,
                                 presented.key.clone(),
@@ -815,10 +1006,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             .into_iter()
                             .map(render_asset_source)
                             .collect::<Vec<_>>();
-                        product.replace_asset_sources(sources.clone())?;
-                        if let Some(proof) = proof.as_ref() {
-                            proof.replace_asset_sources(sources)?;
-                        }
+                        product.replace_asset_sources(sources)?;
                     }
                     Message::PreviewApply {
                         intent,
@@ -1198,8 +1386,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             runtime.as_mut().expect("mounted runtime"),
                                             source_revision,
                                             presented,
-                                            &view,
-                                            &host,
+                                            &mut product,
                                         )?;
                                         queue_evidence_proofs(
                                             &observer,
@@ -1274,23 +1461,89 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                     import_preview.as_ref(),
                                 )?;
                                 if test {
-                                    let result = run_test(
-                                        &observer,
-                                        &output,
-                                        request_id,
-                                        source_revision,
-                                        runtime.as_mut().expect("mounted runtime"),
-                                        &mut view,
-                                        &mut product,
-                                        &mut host,
-                                        &mut columns,
-                                        &steps,
-                                        &mut cursor,
-                                        &state_evidence,
-                                    )
-                                    .await;
-                                    let (passed, semantic_assertions_proven, completed, message) =
-                                        match result {
+                                    if !state_evidence.native_workflow_steps.is_empty() {
+                                        let initial_key = presented
+                                            .as_ref()
+                                            .map(|frame| frame.key.clone())
+                                            .ok_or("native workflow TEST did not mount a presented frame")?;
+                                        native_workflow = NativeWorkflowState::from_test_steps(
+                                            request_id,
+                                            &steps,
+                                            &state_evidence.native_workflow_steps,
+                                            &state_evidence.native_workflow_proof_steps,
+                                        )?;
+                                        product.set_virtual_cursor(Some(cursor));
+                                        if state_evidence.profile_samples > 0 {
+                                            profile_benchmark =
+                                                Some(arm_product_profile_benchmark(
+                                                    &observer,
+                                                    runtime.as_mut().expect("mounted runtime"),
+                                                    &view,
+                                                    &steps,
+                                                    state_evidence.profile_samples,
+                                                    &state_evidence.profile_steps,
+                                                    initial_key.clone(),
+                                                )?);
+                                        }
+                                        if let Some(width) = state_evidence.responsive_width {
+                                            responsive_evidence = Some(arm_responsive_evidence(
+                                                &observer,
+                                                &view,
+                                                &host,
+                                                width,
+                                                initial_key,
+                                            )?);
+                                        }
+                                        if let Some(target) = first_test_target(
+                                            runtime.as_mut().expect("mounted runtime"),
+                                            &view,
+                                            &steps,
+                                        )
+                                        .or_else(|| view.first_visible_hit_target())
+                                        {
+                                            emit(
+                                                &observer,
+                                                ObserverEvent::TestTarget {
+                                                    request_id,
+                                                    node: target.node,
+                                                    source_path: target
+                                                        .source_path
+                                                        .unwrap_or_else(|| "unbound".to_owned()),
+                                                    x: target.center_x,
+                                                    y: target.center_y,
+                                                },
+                                            );
+                                        }
+                                        push_persistence_snapshot(
+                                            &output,
+                                            runtime.as_ref(),
+                                            source_revision,
+                                            &mut persistence_snapshot_sequence,
+                                            last_persistence_operation.as_ref(),
+                                            import_preview.as_ref(),
+                                        )?;
+                                    } else {
+                                        let result = run_test(
+                                            &observer,
+                                            &output,
+                                            request_id,
+                                            source_revision,
+                                            runtime.as_mut().expect("mounted runtime"),
+                                            &mut view,
+                                            &mut product,
+                                            &mut host,
+                                            &mut columns,
+                                            &steps,
+                                            &mut cursor,
+                                            &state_evidence,
+                                        )
+                                        .await;
+                                        let (
+                                            passed,
+                                            semantic_assertions_proven,
+                                            completed,
+                                            message,
+                                        ) = match result {
                                             Ok(outcome) => {
                                                 let last_key = outcome.last_key.clone();
                                                 queue_evidence_proofs(
@@ -1341,53 +1594,55 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             }
                                             Err(error) => (false, false, 0, error.to_string()),
                                         };
-                                    if std::env::var_os(PRODUCT_PROOF_AFTER_TEST_ENV).is_some() {
-                                        proof_requested = false;
-                                        proof_eligible_ordinal = 0;
-                                    }
-                                    if let Some(runtime) = runtime.as_ref()
-                                        && let Some(target) =
-                                            first_test_target(runtime, &view, &steps)
-                                                .or_else(|| view.first_visible_hit_target())
-                                    {
+                                        if std::env::var_os(PRODUCT_PROOF_AFTER_TEST_ENV).is_some()
+                                        {
+                                            proof_requested = false;
+                                            proof_eligible_ordinal = 0;
+                                        }
+                                        if let Some(runtime) = runtime.as_ref()
+                                            && let Some(target) =
+                                                first_test_target(runtime, &view, &steps)
+                                                    .or_else(|| view.first_visible_hit_target())
+                                        {
+                                            emit(
+                                                &observer,
+                                                ObserverEvent::TestTarget {
+                                                    request_id,
+                                                    node: target.node,
+                                                    source_path: target
+                                                        .source_path
+                                                        .unwrap_or_else(|| "unbound".to_owned()),
+                                                    x: target.center_x,
+                                                    y: target.center_y,
+                                                },
+                                            );
+                                        }
                                         emit(
                                             &observer,
-                                            ObserverEvent::TestTarget {
+                                            ObserverEvent::TestCompleted {
                                                 request_id,
-                                                node: target.node,
-                                                source_path: target
-                                                    .source_path
-                                                    .unwrap_or_else(|| "unbound".to_owned()),
-                                                x: target.center_x,
-                                                y: target.center_y,
+                                                passed,
+                                                semantic_assertions_proven,
+                                                completed_steps: completed
+                                                    .try_into()
+                                                    .unwrap_or(u32::MAX),
+                                                message: message.clone(),
                                             },
                                         );
-                                    }
-                                    emit(
-                                        &observer,
-                                        ObserverEvent::TestCompleted {
+                                        output.send(Message::PreviewTestResult {
                                             request_id,
                                             passed,
-                                            semantic_assertions_proven,
-                                            completed_steps: completed
-                                                .try_into()
-                                                .unwrap_or(u32::MAX),
-                                            message: message.clone(),
-                                        },
-                                    );
-                                    output.send(Message::PreviewTestResult {
-                                        request_id,
-                                        passed,
-                                        message,
-                                    })?;
-                                    push_persistence_snapshot(
-                                        &output,
-                                        runtime.as_ref(),
-                                        source_revision,
-                                        &mut persistence_snapshot_sequence,
-                                        last_persistence_operation.as_ref(),
-                                        import_preview.as_ref(),
-                                    )?;
+                                            message,
+                                        })?;
+                                        push_persistence_snapshot(
+                                            &output,
+                                            runtime.as_ref(),
+                                            source_revision,
+                                            &mut persistence_snapshot_sequence,
+                                            last_persistence_operation.as_ref(),
+                                            import_preview.as_ref(),
+                                        )?;
+                                    }
                                 }
                                 send_stats(
                                     &output,
@@ -1459,6 +1714,14 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 let Some(model) = runtime.as_mut() else {
                     continue;
                 };
+                let async_request_id = format!("{}:{}", outcome.session.0, outcome.request_id.0);
+                let async_revision = outcome.revision;
+                let async_queue_depth = outcome.pending_depth;
+                let async_queue_wait_us = duration_us(outcome.queue_wait);
+                let async_worker_us = duration_us(outcome.elapsed);
+                let async_queued_at = outcome.queued_at;
+                let async_completed_at = outcome.completed_at;
+                let compile_failed = outcome.result.is_err();
                 let profile_request = profile_benchmark.as_ref().is_some_and(|benchmark| {
                     profile_candidate_has_request(
                         benchmark,
@@ -1474,6 +1737,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                     &outcome.request_id,
                     outcome.result,
                 )?;
+                let async_completion = observed.completion.clone();
                 let completion_us = duration_us(completion_started.elapsed());
                 let completion_phase = model.last_runtime_phase();
                 let artifact_changed = model.resolve_program_artifact_requests()?;
@@ -1485,22 +1749,21 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 };
                 submit_program_requests(model.take_program_requests(), &program_compiler);
                 let mut child_frame = None;
-                if changed {
-                    if let Some(presented) = product.present(&mut host, &view).await? {
-                        let proof_request = prepare_product_proof_request(
-                            profile_benchmark.as_ref(),
-                            proof.as_ref(),
-                            proof_config.as_ref(),
-                            &mut proof_requested,
-                            &mut proof_eligible_ordinal,
-                            &presented,
-                            &view,
-                            &host,
-                        );
-                        emit_presented(&observer, &presented);
-                        submit_proof_request(&observer, proof.as_ref(), proof_request)?;
-                        child_frame = Some(presented);
-                    }
+                if changed && let Some(presented) = product.present(&mut host, &view).await? {
+                    let proof_request = prepare_product_proof_request(
+                        profile_benchmark.as_ref(),
+                        native_workflow.as_ref(),
+                        proof.as_ref(),
+                        proof_config.as_ref(),
+                        &mut proof_requested,
+                        &mut proof_eligible_ordinal,
+                        &presented,
+                        &mut product,
+                    )?;
+                    emit_presented(&observer, &presented);
+                    latest_presented_key = Some(presented.key.clone());
+                    submit_proof_request(&observer, proof.as_ref(), proof_request)?;
+                    child_frame = Some(presented);
                 }
                 if profile_request {
                     let benchmark = profile_benchmark.as_mut().expect("profile benchmark");
@@ -1551,19 +1814,86 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         .await?;
                     }
                 }
+                let async_key = product
+                    .last_presented_key()
+                    .cloned()
+                    .ok_or("child compile completed before a production frame existed")?;
+                let async_apply_us = duration_us(async_completed_at.elapsed());
+                let async_end_to_end_us = accounted_end_to_end_us(
+                    duration_us(async_queued_at.elapsed()),
+                    async_queue_wait_us,
+                    async_worker_us,
+                    async_apply_us,
+                );
+                emit(
+                    &observer,
+                    ObserverEvent::AsyncLaneCompleted {
+                        lane: AsyncLaneKind::ChildProgramCompile,
+                        request_id: async_request_id,
+                        revision: async_revision,
+                        queue_depth: async_queue_depth,
+                        queue_wait_us: async_queue_wait_us,
+                        worker_us: async_worker_us,
+                        apply_us: async_apply_us,
+                        end_to_end_us: async_end_to_end_us,
+                        outcome: program_async_lane_outcome(&async_completion, compile_failed),
+                        key: async_key,
+                    },
+                );
                 send_program_status(&output, Some(model), source_revision)?;
             }
             Wake::Proof(result) => {
+                let proof_apply_started = Instant::now();
                 let result = result.ok_or("proof worker stopped")?;
                 let completed_key = result.key.clone();
+                let proof_queue_wait_us = duration_us(result.queue_wait);
+                let proof_worker_us = duration_us(result.elapsed);
+                let proof_end_to_end_us = duration_us(result.end_to_end);
+                let proof_failed = result.proof.is_err();
+                let completed_after_key = product
+                    .last_presented_key()
+                    .cloned()
+                    .ok_or("proof completed before any production frame was presented")?;
+                if !completed_key.same_producer_surface(&completed_after_key)
+                    || completed_after_key.frame_id < completed_key.frame_id
+                    || completed_after_key.present_id < completed_key.present_id
+                {
+                    return Err("proof completion is not ordered after its production frame".into());
+                }
                 let worker = proof.as_ref().expect("proof result without worker");
                 emit(
                     &observer,
                     result.observer_event(
-                        product.frame_id(),
+                        completed_after_key.clone(),
                         worker.replaced_count(),
                         worker.result_drop_count(),
                     ),
+                );
+                let proof_apply_us = duration_us(proof_apply_started.elapsed());
+                let proof_end_to_end_us = accounted_end_to_end_us(
+                    proof_end_to_end_us.saturating_add(proof_apply_us),
+                    proof_queue_wait_us,
+                    proof_worker_us,
+                    proof_apply_us,
+                );
+                emit(
+                    &observer,
+                    ObserverEvent::AsyncLaneCompleted {
+                        lane: AsyncLaneKind::ProofReadback,
+                        request_id: format!("proof-{}", completed_key.proof_id),
+                        revision: completed_key.frame_id,
+                        queue_depth: 1,
+                        queue_wait_us: proof_queue_wait_us,
+                        worker_us: proof_worker_us,
+                        apply_us: proof_apply_us,
+                        end_to_end_us: proof_end_to_end_us,
+                        outcome: if proof_failed {
+                            AsyncLaneOutcome::Failed
+                        } else {
+                            AsyncLaneOutcome::Applied
+                        },
+                        key: completed_after_key,
+                    },
                 );
                 if evidence_proof_in_flight.as_ref() == Some(&completed_key) {
                     evidence_proof_in_flight = None;
@@ -1594,6 +1924,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                     if timer_changed || caret_changed || artifact_changed || effect_changed {
                         if let Some(presented) = product.present(&mut host, &view).await? {
                             emit_presented(&observer, &presented);
+                            latest_presented_key = Some(presented.key.clone());
                         }
                         send_stats(
                             &output,
@@ -1632,7 +1963,563 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 }
             }
         }
+        let profile_complete = profile_benchmark
+            .as_ref()
+            .is_none_or(|benchmark| benchmark.phase.is_complete());
+        if let (Some(workflow), Some(model)) = (native_workflow.as_mut(), runtime.as_mut()) {
+            service_native_workflow(
+                workflow,
+                profile_complete,
+                &observer,
+                &output,
+                &state_evidence,
+                source_revision,
+                model,
+                &mut view,
+                &mut product,
+                &mut host,
+                &mut columns,
+                &mut latest_presented_key,
+                proof.as_ref(),
+                &mut queued_evidence_proofs,
+                &mut evidence_proof_in_flight,
+            )
+            .await?;
+        }
+        if let Some(model) = runtime.as_mut() {
+            emit_runtime_async_lanes(&observer, model, &product)?;
+        }
     }
+}
+
+fn observe_native_workflow_input(
+    workflow: &mut NativeWorkflowState,
+    envelope: &HostEventEnvelope,
+    pointer_source_path: Option<&str>,
+    dispatched_source_path: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !workflow.prepared || workflow.complete() || envelope.origin != HostEventOrigin::RealOs {
+        return Ok(());
+    }
+    let step = workflow
+        .current()
+        .cloned()
+        .ok_or("native workflow lost its current step")?;
+    let Some(action_kind) = step.action_kind.as_deref() else {
+        return Ok(());
+    };
+    let Some(pending) = workflow.pending.as_mut() else {
+        return Ok(());
+    };
+    if pending.started_at.is_none() {
+        let starts_on_target = matches!(
+            &envelope.event,
+            HostEvent::Pointer(PointerEvent {
+                phase: PointerPhase::Down,
+                button: Some(PointerButton::Primary),
+                ..
+            })
+        ) && pointer_source_path == Some(step.source_path.as_str())
+            && dispatched_source_path == Some(step.source_path.as_str());
+        let starts_on_blur = action_kind == "blur"
+            && matches!(envelope.event, HostEvent::Focus { focused: false, .. });
+        if !starts_on_target && !starts_on_blur {
+            return Ok(());
+        }
+        pending.started_at = Some(Instant::now());
+    }
+    if pending.action_complete {
+        return Err(format!(
+            "native workflow step `{}` received input after its action span closed",
+            step.id
+        )
+        .into());
+    }
+    if pending
+        .last_sequence
+        .is_some_and(|last| envelope.sequence <= last)
+    {
+        return Err(format!(
+            "native workflow step `{}` received a non-monotonic input sequence",
+            step.id
+        )
+        .into());
+    }
+    pending.first_sequence.get_or_insert(envelope.sequence);
+    pending.last_sequence = Some(envelope.sequence);
+    pending.event_digests.push(host_event_digest(envelope));
+    if pending.event_digests.len() > 256 {
+        return Err(format!(
+            "native workflow step `{}` exceeded its bounded input span",
+            step.id
+        )
+        .into());
+    }
+
+    match (action_kind, &envelope.event) {
+        (
+            "click" | "double_click",
+            HostEvent::Pointer(PointerEvent {
+                phase: PointerPhase::Up,
+                button: Some(PointerButton::Primary),
+                ..
+            }),
+        ) if pointer_source_path == Some(step.source_path.as_str())
+            && dispatched_source_path == Some(step.source_path.as_str()) =>
+        {
+            pending.pointer_up_count = pending.pointer_up_count.saturating_add(1);
+            pending.action_complete = action_kind == "click" || pending.pointer_up_count == 2;
+        }
+        ("type_text", HostEvent::TextInput(text))
+            if dispatched_source_path == Some(step.source_path.as_str()) =>
+        {
+            let expected = step
+                .text
+                .as_deref()
+                .ok_or("native workflow type_text step has no text")?;
+            pending.batch_text.push_str(&text.text);
+            if !expected.starts_with(&pending.batch_text) {
+                return Err(format!(
+                    "native workflow step `{}` received text outside its declared batch",
+                    step.id
+                )
+                .into());
+            }
+        }
+        ("type_text", event) if is_ascii_batch_end(event) => {
+            pending.action_complete = step.text.as_deref() == Some(pending.batch_text.as_str());
+            if !pending.action_complete {
+                return Err(format!(
+                    "native workflow step `{}` closed an incomplete text batch",
+                    step.id
+                )
+                .into());
+            }
+        }
+        ("key", HostEvent::Keyboard(key)) if !key.pressed => {
+            pending.action_complete = step.key.as_deref().is_some_and(|expected| {
+                matches!(&key.logical_key, LogicalKey::Named(actual) if actual == expected)
+            });
+        }
+        ("blur", HostEvent::Focus { focused: false, .. }) => {
+            pending.action_complete = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn service_native_workflow(
+    workflow: &mut NativeWorkflowState,
+    profile_complete: bool,
+    observer: &Option<ObserverClient>,
+    output: &PreviewOutput,
+    state_evidence: &StateEvidenceConfig,
+    source_revision: u64,
+    runtime: &mut RuntimeView,
+    view: &mut RetainedView,
+    product: &mut ProductFrame,
+    host: &mut NativeSurfaceHost,
+    columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
+    latest_presented_key: &mut Option<crate::observer::FrameEvidenceKey>,
+    proof: Option<&ProofWorker>,
+    queued_evidence_proofs: &mut VecDeque<PreparedProofRequest>,
+    evidence_proof_in_flight: &mut Option<crate::observer::FrameEvidenceKey>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if workflow.complete() && workflow.test_completed_emitted {
+        return Ok(());
+    }
+    if !workflow.prepared {
+        if !profile_complete {
+            return Ok(());
+        }
+        if !workflow.host_evidence_complete {
+            let key = latest_presented_key
+                .clone()
+                .ok_or("native workflow host evidence has no presented baseline")?;
+            if state_evidence.persistence_exercise {
+                let requests = run_persistence_evidence(
+                    observer,
+                    source_revision,
+                    runtime,
+                    view,
+                    product,
+                    host,
+                    columns,
+                    key,
+                )
+                .await?;
+                queue_evidence_proofs(
+                    observer,
+                    proof,
+                    queued_evidence_proofs,
+                    evidence_proof_in_flight,
+                    requests,
+                )?;
+            }
+            if state_evidence.stale_program {
+                let request = run_stale_program_evidence(
+                    observer,
+                    source_revision,
+                    runtime,
+                    view,
+                    product,
+                    host,
+                    columns,
+                    &workflow.steps,
+                    &state_evidence.profile_steps,
+                )
+                .await?;
+                queue_evidence_proofs(
+                    observer,
+                    proof,
+                    queued_evidence_proofs,
+                    evidence_proof_in_flight,
+                    [request],
+                )?;
+            }
+            workflow.host_evidence_complete = true;
+        }
+        runtime.start_over()?;
+        view.replace(runtime.frame(), viewport(host), columns)?;
+        settle_test_runtime(runtime, view, columns)?;
+        let frame = present_runtime(runtime, view, product, host, columns)
+            .await?
+            .ok_or("native workflow reset did not present")?;
+        emit_presented(observer, &frame);
+        *latest_presented_key = Some(frame.key.clone());
+        let state = authoritative_state_evidence(runtime)?;
+        workflow.initial_state_digest = Some(state.digest.clone());
+        workflow.current_state_digest = Some(state.digest.clone());
+        workflow.prepared = true;
+        emit(
+            observer,
+            ObserverEvent::NativeWorkflowReady {
+                test_request_id: workflow.test_request_id,
+                step_count: workflow.steps.len().try_into().unwrap_or(u32::MAX),
+                source_revision,
+                runtime_sequence: runtime.runtime_turn_sequence(),
+                durable_epoch: state.durable_epoch,
+                state_digest: state.digest,
+                key: frame.key,
+            },
+        );
+    }
+
+    while workflow
+        .current()
+        .is_some_and(|step| step.action_kind.is_none())
+    {
+        let step = workflow
+            .current()
+            .cloned()
+            .ok_or("native workflow lost its assertion-only step")?;
+        let assertion_count = assert_test_step_semantics(runtime, &step)?;
+        let state = authoritative_state_evidence(runtime)?;
+        let durable_acked = state.durable_turn_sequence >= runtime.runtime_turn_sequence();
+        if !durable_acked {
+            return Err(format!(
+                "native workflow step `{}` was observed before its durable acknowledgement",
+                step.id
+            )
+            .into());
+        }
+        let frame = present_runtime(runtime, view, product, host, columns)
+            .await?
+            .ok_or("native workflow assertion frame did not present")?;
+        emit_presented(observer, &frame);
+        *latest_presented_key = Some(frame.key.clone());
+        let ordinal = workflow.completed.saturating_add(1);
+        let request_id = native_workflow_request_id(workflow.test_request_id, ordinal);
+        let before_state_digest = workflow
+            .current_state_digest
+            .clone()
+            .ok_or("native workflow assertion has no prior state digest")?;
+        emit(
+            observer,
+            ObserverEvent::NativeWorkflowStep {
+                request_id,
+                ordinal: ordinal.try_into().unwrap_or(u32::MAX),
+                step_id: step.id.clone(),
+                source_path: "assertion-only".to_owned(),
+                action_kind: "assertion_only".to_owned(),
+                action_digest: native_workflow_action_digest(&step),
+                input_first_sequence: 0,
+                input_last_sequence: 0,
+                input_event_count: 0,
+                input_event_digest: native_workflow_input_digest(&[]),
+                assertion_count: assertion_count.try_into().unwrap_or(u32::MAX),
+                source_revision,
+                runtime_sequence: runtime.runtime_turn_sequence(),
+                durable_epoch: state.durable_epoch,
+                durable_turn_sequence: state.durable_turn_sequence,
+                durable_acked,
+                before_state_digest,
+                state_digest: state.digest.clone(),
+                key: frame.key.clone(),
+            },
+        );
+        if workflow.proof_steps.contains(&step.id) {
+            queue_evidence_proofs(
+                observer,
+                proof,
+                queued_evidence_proofs,
+                evidence_proof_in_flight,
+                [prepare_evidence_proof(
+                    &format!("native-workflow-{}", step.id),
+                    frame.key.clone(),
+                    product,
+                )?],
+            )?;
+        }
+        workflow.current_state_digest = Some(state.digest);
+        workflow.completed = workflow.completed.saturating_add(1);
+    }
+
+    if let Some(pending) = workflow.pending.as_ref()
+        && pending.action_complete
+    {
+        let step = workflow
+            .current()
+            .cloned()
+            .ok_or("native workflow accepted input after its final step")?;
+        match assert_test_step_semantics(runtime, &step) {
+            Ok(assertion_count) => {
+                let pending = workflow
+                    .pending
+                    .take()
+                    .expect("checked native workflow action span");
+                let state = authoritative_state_evidence(runtime)?;
+                let durable_acked = state.durable_turn_sequence >= runtime.runtime_turn_sequence();
+                if !durable_acked {
+                    return Err(format!(
+                        "native workflow step `{}` was observed before its durable acknowledgement",
+                        step.id
+                    )
+                    .into());
+                }
+                let frame = present_runtime(runtime, view, product, host, columns)
+                    .await?
+                    .ok_or("native workflow evidence frame did not present")?;
+                emit_presented(observer, &frame);
+                *latest_presented_key = Some(frame.key.clone());
+                let ordinal = workflow.completed.saturating_add(1);
+                let first_sequence = pending
+                    .first_sequence
+                    .ok_or("native workflow action has no first input sequence")?;
+                let last_sequence = pending
+                    .last_sequence
+                    .ok_or("native workflow action has no last input sequence")?;
+                emit(
+                    observer,
+                    ObserverEvent::NativeWorkflowStep {
+                        request_id: pending.request_id,
+                        ordinal: ordinal.try_into().unwrap_or(u32::MAX),
+                        step_id: step.id.clone(),
+                        source_path: step.source_path.clone(),
+                        action_kind: step.action_kind.clone().expect("validated workflow action"),
+                        action_digest: pending.action_digest,
+                        input_first_sequence: first_sequence,
+                        input_last_sequence: last_sequence,
+                        input_event_count: pending
+                            .event_digests
+                            .len()
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                        input_event_digest: native_workflow_input_digest(&pending.event_digests),
+                        assertion_count: assertion_count.try_into().unwrap_or(u32::MAX),
+                        source_revision,
+                        runtime_sequence: runtime.runtime_turn_sequence(),
+                        durable_epoch: state.durable_epoch,
+                        durable_turn_sequence: state.durable_turn_sequence,
+                        durable_acked,
+                        before_state_digest: pending.before_state_digest,
+                        state_digest: state.digest.clone(),
+                        key: frame.key.clone(),
+                    },
+                );
+                if workflow.proof_steps.contains(&step.id) {
+                    queue_evidence_proofs(
+                        observer,
+                        proof,
+                        queued_evidence_proofs,
+                        evidence_proof_in_flight,
+                        [prepare_evidence_proof(
+                            &format!("native-workflow-{}", step.id),
+                            frame.key.clone(),
+                            product,
+                        )?],
+                    )?;
+                }
+                workflow.current_state_digest = Some(state.digest);
+                workflow.completed = workflow.completed.saturating_add(1);
+            }
+            Err(error)
+                if pending
+                    .started_at
+                    .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT) =>
+            {
+                return Err(format!(
+                    "native workflow step `{}` did not reach its declared semantics: {error}",
+                    step.id
+                )
+                .into());
+            }
+            Err(_) => return Ok(()),
+        }
+    } else if let Some(pending) = workflow.pending.as_ref()
+        && pending
+            .started_at
+            .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT)
+    {
+        return Err(format!(
+            "native workflow step `{}` did not complete its declared real-input span",
+            workflow
+                .current()
+                .map_or("unknown", |step| step.id.as_str())
+        )
+        .into());
+    }
+
+    if workflow.complete() {
+        if !workflow.test_completed_emitted {
+            let key = latest_presented_key
+                .clone()
+                .ok_or("native workflow completed without a presented frame")?;
+            let initial_state_digest = workflow
+                .initial_state_digest
+                .clone()
+                .ok_or("native workflow has no reset digest")?;
+            let final_state_digest = workflow
+                .current_state_digest
+                .clone()
+                .ok_or("native workflow has no final digest")?;
+            emit(
+                observer,
+                ObserverEvent::NativeWorkflowCompleted {
+                    test_request_id: workflow.test_request_id,
+                    step_count: workflow.completed.try_into().unwrap_or(u32::MAX),
+                    initial_state_digest,
+                    final_state_digest,
+                    key,
+                },
+            );
+            emit(
+                observer,
+                ObserverEvent::TestCompleted {
+                    request_id: workflow.test_request_id,
+                    passed: true,
+                    semantic_assertions_proven: true,
+                    completed_steps: workflow.completed.try_into().unwrap_or(u32::MAX),
+                    message: format!(
+                        "{} isolated kernel-uinput steps and semantic assertions passed",
+                        workflow.completed
+                    ),
+                },
+            );
+            output.send(Message::PreviewTestResult {
+                request_id: workflow.test_request_id,
+                passed: true,
+                message: format!(
+                    "{} isolated kernel-uinput steps and semantic assertions passed",
+                    workflow.completed
+                ),
+            })?;
+            workflow.test_completed_emitted = true;
+            product.set_virtual_cursor(None);
+        }
+        return Ok(());
+    }
+
+    emit_current_native_workflow_target(
+        workflow,
+        observer,
+        runtime,
+        view,
+        latest_presented_key.as_ref(),
+    )?;
+    Ok(())
+}
+
+fn emit_current_native_workflow_target(
+    workflow: &mut NativeWorkflowState,
+    observer: &Option<ObserverClient>,
+    runtime: &mut RuntimeView,
+    view: &RetainedView,
+    key: Option<&crate::observer::FrameEvidenceKey>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if workflow.pending.is_some() || workflow.complete() {
+        return Ok(());
+    }
+    let step = workflow
+        .current()
+        .cloned()
+        .ok_or("native workflow has no target step")?;
+    let action_kind = step
+        .action_kind
+        .clone()
+        .ok_or("native workflow target cannot represent an assertion-only step")?;
+    let target_row = runtime.scenario_target_row(
+        &step.source_path,
+        step.target_text.as_deref(),
+        step.address.as_deref(),
+        step.target_occurrence,
+    )?;
+    let Some(target) = view.target_for_scenario(
+        &step.source_path,
+        step.action_kind.as_deref(),
+        step.target_text.as_deref(),
+        step.address.as_deref(),
+        target_row,
+    ) else {
+        return Ok(());
+    };
+    let key = key
+        .cloned()
+        .ok_or("native workflow target has no presented frame")?;
+    let point = test_step_pointer_position(view, &target, &step);
+    let ordinal = workflow.completed.saturating_add(1);
+    let request_id = native_workflow_request_id(workflow.test_request_id, ordinal);
+    let action_digest = native_workflow_action_digest(&step);
+    workflow.pending = Some(NativeWorkflowPending {
+        request_id,
+        action_digest: action_digest.clone(),
+        before_state_digest: workflow
+            .current_state_digest
+            .clone()
+            .ok_or("native workflow target has no prior state digest")?,
+        started_at: None,
+        first_sequence: None,
+        last_sequence: None,
+        event_digests: Vec::new(),
+        batch_text: String::new(),
+        pointer_up_count: 0,
+        action_complete: false,
+    });
+    emit(
+        observer,
+        ObserverEvent::NativeWorkflowTarget {
+            request_id,
+            ordinal: ordinal.try_into().unwrap_or(u32::MAX),
+            step_id: step.id,
+            source_path: step.source_path,
+            action_kind,
+            action_digest,
+            node: target.node,
+            x: point.0,
+            y: point.1,
+            key,
+        },
+    );
+    Ok(())
+}
+
+fn native_workflow_request_id(test_request_id: u64, ordinal: usize) -> u64 {
+    test_request_id
+        .saturating_mul(64)
+        .saturating_add(ordinal.try_into().unwrap_or(u64::MAX))
+        .max(1)
 }
 
 fn render_asset_source(asset: AssetBlob) -> boon_native_gpu::RenderAssetSource {
@@ -2370,26 +3257,30 @@ struct PreparedProofRequest {
     snapshot_prepare_us: u64,
 }
 
-fn product_proof_is_eligible(benchmark: Option<&ProductProfileBenchmark>) -> bool {
+fn product_proof_is_eligible(
+    benchmark: Option<&ProductProfileBenchmark>,
+    workflow: Option<&NativeWorkflowState>,
+) -> bool {
     benchmark.is_none_or(|benchmark| matches!(benchmark.phase, ProductProfilePhase::Complete))
+        && workflow.is_none_or(|workflow| workflow.complete() && workflow.test_completed_emitted)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_product_proof_request(
     benchmark: Option<&ProductProfileBenchmark>,
+    workflow: Option<&NativeWorkflowState>,
     proof: Option<&ProofWorker>,
     config: Option<&ProofConfig>,
     requested: &mut bool,
     ordinal: &mut u64,
     presented: &PresentedFrame,
-    view: &RetainedView,
-    host: &NativeSurfaceHost,
-) -> Option<PreparedProofRequest> {
-    if !product_proof_is_eligible(benchmark) {
-        return None;
+    product: &mut ProductFrame,
+) -> Result<Option<PreparedProofRequest>, Box<dyn std::error::Error + Send + Sync>> {
+    if !product_proof_is_eligible(benchmark, workflow) {
+        return Ok(None);
     }
     *ordinal = ordinal.saturating_add(1);
-    prepare_proof_request(proof, config, requested, *ordinal, presented, view, host)
+    prepare_proof_request(proof, config, requested, *ordinal, presented, product)
 }
 
 fn prepare_proof_request(
@@ -2398,29 +3289,28 @@ fn prepare_proof_request(
     requested: &mut bool,
     ordinal: u64,
     presented: &PresentedFrame,
-    view: &RetainedView,
-    host: &NativeSurfaceHost,
-) -> Option<PreparedProofRequest> {
+    product: &mut ProductFrame,
+) -> Result<Option<PreparedProofRequest>, Box<dyn std::error::Error + Send + Sync>> {
     let (Some(_proof), Some(config)) = (proof, config) else {
-        return None;
+        return Ok(None);
     };
     if *requested || ordinal < config.sample_ordinal {
-        return None;
+        return Ok(None);
     }
     let snapshot_started = Instant::now();
-    let native = host.viewport();
+    let readback = product.capture_presented(
+        &presented.key,
+        format!("preview-frame-{}", presented.key.frame_id),
+    )?;
     *requested = true;
-    Some(PreparedProofRequest {
+    Ok(Some(PreparedProofRequest {
         request: ProofRequest {
             key: presented.key.clone(),
-            scene: view.scene().clone(),
-            width: native.physical_size.width,
-            height: native.physical_size.height,
-            surface_id: host.ids().surface.clone(),
-            artifact_label: format!("preview-frame-{}", presented.key.frame_id),
+            readback,
+            queued_at: Instant::now(),
         },
         snapshot_prepare_us: duration_us(snapshot_started.elapsed()),
-    })
+    }))
 }
 
 fn submit_proof_request(
@@ -2490,22 +3380,18 @@ fn importable_authority(
 fn prepare_evidence_proof(
     label: &str,
     key: crate::observer::FrameEvidenceKey,
-    view: &RetainedView,
-    host: &NativeSurfaceHost,
-) -> PreparedProofRequest {
+    product: &mut ProductFrame,
+) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
     let started = Instant::now();
-    let native = host.viewport();
-    PreparedProofRequest {
+    let readback = product.capture_presented(&key, format!("{label}-frame-{}", key.frame_id))?;
+    Ok(PreparedProofRequest {
         request: ProofRequest {
-            artifact_label: format!("{label}-frame-{}", key.frame_id),
             key,
-            scene: view.scene().clone(),
-            width: native.physical_size.width,
-            height: native.physical_size.height,
-            surface_id: host.ids().surface.clone(),
+            readback,
+            queued_at: Instant::now(),
         },
         snapshot_prepare_us: duration_us(started.elapsed()),
-    }
+    })
 }
 
 fn capture_state_mounted(
@@ -2513,8 +3399,7 @@ fn capture_state_mounted(
     runtime: &mut RuntimeView,
     source_revision: u64,
     presented: &PresentedFrame,
-    view: &RetainedView,
-    host: &NativeSurfaceHost,
+    product: &mut ProductFrame,
 ) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
     let state = authoritative_state_evidence(runtime)?;
     let startup = runtime.startup_evidence();
@@ -2547,12 +3432,7 @@ fn capture_state_mounted(
             key: presented.key.clone(),
         },
     );
-    Ok(prepare_evidence_proof(
-        "state-mounted",
-        presented.key.clone(),
-        view,
-        host,
-    ))
+    prepare_evidence_proof("state-mounted", presented.key.clone(), product)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2564,8 +3444,7 @@ fn capture_scenario_checkpoint(
     source_revision: u64,
     runtime: &mut RuntimeView,
     key: crate::observer::FrameEvidenceKey,
-    view: &RetainedView,
-    host: &NativeSurfaceHost,
+    product: &mut ProductFrame,
 ) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
     if assertion_count == 0 {
         return Err(format!(
@@ -2589,12 +3468,7 @@ fn capture_scenario_checkpoint(
             key: key.clone(),
         },
     );
-    Ok(prepare_evidence_proof(
-        &format!("checkpoint-{}", step.id),
-        key,
-        view,
-        host,
-    ))
+    prepare_evidence_proof(&format!("checkpoint-{}", step.id), key, product)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2612,9 +3486,8 @@ async fn run_persistence_evidence(
     let mut proofs = vec![prepare_evidence_proof(
         "persistence-baseline",
         baseline_key.clone(),
-        view,
-        host,
-    )];
+        product,
+    )?];
     emit_persistence_evidence(
         observer,
         PersistenceEvidenceKind::Exported,
@@ -2680,9 +3553,8 @@ async fn run_persistence_evidence(
     proofs.push(prepare_evidence_proof(
         "persistence-cleared",
         cleared_frame.key.clone(),
-        view,
-        host,
-    ));
+        product,
+    )?);
 
     runtime.preview_state_artifact(&baseline.artifact)?;
     let after_preview = authoritative_state_evidence(runtime)?;
@@ -2727,9 +3599,8 @@ async fn run_persistence_evidence(
     proofs.push(prepare_evidence_proof(
         "persistence-imported",
         activated_frame.key,
-        view,
-        host,
-    ));
+        product,
+    )?);
     Ok(proofs)
 }
 
@@ -2839,12 +3710,7 @@ async fn run_schema_migration_evidence(
         &activated,
         presented.key.clone(),
     );
-    Ok(prepare_evidence_proof(
-        "persistence-migrated",
-        presented.key,
-        view,
-        host,
-    ))
+    prepare_evidence_proof("persistence-migrated", presented.key, product)
 }
 
 fn emit_persistence_evidence(
@@ -2913,7 +3779,7 @@ fn capture_responsive_layout_evidence(
     source_revision: u64,
     runtime: &mut RuntimeView,
     view: &RetainedView,
-    host: &NativeSurfaceHost,
+    product: &mut ProductFrame,
     evidence: &ResponsiveEvidenceState,
     resize_sequence: u64,
     key: crate::observer::FrameEvidenceKey,
@@ -2976,10 +3842,11 @@ fn capture_responsive_layout_evidence(
             source_revision,
             runtime_sequence: runtime.runtime_turn_sequence(),
             durable_epoch: state.durable_epoch,
+            durable_turn_sequence: state.durable_turn_sequence,
             key: key.clone(),
         },
     );
-    Ok(prepare_evidence_proof("responsive-narrow", key, view, host))
+    prepare_evidence_proof("responsive-narrow", key, product)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3162,7 +4029,7 @@ async fn run_stale_program_evidence(
             key: frame.key.clone(),
         },
     );
-    let proof = prepare_evidence_proof("stale-program-rejected", frame.key, view, host);
+    let proof = prepare_evidence_proof("stale-program-rejected", frame.key, product)?;
 
     runtime.activate_state_artifact(&baseline)?;
     settle_test_runtime(runtime, view, columns)?;
@@ -3277,8 +4144,7 @@ async fn run_test(
                     source_revision,
                     runtime,
                     key,
-                    view,
-                    host,
+                    product,
                 )?);
             }
             completed += 1;
@@ -3505,8 +4371,7 @@ async fn run_test(
                 source_revision,
                 runtime,
                 key,
-                view,
-                host,
+                product,
             )?);
         }
         output.send(Message::PreviewRuntimeChanged {
@@ -3850,8 +4715,7 @@ fn finalize_profile_candidate(
     source_revision: u64,
     runtime: &RuntimeView,
     benchmark: &mut ProductProfileBenchmark,
-    view: &RetainedView,
-    host: &NativeSurfaceHost,
+    product: &mut ProductFrame,
 ) -> Result<ProfileFinalize, Box<dyn std::error::Error + Send + Sync>> {
     let candidate = benchmark
         .candidate
@@ -3883,6 +4747,15 @@ fn finalize_profile_candidate(
         .saturating_sub(candidate.parent_generation_before)
         .try_into()
         .unwrap_or(u32::MAX);
+    let (pending_program_artifact_stores, pending_program_artifact_loads) =
+        runtime.program_artifact_lane_counts();
+    let persistence = runtime.persistence_status();
+    let pending_durable_turns = persistence.pending.as_ref().map_or(0, |pending| {
+        pending
+            .last_turn_sequence
+            .saturating_sub(pending.first_turn_sequence)
+            .saturating_add(1)
+    });
     match benchmark.phase {
         ProductProfilePhase::Seed => {
             emit(
@@ -3905,9 +4778,15 @@ fn finalize_profile_candidate(
         ProductProfilePhase::Samples => {
             benchmark.completed_samples = benchmark.completed_samples.saturating_add(1);
             let ordinal = benchmark.completed_samples;
-            let proof_request = (ordinal == 11).then(|| {
-                prepare_evidence_proof("profile-benchmark", child_frame.key.clone(), view, host)
-            });
+            let proof_request = if ordinal == 11 {
+                Some(prepare_evidence_proof(
+                    "profile-benchmark",
+                    child_frame.key.clone(),
+                    product,
+                )?)
+            } else {
+                None
+            };
             emit(
                 observer,
                 ObserverEvent::ProfileSample {
@@ -3946,6 +4825,21 @@ fn finalize_profile_candidate(
                         || candidate.completion_update.full_lowered,
                     interaction_frame_block_us: editor_block_us.max(child_block_us),
                     pending_child_artifacts: candidate.pending_depth,
+                    pending_program_artifact_stores: pending_program_artifact_stores
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                    pending_program_artifact_loads: pending_program_artifact_loads
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                    pending_persistence_artifact_stores: persistence
+                        .pending_content_artifact_stores
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                    pending_persistence_artifact_loads: persistence
+                        .pending_content_artifact_loads
+                        .try_into()
+                        .unwrap_or(u32::MAX),
+                    pending_durable_turns: pending_durable_turns.try_into().unwrap_or(u32::MAX),
                     trusted_parent_rebuilds,
                     source_revision,
                     runtime_sequence: runtime.runtime_turn_sequence(),
@@ -3987,7 +4881,7 @@ async fn finalize_ready_profile_candidate(
         return Ok(());
     }
     let finalized =
-        finalize_profile_candidate(observer, source_revision, runtime, benchmark, view, host)?;
+        finalize_profile_candidate(observer, source_revision, runtime, benchmark, product)?;
     if let Some(request) = finalized.proof_request {
         queue_evidence_proofs(
             observer,
@@ -4363,6 +5257,7 @@ fn observe_input(
             pointer_y,
             target,
             target_source_path,
+            event_digest: host_event_digest(envelope),
             visible_change,
         }),
     );
@@ -4382,6 +5277,80 @@ fn emit_presented(observer: &Option<ObserverClient>, frame: &PresentedFrame) {
         .map(ObserverClient::dropped_count)
         .unwrap_or(0);
     emit(observer, frame.observer_event(ObserverRole::Preview, drops));
+}
+
+fn emit_runtime_async_lanes(
+    observer: &Option<ObserverClient>,
+    runtime: &mut RuntimeView,
+    product: &ProductFrame,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let observations = runtime.take_async_lane_observations();
+    if observations.is_empty() {
+        return Ok(());
+    }
+    let key = product
+        .last_presented_key()
+        .cloned()
+        .ok_or("async runtime lane completed before a production frame existed")?;
+    for observation in observations {
+        let end_to_end_us = accounted_end_to_end_us(
+            observation.end_to_end_us,
+            observation.queue_wait_us,
+            observation.worker_us,
+            observation.apply_us,
+        );
+        emit(
+            observer,
+            ObserverEvent::AsyncLaneCompleted {
+                lane: match observation.lane {
+                    RuntimeAsyncLaneKind::PersistenceTurn => AsyncLaneKind::PersistenceTurn,
+                    RuntimeAsyncLaneKind::ProgramArtifactStore => {
+                        AsyncLaneKind::ProgramArtifactStore
+                    }
+                    RuntimeAsyncLaneKind::ProgramArtifactLoad => AsyncLaneKind::ProgramArtifactLoad,
+                },
+                request_id: observation.request_id,
+                revision: observation.revision,
+                queue_depth: observation.queue_depth,
+                queue_wait_us: observation.queue_wait_us,
+                worker_us: observation.worker_us,
+                apply_us: observation.apply_us,
+                end_to_end_us,
+                outcome: match observation.outcome {
+                    RuntimeAsyncLaneOutcome::Applied => AsyncLaneOutcome::Applied,
+                    RuntimeAsyncLaneOutcome::StaleRejected => AsyncLaneOutcome::StaleRejected,
+                    RuntimeAsyncLaneOutcome::Failed => AsyncLaneOutcome::Failed,
+                },
+                key: key.clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn program_async_lane_outcome(
+    completion: &ProgramCompletionObservation,
+    failed: bool,
+) -> AsyncLaneOutcome {
+    if failed {
+        return AsyncLaneOutcome::Failed;
+    }
+    match completion {
+        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+            ProgramCompletion::Stale { .. },
+        ))
+        | ProgramCompletionObservation::Host(ProgramHostCompletion::Superseded { .. })
+        | ProgramCompletionObservation::Host(ProgramHostCompletion::Removed { .. }) => {
+            AsyncLaneOutcome::StaleRejected
+        }
+        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+            ProgramCompletion::Rejected { .. },
+        )) => AsyncLaneOutcome::Failed,
+        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+            ProgramCompletion::Activated { .. },
+        ))
+        | ProgramCompletionObservation::ArtifactStorePending { .. } => AsyncLaneOutcome::Applied,
+    }
 }
 
 fn emit(observer: &Option<ObserverClient>, event: ObserverEvent) {
@@ -4503,6 +5472,10 @@ fn saturating_u32(value: u64) -> u32 {
 
 fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+fn accounted_end_to_end_us(measured: u64, queue_wait: u64, worker: u64, apply: u64) -> u64 {
+    measured.max(queue_wait.saturating_add(worker).saturating_add(apply))
 }
 
 #[cfg(test)]
@@ -4631,12 +5604,12 @@ mod tests {
     fn profile_batch_becomes_ready_when_marker_follows_completion() {
         let mut benchmark = profile_test_benchmark("seed", true);
 
-        assert!(!product_proof_is_eligible(Some(&benchmark)));
+        assert!(!product_proof_is_eligible(Some(&benchmark), None));
         assert!(!profile_candidate_is_ready(&benchmark));
         close_profile_input_batch(&mut benchmark).unwrap();
         assert!(profile_candidate_is_ready(&benchmark));
         benchmark.phase = ProductProfilePhase::Complete;
-        assert!(product_proof_is_eligible(Some(&benchmark)));
+        assert!(product_proof_is_eligible(Some(&benchmark), None));
     }
 
     #[test]

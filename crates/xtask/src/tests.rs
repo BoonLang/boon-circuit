@@ -1,12 +1,14 @@
 use super::*;
 use crate::report_v2::{
     AdapterBackend, AdapterDeviceType, AggregateGateResult, AggregateIdentity, AggregateMode,
-    AggregateReport, AggregateReportKind, ArtifactKind, ArtifactMetadata, AsyncProofTimingEvidence,
-    BoundedId, BoundedString, BudgetComparison, BudgetObservation, BudgetProof, BudgetUnit,
-    CaptureMethod, CheckOutcome, CheckpointEvidenceRequirement, ChildValidation, ExpectedIdentity,
-    FORMAT_VERSION, FrameEvidenceKey, GateCommand, GateEvidence, GateName, GateRunner,
-    HostBoundary, InputDelivery, LaunchIsolationEvidence, LaunchIsolationPhase, ManifestGate,
-    ManifestIdentity, MeasurementContract, NativeEvidence, PresentMode, ProducerEvidence,
+    AggregateReport, AggregateReportKind, ArtifactKind, ArtifactMetadata, AsyncLaneEvidence,
+    AsyncLaneOutcome, AsyncProofTimingEvidence, BoundedId, BoundedString, BudgetComparison,
+    BudgetObservation, BudgetProof, BudgetUnit, CaptureMethod, CheckOutcome,
+    CheckpointEvidenceRequirement, ChildValidation, ExpectedIdentity, FORMAT_VERSION,
+    FrameEvidenceKey, GateCommand, GateEvidence, GateName, GateRunner, HostBoundary, InputDelivery,
+    LaunchIsolationEvidence, LaunchIsolationPhase, ManifestGate, ManifestIdentity,
+    MeasurementContract, NativeEvidence, NativeWorkflowActionKind, NativeWorkflowProof,
+    NativeWorkflowScenarioBoundary, NativeWorkflowStepProof, PresentMode, ProducerEvidence,
     ProductTimingEvidence, RelativePath, ReportFileMetadata, ReportStatus, ScenarioBoundary,
     ScenarioProof, Sha256Digest, ShortText, SourceIdentity, StateCheckpointEvidence,
     StateCheckpointProof, StateRootProof, TimingSummary, ToolIdentity, VerificationProfileEvidence,
@@ -106,7 +108,14 @@ fn handoff_manifest_defines_the_ordered_v2_gate_inventory() {
     let persons = manifest_gate(&manifest, "persons-pro");
     let profile = persons.profile.as_ref().expect("Persons.pro profile");
     assert_eq!(profile.argument("--example"), Some("persons_pro"));
-    assert_eq!(profile.proof_requirements.checkpoints.len(), 25);
+    assert_eq!(profile.proof_requirements.checkpoints.len(), 32);
+    let native_workflow = profile
+        .proof_requirements
+        .native_workflow
+        .as_ref()
+        .expect("Persons.pro native workflow");
+    assert_eq!(native_workflow.steps.len(), 29);
+    assert_eq!(native_workflow.proof_steps.len(), 18);
     let checkpoint_ids = profile
         .proof_requirements
         .checkpoints
@@ -119,6 +128,9 @@ fn handoff_manifest_defines_the_ordered_v2_gate_inventory() {
         "duplicate-passkey-rejected",
         "authentication-cancel-preserves-sign-out",
         "authentication-failure-preserves-sign-out",
+        "native-diagnostic-focus",
+        "native-protect-workspace",
+        "native-auto-preview",
     ] {
         assert!(checkpoint_ids.contains(required));
     }
@@ -240,6 +252,7 @@ fn valid_fail_report_is_structurally_distinct_from_invalid_report() {
             native: None,
             product_ux_timings: Vec::new(),
             async_proof_timing: None,
+            async_lanes: Vec::new(),
             artifacts: Vec::new(),
         },
         vec![blocker],
@@ -308,6 +321,29 @@ fn hash_only_proof_is_rejected_by_strict_artifact_shape() {
 }
 
 #[test]
+fn proof_rejects_wrong_capture_token_and_backward_completion() {
+    let mut wrong_token = passing_timed_report("cells");
+    wrong_token.evidence.artifacts[0].capture_token_digest = digest('f');
+    assert!(
+        wrong_token
+            .validate_shape()
+            .unwrap_err()
+            .contains("capture token")
+    );
+
+    let mut backward = passing_timed_report("cells");
+    let proof = backward.evidence.async_proof_timing.as_mut().unwrap();
+    proof.completed_after_frame.frame_id = proof.captured_frame.frame_id - 1;
+    proof.completed_after_frame.present_id = proof.captured_frame.present_id - 1;
+    assert!(
+        backward
+            .validate_shape()
+            .unwrap_err()
+            .contains("not ordered")
+    );
+}
+
+#[test]
 fn persons_profile_rejects_unproven_semantic_scenario_and_missing_checkpoint() {
     let manifest = load_manifest(&workspace_root()).unwrap().0;
     let entry = manifest_gate(&manifest, "persons-pro");
@@ -349,6 +385,72 @@ fn persons_profile_rejects_unproven_semantic_scenario_and_missing_checkpoint() {
 }
 
 #[test]
+fn persons_profile_rejects_invalid_native_spans_reused_frames_and_restart_identity() {
+    let mut missing_span = passing_timed_report("persons-pro");
+    missing_span
+        .evidence
+        .profile
+        .as_mut()
+        .unwrap()
+        .native_workflow
+        .as_mut()
+        .unwrap()
+        .steps[1]
+        .input_event_count = 0;
+    assert!(
+        missing_span
+            .validate_shape()
+            .unwrap_err()
+            .contains("real-input span")
+    );
+
+    let mut reused_frame = passing_timed_report("persons-pro");
+    let workflow = reused_frame
+        .evidence
+        .profile
+        .as_mut()
+        .unwrap()
+        .native_workflow
+        .as_mut()
+        .unwrap();
+    workflow.steps[1].frame = workflow.steps[0].frame.clone();
+    assert!(
+        reused_frame
+            .validate_shape()
+            .unwrap_err()
+            .contains("distinct ordered")
+    );
+
+    let mut same_restart = passing_timed_report("persons-pro");
+    let restart = same_restart
+        .evidence
+        .profile
+        .as_mut()
+        .unwrap()
+        .checkpoints
+        .iter_mut()
+        .find(|checkpoint| {
+            matches!(
+                &checkpoint.evidence,
+                StateCheckpointEvidence::RestartRestore { .. }
+            )
+        })
+        .unwrap();
+    if let StateCheckpointEvidence::RestartRestore {
+        process_replaced, ..
+    } = &mut restart.evidence
+    {
+        *process_replaced = false;
+    }
+    assert!(
+        same_restart
+            .validate_shape()
+            .unwrap_err()
+            .contains("new process")
+    );
+}
+
+#[test]
 fn persons_profile_rejects_budget_observation_over_its_limit() {
     let manifest = load_manifest(&workspace_root()).unwrap().0;
     let entry = manifest_gate(&manifest, "persons-pro");
@@ -369,6 +471,40 @@ fn persons_profile_rejects_budget_observation_over_its_limit() {
             .validate_current(entry, &expected)
             .unwrap_err()
             .contains("exceeds its limit")
+    );
+}
+
+#[test]
+fn persons_profile_requires_applied_well_accounted_async_lanes() {
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
+    let entry = manifest_gate(&manifest, "persons-pro");
+    let expected = expected_identity();
+
+    let mut missing = passing_timed_report("persons-pro");
+    let removed = missing.evidence.async_lanes.pop().unwrap();
+    assert!(
+        missing
+            .validate_current(entry, &expected)
+            .unwrap_err()
+            .contains(removed.lane.as_str())
+    );
+
+    let mut failed = passing_timed_report("persons-pro");
+    failed.evidence.async_lanes[0].outcome = AsyncLaneOutcome::Failed;
+    assert!(
+        failed
+            .validate_current(entry, &expected)
+            .unwrap_err()
+            .contains("missing applied request-level async lane")
+    );
+
+    let mut under_accounted = passing_timed_report("persons-pro");
+    under_accounted.evidence.async_lanes[0].end_to_end_us = 1;
+    assert!(
+        under_accounted
+            .validate_shape()
+            .unwrap_err()
+            .contains("does not account")
     );
 }
 
@@ -441,6 +577,39 @@ fn passing_timed_report(gate: &str) -> crate::report_v2::GateReport {
         .collect::<Vec<_>>();
     let linked_product_metric = product_ux_timings[0].metric;
     let artifact_id = bounded_id("proof-png");
+    let mut completed_after_frame = frame.clone();
+    completed_after_frame.frame_id += 2;
+    completed_after_frame.present_id += 2;
+    let profile_evidence = complete_profile_evidence(entry);
+    let mut artifact_frames = vec![frame.clone()];
+    for checkpoint in &profile_evidence.checkpoints {
+        if !artifact_frames.contains(&checkpoint.frame) {
+            artifact_frames.push(checkpoint.frame.clone());
+        }
+    }
+    let artifacts = artifact_frames
+        .into_iter()
+        .enumerate()
+        .map(|(index, artifact_frame)| ArtifactMetadata {
+            artifact_id: if index == 0 {
+                artifact_id.clone()
+            } else {
+                bounded_id(&format!("checkpoint-proof-{index}"))
+            },
+            kind: ArtifactKind::WgpuPngReadback,
+            path: RelativePath::new(format!(
+                "target/reports/report-v2/artifacts/proof-{index}.png"
+            ))
+            .unwrap(),
+            sha256: digest_index(index + 3),
+            byte_len: 64,
+            capture_method: CaptureMethod::AppOwnedRenderTargetReadback,
+            capture_token_digest: artifact_frame.capture_token_digest(),
+            nonblank_samples: 32,
+            unique_rgba_values: 4,
+            frame: artifact_frame,
+        })
+        .collect();
     gate_report(
         entry,
         bounded_id("fresh-run"),
@@ -453,27 +622,41 @@ fn passing_timed_report(gate: &str) -> crate::report_v2::GateReport {
                 "all evidence passed",
             )],
             producer: Some(producer(Some(0))),
-            profile: Some(complete_profile_evidence(entry)),
+            profile: Some(profile_evidence),
             native: Some(native_evidence()),
             product_ux_timings,
             async_proof_timing: Some(AsyncProofTimingEvidence {
                 linked_product_metric,
                 captured_frame: frame.clone(),
-                completed_after_frame_id: frame.frame_id + 2,
+                completed_after_frame,
                 proof_lag_frames: 2,
                 artifact_id: artifact_id.clone(),
                 snapshot_prepare_us: 100,
                 worker_us: 900,
                 summary: summary(async_proof.samples.minimum_samples, 1_000),
             }),
-            artifacts: vec![ArtifactMetadata {
-                artifact_id,
-                kind: ArtifactKind::WgpuPngReadback,
-                path: RelativePath::new("target/reports/report-v2/artifacts/proof.png").unwrap(),
-                sha256: digest('3'),
-                byte_len: 64,
-                frame,
-            }],
+            async_lanes: entry
+                .profile
+                .as_ref()
+                .expect("timed profile")
+                .proof_requirements
+                .async_lanes
+                .iter()
+                .copied()
+                .map(|lane| AsyncLaneEvidence {
+                    lane,
+                    request_id: bounded_id(lane.as_str()),
+                    revision: 1,
+                    queue_depth: 1,
+                    queue_wait_us: 100,
+                    worker_us: 200,
+                    apply_us: 300,
+                    end_to_end_us: 600,
+                    outcome: AsyncLaneOutcome::Applied,
+                    frame: frame.clone(),
+                })
+                .collect(),
+            artifacts,
         },
         Vec::new(),
     )
@@ -493,7 +676,9 @@ fn complete_profile_evidence(entry: &ManifestGate) -> VerificationProfileEvidenc
             .map(|scenario| ScenarioProof {
                 path: scenario.path.clone(),
                 sha256: digest('4'),
-                boundary: if scenario.semantic_assertions {
+                boundary: if requirements.native_workflow.is_some() {
+                    ScenarioBoundary::KernelUinputWorkflowAndSemanticAssertions
+                } else if scenario.semantic_assertions {
                     ScenarioBoundary::NativeTestPlaybackAndSemanticAssertions
                 } else {
                     ScenarioBoundary::NativeTestPlayback
@@ -532,55 +717,166 @@ fn complete_profile_evidence(entry: &ManifestGate) -> VerificationProfileEvidenc
                 restart_count: u32::from(state_root.restart_required),
                 restored_after_restart: state_root.restart_required,
             }),
+        native_workflow: requirements.native_workflow.as_ref().map(|workflow| {
+            let initial_digest = digest_index(90);
+            let steps = workflow
+                .steps
+                .iter()
+                .enumerate()
+                .map(|(index, scenario_step)| {
+                    let assertion_only = index == 0;
+                    NativeWorkflowStepProof {
+                        request_id: u64::try_from(1_001 + index).unwrap(),
+                        ordinal: u32::try_from(index + 1).unwrap(),
+                        scenario_step: scenario_step.clone(),
+                        source_path: ShortText::new(if assertion_only {
+                            "assertion-only"
+                        } else {
+                            "store.elements.test"
+                        })
+                        .unwrap(),
+                        action_kind: if assertion_only {
+                            NativeWorkflowActionKind::AssertionOnly
+                        } else {
+                            NativeWorkflowActionKind::Click
+                        },
+                        action_digest: digest_index(200 + index),
+                        input_first_sequence: if assertion_only {
+                            0
+                        } else {
+                            u64::try_from(10 + index * 2).unwrap()
+                        },
+                        input_last_sequence: if assertion_only {
+                            0
+                        } else {
+                            u64::try_from(11 + index * 2).unwrap()
+                        },
+                        input_event_count: if assertion_only { 0 } else { 2 },
+                        input_event_digest: digest_index(300 + index),
+                        assertion_count: 1,
+                        source_revision: 1,
+                        runtime_sequence: u64::try_from(index + 1).unwrap(),
+                        durable_epoch: u64::try_from(index + 1).unwrap(),
+                        durable_turn_sequence: u64::try_from(index + 1).unwrap(),
+                        durable_acked: true,
+                        before_state_digest: if index == 0 {
+                            initial_digest.clone()
+                        } else {
+                            digest_index(100 + index - 1)
+                        },
+                        state_digest: digest_index(100 + index),
+                        frame: frame_key_at(u64::try_from(101 + index).unwrap()),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let final_digest = steps
+                .last()
+                .expect("native workflow steps")
+                .state_digest
+                .clone();
+            let final_frame = steps.last().expect("native workflow steps").frame.clone();
+            NativeWorkflowProof {
+                input_delivery: InputDelivery::NativeOsAppWindowCallback,
+                scenario_boundary:
+                    NativeWorkflowScenarioBoundary::KernelUinputAndSemanticAssertions,
+                test_request_id: 15,
+                initial_state_digest: initial_digest,
+                final_state_digest: final_digest,
+                ready_frame: frame_key_at(100),
+                final_frame,
+                steps,
+            }
+        }),
         checkpoints: requirements
             .checkpoints
             .iter()
             .cloned()
-            .map(|requirement| StateCheckpointProof {
-                id: requirement.id,
-                source_revision: 1,
-                runtime_sequence: 1,
-                durable_epoch: 1,
-                state_digest: digest('6'),
-                frame: frame_key(),
-                evidence: match requirement.evidence {
-                    CheckpointEvidenceRequirement::ScenarioStep { scenario_step } => {
-                        StateCheckpointEvidence::ScenarioSemanticFrame {
-                            scenario_step,
-                            assertion_count: 1,
-                        }
-                    }
-                    CheckpointEvidenceRequirement::RestartRestore {
-                        baseline_checkpoint,
-                    } => StateCheckpointEvidence::RestartRestore {
-                        baseline_checkpoint,
-                        before_restart_digest: digest('6'),
-                        startup_restored: true,
+            .map(|requirement| {
+                let is_restart = matches!(
+                    &requirement.evidence,
+                    CheckpointEvidenceRequirement::RestartRestore { .. }
+                );
+                StateCheckpointProof {
+                    id: requirement.id,
+                    source_revision: 1,
+                    runtime_sequence: 1,
+                    durable_epoch: 1,
+                    durable_turn_sequence: 1,
+                    state_digest: digest('6'),
+                    frame: if is_restart {
+                        restart_frame_key()
+                    } else {
+                        frame_key()
                     },
-                    CheckpointEvidenceRequirement::ResponsiveLayout {
-                        baseline_checkpoint,
-                        logical_width,
-                    } => StateCheckpointEvidence::ResponsiveLayout {
-                        baseline_checkpoint,
-                        logical_width,
-                        logical_height: 844,
-                        action_count: 1,
-                        action_digest: digest('7'),
+                    evidence: match requirement.evidence {
+                        CheckpointEvidenceRequirement::ScenarioStep { scenario_step } => {
+                            StateCheckpointEvidence::ScenarioSemanticFrame {
+                                scenario_step,
+                                assertion_count: 1,
+                            }
+                        }
+                        CheckpointEvidenceRequirement::RestartRestore {
+                            baseline_checkpoint,
+                        } => StateCheckpointEvidence::RestartRestore {
+                            baseline_checkpoint,
+                            before_restart_digest: digest('6'),
+                            baseline_durable_epoch: 1,
+                            baseline_durable_turn_sequence: 1,
+                            baseline_frame: frame_key(),
+                            process_replaced: true,
+                            session_replaced: true,
+                            first_observable_frame: true,
+                            startup_restored: true,
+                        },
+                        CheckpointEvidenceRequirement::ResponsiveLayout {
+                            baseline_checkpoint,
+                            logical_width,
+                        } => StateCheckpointEvidence::ResponsiveLayout {
+                            baseline_checkpoint,
+                            logical_width,
+                            logical_height: 844,
+                            action_count: 1,
+                            action_digest: digest('7'),
+                        },
+                        CheckpointEvidenceRequirement::StaleCompileRejection => {
+                            StateCheckpointEvidence::StaleCompileRejection {
+                                session: bounded_id("test-program"),
+                                stale_revision: 1,
+                                latest_revision: 2,
+                            }
+                        }
+                        CheckpointEvidenceRequirement::PersistenceOperation { operation } => {
+                            StateCheckpointEvidence::PersistenceOperation {
+                                operation,
+                                before_state_digest: digest('6'),
+                            }
+                        }
+                        CheckpointEvidenceRequirement::NativeWorkflowStep { scenario_step } => {
+                            let assertion_only = requirements
+                                .native_workflow
+                                .as_ref()
+                                .and_then(|workflow| workflow.steps.first())
+                                .is_some_and(|first| first == &scenario_step);
+                            StateCheckpointEvidence::NativeWorkflowFrame {
+                                scenario_step,
+                                action_kind: if assertion_only {
+                                    NativeWorkflowActionKind::AssertionOnly
+                                } else {
+                                    NativeWorkflowActionKind::Click
+                                },
+                                request_id: 1,
+                                action_digest: digest('7'),
+                                input_first_sequence: if assertion_only { 0 } else { 1 },
+                                input_last_sequence: if assertion_only { 0 } else { 2 },
+                                input_event_count: if assertion_only { 0 } else { 2 },
+                                input_event_digest: digest('8'),
+                                durable_turn_sequence: 1,
+                                durable_acked: true,
+                                assertion_count: 1,
+                            }
+                        }
                     },
-                    CheckpointEvidenceRequirement::StaleCompileRejection => {
-                        StateCheckpointEvidence::StaleCompileRejection {
-                            session: bounded_id("test-program"),
-                            stale_revision: 1,
-                            latest_revision: 2,
-                        }
-                    }
-                    CheckpointEvidenceRequirement::PersistenceOperation { operation } => {
-                        StateCheckpointEvidence::PersistenceOperation {
-                            operation,
-                            before_state_digest: digest('6'),
-                        }
-                    }
-                },
+                }
             })
             .collect(),
     }
@@ -658,7 +954,7 @@ fn native_evidence() -> NativeEvidence {
         dev_pid: 101,
         input_delivery: InputDelivery::NativeOsAppWindowCallback,
         scenario_boundary: HostBoundary::PublicHostEvent,
-        capture_method: CaptureMethod::AppOwnedWgpuReadback,
+        capture_method: CaptureMethod::AppOwnedRenderTargetReadback,
         private_runtime_dispatch_used: false,
         launch_isolation: vec![LaunchIsolationEvidence {
             phase: LaunchIsolationPhase::Primary,
@@ -688,19 +984,30 @@ fn producer(exit_code: Option<i32>) -> ProducerEvidence {
 }
 
 fn frame_key() -> FrameEvidenceKey {
+    frame_key_at(100)
+}
+
+fn frame_key_at(frame_id: u64) -> FrameEvidenceKey {
     FrameEvidenceKey {
         surface_id: ShortText::new("preview-surface").unwrap(),
         process_id: 100,
         session_id: ShortText::new("session-primary").unwrap(),
-        frame_id: 100,
+        frame_id,
         input_id: 20,
         content_id: 30,
         layout_id: 40,
         render_id: 50,
         surface_epoch: 2,
-        present_id: 60,
-        proof_id: 70,
+        present_id: frame_id,
+        proof_id: frame_id,
     }
+}
+
+fn restart_frame_key() -> FrameEvidenceKey {
+    let mut frame = frame_key_at(200);
+    frame.process_id = 102;
+    frame.session_id = ShortText::new("session-restart").unwrap();
+    frame
 }
 
 fn summary(sample_count: u32, base: u64) -> TimingSummary {
@@ -720,4 +1027,8 @@ fn bounded_id(value: &str) -> BoundedId {
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::new(character.to_string().repeat(64)).unwrap()
+}
+
+fn digest_index(value: usize) -> Sha256Digest {
+    Sha256Digest::new(format!("{value:064x}")).unwrap()
 }

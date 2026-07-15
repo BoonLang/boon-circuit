@@ -119,12 +119,19 @@ mod tests {
         let contract =
             BudgetContract::parse(include_str!("../../../examples/persons_pro.budget.toml"))
                 .unwrap();
-        assert_eq!(contract.metric_count(), 9);
+        assert_eq!(contract.metric_count(), 16);
         assert_eq!(
             contract.limit("keystroke-to-editor-visible-p95").unwrap(),
             BudgetLimit {
                 unit: BudgetUnit::Microseconds,
                 at_most: 16_700,
+            }
+        );
+        assert_eq!(
+            contract.limit("proof-replacement-max").unwrap(),
+            BudgetLimit {
+                unit: BudgetUnit::Count,
+                at_most: 0,
             }
         );
         assert_eq!(

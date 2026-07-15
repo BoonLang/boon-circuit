@@ -22,9 +22,11 @@ pub const PRODUCT_PROOF_AFTER_TEST_ENV: &str = "BOON_VERIFY_PRODUCT_PROOF_AFTER_
 pub const RESPONSIVE_EVIDENCE_WIDTH_ENV: &str = "BOON_VERIFY_RESPONSIVE_EVIDENCE_WIDTH";
 pub const SCROLL_PROOF_ORDINAL_ENV: &str = "BOON_VERIFY_SCROLL_PROOF_ORDINAL";
 pub const STALE_PROGRAM_EVIDENCE_ENV: &str = "BOON_VERIFY_STALE_PROGRAM_EVIDENCE";
+pub const NATIVE_WORKFLOW_STEPS_ENV: &str = "BOON_VERIFY_NATIVE_WORKFLOW_STEPS";
+pub const NATIVE_WORKFLOW_PROOF_STEPS_ENV: &str = "BOON_VERIFY_NATIVE_WORKFLOW_PROOF_STEPS";
 
 const MAGIC: [u8; 4] = *b"BNVO";
-const VERSION: u16 = 6;
+const VERSION: u16 = 9;
 const HEADER_BYTES: usize = 7;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024;
@@ -161,6 +163,48 @@ impl InputKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum AsyncLaneKind {
+    ChildProgramCompile = 1,
+    PersistenceTurn = 2,
+    ProgramArtifactStore = 3,
+    ProgramArtifactLoad = 4,
+    ProofReadback = 5,
+}
+
+impl AsyncLaneKind {
+    fn decode(value: u8) -> Result<Self, ObserverError> {
+        match value {
+            1 => Ok(Self::ChildProgramCompile),
+            2 => Ok(Self::PersistenceTurn),
+            3 => Ok(Self::ProgramArtifactStore),
+            4 => Ok(Self::ProgramArtifactLoad),
+            5 => Ok(Self::ProofReadback),
+            _ => Err(ObserverError::InvalidEnum("async lane kind", value)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AsyncLaneOutcome {
+    Applied = 1,
+    StaleRejected = 2,
+    Failed = 3,
+}
+
+impl AsyncLaneOutcome {
+    fn decode(value: u8) -> Result<Self, ObserverError> {
+        match value {
+            1 => Ok(Self::Applied),
+            2 => Ok(Self::StaleRejected),
+            3 => Ok(Self::Failed),
+            _ => Err(ObserverError::InvalidEnum("async lane outcome", value)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FrameEvidenceKey {
     pub surface_id: String,
@@ -265,6 +309,7 @@ pub struct InputAccepted {
     pub pointer_y: Option<f32>,
     pub target: Option<String>,
     pub target_source_path: Option<String>,
+    pub event_digest: String,
     pub visible_change: bool,
 }
 
@@ -302,6 +347,7 @@ pub struct ProofArtifact {
     pub sha256: String,
     pub byte_len: u64,
     pub capture_method: String,
+    pub capture_token_digest: String,
     pub nonblank_samples: u64,
     pub unique_rgba_values: u64,
 }
@@ -352,7 +398,7 @@ pub enum ObserverEvent {
     },
     ProofCompleted {
         key: FrameEvidenceKey,
-        completed_after_frame_id: u64,
+        completed_after_key: FrameEvidenceKey,
         elapsed_us: u64,
         replaced_count: u64,
         result_drop_count: u64,
@@ -413,6 +459,7 @@ pub enum ObserverEvent {
         source_revision: u64,
         runtime_sequence: u64,
         durable_epoch: u64,
+        durable_turn_sequence: u64,
         key: FrameEvidenceKey,
     },
     ProfileSample {
@@ -438,6 +485,11 @@ pub enum ObserverEvent {
         full_lowered: bool,
         interaction_frame_block_us: u64,
         pending_child_artifacts: u32,
+        pending_program_artifact_stores: u32,
+        pending_program_artifact_loads: u32,
+        pending_persistence_artifact_stores: u32,
+        pending_persistence_artifact_loads: u32,
+        pending_durable_turns: u32,
         trusted_parent_rebuilds: u32,
         source_revision: u64,
         runtime_sequence: u64,
@@ -489,6 +541,67 @@ pub enum ObserverEvent {
         ordinal: u32,
         key: FrameEvidenceKey,
     },
+    NativeWorkflowReady {
+        test_request_id: u64,
+        step_count: u32,
+        source_revision: u64,
+        runtime_sequence: u64,
+        durable_epoch: u64,
+        state_digest: String,
+        key: FrameEvidenceKey,
+    },
+    NativeWorkflowTarget {
+        request_id: u64,
+        ordinal: u32,
+        step_id: String,
+        source_path: String,
+        action_kind: String,
+        action_digest: String,
+        node: String,
+        x: f32,
+        y: f32,
+        key: FrameEvidenceKey,
+    },
+    NativeWorkflowStep {
+        request_id: u64,
+        ordinal: u32,
+        step_id: String,
+        source_path: String,
+        action_kind: String,
+        action_digest: String,
+        input_first_sequence: u64,
+        input_last_sequence: u64,
+        input_event_count: u32,
+        input_event_digest: String,
+        assertion_count: u32,
+        source_revision: u64,
+        runtime_sequence: u64,
+        durable_epoch: u64,
+        durable_turn_sequence: u64,
+        durable_acked: bool,
+        before_state_digest: String,
+        state_digest: String,
+        key: FrameEvidenceKey,
+    },
+    NativeWorkflowCompleted {
+        test_request_id: u64,
+        step_count: u32,
+        initial_state_digest: String,
+        final_state_digest: String,
+        key: FrameEvidenceKey,
+    },
+    AsyncLaneCompleted {
+        lane: AsyncLaneKind,
+        request_id: String,
+        revision: u64,
+        queue_depth: u32,
+        queue_wait_us: u64,
+        worker_us: u64,
+        apply_us: u64,
+        end_to_end_us: u64,
+        outcome: AsyncLaneOutcome,
+        key: FrameEvidenceKey,
+    },
 }
 
 impl ObserverEvent {
@@ -517,6 +630,11 @@ impl ObserverEvent {
             Self::ResponsiveResizeReady { .. } => 21,
             Self::ResponsiveResizeObserved { .. } => 22,
             Self::ScrollProofFrame { .. } => 23,
+            Self::NativeWorkflowReady { .. } => 24,
+            Self::NativeWorkflowTarget { .. } => 25,
+            Self::NativeWorkflowStep { .. } => 26,
+            Self::NativeWorkflowCompleted { .. } => 27,
+            Self::AsyncLaneCompleted { .. } => 28,
         }
     }
 
@@ -557,6 +675,7 @@ impl ObserverEvent {
                 out.optional_f32(value.pointer_y);
                 out.optional_string(value.target.as_deref())?;
                 out.optional_string(value.target_source_path.as_deref())?;
+                out.string(&value.event_digest)?;
                 out.bool(value.visible_change);
             }
             Self::FramePresented(value) => {
@@ -659,7 +778,7 @@ impl ObserverEvent {
             }
             Self::ProofCompleted {
                 key,
-                completed_after_frame_id,
+                completed_after_key,
                 elapsed_us,
                 replaced_count,
                 result_drop_count,
@@ -667,7 +786,7 @@ impl ObserverEvent {
                 error,
             } => {
                 key.encode(out)?;
-                out.u64(*completed_after_frame_id);
+                completed_after_key.encode(out)?;
                 out.u64(*elapsed_us);
                 out.u64(*replaced_count);
                 out.u64(*result_drop_count);
@@ -677,6 +796,7 @@ impl ObserverEvent {
                     out.string(&artifact.sha256)?;
                     out.u64(artifact.byte_len);
                     out.string(&artifact.capture_method)?;
+                    out.string(&artifact.capture_token_digest)?;
                     out.u64(artifact.nonblank_samples);
                     out.u64(artifact.unique_rgba_values);
                 }
@@ -777,6 +897,7 @@ impl ObserverEvent {
                 source_revision,
                 runtime_sequence,
                 durable_epoch,
+                durable_turn_sequence,
                 key,
             } => {
                 out.u64(*resize_sequence);
@@ -788,6 +909,7 @@ impl ObserverEvent {
                 out.u64(*source_revision);
                 out.u64(*runtime_sequence);
                 out.u64(*durable_epoch);
+                out.u64(*durable_turn_sequence);
                 key.encode(out)?;
             }
             Self::ProfileSample {
@@ -813,6 +935,11 @@ impl ObserverEvent {
                 full_lowered,
                 interaction_frame_block_us,
                 pending_child_artifacts,
+                pending_program_artifact_stores,
+                pending_program_artifact_loads,
+                pending_persistence_artifact_stores,
+                pending_persistence_artifact_loads,
+                pending_durable_turns,
                 trusted_parent_rebuilds,
                 source_revision,
                 runtime_sequence,
@@ -841,6 +968,11 @@ impl ObserverEvent {
                 out.bool(*full_lowered);
                 out.u64(*interaction_frame_block_us);
                 out.u32(*pending_child_artifacts);
+                out.u32(*pending_program_artifact_stores);
+                out.u32(*pending_program_artifact_loads);
+                out.u32(*pending_persistence_artifact_stores);
+                out.u32(*pending_persistence_artifact_loads);
+                out.u32(*pending_durable_turns);
                 out.u32(*trusted_parent_rebuilds);
                 out.u64(*source_revision);
                 out.u64(*runtime_sequence);
@@ -928,6 +1060,123 @@ impl ObserverEvent {
                 out.u32(*ordinal);
                 key.encode(out)?;
             }
+            Self::NativeWorkflowReady {
+                test_request_id,
+                step_count,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                state_digest,
+                key,
+            } => {
+                out.u64(*test_request_id);
+                out.u32(*step_count);
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                out.u64(*durable_epoch);
+                out.string(state_digest)?;
+                key.encode(out)?;
+            }
+            Self::NativeWorkflowTarget {
+                request_id,
+                ordinal,
+                step_id,
+                source_path,
+                action_kind,
+                action_digest,
+                node,
+                x,
+                y,
+                key,
+            } => {
+                out.u64(*request_id);
+                out.u32(*ordinal);
+                out.string(step_id)?;
+                out.string(source_path)?;
+                out.string(action_kind)?;
+                out.string(action_digest)?;
+                out.string(node)?;
+                out.f32(*x);
+                out.f32(*y);
+                key.encode(out)?;
+            }
+            Self::NativeWorkflowStep {
+                request_id,
+                ordinal,
+                step_id,
+                source_path,
+                action_kind,
+                action_digest,
+                input_first_sequence,
+                input_last_sequence,
+                input_event_count,
+                input_event_digest,
+                assertion_count,
+                source_revision,
+                runtime_sequence,
+                durable_epoch,
+                durable_turn_sequence,
+                durable_acked,
+                before_state_digest,
+                state_digest,
+                key,
+            } => {
+                out.u64(*request_id);
+                out.u32(*ordinal);
+                out.string(step_id)?;
+                out.string(source_path)?;
+                out.string(action_kind)?;
+                out.string(action_digest)?;
+                out.u64(*input_first_sequence);
+                out.u64(*input_last_sequence);
+                out.u32(*input_event_count);
+                out.string(input_event_digest)?;
+                out.u32(*assertion_count);
+                out.u64(*source_revision);
+                out.u64(*runtime_sequence);
+                out.u64(*durable_epoch);
+                out.u64(*durable_turn_sequence);
+                out.bool(*durable_acked);
+                out.string(before_state_digest)?;
+                out.string(state_digest)?;
+                key.encode(out)?;
+            }
+            Self::NativeWorkflowCompleted {
+                test_request_id,
+                step_count,
+                initial_state_digest,
+                final_state_digest,
+                key,
+            } => {
+                out.u64(*test_request_id);
+                out.u32(*step_count);
+                out.string(initial_state_digest)?;
+                out.string(final_state_digest)?;
+                key.encode(out)?;
+            }
+            Self::AsyncLaneCompleted {
+                lane,
+                request_id,
+                revision,
+                queue_depth,
+                queue_wait_us,
+                worker_us,
+                apply_us,
+                end_to_end_us,
+                outcome,
+                key,
+            } => {
+                out.u8(*lane as u8);
+                out.string(request_id)?;
+                out.u64(*revision);
+                out.u32(*queue_depth);
+                out.u64(*queue_wait_us);
+                out.u64(*worker_us);
+                out.u64(*apply_us);
+                out.u64(*end_to_end_us);
+                out.u8(*outcome as u8);
+                key.encode(out)?;
+            }
         }
         Ok(())
     }
@@ -970,6 +1219,7 @@ impl ObserverEvent {
                 pointer_y: input.optional_f32()?,
                 target: input.optional_string()?,
                 target_source_path: input.optional_string()?,
+                event_digest: input.string()?,
                 visible_change: input.bool()?,
             }),
             3 => Self::FramePresented(FramePresented {
@@ -1029,7 +1279,7 @@ impl ObserverEvent {
             },
             9 => {
                 let key = FrameEvidenceKey::decode(input)?;
-                let completed_after_frame_id = input.u64()?;
+                let completed_after_key = FrameEvidenceKey::decode(input)?;
                 let elapsed_us = input.u64()?;
                 let replaced_count = input.u64()?;
                 let result_drop_count = input.u64()?;
@@ -1039,6 +1289,7 @@ impl ObserverEvent {
                         sha256: input.string()?,
                         byte_len: input.u64()?,
                         capture_method: input.string()?,
+                        capture_token_digest: input.string()?,
                         nonblank_samples: input.u64()?,
                         unique_rgba_values: input.u64()?,
                     })
@@ -1047,7 +1298,7 @@ impl ObserverEvent {
                 };
                 Self::ProofCompleted {
                     key,
-                    completed_after_frame_id,
+                    completed_after_key,
                     elapsed_us,
                     replaced_count,
                     result_drop_count,
@@ -1129,6 +1380,7 @@ impl ObserverEvent {
                 source_revision: input.u64()?,
                 runtime_sequence: input.u64()?,
                 durable_epoch: input.u64()?,
+                durable_turn_sequence: input.u64()?,
                 key: FrameEvidenceKey::decode(input)?,
             },
             17 => Self::ProfileSample {
@@ -1154,6 +1406,11 @@ impl ObserverEvent {
                 full_lowered: input.bool()?,
                 interaction_frame_block_us: input.u64()?,
                 pending_child_artifacts: input.u32()?,
+                pending_program_artifact_stores: input.u32()?,
+                pending_program_artifact_loads: input.u32()?,
+                pending_persistence_artifact_stores: input.u32()?,
+                pending_persistence_artifact_loads: input.u32()?,
+                pending_durable_turns: input.u32()?,
                 trusted_parent_rebuilds: input.u32()?,
                 source_revision: input.u64()?,
                 runtime_sequence: input.u64()?,
@@ -1203,6 +1460,67 @@ impl ObserverEvent {
             },
             23 => Self::ScrollProofFrame {
                 ordinal: input.u32()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            24 => Self::NativeWorkflowReady {
+                test_request_id: input.u64()?,
+                step_count: input.u32()?,
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                durable_epoch: input.u64()?,
+                state_digest: input.string()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            25 => Self::NativeWorkflowTarget {
+                request_id: input.u64()?,
+                ordinal: input.u32()?,
+                step_id: input.string()?,
+                source_path: input.string()?,
+                action_kind: input.string()?,
+                action_digest: input.string()?,
+                node: input.string()?,
+                x: input.f32()?,
+                y: input.f32()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            26 => Self::NativeWorkflowStep {
+                request_id: input.u64()?,
+                ordinal: input.u32()?,
+                step_id: input.string()?,
+                source_path: input.string()?,
+                action_kind: input.string()?,
+                action_digest: input.string()?,
+                input_first_sequence: input.u64()?,
+                input_last_sequence: input.u64()?,
+                input_event_count: input.u32()?,
+                input_event_digest: input.string()?,
+                assertion_count: input.u32()?,
+                source_revision: input.u64()?,
+                runtime_sequence: input.u64()?,
+                durable_epoch: input.u64()?,
+                durable_turn_sequence: input.u64()?,
+                durable_acked: input.bool()?,
+                before_state_digest: input.string()?,
+                state_digest: input.string()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            27 => Self::NativeWorkflowCompleted {
+                test_request_id: input.u64()?,
+                step_count: input.u32()?,
+                initial_state_digest: input.string()?,
+                final_state_digest: input.string()?,
+                key: FrameEvidenceKey::decode(input)?,
+            },
+            28 => Self::AsyncLaneCompleted {
+                lane: AsyncLaneKind::decode(input.u8()?)?,
+                request_id: input.string()?,
+                revision: input.u64()?,
+                queue_depth: input.u32()?,
+                queue_wait_us: input.u64()?,
+                worker_us: input.u64()?,
+                apply_us: input.u64()?,
+                end_to_end_us: input.u64()?,
+                outcome: AsyncLaneOutcome::decode(input.u8()?)?,
                 key: FrameEvidenceKey::decode(input)?,
             },
             _ => return Err(ObserverError::UnknownEvent(tag)),
@@ -1603,6 +1921,7 @@ mod tests {
             pointer_y: Some(30.0),
             target: Some("dev.test".to_owned()),
             target_source_path: None,
+            event_digest: "0".repeat(64),
             visible_change: true,
         }));
         roundtrip(ObserverEvent::RoleMetadata(RoleMetadata {
@@ -1659,7 +1978,7 @@ mod tests {
         });
         roundtrip(ObserverEvent::ProofCompleted {
             key: key(20),
-            completed_after_frame_id: 22,
+            completed_after_key: key(22),
             elapsed_us: 1_234,
             replaced_count: 2,
             result_drop_count: 0,
@@ -1667,7 +1986,8 @@ mod tests {
                 path: "target/proof.png".to_owned(),
                 sha256: "a".repeat(64),
                 byte_len: 42,
-                capture_method: "app-owned-wgpu".to_owned(),
+                capture_method: "app-owned-render-target-readback".to_owned(),
+                capture_token_digest: "b".repeat(64),
                 nonblank_samples: 10,
                 unique_rgba_values: 3,
             }),
@@ -1744,6 +2064,7 @@ mod tests {
             source_revision: 4,
             runtime_sequence: 10,
             durable_epoch: 9,
+            durable_turn_sequence: 8,
             key: key(43),
         });
         roundtrip(ObserverEvent::ProfileSample {
@@ -1769,6 +2090,11 @@ mod tests {
             full_lowered: false,
             interaction_frame_block_us: 2_100,
             pending_child_artifacts: 1,
+            pending_program_artifact_stores: 1,
+            pending_program_artifact_loads: 0,
+            pending_persistence_artifact_stores: 1,
+            pending_persistence_artifact_loads: 0,
+            pending_durable_turns: 1,
             trusted_parent_rebuilds: 0,
             source_revision: 4,
             runtime_sequence: 11,
@@ -1808,6 +2134,67 @@ mod tests {
         roundtrip(ObserverEvent::ScrollProofFrame {
             ordinal: 21,
             key: key(50),
+        });
+        roundtrip(ObserverEvent::NativeWorkflowReady {
+            test_request_id: 9,
+            step_count: 29,
+            source_revision: 4,
+            runtime_sequence: 12,
+            durable_epoch: 10,
+            state_digest: "2".repeat(64),
+            key: key(51),
+        });
+        roundtrip(ObserverEvent::NativeWorkflowTarget {
+            request_id: 577,
+            ordinal: 1,
+            step_id: "valid-edit-preview".to_owned(),
+            source_path: "store.elements.source_editor".to_owned(),
+            action_kind: "type_text".to_owned(),
+            action_digest: "4".repeat(64),
+            node: "source-editor".to_owned(),
+            x: 120.0,
+            y: 80.0,
+            key: key(52),
+        });
+        roundtrip(ObserverEvent::NativeWorkflowStep {
+            request_id: 577,
+            ordinal: 1,
+            step_id: "valid-edit-preview".to_owned(),
+            source_path: "store.elements.source_editor".to_owned(),
+            action_kind: "type_text".to_owned(),
+            action_digest: "4".repeat(64),
+            input_first_sequence: 22,
+            input_last_sequence: 29,
+            input_event_count: 8,
+            input_event_digest: "5".repeat(64),
+            assertion_count: 4,
+            source_revision: 4,
+            runtime_sequence: 13,
+            durable_epoch: 11,
+            durable_turn_sequence: 10,
+            durable_acked: true,
+            before_state_digest: "2".repeat(64),
+            state_digest: "3".repeat(64),
+            key: key(53),
+        });
+        roundtrip(ObserverEvent::NativeWorkflowCompleted {
+            test_request_id: 9,
+            step_count: 29,
+            initial_state_digest: "2".repeat(64),
+            final_state_digest: "3".repeat(64),
+            key: key(53),
+        });
+        roundtrip(ObserverEvent::AsyncLaneCompleted {
+            lane: AsyncLaneKind::ChildProgramCompile,
+            request_id: "public-page:request-7".to_owned(),
+            revision: 7,
+            queue_depth: 1,
+            queue_wait_us: 10,
+            worker_us: 20,
+            apply_us: 30,
+            end_to_end_us: 60,
+            outcome: AsyncLaneOutcome::Applied,
+            key: key(54),
         });
         roundtrip(ObserverEvent::StaleProgramRejected {
             session: "profile-draft".to_owned(),

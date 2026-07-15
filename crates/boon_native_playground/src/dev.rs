@@ -11,8 +11,8 @@ use futures::{FutureExt, StreamExt, pin_mut, select};
 
 use crate::dev_state::{ClipboardAction, DevAction, DevChange, DevState, NameEditTarget};
 use crate::frame::{
-    NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, input_kind,
-    pointer_button_pressed,
+    NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, host_event_digest,
+    input_kind, pointer_button_pressed,
 };
 use crate::language::{LanguageSnapshot, LanguageWorker};
 use crate::observer::{InputAccepted, ObserverClient, ObserverEvent, ObserverRole};
@@ -238,7 +238,7 @@ enum InspectionResultDisposition {
 
 pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeRoleResult {
     let observer = ObserverClient::from_env()?;
-    let mut product = ProductFrame::attach(&mut host, ObserverRole::Dev).await?;
+    let mut product = ProductFrame::attach(&mut host, ObserverRole::Dev, false).await?;
     emit(
         &observer,
         ObserverEvent::RoleMetadata(product.role_metadata()),
@@ -1573,6 +1573,7 @@ fn observe_input(
             pointer_y,
             target,
             target_source_path: None,
+            event_digest: host_event_digest(envelope),
             visible_change,
         }),
     );

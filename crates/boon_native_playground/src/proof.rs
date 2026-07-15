@@ -4,15 +4,16 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use boon_document::RenderScene;
 use boon_host::SurfaceId;
 use boon_native_gpu::{
-    AppOwnedProofRenderer, AppOwnedRenderSceneRequest, RenderAssetSource, RenderProof,
-    RenderProofArtifact,
+    PresentedTextureReadbackRequest, RenderProof, RenderProofArtifact,
+    complete_presented_texture_readback,
 };
 use futures::StreamExt;
 use futures::channel::mpsc;
+use sha2::{Digest, Sha256};
 
+use crate::frame::PresentedReadbackTicket;
 use crate::observer::{
     FrameEvidenceKey, ObserverEvent, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV,
     PROOF_SAMPLE_ORDINAL_ENV, ProofArtifact,
@@ -54,26 +55,24 @@ impl ProofConfig {
     }
 }
 
-#[derive(Clone)]
 pub struct ProofRequest {
     pub key: FrameEvidenceKey,
-    pub scene: RenderScene,
-    pub width: u32,
-    pub height: u32,
-    pub surface_id: SurfaceId,
-    pub artifact_label: String,
+    pub readback: PresentedReadbackTicket,
+    pub queued_at: Instant,
 }
 
 pub struct ProofResult {
     pub key: FrameEvidenceKey,
     pub elapsed: Duration,
+    pub queue_wait: Duration,
+    pub end_to_end: Duration,
     pub proof: Result<RenderProof, String>,
 }
 
 impl ProofResult {
     pub fn observer_event(
         self,
-        completed_after_frame_id: u64,
+        completed_after_key: FrameEvidenceKey,
         replaced_count: u64,
         result_drop_count: u64,
     ) -> ObserverEvent {
@@ -81,7 +80,7 @@ impl ProofResult {
         match self.proof {
             Ok(proof) => ObserverEvent::ProofCompleted {
                 key: self.key,
-                completed_after_frame_id,
+                completed_after_key,
                 elapsed_us,
                 replaced_count,
                 result_drop_count,
@@ -90,7 +89,7 @@ impl ProofResult {
             },
             Err(error) => ObserverEvent::ProofCompleted {
                 key: self.key,
-                completed_after_frame_id,
+                completed_after_key,
                 elapsed_us,
                 replaced_count,
                 result_drop_count,
@@ -104,16 +103,16 @@ impl ProofResult {
 #[derive(Default)]
 struct QueueState {
     pending: Option<ProofRequest>,
-    pending_asset_sources: Option<Vec<RenderAssetSource>>,
     closing: bool,
-    replaced: u64,
 }
 
 impl QueueState {
-    fn replace_pending(&mut self, request: ProofRequest) {
-        if self.pending.replace(request).is_some() {
-            self.replaced = self.replaced.saturating_add(1);
+    fn enqueue(&mut self, request: ProofRequest) -> Result<(), String> {
+        if self.pending.is_some() {
+            return Err("proof queue already contains a pending production readback".to_owned());
         }
+        self.pending = Some(request);
+        Ok(())
     }
 }
 
@@ -154,7 +153,11 @@ impl ProofWorker {
         if !request.key.is_complete() {
             return Err("proof request has an incomplete frame evidence key".to_owned());
         }
+        if request.key != request.readback.key {
+            return Err("proof request key differs from its production readback".to_owned());
+        }
         if !request
+            .readback
             .artifact_label
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -166,18 +169,7 @@ impl ProofWorker {
         if state.closing {
             return Err("proof worker is closing".to_owned());
         }
-        state.replace_pending(request);
-        wake.notify_one();
-        Ok(())
-    }
-
-    pub fn replace_asset_sources(&self, sources: Vec<RenderAssetSource>) -> Result<(), String> {
-        let (lock, wake) = &*self.queue;
-        let mut state = lock.lock().expect("proof queue lock");
-        if state.closing {
-            return Err("proof worker is closing".to_owned());
-        }
-        state.pending_asset_sources = Some(sources);
+        state.enqueue(request)?;
         wake.notify_one();
         Ok(())
     }
@@ -187,7 +179,7 @@ impl ProofWorker {
     }
 
     pub fn replaced_count(&self) -> u64 {
-        self.queue.0.lock().expect("proof queue lock").replaced
+        0
     }
 
     pub fn result_drop_count(&self) -> u64 {
@@ -213,60 +205,48 @@ fn proof_loop(
     artifact_dir: PathBuf,
 ) {
     demote_proof_worker();
-    let mut gpu = futures::executor::block_on(create_gpu());
-    let mut asset_error = None;
     loop {
-        let (asset_sources, request) = {
+        let request = {
             let (lock, wake) = &*queue;
             let mut state = lock.lock().expect("proof queue lock");
-            while state.pending.is_none() && state.pending_asset_sources.is_none() && !state.closing
-            {
+            while state.pending.is_none() && !state.closing {
                 state = wake.wait(state).expect("proof queue wait");
             }
             if state.closing {
                 return;
             }
-            (state.pending_asset_sources.take(), state.pending.take())
+            state.pending.take()
         };
-
-        if let Some(sources) = asset_sources {
-            asset_error = match &mut gpu {
-                Ok((_, _, renderer)) => renderer
-                    .replace_asset_sources(sources)
-                    .err()
-                    .map(|error| error.to_string()),
-                Err(error) => Some(error.clone()),
-            };
-        }
-
         let Some(request) = request else {
             continue;
         };
         let started = Instant::now();
-        let proof = match asset_error.as_ref() {
-            Some(error) => Err(error.clone()),
-            None => match &mut gpu {
-                Ok((device, queue, renderer)) => renderer
-                    .render_scene_pixels(AppOwnedRenderSceneRequest {
-                        device,
-                        queue,
-                        scene: &request.scene,
-                        render_identity_hash: &render_identity(&request.key),
-                        surface_id: request.surface_id,
-                        surface_epoch: request.key.surface_epoch,
-                        width: request.width,
-                        height: request.height,
-                        artifact_dir: &artifact_dir,
-                        artifact_label: &request.artifact_label,
-                    })
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error.clone()),
-            },
-        };
+        let queue_wait = started.saturating_duration_since(request.queued_at);
+        let capture_token_digest = frame_capture_token_digest(&request.key);
+        let readback = request.readback;
+        let proof = complete_presented_texture_readback(PresentedTextureReadbackRequest {
+            device: &readback.device,
+            submission_index: readback.submission_index,
+            buffer: &readback.buffer,
+            width: readback.width,
+            height: readback.height,
+            unpadded_bytes_per_row: readback.unpadded_bytes_per_row,
+            padded_bytes_per_row: readback.padded_bytes_per_row,
+            format: readback.format,
+            surface_id: SurfaceId(request.key.surface_id.clone()),
+            surface_epoch: request.key.surface_epoch,
+            frame_seq: request.key.frame_id,
+            capture_token_digest: &capture_token_digest,
+            artifact_dir: &artifact_dir,
+            artifact_label: &readback.artifact_label,
+        })
+        .map_err(|error| error.to_string());
         if results
             .try_send(ProofResult {
                 key: request.key,
                 elapsed: started.elapsed(),
+                queue_wait,
+                end_to_end: request.queued_at.elapsed(),
                 proof,
             })
             .is_err()
@@ -274,31 +254,6 @@ fn proof_loop(
             result_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
-}
-
-async fn create_gpu() -> Result<(wgpu::Device, wgpu::Queue, AppOwnedProofRenderer), String> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::LowPower,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })
-        .await
-        .map_err(|error| format!("request proof adapter: {error}"))?;
-    let (device, queue) = adapter
-        .request_device(&wgpu::DeviceDescriptor {
-            label: Some("boon-proof-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::default(),
-            experimental_features: wgpu::ExperimentalFeatures::default(),
-        })
-        .await
-        .map_err(|error| format!("request proof device: {error}"))?;
-    let renderer = AppOwnedProofRenderer::new(&device, &queue);
-    Ok((device, queue, renderer))
 }
 
 #[cfg(target_os = "linux")]
@@ -319,6 +274,7 @@ fn proof_artifact(proof: RenderProof) -> Option<ProofArtifact> {
             artifact_path,
             artifact_sha256,
             capture_method,
+            render_scene_identity_hash,
             nonblank_samples,
             unique_rgba_values,
             ..
@@ -329,6 +285,7 @@ fn proof_artifact(proof: RenderProof) -> Option<ProofArtifact> {
                 sha256: artifact_sha256,
                 byte_len,
                 capture_method,
+                capture_token_digest: render_scene_identity_hash,
                 nonblank_samples: nonblank_samples.try_into().unwrap_or(u64::MAX),
                 unique_rgba_values: unique_rgba_values.try_into().unwrap_or(u64::MAX),
             })
@@ -337,12 +294,14 @@ fn proof_artifact(proof: RenderProof) -> Option<ProofArtifact> {
     }
 }
 
-fn render_identity(key: &FrameEvidenceKey) -> String {
-    format!(
-        "surface-id:{}:process:{}:session:{}:frame:{}:input:{}:content:{}:layout:{}:render:{}:surface-epoch:{}:present:{}:proof:{}",
-        key.surface_id,
-        key.process_id,
-        key.session_id,
+pub(crate) fn frame_capture_token_digest(key: &FrameEvidenceKey) -> String {
+    let mut digest = Sha256::new();
+    digest.update((key.surface_id.len() as u64).to_le_bytes());
+    digest.update(key.surface_id.as_bytes());
+    digest.update(key.process_id.to_le_bytes());
+    digest.update((key.session_id.len() as u64).to_le_bytes());
+    digest.update(key.session_id.as_bytes());
+    for revision in [
         key.frame_id,
         key.input_id,
         key.content_id,
@@ -350,8 +309,11 @@ fn render_identity(key: &FrameEvidenceKey) -> String {
         key.render_id,
         key.surface_epoch,
         key.present_id,
-        key.proof_id
-    )
+        key.proof_id,
+    ] {
+        digest.update(revision.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 #[cfg(test)]
@@ -374,69 +336,13 @@ mod tests {
         }
     }
 
-    fn request(frame_id: u64) -> ProofRequest {
-        ProofRequest {
-            key: key(frame_id),
-            scene: RenderScene {
-                viewport: boon_document::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1.0,
-                    height: 1.0,
-                },
-                items: Vec::new(),
-                visual_primitives: Vec::new(),
-                quad_batches: Vec::new(),
-                text_runs: Vec::new(),
-                metrics: boon_document::render_scene::RenderSceneMetrics::default(),
-            },
-            width: 1,
-            height: 1,
-            surface_id: SurfaceId("preview".to_owned()),
-            artifact_label: format!("frame-{frame_id}"),
-        }
-    }
-
     #[test]
     fn evidence_identity_includes_every_revision() {
-        let identity = render_identity(&key(1));
-        for value in 1..=8 {
-            assert!(identity.contains(&value.to_string()));
-        }
-    }
-
-    #[test]
-    fn pending_queue_is_latest_wins_at_depth_one() {
-        let mut queue = QueueState::default();
-        queue.replace_pending(request(1));
-        queue.replace_pending(request(2));
-        queue.replace_pending(request(3));
-        assert_eq!(queue.replaced, 2);
-        assert_eq!(queue.pending.unwrap().key.frame_id, 3);
-    }
-
-    #[test]
-    fn pending_asset_sources_are_latest_wins_without_consuming_proof_depth() {
-        let mut queue = QueueState::default();
-        queue.replace_pending(request(1));
-        queue.pending_asset_sources = Some(vec![asset("asset://first")]);
-        queue.pending_asset_sources = Some(vec![asset("asset://latest")]);
-
-        assert_eq!(queue.replaced, 0);
-        assert_eq!(queue.pending.unwrap().key.frame_id, 1);
-        assert_eq!(
-            queue.pending_asset_sources.unwrap()[0].url,
-            "asset://latest"
-        );
-    }
-
-    fn asset(url: &str) -> RenderAssetSource {
-        RenderAssetSource {
-            url: url.to_owned(),
-            media_type: "image/png".to_owned(),
-            sha256: "00".repeat(32),
-            bytes: vec![0].into(),
-        }
+        let baseline = frame_capture_token_digest(&key(1));
+        assert_eq!(baseline.len(), 64);
+        let mut changed = key(1);
+        changed.present_id += 1;
+        assert_ne!(baseline, frame_capture_token_digest(&changed));
     }
 
     #[test]

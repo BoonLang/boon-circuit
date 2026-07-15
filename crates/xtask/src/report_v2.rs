@@ -24,6 +24,7 @@ const MAX_PRODUCT_METRICS: usize = 8;
 const MAX_PROFILE_ARGUMENTS: usize = 24;
 const MAX_PROFILE_CHECKPOINTS: usize = 32;
 const MAX_ARTIFACTS: usize = MAX_PROFILE_CHECKPOINTS + MAX_PRODUCT_METRICS;
+const MAX_ASYNC_LANES: usize = 16;
 const MAX_BUDGET_METRICS: usize = 32;
 const MAX_HANDOFF_GATES: usize = 32;
 const REPORT_PROTOCOL: &str = "boon-gate-evidence-v2";
@@ -333,6 +334,9 @@ pub struct ProfileProofRequirements {
     pub scenario: Option<ScenarioRequirement>,
     pub budget: Option<BudgetRequirement>,
     pub state_root: Option<StateRootRequirement>,
+    pub native_workflow: Option<NativeWorkflowRequirement>,
+    #[serde(default)]
+    pub async_lanes: Vec<AsyncLaneKind>,
     #[serde(default)]
     pub checkpoints: Vec<CheckpointRequirement>,
 }
@@ -361,6 +365,62 @@ pub enum CheckpointEvidenceRequirement {
     PersistenceOperation {
         operation: PersistenceEvidenceOperation,
     },
+    NativeWorkflowStep {
+        scenario_step: BoundedId,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkflowRequirement {
+    pub delivery: NativeWorkflowDelivery,
+    pub scenario_boundary: NativeWorkflowScenarioBoundary,
+    pub capture_method: CaptureMethod,
+    pub durability: NativeWorkflowDurability,
+    pub steps: Vec<BoundedId>,
+    pub proof_steps: Vec<BoundedId>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeWorkflowDelivery {
+    KernelUinputIsolatedSeat,
+}
+
+impl NativeWorkflowDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelUinputIsolatedSeat => "kernel-uinput-isolated-seat",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeWorkflowScenarioBoundary {
+    KernelUinputAndSemanticAssertions,
+}
+
+impl NativeWorkflowScenarioBoundary {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelUinputAndSemanticAssertions => "kernel-uinput-and-semantic-assertions",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeWorkflowDurability {
+    StateChangingStepsAcked,
+}
+
+impl NativeWorkflowDurability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StateChangingStepsAcked => "state-changing-steps-acked",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -766,6 +826,8 @@ impl ProfileProofRequirements {
         self.scenario.is_none()
             && self.budget.is_none()
             && self.state_root.is_none()
+            && self.native_workflow.is_none()
+            && self.async_lanes.is_empty()
             && self.checkpoints.is_empty()
     }
 
@@ -787,6 +849,63 @@ impl ProfileProofRequirements {
                 }
             }
         }
+        if let Some(requirement) = &self.native_workflow {
+            if self.scenario.is_none() {
+                return Err("native workflow requires a scenario proof".to_owned());
+            }
+            if requirement.delivery != NativeWorkflowDelivery::KernelUinputIsolatedSeat
+                || requirement.scenario_boundary
+                    != NativeWorkflowScenarioBoundary::KernelUinputAndSemanticAssertions
+                || requirement.capture_method != CaptureMethod::AppOwnedRenderTargetReadback
+                || requirement.durability != NativeWorkflowDurability::StateChangingStepsAcked
+            {
+                return Err(
+                    "native workflow must require isolated kernel input, semantic assertions, production-target readback, and durable acknowledgements"
+                        .to_owned(),
+                );
+            }
+            if requirement.steps.is_empty() || requirement.steps.len() > MAX_PROFILE_CHECKPOINTS {
+                return Err(format!(
+                    "native workflow steps must contain 1..={MAX_PROFILE_CHECKPOINTS} entries"
+                ));
+            }
+            let steps = requirement
+                .steps
+                .iter()
+                .map(BoundedId::as_str)
+                .collect::<BTreeSet<_>>();
+            if steps.len() != requirement.steps.len()
+                || requirement.proof_steps.is_empty()
+                || requirement.proof_steps.len() > requirement.steps.len()
+                || requirement
+                    .proof_steps
+                    .iter()
+                    .any(|step| !steps.contains(step.as_str()))
+                || requirement
+                    .proof_steps
+                    .iter()
+                    .map(BoundedId::as_str)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != requirement.proof_steps.len()
+            {
+                return Err(
+                    "native workflow and proof steps must be unique, bounded, and proof steps must be a non-empty subset"
+                        .to_owned(),
+                );
+            }
+        }
+        if self.async_lanes.len() > MAX_ASYNC_LANES {
+            return Err(format!(
+                "profile requires more than {MAX_ASYNC_LANES} async lanes"
+            ));
+        }
+        let mut async_lanes = BTreeSet::new();
+        for lane in &self.async_lanes {
+            if !async_lanes.insert(*lane) {
+                return Err(format!("profile duplicates async lane {}", lane.as_str()));
+            }
+        }
         if self.checkpoints.len() > MAX_PROFILE_CHECKPOINTS {
             return Err(format!(
                 "profile checkpoints exceed {MAX_PROFILE_CHECKPOINTS} entries"
@@ -801,6 +920,19 @@ impl ProfileProofRequirements {
                 CheckpointEvidenceRequirement::ScenarioStep { .. } if self.scenario.is_none() => {
                     return Err(format!(
                         "scenario checkpoint {} requires a scenario proof",
+                        checkpoint.id
+                    ));
+                }
+                CheckpointEvidenceRequirement::NativeWorkflowStep { scenario_step }
+                    if self.native_workflow.as_ref().is_none_or(|workflow| {
+                        !workflow
+                            .proof_steps
+                            .iter()
+                            .any(|step| step == scenario_step)
+                    }) =>
+                {
+                    return Err(format!(
+                        "native workflow checkpoint {} must reference a declared proof step",
                         checkpoint.id
                     ));
                 }
@@ -867,7 +999,7 @@ fn validate_kebab_identifier(value: &str, kind: &str) -> ValidationResult<()> {
 }
 
 fn validate_profile_flag(flag: &BoundedString<64>) -> ValidationResult<()> {
-    const RESERVED: [&str; 16] = [
+    const RESERVED: [&str; 23] = [
         "--role",
         "--gate",
         "--evidence-output",
@@ -881,9 +1013,16 @@ fn validate_profile_flag(flag: &BoundedString<64>) -> ValidationResult<()> {
         "--require-semantic-scenario",
         "--budget-proof",
         "--required-budget-metrics",
+        "--required-async-lanes",
         "--state-root-policy",
         "--restart-required",
         "--required-checkpoints",
+        "--required-native-workflow-steps",
+        "--required-native-workflow-proof-steps",
+        "--native-workflow-delivery",
+        "--native-workflow-scenario-boundary",
+        "--native-workflow-capture-method",
+        "--native-workflow-durability",
     ];
     let value = flag.as_str();
     if RESERVED.contains(&value) {
@@ -1063,6 +1202,36 @@ impl FrameEvidenceKey {
         }
         Ok(())
     }
+
+    fn same_producer_surface(&self, other: &Self) -> bool {
+        self.surface_id == other.surface_id
+            && self.process_id == other.process_id
+            && self.session_id == other.session_id
+            && self.surface_epoch == other.surface_epoch
+    }
+
+    pub(crate) fn capture_token_digest(&self) -> Sha256Digest {
+        let mut digest = Sha256::new();
+        digest.update((self.surface_id.as_str().len() as u64).to_le_bytes());
+        digest.update(self.surface_id.as_str().as_bytes());
+        digest.update(self.process_id.to_le_bytes());
+        digest.update((self.session_id.as_str().len() as u64).to_le_bytes());
+        digest.update(self.session_id.as_str().as_bytes());
+        for revision in [
+            self.frame_id,
+            self.input_id,
+            self.content_id,
+            self.layout_id,
+            self.render_id,
+            self.surface_epoch,
+            self.present_id,
+            self.proof_id,
+        ] {
+            digest.update(revision.to_le_bytes());
+        }
+        Sha256Digest::new(format!("{:x}", digest.finalize()))
+            .expect("SHA-256 output is a valid digest")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1079,6 +1248,10 @@ pub struct ArtifactMetadata {
     pub path: RelativePath,
     pub sha256: Sha256Digest,
     pub byte_len: u64,
+    pub capture_method: CaptureMethod,
+    pub capture_token_digest: Sha256Digest,
+    pub nonblank_samples: u64,
+    pub unique_rgba_values: u64,
     pub frame: FrameEvidenceKey,
 }
 
@@ -1098,6 +1271,18 @@ impl ArtifactMetadata {
         if self.byte_len == 0 || self.byte_len > MAX_ARTIFACT_BYTES {
             return Err(format!(
                 "artifact {} byte length must be between 1 and {MAX_ARTIFACT_BYTES}",
+                self.path
+            ));
+        }
+        if self.nonblank_samples == 0 || self.unique_rgba_values <= 1 {
+            return Err(format!(
+                "artifact {} must contain nonblank, non-uniform app-owned pixels",
+                self.path
+            ));
+        }
+        if self.capture_token_digest != self.frame.capture_token_digest() {
+            return Err(format!(
+                "artifact {} capture token does not match its exact production frame",
                 self.path
             ));
         }
@@ -1159,8 +1344,15 @@ pub enum HostBoundary {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CaptureMethod {
-    AppOwnedWgpuReadback,
     AppOwnedRenderTargetReadback,
+}
+
+impl CaptureMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppOwnedRenderTargetReadback => "app-owned-render-target-readback",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1457,12 +1649,80 @@ pub struct ProductTimingEvidence {
 pub struct AsyncProofTimingEvidence {
     pub linked_product_metric: TimingMetric,
     pub captured_frame: FrameEvidenceKey,
-    pub completed_after_frame_id: u64,
+    pub completed_after_frame: FrameEvidenceKey,
     pub proof_lag_frames: u32,
     pub artifact_id: BoundedId,
     pub snapshot_prepare_us: u64,
     pub worker_us: u64,
     pub summary: TimingSummary,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AsyncLaneKind {
+    ChildProgramCompile,
+    PersistenceTurn,
+    ProgramArtifactStore,
+    ProgramArtifactLoad,
+    ProofReadback,
+}
+
+impl AsyncLaneKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChildProgramCompile => "child-program-compile",
+            Self::PersistenceTurn => "persistence-turn",
+            Self::ProgramArtifactStore => "program-artifact-store",
+            Self::ProgramArtifactLoad => "program-artifact-load",
+            Self::ProofReadback => "proof-readback",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AsyncLaneOutcome {
+    Applied,
+    StaleRejected,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncLaneEvidence {
+    pub lane: AsyncLaneKind,
+    pub request_id: BoundedId,
+    pub revision: u64,
+    pub queue_depth: u32,
+    pub queue_wait_us: u64,
+    pub worker_us: u64,
+    pub apply_us: u64,
+    pub end_to_end_us: u64,
+    pub outcome: AsyncLaneOutcome,
+    pub frame: FrameEvidenceKey,
+}
+
+impl AsyncLaneEvidence {
+    fn validate(&self) -> ValidationResult<()> {
+        self.frame.validate()?;
+        if self.revision == 0 || self.queue_depth == 0 {
+            return Err(format!(
+                "async lane {} requires a non-zero revision and bounded queue depth",
+                self.lane.as_str()
+            ));
+        }
+        let accounted = self
+            .queue_wait_us
+            .saturating_add(self.worker_us)
+            .saturating_add(self.apply_us);
+        if self.end_to_end_us < accounted {
+            return Err(format!(
+                "async lane {} end-to-end time does not account for queue, worker, and apply phases",
+                self.lane.as_str()
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1494,6 +1754,7 @@ impl ProducerEvidence {
 pub enum ScenarioBoundary {
     NativeTestPlayback,
     NativeTestPlaybackAndSemanticAssertions,
+    KernelUinputWorkflowAndSemanticAssertions,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1532,6 +1793,7 @@ impl ScenarioProof {
             != matches!(
                 self.boundary,
                 ScenarioBoundary::NativeTestPlaybackAndSemanticAssertions
+                    | ScenarioBoundary::KernelUinputWorkflowAndSemanticAssertions
             )
         {
             return Err(
@@ -1620,6 +1882,7 @@ pub struct StateCheckpointProof {
     pub source_revision: u64,
     pub runtime_sequence: u64,
     pub durable_epoch: u64,
+    pub durable_turn_sequence: u64,
     pub state_digest: Sha256Digest,
     pub frame: FrameEvidenceKey,
     #[serde(flatten)]
@@ -1636,6 +1899,12 @@ pub enum StateCheckpointEvidence {
     RestartRestore {
         baseline_checkpoint: BoundedId,
         before_restart_digest: Sha256Digest,
+        baseline_durable_epoch: u64,
+        baseline_durable_turn_sequence: u64,
+        baseline_frame: FrameEvidenceKey,
+        process_replaced: bool,
+        session_replaced: bool,
+        first_observable_frame: bool,
         startup_restored: bool,
     },
     ResponsiveLayout {
@@ -1654,17 +1923,48 @@ pub enum StateCheckpointEvidence {
         operation: PersistenceEvidenceOperation,
         before_state_digest: Sha256Digest,
     },
+    NativeWorkflowFrame {
+        scenario_step: BoundedId,
+        action_kind: NativeWorkflowActionKind,
+        request_id: u64,
+        action_digest: Sha256Digest,
+        input_first_sequence: u64,
+        input_last_sequence: u64,
+        input_event_count: u32,
+        input_event_digest: Sha256Digest,
+        durable_turn_sequence: u64,
+        durable_acked: bool,
+        assertion_count: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeWorkflowActionKind {
+    AssertionOnly,
+    Click,
+    TypeText,
+    DoubleClick,
+    Key,
+    Blur,
 }
 
 impl StateCheckpointProof {
     fn validate(&self) -> ValidationResult<()> {
-        if self.source_revision == 0 || self.runtime_sequence == 0 || self.durable_epoch == 0 {
+        if self.source_revision == 0
+            || self.runtime_sequence == 0
+            || self.durable_epoch == 0
+            || self.durable_turn_sequence == 0
+        {
             return Err(format!(
                 "state checkpoint {} requires non-zero source, runtime, and durable identities",
                 self.id
             ));
         }
         self.frame.validate()?;
+        if let StateCheckpointEvidence::RestartRestore { baseline_frame, .. } = &self.evidence {
+            baseline_frame.validate()?;
+        }
         match &self.evidence {
             StateCheckpointEvidence::ScenarioSemanticFrame {
                 assertion_count, ..
@@ -1674,13 +1974,58 @@ impl StateCheckpointProof {
                     self.id
                 ));
             }
+            StateCheckpointEvidence::NativeWorkflowFrame {
+                action_kind,
+                request_id,
+                input_first_sequence,
+                input_last_sequence,
+                input_event_count,
+                durable_turn_sequence,
+                durable_acked,
+                assertion_count,
+                ..
+            } if *request_id == 0
+                || *assertion_count == 0
+                || *durable_turn_sequence == 0
+                || !durable_acked
+                || (*action_kind == NativeWorkflowActionKind::AssertionOnly
+                    && (*input_first_sequence != 0
+                        || *input_last_sequence != 0
+                        || *input_event_count != 0))
+                || (*action_kind != NativeWorkflowActionKind::AssertionOnly
+                    && (*input_first_sequence == 0
+                        || *input_last_sequence < *input_first_sequence
+                        || *input_event_count == 0)) =>
+            {
+                return Err(format!(
+                    "native workflow checkpoint {} lacks a valid action span, durable acknowledgement, or semantic assertions",
+                    self.id
+                ));
+            }
             StateCheckpointEvidence::RestartRestore {
                 before_restart_digest,
+                baseline_durable_epoch,
+                baseline_durable_turn_sequence,
+                baseline_frame,
+                process_replaced,
+                session_replaced,
+                first_observable_frame,
                 startup_restored,
                 ..
-            } if !startup_restored || before_restart_digest != &self.state_digest => {
+            } if !startup_restored
+                || before_restart_digest != &self.state_digest
+                || *baseline_durable_epoch == 0
+                || *baseline_durable_turn_sequence == 0
+                || self.durable_epoch < *baseline_durable_epoch
+                || self.durable_turn_sequence < *baseline_durable_turn_sequence
+                || !process_replaced
+                || !session_replaced
+                || !first_observable_frame
+                || baseline_frame.process_id == self.frame.process_id
+                || baseline_frame.session_id == self.frame.session_id =>
+            {
                 return Err(format!(
-                    "restart checkpoint {} does not prove the same restored authority",
+                    "restart checkpoint {} does not prove a new process restored the durable authority before its first frame",
                     self.id
                 ));
             }
@@ -1722,7 +2067,128 @@ pub struct VerificationProfileEvidence {
     pub scenario: Option<ScenarioProof>,
     pub budget: Option<BudgetProof>,
     pub state_root: Option<StateRootProof>,
+    pub native_workflow: Option<NativeWorkflowProof>,
     pub checkpoints: Vec<StateCheckpointProof>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkflowProof {
+    pub input_delivery: InputDelivery,
+    pub scenario_boundary: NativeWorkflowScenarioBoundary,
+    pub test_request_id: u64,
+    pub initial_state_digest: Sha256Digest,
+    pub final_state_digest: Sha256Digest,
+    pub ready_frame: FrameEvidenceKey,
+    pub final_frame: FrameEvidenceKey,
+    pub steps: Vec<NativeWorkflowStepProof>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWorkflowStepProof {
+    pub request_id: u64,
+    pub ordinal: u32,
+    pub scenario_step: BoundedId,
+    pub source_path: ShortText,
+    pub action_kind: NativeWorkflowActionKind,
+    pub action_digest: Sha256Digest,
+    pub input_first_sequence: u64,
+    pub input_last_sequence: u64,
+    pub input_event_count: u32,
+    pub input_event_digest: Sha256Digest,
+    pub assertion_count: u32,
+    pub source_revision: u64,
+    pub runtime_sequence: u64,
+    pub durable_epoch: u64,
+    pub durable_turn_sequence: u64,
+    pub durable_acked: bool,
+    pub before_state_digest: Sha256Digest,
+    pub state_digest: Sha256Digest,
+    pub frame: FrameEvidenceKey,
+}
+
+impl NativeWorkflowProof {
+    fn validate(&self) -> ValidationResult<()> {
+        if self.input_delivery != InputDelivery::NativeOsAppWindowCallback
+            || self.scenario_boundary
+                != NativeWorkflowScenarioBoundary::KernelUinputAndSemanticAssertions
+            || self.test_request_id == 0
+            || self.steps.is_empty()
+            || self.steps.len() > MAX_PROFILE_CHECKPOINTS
+            || self.initial_state_digest == self.final_state_digest
+        {
+            return Err(
+                "native workflow requires bounded real OS steps and a changed final authority"
+                    .to_owned(),
+            );
+        }
+        self.ready_frame.validate()?;
+        self.final_frame.validate()?;
+        if !self.ready_frame.same_producer_surface(&self.final_frame)
+            || self.final_frame.frame_id < self.ready_frame.frame_id
+        {
+            return Err(
+                "native workflow frames do not form one ordered producer surface".to_owned(),
+            );
+        }
+        let mut ids = BTreeSet::new();
+        let mut requests = BTreeSet::new();
+        let mut previous_frame_id = self.ready_frame.frame_id;
+        let mut previous_state_digest = self.initial_state_digest.clone();
+        for (index, step) in self.steps.iter().enumerate() {
+            if step.ordinal as usize != index + 1
+                || step.request_id == 0
+                || step.assertion_count == 0
+                || step.source_revision == 0
+                || step.runtime_sequence == 0
+                || step.durable_epoch == 0
+                || step.durable_turn_sequence == 0
+                || !step.durable_acked
+                || step.before_state_digest != previous_state_digest
+                || !ids.insert(step.scenario_step.as_str())
+                || !requests.insert(step.request_id)
+            {
+                return Err(
+                    "native workflow steps are incomplete, duplicated, or unordered".to_owned(),
+                );
+            }
+            let assertion_only = step.action_kind == NativeWorkflowActionKind::AssertionOnly;
+            if assertion_only
+                != (step.input_first_sequence == 0
+                    && step.input_last_sequence == 0
+                    && step.input_event_count == 0)
+            {
+                return Err(
+                    "native workflow assertion-only and real-input spans are inconsistent"
+                        .to_owned(),
+                );
+            }
+            if !assertion_only
+                && (step.input_first_sequence == 0
+                    || step.input_last_sequence < step.input_first_sequence
+                    || step.input_event_count == 0)
+            {
+                return Err("native workflow action has an invalid real-input span".to_owned());
+            }
+            step.frame.validate()?;
+            if !self.ready_frame.same_producer_surface(&step.frame)
+                || step.frame.frame_id <= previous_frame_id
+            {
+                return Err(
+                    "native workflow steps must use distinct ordered producer frames".to_owned(),
+                );
+            }
+            previous_frame_id = step.frame.frame_id;
+            previous_state_digest = step.state_digest.clone();
+        }
+        if self.steps.last().is_none_or(|step| {
+            step.state_digest != self.final_state_digest || step.frame != self.final_frame
+        }) {
+            return Err("native workflow completion does not match its final step".to_owned());
+        }
+        Ok(())
+    }
 }
 
 impl VerificationProfileEvidence {
@@ -1732,6 +2198,9 @@ impl VerificationProfileEvidence {
         }
         if let Some(budget) = &self.budget {
             budget.validate()?;
+        }
+        if let Some(workflow) = &self.native_workflow {
+            workflow.validate()?;
         }
         if self.checkpoints.len() > MAX_PROFILE_CHECKPOINTS {
             return Err(format!(
@@ -1777,6 +2246,16 @@ impl VerificationProfileEvidence {
                     {
                         return Err(
                             "passing profile requires complete semantic scenario proof".to_owned()
+                        );
+                    }
+                    if require_complete
+                        && requirements.native_workflow.is_some()
+                        && proof.boundary
+                            != ScenarioBoundary::KernelUinputWorkflowAndSemanticAssertions
+                    {
+                        return Err(
+                            "native workflow profile requires the kernel-uinput semantic scenario boundary"
+                                .to_owned(),
                         );
                     }
                 }
@@ -1847,6 +2326,33 @@ impl VerificationProfileEvidence {
             return Err("profile evidence includes an undeclared state-root proof".to_owned());
         }
 
+        if let Some(requirement) = &requirements.native_workflow {
+            match &self.native_workflow {
+                Some(proof) if require_complete => {
+                    if proof.scenario_boundary != requirement.scenario_boundary
+                        || proof.steps.len() != requirement.steps.len()
+                        || proof
+                            .steps
+                            .iter()
+                            .zip(&requirement.steps)
+                            .any(|(observed, required)| observed.scenario_step != *required)
+                    {
+                        return Err(
+                            "passing profile native workflow differs from the manifest order"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Some(_) => {}
+                None if require_complete => {
+                    return Err("passing profile requires native workflow proof".to_owned());
+                }
+                None => {}
+            }
+        } else if self.native_workflow.is_some() {
+            return Err("profile evidence includes an undeclared native workflow".to_owned());
+        }
+
         if require_complete {
             for required in &requirements.checkpoints {
                 let proof = self
@@ -1904,6 +2410,13 @@ fn validate_checkpoint_requirement(
                 ..
             },
         ) => operation == observed,
+        (
+            CheckpointEvidenceRequirement::NativeWorkflowStep { scenario_step },
+            StateCheckpointEvidence::NativeWorkflowFrame {
+                scenario_step: observed,
+                ..
+            },
+        ) => scenario_step == observed,
         _ => false,
     };
     if matches {
@@ -1925,6 +2438,8 @@ pub struct GateEvidence {
     pub native: Option<NativeEvidence>,
     pub product_ux_timings: Vec<ProductTimingEvidence>,
     pub async_proof_timing: Option<AsyncProofTimingEvidence>,
+    #[serde(default)]
+    pub async_lanes: Vec<AsyncLaneEvidence>,
     pub artifacts: Vec<ArtifactMetadata>,
 }
 
@@ -1944,6 +2459,21 @@ impl GateEvidence {
         }
         if self.artifacts.len() > MAX_ARTIFACTS {
             return Err(format!("artifact metadata exceeds {MAX_ARTIFACTS} entries"));
+        }
+        if self.async_lanes.len() > MAX_ASYNC_LANES {
+            return Err(format!(
+                "async lane evidence exceeds {MAX_ASYNC_LANES} entries"
+            ));
+        }
+        let mut async_lanes = BTreeSet::new();
+        for lane in &self.async_lanes {
+            lane.validate()?;
+            if !async_lanes.insert(lane.lane) {
+                return Err(format!(
+                    "duplicate async lane evidence {}",
+                    lane.lane.as_str()
+                ));
+            }
         }
         let mut check_ids = BTreeSet::new();
         for check in &self.checks {
@@ -2014,6 +2544,21 @@ impl GateEvidence {
             (Some(_), None) => Ok(()),
         };
         result?;
+        if report_status == ReportStatus::Pass
+            && let Some(profile) = &manifest_gate.profile
+        {
+            for required in &profile.proof_requirements.async_lanes {
+                if !self.async_lanes.iter().any(|observed| {
+                    observed.lane == *required && observed.outcome == AsyncLaneOutcome::Applied
+                }) {
+                    return Err(format!(
+                        "passing {} report is missing applied request-level async lane {}",
+                        manifest_gate.gate.slug(),
+                        required.as_str()
+                    ));
+                }
+            }
+        }
         if report_status == ReportStatus::Pass
             && let Some(profile) = &self.profile
         {
@@ -2093,6 +2638,7 @@ impl GateEvidence {
 
         if let Some(proof) = &self.async_proof_timing {
             proof.captured_frame.validate()?;
+            proof.completed_after_frame.validate()?;
             if proof_definition.metric != TimingMetric::AsyncProof {
                 return Err("async proof definition has the wrong metric".to_owned());
             }
@@ -2119,12 +2665,22 @@ impl GateEvidence {
                     "async proof frame identity does not match its product UX frame".to_owned(),
                 );
             }
+            if !proof
+                .captured_frame
+                .same_producer_surface(&proof.completed_after_frame)
+                || proof.completed_after_frame.present_id < proof.captured_frame.present_id
+            {
+                return Err(
+                    "async proof completion is not ordered on the captured production surface"
+                        .to_owned(),
+                );
+            }
             let expected_completion = proof
                 .captured_frame
                 .frame_id
                 .checked_add(u64::from(proof.proof_lag_frames))
                 .ok_or_else(|| "async proof frame lag overflows".to_owned())?;
-            if expected_completion != proof.completed_after_frame_id {
+            if expected_completion != proof.completed_after_frame.frame_id {
                 return Err("async proof lag does not match its completion frame".to_owned());
             }
             let artifact = self
@@ -2137,6 +2693,15 @@ impl GateEvidence {
             if artifact.frame != proof.captured_frame {
                 return Err(
                     "proof artifact frame identity does not match timing evidence".to_owned(),
+                );
+            }
+            if self
+                .native
+                .as_ref()
+                .is_some_and(|native| native.capture_method != artifact.capture_method)
+            {
+                return Err(
+                    "native capture method does not match the linked proof artifact".to_owned(),
                 );
             }
         } else if require_complete {
@@ -2956,6 +3521,7 @@ pub fn empty_evidence(checks: Vec<CheckEvidence>) -> GateEvidence {
         product_ux_timings: Vec::new(),
         async_proof_timing: None,
         artifacts: Vec::new(),
+        async_lanes: Vec::new(),
     }
 }
 

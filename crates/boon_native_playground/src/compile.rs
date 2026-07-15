@@ -105,6 +105,9 @@ pub struct ProgramCompileOutcome {
     pub session: ProgramSessionId,
     pub revision: u64,
     pub elapsed: Duration,
+    pub queue_wait: Duration,
+    pub queued_at: Instant,
+    pub completed_at: Instant,
     pub pending_depth: u32,
     pub result: Result<ProgramArtifact, ProgramDiagnostic>,
 }
@@ -118,6 +121,7 @@ pub struct ProgramCompileReceipt {
 struct PendingProgramCompile {
     request: ProgramHostRequest,
     pending_depth: u32,
+    queued_at: Instant,
 }
 
 #[derive(Default)]
@@ -170,6 +174,7 @@ impl ProgramCompileWorker {
                 PendingProgramCompile {
                     request,
                     pending_depth: 0,
+                    queued_at: Instant::now(),
                 },
             );
             let pending_depth = state.pending.len().try_into().unwrap_or(u32::MAX);
@@ -239,19 +244,25 @@ fn program_compile_loop(
         let PendingProgramCompile {
             request,
             pending_depth,
+            queued_at,
         } = request;
         let request_id = request.request_id;
         let session = request.session;
         let revision = request.compile.revision;
         let started = Instant::now();
+        let queue_wait = started.saturating_duration_since(queued_at);
         let result = compile_program_artifact(&request.compile);
         let elapsed = started.elapsed();
+        let completed_at = Instant::now();
         if output
             .unbounded_send(ProgramCompileOutcome {
                 request_id,
                 session,
                 revision,
                 elapsed,
+                queue_wait,
+                queued_at,
+                completed_at,
                 pending_depth,
                 result,
             })

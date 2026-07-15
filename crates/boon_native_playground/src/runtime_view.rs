@@ -168,6 +168,42 @@ pub struct RuntimeView {
     host_identity_generation: u64,
     scenario_trigger_source: Option<String>,
     scenario_trigger_turn: Option<RuntimeTurn>,
+    pending_durable_lanes: BTreeMap<u64, PendingDurableLane>,
+    async_lane_observations: Vec<RuntimeAsyncLaneObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeAsyncLaneKind {
+    PersistenceTurn,
+    ProgramArtifactStore,
+    ProgramArtifactLoad,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeAsyncLaneOutcome {
+    Applied,
+    StaleRejected,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeAsyncLaneObservation {
+    pub lane: RuntimeAsyncLaneKind,
+    pub request_id: String,
+    pub revision: u64,
+    pub queue_depth: u32,
+    pub queue_wait_us: u64,
+    pub worker_us: u64,
+    pub apply_us: u64,
+    pub end_to_end_us: u64,
+    pub outcome: RuntimeAsyncLaneOutcome,
+}
+
+#[derive(Clone, Debug)]
+struct PendingDurableLane {
+    queued_at: Instant,
+    enqueue_us: u64,
+    queue_depth: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +214,10 @@ struct PendingProgramArtifactStore {
     request_id: ProgramRequestId,
     artifact: ProgramArtifact,
     ownership: ProgramArtifactOwnership,
+    queued_at: Instant,
+    queue_depth: u32,
+    queue_wait_us: u64,
+    worker_us: u64,
 }
 
 #[derive(Debug)]
@@ -186,6 +226,7 @@ struct ProgramArtifactStoreFlight {
     mount_epoch: u64,
     artifact_id: boon_persistence::ContentArtifactId,
     waiters: BTreeMap<ProgramSessionId, PendingProgramArtifactStore>,
+    started_at: Instant,
 }
 
 #[derive(Debug)]
@@ -262,6 +303,8 @@ struct PendingProgramArtifactLoad {
     candidate_sequence: u64,
     mount_epoch: u64,
     request: ProgramHostRequest,
+    queued_at: Instant,
+    queue_depth: u32,
 }
 
 #[derive(Debug)]
@@ -270,6 +313,7 @@ struct ProgramArtifactLoadFlight {
     mount_epoch: u64,
     artifact_id: boon_persistence::ContentArtifactId,
     waiters: BTreeMap<ProgramSessionId, PendingProgramArtifactLoad>,
+    started_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -589,6 +633,8 @@ impl RuntimeView {
             host_identity_generation,
             scenario_trigger_source: None,
             scenario_trigger_turn: None,
+            pending_durable_lanes: BTreeMap::new(),
+            async_lane_observations: Vec::new(),
         };
         view.resolve_program_artifact_requests_blocking()?;
         view.pending_patches.clear();
@@ -791,7 +837,10 @@ impl RuntimeView {
             return false;
         }
         let previous_status = self.persistence_status.clone();
+        let apply_started = Instant::now();
         self.persistence_status = self.query_persistence_status();
+        let apply_us = duration_us(apply_started.elapsed());
+        self.record_durable_lane_completions(now, apply_us);
         let mut changed = self.persistence_status != previous_status;
         let idle = self.persistence_status.pending.is_none()
             && self.persistence_status.queue_depth == 0
@@ -1029,9 +1078,11 @@ impl RuntimeView {
     }
 
     fn refresh_persistence_after_control(&mut self) {
+        let apply_started = Instant::now();
         self.persistence_status = self.query_persistence_status();
         self.refresh_persistence_inspector();
         self.persistence_status = self.query_persistence_status();
+        self.record_durable_lane_completions(Instant::now(), duration_us(apply_started.elapsed()));
         self.next_persistence_poll = None;
     }
 
@@ -1243,6 +1294,13 @@ impl RuntimeView {
         let pending = PendingProgramArtifactLoad {
             candidate_sequence: self.program_artifact_load_lane.next_sequence(),
             mount_epoch: self.program_artifact_load_lane.mount_epoch,
+            queue_depth: self
+                .program_artifact_load_lane
+                .session_count()
+                .saturating_add(1)
+                .try_into()
+                .unwrap_or(u32::MAX),
+            queued_at: Instant::now(),
             request,
         };
         let joins_in_flight = self
@@ -1318,6 +1376,7 @@ impl RuntimeView {
                     mount_epoch: self.program_artifact_load_lane.mount_epoch,
                     artifact_id,
                     waiters,
+                    started_at: Instant::now(),
                 });
                 Ok(false)
             }
@@ -1367,6 +1426,24 @@ impl RuntimeView {
             if flight.mount_epoch != self.program_artifact_load_lane.mount_epoch
                 || completion.id != flight.artifact_id
             {
+                for pending in flight.waiters.into_values() {
+                    self.async_lane_observations
+                        .push(RuntimeAsyncLaneObservation {
+                            lane: RuntimeAsyncLaneKind::ProgramArtifactLoad,
+                            request_id: pending.request.request_id.0,
+                            revision: pending.request.compile.revision,
+                            queue_depth: pending.queue_depth,
+                            queue_wait_us: duration_us(
+                                flight
+                                    .started_at
+                                    .saturating_duration_since(pending.queued_at),
+                            ),
+                            worker_us: duration_us(flight.started_at.elapsed()),
+                            apply_us: 0,
+                            end_to_end_us: duration_us(pending.queued_at.elapsed()),
+                            outcome: RuntimeAsyncLaneOutcome::StaleRejected,
+                        });
+                }
                 continue;
             }
             if let Ok(Some(content)) = &completion.result {
@@ -1374,6 +1451,7 @@ impl RuntimeView {
                     .insert(content.id, content.clone());
             }
             for (_, pending) in flight.waiters {
+                let apply_started = Instant::now();
                 let result = match &completion.result {
                     Ok(Some(content)) => ProgramArtifact::from_content_artifact(
                         pending.request.compile.revision,
@@ -1392,13 +1470,29 @@ impl RuntimeView {
                         error.to_string(),
                     )),
                 };
-                changed |= self
-                    .complete_program_observed(
-                        &pending.request.session,
-                        &pending.request.request_id,
-                        result,
-                    )?
-                    .changed;
+                let failed = result.is_err();
+                let observed = self.complete_program_observed(
+                    &pending.request.session,
+                    &pending.request.request_id,
+                    result,
+                )?;
+                changed |= observed.changed;
+                self.async_lane_observations
+                    .push(RuntimeAsyncLaneObservation {
+                        lane: RuntimeAsyncLaneKind::ProgramArtifactLoad,
+                        request_id: pending.request.request_id.0,
+                        revision: pending.request.compile.revision,
+                        queue_depth: pending.queue_depth,
+                        queue_wait_us: duration_us(
+                            flight
+                                .started_at
+                                .saturating_duration_since(pending.queued_at),
+                        ),
+                        worker_us: duration_us(flight.started_at.elapsed()),
+                        apply_us: duration_us(apply_started.elapsed()),
+                        end_to_end_us: duration_us(pending.queued_at.elapsed()),
+                        outcome: runtime_lane_outcome(&observed.completion, failed),
+                    });
             }
         }
         changed |= self.drive_program_artifact_load_lane()?;
@@ -1414,6 +1508,17 @@ impl RuntimeView {
 
     pub fn has_pending_program_artifact_store(&self) -> bool {
         self.program_artifact_store_lane.has_pending()
+    }
+
+    pub(crate) fn program_artifact_lane_counts(&self) -> (usize, usize) {
+        (
+            self.program_artifact_store_lane.session_count(),
+            self.program_artifact_load_lane.session_count(),
+        )
+    }
+
+    pub(crate) fn take_async_lane_observations(&mut self) -> Vec<RuntimeAsyncLaneObservation> {
+        std::mem::take(&mut self.async_lane_observations)
     }
 
     pub fn complete_program(
@@ -1450,6 +1555,15 @@ impl RuntimeView {
                         request_id: request_id.clone(),
                         artifact,
                         ownership,
+                        queued_at: Instant::now(),
+                        queue_depth: self
+                            .program_artifact_store_lane
+                            .session_count()
+                            .saturating_add(1)
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                        queue_wait_us: 0,
+                        worker_us: 0,
                     };
                     self.enqueue_program_artifact_store(pending)
                 }
@@ -1642,6 +1756,7 @@ impl RuntimeView {
                     mount_epoch: self.program_artifact_store_lane.mount_epoch,
                     artifact_id,
                     waiters,
+                    started_at: Instant::now(),
                 });
                 Ok(false)
             }
@@ -1699,6 +1814,7 @@ impl RuntimeView {
                     )
                 })
             });
+            let store_worker_us = duration_us(flight.started_at.elapsed());
             if acknowledged.is_ok()
                 && flight.mount_epoch == self.program_artifact_store_lane.mount_epoch
                 && let Some(artifact) = flight.waiters.values().next()
@@ -1706,10 +1822,29 @@ impl RuntimeView {
                 self.program_artifact_cache
                     .insert(flight.artifact_id, artifact.artifact.to_content_artifact());
             }
-            for (_, waiter) in flight.waiters {
+            for (_, mut waiter) in flight.waiters {
+                waiter.queue_wait_us = duration_us(
+                    flight
+                        .started_at
+                        .saturating_duration_since(waiter.queued_at),
+                );
+                waiter.worker_us = store_worker_us;
                 if flight.mount_epoch != self.program_artifact_store_lane.mount_epoch {
                     self.program_artifact_store_lane
                         .remove_waiter_bytes(&waiter);
+                    let revision = waiter.artifact.revision();
+                    self.async_lane_observations
+                        .push(RuntimeAsyncLaneObservation {
+                            lane: RuntimeAsyncLaneKind::ProgramArtifactStore,
+                            request_id: waiter.request_id.0,
+                            revision,
+                            queue_depth: waiter.queue_depth,
+                            queue_wait_us: waiter.queue_wait_us,
+                            worker_us: waiter.worker_us,
+                            apply_us: 0,
+                            end_to_end_us: duration_us(waiter.queued_at.elapsed()),
+                            outcome: RuntimeAsyncLaneOutcome::StaleRejected,
+                        });
                     continue;
                 }
                 match &acknowledged {
@@ -1721,17 +1856,12 @@ impl RuntimeView {
                     Err(error) => {
                         self.program_artifact_store_lane
                             .remove_waiter_bytes(&waiter);
+                        let diagnostic = ProgramDiagnostic::artifact(
+                            waiter.artifact.revision(),
+                            error.to_string(),
+                        );
                         changed |= self
-                            .finish_program_completion_observed(
-                                &waiter.session,
-                                &waiter.request_id,
-                                Err(ProgramDiagnostic::artifact(
-                                    waiter.artifact.revision(),
-                                    error.to_string(),
-                                )),
-                                false,
-                                false,
-                            )?
+                            .finish_program_artifact_store_observed(waiter, Err(diagnostic), false)?
                             .changed;
                     }
                 }
@@ -1774,13 +1904,7 @@ impl RuntimeView {
                 self.program_artifact_store_lane
                     .remove_waiter_bytes(&pending);
                 changed |= self
-                    .finish_program_completion_observed(
-                        &pending.session,
-                        &pending.request_id,
-                        Ok(pending.artifact),
-                        false,
-                        true,
-                    )?
+                    .finish_program_artifact_store_observed(pending, Ok(()), true)?
                     .changed;
                 continue;
             }
@@ -1886,13 +2010,7 @@ impl RuntimeView {
             self.program_artifact_store_lane
                 .remove_waiter_bytes(&pending);
             changed |= self
-                .finish_program_completion_observed(
-                    &pending.session,
-                    &pending.request_id,
-                    Ok(pending.artifact),
-                    false,
-                    true,
-                )?
+                .finish_program_artifact_store_observed(pending, Ok(()), true)?
                 .changed;
         }
         Ok(changed)
@@ -1928,6 +2046,42 @@ impl RuntimeView {
         self.schedule_effect_poll()
             .map_err(PersistentDispatchError::Runtime)?;
         Ok((changed, ticket))
+    }
+
+    fn finish_program_artifact_store_observed(
+        &mut self,
+        pending: PendingProgramArtifactStore,
+        result: Result<(), ProgramDiagnostic>,
+        superseded_after_store: bool,
+    ) -> ViewResult<ObservedProgramCompletion> {
+        let request_id = pending.request_id.0.clone();
+        let revision = pending.artifact.revision();
+        let queue_depth = pending.queue_depth;
+        let queue_wait_us = pending.queue_wait_us;
+        let worker_us = pending.worker_us;
+        let queued_at = pending.queued_at;
+        let failed = result.is_err();
+        let apply_started = Instant::now();
+        let observed = self.finish_program_completion_observed(
+            &pending.session,
+            &pending.request_id,
+            result.map(|()| pending.artifact),
+            false,
+            superseded_after_store,
+        )?;
+        self.async_lane_observations
+            .push(RuntimeAsyncLaneObservation {
+                lane: RuntimeAsyncLaneKind::ProgramArtifactStore,
+                request_id,
+                revision,
+                queue_depth,
+                queue_wait_us,
+                worker_us,
+                apply_us: duration_us(apply_started.elapsed()),
+                end_to_end_us: duration_us(queued_at.elapsed()),
+                outcome: runtime_lane_outcome(&observed.completion, failed),
+            });
+        Ok(observed)
     }
 
     fn finish_program_completion_observed(
@@ -3101,10 +3255,27 @@ impl RuntimeView {
     }
 
     fn finish_parent_runtime_turn(&mut self, turn: RuntimeTurn) -> ViewResult<bool> {
+        let durable_sequence = turn.sequence;
+        let durable_queued_at = Instant::now();
+        let persistence_enqueue_us = turn.phase_timings.persistence_enqueue_us;
         let parent_patches = turn.document_patches;
         self.runtime_turn_sequence = turn.sequence;
         self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
         self.persistence_status = self.query_persistence_status();
+        self.pending_durable_lanes.insert(
+            durable_sequence,
+            PendingDurableLane {
+                queued_at: durable_queued_at,
+                enqueue_us: persistence_enqueue_us,
+                queue_depth: self
+                    .persistence_status
+                    .queue_depth
+                    .max(1)
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+            },
+        );
+        self.record_durable_lane_completions(Instant::now(), 0);
         self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
         self.last_runtime_phase = turn.phase_timings;
         let parent = self
@@ -3114,9 +3285,48 @@ impl RuntimeView {
             .map_err(|error| error.to_string())?;
         let update = self
             .program_host
-            .reconcile_with_parent_patches(&parent, parent_patches);
+            .reconcile_with_parent_patches(parent, parent_patches);
         let changed = self.queue_program_update(update.patches, update.requests);
         Ok(changed)
+    }
+
+    fn record_durable_lane_completions(&mut self, now: Instant, apply_us: u64) {
+        let through = self.persistence_status.durable_through_turn_sequence;
+        let worker_us = self
+            .persistence_status
+            .timings
+            .encode_us
+            .saturating_add(self.persistence_status.timings.checkpoint_us);
+        let completed = self
+            .pending_durable_lanes
+            .range(..=through)
+            .map(|(sequence, _)| *sequence)
+            .collect::<Vec<_>>();
+        for sequence in completed {
+            let pending = self
+                .pending_durable_lanes
+                .remove(&sequence)
+                .expect("selected durable lane exists");
+            let end_to_end_us = pending.enqueue_us.saturating_add(duration_us(
+                now.saturating_duration_since(pending.queued_at),
+            ));
+            let queue_wait_us = end_to_end_us
+                .saturating_sub(pending.enqueue_us)
+                .saturating_sub(worker_us)
+                .saturating_sub(apply_us);
+            self.async_lane_observations
+                .push(RuntimeAsyncLaneObservation {
+                    lane: RuntimeAsyncLaneKind::PersistenceTurn,
+                    request_id: format!("turn-{sequence}"),
+                    revision: sequence,
+                    queue_depth: pending.queue_depth,
+                    queue_wait_us,
+                    worker_us,
+                    apply_us,
+                    end_to_end_us,
+                    outcome: RuntimeAsyncLaneOutcome::Applied,
+                });
+        }
     }
 
     fn schedule_effect_poll(&mut self) -> ViewResult<()> {
@@ -3673,6 +3883,37 @@ fn unique_text_input(
         return None;
     }
     Some(target)
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
+fn runtime_lane_outcome(
+    completion: &ProgramCompletionObservation,
+    failed: bool,
+) -> RuntimeAsyncLaneOutcome {
+    if failed {
+        return RuntimeAsyncLaneOutcome::Failed;
+    }
+    match completion {
+        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+            ProgramCompletion::Stale { .. },
+        ))
+        | ProgramCompletionObservation::Host(ProgramHostCompletion::Superseded { .. })
+        | ProgramCompletionObservation::Host(ProgramHostCompletion::Removed { .. }) => {
+            RuntimeAsyncLaneOutcome::StaleRejected
+        }
+        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+            ProgramCompletion::Rejected { .. },
+        )) => RuntimeAsyncLaneOutcome::Failed,
+        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
+            ProgramCompletion::Activated { .. },
+        ))
+        | ProgramCompletionObservation::ArtifactStorePending { .. } => {
+            RuntimeAsyncLaneOutcome::Applied
+        }
+    }
 }
 
 #[cfg(test)]

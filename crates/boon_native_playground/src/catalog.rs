@@ -163,7 +163,7 @@ fn load_migration_bundle(
     })
 }
 
-fn ordinary_test_steps(path: &str) -> RuntimeResult<Vec<TestStep>> {
+pub(crate) fn ordinary_test_steps(path: &str) -> RuntimeResult<Vec<TestStep>> {
     boon_runtime::parse_scenario(Path::new(path))?
         .steps
         .into_iter()

@@ -646,6 +646,23 @@ pub struct AppOwnedRenderSceneRequest<'a> {
     pub artifact_label: &'a str,
 }
 
+pub struct PresentedTextureReadbackRequest<'a> {
+    pub device: &'a wgpu::Device,
+    pub submission_index: wgpu::SubmissionIndex,
+    pub buffer: &'a wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub unpadded_bytes_per_row: u32,
+    pub padded_bytes_per_row: u32,
+    pub format: wgpu::TextureFormat,
+    pub surface_id: SurfaceId,
+    pub surface_epoch: u64,
+    pub frame_seq: u64,
+    pub capture_token_digest: &'a str,
+    pub artifact_dir: &'a Path,
+    pub artifact_label: &'a str,
+}
+
 pub struct AppOwnedProofRenderer {
     renderer: VisibleLayoutRenderer,
 }
@@ -3641,6 +3658,145 @@ pub fn render_app_owned_scene_pixels(
 ) -> Result<RenderProof, RenderError> {
     let mut renderer = AppOwnedProofRenderer::new(request.device, request.queue);
     renderer.render_scene_pixels(request)
+}
+
+pub fn complete_presented_texture_readback(
+    request: PresentedTextureReadbackRequest<'_>,
+) -> Result<RenderProof, RenderError> {
+    std::fs::create_dir_all(request.artifact_dir).map_err(|error| RenderError {
+        message: format!(
+            "create native GPU artifact directory `{}`: {error}",
+            request.artifact_dir.display()
+        ),
+    })?;
+    if request.width == 0
+        || request.height == 0
+        || request.unpadded_bytes_per_row != request.width.saturating_mul(4)
+        || request.padded_bytes_per_row < request.unpadded_bytes_per_row
+    {
+        return Err(RenderError {
+            message: "production render-target readback has invalid dimensions".to_owned(),
+        });
+    }
+    let slice = request.buffer.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    request
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(request.submission_index.clone()),
+            timeout: Some(APP_OWNED_READBACK_TIMEOUT),
+        })
+        .map_err(|error| RenderError {
+            message: format!(
+                "production render-target readback poll failed for frame {}: {error}",
+                request.frame_seq
+            ),
+        })?;
+    receiver
+        .recv_timeout(APP_OWNED_READBACK_TIMEOUT)
+        .map_err(|error| RenderError {
+            message: format!(
+                "production render-target readback callback timed out for frame {}: {error}",
+                request.frame_seq
+            ),
+        })?
+        .map_err(|error| RenderError {
+            message: format!(
+                "production render-target buffer mapping failed for frame {}: {error}",
+                request.frame_seq
+            ),
+        })?;
+
+    let mapped = slice.get_mapped_range();
+    let pixel_len = u64::from(request.width)
+        .checked_mul(u64::from(request.height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| RenderError {
+            message: "production render-target pixel size overflow".to_owned(),
+        })?;
+    let mut pixels = Vec::with_capacity(pixel_len);
+    for row in 0..request.height as usize {
+        let start = row * request.padded_bytes_per_row as usize;
+        let end = start + request.unpadded_bytes_per_row as usize;
+        pixels.extend_from_slice(&mapped[start..end]);
+    }
+    drop(mapped);
+    request.buffer.unmap();
+    match request.format {
+        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb => {}
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
+            for rgba in pixels.chunks_exact_mut(4) {
+                rgba.swap(0, 2);
+            }
+        }
+        format => {
+            return Err(RenderError {
+                message: format!(
+                    "production render-target readback does not support format {format:?}"
+                ),
+            });
+        }
+    }
+
+    let nonblank_samples = pixels
+        .chunks_exact(4)
+        .filter(|rgba| rgba[0] != 0 || rgba[1] != 0 || rgba[2] != 0 || rgba[3] != 0)
+        .count();
+    let unique_rgba_values = pixels
+        .chunks_exact(4)
+        .map(|rgba| [rgba[0], rgba[1], rgba[2], rgba[3]])
+        .collect::<BTreeSet<_>>()
+        .len();
+    let capture_prefix = request
+        .capture_token_digest
+        .get(..16)
+        .unwrap_or(request.capture_token_digest);
+    let artifact_path = request.artifact_dir.join(format!(
+        "{}-{}-{}x{}-{}-{}.png",
+        std::process::id(),
+        request.artifact_label,
+        request.width,
+        request.height,
+        request.frame_seq,
+        capture_prefix,
+    ));
+    image::save_buffer(
+        &artifact_path,
+        &pixels,
+        request.width,
+        request.height,
+        image::ColorType::Rgba8,
+    )
+    .map_err(|error| RenderError {
+        message: format!(
+            "save production render-target artifact `{}`: {error}",
+            artifact_path.display()
+        ),
+    })?;
+    let artifact_sha256 = sha256_file(&artifact_path)?;
+    Ok(RenderProof {
+        artifact: RenderProofArtifact::AppOwnedPixels {
+            artifact_path: artifact_path.display().to_string(),
+            artifact_sha256,
+            capture_method: "app-owned-render-target-readback".to_owned(),
+            surface_id: request.surface_id,
+            surface_epoch: request.surface_epoch,
+            frame_seq: request.frame_seq,
+            layout_frame_hash: None,
+            render_scene_identity_hash: request.capture_token_digest.to_owned(),
+            width: request.width,
+            height: request.height,
+            nonblank_samples,
+            unique_rgba_values,
+            readback_deadline_ms: APP_OWNED_READBACK_TIMEOUT.as_millis() as u64,
+            readback_poll_status: "completed_before_deadline".to_owned(),
+        },
+        metrics: FrameMetrics::default(),
+    })
 }
 
 fn render_app_owned_scene_pixels_with_renderer(

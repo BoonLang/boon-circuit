@@ -9,4 +9,11 @@ interaction_frame_block_max = 16.7
 
 [count]
 pending_child_artifact_max = 1
+pending_program_artifact_store_max = 1
+pending_program_artifact_load_max = 1
+pending_persistence_artifact_store_max = 1
+pending_persistence_artifact_load_max = 1
+pending_durable_turn_max = 1
+proof_replacement_max = 0
+proof_result_drop_max = 0
 trusted_parent_rebuilds_per_edit = 0

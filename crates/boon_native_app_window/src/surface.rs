@@ -169,6 +169,7 @@ pub struct SurfacePresentReceipt {
     pub surface_id: SurfaceId,
     pub epoch: u64,
     pub configuration_generation: u64,
+    pub present_id: u64,
     pub recovered_suboptimal_surface: bool,
 }
 
@@ -177,6 +178,7 @@ pub struct NativeSurfaceHost {
     viewport: NativeViewport,
     epoch: u64,
     configuration_generation: u64,
+    present_id: u64,
     lifecycle: NativeSurfaceLifecycle,
     capabilities: NativeEventCapabilities,
     event_adapter: EventAdapter,
@@ -230,6 +232,7 @@ impl NativeSurfaceHost {
             viewport,
             epoch: 1,
             configuration_generation: 0,
+            present_id: 0,
             lifecycle: NativeSurfaceLifecycle::Unconfigured,
             capabilities,
             event_adapter: EventAdapter::new(config.ids),
@@ -696,6 +699,13 @@ impl NativeSurfaceFrame<'_> {
         on_surface_thread("surface present", move || texture.present()).await?;
         self.host.frame_in_flight = false;
         self.finished = true;
+        self.host.present_id =
+            self.host
+                .present_id
+                .checked_add(1)
+                .ok_or(SurfacePresentError::Host(NativeHostError::CounterOverflow(
+                    "surface present ID",
+                )))?;
 
         let recovered_suboptimal_surface = self.suboptimal;
         let presented_epoch = self.epoch;
@@ -709,6 +719,7 @@ impl NativeSurfaceFrame<'_> {
             surface_id: self.host.ids.surface.clone(),
             epoch: presented_epoch,
             configuration_generation: presented_generation,
+            present_id: self.host.present_id,
             recovered_suboptimal_surface,
         })
     }

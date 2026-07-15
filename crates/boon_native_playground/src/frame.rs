@@ -8,6 +8,7 @@ use boon_native_app_window::{
 use boon_native_gpu::{
     FrameMetrics, RenderAssetSource, SurfaceRenderSceneRequest, VisibleLayoutRenderer,
 };
+use sha2::{Digest, Sha256};
 
 use crate::observer::{
     FrameEvidenceKey, FramePresented, InputKind, NATIVE_SESSION_ID_ENV, ObserverEvent,
@@ -50,6 +51,14 @@ pub fn pointer_button_pressed(event: &HostEvent) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+pub fn host_event_digest(envelope: &HostEventEnvelope) -> String {
+    let canonical = format!(
+        "sequence={};surface_epoch={};origin={:?};event={:?}",
+        envelope.sequence, envelope.surface_epoch, envelope.origin, envelope.event
+    );
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
 }
 
 #[derive(Default)]
@@ -218,12 +227,38 @@ pub struct ProductFrame {
     accepted_input: Option<AcceptedInput>,
     interaction_samples: Vec<u64>,
     stats: PreviewPerfStats,
+    virtual_cursor: Option<(f32, f32)>,
+    present_target: Option<ProductPresentTarget>,
+    last_presented_key: Option<FrameEvidenceKey>,
+    last_presented_captured: bool,
+}
+
+struct ProductPresentTarget {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+}
+
+pub struct PresentedReadbackTicket {
+    pub key: FrameEvidenceKey,
+    pub device: wgpu::Device,
+    pub submission_index: wgpu::SubmissionIndex,
+    pub buffer: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub unpadded_bytes_per_row: u32,
+    pub padded_bytes_per_row: u32,
+    pub format: wgpu::TextureFormat,
+    pub artifact_label: String,
 }
 
 impl ProductFrame {
     pub async fn attach(
         host: &mut NativeSurfaceHost,
         role: ObserverRole,
+        proof_enabled: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let adapter = host
             .request_adapter(wgpu::PowerPreference::HighPerformance, false)
@@ -244,6 +279,9 @@ impl ProductFrame {
         let binding = host
             .configure(&adapter, &device, SurfacePreferences::default())
             .await?;
+        if proof_enabled && !binding.usage.contains(wgpu::TextureUsages::COPY_DST) {
+            return Err("proof mode requires a surface with COPY_DST support".into());
+        }
         let mut renderer = VisibleLayoutRenderer::new(&device, &queue, binding.format);
         renderer.set_diagnostics_enabled(false);
         let viewport = binding.viewport;
@@ -294,6 +332,10 @@ impl ProductFrame {
             accepted_input: None,
             interaction_samples: Vec::with_capacity(256),
             stats: PreviewPerfStats::default(),
+            virtual_cursor: None,
+            present_target: None,
+            last_presented_key: None,
+            last_presented_captured: false,
         })
     }
 
@@ -342,12 +384,12 @@ impl ProductFrame {
         self.stats
     }
 
-    pub fn frame_id(&self) -> u64 {
-        self.frame_id
+    pub fn last_presented_key(&self) -> Option<&FrameEvidenceKey> {
+        self.last_presented_key.as_ref()
     }
 
-    pub fn set_proof_enabled(&mut self, enabled: bool) {
-        self.stats.proof_enabled = enabled;
+    pub fn set_virtual_cursor(&mut self, cursor: Option<(f32, f32)>) {
+        self.virtual_cursor = cursor;
     }
 
     pub fn replace_asset_sources(
@@ -358,19 +400,105 @@ impl ProductFrame {
         Ok(())
     }
 
+    pub fn capture_presented(
+        &mut self,
+        key: &FrameEvidenceKey,
+        artifact_label: String,
+    ) -> Result<PresentedReadbackTicket, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.stats.proof_enabled {
+            return Err("production-target capture requires proof mode".into());
+        }
+        if self.last_presented_key.as_ref() != Some(key) {
+            return Err("proof capture key is not the latest production frame".into());
+        }
+        if self.last_presented_captured {
+            return Err("latest production frame was already captured".into());
+        }
+        let target = self
+            .present_target
+            .as_ref()
+            .ok_or("production render target is unavailable")?;
+        let unpadded_bytes_per_row = target
+            .width
+            .checked_mul(4)
+            .ok_or("production readback row size overflow")?;
+        let padded_bytes_per_row =
+            align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)?;
+        let readback_size = u64::from(padded_bytes_per_row)
+            .checked_mul(u64::from(target.height))
+            .ok_or("production readback buffer size overflow")?;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("boon-playground-product-readback"),
+            size: readback_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("boon-playground-product-readback-encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(target.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: target.width,
+                height: target.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission_index = self.queue.submit([encoder.finish()]);
+        self.last_presented_captured = true;
+        Ok(PresentedReadbackTicket {
+            key: key.clone(),
+            device: self.device.clone(),
+            submission_index,
+            buffer,
+            width: target.width,
+            height: target.height,
+            unpadded_bytes_per_row,
+            padded_bytes_per_row,
+            format: target.format,
+            artifact_label,
+        })
+    }
+
     pub async fn present(
         &mut self,
         host: &mut NativeSurfaceHost,
         view: &RetainedView,
     ) -> Result<Option<PresentedFrame>, Box<dyn std::error::Error + Send + Sync>> {
         let revisions = view.revisions();
-        self.present_scene(
-            host,
-            view.scene(),
-            format!("scene-{}", revisions.2),
-            revisions,
-        )
-        .await
+        if let Some((x, y)) = self.virtual_cursor {
+            let scene = view.scene_with_cursor(x, y);
+            self.present_scene(
+                host,
+                &scene,
+                format!("scene-{}-native-cursor-{x:.1}-{y:.1}", revisions.2),
+                revisions,
+            )
+            .await
+        } else {
+            self.present_scene(
+                host,
+                view.scene(),
+                format!("scene-{}", revisions.2),
+                revisions,
+            )
+            .await
+        }
     }
 
     pub async fn present_cursor(
@@ -413,7 +541,7 @@ impl ProductFrame {
             Err(error) => return Err(Box::new(error)),
         };
         let surface_epoch = frame.epoch();
-        let view_texture = frame
+        let surface_view = frame
             .texture()
             .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
@@ -423,17 +551,56 @@ impl ProductFrame {
             });
 
         let render_started = Instant::now();
-        let metrics: FrameMetrics = self.renderer.encode_scene(SurfaceRenderSceneRequest {
-            device: &self.device,
-            queue: &self.queue,
-            encoder: &mut encoder,
-            view: &view_texture,
-            scene,
-            scene_identity: Some(&scene_identity),
-            format: self.format,
-            width: viewport.physical_size.width,
-            height: viewport.physical_size.height,
-        })?;
+        let metrics: FrameMetrics = if self.stats.proof_enabled {
+            self.ensure_present_target(viewport.physical_size.width, viewport.physical_size.height);
+            let target = self
+                .present_target
+                .as_ref()
+                .expect("ensured production render target");
+            let metrics = self.renderer.encode_scene(SurfaceRenderSceneRequest {
+                device: &self.device,
+                queue: &self.queue,
+                encoder: &mut encoder,
+                view: &target.view,
+                scene,
+                scene_identity: Some(&scene_identity),
+                format: self.format,
+                width: viewport.physical_size.width,
+                height: viewport.physical_size.height,
+            })?;
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &target.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: frame.texture(),
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: target.width,
+                    height: target.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            metrics
+        } else {
+            self.renderer.encode_scene(SurfaceRenderSceneRequest {
+                device: &self.device,
+                queue: &self.queue,
+                encoder: &mut encoder,
+                view: &surface_view,
+                scene,
+                scene_identity: Some(&scene_identity),
+                format: self.format,
+                width: viewport.physical_size.width,
+                height: viewport.physical_size.height,
+            })?
+        };
         let render_us = duration_us(render_started.elapsed());
 
         let submit_started = Instant::now();
@@ -445,7 +612,10 @@ impl ProductFrame {
         let present_us = duration_us(present_started.elapsed());
         debug_assert_eq!(receipt.epoch, surface_epoch);
 
-        self.frame_id = self.frame_id.saturating_add(1);
+        self.frame_id = self
+            .frame_id
+            .checked_add(1)
+            .ok_or("product frame ID overflow")?;
         let frame_us = duration_us(frame_started.elapsed());
         let accepted = self.accepted_input.take();
         let input_to_present_us = accepted
@@ -466,9 +636,11 @@ impl ProductFrame {
             layout_id: revisions.1.max(1),
             render_id: revisions.2.max(1),
             surface_epoch: receipt.epoch.max(1),
-            present_id: self.frame_id,
-            proof_id: self.frame_id,
+            present_id: receipt.present_id,
+            proof_id: receipt.present_id,
         };
+        self.last_presented_key = Some(key.clone());
+        self.last_presented_captured = false;
 
         self.stats.frame_id = self.frame_id;
         self.stats.last_render_us = render_us;
@@ -525,6 +697,48 @@ impl ProductFrame {
             present_us,
             frame_us,
         }))
+    }
+
+    fn ensure_present_target(&mut self, width: u32, height: u32) {
+        let reusable = self.present_target.as_ref().is_some_and(|target| {
+            target.width == width && target.height == height && target.format == self.format
+        });
+        if reusable {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("boon-playground-product-present-target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.present_target = Some(ProductPresentTarget {
+            texture,
+            view,
+            width,
+            height,
+            format: self.format,
+        });
+    }
+}
+
+fn align_to(value: u32, alignment: u32) -> Result<u32, &'static str> {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(alignment - remainder)
+            .ok_or("production readback row alignment overflow")
     }
 }
 

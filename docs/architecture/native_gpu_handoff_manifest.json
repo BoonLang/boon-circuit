@@ -131,7 +131,7 @@
       "byte_limit": 262144,
       "sidecar_byte_limit": 67108864,
       "profile": {
-        "id": "native-local-first-workflow-v1",
+        "id": "native-local-first-workflow-v2",
         "arguments": [
           { "flag": "--harness", "value": "timed" },
           { "flag": "--example", "value": "persons_pro" },
@@ -164,6 +164,13 @@
               "passive-preview-scroll-p95",
               "interaction-frame-block-max",
               "pending-child-artifact-max",
+              "pending-program-artifact-store-max",
+              "pending-program-artifact-load-max",
+              "pending-persistence-artifact-store-max",
+              "pending-persistence-artifact-load-max",
+              "pending-durable-turn-max",
+              "proof-replacement-max",
+              "proof-result-drop-max",
               "trusted-parent-rebuilds-per-edit"
             ]
           },
@@ -171,91 +178,155 @@
             "policy": "launch-scoped-clean",
             "restart_required": true
           },
+          "async_lanes": [
+            "child-program-compile",
+            "persistence-turn",
+            "program-artifact-store",
+            "program-artifact-load",
+            "proof-readback"
+          ],
+          "native_workflow": {
+            "delivery": "kernel-uinput-isolated-seat",
+            "scenario_boundary": "kernel-uinput-and-semantic-assertions",
+            "capture_method": "app-owned-render-target-readback",
+            "durability": "state-changing-steps-acked",
+            "steps": [
+              "fresh-anonymous-workspace-and-starter-preview",
+              "valid-edit-preview",
+              "invalid-edit-retains-last-valid",
+              "diagnostic-focuses-source-location",
+              "corrected-edit-preview",
+              "immutable-publish",
+              "published-child-artifact-visible",
+              "invalid-edit-before-failed-publish",
+              "failed-publish-preserves-pointer",
+              "select-passkey-cancellation",
+              "passkey-cancel-preserves-anonymous",
+              "select-passkey-registration-failure",
+              "passkey-registration-failure-preserves-anonymous",
+              "select-passkey-success",
+              "first-passkey-protects",
+              "select-duplicate-credential",
+              "duplicate-credential-is-rejected",
+              "restore-passkey-success-mode",
+              "second-passkey-same-account",
+              "sign-out",
+              "select-authentication-cancellation",
+              "authentication-cancellation-preserves-sign-out",
+              "select-authentication-failure",
+              "authentication-failure-preserves-sign-out",
+              "select-authentication-success",
+              "passkey-sign-in-restores-access",
+              "toggle-dark",
+              "phone-preview-width",
+              "restore-auto-preview-width"
+            ],
+            "proof_steps": [
+              "fresh-anonymous-workspace-and-starter-preview",
+              "valid-edit-preview",
+              "invalid-edit-retains-last-valid",
+              "diagnostic-focuses-source-location",
+              "corrected-edit-preview",
+              "immutable-publish",
+              "published-child-artifact-visible",
+              "failed-publish-preserves-pointer",
+              "passkey-cancel-preserves-anonymous",
+              "passkey-registration-failure-preserves-anonymous",
+              "first-passkey-protects",
+              "duplicate-credential-is-rejected",
+              "second-passkey-same-account",
+              "authentication-cancellation-preserves-sign-out",
+              "authentication-failure-preserves-sign-out",
+              "passkey-sign-in-restores-access",
+              "phone-preview-width",
+              "restore-auto-preview-width"
+            ]
+          },
           "checkpoints": [
             {
               "id": "fresh-anonymous-workspace",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "fresh-anonymous-workspace-and-starter-preview"
             },
             {
               "id": "starter-child-preview",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "fresh-anonymous-workspace-and-starter-preview"
             },
             {
               "id": "valid-edit-preview",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "valid-edit-preview"
             },
             {
               "id": "invalid-edit-last-valid",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "invalid-edit-retains-last-valid"
             },
             {
               "id": "corrected-edit-preview",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "corrected-edit-preview"
             },
             {
               "id": "publish-success",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "immutable-publish"
             },
             {
               "id": "published-child-visible",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "published-child-artifact-visible"
             },
             {
               "id": "publish-failure-preserves-pointer",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "failed-publish-preserves-pointer"
             },
             {
               "id": "passkey-cancel-preserves-anonymous",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "passkey-cancel-preserves-anonymous"
             },
             {
               "id": "passkey-failure-preserves-anonymous",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "passkey-registration-failure-preserves-anonymous"
             },
             {
               "id": "first-passkey-protects",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "first-passkey-protects"
             },
             {
               "id": "duplicate-passkey-rejected",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "duplicate-credential-is-rejected"
             },
             {
               "id": "second-passkey-same-account",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "second-passkey-same-account"
             },
             {
               "id": "authentication-cancel-preserves-sign-out",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "authentication-cancellation-preserves-sign-out"
             },
             {
               "id": "authentication-failure-preserves-sign-out",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "authentication-failure-preserves-sign-out"
             },
             {
               "id": "sign-out-sign-in",
-              "kind": "scenario-step",
+              "kind": "native-workflow-step",
               "scenario_step": "passkey-sign-in-restores-access"
             },
             {
               "id": "restart-restores-authority",
               "kind": "restart-restore",
-              "baseline_checkpoint": "sign-out-sign-in"
+              "baseline_checkpoint": "native-auto-preview"
             },
             {
               "id": "responsive-layout-parity",
@@ -296,6 +367,41 @@
               "id": "schema-migration-activated",
               "kind": "persistence-operation",
               "operation": "migration-activated"
+            },
+            {
+              "id": "native-diagnostic-focus",
+              "kind": "native-workflow-step",
+              "scenario_step": "diagnostic-focuses-source-location"
+            },
+            {
+              "id": "native-publish",
+              "kind": "native-workflow-step",
+              "scenario_step": "immutable-publish"
+            },
+            {
+              "id": "native-published-page",
+              "kind": "native-workflow-step",
+              "scenario_step": "published-child-artifact-visible"
+            },
+            {
+              "id": "native-protect-workspace",
+              "kind": "native-workflow-step",
+              "scenario_step": "first-passkey-protects"
+            },
+            {
+              "id": "native-sign-in",
+              "kind": "native-workflow-step",
+              "scenario_step": "passkey-sign-in-restores-access"
+            },
+            {
+              "id": "native-phone-preview",
+              "kind": "native-workflow-step",
+              "scenario_step": "phone-preview-width"
+            },
+            {
+              "id": "native-auto-preview",
+              "kind": "native-workflow-step",
+              "scenario_step": "restore-auto-preview-width"
             }
           ]
         }

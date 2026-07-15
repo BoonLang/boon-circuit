@@ -273,6 +273,16 @@ fn append_profile_arguments(command: &mut Command, profile: &VerifierProfile) {
                     .join(","),
             );
     }
+    if !requirements.async_lanes.is_empty() {
+        command.arg("--required-async-lanes").arg(
+            requirements
+                .async_lanes
+                .iter()
+                .map(|lane| lane.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     if let Some(state_root) = &requirements.state_root {
         command
             .arg("--state-root-policy")
@@ -283,6 +293,35 @@ fn append_profile_arguments(command: &mut Command, profile: &VerifierProfile) {
             } else {
                 "false"
             });
+    }
+    if let Some(workflow) = &requirements.native_workflow {
+        command
+            .arg("--native-workflow-delivery")
+            .arg(workflow.delivery.as_str())
+            .arg("--native-workflow-scenario-boundary")
+            .arg(workflow.scenario_boundary.as_str())
+            .arg("--native-workflow-capture-method")
+            .arg(workflow.capture_method.as_str())
+            .arg("--native-workflow-durability")
+            .arg(workflow.durability.as_str())
+            .arg("--required-native-workflow-steps")
+            .arg(
+                workflow
+                    .steps
+                    .iter()
+                    .map(BoundedId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+            .arg("--required-native-workflow-proof-steps")
+            .arg(
+                workflow
+                    .proof_steps
+                    .iter()
+                    .map(BoundedId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
     }
     for checkpoint in &requirements.checkpoints {
         command.arg("--required-checkpoint").arg(

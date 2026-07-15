@@ -4,6 +4,144 @@ use super::*;
 include!("tests/flow_and_state.rs");
 include!("tests/functions_and_arguments.rs");
 
+fn passkey_effect_fixture() -> ParsedProgram {
+    boon_parser::parse_source(
+        "typed-passkey-effects.bn",
+        r#"
+store: [
+    register: SOURCE
+    registration_succeeded: SOURCE
+    registration_cancelled: SOURCE
+    registration_failed: SOURCE
+    duplicate_credential: SOURCE
+    simulate_cancel: SOURCE
+    simulate_failure: SOURCE
+    simulate_duplicate: SOURCE
+    workspace_id: TEXT { workspace-1 }
+    account_id: TEXT {}
+    credential_count: 0
+    simulation:
+        Success |> HOLD simulation {
+            LATEST {
+                store.simulate_cancel |> THEN { Cancel }
+                store.simulate_failure |> THEN { Failure }
+                store.simulate_duplicate |> THEN { Duplicate }
+            }
+        }
+]
+
+effects: [
+    protect_workspace: [
+        on: store.register
+        perform: Passkey/register(
+            workspace_id: store.workspace_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.simulation
+        )
+        results: [
+            RegistrationSucceeded: store.registration_succeeded
+            RegistrationCancelled: store.registration_cancelled
+            RegistrationFailed: store.registration_failed
+            DuplicateCredential: store.duplicate_credential
+        ]
+    ]
+]
+"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn passkey_effect_declaration_has_closed_named_intent_and_typed_result_sources() {
+    let report = check(&passkey_effect_fixture());
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}",
+        report.diagnostics
+    );
+    let declaration = &report.host_effect_table.declarations[0];
+    assert_eq!(declaration.name, "protect_workspace");
+    assert_eq!(declaration.operation, "Passkey/register");
+    assert_eq!(
+        declaration
+            .intent_fields
+            .iter()
+            .find(|field| field.name == "simulation")
+            .unwrap()
+            .value_type,
+        passkey_simulation_type()
+    );
+    assert_eq!(
+        declaration
+            .intent_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "workspace_id",
+            "account_id",
+            "credential_count",
+            "simulation"
+        ]
+    );
+    assert_eq!(
+        declaration
+            .result_routes
+            .iter()
+            .map(|route| route.variant.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "RegistrationSucceeded",
+            "RegistrationCancelled",
+            "RegistrationFailed",
+            "DuplicateCredential",
+        ])
+    );
+    let failure = report
+        .source_payload_shape_table
+        .iter()
+        .find(|entry| entry.source_path == "store.registration_failed")
+        .unwrap();
+    assert_eq!(
+        failure
+            .fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.ty.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        BTreeMap::from([
+            ("code", Type::Text),
+            ("message", Type::Text),
+            ("retryable", true_false_type()),
+        ])
+    );
+}
+
+#[test]
+fn passkey_effect_declaration_rejects_missing_result_route() {
+    let mut parsed = passkey_effect_fixture();
+    let route = parsed
+        .ast
+        .statements
+        .iter_mut()
+        .find(|statement| statement_field_name(statement) == Some("effects"))
+        .unwrap()
+        .children[0]
+        .children
+        .iter_mut()
+        .find(|statement| statement_field_name(statement) == Some("results"))
+        .unwrap();
+    route
+        .children
+        .retain(|statement| statement_field_name(statement) != Some("RegistrationCancelled"));
+    let report = check(&parsed);
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("missing result route `RegistrationCancelled`")
+    }));
+}
+
 #[test]
 fn list_chunk_type_uses_declared_output_field_names() {
     let parsed = boon_parser::parse_source(

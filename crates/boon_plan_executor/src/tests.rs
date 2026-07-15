@@ -2029,3 +2029,464 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
     };
     assert_eq!(response["request_count"], Value::Number(1));
 }
+
+fn typed_passkey_effect_machine() -> MachinePlan {
+    boon_compiler::compile_source_text_to_machine_plan(
+        "typed-passkey-effects-executor.bn",
+        r#"
+store: [
+    register: SOURCE
+    authenticate: SOURCE
+    registration_succeeded: SOURCE
+    registration_cancelled: SOURCE
+    registration_failed: SOURCE
+    duplicate_credential: SOURCE
+    authentication_succeeded: SOURCE
+    authentication_cancelled: SOURCE
+    authentication_failed: SOURCE
+    simulate_cancel: SOURCE
+    simulate_failure: SOURCE
+    simulate_duplicate: SOURCE
+    workspace_id: TEXT { workspace-1 } |> HOLD workspace_id
+    account_id: TEXT { account-1 } |> HOLD account_id
+    credential_count: 1 |> HOLD credential_count
+    simulation:
+        Success |> HOLD simulation {
+            LATEST {
+                store.simulate_cancel |> THEN { Cancel }
+                store.simulate_failure |> THEN { Failure }
+                store.simulate_duplicate |> THEN { Duplicate }
+            }
+        }
+    last_result:
+        Pending |> HOLD last_result {
+            LATEST {
+                store.registration_succeeded |> THEN { RegistrationSucceeded }
+                store.registration_cancelled |> THEN { RegistrationCancelled }
+                store.registration_failed |> THEN { RegistrationFailed }
+                store.duplicate_credential |> THEN { DuplicateCredential }
+                store.authentication_succeeded |> THEN { AuthenticationSucceeded }
+                store.authentication_cancelled |> THEN { AuthenticationCancelled }
+                store.authentication_failed |> THEN { AuthenticationFailed }
+            }
+        }
+    result_account_id:
+        TEXT {} |> HOLD result_account_id {
+            LATEST {
+                store.registration_succeeded |> THEN { store.registration_succeeded.account_id }
+                store.duplicate_credential |> THEN { store.duplicate_credential.account_id }
+                store.authentication_succeeded |> THEN { store.authentication_succeeded.account_id }
+            }
+        }
+    result_credential_id:
+        TEXT {} |> HOLD result_credential_id {
+            LATEST {
+                store.registration_succeeded |> THEN { store.registration_succeeded.credential_id }
+                store.duplicate_credential |> THEN { store.duplicate_credential.credential_id }
+                store.authentication_succeeded |> THEN { store.authentication_succeeded.credential_id }
+            }
+        }
+    result_label:
+        TEXT {} |> HOLD result_label {
+            LATEST {
+                store.registration_succeeded |> THEN { store.registration_succeeded.label }
+            }
+        }
+    failure_code:
+        TEXT {} |> HOLD failure_code {
+            LATEST {
+                store.registration_failed |> THEN { store.registration_failed.code }
+                store.authentication_failed |> THEN { store.authentication_failed.code }
+            }
+        }
+    failure_message:
+        TEXT {} |> HOLD failure_message {
+            LATEST {
+                store.registration_failed |> THEN { store.registration_failed.message }
+                store.authentication_failed |> THEN { store.authentication_failed.message }
+            }
+        }
+    failure_retryable:
+        False |> HOLD failure_retryable {
+            LATEST {
+                store.registration_failed |> THEN { store.registration_failed.retryable }
+                store.authentication_failed |> THEN { store.authentication_failed.retryable }
+            }
+        }
+]
+
+effects: [
+    register_passkey: [
+        on: store.register
+        perform: Passkey/register(
+            workspace_id: store.workspace_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.simulation
+        )
+        results: [
+            RegistrationSucceeded: store.registration_succeeded
+            RegistrationCancelled: store.registration_cancelled
+            RegistrationFailed: store.registration_failed
+            DuplicateCredential: store.duplicate_credential
+        ]
+    ]
+    authenticate_passkey: [
+        on: store.authenticate
+        perform: Passkey/authenticate(
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.simulation
+        )
+        results: [
+            AuthenticationSucceeded: store.authentication_succeeded
+            AuthenticationCancelled: store.authentication_cancelled
+            AuthenticationFailed: store.authentication_failed
+        ]
+    ]
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan
+}
+
+fn source_id(machine: &MachinePlan, path: &str) -> SourceId {
+    machine
+        .source_routes
+        .iter()
+        .find(|route| route.path == path)
+        .unwrap_or_else(|| panic!("missing SOURCE route `{path}`"))
+        .source_id
+}
+
+fn state_id(machine: &MachinePlan, label: &str) -> StateId {
+    let id = &machine
+        .debug_map
+        .state_slots
+        .iter()
+        .find(|entry| entry.label == label)
+        .unwrap_or_else(|| panic!("missing state debug label `{label}`"))
+        .id;
+    StateId(id.strip_prefix("state:").unwrap().parse().unwrap())
+}
+
+fn enqueue_item(turn: &Turn) -> boon_persistence::DurableOutboxItem {
+    let [boon_persistence::DurableOutboxChange::Enqueue { item }] = turn.outbox_changes.as_slice()
+    else {
+        panic!("expected one outbox enqueue, got {:?}", turn.outbox_changes);
+    };
+    item.clone()
+}
+
+fn dispatch_item(
+    session: &mut Session,
+    item: &boon_persistence::DurableOutboxItem,
+) -> boon_persistence::DurableOutboxItem {
+    let turn = session.begin_effect_dispatch(item).unwrap();
+    let [
+        boon_persistence::DurableOutboxChange::BeginDispatch {
+            item_id,
+            expected_revision,
+            next_revision,
+            attempt,
+            turn_sequence,
+        },
+    ] = turn.outbox_changes.as_slice()
+    else {
+        panic!("expected one begin-dispatch change");
+    };
+    assert_eq!(*item_id, item.item_id);
+    assert_eq!(*expected_revision, item.revision);
+    let mut dispatched = item.clone();
+    dispatched.revision = *next_revision;
+    dispatched.updated_turn_sequence = *turn_sequence;
+    dispatched.state = boon_persistence::DurableOutboxState::Dispatching { attempt: *attempt };
+    dispatched
+}
+
+fn result_variant(
+    tag: &str,
+    fields: impl IntoIterator<Item = (&'static str, boon_persistence::StoredValue)>,
+) -> boon_persistence::StoredValue {
+    boon_persistence::StoredValue::Variant {
+        tag: tag.to_owned(),
+        fields: fields
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    }
+}
+
+fn apply_register_effect(
+    machine: &MachinePlan,
+    sequence: u64,
+) -> (Session, boon_persistence::DurableOutboxItem) {
+    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let turn = session
+        .apply(SourceEvent {
+            sequence,
+            source: source_id(machine, "store.register"),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    let pending = enqueue_item(&turn);
+    let boon_persistence::StoredValue::Record(intent) = &pending.intent else {
+        panic!("effect intent must be a durable record");
+    };
+    assert_eq!(
+        intent["simulation"],
+        boon_persistence::StoredValue::Variant {
+            tag: "Success".to_owned(),
+            fields: BTreeMap::new(),
+        }
+    );
+    let dispatched = dispatch_item(&mut session, &pending);
+    (session, dispatched)
+}
+
+#[test]
+fn correlated_effect_completion_routes_each_registration_variant_with_typed_fields() {
+    let machine = typed_passkey_effect_machine();
+    let cases = [
+        (
+            result_variant(
+                "RegistrationSucceeded",
+                [
+                    (
+                        "account_id",
+                        boon_persistence::StoredValue::Text("account-success".to_owned()),
+                    ),
+                    (
+                        "credential_id",
+                        boon_persistence::StoredValue::Text("credential-success".to_owned()),
+                    ),
+                    (
+                        "label",
+                        boon_persistence::StoredValue::Text("Primary".to_owned()),
+                    ),
+                ],
+            ),
+            "RegistrationSucceeded",
+            Some((
+                "store.result_account_id",
+                Value::Text("account-success".to_owned()),
+            )),
+        ),
+        (
+            result_variant("RegistrationCancelled", []),
+            "RegistrationCancelled",
+            None,
+        ),
+        (
+            result_variant(
+                "RegistrationFailed",
+                [
+                    (
+                        "code",
+                        boon_persistence::StoredValue::Text("not_allowed".to_owned()),
+                    ),
+                    (
+                        "message",
+                        boon_persistence::StoredValue::Text("Not allowed".to_owned()),
+                    ),
+                    ("retryable", boon_persistence::StoredValue::Bool(true)),
+                ],
+            ),
+            "RegistrationFailed",
+            Some(("store.failure_retryable", Value::Bool(true))),
+        ),
+        (
+            result_variant(
+                "DuplicateCredential",
+                [
+                    (
+                        "account_id",
+                        boon_persistence::StoredValue::Text("account-duplicate".to_owned()),
+                    ),
+                    (
+                        "credential_id",
+                        boon_persistence::StoredValue::Text("credential-duplicate".to_owned()),
+                    ),
+                ],
+            ),
+            "DuplicateCredential",
+            Some((
+                "store.result_credential_id",
+                Value::Text("credential-duplicate".to_owned()),
+            )),
+        ),
+    ];
+
+    for (index, (outcome, expected_tag, typed_field)) in cases.into_iter().enumerate() {
+        let (mut session, item) = apply_register_effect(&machine, index as u64 + 1);
+        let turn = session.complete_effect(&item, outcome.clone()).unwrap();
+        assert!(matches!(
+            turn.outbox_changes.as_slice(),
+            [boon_persistence::DurableOutboxChange::Complete {
+                item_id,
+                expected_revision: 1,
+                next_revision: 2,
+                attempt: 1,
+                outcome: completed,
+                ..
+            }] if *item_id == item.item_id && *completed == outcome
+        ));
+        let snapshot = session.snapshot().unwrap();
+        assert_eq!(
+            snapshot.states[&state_id(&machine, "store.last_result")],
+            Value::Text(expected_tag.to_owned())
+        );
+        if let Some((label, expected)) = typed_field {
+            assert_eq!(snapshot.states[&state_id(&machine, label)], expected);
+        }
+    }
+}
+
+#[test]
+fn correlated_effect_completion_rejects_wrong_variant_and_shape_atomically() {
+    let machine = typed_passkey_effect_machine();
+    let (mut session, item) = apply_register_effect(&machine, 1);
+    let before = session.authority_snapshot().unwrap();
+
+    assert!(
+        session
+            .complete_effect(&item, result_variant("UnknownResult", []))
+            .is_err()
+    );
+    assert_eq!(session.authority_snapshot().unwrap(), before);
+    assert!(
+        session
+            .complete_effect(
+                &item,
+                result_variant(
+                    "RegistrationSucceeded",
+                    [
+                        (
+                            "account_id",
+                            boon_persistence::StoredValue::Text("account-1".to_owned()),
+                        ),
+                        (
+                            "credential_id",
+                            boon_persistence::StoredValue::Text("credential-1".to_owned()),
+                        ),
+                    ],
+                ),
+            )
+            .is_err()
+    );
+    assert_eq!(session.authority_snapshot().unwrap(), before);
+
+    session
+        .complete_effect(&item, result_variant("RegistrationCancelled", []))
+        .unwrap();
+    assert_eq!(
+        session.snapshot().unwrap().states[&state_id(&machine, "store.last_result")],
+        Value::Text("RegistrationCancelled".to_owned())
+    );
+}
+
+#[test]
+fn identical_effect_intents_on_distinct_source_turns_have_distinct_identities() {
+    let machine = typed_passkey_effect_machine();
+    let register = source_id(&machine, "store.register");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let first = enqueue_item(
+        &session
+            .apply(SourceEvent {
+                sequence: 10,
+                source: register,
+                target: None,
+                payload: SourcePayload::default(),
+            })
+            .unwrap(),
+    );
+    let second = enqueue_item(
+        &session
+            .apply(SourceEvent {
+                sequence: 11,
+                source: register,
+                target: None,
+                payload: SourcePayload::default(),
+            })
+            .unwrap(),
+    );
+
+    assert_eq!(first.invocation_id, second.invocation_id);
+    assert_eq!(first.intent, second.intent);
+    assert_ne!(first.created_turn_sequence, second.created_turn_sequence);
+    assert_ne!(first.idempotency_key, second.idempotency_key);
+    assert_ne!(first.item_id, second.item_id);
+}
+
+#[test]
+fn reconciliation_completion_routes_result_after_session_restart() {
+    let machine = typed_passkey_effect_machine();
+    let (mut session, dispatching) = apply_register_effect(&machine, 1);
+    let turn = session.require_effect_reconciliation(&dispatching).unwrap();
+    let [
+        boon_persistence::DurableOutboxChange::RequireReconciliation {
+            item_id,
+            expected_revision,
+            next_revision,
+            attempt,
+            turn_sequence,
+        },
+    ] = turn.outbox_changes.as_slice()
+    else {
+        panic!("expected one reconciliation change");
+    };
+    assert_eq!(*item_id, dispatching.item_id);
+    assert_eq!(*expected_revision, dispatching.revision);
+    let mut reconciling = dispatching;
+    reconciling.revision = *next_revision;
+    reconciling.updated_turn_sequence = *turn_sequence;
+    reconciling.state =
+        boon_persistence::DurableOutboxState::ReconciliationRequired { attempt: *attempt };
+
+    let authority = session.authority_snapshot().unwrap();
+    let mut restored = SessionBuilder::new(machine.clone(), SessionOptions::default())
+        .unwrap()
+        .restore(authority)
+        .build()
+        .unwrap();
+    let outcome = result_variant(
+        "RegistrationSucceeded",
+        [
+            (
+                "account_id",
+                boon_persistence::StoredValue::Text("restored-account".to_owned()),
+            ),
+            (
+                "credential_id",
+                boon_persistence::StoredValue::Text("restored-credential".to_owned()),
+            ),
+            (
+                "label",
+                boon_persistence::StoredValue::Text("Restored".to_owned()),
+            ),
+        ],
+    );
+    let completion = restored.complete_effect(&reconciling, outcome).unwrap();
+    assert!(matches!(
+        completion.outbox_changes.as_slice(),
+        [boon_persistence::DurableOutboxChange::Complete {
+            item_id,
+            expected_revision: 2,
+            next_revision: 3,
+            attempt: 1,
+            ..
+        }] if *item_id == reconciling.item_id
+    ));
+    let snapshot = restored.snapshot().unwrap();
+    assert_eq!(
+        snapshot.states[&state_id(&machine, "store.last_result")],
+        Value::Text("RegistrationSucceeded".to_owned())
+    );
+    assert_eq!(
+        snapshot.states[&state_id(&machine, "store.result_account_id")],
+        Value::Text("restored-account".to_owned())
+    );
+}

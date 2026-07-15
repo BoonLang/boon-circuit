@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::path::{Component, Path};
@@ -443,6 +443,18 @@ const BUILTIN_EFFECT_CONTRACTS: &[BuiltinEffectSpec] = &[
         result_policy: EffectResultPolicy::Acknowledgement,
     },
     BuiltinEffectSpec {
+        host_operation: "Passkey/register",
+        replay: BuiltinEffectReplay::IdempotentBytesKey,
+        barrier: EffectBarrier::BeforeAndAfter,
+        result_policy: EffectResultPolicy::CorrelatedSource,
+    },
+    BuiltinEffectSpec {
+        host_operation: "Passkey/authenticate",
+        replay: BuiltinEffectReplay::IdempotentBytesKey,
+        barrier: EffectBarrier::BeforeAndAfter,
+        result_policy: EffectResultPolicy::CorrelatedSource,
+    },
+    BuiltinEffectSpec {
         host_operation: "File/write_text",
         replay: BuiltinEffectReplay::NonReplayable,
         barrier: EffectBarrier::BeforeAndAfter,
@@ -486,6 +498,128 @@ pub fn builtin_effect_contract(host_operation: &str) -> Result<Option<EffectCont
         result_policy: spec.result_policy,
     };
     Ok(Some(contract))
+}
+
+pub fn builtin_effect_outbox_schema(
+    host_operation: &str,
+) -> Result<Option<EffectOutboxSchema>, PlanError> {
+    let (intent_type, result_type) = match host_operation {
+        "File/write_bytes" => (
+            DataTypePlan::Record {
+                fields: vec![
+                    data_type_field("bytes", DataTypePlan::Bytes { fixed_len: None }),
+                    data_type_field("path", DataTypePlan::Text),
+                ],
+                open: false,
+            },
+            DataTypePlan::Text,
+        ),
+        "Passkey/register" => (
+            DataTypePlan::Record {
+                fields: vec![
+                    data_type_field("workspace_id", DataTypePlan::Text),
+                    data_type_field("account_id", DataTypePlan::Text),
+                    data_type_field("credential_count", DataTypePlan::Number),
+                    data_type_field("simulation", passkey_simulation_data_type()),
+                ],
+                open: false,
+            },
+            DataTypePlan::Variant {
+                variants: vec![
+                    data_variant(
+                        "RegistrationSucceeded",
+                        vec![
+                            data_type_field("account_id", DataTypePlan::Text),
+                            data_type_field("credential_id", DataTypePlan::Text),
+                            data_type_field("label", DataTypePlan::Text),
+                        ],
+                    ),
+                    data_variant("RegistrationCancelled", Vec::new()),
+                    data_variant(
+                        "RegistrationFailed",
+                        vec![
+                            data_type_field("code", DataTypePlan::Text),
+                            data_type_field("message", DataTypePlan::Text),
+                            data_type_field("retryable", DataTypePlan::Bool),
+                        ],
+                    ),
+                    data_variant(
+                        "DuplicateCredential",
+                        vec![
+                            data_type_field("account_id", DataTypePlan::Text),
+                            data_type_field("credential_id", DataTypePlan::Text),
+                        ],
+                    ),
+                ],
+            },
+        ),
+        "Passkey/authenticate" => (
+            DataTypePlan::Record {
+                fields: vec![
+                    data_type_field("account_id", DataTypePlan::Text),
+                    data_type_field("credential_count", DataTypePlan::Number),
+                    data_type_field("simulation", passkey_simulation_data_type()),
+                ],
+                open: false,
+            },
+            DataTypePlan::Variant {
+                variants: vec![
+                    data_variant(
+                        "AuthenticationSucceeded",
+                        vec![
+                            data_type_field("account_id", DataTypePlan::Text),
+                            data_type_field("credential_id", DataTypePlan::Text),
+                        ],
+                    ),
+                    data_variant("AuthenticationCancelled", Vec::new()),
+                    data_variant(
+                        "AuthenticationFailed",
+                        vec![
+                            data_type_field("code", DataTypePlan::Text),
+                            data_type_field("message", DataTypePlan::Text),
+                            data_type_field("retryable", DataTypePlan::Bool),
+                        ],
+                    ),
+                ],
+            },
+        ),
+        _ => return Ok(None),
+    };
+    let contract = builtin_effect_contract(host_operation)?.ok_or_else(|| {
+        PlanError::new(format!(
+            "effect outbox schema `{host_operation}` has no built-in contract"
+        ))
+    })?;
+    let EffectReplay::Idempotent { key_type } = contract.replay else {
+        return Err(PlanError::new(format!(
+            "effect outbox schema `{host_operation}` is not idempotent"
+        )));
+    };
+    EffectOutboxSchema::new(contract.effect_id, intent_type, key_type, result_type).map(Some)
+}
+
+fn data_type_field(name: &str, data_type: DataTypePlan) -> DataTypeFieldPlan {
+    DataTypeFieldPlan {
+        name: name.to_owned(),
+        data_type,
+    }
+}
+
+fn data_variant(tag: &str, fields: Vec<DataTypeFieldPlan>) -> DataVariantPlan {
+    DataVariantPlan {
+        tag: tag.to_owned(),
+        fields,
+        open: false,
+    }
+}
+
+fn passkey_simulation_data_type() -> DataTypePlan {
+    DataTypePlan::Variant {
+        variants: ["Success", "Cancel", "Failure", "Duplicate"]
+            .into_iter()
+            .map(|tag| data_variant(tag, Vec::new()))
+            .collect(),
+    }
 }
 
 fn data_type_contains_unknown(data_type: &DataTypePlan) -> bool {
@@ -1986,6 +2120,7 @@ pub struct SourcePayloadDescriptor {
 pub enum SourcePayloadValueType {
     Bytes,
     Bool,
+    Number,
     Text,
 }
 
@@ -2283,22 +2418,50 @@ pub struct PlanOp {
 pub struct EffectInvocationPlan {
     pub invocation_id: EffectInvocationId,
     pub effect_id: EffectId,
-    pub intent_inputs: Vec<ValueRef>,
+    pub intent_fields: Vec<EffectIntentFieldPlan>,
     pub idempotency_key: EffectIdempotencyKeyPlan,
     pub result: EffectResultRoute,
     pub barrier: EffectBarrier,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectIntentFieldPlan {
+    pub name: String,
+    pub input: ValueRef,
+    pub data_type: DataTypePlan,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectIdempotencyKeyPlan {
-    CanonicalIntentSha256,
+    InvocationTurnIntentSha256,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EffectResultRoute {
-    pub target: ValueRef,
-    pub policy: EffectResultPolicy,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectResultRoute {
+    Target {
+        target: ValueRef,
+        policy: EffectResultPolicy,
+    },
+    CorrelatedSources {
+        variants: Vec<EffectResultVariantRoute>,
+    },
+}
+
+impl EffectResultRoute {
+    pub fn policy(&self) -> EffectResultPolicy {
+        match self {
+            Self::Target { policy, .. } => *policy,
+            Self::CorrelatedSources { .. } => EffectResultPolicy::CorrelatedSource,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectResultVariantRoute {
+    pub tag: String,
+    pub source_id: SourceId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2687,6 +2850,7 @@ pub enum PlanExpressionKind {
     BytesWriteSigned,
     FileReadBytes,
     FileWriteBytes,
+    HostEffect,
     TextToBytes,
     BytesToText,
     BytesConcat,
@@ -3421,6 +3585,14 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                 contract.host_operation
             ));
         }
+        if let Ok(Some(expected)) = builtin_effect_outbox_schema(&contract.host_operation)
+            && expected != *outbox
+        {
+            return Some(format!(
+                "outbox schema for `{}` differs from the centralized host schema",
+                contract.host_operation
+            ));
+        }
     }
     for contract in &plan.effects {
         if matches!(contract.replay, EffectReplay::Idempotent { .. })
@@ -3459,7 +3631,10 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
         else {
             continue;
         };
-        let consequential = matches!(expression_kind, PlanExpressionKind::FileWriteBytes);
+        let consequential = matches!(
+            expression_kind,
+            PlanExpressionKind::FileWriteBytes | PlanExpressionKind::HostEffect
+        );
         if consequential != effect.is_some() {
             return Some(format!(
                 "effectful update op {} has inconsistent invocation metadata",
@@ -3485,15 +3660,28 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                 invocation.invocation_id
             ));
         };
-        if invocation.intent_inputs != *ordered_inputs
-            || op.output.as_ref() != Some(&invocation.result.target)
-            || invocation.result.policy != contract.result_policy
+        let Some(outbox) = plan
+            .persistence
+            .effect_outbox
+            .iter()
+            .find(|schema| schema.effect_id == invocation.effect_id)
+        else {
+            return Some(format!(
+                "effect invocation {} has no outbox schema",
+                invocation.invocation_id
+            ));
+        };
+        let intent_inputs = invocation
+            .intent_fields
+            .iter()
+            .map(|field| field.input.clone())
+            .collect::<Vec<_>>();
+        if intent_inputs != *ordered_inputs
+            || !effect_intent_fields_match_schema(&invocation.intent_fields, &outbox.intent_type)
+            || !effect_result_route_matches(plan, op, &invocation.result, &outbox.result_type)
+            || invocation.result.policy() != contract.result_policy
             || invocation.barrier != contract.barrier
-            || !plan
-                .persistence
-                .effect_outbox
-                .iter()
-                .any(|schema| schema.effect_id == invocation.effect_id)
+            || invocation.idempotency_key != EffectIdempotencyKeyPlan::InvocationTurnIntentSha256
         {
             return Some(format!(
                 "effect invocation {} disagrees with its update, contract, or outbox schema",
@@ -3502,6 +3690,112 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
         }
     }
     None
+}
+
+fn effect_intent_fields_match_schema(
+    fields: &[EffectIntentFieldPlan],
+    intent_type: &DataTypePlan,
+) -> bool {
+    let DataTypePlan::Record {
+        fields: schema_fields,
+        open: false,
+    } = intent_type
+    else {
+        return false;
+    };
+    fields.windows(2).all(|pair| pair[0].name < pair[1].name)
+        && fields
+            .iter()
+            .map(|field| (&field.name, &field.data_type))
+            .eq(schema_fields
+                .iter()
+                .map(|field| (&field.name, &field.data_type)))
+}
+
+fn effect_result_route_matches(
+    plan: &MachinePlan,
+    op: &PlanOp,
+    route: &EffectResultRoute,
+    result_type: &DataTypePlan,
+) -> bool {
+    match route {
+        EffectResultRoute::Target { target, policy } => {
+            *policy != EffectResultPolicy::CorrelatedSource && op.output.as_ref() == Some(target)
+        }
+        EffectResultRoute::CorrelatedSources { variants } => {
+            let DataTypePlan::Variant {
+                variants: result_variants,
+            } = result_type
+            else {
+                return false;
+            };
+            op.output.is_none()
+                && variants.windows(2).all(|pair| pair[0].tag < pair[1].tag)
+                && variants
+                    .iter()
+                    .map(|route| route.tag.as_str())
+                    .eq(result_variants.iter().map(|variant| variant.tag.as_str()))
+                && variants
+                    .iter()
+                    .zip(result_variants)
+                    .all(|(route, variant)| {
+                        plan.source_routes
+                            .iter()
+                            .find(|source| source.source_id == route.source_id)
+                            .is_some_and(|source| source_payload_matches_variant(source, variant))
+                    })
+        }
+    }
+}
+
+fn source_payload_matches_variant(source: &SourceRoute, variant: &DataVariantPlan) -> bool {
+    let expected = variant
+        .fields
+        .iter()
+        .map(|field| {
+            Some((
+                source_payload_field_from_schema_name(&field.name),
+                source_payload_type_from_data_type(&field.data_type)?,
+            ))
+        })
+        .collect::<Option<BTreeMap<_, _>>>();
+    let Some(expected) = expected else {
+        return false;
+    };
+    let actual = source
+        .payload_schema
+        .typed_fields
+        .iter()
+        .map(|field| (field.field.clone(), field.value_type))
+        .collect::<BTreeMap<_, _>>();
+    actual == expected
+        && source
+            .payload_schema
+            .fields
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            == expected.keys().cloned().collect()
+}
+
+fn source_payload_field_from_schema_name(name: &str) -> SourcePayloadField {
+    match name {
+        "address" => SourcePayloadField::Address,
+        "bytes" => SourcePayloadField::Bytes,
+        "key" => SourcePayloadField::Key,
+        "text" => SourcePayloadField::Text,
+        _ => SourcePayloadField::Named(name.to_owned()),
+    }
+}
+
+fn source_payload_type_from_data_type(data_type: &DataTypePlan) -> Option<SourcePayloadValueType> {
+    match data_type {
+        DataTypePlan::Bytes { .. } => Some(SourcePayloadValueType::Bytes),
+        DataTypePlan::Bool => Some(SourcePayloadValueType::Bool),
+        DataTypePlan::Number | DataTypePlan::Byte => Some(SourcePayloadValueType::Number),
+        DataTypePlan::Text => Some(SourcePayloadValueType::Text),
+        _ => None,
+    }
 }
 
 fn required_effect_operations(plan: &MachinePlan) -> BTreeSet<&'static str> {
@@ -4204,14 +4498,23 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
         | PlanOpKind::DependencyEdge => true,
         PlanOpKind::UpdateBranch {
             expression_kind,
-            ordered_inputs: _,
+            ordered_inputs,
             source_payload_field,
             update_constant_id,
             source_guard,
-            effect: _,
+            effect,
         } => {
             if op.unresolved_executable_ref_count != 0 {
                 return false;
+            }
+            if *expression_kind == PlanExpressionKind::HostEffect {
+                return effect.is_some()
+                    && op.output.is_none()
+                    && source_payload_field.is_none()
+                    && update_constant_id.is_none()
+                    && source_guard.is_none()
+                    && update_branch_source_ids(op).len() == 1
+                    && !ordered_inputs.is_empty();
             }
             if op.indexed {
                 return cpu_plan_executor_supports_indexed_update_op(
@@ -4512,6 +4815,16 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && update_branch_source_ids(op).len() == 1
                         && root_match_value_const_inputs_supported(scalar_slots, constants, op)
                 }
+                PlanExpressionKind::MatchTextIsEmptyConst => {
+                    source_payload_field.is_none()
+                        && update_constant_id.is_none()
+                        && update_branch_source_ids(op).len() == 1
+                        && root_match_text_is_empty_const_inputs_supported(
+                            scalar_slots,
+                            constants,
+                            op,
+                        )
+                }
                 PlanExpressionKind::NumberInfix => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
@@ -4520,9 +4833,9 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         && root_number_infix_inputs_supported(scalar_slots, constants, op)
                 }
                 PlanExpressionKind::ProjectTime
-                | PlanExpressionKind::MatchTextIsEmptyConst
                 | PlanExpressionKind::MatchInfixConst
                 | PlanExpressionKind::ListFindValue
+                | PlanExpressionKind::HostEffect
                 | PlanExpressionKind::Unknown => false,
             }
         }
@@ -5051,6 +5364,7 @@ fn cpu_plan_executor_supports_indexed_update_op(
         | PlanExpressionKind::MatchValueConst
         | PlanExpressionKind::MatchInfixConst
         | PlanExpressionKind::ListFindValue
+        | PlanExpressionKind::HostEffect
         | PlanExpressionKind::Unknown => false,
     }
 }
@@ -6193,6 +6507,7 @@ fn source_payload_value_type_matches_plan_type(
     match payload_type {
         SourcePayloadValueType::Bytes => matches!(plan_type, PlanValueType::Bytes { .. }),
         SourcePayloadValueType::Bool => plan_type == &PlanValueType::Bool,
+        SourcePayloadValueType::Number => plan_type == &PlanValueType::Number,
         SourcePayloadValueType::Text => plan_type == &PlanValueType::Text,
     }
 }
@@ -6391,16 +6706,192 @@ fn root_match_value_const_inputs_supported(
     let [input, arm_operands @ ..] = ordered_inputs.as_slice() else {
         return false;
     };
-    if arm_operands.is_empty() || arm_operands.len() % 2 != 0 {
-        return false;
-    }
     if !match_const_input_ref_supported(scalar_slots, op, input) {
         return false;
     }
-    arm_operands.chunks_exact(2).all(|pair| {
-        match_const_pattern_ref_supported(constants, &pair[0])
-            && root_update_value_ref_supported(scalar_slots, constants, op, output_type, &pair[1])
-    })
+    root_encoded_match_arms_supported(scalar_slots, constants, op, output_type, arm_operands)
+}
+
+fn root_match_text_is_empty_const_inputs_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+) -> bool {
+    let Some(output_type) = output_state_type(scalar_slots, op) else {
+        return false;
+    };
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        return false;
+    };
+    let [input, arm_operands @ ..] = ordered_inputs.as_slice() else {
+        return false;
+    };
+    text_operand_ref_supported(scalar_slots, constants, input, true)
+        && root_encoded_match_arms_supported(scalar_slots, constants, op, output_type, arm_operands)
+}
+
+fn root_encoded_match_arms_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+    output_type: &PlanValueType,
+    inputs: &[ValueRef],
+) -> bool {
+    let mut cursor = 0usize;
+    let mut arm_count = 0usize;
+    while cursor < inputs.len() {
+        if !match_const_pattern_ref_supported(constants, &inputs[cursor]) {
+            return false;
+        }
+        cursor += 1;
+        if !root_encoded_update_supported(
+            scalar_slots,
+            constants,
+            op,
+            output_type,
+            inputs,
+            &mut cursor,
+        ) {
+            return false;
+        }
+        arm_count += 1;
+    }
+    arm_count > 0
+}
+
+fn root_encoded_update_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+    output_type: &PlanValueType,
+    inputs: &[ValueRef],
+    cursor: &mut usize,
+) -> bool {
+    let Some(ValueRef::Constant(tag_id)) = inputs.get(*cursor) else {
+        return false;
+    };
+    let Some(tag) = plan_text_constant_value(constants, *tag_id) else {
+        return false;
+    };
+    *cursor += 1;
+    match tag {
+        "ref" => {
+            let Some(value) = inputs.get(*cursor) else {
+                return false;
+            };
+            *cursor += 1;
+            root_update_value_ref_supported(scalar_slots, constants, op, output_type, value)
+        }
+        "number_infix" => {
+            let Some(operands) = inputs.get(*cursor..*cursor + 3) else {
+                return false;
+            };
+            *cursor += 3;
+            output_type == &PlanValueType::Number
+                && root_number_operand_supported(scalar_slots, constants, op, &operands[0])
+                && plan_text_constant_value_ref(constants, &operands[1])
+                    .is_some_and(|operator| matches!(operator, "+" | "-" | "*" | "/" | "%"))
+                && root_number_operand_supported(scalar_slots, constants, op, &operands[2])
+        }
+        "match_const" => root_encoded_nested_match_supported(
+            scalar_slots,
+            constants,
+            op,
+            output_type,
+            inputs,
+            cursor,
+            false,
+        ),
+        "match_infix_const" => root_encoded_nested_match_supported(
+            scalar_slots,
+            constants,
+            op,
+            output_type,
+            inputs,
+            cursor,
+            true,
+        ),
+        _ => false,
+    }
+}
+
+fn root_encoded_nested_match_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+    output_type: &PlanValueType,
+    inputs: &[ValueRef],
+    cursor: &mut usize,
+    infix: bool,
+) -> bool {
+    let header_len = if infix { 4 } else { 2 };
+    let Some(header) = inputs.get(*cursor..*cursor + header_len) else {
+        return false;
+    };
+    let valid_header = if infix {
+        root_number_operand_supported(scalar_slots, constants, op, &header[0])
+            && plan_text_constant_value_ref(constants, &header[1])
+                .is_some_and(|operator| matches!(operator, "==" | "!=" | ">" | ">=" | "<" | "<="))
+            && root_number_operand_supported(scalar_slots, constants, op, &header[2])
+    } else {
+        match_const_input_ref_supported(scalar_slots, op, &header[0])
+    };
+    let count_ref = &header[header_len - 1];
+    let ValueRef::Constant(count_id) = count_ref else {
+        return false;
+    };
+    let Some(arm_count) = plan_number_constant_u64(constants, *count_id)
+        .and_then(|count| usize::try_from(count).ok())
+    else {
+        return false;
+    };
+    if !valid_header || arm_count == 0 {
+        return false;
+    }
+    *cursor += header_len;
+    for _ in 0..arm_count {
+        let Some(pattern) = inputs.get(*cursor) else {
+            return false;
+        };
+        if !match_const_pattern_ref_supported(constants, pattern) {
+            return false;
+        }
+        *cursor += 1;
+        if !root_encoded_update_supported(scalar_slots, constants, op, output_type, inputs, cursor)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn root_number_operand_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+    value: &ValueRef,
+) -> bool {
+    match value {
+        ValueRef::State(state) => {
+            op.inputs.contains(value)
+                && plan_value_type_for_state_slots(scalar_slots, *state)
+                    == Some(&PlanValueType::Number)
+        }
+        ValueRef::Constant(id) => plan_constant_by_id(constants, *id)
+            .is_some_and(|constant| matches!(constant.value, PlanConstantValue::Number { .. })),
+        ValueRef::Field(_) | ValueRef::SourcePayload { .. } => op.inputs.contains(value),
+        ValueRef::Source(_) | ValueRef::List(_) => false,
+    }
+}
+
+fn plan_text_constant_value_ref<'a>(
+    constants: &'a [PlanConstant],
+    value: &ValueRef,
+) -> Option<&'a str> {
+    let ValueRef::Constant(id) = value else {
+        return None;
+    };
+    plan_text_constant_value(constants, *id)
 }
 
 fn root_update_value_ref_supported(

@@ -32,11 +32,11 @@ store: [
 }
 use boon_plan::{
     DataTypePlan, DocumentExprId, DocumentExprOp, DocumentMaterializationSource, DocumentRead,
-    DocumentValueClass, EffectBarrier, EffectReplay, MemoryId, MemoryKind, MigrationExpressionPlan,
-    MigrationPredecessorBinding, MigrationTransferKindPlan, MigrationTransformPlan,
-    OutputContractKind, OutputDemandPolicy, OutputValueRef, PLAN_MAJOR_VERSION,
-    PlanDerivedExpression, PlanExpressionKind, PlanOpKind, PlanRowExpression, RootOutputDemand,
-    ValueRef, plan_binary, plan_sha256, verify_plan,
+    DocumentValueClass, EffectBarrier, EffectReplay, EffectResultPolicy, EffectResultRoute,
+    MemoryId, MemoryKind, MigrationExpressionPlan, MigrationPredecessorBinding,
+    MigrationTransferKindPlan, MigrationTransformPlan, OutputContractKind, OutputDemandPolicy,
+    OutputValueRef, PLAN_MAJOR_VERSION, PlanDerivedExpression, PlanExpressionKind, PlanOpKind,
+    PlanRowExpression, RootOutputDemand, ValueRef, plan_binary, plan_sha256, verify_plan,
 };
 
 fn example_path(path: &str) -> PathBuf {
@@ -388,7 +388,14 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
         })
         .expect("write effect invocation");
     assert_eq!(invocation.effect_id, contract.effect_id);
-    assert_eq!(invocation.intent_inputs.len(), 2);
+    assert_eq!(
+        invocation
+            .intent_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["bytes", "path"]
+    );
     assert!(
         verify_plan(&write.plan)
             .unwrap()
@@ -396,6 +403,268 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
             .iter()
             .all(|check| check.pass),
         "compiled transactional write plan must verify"
+    );
+}
+
+fn typed_passkey_effect_source() -> &'static str {
+    r#"
+store: [
+    register: SOURCE
+    authenticate: SOURCE
+    registration_succeeded: SOURCE
+    registration_cancelled: SOURCE
+    registration_failed: SOURCE
+    duplicate_credential: SOURCE
+    authentication_succeeded: SOURCE
+    authentication_cancelled: SOURCE
+    authentication_failed: SOURCE
+    simulate_cancel: SOURCE
+    simulate_failure: SOURCE
+    simulate_duplicate: SOURCE
+    workspace_id: TEXT { workspace-1 } |> HOLD workspace_id
+    account_id: TEXT { account-1 } |> HOLD account_id
+    credential_count: 1 |> HOLD credential_count
+    simulation:
+        Success |> HOLD simulation {
+            LATEST {
+                store.simulate_cancel |> THEN { Cancel }
+                store.simulate_failure |> THEN { Failure }
+                store.simulate_duplicate |> THEN { Duplicate }
+            }
+        }
+]
+
+effects: [
+    register_passkey: [
+        on: store.register
+        perform: Passkey/register(
+            workspace_id: store.workspace_id
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.simulation
+        )
+        results: [
+            RegistrationSucceeded: store.registration_succeeded
+            RegistrationCancelled: store.registration_cancelled
+            RegistrationFailed: store.registration_failed
+            DuplicateCredential: store.duplicate_credential
+        ]
+    ]
+    authenticate_passkey: [
+        on: store.authenticate
+        perform: Passkey/authenticate(
+            account_id: store.account_id
+            credential_count: store.credential_count
+            simulation: store.simulation
+        )
+        results: [
+            AuthenticationSucceeded: store.authentication_succeeded
+            AuthenticationCancelled: store.authentication_cancelled
+            AuthenticationFailed: store.authentication_failed
+        ]
+    ]
+]
+"#
+}
+
+#[test]
+fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes() {
+    let compiled = compile_source_text_to_machine_plan(
+        "typed-passkey-effects.bn",
+        typed_passkey_effect_source(),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    for operation in ["Passkey/register", "Passkey/authenticate"] {
+        let contract = compiled
+            .plan
+            .effects
+            .iter()
+            .find(|contract| contract.host_operation == operation)
+            .unwrap();
+        assert_eq!(contract.result_policy, EffectResultPolicy::CorrelatedSource);
+        assert_eq!(contract.barrier, EffectBarrier::BeforeAndAfter);
+        assert!(
+            compiled
+                .plan
+                .persistence
+                .effect_outbox
+                .iter()
+                .any(|schema| schema.effect_id == contract.effect_id)
+        );
+    }
+    let registration = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::HostEffect,
+                effect: Some(effect),
+                ..
+            } if compiled.plan.effects.iter().any(|contract| {
+                contract.effect_id == effect.effect_id
+                    && contract.host_operation == "Passkey/register"
+            }) =>
+            {
+                Some(effect)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        registration
+            .intent_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "account_id",
+            "credential_count",
+            "simulation",
+            "workspace_id"
+        ]
+    );
+    let simulation = registration
+        .intent_fields
+        .iter()
+        .find(|field| field.name == "simulation")
+        .unwrap();
+    let DataTypePlan::Variant { variants } = &simulation.data_type else {
+        panic!("simulation intent must have a variant schema");
+    };
+    assert_eq!(
+        variants
+            .iter()
+            .map(|variant| variant.tag.as_str())
+            .collect::<Vec<_>>(),
+        ["Cancel", "Duplicate", "Failure", "Success"]
+    );
+    let EffectResultRoute::CorrelatedSources { variants } = &registration.result else {
+        panic!("registration must route correlated variants");
+    };
+    assert_eq!(
+        variants
+            .iter()
+            .map(|route| route.tag.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "DuplicateCredential",
+            "RegistrationCancelled",
+            "RegistrationFailed",
+            "RegistrationSucceeded"
+        ]
+    );
+    let verification = verify_plan(&compiled.plan).unwrap();
+    assert!(
+        verification.checks.iter().all(|check| check.pass),
+        "verification failures: {:?}",
+        verification
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn function_call_match_input_in_hold_update_is_statically_scheduled() {
+    let compiled = compile_source_text_to_machine_plan(
+        "call-derived-match-input.bn",
+        r#"
+store: [
+    lifecycle: [started: SOURCE]
+    workspace_id:
+        Text/empty() |> HOLD workspace_id {
+            store.lifecycle.started |> THEN {
+                Text/is_empty(workspace_id) |> WHEN {
+                    True => store.lifecycle.started.workspace_id
+                    False => workspace_id
+                }
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let branch = compiled
+        .ir
+        .update_branches
+        .iter()
+        .find(|branch| {
+            branch.target == "store.workspace_id" && branch.source == "store.lifecycle.started"
+        })
+        .unwrap();
+    let boon_ir::UpdateExpression::MatchTextIsEmptyConst { input, arms } = &branch.expression
+    else {
+        panic!("unexpected update expression: {:?}", branch.expression);
+    };
+    assert_eq!(input, "store.workspace_id");
+    assert!(arms.iter().any(|arm| {
+        arm.pattern == "True"
+            && matches!(
+                &arm.output,
+                boon_ir::UpdateValueExpression::ReadPath { path }
+                    if path == "store.lifecycle.started.workspace_id"
+            )
+    }));
+    assert!(arms.iter().any(|arm| {
+        arm.pattern == "False"
+            && matches!(
+                &arm.output,
+                boon_ir::UpdateValueExpression::ReadPath { path }
+                    if path == "store.workspace_id"
+            )
+    }));
+
+    let op = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| {
+            matches!(
+                op.kind,
+                PlanOpKind::UpdateBranch {
+                    expression_kind: PlanExpressionKind::MatchTextIsEmptyConst,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let PlanOpKind::UpdateBranch { ordered_inputs, .. } = &op.kind else {
+        unreachable!();
+    };
+    assert!(
+        ordered_inputs
+            .iter()
+            .any(|input| matches!(input, ValueRef::State(_)))
+    );
+    assert!(ordered_inputs.iter().any(|input| {
+        matches!(
+            input,
+            ValueRef::SourcePayload {
+                field: boon_plan::SourcePayloadField::Named(name),
+                ..
+            } if name == "workspace_id"
+        )
+    }));
+    assert!(
+        compiled.plan.capability_summary.cpu_plan_executor_complete,
+        "call-derived match op must be CPU-executable: {op:?}"
+    );
+    let verification = verify_plan(&compiled.plan).unwrap();
+    assert!(
+        verification.checks.iter().all(|check| check.pass),
+        "verification failures: {:?}",
+        verification
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .collect::<Vec<_>>()
     );
 }
 

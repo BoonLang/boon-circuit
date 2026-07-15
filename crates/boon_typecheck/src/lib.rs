@@ -376,6 +376,38 @@ pub struct SourcePayloadShapeField {
     pub ty: Type,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectTable {
+    pub declarations: Vec<HostEffectDeclaration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectDeclaration {
+    pub name: String,
+    pub line: usize,
+    pub trigger_source: String,
+    pub trigger_expr_id: usize,
+    pub operation: String,
+    pub perform_expr_id: usize,
+    pub intent_type: Type,
+    pub intent_fields: Vec<HostEffectIntentField>,
+    pub result_type: Type,
+    pub result_routes: Vec<HostEffectResultRoute>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectIntentField {
+    pub name: String,
+    pub value_expr_id: usize,
+    pub value_type: Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectResultRoute {
+    pub variant: String,
+    pub source_path: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TypeCheckReport {
     pub expression_count: usize,
@@ -387,6 +419,8 @@ pub struct TypeCheckReport {
     pub builtin_signature_coverage: Vec<String>,
     pub source_payload_shape_coverage: Vec<String>,
     pub source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
+    #[serde(default)]
+    pub host_effect_table: HostEffectTable,
     pub full_document_typecheck_coverage: bool,
     pub list_map_binding_count_runtime_value: usize,
     pub list_map_binding_count_render_slot_materialization: usize,
@@ -418,6 +452,419 @@ impl TypeCheckReport {
             .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
             || self.render_slot_failure_count > 0
     }
+}
+
+#[derive(Clone)]
+struct HostEffectSignature {
+    intent_type: Type,
+    intent_fields: Vec<(String, Type)>,
+    result_type: Type,
+}
+
+fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
+    let text = || Type::Text;
+    let number = || Type::Number;
+    let boolean = || true_false_type();
+    let tagged = |tag: &str, fields: Vec<(&str, Type)>| Variant::Tagged {
+        tag: tag.to_owned(),
+        fields: ObjectShape::from_ordered_fields(
+            fields.into_iter().map(|(name, ty)| (name.to_owned(), ty)),
+            false,
+        ),
+    };
+    let (intent_fields, variants) = match operation {
+        "Passkey/register" => (
+            vec![
+                ("workspace_id".to_owned(), text()),
+                ("account_id".to_owned(), text()),
+                ("credential_count".to_owned(), number()),
+                ("simulation".to_owned(), passkey_simulation_type()),
+            ],
+            vec![
+                tagged(
+                    "RegistrationSucceeded",
+                    vec![
+                        ("account_id", text()),
+                        ("credential_id", text()),
+                        ("label", text()),
+                    ],
+                ),
+                tagged("RegistrationCancelled", Vec::new()),
+                tagged(
+                    "RegistrationFailed",
+                    vec![
+                        ("code", text()),
+                        ("message", text()),
+                        ("retryable", boolean()),
+                    ],
+                ),
+                tagged(
+                    "DuplicateCredential",
+                    vec![("account_id", text()), ("credential_id", text())],
+                ),
+            ],
+        ),
+        "Passkey/authenticate" => (
+            vec![
+                ("account_id".to_owned(), text()),
+                ("credential_count".to_owned(), number()),
+                ("simulation".to_owned(), passkey_simulation_type()),
+            ],
+            vec![
+                tagged(
+                    "AuthenticationSucceeded",
+                    vec![("account_id", text()), ("credential_id", text())],
+                ),
+                tagged("AuthenticationCancelled", Vec::new()),
+                tagged(
+                    "AuthenticationFailed",
+                    vec![
+                        ("code", text()),
+                        ("message", text()),
+                        ("retryable", boolean()),
+                    ],
+                ),
+            ],
+        ),
+        _ => return None,
+    };
+    Some(HostEffectSignature {
+        intent_type: Type::Object(ObjectShape::from_ordered_fields(
+            intent_fields.iter().cloned(),
+            false,
+        )),
+        intent_fields,
+        result_type: Type::VariantSet(variants),
+    })
+}
+
+fn passkey_simulation_type() -> Type {
+    Type::VariantSet(
+        ["Success", "Cancel", "Failure", "Duplicate"]
+            .into_iter()
+            .map(|tag| Variant::Tag(tag.to_owned()))
+            .collect(),
+    )
+}
+
+fn host_effect_table(
+    program: &ParsedProgram,
+    source_lookup: &SourcePayloadPathLookup,
+) -> (HostEffectTable, Vec<TypeDiagnostic>) {
+    let mut table = HostEffectTable::default();
+    let mut diagnostics = Vec::new();
+    let effects = program
+        .ast
+        .statements
+        .iter()
+        .filter(|statement| statement_field_name(statement) == Some("effects"))
+        .collect::<Vec<_>>();
+    if effects.len() > 1 {
+        diagnostics.push(diagnostic_for_statement(
+            effects.get(1).copied(),
+            "top-level `effects` may be declared only once".to_owned(),
+        ));
+    }
+    let Some(effects) = effects.first().copied() else {
+        return (table, diagnostics);
+    };
+    let mut declaration_names = BTreeSet::new();
+    for declaration in &effects.children {
+        let Some(name) = statement_field_name(declaration).map(str::to_owned) else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(declaration),
+                "each `effects` entry must be a named record".to_owned(),
+            ));
+            continue;
+        };
+        let diagnostic_start = diagnostics.len();
+        if !declaration_names.insert(name.clone()) {
+            diagnostics.push(diagnostic_for_statement(
+                Some(declaration),
+                format!("effect declaration `{name}` is duplicated"),
+            ));
+        }
+        let mut members = BTreeMap::<&str, &AstStatement>::new();
+        for member in &declaration.children {
+            let Some(member_name) = statement_field_name(member) else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(member),
+                    format!("effect declaration `{name}` contains an unnamed member"),
+                ));
+                continue;
+            };
+            if !matches!(member_name, "on" | "perform" | "results") {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(member),
+                    format!(
+                        "effect declaration `{name}` has unsupported member `{member_name}`; expected `on`, `perform`, or `results`"
+                    ),
+                ));
+                continue;
+            }
+            if members.insert(member_name, member).is_some() {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(member),
+                    format!("effect declaration `{name}` repeats `{member_name}`"),
+                ));
+            }
+        }
+        for required in ["on", "perform", "results"] {
+            if !members.contains_key(required) {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(declaration),
+                    format!("effect declaration `{name}` is missing `{required}`"),
+                ));
+            }
+        }
+        let Some(on) = members.get("on").copied() else {
+            continue;
+        };
+        let Some(trigger_expr_id) = on.expr else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(on),
+                format!("effect declaration `{name}` has no `on` source"),
+            ));
+            continue;
+        };
+        let Some(trigger_source) =
+            effect_source_path(program, trigger_expr_id, source_lookup, false)
+        else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(on),
+                format!("effect declaration `{name}` `on` must resolve to one SOURCE"),
+            ));
+            continue;
+        };
+        let Some(perform) = members.get("perform").copied() else {
+            continue;
+        };
+        let Some(perform_expr_id) = perform.expr else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(perform),
+                format!("effect declaration `{name}` has no `perform` call"),
+            ));
+            continue;
+        };
+        let Some(AstExpr {
+            kind: AstExprKind::Call { function, args },
+            ..
+        }) = program.expressions.get(perform_expr_id)
+        else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(perform),
+                format!("effect declaration `{name}` `perform` must be a direct host call"),
+            ));
+            continue;
+        };
+        let Some(signature) = host_effect_signature(function) else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(perform),
+                format!("effect declaration `{name}` uses unknown typed host effect `{function}`"),
+            ));
+            continue;
+        };
+        let mut args_by_name = BTreeMap::new();
+        for arg in args {
+            let Some(arg_name) = arg.name.as_deref() else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(perform),
+                    format!("effect declaration `{name}` requires named intent fields"),
+                ));
+                continue;
+            };
+            if args_by_name.insert(arg_name, arg.value).is_some() {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(perform),
+                    format!("effect declaration `{name}` repeats intent field `{arg_name}`"),
+                ));
+            }
+        }
+        for arg in &perform.children {
+            let Some(arg_name) = statement_field_name(arg) else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(arg),
+                    format!("effect declaration `{name}` requires named intent fields"),
+                ));
+                continue;
+            };
+            let Some(value_expr_id) = arg.expr else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(arg),
+                    format!("intent field `{arg_name}` has no value"),
+                ));
+                continue;
+            };
+            if args_by_name.insert(arg_name, value_expr_id).is_some() {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(arg),
+                    format!("effect declaration `{name}` repeats intent field `{arg_name}`"),
+                ));
+            }
+        }
+        let expected_args = signature
+            .intent_fields
+            .iter()
+            .map(|(field, _)| field.as_str())
+            .collect::<BTreeSet<_>>();
+        for actual in args_by_name.keys().copied() {
+            if !expected_args.contains(actual) {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(perform),
+                    format!("`{function}` has no intent field `{actual}`"),
+                ));
+            }
+        }
+        let mut intent_fields = Vec::new();
+        for (field, ty) in &signature.intent_fields {
+            let Some(value_expr_id) = args_by_name.get(field.as_str()).copied() else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(perform),
+                    format!("`{function}` is missing intent field `{field}`"),
+                ));
+                continue;
+            };
+            intent_fields.push(HostEffectIntentField {
+                name: field.clone(),
+                value_expr_id,
+                value_type: ty.clone(),
+            });
+        }
+        let Some(results) = members.get("results").copied() else {
+            continue;
+        };
+        let expected_variants = host_effect_variants(&signature.result_type);
+        let mut routes_by_variant = BTreeMap::new();
+        for route in &results.children {
+            let Some(variant) = statement_field_name(route) else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(route),
+                    format!("effect declaration `{name}` has an unnamed result route"),
+                ));
+                continue;
+            };
+            if !expected_variants.contains_key(variant) {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(route),
+                    format!("`{function}` has no result variant `{variant}`"),
+                ));
+                continue;
+            }
+            let Some(expr_id) = route.expr else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(route),
+                    format!("result variant `{variant}` has no SOURCE route"),
+                ));
+                continue;
+            };
+            let Some(source_path) = effect_source_path(program, expr_id, source_lookup, true)
+            else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(route),
+                    format!("result variant `{variant}` must route to one direct SOURCE"),
+                ));
+                continue;
+            };
+            if routes_by_variant.insert(variant, source_path).is_some() {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(route),
+                    format!("result variant `{variant}` is routed more than once"),
+                ));
+            }
+        }
+        let mut result_routes = Vec::new();
+        let mut routed_sources = BTreeSet::new();
+        for variant in expected_variants.keys() {
+            let Some(source_path) = routes_by_variant.get(variant.as_str()).cloned() else {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(results),
+                    format!("`{function}` is missing result route `{variant}`"),
+                ));
+                continue;
+            };
+            if !routed_sources.insert(source_path.clone()) {
+                diagnostics.push(diagnostic_for_statement(
+                    Some(results),
+                    format!(
+                        "effect declaration `{name}` routes multiple variants to `{source_path}`"
+                    ),
+                ));
+            }
+            result_routes.push(HostEffectResultRoute {
+                variant: variant.clone(),
+                source_path,
+            });
+        }
+        if diagnostics.len() == diagnostic_start {
+            table.declarations.push(HostEffectDeclaration {
+                name,
+                line: declaration.line,
+                trigger_source,
+                trigger_expr_id,
+                operation: function.clone(),
+                perform_expr_id,
+                intent_type: signature.intent_type,
+                intent_fields,
+                result_type: signature.result_type,
+                result_routes,
+            });
+        }
+    }
+    table
+        .declarations
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    (table, diagnostics)
+}
+
+fn statement_field_name(statement: &AstStatement) -> Option<&str> {
+    match &statement.kind {
+        AstStatementKind::Field { name }
+        | AstStatementKind::Source {
+            field: Some(name), ..
+        }
+        | AstStatementKind::List {
+            field: Some(name), ..
+        } => Some(name),
+        _ => None,
+    }
+}
+
+fn effect_source_path(
+    program: &ParsedProgram,
+    expr_id: usize,
+    source_lookup: &SourcePayloadPathLookup,
+    direct: bool,
+) -> Option<String> {
+    let parts = match &program.expressions.get(expr_id)?.kind {
+        AstExprKind::Identifier(value) => vec![value.clone()],
+        AstExprKind::Path(parts) => parts.clone(),
+        _ => return None,
+    };
+    if direct
+        && !matches!(
+            source_lookup.access_for_parts(&parts),
+            Some(SourcePayloadAccess::Direct(_))
+        )
+    {
+        return None;
+    }
+    let mut matches = source_lookup.source_paths_for_parts(&parts);
+    matches.sort();
+    matches.dedup();
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+fn host_effect_variants(result_type: &Type) -> BTreeMap<String, ObjectShape> {
+    let Type::VariantSet(variants) = result_type else {
+        return BTreeMap::new();
+    };
+    variants
+        .iter()
+        .map(|variant| match variant {
+            Variant::Tag(tag) => (tag.clone(), ObjectShape::new(BTreeMap::new(), false)),
+            Variant::Tagged { tag, fields } => (tag.clone(), fields.clone()),
+        })
+        .collect()
 }
 
 pub fn check(program: &ParsedProgram) -> TypeCheckReport {
@@ -483,6 +930,7 @@ struct Checker<'a> {
     source_payload_lookup: SourcePayloadPathLookup,
     source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
     source_payload_types: BTreeMap<String, Type>,
+    host_effect_table: HostEffectTable,
     function_statements: BTreeMap<String, &'a AstStatement>,
     function_call_graph: BTreeMap<String, BTreeSet<String>>,
     function_args_by_name: BTreeMap<String, Vec<String>>,
@@ -518,9 +966,15 @@ impl<'a> Checker<'a> {
             .collect();
         let source_paths_ms = typecheck_elapsed_ms(source_paths_started);
         let source_payload_lookup = SourcePayloadPathLookup::new(&source_paths);
+        let (host_effect_table, host_effect_diagnostics) =
+            host_effect_table(program, &source_payload_lookup);
         let source_payload_shape_table_started = Instant::now();
-        let source_payload_shape_table =
-            source_payload_shape_table(program, &source_paths, &source_payload_lookup);
+        let source_payload_shape_table = source_payload_shape_table(
+            program,
+            &source_paths,
+            &source_payload_lookup,
+            &host_effect_table,
+        );
         let source_payload_shape_table_ms =
             typecheck_elapsed_ms(source_payload_shape_table_started);
         let source_payload_types_started = Instant::now();
@@ -575,6 +1029,7 @@ impl<'a> Checker<'a> {
             source_payload_lookup,
             source_payload_shape_table,
             source_payload_types,
+            host_effect_table,
             function_statements,
             function_call_graph,
             function_args_by_name,
@@ -596,7 +1051,7 @@ impl<'a> Checker<'a> {
             render_slot_table: RenderSlotTable::default(),
             list_map_bindings: Vec::new(),
             constraints: Vec::new(),
-            diagnostics: Vec::new(),
+            diagnostics: host_effect_diagnostics,
         };
         let refresh_started = Instant::now();
         checker.refresh_static_row_scope_bindings();
@@ -689,6 +1144,7 @@ impl<'a> Checker<'a> {
             eprintln!("boon_typecheck recursive_functions:start");
         }
         self.check_recursive_functions();
+        self.check_host_effect_declarations();
         let recursive_functions_ms = typecheck_elapsed_ms(recursive_functions_started);
         trace_phase("recursive_functions", recursive_functions_ms);
         let check_statements_started = Instant::now();
@@ -785,6 +1241,7 @@ impl<'a> Checker<'a> {
                 .map(|source| source.path.clone())
                 .collect(),
             source_payload_shape_table,
+            host_effect_table: self.host_effect_table.clone(),
             full_document_typecheck_coverage: document_root(self.program).is_none_or(|root| {
                 statement_expr_ids(root)
                     .into_iter()
@@ -2228,7 +2685,15 @@ impl<'a> Checker<'a> {
                     return source_payload_type_for_path(&self.source_payload_types, &source_path)
                         .unwrap_or_else(exact_empty_object_type);
                 }
-                SourcePayloadAccess::Field(field) => return source_payload_field_type(&field),
+                SourcePayloadAccess::Field(field) => {
+                    return declared_source_payload_field_type(
+                        &self.source_payload_lookup,
+                        &self.source_payload_types,
+                        parts,
+                        &field,
+                    )
+                    .unwrap_or_else(|| source_payload_field_type(&field));
+                }
                 SourcePayloadAccess::UnknownField(field) => {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         expr_id,
@@ -2300,7 +2765,13 @@ impl<'a> Checker<'a> {
                 SourcePayloadAccess::Direct(source_path) => {
                     source_payload_type_for_path(&self.source_payload_types, &source_path)
                 }
-                SourcePayloadAccess::Field(field) => Some(source_payload_field_type(&field)),
+                SourcePayloadAccess::Field(field) => declared_source_payload_field_type(
+                    &self.source_payload_lookup,
+                    &self.source_payload_types,
+                    parts,
+                    &field,
+                )
+                .or_else(|| Some(source_payload_field_type(&field))),
                 SourcePayloadAccess::UnknownField(_) => None,
             };
         }
@@ -4256,6 +4727,48 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn check_host_effect_declarations(&mut self) {
+        let declarations = self.host_effect_table.declarations.clone();
+        let perform_expr_ids = declarations
+            .iter()
+            .map(|declaration| declaration.perform_expr_id)
+            .collect::<BTreeSet<_>>();
+        for declaration in declarations {
+            for field in declaration.intent_fields {
+                let actual = self.ensure_expr(field.value_expr_id).ty;
+                self.constraints.push(Constraint::Assignable {
+                    actual: actual.clone(),
+                    expected: field.value_type.clone(),
+                });
+                if !type_is_assignable_to(&actual, &field.value_type) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        field.value_expr_id,
+                        format!(
+                            "`{}` intent field `{}` has incompatible type\nexpected: {}\nfound: {}",
+                            declaration.operation,
+                            field.name,
+                            boon_facing_type_label(&field.value_type),
+                            boon_facing_type_label(&actual)
+                        ),
+                    ));
+                }
+            }
+        }
+        for expr in &self.program.expressions {
+            let AstExprKind::Call { function, .. } = &expr.kind else {
+                continue;
+            };
+            if host_effect_signature(function).is_some() && !perform_expr_ids.contains(&expr.id) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr.id,
+                    format!(
+                        "typed host effect `{function}` may only appear as `effects.<name>.perform`"
+                    ),
+                ));
+            }
+        }
+    }
+
     fn diagnostic_for_expr(&self, expr_id: usize, message: String) -> TypeDiagnostic {
         let expr = self.program.expressions.get(expr_id);
         TypeDiagnostic {
@@ -5352,7 +5865,9 @@ impl Default for BuiltinSignatureRegistry {
 
 impl BuiltinSignatureRegistry {
     fn type_for_call(&self, function: &str, render_contracts: &RenderContractRegistry) -> Type {
-        if self.text_functions.contains(function) {
+        if let Some(signature) = host_effect_signature(function) {
+            signature.result_type
+        } else if self.text_functions.contains(function) {
             Type::Text
         } else if self.number_functions.contains(function) {
             Type::Number
@@ -7306,6 +7821,14 @@ fn builtin_argument_expected_type(
     arg_name: Option<&str>,
     piped: bool,
 ) -> Option<Type> {
+    if let Some(signature) = host_effect_signature(function) {
+        return arg_name.and_then(|arg_name| {
+            signature
+                .intent_fields
+                .into_iter()
+                .find_map(|(name, ty)| (name == arg_name).then_some(ty))
+        });
+    }
     if function == "Bool/toggle" && arg_name == Some("when") {
         return Some(Type::Unknown);
     }
@@ -8888,6 +9411,25 @@ fn source_payload_field_type(field: &str) -> Type {
     }
 }
 
+fn declared_source_payload_field_type(
+    source_lookup: &SourcePayloadPathLookup,
+    source_payload_types: &BTreeMap<String, Type>,
+    parts: &[String],
+    field: &str,
+) -> Option<Type> {
+    source_lookup
+        .source_paths_for_parts(parts)
+        .into_iter()
+        .find_map(|source_path| {
+            let Type::Object(shape) =
+                source_payload_type_for_path(source_payload_types, &source_path)?
+            else {
+                return None;
+            };
+            shape.fields.get(field).cloned()
+        })
+}
+
 fn source_payload_type_for_path(
     source_payload_types: &BTreeMap<String, Type>,
     path: &str,
@@ -8910,6 +9452,7 @@ fn source_payload_shape_table(
     program: &ParsedProgram,
     source_paths: &BTreeSet<String>,
     source_lookup: &SourcePayloadPathLookup,
+    host_effects: &HostEffectTable,
 ) -> Vec<SourcePayloadShapeEntry> {
     let mut fields_by_source = source_paths
         .iter()
@@ -8934,6 +9477,20 @@ fn source_payload_shape_table(
         source_lookup,
         &mut fields_by_source,
     );
+    for declaration in &host_effects.declarations {
+        let variants = host_effect_variants(&declaration.result_type);
+        for route in &declaration.result_routes {
+            let Some(fields) = fields_by_source.get_mut(&route.source_path) else {
+                continue;
+            };
+            let Some(result_fields) = variants.get(&route.variant) else {
+                continue;
+            };
+            for (name, ty) in result_fields.ordered_fields() {
+                fields.insert(name.clone(), ty.clone());
+            }
+        }
+    }
     program
         .source_ports
         .iter()

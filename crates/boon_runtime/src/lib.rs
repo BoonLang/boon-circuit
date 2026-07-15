@@ -650,7 +650,7 @@ impl LiveRuntime {
             } else {
                 None
             };
-            self.assert_scenario(step, turn.as_ref())?;
+            self.assert_scenario_step(step, turn.as_ref())?;
             if let Some(turn) = turn {
                 turns.push(turn);
             }
@@ -658,7 +658,7 @@ impl LiveRuntime {
         Ok(turns)
     }
 
-    fn assert_scenario(
+    pub fn assert_scenario_step(
         &mut self,
         step: &ScenarioStep,
         turn: Option<&RuntimeTurn>,

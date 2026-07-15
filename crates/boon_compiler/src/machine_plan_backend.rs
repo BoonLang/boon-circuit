@@ -86,38 +86,16 @@ fn effect_contracts(program: &TypedProgram) -> Result<Vec<EffectContract>, PlanE
 fn effect_outbox_schemas(effects: &[EffectContract]) -> Result<Vec<EffectOutboxSchema>, PlanError> {
     let mut schemas = Vec::new();
     for contract in effects {
-        let EffectReplay::Idempotent { key_type } = &contract.replay else {
+        let EffectReplay::Idempotent { .. } = &contract.replay else {
             continue;
         };
-        let (intent_type, result_type) = match contract.host_operation.as_str() {
-            "File/write_bytes" => (
-                DataTypePlan::Record {
-                    fields: vec![
-                        DataTypeFieldPlan {
-                            name: "bytes".to_owned(),
-                            data_type: DataTypePlan::Bytes { fixed_len: None },
-                        },
-                        DataTypeFieldPlan {
-                            name: "path".to_owned(),
-                            data_type: DataTypePlan::Text,
-                        },
-                    ],
-                    open: false,
-                },
-                DataTypePlan::Text,
-            ),
-            other => {
-                return Err(PlanError::new(format!(
-                    "idempotent host effect `{other}` is missing a centralized intent/result outbox schema"
-                )));
-            }
-        };
-        schemas.push(EffectOutboxSchema::new(
-            contract.effect_id,
-            intent_type,
-            key_type.clone(),
-            result_type,
-        )?);
+        let schema = builtin_effect_outbox_schema(&contract.host_operation)?.ok_or_else(|| {
+            PlanError::new(format!(
+                "idempotent host effect `{}` is missing a centralized intent/result outbox schema",
+                contract.host_operation
+            ))
+        })?;
+        schemas.push(schema);
     }
     schemas.sort_by_key(|schema| schema.effect_id);
     Ok(schemas)
@@ -145,6 +123,25 @@ fn effect_invocation_for_branch(
             branch.target
         ))
     })?;
+    let schema = builtin_effect_outbox_schema(host_operation)?.ok_or_else(|| {
+        PlanError::new(format!(
+            "effectful update has no centralized outbox schema for `{host_operation}`"
+        ))
+    })?;
+    let DataTypePlan::Record {
+        fields: intent_schema,
+        open: false,
+    } = schema.intent_type
+    else {
+        return Err(PlanError::new(format!(
+            "effectful update `{host_operation}` has a non-record intent schema"
+        )));
+    };
+    if intent_schema.len() != ordered_inputs.len() {
+        return Err(PlanError::new(format!(
+            "effectful update `{host_operation}` intent arity differs from its schema"
+        )));
+    }
     Ok(Some(EffectInvocationPlan {
         invocation_id: EffectInvocationId::from_semantic_route(
             contract.effect_id,
@@ -152,14 +149,206 @@ fn effect_invocation_for_branch(
             &branch.target,
         )?,
         effect_id: contract.effect_id,
-        intent_inputs: ordered_inputs.to_vec(),
-        idempotency_key: EffectIdempotencyKeyPlan::CanonicalIntentSha256,
-        result: EffectResultRoute {
+        intent_fields: intent_schema
+            .into_iter()
+            .zip(ordered_inputs.iter().cloned())
+            .map(|(field, input)| EffectIntentFieldPlan {
+                name: field.name,
+                input,
+                data_type: field.data_type,
+            })
+            .collect(),
+        idempotency_key: EffectIdempotencyKeyPlan::InvocationTurnIntentSha256,
+        result: EffectResultRoute::Target {
             target,
             policy: contract.result_policy,
         },
         barrier: contract.barrier,
     }))
+}
+
+fn host_effect_plan_op(
+    program: &TypedProgram,
+    declaration: &ir::HostEffectDeclaration,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    next_op: &mut usize,
+) -> Result<PlanOp, PlanError> {
+    let contract = builtin_effect_contract(&declaration.operation)?.ok_or_else(|| {
+        PlanError::new(format!(
+            "typed host effect `{}` has no centralized contract",
+            declaration.operation
+        ))
+    })?;
+    let schema = builtin_effect_outbox_schema(&declaration.operation)?.ok_or_else(|| {
+        PlanError::new(format!(
+            "typed host effect `{}` has no centralized outbox schema",
+            declaration.operation
+        ))
+    })?;
+    if semantic_data_type_plan(&declaration.intent_type).canonicalized() != schema.intent_type
+        || semantic_data_type_plan(&declaration.result_type).canonicalized() != schema.result_type
+    {
+        return Err(PlanError::new(format!(
+            "typed host effect declaration `{}` differs from the centralized schema",
+            declaration.name
+        )));
+    }
+    let ValueRef::Source(trigger_source_id) =
+        index.resolve(&declaration.trigger_source).ok_or_else(|| {
+            PlanError::new(format!(
+                "typed host effect declaration `{}` has an unresolved trigger source `{}`",
+                declaration.name, declaration.trigger_source
+            ))
+        })?
+    else {
+        return Err(PlanError::new(format!(
+            "typed host effect declaration `{}` trigger is not a SOURCE",
+            declaration.name
+        )));
+    };
+    let DataTypePlan::Record {
+        fields: schema_fields,
+        open: false,
+    } = &schema.intent_type
+    else {
+        return Err(PlanError::new(format!(
+            "typed host effect `{}` has a non-record intent schema",
+            declaration.operation
+        )));
+    };
+    let declared_fields = declaration
+        .intent_fields
+        .iter()
+        .map(|field| (field.name.as_str(), field))
+        .collect::<BTreeMap<_, _>>();
+    let mut intent_fields = Vec::with_capacity(schema_fields.len());
+    for schema_field in schema_fields {
+        let field = declared_fields
+            .get(schema_field.name.as_str())
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "typed host effect declaration `{}` is missing intent field `{}`",
+                    declaration.name, schema_field.name
+                ))
+            })?;
+        if semantic_data_type_plan(&field.data_type).canonicalized() != schema_field.data_type {
+            return Err(PlanError::new(format!(
+                "typed host effect declaration `{}` intent field `{}` differs from its schema",
+                declaration.name, field.name
+            )));
+        }
+        let input = host_effect_intent_value_ref(
+            program,
+            index,
+            constants,
+            &declaration.trigger_source,
+            field.value_expr_id.as_usize(),
+        )
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "typed host effect declaration `{}` intent field `{}` is not a lowerable value reference or constant",
+                declaration.name, field.name
+            ))
+        })?;
+        intent_fields.push(EffectIntentFieldPlan {
+            name: schema_field.name.clone(),
+            input,
+            data_type: schema_field.data_type.clone(),
+        });
+    }
+    let DataTypePlan::Variant {
+        variants: result_variants,
+    } = &schema.result_type
+    else {
+        return Err(PlanError::new(format!(
+            "correlated host effect `{}` has a non-variant result schema",
+            declaration.operation
+        )));
+    };
+    let declared_routes = declaration
+        .result_routes
+        .iter()
+        .map(|route| (route.variant.as_str(), route))
+        .collect::<BTreeMap<_, _>>();
+    let mut variants = Vec::with_capacity(result_variants.len());
+    for result_variant in result_variants {
+        let route = declared_routes
+            .get(result_variant.tag.as_str())
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "typed host effect declaration `{}` is missing result route `{}`",
+                    declaration.name, result_variant.tag
+                ))
+            })?;
+        let ValueRef::Source(source_id) = index.resolve(&route.source_path).ok_or_else(|| {
+            PlanError::new(format!(
+                "typed host effect declaration `{}` result route `{}` has unresolved SOURCE `{}`",
+                declaration.name, result_variant.tag, route.source_path
+            ))
+        })?
+        else {
+            return Err(PlanError::new(format!(
+                "typed host effect declaration `{}` result route `{}` is not a SOURCE",
+                declaration.name, result_variant.tag
+            )));
+        };
+        variants.push(EffectResultVariantRoute {
+            tag: result_variant.tag.clone(),
+            source_id,
+        });
+    }
+    let ordered_inputs = intent_fields
+        .iter()
+        .map(|field| field.input.clone())
+        .collect::<Vec<_>>();
+    let mut inputs = vec![ValueRef::Source(trigger_source_id)];
+    inputs.extend(ordered_inputs.iter().cloned());
+    let indexed = program
+        .sources
+        .iter()
+        .find(|source| source.path == declaration.trigger_source)
+        .is_some_and(|source| source.scoped);
+    Ok(op(
+        next_op,
+        PlanOpKind::UpdateBranch {
+            expression_kind: PlanExpressionKind::HostEffect,
+            ordered_inputs,
+            source_payload_field: None,
+            update_constant_id: None,
+            source_guard: None,
+            effect: Some(EffectInvocationPlan {
+                invocation_id: EffectInvocationId::from_semantic_route(
+                    contract.effect_id,
+                    &declaration.trigger_source,
+                    &format!("effects.{}", declaration.name),
+                )?,
+                effect_id: contract.effect_id,
+                intent_fields,
+                idempotency_key: EffectIdempotencyKeyPlan::InvocationTurnIntentSha256,
+                result: EffectResultRoute::CorrelatedSources { variants },
+                barrier: contract.barrier,
+            }),
+        },
+        unique_value_refs(inputs),
+        None,
+        indexed,
+        0,
+    ))
+}
+
+fn host_effect_intent_value_ref(
+    program: &TypedProgram,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    trigger_source: &str,
+    expr_id: usize,
+) -> Option<ValueRef> {
+    if let Some(path) = expression_path_string(program, expr_id) {
+        return resolve_update_value_ref(index, trigger_source, "", false, &path);
+    }
+    constant_initial_expression_value(program, expr_id)
+        .map(|value| ValueRef::Constant(push_plan_constant(constants, value)))
 }
 
 fn output_root_plans(
@@ -313,6 +502,7 @@ fn source_payload_value_type_from_ir(value: ir::SourcePayloadValueType) -> Sourc
     match value {
         ir::SourcePayloadValueType::Bytes => SourcePayloadValueType::Bytes,
         ir::SourcePayloadValueType::Bool => SourcePayloadValueType::Bool,
+        ir::SourcePayloadValueType::Number => SourcePayloadValueType::Number,
         ir::SourcePayloadValueType::Text => SourcePayloadValueType::Text,
     }
 }
@@ -2715,7 +2905,7 @@ pub fn compile_typed_program(
         ));
     }
 
-    let update_ops = program
+    let mut update_ops = program
         .update_branches
         .iter()
         .map(|branch| {
@@ -2793,6 +2983,15 @@ pub fn compile_typed_program(
             ))
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
+    for declaration in &program.host_effects {
+        update_ops.push(host_effect_plan_op(
+            program,
+            declaration,
+            &index,
+            &mut constants,
+            &mut next_op,
+        )?);
+    }
 
     let list_ops = program
         .list_operations
@@ -3164,7 +3363,7 @@ pub fn compile_typed_program(
                 .count(),
         },
         commit_plan: CommitPlan {
-            update_branch_count: program.update_branches.len(),
+            update_branch_count: program.update_branches.len() + program.host_effects.len(),
             unresolved_update_branch_count: regions[3]
                 .ops
                 .iter()
@@ -3970,6 +4169,7 @@ fn plan_value_type_from_source_payload_type(
     match value_type {
         ir::SourcePayloadValueType::Bytes => PlanValueType::Bytes { fixed_len: None },
         ir::SourcePayloadValueType::Bool => PlanValueType::Bool,
+        ir::SourcePayloadValueType::Number => PlanValueType::Number,
         ir::SourcePayloadValueType::Text => PlanValueType::Text,
     }
 }

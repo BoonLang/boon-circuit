@@ -353,6 +353,8 @@ pub struct DocumentAst {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
     pub path: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
     pub message: String,
 }
 
@@ -408,6 +410,8 @@ pub fn parse_project(
     if parsed_files.is_empty() {
         return Err(ParseError {
             path,
+            line: None,
+            column: None,
             message: "project has no source files".to_owned(),
         });
     }
@@ -934,6 +938,8 @@ pub fn lex_source(path: &str, source: &str) -> Result<Vec<AstToken>, ParseError>
                 .unwrap_or_else(|| "syntax error".to_owned());
             ParseError {
                 path: path.to_owned(),
+                line: None,
+                column: None,
                 message,
             }
         })?;
@@ -2824,6 +2830,8 @@ fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseE
             .expect("stack is known to be nonempty");
         Err(ParseError {
             path: path.to_owned(),
+            line: Some(line),
+            column: Some(column),
             message: format!("unclosed `{ch}` at line {line}, column {column}"),
         })
     }
@@ -2883,6 +2891,8 @@ fn validate_no_reducer_style_update(path: &str, ast: &AstProgram) -> Result<(), 
     if ast.semantic_parser_items().any(reducer_update_signature) {
         return Err(ParseError {
             path: path.to_owned(),
+            line: None,
+            column: None,
             message: "central reducer `FUNCTION update(state, event)` is not allowed; define local HOLD equations for each value".to_owned(),
         });
     }
@@ -2895,6 +2905,8 @@ fn validate_no_reducer_style_update(path: &str, ast: &AstProgram) -> Result<(), 
     if has_event_source_when && has_state_pipe {
         return Err(ParseError {
             path: path.to_owned(),
+            line: None,
+            column: None,
             message: "global event-source reducer over `state` is not allowed; each value must declare its own sources".to_owned(),
         });
     }
@@ -2912,6 +2924,8 @@ fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), 
         if let Some(needle) = hidden_runtime_identity_token(&token.lexeme) {
             return Err(ParseError {
                 path: path.to_owned(),
+                line: Some(token.line),
+                column: Some(token.column),
                 message: format!("Boon source exposes hidden runtime identity `{needle}`"),
             });
         }
@@ -2920,6 +2934,8 @@ fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), 
         if item.field.as_deref() == Some("alive") {
             return Err(ParseError {
                 path: path.to_owned(),
+                line: Some(item.line),
+                column: None,
                 message: format!(
                     "Boon source exposes app-visible liveness field `alive` at line {}",
                     item.line
@@ -4683,6 +4699,8 @@ fn collect_operators(ast: &AstProgram) -> Vec<String> {
 fn error(path: &str, line: usize, column: usize, message: &str) -> ParseError {
     ParseError {
         path: path.to_owned(),
+        line: Some(line),
+        column: Some(column),
         message: format!("{message} at line {line}, column {column}"),
     }
 }

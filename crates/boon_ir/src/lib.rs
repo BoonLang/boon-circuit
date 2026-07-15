@@ -25,6 +25,8 @@ pub struct TypedProgram {
     pub nodes: Vec<IrNode>,
     pub row_scopes: Vec<RowScope>,
     pub sources: Vec<SourcePort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_effects: Vec<HostEffectDeclaration>,
     pub state_cells: Vec<StateCell>,
     pub lists: Vec<ListMemory>,
     #[serde(default)]
@@ -347,6 +349,31 @@ pub struct SourcePort {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectDeclaration {
+    pub name: String,
+    pub line: usize,
+    pub trigger_source: String,
+    pub operation: String,
+    pub intent_type: SemanticDataType,
+    pub intent_fields: Vec<HostEffectIntentField>,
+    pub result_type: SemanticDataType,
+    pub result_routes: Vec<HostEffectResultRoute>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectIntentField {
+    pub name: String,
+    pub value_expr_id: ExprId,
+    pub data_type: SemanticDataType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectResultRoute {
+    pub variant: String,
+    pub source_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RowScope {
     pub id: ScopeId,
     pub list: String,
@@ -380,6 +407,7 @@ pub struct SourcePayloadDescriptor {
 pub enum SourcePayloadValueType {
     Bytes,
     Bool,
+    Number,
     Text,
 }
 
@@ -961,7 +989,13 @@ fn lower_with_typecheck(
             scoped: source.scoped,
             scope_id: scope_id_for_path(&row_scopes, &source.path),
             interval_ms: source.interval_ms,
-            payload_schema: source_payload_schema(program, &fields, &direct_sources, &source.path),
+            payload_schema: source_payload_schema(
+                program,
+                &fields,
+                &direct_sources,
+                &typecheck_report,
+                &source.path,
+            ),
             path: source.path.clone(),
         })
         .collect::<Vec<_>>();
@@ -1122,6 +1156,7 @@ fn lower_with_typecheck(
         nodes,
         row_scopes,
         sources,
+        host_effects: host_effect_declarations(&typecheck_report),
         output_values,
         dependencies,
         possible_causes,
@@ -1856,7 +1891,13 @@ pub fn document_view_bindings_with_typecheck(
             scoped: source.scoped,
             scope_id: scope_id_for_path(&row_scopes, &source.path),
             interval_ms: source.interval_ms,
-            payload_schema: source_payload_schema(program, &fields, &direct_sources, &source.path),
+            payload_schema: source_payload_schema(
+                program,
+                &fields,
+                &direct_sources,
+                typecheck_report,
+                &source.path,
+            ),
             path: source.path.clone(),
         })
         .collect::<Vec<_>>();
@@ -2244,6 +2285,7 @@ fn source_payload_schema(
     program: &ParsedProgram,
     fields: &[FieldDef],
     direct_sources: &BTreeMap<String, Vec<String>>,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
     source: &str,
 ) -> SourcePayloadSchema {
     let variants = source_ref_variants(source);
@@ -2262,13 +2304,30 @@ fn source_payload_schema(
     if row_lookup_field.is_some() {
         payload_fields.insert(SourcePayloadField::Address);
     }
+    let typed_payload_fields = typecheck_report
+        .source_payload_shape_table
+        .iter()
+        .find(|entry| entry.source_path == source)
+        .into_iter()
+        .flat_map(|entry| &entry.fields)
+        .filter_map(|field| {
+            Some((
+                SourcePayloadField::from_name(&field.name),
+                source_payload_value_type_from_checked_type(&field.ty)?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    payload_fields.extend(typed_payload_fields.keys().cloned());
     SourcePayloadSchema {
         fields: payload_fields.iter().cloned().collect(),
         typed_fields: payload_fields
             .iter()
             .cloned()
             .map(|field| SourcePayloadDescriptor {
-                value_type: source_payload_value_type(&field),
+                value_type: typed_payload_fields
+                    .get(&field)
+                    .copied()
+                    .unwrap_or_else(|| source_payload_value_type(&field)),
                 field,
             })
             .collect(),
@@ -2285,6 +2344,53 @@ fn source_payload_value_type(field: &SourcePayloadField) -> SourcePayloadValueTy
         }
         SourcePayloadField::Named(_) => SourcePayloadValueType::Text,
     }
+}
+
+fn source_payload_value_type_from_checked_type(
+    ty: &boon_typecheck::Type,
+) -> Option<SourcePayloadValueType> {
+    match semantic_data_type(ty) {
+        SemanticDataType::Bytes { .. } => Some(SourcePayloadValueType::Bytes),
+        SemanticDataType::Bool => Some(SourcePayloadValueType::Bool),
+        SemanticDataType::Number | SemanticDataType::Byte => Some(SourcePayloadValueType::Number),
+        SemanticDataType::Text => Some(SourcePayloadValueType::Text),
+        _ => None,
+    }
+}
+
+fn host_effect_declarations(
+    report: &boon_typecheck::TypeCheckReport,
+) -> Vec<HostEffectDeclaration> {
+    report
+        .host_effect_table
+        .declarations
+        .iter()
+        .map(|declaration| HostEffectDeclaration {
+            name: declaration.name.clone(),
+            line: declaration.line,
+            trigger_source: declaration.trigger_source.clone(),
+            operation: declaration.operation.clone(),
+            intent_type: semantic_data_type(&declaration.intent_type),
+            intent_fields: declaration
+                .intent_fields
+                .iter()
+                .map(|field| HostEffectIntentField {
+                    name: field.name.clone(),
+                    value_expr_id: ExprId(field.value_expr_id),
+                    data_type: semantic_data_type(&field.value_type),
+                })
+                .collect(),
+            result_type: semantic_data_type(&declaration.result_type),
+            result_routes: declaration
+                .result_routes
+                .iter()
+                .map(|route| HostEffectResultRoute {
+                    variant: route.variant.clone(),
+                    source_path: route.source_path.clone(),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn source_row_lookup_field(
@@ -9566,6 +9672,11 @@ fn guarded_function_match_update_expression_from_expr(
             arms,
         });
     }
+    if let Some(raw_input) = text_is_empty_input_path(field, input) {
+        let input =
+            canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
+        return Some(UpdateExpression::MatchTextIsEmptyConst { input, arms });
+    }
     let raw_input = ast_argument_value(field, input)?;
     let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
     Some(UpdateExpression::MatchValueConst { input, arms })
@@ -10018,6 +10129,11 @@ fn inline_match_value_update_expression(
             arms,
         });
     }
+    if let Some(raw_input) = text_is_empty_input_path(field, input) {
+        let input =
+            canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
+        return Some(UpdateExpression::MatchTextIsEmptyConst { input, arms });
+    }
     let raw_input = ast_argument_value(field, input)?;
     let input = canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source);
     Some(UpdateExpression::MatchValueConst { input, arms })
@@ -10202,7 +10318,7 @@ fn match_text_is_empty_const_update_expression_from_input(
         |source| canonical_scalar_update_path_for_source(field, target, &raw_input, fields, source),
     );
     let arms = match_value_arms_for_when(field, target, fields, when_expr_id, source);
-    (!arms.is_empty()).then_some(UpdateExpression::MatchValueConst { input, arms })
+    (!arms.is_empty()).then_some(UpdateExpression::MatchTextIsEmptyConst { input, arms })
 }
 
 fn match_infix_const_update_expression_from_input(
@@ -10544,7 +10660,10 @@ fn update_value_expression_from_expr(
             || canonical_scalar_update_path_with_fields(field, target, &raw, fields),
             |source| canonical_scalar_update_path_for_source(field, target, &raw, fields, source),
         );
-        if path == target || fields.iter().any(|candidate| candidate.path == path) {
+        if path == target
+            || fields.iter().any(|candidate| candidate.path == path)
+            || source.is_some_and(|source| source_payload_input_matches(&path, source))
+        {
             return Some(UpdateValueExpression::ReadPath { path });
         }
     }
@@ -13594,6 +13713,7 @@ fn should_record_field_statement(
         .is_some_and(|root| !matches!(root.as_str(), "store" | "document" | "scene"));
     local_name != "sources"
         && !scope.iter().any(|name| name == "sources")
+        && !scope.first().is_some_and(|name| name == "effects")
         && (program
             .state_cells
             .iter()

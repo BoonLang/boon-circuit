@@ -1065,6 +1065,32 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
     }
 }
 
+fn stored_value_for_data_type(
+    value: &Value,
+    data_type: &boon_plan::DataTypePlan,
+) -> Result<boon_persistence::StoredValue, Error> {
+    if let (Value::Text(tag), boon_plan::DataTypePlan::Variant { variants }) = (value, data_type) {
+        let variant = variants
+            .iter()
+            .find(|variant| variant.tag == *tag)
+            .ok_or_else(|| {
+                Error::Evaluation(format!(
+                    "variant tag `{tag}` is not declared by the durable value schema"
+                ))
+            })?;
+        if !variant.fields.is_empty() {
+            return Err(Error::Evaluation(format!(
+                "structured variant `{tag}` requires named fields"
+            )));
+        }
+        return Ok(boon_persistence::StoredValue::Variant {
+            tag: tag.clone(),
+            fields: BTreeMap::new(),
+        });
+    }
+    stored_value(value)
+}
+
 pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Value, Error> {
     match value {
         boon_persistence::StoredValue::Null => Ok(Value::Null),
@@ -2795,8 +2821,14 @@ impl Session {
         let mut work = self.take_internal_turn_work();
         let result = (|| {
             let row = self.runtime_row_for_effect(item.target_row)?;
-            let value = runtime_value(outcome.clone())?;
-            self.apply_effect_result(&op, &effect.result.target, row, value, &mut work)?;
+            self.apply_effect_outcome(
+                &op,
+                &effect.result,
+                row,
+                outcome.clone(),
+                sequence,
+                &mut work,
+            )?;
             let durable_changes = self.durable_changes(&work.authority_deltas)?;
             work.outbox_changes
                 .push(boon_persistence::DurableOutboxChange::Complete {
@@ -2957,6 +2989,93 @@ impl Session {
             )));
         }
         Ok(Some(row))
+    }
+
+    fn apply_effect_outcome(
+        &mut self,
+        op: &PlanOp,
+        route: &boon_plan::EffectResultRoute,
+        row: Option<RowId>,
+        outcome: boon_persistence::StoredValue,
+        sequence: u64,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        match route {
+            boon_plan::EffectResultRoute::Target { target, .. } => {
+                let value = runtime_value(outcome)?;
+                self.apply_effect_result(op, target, row, value, work)
+            }
+            boon_plan::EffectResultRoute::CorrelatedSources { variants } => {
+                let boon_persistence::StoredValue::Variant { tag, fields } = outcome else {
+                    return Err(Error::InvalidPlan(format!(
+                        "correlated effect invocation {} completed with a non-variant outcome",
+                        op.id.0
+                    )));
+                };
+                let mut matching = variants.iter().filter(|route| route.tag == tag);
+                let route = matching.next().ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "correlated effect invocation {} has no SOURCE route for `{tag}`",
+                        op.id.0
+                    ))
+                })?;
+                if matching.next().is_some() {
+                    return Err(Error::InvalidPlan(format!(
+                        "correlated effect invocation {} has multiple SOURCE routes for `{tag}`",
+                        op.id.0
+                    )));
+                }
+                let source = self
+                    .metadata
+                    .routes
+                    .get(&route.source_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "correlated effect result SOURCE {} is absent from the plan",
+                            route.source_id.0
+                        ))
+                    })?;
+                let expected_fields = source
+                    .payload_schema
+                    .typed_fields
+                    .iter()
+                    .map(|field| source_payload_schema_field_name(&field.field).to_owned())
+                    .collect::<BTreeSet<_>>();
+                if expected_fields != fields.keys().cloned().collect() {
+                    return Err(Error::InvalidPlan(format!(
+                        "correlated effect result `{tag}` fields differ from SOURCE {} payload schema",
+                        route.source_id.0
+                    )));
+                }
+                let mut payload = SourcePayload::default();
+                for (name, value) in fields {
+                    set_source_payload_value(
+                        &mut payload,
+                        &source_payload_field_from_effect_name(&name),
+                        runtime_value(value)?,
+                    )?;
+                }
+                let target = if source.scoped {
+                    Some(row.ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "scoped correlated effect result SOURCE {} has no durable row",
+                            route.source_id.0
+                        ))
+                    })?)
+                } else {
+                    None
+                };
+                let mut event = SourceEvent {
+                    sequence,
+                    source: route.source_id,
+                    target,
+                    payload,
+                };
+                self.validate_event_route(&event)?;
+                self.route_event_with_work(&mut event, &[], work)
+            }
+        }
     }
 
     fn apply_effect_result(
@@ -3184,40 +3303,7 @@ impl Session {
         work: &mut Work,
     ) -> Result<Turn, Error> {
         self.validate_event(&event)?;
-        self.complete_target_payload(&mut event, work)?;
-        let targets = self.event_targets(&event, work)?;
-        let metadata = Arc::clone(&self.metadata);
-
-        if let Some(source_fields) = metadata.source_derived_by_source.get(&event.source) {
-            for field in source_fields {
-                self.mark_root_dirty(*field, work);
-            }
-            for field in source_fields {
-                self.ensure_root_field(*field, Some(&event), work)?;
-            }
-        }
-
-        let scoped_update_row = metadata
-            .routes
-            .get(&event.source)
-            .and_then(|route| route.scope_id)
-            .and_then(|_| event.target.or_else(|| targets.first().copied()));
-        if let Some(updates) = metadata.updates_by_source.get(&event.source) {
-            for op in updates {
-                if op.indexed {
-                    let rows = self.indexed_update_targets(op, &event, &targets)?;
-                    self.execute_indexed_update_batch(op, &rows, &event, work)?;
-                } else {
-                    self.execute_update(op, scoped_update_row, &event, work)?;
-                }
-            }
-        }
-
-        for op in &metadata.mutations {
-            self.execute_mutation(op, &event, &targets, work)?;
-        }
-
-        self.ensure_demanded_current(demanded_targets, Some(&event), work)?;
+        self.route_event_with_work(&mut event, demanded_targets, work)?;
         let durable_changes = self.durable_changes(&work.authority_deltas)?;
 
         self.last_sequence = Some(event.sequence);
@@ -3235,6 +3321,49 @@ impl Session {
             outbox_changes: std::mem::take(&mut work.outbox_changes),
             metrics: std::mem::take(&mut work.metrics),
         })
+    }
+
+    fn route_event_with_work(
+        &mut self,
+        event: &mut SourceEvent,
+        demanded_targets: &[ValueTarget],
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        self.complete_target_payload(event, work)?;
+        let targets = self.event_targets(event, work)?;
+        let metadata = Arc::clone(&self.metadata);
+
+        if let Some(source_fields) = metadata.source_derived_by_source.get(&event.source) {
+            for field in source_fields {
+                self.mark_root_dirty(*field, work);
+            }
+            for field in source_fields {
+                self.ensure_root_field(*field, Some(event), work)?;
+            }
+        }
+
+        let scoped_update_row = metadata
+            .routes
+            .get(&event.source)
+            .and_then(|route| route.scope_id)
+            .and_then(|_| event.target.or_else(|| targets.first().copied()));
+        if let Some(updates) = metadata.updates_by_source.get(&event.source) {
+            for op in updates {
+                if op.indexed {
+                    let rows = self.indexed_update_targets(op, event, &targets)?;
+                    self.execute_indexed_update_batch(op, &rows, event, work)?;
+                } else {
+                    self.execute_update(op, scoped_update_row, event, work)?;
+                }
+            }
+        }
+
+        for op in &metadata.mutations {
+            self.execute_mutation(op, event, &targets, work)?;
+        }
+
+        self.ensure_demanded_current(demanded_targets, Some(event), work)?;
+        Ok(())
     }
 
     fn complete_target_payload(
@@ -3282,6 +3411,10 @@ impl Session {
                 self.last_sequence.unwrap_or_default()
             )));
         }
+        self.validate_event_route(event)
+    }
+
+    fn validate_event_route(&self, event: &SourceEvent) -> Result<(), Error> {
         if !self.metadata.routes.contains_key(&event.source) {
             return Err(Error::InvalidEvent(format!(
                 "source {} is not in the plan",
@@ -3513,37 +3646,30 @@ impl Session {
                 op.id.0
             )));
         };
-        let values = effect
-            .intent_inputs
-            .iter()
-            .map(|input| self.eval_update_ref(input, row, event, work))
-            .collect::<Result<Vec<_>, _>>()?;
-        let intent = match expression_kind {
-            PlanExpressionKind::FileWriteBytes => {
-                let [bytes, path] = values.as_slice() else {
-                    return Err(Error::InvalidPlan(format!(
-                        "FileWriteBytes effect {} requires bytes and path inputs",
-                        effect.invocation_id
-                    )));
-                };
-                boon_persistence::StoredValue::Record(BTreeMap::from([
-                    (
-                        "bytes".to_owned(),
-                        boon_persistence::StoredValue::Bytes(value_to_bytes(bytes)?),
-                    ),
-                    (
-                        "path".to_owned(),
-                        boon_persistence::StoredValue::Text(value_to_text(path)?),
-                    ),
-                ]))
-            }
-            other => {
-                return Err(Error::Unsupported {
-                    op: op.id,
-                    detail: format!("effect intent lowering is not implemented for {other:?}"),
-                });
-            }
-        };
+        if !matches!(
+            expression_kind,
+            PlanExpressionKind::FileWriteBytes | PlanExpressionKind::HostEffect
+        ) {
+            return Err(Error::Unsupported {
+                op: op.id,
+                detail: format!(
+                    "effect intent lowering is not implemented for {expression_kind:?}"
+                ),
+            });
+        }
+        let intent = boon_persistence::StoredValue::Record(
+            effect
+                .intent_fields
+                .iter()
+                .map(|field| {
+                    let value = self.eval_update_ref(&field.input, row, event, work)?;
+                    Ok((
+                        field.name.clone(),
+                        stored_value_for_data_type(&value, &field.data_type)?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+        );
         let target_row = row
             .map(|row| {
                 Ok(boon_persistence::DurableEffectRow {
@@ -3557,10 +3683,31 @@ impl Session {
             .turn_sequence
             .checked_add(1)
             .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
+        let idempotency_key = match effect.idempotency_key {
+            boon_plan::EffectIdempotencyKeyPlan::InvocationTurnIntentSha256 => {
+                boon_persistence::canonical_intent_key(&boon_persistence::StoredValue::Record(
+                    BTreeMap::from([
+                        (
+                            "authority_turn_sequence".to_owned(),
+                            boon_persistence::StoredValue::Text(sequence.to_string()),
+                        ),
+                        ("canonical_intent".to_owned(), intent.clone()),
+                        (
+                            "invocation_id".to_owned(),
+                            boon_persistence::StoredValue::Text(effect.invocation_id.to_string()),
+                        ),
+                        (
+                            "source_sequence".to_owned(),
+                            boon_persistence::StoredValue::Text(event.sequence.to_string()),
+                        ),
+                    ]),
+                ))
+            }
+        };
         let item = boon_persistence::DurableOutboxItem::pending(
             effect.invocation_id,
             effect.effect_id,
-            boon_persistence::canonical_intent_key(&intent),
+            idempotency_key,
             intent,
             target_row,
             sequence,
@@ -6246,7 +6393,9 @@ impl Session {
             PlanExpressionKind::ListFindValue => {
                 self.evaluate_list_find_update(op, ordered_inputs, row, event, work)?
             }
-            PlanExpressionKind::FileReadBytes | PlanExpressionKind::FileWriteBytes => {
+            PlanExpressionKind::FileReadBytes
+            | PlanExpressionKind::FileWriteBytes
+            | PlanExpressionKind::HostEffect => {
                 return Err(Error::Unsupported {
                     op: op.id,
                     detail: format!(
@@ -7657,6 +7806,26 @@ fn source_payload_value(payload: &SourcePayload, field: &SourcePayloadField) -> 
             .get("bytes")
             .or_else(|| payload.fields.get("Bytes"))
             .cloned(),
+    }
+}
+
+fn source_payload_schema_field_name(field: &SourcePayloadField) -> &str {
+    match field {
+        SourcePayloadField::Address => "address",
+        SourcePayloadField::Bytes => "bytes",
+        SourcePayloadField::Key => "key",
+        SourcePayloadField::Named(name) => name,
+        SourcePayloadField::Text => "text",
+    }
+}
+
+fn source_payload_field_from_effect_name(name: &str) -> SourcePayloadField {
+    match name {
+        "address" => SourcePayloadField::Address,
+        "bytes" => SourcePayloadField::Bytes,
+        "key" => SourcePayloadField::Key,
+        "text" => SourcePayloadField::Text,
+        _ => SourcePayloadField::Named(name.to_owned()),
     }
 }
 

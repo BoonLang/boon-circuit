@@ -76,6 +76,61 @@ pub trait HostEffectDriver {
     ) -> Result<HostEffectReconciliation, HostEffectError>;
 }
 
+#[derive(Default)]
+pub struct HostEffectRouter {
+    drivers: BTreeMap<EffectId, Box<dyn HostEffectDriver + Send>>,
+}
+
+impl HostEffectRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(
+        &mut self,
+        host_operation: &str,
+        driver: impl HostEffectDriver + Send + 'static,
+    ) -> Result<(), HostEffectError> {
+        let effect_id = EffectId::from_host_operation(host_operation)
+            .map_err(|error| HostEffectError::rejected(error.to_string()))?;
+        if self.drivers.contains_key(&effect_id) {
+            return Err(HostEffectError::rejected(format!(
+                "host effect driver already registered for `{host_operation}`"
+            )));
+        }
+        self.drivers.insert(effect_id, Box::new(driver));
+        Ok(())
+    }
+
+    fn driver(
+        &mut self,
+        request: &HostEffectRequest,
+    ) -> Result<&mut (dyn HostEffectDriver + Send + 'static), HostEffectError> {
+        self.drivers
+            .get_mut(&request.effect_id)
+            .map(Box::as_mut)
+            .ok_or_else(|| {
+                HostEffectError::rejected(format!(
+                    "no host effect driver owns effect {}",
+                    request.effect_id
+                ))
+            })
+    }
+}
+
+impl HostEffectDriver for HostEffectRouter {
+    fn dispatch(&mut self, request: &HostEffectRequest) -> Result<StoredValue, HostEffectError> {
+        self.driver(request)?.dispatch(request)
+    }
+
+    fn reconcile(
+        &mut self,
+        request: &HostEffectRequest,
+    ) -> Result<HostEffectReconciliation, HostEffectError> {
+        self.driver(request)?.reconcile(request)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostEffectWorkerOperation {
     Dispatch,

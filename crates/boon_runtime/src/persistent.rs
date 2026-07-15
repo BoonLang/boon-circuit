@@ -358,6 +358,16 @@ impl PersistentRuntime {
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
+    pub fn assert_scenario_step(
+        &mut self,
+        step: &crate::ScenarioStep,
+        turn: Option<&RuntimeTurn>,
+    ) -> Result<(), PersistentDispatchError> {
+        self.runtime
+            .assert_scenario_step(step, turn)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
     pub fn demand_document_window_by_id(
         &mut self,
         materialization: u64,

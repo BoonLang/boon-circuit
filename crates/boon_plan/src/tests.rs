@@ -231,6 +231,132 @@ fn effect_ids_and_builtin_contracts_are_stable_and_safe_by_construction() {
 }
 
 #[test]
+fn passkey_effect_contracts_have_canonical_closed_outbox_schemas() {
+    let cases = [
+        (
+            "Passkey/register",
+            vec![
+                ("account_id", DataTypePlan::Text),
+                ("credential_count", DataTypePlan::Number),
+                ("simulation", passkey_simulation_data_type().canonicalized()),
+                ("workspace_id", DataTypePlan::Text),
+            ],
+            vec![
+                (
+                    "DuplicateCredential",
+                    vec![
+                        ("account_id", DataTypePlan::Text),
+                        ("credential_id", DataTypePlan::Text),
+                    ],
+                ),
+                ("RegistrationCancelled", Vec::new()),
+                (
+                    "RegistrationFailed",
+                    vec![
+                        ("code", DataTypePlan::Text),
+                        ("message", DataTypePlan::Text),
+                        ("retryable", DataTypePlan::Bool),
+                    ],
+                ),
+                (
+                    "RegistrationSucceeded",
+                    vec![
+                        ("account_id", DataTypePlan::Text),
+                        ("credential_id", DataTypePlan::Text),
+                        ("label", DataTypePlan::Text),
+                    ],
+                ),
+            ],
+        ),
+        (
+            "Passkey/authenticate",
+            vec![
+                ("account_id", DataTypePlan::Text),
+                ("credential_count", DataTypePlan::Number),
+                ("simulation", passkey_simulation_data_type().canonicalized()),
+            ],
+            vec![
+                ("AuthenticationCancelled", Vec::new()),
+                (
+                    "AuthenticationFailed",
+                    vec![
+                        ("code", DataTypePlan::Text),
+                        ("message", DataTypePlan::Text),
+                        ("retryable", DataTypePlan::Bool),
+                    ],
+                ),
+                (
+                    "AuthenticationSucceeded",
+                    vec![
+                        ("account_id", DataTypePlan::Text),
+                        ("credential_id", DataTypePlan::Text),
+                    ],
+                ),
+            ],
+        ),
+    ];
+
+    for (operation, expected_intent, expected_results) in cases {
+        let contract = builtin_effect_contract(operation).unwrap().unwrap();
+        assert_eq!(contract.result_policy, EffectResultPolicy::CorrelatedSource);
+        assert_eq!(contract.barrier, EffectBarrier::BeforeAndAfter);
+        assert!(matches!(contract.replay, EffectReplay::Idempotent { .. }));
+
+        let schema = builtin_effect_outbox_schema(operation).unwrap().unwrap();
+        assert_eq!(schema.effect_id, contract.effect_id);
+        let DataTypePlan::Record {
+            fields: intent_fields,
+            open: false,
+        } = schema.intent_type
+        else {
+            panic!("{operation} intent must be a closed record");
+        };
+        assert_eq!(
+            intent_fields
+                .into_iter()
+                .map(|field| (field.name, field.data_type))
+                .collect::<Vec<_>>(),
+            expected_intent
+                .into_iter()
+                .map(|(name, data_type)| (name.to_owned(), data_type))
+                .collect::<Vec<_>>()
+        );
+
+        let DataTypePlan::Variant { variants } = schema.result_type else {
+            panic!("{operation} result must be a closed variant");
+        };
+        assert_eq!(
+            variants
+                .into_iter()
+                .map(|variant| {
+                    assert!(!variant.open, "{operation}.{} must be closed", variant.tag);
+                    (
+                        variant.tag,
+                        variant
+                            .fields
+                            .into_iter()
+                            .map(|field| (field.name, field.data_type))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            expected_results
+                .into_iter()
+                .map(|(tag, fields)| {
+                    (
+                        tag.to_owned(),
+                        fields
+                            .into_iter()
+                            .map(|(name, data_type)| (name.to_owned(), data_type))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn persistence_schema_hash_includes_outbox_schema_but_excludes_output_registry() {
     let plan = empty_plan();
     let effect_id = EffectId::from_host_operation("Bank/transfer").unwrap();

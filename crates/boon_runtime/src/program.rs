@@ -3,7 +3,8 @@ use crate::{
     RowId, RuntimeSourceUnit, SessionOptions, SourcePayload, source_units_hash,
 };
 use boon_compiler::{
-    CompileProfile, CompilerSourceUnit, compile_runtime_source_units_to_machine_plan_with_identity,
+    COMPILER_ID, CompileProfile, CompilerSourceUnit,
+    compile_runtime_source_units_to_machine_plan_with_identity, diagnose_runtime_source_units,
 };
 use boon_document_model::{
     DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor, ScrollRootId, SourceBindingId,
@@ -68,6 +69,9 @@ pub enum ProgramDiagnosticPhase {
 pub struct ProgramDiagnostic {
     pub revision: u64,
     pub phase: ProgramDiagnosticPhase,
+    pub source_path: String,
+    pub line: usize,
+    pub column: usize,
     pub message: String,
 }
 
@@ -76,8 +80,23 @@ impl ProgramDiagnostic {
         Self {
             revision,
             phase,
+            source_path: String::new(),
+            line: 0,
+            column: 0,
             message: bounded_diagnostic(message.into()),
         }
+    }
+
+    fn with_source_location(
+        mut self,
+        source_path: impl Into<String>,
+        line: Option<usize>,
+        column: Option<usize>,
+    ) -> Self {
+        self.source_path = source_path.into();
+        self.line = line.unwrap_or_default();
+        self.column = column.unwrap_or_default();
+        self
     }
 }
 
@@ -85,9 +104,19 @@ impl fmt::Display for ProgramDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "program revision {} {:?} failed: {}",
-            self.revision, self.phase, self.message
-        )
+            "program revision {} {:?} failed",
+            self.revision, self.phase
+        )?;
+        if !self.source_path.is_empty() {
+            write!(formatter, " at {}", self.source_path)?;
+            if self.line > 0 {
+                write!(formatter, ":{}", self.line)?;
+                if self.column > 0 {
+                    write!(formatter, ":{}", self.column)?;
+                }
+            }
+        }
+        write!(formatter, ": {}", self.message)
     }
 }
 
@@ -122,6 +151,20 @@ impl ProgramArtifact {
     pub fn plan(&self) -> &Arc<MachinePlan> {
         &self.plan
     }
+
+    pub fn compiler_id(&self) -> &'static str {
+        COMPILER_ID
+    }
+
+    pub fn target_profile_id(&self) -> &'static str {
+        "software_bounded"
+    }
+
+    pub fn capability_profile_id(&self) -> &'static str {
+        match self.capability_profile {
+            ProgramCapabilityProfile::PublicDocument => "public_document",
+        }
+    }
 }
 
 pub fn compile_program_artifact(
@@ -144,11 +187,20 @@ pub fn compile_program_artifact(
         request.application.clone(),
     )
     .map_err(|error| {
-        ProgramDiagnostic::new(
+        let fallback = error.to_string();
+        let location = diagnose_runtime_source_units(&request.source_label, &units)
+            .into_iter()
+            .next();
+        let diagnostic = ProgramDiagnostic::new(
             request.revision,
             ProgramDiagnosticPhase::Compile,
-            error.to_string(),
-        )
+            location
+                .as_ref()
+                .map_or(fallback, |diagnostic| diagnostic.message.clone()),
+        );
+        location.map_or(diagnostic.clone(), |location| {
+            diagnostic.with_source_location(location.path, location.line, location.column)
+        })
     })?;
     validate_plan(request.revision, request.capability_profile, &compiled.plan)?;
     Ok(ProgramArtifact {
@@ -1223,6 +1275,9 @@ document: Document/new(
             valid_digest
         );
         assert_eq!(controller.diagnostic().unwrap().revision, 2);
+        assert_eq!(controller.diagnostic().unwrap().source_path, "Child.bn");
+        assert_eq!(controller.diagnostic().unwrap().line, 1);
+        assert!(controller.diagnostic().unwrap().column > 0);
     }
 
     #[test]

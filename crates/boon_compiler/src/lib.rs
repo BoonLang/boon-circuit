@@ -18,10 +18,99 @@ mod machine_plan_backend;
 
 pub type CompilerResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+pub const COMPILER_ID: &str = concat!("boon-compiler/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompilerSourceUnit {
     pub path: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompilerDiagnostic {
+    pub path: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub start: Option<usize>,
+    pub end: Option<usize>,
+    pub message: String,
+}
+
+/// Produces structured parser/type diagnostics for a failed runtime compile.
+/// Callers use this only on the error path, so successful compilation does not
+/// repeat parsing or type checking.
+pub fn diagnose_runtime_source_units(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+) -> Vec<CompilerDiagnostic> {
+    let parsed = if let [unit] = units {
+        parse_source(unit.path.clone(), unit.source.clone())
+    } else {
+        parse_project(
+            source_label.to_owned(),
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone())),
+        )
+    };
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return vec![CompilerDiagnostic {
+                path: error.path,
+                line: error.line,
+                column: error.column,
+                start: None,
+                end: None,
+                message: error.message,
+            }];
+        }
+    };
+    boon_typecheck::check_runtime_profiled(&parsed)
+        .0
+        .diagnostics
+        .into_iter()
+        .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
+        .map(|diagnostic| {
+            let (path, line) = source_file_location(&parsed, diagnostic.line);
+            CompilerDiagnostic {
+                path,
+                line: Some(line),
+                column: byte_column(&parsed.source, diagnostic.line, diagnostic.start),
+                start: Some(diagnostic.start),
+                end: Some(diagnostic.end),
+                message: diagnostic.message,
+            }
+        })
+        .collect()
+}
+
+fn source_file_location(parsed: &ParsedProgram, global_line: usize) -> (String, usize) {
+    parsed
+        .files
+        .iter()
+        .filter(|file| file.start_line <= global_line)
+        .max_by_key(|file| file.start_line)
+        .map_or_else(
+            || (parsed.path.clone(), global_line),
+            |file| {
+                (
+                    file.path.clone(),
+                    global_line
+                        .saturating_sub(file.start_line)
+                        .saturating_add(1),
+                )
+            },
+        )
+}
+
+fn byte_column(source: &str, line: usize, byte: usize) -> Option<usize> {
+    let line_start = source
+        .split_inclusive('\n')
+        .take(line.saturating_sub(1))
+        .map(str::len)
+        .sum::<usize>();
+    (byte >= line_start && byte <= source.len()).then_some(byte - line_start + 1)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

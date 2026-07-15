@@ -415,7 +415,35 @@ pub fn parse_project(
             message: "project has no source files".to_owned(),
         });
     }
-    parse_combined_source(path, source, parsed_files)
+    parse_combined_source(path.clone(), source, parsed_files.clone())
+        .map_err(|error| project_source_error(error, &path, &parsed_files))
+}
+
+fn project_source_error(
+    mut error: ParseError,
+    project_path: &str,
+    files: &[ParsedSourceFile],
+) -> ParseError {
+    if error.path != project_path {
+        return error;
+    }
+    let Some(global_line) = error.line else {
+        return error;
+    };
+    let Some(file) = files
+        .iter()
+        .filter(|file| file.start_line <= global_line)
+        .max_by_key(|file| file.start_line)
+    else {
+        return error;
+    };
+    error.path.clone_from(&file.path);
+    error.line = Some(
+        global_line
+            .saturating_sub(file.start_line)
+            .saturating_add(1),
+    );
+    error
 }
 
 fn parse_combined_source(

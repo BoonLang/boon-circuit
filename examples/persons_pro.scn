@@ -161,3 +161,15 @@ id = "toggle-dark"
 user_action = { kind = "click", target = "theme", target_text = "Dark" }
 expected_source_event = { source = "store.elements.theme_toggle", target_text = "Dark" }
 expect_root_text = { "store.mode" = "Dark" }
+
+[[step]]
+id = "phone-preview-width"
+user_action = { kind = "click", target = "phone preview width", target_text = "Phone" }
+expected_source_event = { source = "store.elements.preview_phone", target_text = "Phone" }
+expect_root_text = { "store.preview_width_mode" = "Phone" }
+
+[[step]]
+id = "restore-auto-preview-width"
+user_action = { kind = "click", target = "auto preview width", target_text = "Auto" }
+expected_source_event = { source = "store.elements.preview_desktop", target_text = "Auto" }
+expect_root_text = { "store.preview_width_mode" = "Desktop" }

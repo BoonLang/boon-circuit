@@ -4,17 +4,17 @@ use super::effects::{
 };
 use super::{DocumentPatch, LiveRuntime, RuntimeTurn};
 use boon_persistence::{
-    ActivationAck, ActivationBatch, AuthorityTurn, AuthorityTurnReservation, BarrierAck,
-    CommitAck, CompactAck, ContentArtifact, ContentArtifactId, ContentArtifactManifest,
-    ContentArtifactStoreCompletion,
-    ContentArtifactStoreEnqueueError, ContentArtifactStoreTicket, DecodeLimits,
-    DurableContentArtifactChange, DurableOutboxChange, DurableOutboxItem, DurableOutboxState,
-    OutboxItemId, PersistenceControlError, PersistenceCoordinator, PersistenceDriver,
-    PersistenceInspectorSnapshot, PersistenceWorkerConfig, PersistenceWorkerStartError,
-    PersistenceWorkerStatus, PutContentArtifactAck, ResetApplicationAck, ResetApplicationBatch,
-    RestoreImage, StoredValue, TurnEnqueueError, TurnReservationError,
-    apply_durable_outbox_changes, decode_application_transfer, encode_application_transfer,
-    stage_migration,
+    ActivationAck, ActivationBatch, AuthorityTurn, AuthorityTurnReservation, BarrierAck, CommitAck,
+    CompactAck, ContentArtifact, ContentArtifactId, ContentArtifactLoadCompletion,
+    ContentArtifactLoadEnqueueError, ContentArtifactLoadTicket, ContentArtifactManifest,
+    ContentArtifactStoreCompletion, ContentArtifactStoreEnqueueError, ContentArtifactStoreTicket,
+    DecodeLimits, DurableContentArtifactChange, DurableOutboxChange, DurableOutboxItem,
+    DurableOutboxState, OutboxItemId, PersistenceControlError, PersistenceCoordinator,
+    PersistenceDriver, PersistenceInspectorSnapshot, PersistenceWorkerConfig,
+    PersistenceWorkerStartError, PersistenceWorkerStatus, PutContentArtifactAck,
+    ResetApplicationAck, ResetApplicationBatch, RestoreImage, StoredValue, TurnEnqueueError,
+    TurnReservationError, apply_durable_outbox_changes, decode_application_transfer,
+    encode_application_transfer, stage_migration,
 };
 use boon_plan::{MachinePlan, MemoryKind};
 use boon_plan_executor::{SessionOptions, SourceEvent, Value};
@@ -729,6 +729,17 @@ impl PersistentRuntime {
         id: ContentArtifactId,
     ) -> Result<Option<ContentArtifact>, PersistenceControlError> {
         self.persistence.load_content_artifact(id)
+    }
+
+    pub fn try_load_content_artifact(
+        &self,
+        id: ContentArtifactId,
+    ) -> Result<ContentArtifactLoadTicket, ContentArtifactLoadEnqueueError> {
+        self.persistence.try_load_content_artifact(id)
+    }
+
+    pub fn take_content_artifact_load_completions(&self) -> Vec<ContentArtifactLoadCompletion> {
+        self.persistence.take_content_artifact_load_completions()
     }
 
     pub fn inspect(&self) -> Result<Option<PersistenceInspectorSnapshot>, PersistenceControlError> {

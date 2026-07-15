@@ -12,6 +12,7 @@ FUNCTION root() {
             Preview/draft_compiler(PASS: [store: PASSED.store])
             Publish/compiler(PASS: [store: PASSED.store])
             header()
+            desktop_toolbar()
             Auth/development_panel(PASS: [store: PASSED.store])
             desktop_workspace()
             mobile_workspace()
@@ -36,7 +37,6 @@ FUNCTION header() {
         items: LIST {
             brand()
             header_spacer()
-            header_desktop_actions()
             theme_button()
                 |> SOURCE { PASSED.store.elements.theme_toggle }
         }
@@ -82,15 +82,57 @@ FUNCTION header_spacer() {
     )
 }
 
-FUNCTION header_desktop_actions() {
+FUNCTION desktop_toolbar() {
     Scene/Element/stripe(
         element: []
         direction: Row
         gap: 10
-        style: [width: Auto, visible_min_width: 860, paint: False]
+        style: [
+            width: Fill
+            height: 56
+            visible_min_width: 860
+            padding: [left: 20, right: 20, top: 8, bottom: 8]
+            background: [color: PersonsTheme/header_background(mode: PASSED.store.mode)]
+            border: [color: PersonsTheme/header_border()]
+            border_width: 1
+        ]
         items: LIST {
+            preview_width_controls()
+            header_spacer()
             Publish/controls(PASS: [store: PASSED.store])
             Auth/controls(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION preview_width_controls() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 6
+        style: [width: Auto, height: 40, paint: False]
+        items: LIST {
+            Components/button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Phone }
+                tone: Neutral
+                selected: PASSED.store.preview_width_mode == Phone
+            )
+                |> SOURCE { PASSED.store.elements.preview_phone }
+            Components/button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Tablet }
+                tone: Neutral
+                selected: PASSED.store.preview_width_mode == Tablet
+            )
+                |> SOURCE { PASSED.store.elements.preview_tablet }
+            Components/button(
+                PASS: [store: PASSED.store]
+                label: TEXT { Auto }
+                tone: Neutral
+                selected: PASSED.store.preview_width_mode == Desktop
+            )
+                |> SOURCE { PASSED.store.elements.preview_desktop }
         }
     )
 }
@@ -121,7 +163,7 @@ FUNCTION desktop_workspace() {
         ]
         items: LIST {
             Editor/root(PASS: [store: PASSED.store])
-            Preview/root(PASS: [store: PASSED.store])
+            preview_frame()
         }
     )
 }
@@ -142,7 +184,7 @@ FUNCTION mobile_workspace() {
             mobile_tabs()
             PASSED.store.active_view |> WHEN {
                 Code => Editor/root(PASS: [store: PASSED.store])
-                Preview => Preview/root(PASS: [store: PASSED.store])
+                Preview => preview_frame()
                 Publish => Publish/root(PASS: [store: PASSED.store])
                 __ => Editor/root(PASS: [store: PASSED.store])
             }
@@ -157,8 +199,30 @@ FUNCTION mobile_actions() {
         gap: 8
         style: [width: Fill, paint: False]
         items: LIST {
-            Publish/controls(PASS: [store: PASSED.store])
+            PASSED.store.active_view == Publish |> WHEN {
+                True => NoElement
+                False => Publish/controls(PASS: [store: PASSED.store])
+            }
             Auth/controls(PASS: [store: PASSED.store])
+            preview_width_controls()
+        }
+    )
+}
+
+FUNCTION preview_frame() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 0
+        style: [
+            width: Fill
+            height: Fill
+            scroll_x: True
+            scrollbars: True
+            background: [color: PersonsTheme/preview_empty_background(mode: PASSED.store.mode)]
+        ]
+        items: LIST {
+            Preview/root(PASS: [store: PASSED.store])
         }
     )
 }

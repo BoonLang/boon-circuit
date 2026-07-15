@@ -1167,6 +1167,21 @@ fn parse_project_namespaces_uppercase_module_files() {
 }
 
 #[test]
+fn parse_project_reports_errors_in_the_owning_source_file() {
+    let error = parse_project(
+        "RUN.bn",
+        [
+            ("RUN.bn".to_owned(), "scene: Theme/render()\n".to_owned()),
+            ("Theme.bn".to_owned(), "FUNCTION render() {\n".to_owned()),
+        ],
+    )
+    .unwrap_err();
+
+    assert_eq!(error.path, "Theme.bn");
+    assert!(error.line.is_some_and(|line| line <= 2), "{error:?}");
+}
+
+#[test]
 fn parses_profiled_list_capacity() {
     let source = r#"
 todos: LIST[10000] {}

@@ -5,7 +5,11 @@ FUNCTION root() {
         gap: 0
         style: [
             ...PersonsTheme/panel(mode: PASSED.store.mode)
-            width: Fill
+            width: PASSED.store.preview_width_mode |> WHEN {
+                Phone => 390
+                Tablet => 768
+                __ => Fill
+            }
             height: Fill
         ]
         items: LIST {
@@ -70,6 +74,7 @@ FUNCTION draft_compiler() {
         element: [event: PASSED.store.elements.draft_program]
         style: [width: 0, height: 0, paint: False]
         source: PASSED.store.source_draft
+        support_sources: Profile/support_sources()
         revision: PASSED.store.draft_revision
         artifact_retention: Replaceable
         bootstrap_source:
@@ -93,6 +98,7 @@ FUNCTION draft_program() {
             height: Fill
         ]
         source: PASSED.store.source_draft
+        support_sources: Profile/support_sources()
         revision: PASSED.store.draft_revision
         artifact_retention: Replaceable
         bootstrap_source:

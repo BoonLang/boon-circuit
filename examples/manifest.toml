@@ -517,6 +517,7 @@ source_files = [
   "examples/persons_pro/Model/Workspace.bn",
   "examples/persons_pro/Model/Account.bn",
   "examples/persons_pro/Templates/Profile.bn",
+  "examples/persons_pro/Templates/ProfilePage.bn",
   "examples/persons_pro/Theme/PersonsTheme.bn",
   "examples/persons_pro/View/Components.bn",
   "examples/persons_pro/View/Editor.bn",

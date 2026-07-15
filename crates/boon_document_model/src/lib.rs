@@ -80,6 +80,25 @@ impl ProgramArtifactRetention {
 }
 
 #[derive(Clone, Eq, PartialEq, Deserialize)]
+pub struct EmbeddedProgramSourceUnit {
+    pub path: String,
+    #[serde(default)]
+    pub source: String,
+    pub source_digest: String,
+}
+
+impl Debug for EmbeddedProgramSourceUnit {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EmbeddedProgramSourceUnit")
+            .field("path", &self.path)
+            .field("source_digest", &self.source_digest)
+            .field("source_bytes", &self.source.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Deserialize)]
 pub struct EmbeddedProgramDescriptor {
     #[serde(default)]
     pub source: String,
@@ -89,6 +108,8 @@ pub struct EmbeddedProgramDescriptor {
     pub artifact_id: String,
     #[serde(default)]
     pub artifact_retention: ProgramArtifactRetention,
+    #[serde(default)]
+    pub support_sources: Vec<EmbeddedProgramSourceUnit>,
     #[serde(default)]
     pub bootstrap_source: String,
     #[serde(default)]
@@ -112,6 +133,7 @@ impl Default for EmbeddedProgramDescriptor {
             revision: 0,
             artifact_id: String::new(),
             artifact_retention: ProgramArtifactRetention::default(),
+            support_sources: Vec::new(),
             bootstrap_source: String::new(),
             bootstrap_source_digest: String::new(),
             bootstrap_artifact_id: String::new(),
@@ -132,6 +154,7 @@ impl Debug for EmbeddedProgramDescriptor {
             .field("revision", &self.revision)
             .field("artifact_id", &self.artifact_id)
             .field("artifact_retention", &self.artifact_retention)
+            .field("support_sources", &self.support_sources)
             .field("bootstrap_source_digest", &self.bootstrap_source_digest)
             .field("bootstrap_source_bytes", &self.bootstrap_source.len())
             .field("bootstrap_artifact_id", &self.bootstrap_artifact_id)
@@ -155,6 +178,7 @@ impl Serialize for EmbeddedProgramDescriptor {
             revision: u64,
             artifact_id: &'a str,
             artifact_retention: ProgramArtifactRetention,
+            support_sources: Vec<SourceUnitArtifact<'a>>,
             bootstrap_source_digest: &'a str,
             bootstrap_source_bytes: usize,
             bootstrap_artifact_id: &'a str,
@@ -164,12 +188,28 @@ impl Serialize for EmbeddedProgramDescriptor {
             mount: bool,
         }
 
+        #[derive(Serialize)]
+        struct SourceUnitArtifact<'a> {
+            path: &'a str,
+            source_digest: &'a str,
+            source_bytes: usize,
+        }
+
         Artifact {
             source_digest: &self.source_digest,
             source_bytes: self.source.len(),
             revision: self.revision,
             artifact_id: &self.artifact_id,
             artifact_retention: self.artifact_retention,
+            support_sources: self
+                .support_sources
+                .iter()
+                .map(|unit| SourceUnitArtifact {
+                    path: &unit.path,
+                    source_digest: &unit.source_digest,
+                    source_bytes: unit.source.len(),
+                })
+                .collect(),
             bootstrap_source_digest: &self.bootstrap_source_digest,
             bootstrap_source_bytes: self.bootstrap_source.len(),
             bootstrap_artifact_id: &self.bootstrap_artifact_id,

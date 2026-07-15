@@ -1,3 +1,12 @@
 FUNCTION starter_source() {
-    "scene: Scene/Element/stripe(\n    element: []\n    direction: Column\n    gap: 18\n    style: [\n        width: Fill\n        height: Fill\n        padding: [left: 34, right: 34, top: 38, bottom: 30]\n        background: [color: Oklch[lightness:0.99,chroma:0.01,hue:150]]\n    ]\n    items: LIST {\n        Scene/Element/text(\n            element: [tag: Heading]\n            style: [width: Fill, text_wrap: True, size: 38, weight: 700, color: Oklch[lightness:0.23,chroma:0.04,hue:150]]\n            text: TEXT { Your name }\n        )\n        Scene/Element/text(\n            element: []\n            style: [width: Fill, text_wrap: True, size: 19, line_height: 28, color: Oklch[lightness:0.31,chroma:0.03,hue:150]]\n            text: TEXT { I build useful things with Boon. }\n        )\n        Scene/Element/text(\n            element: []\n            style: [width: Fill, height: 24, size: 14, color: Oklch[lightness:0.48,chroma:0.04,hue:150]]\n            text: TEXT { Trondheim, Norway }\n        )\n        Scene/Element/block(\n            element: []\n            style: [width: Fill, height: 1, background: [color: Oklch[lightness:0.88,chroma:0.02,hue:150]]]\n            child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())\n        )\n        Scene/Element/text(\n            element: [tag: Heading]\n            style: [width: Fill, height: 28, size: 19, weight: 700, color: Oklch[lightness:0.23,chroma:0.04,hue:150]]\n            text: TEXT { Projects }\n        )\n        Scene/Element/text(\n            element: []\n            style: [width: Fill, text_wrap: True, size: 15, color: Oklch[lightness:0.38,chroma:0.03,hue:150]]\n            text: TEXT { First Boon project - a public page compiled from this source. }\n        )\n    }\n)\n"
+    "profile: [\n    name: TEXT { Your name }\n    introduction: TEXT { I build useful things with Boon. }\n    location: TEXT { Trondheim, Norway }\n    projects: LIST {\n        [\n            title: TEXT { First Boon project }\n            summary: TEXT { A public page compiled from this source. }\n        ]\n    }\n]\n\nscene: ProfilePage/render(profile: profile)\n"
+}
+
+FUNCTION support_sources() {
+    LIST {
+        [
+            path: TEXT { ProfilePage.bn }
+            source: ProfilePage/library_source()
+        ]
+    }
 }

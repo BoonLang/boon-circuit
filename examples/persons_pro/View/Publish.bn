@@ -30,6 +30,7 @@ FUNCTION compiler() {
             element: [event: PASSED.store.elements.publish_candidate_program]
             style: [width: 0, height: 0, paint: False]
             source: PASSED.store.publish_candidate_source
+            support_sources: Profile/support_sources()
             revision: PASSED.store.publish_request_sequence
             capability_profile: PublicDocument
             artifact_retention: Archive

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 #[test]
 fn root_value_comparison_lowers_both_typed_operands() {
@@ -2128,6 +2129,89 @@ document: Document/new(root: View/root(PASS: [store: store]))
                 boon_plan::DocumentBindingTarget::Source { .. }
             )
     }));
+}
+
+#[test]
+fn cross_module_document_call_lowers_typed_global_record_with_exact_demand() {
+    let units = [
+        CompilerSourceUnit {
+            path: "ProfilePage.bn".to_owned(),
+            source: r#"
+FUNCTION render(profile) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        style: [width: Fill]
+        items: LIST {
+            Scene/Element/text(element: [], style: [width: Fill], text: profile.name)
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                style: [width: Fill]
+                items: profile.projects
+                    |> List/map(project, new: project_row(project: project))
+            )
+        }
+    )
+}
+
+FUNCTION project_row(project) {
+    Scene/Element/text(element: [], style: [width: Fill], text: project.title)
+}
+"#
+            .to_owned(),
+        },
+        CompilerSourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: r#"
+profile: [
+    name: TEXT { Your name }
+    projects: LIST {
+        [title: TEXT { First project }]
+    }
+]
+
+scene: ProfilePage/render(profile: profile)
+"#
+            .to_owned(),
+        },
+    ];
+
+    let compiled =
+        compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
+            .unwrap();
+    let document = compiled.plan.document.as_ref().unwrap();
+    let DocumentExprOp::FunctionCall { arguments, .. } =
+        &document.expressions[document.root.expression.0].op
+    else {
+        panic!("scene root is not the ProfilePage call");
+    };
+    let DocumentExprOp::Record { fields: record } = &document.expressions[arguments[0].value.0].op
+    else {
+        panic!("ProfilePage call did not receive an explicit typed global record");
+    };
+    let demanded = match &compiled.plan.demand.root_derived_outputs {
+        RootOutputDemand::Selected(fields) => fields.iter().copied().collect::<BTreeSet<_>>(),
+        RootOutputDemand::All => panic!("document demand must remain sparse"),
+    };
+    let mut direct_field_count = 0;
+    let mut direct_list_count = 0;
+    for record_field in record {
+        match document.expressions[record_field.value.0].op {
+            DocumentExprOp::Read {
+                read: DocumentRead::Field { field },
+            } => {
+                direct_field_count += 1;
+                assert!(demanded.contains(&field));
+            }
+            DocumentExprOp::Read {
+                read: DocumentRead::List { .. },
+            } => direct_list_count += 1,
+            _ => panic!("global record member did not lower to a direct typed read"),
+        }
+    }
+    assert_eq!(direct_field_count, 1);
+    assert_eq!(direct_list_count, 1);
 }
 
 #[test]

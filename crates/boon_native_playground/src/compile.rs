@@ -474,7 +474,7 @@ mod tests {
                 host: host.clone(),
                 compile: boon_runtime::ProgramCompileRequest {
                     revision,
-                    source_label: "Child.bn".to_owned(),
+                    entry_path: "RUN.bn".to_owned(),
                     units: vec![boon_runtime::RuntimeSourceUnit {
                         path: "RUN.bn".to_owned(),
                         source: format!("value: {revision}\n"),

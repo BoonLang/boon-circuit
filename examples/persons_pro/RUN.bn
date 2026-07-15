@@ -29,6 +29,9 @@ store: [
         show_publish: SOURCE
         show_draft_page: SOURCE
         show_published_page: SOURCE
+        preview_phone: SOURCE
+        preview_tablet: SOURCE
+        preview_desktop: SOURCE
         register_passkey: SOURCE
         sign_out: SOURCE
         sign_in: SOURCE
@@ -159,6 +162,14 @@ store: [
             DraftPage
             elements.show_draft_page.event.press |> THEN { DraftPage }
             elements.show_published_page.event.press |> THEN { PublishedPage }
+        }
+
+    preview_width_mode:
+        LATEST {
+            Desktop
+            elements.preview_phone.event.press |> THEN { Phone }
+            elements.preview_tablet.event.press |> THEN { Tablet }
+            elements.preview_desktop.event.press |> THEN { Desktop }
         }
 
     passkey_simulation:

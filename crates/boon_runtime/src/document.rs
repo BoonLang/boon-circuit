@@ -1,8 +1,8 @@
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
-    DocumentPatch, EmbeddedProgramDescriptor, MaterializedRange, ProgramArtifactRetention,
-    ProgramCapabilityProfile, SourceBinding, SourceBindingId, StyleMap, StylePatch, StyleValue,
-    TextValue,
+    DocumentPatch, EmbeddedProgramDescriptor, EmbeddedProgramSourceUnit, MaterializedRange,
+    ProgramArtifactRetention, ProgramCapabilityProfile, SourceBinding, SourceBindingId, StyleMap,
+    StylePatch, StyleValue, TextValue,
 };
 use boon_plan::{
     DocumentArgumentRole, DocumentBuiltin, DocumentConstantId, DocumentConstantValue,
@@ -3154,6 +3154,9 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                     _ => ProgramArtifactRetention::Ephemeral,
                 };
             }
+            "support_sources" => {
+                program.support_sources = embedded_program_source_units(&value);
+            }
             "bootstrap_source" => {
                 program.bootstrap_source = value.text();
                 program.bootstrap_source_digest =
@@ -3187,6 +3190,7 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                 | "revision"
                 | "artifact_id"
                 | "artifact_retention"
+                | "support_sources"
                 | "bootstrap_source"
                 | "bootstrap_artifact_id"
                 | "bootstrap_revision"
@@ -3204,6 +3208,36 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
         };
         node.style.insert(key.to_owned(), style);
     }
+}
+
+fn embedded_program_source_units(value: &EvalValue) -> Vec<EmbeddedProgramSourceUnit> {
+    let EvalValue::List(values) = value else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .map(|value| {
+            let fields = match value {
+                EvalValue::Record(fields) | EvalValue::Tagged(_, fields) => Some(fields),
+                EvalValue::MappedRow { fields, .. } => Some(fields),
+                _ => None,
+            };
+            let path = fields
+                .and_then(|fields| fields.get("path"))
+                .map(|value| value.text())
+                .unwrap_or_default();
+            let source = fields
+                .and_then(|fields| fields.get("source"))
+                .map(|value| value.text())
+                .unwrap_or_default();
+            let source_digest = crate::sha256_bytes(source.as_bytes());
+            EmbeddedProgramSourceUnit {
+                path,
+                source,
+                source_digest,
+            }
+        })
+        .collect()
 }
 
 fn lower_style_record(record: &BTreeMap<String, EvalValue>, style: &mut StyleMap) {

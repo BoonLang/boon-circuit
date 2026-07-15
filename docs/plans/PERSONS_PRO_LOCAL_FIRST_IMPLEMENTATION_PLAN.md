@@ -299,7 +299,8 @@ Persist only authoritative product memory:
 - current source draft and source revision;
 - last successful artifact identity;
 - immutable published revision metadata;
-- selected editor or preview mode when it is genuine user preference;
+- selected editor, preview surface, and preview-width mode as workspace UI
+  preferences;
 - registered credential descriptors, never private key material;
 - bounded account and publish workflow state that cannot be reconstructed.
 

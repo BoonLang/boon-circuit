@@ -1,6 +1,6 @@
 use crate::{
     ApplicationIdentity, DocumentFrame, DocumentPatch, LiveRuntime, ProgramCapabilityProfile,
-    RowId, RuntimeSourceUnit, SessionOptions, SourcePayload, source_units_hash,
+    RowId, RuntimeSourceUnit, SessionOptions, SourcePayload,
 };
 use boon_compiler::{
     COMPILER_ID, CompileProfile, CompilerSourceUnit,
@@ -62,7 +62,7 @@ fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramCompileRequest {
     pub revision: u64,
-    pub source_label: String,
+    pub entry_path: String,
     pub units: Vec<RuntimeSourceUnit>,
     pub application: ApplicationIdentity,
     pub capability_profile: ProgramCapabilityProfile,
@@ -358,7 +358,7 @@ pub fn compile_program_artifact(
     request: &ProgramCompileRequest,
 ) -> Result<ProgramArtifact, ProgramDiagnostic> {
     validate_request(request)?;
-    let source_digest = source_units_hash(&request.units);
+    let source_digest = crate::sha256_bytes(request.units[0].source.as_bytes());
     let units = request
         .units
         .iter()
@@ -368,14 +368,14 @@ pub fn compile_program_artifact(
         })
         .collect::<Vec<_>>();
     let compiled = compile_runtime_source_units_to_machine_plan_with_identity(
-        &request.source_label,
+        &request.entry_path,
         &units,
         TargetProfile::SoftwareBounded,
         request.application.clone(),
     )
     .map_err(|error| {
         let fallback = error.to_string();
-        let location = diagnose_runtime_source_units(&request.source_label, &units)
+        let location = diagnose_runtime_source_units(&request.entry_path, &units)
             .into_iter()
             .next();
         let diagnostic = ProgramDiagnostic::new(
@@ -622,6 +622,20 @@ fn validate_request(request: &ProgramCompileRequest) -> Result<(), ProgramDiagno
                 format!("source unit path `{}` is duplicated", unit.path),
             ));
         }
+    }
+    if !request
+        .units
+        .iter()
+        .any(|unit| unit.path == request.entry_path)
+    {
+        return Err(ProgramDiagnostic::new(
+            request.revision,
+            ProgramDiagnosticPhase::Request,
+            format!(
+                "entry source path `{}` is not present in the source units",
+                request.entry_path
+            ),
+        ));
     }
     if !request.application.is_valid() {
         return Err(ProgramDiagnostic::new(
@@ -1128,10 +1142,17 @@ impl ProgramDocumentHost {
                     program.latest_request_artifact_ownership = artifact_ownership;
                     let units = artifact_id.map_or_else(
                         || {
-                            vec![RuntimeSourceUnit {
+                            let mut units = vec![RuntimeSourceUnit {
                                 path: "RUN.bn".to_owned(),
                                 source: request_descriptor.source.clone(),
-                            }]
+                            }];
+                            units.extend(request_descriptor.support_sources.iter().map(|unit| {
+                                RuntimeSourceUnit {
+                                    path: unit.path.clone(),
+                                    source: unit.source.clone(),
+                                }
+                            }));
+                            units
                         },
                         |_| Vec::new(),
                     );
@@ -1141,7 +1162,7 @@ impl ProgramDocumentHost {
                         host: host.clone(),
                         compile: ProgramCompileRequest {
                             revision: request_descriptor.revision,
-                            source_label: format!("embedded-program/{}.bn", namespace(&session.0)),
+                            entry_path: "RUN.bn".to_owned(),
                             units,
                             application: child_application(&self.parent_application, &session),
                             capability_profile: request_descriptor.capability_profile,
@@ -1732,6 +1753,12 @@ fn program_request_id(
     descriptor: &EmbeddedProgramDescriptor,
 ) -> ProgramRequestId {
     let revision = descriptor.revision.to_string();
+    let support_parts = descriptor
+        .support_sources
+        .iter()
+        .map(|unit| (unit.path.as_str(), unit.source.as_str()))
+        .collect::<Vec<_>>();
+    let support_sources = crate::source_unit_parts_hash(&support_parts);
     ProgramRequestId(crate::source_unit_parts_hash(&[
         ("parent.package_id", parent.package_id.as_str()),
         ("parent.state_namespace", parent.state_namespace.as_str()),
@@ -1742,6 +1769,7 @@ fn program_request_id(
         ("session", session.0.as_str()),
         ("revision", revision.as_str()),
         ("source", descriptor.source_digest.as_str()),
+        ("support_sources", support_sources.as_str()),
         ("artifact", descriptor.artifact_id.as_str()),
     ]))
 }
@@ -1806,6 +1834,7 @@ fn same_program_definition(
     right: &EmbeddedProgramDescriptor,
 ) -> bool {
     left.source_digest == right.source_digest
+        && left.support_sources == right.support_sources
         && left.artifact_id == right.artifact_id
         && left.artifact_retention == right.artifact_retention
         && left.revision == right.revision
@@ -1820,6 +1849,7 @@ fn same_current_program_definition(
     right: &EmbeddedProgramDescriptor,
 ) -> bool {
     left.source_digest == right.source_digest
+        && left.support_sources == right.support_sources
         && left.artifact_id == right.artifact_id
         && left.artifact_retention == right.artifact_retention
         && left.revision == right.revision
@@ -1863,6 +1893,9 @@ fn bootstrap_descriptor(
     } else {
         descriptor.bootstrap_source_digest.clone()
     };
+    if has_artifact {
+        bootstrap.support_sources.clear();
+    }
     bootstrap.artifact_id = descriptor.bootstrap_artifact_id.clone();
     bootstrap.artifact_retention = ProgramArtifactRetention::Ephemeral;
     bootstrap.revision = descriptor.bootstrap_revision;
@@ -1892,6 +1925,13 @@ fn descriptor_artifact_id(
             descriptor.revision,
             ProgramDiagnosticPhase::Request,
             "artifact-backed embedded program cannot also provide source",
+        ));
+    }
+    if !descriptor.support_sources.is_empty() {
+        return Err(ProgramDiagnostic::new(
+            descriptor.revision,
+            ProgramDiagnosticPhase::Request,
+            "artifact-backed embedded program cannot also provide support sources",
         ));
     }
     if descriptor.artifact_retention != ProgramArtifactRetention::Ephemeral {
@@ -1941,12 +1981,14 @@ fn namespace(value: &str) -> String {
 mod tests {
     use super::*;
     use boon_document::{DocumentChangeBatch, DocumentState};
-    use boon_document_model::{DocumentNode, DocumentNodeKind, TextValue};
+    use boon_document_model::{
+        DocumentNode, DocumentNodeKind, EmbeddedProgramSourceUnit, TextValue,
+    };
 
     fn request(revision: u64, source: &str) -> ProgramCompileRequest {
         ProgramCompileRequest {
             revision,
-            source_label: "Child.bn".to_owned(),
+            entry_path: "Child.bn".to_owned(),
             units: vec![RuntimeSourceUnit {
                 path: "Child.bn".to_owned(),
                 source: source.to_owned(),
@@ -2210,6 +2252,72 @@ document: Document/new(
             node.text
                 .as_ref()
                 .is_some_and(|text| text.text == "Stored child")
+        }));
+    }
+
+    #[test]
+    fn document_host_compiles_bounded_support_source_units() {
+        let source = "scene: ProfilePage/render()\n";
+        let support_source = r#"
+FUNCTION render() {
+    Scene/Element/text(
+        element: []
+        style: [width: Fill]
+        text: TEXT { Typed profile }
+    )
+}
+"#;
+        let mut parent = parent_frame(1, source);
+        parent
+            .nodes
+            .get_mut(&DocumentNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap()
+            .support_sources = vec![EmbeddedProgramSourceUnit {
+            path: "ProfilePage.bn".to_owned(),
+            source: support_source.to_owned(),
+            source_digest: crate::sha256_bytes(support_source.as_bytes()),
+        }];
+
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "support-source", "local"),
+            &parent,
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].compile.units.len(), 2);
+        assert_eq!(requests[0].compile.units[0].path, "RUN.bn");
+        assert_eq!(requests[0].compile.units[1].path, "ProfilePage.bn");
+        let artifact = compile_program_artifact(&requests[0].compile).unwrap();
+        assert_eq!(
+            artifact.source_digest(),
+            crate::sha256_bytes(source.as_bytes())
+        );
+
+        let mut changed_support = requests[0].compile.clone();
+        changed_support.units[1].source =
+            support_source.replace("Typed profile", "Changed profile");
+        let changed_artifact = compile_program_artifact(&changed_support).unwrap();
+        assert_eq!(changed_artifact.source_digest(), artifact.source_digest());
+        assert_ne!(changed_artifact.id(), artifact.id());
+
+        let mut invalid_support = requests[0].compile.clone();
+        invalid_support.units[1].source = "FUNCTION render() {\n".to_owned();
+        let diagnostic = compile_program_artifact(&invalid_support).unwrap_err();
+        assert_eq!(diagnostic.source_path, "ProfilePage.bn");
+        assert!(diagnostic.line > 0);
+
+        let (completion, _) =
+            host.complete(&requests[0].session, &requests[0].request_id, Ok(artifact));
+        assert_eq!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
+        );
+        assert!(host.frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Typed profile")
         }));
     }
 

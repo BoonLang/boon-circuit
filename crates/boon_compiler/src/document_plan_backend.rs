@@ -1771,6 +1771,10 @@ impl<'a> DocumentCompiler<'a> {
             self.record_compiled_path(context, path, expression);
             return Ok(expression);
         }
+        if let Some(expression) = self.compile_global_record(expr_id, &stripped.join("."))? {
+            self.record_compiled_path(context, path, expression);
+            return Ok(expression);
+        }
         let first = stripped[0];
         let projection = stripped[1..]
             .iter()
@@ -1807,6 +1811,70 @@ impl<'a> DocumentCompiler<'a> {
             .unwrap_or_default();
         Err(PlanError::new(format!(
             "unresolved executable document path `{path}` at expression {expr_id} (line {line})"
+        )))
+    }
+
+    fn compile_global_record(
+        &mut self,
+        expr_id: usize,
+        path: &str,
+    ) -> Result<Option<DocumentExprId>, PlanError> {
+        let prefix = format!("{path}.");
+        let child_names = self
+            .globals
+            .keys()
+            .filter_map(|candidate| {
+                candidate
+                    .strip_prefix(&prefix)
+                    .and_then(|suffix| suffix.split('.').next())
+                    .map(str::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        if child_names.is_empty() {
+            return Ok(None);
+        }
+
+        let mut fields = Vec::with_capacity(child_names.len());
+        for child in child_names {
+            let child_path = format!("{path}.{child}");
+            let value = if let Some(global) = self.globals.get(&child_path).copied() {
+                let (read, class) = match global {
+                    GlobalValue::State(state) => (
+                        DocumentRead::State { state },
+                        DocumentValueClass::DynamicScalar,
+                    ),
+                    GlobalValue::Field(field) => (
+                        DocumentRead::Field { field },
+                        DocumentValueClass::DynamicScalar,
+                    ),
+                    GlobalValue::List(list) => (
+                        DocumentRead::List { list },
+                        DocumentValueClass::DynamicStructure,
+                    ),
+                    GlobalValue::Source(source) => (
+                        DocumentRead::Source { source },
+                        DocumentValueClass::DynamicScalar,
+                    ),
+                };
+                self.push_expr(expr_id, class, DocumentExprOp::Read { read })
+            } else {
+                self.compile_global_record(expr_id, &child_path)?
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "global document record `{child_path}` has no typed children"
+                        ))
+                    })?
+            };
+            fields.push(DocumentRecordField {
+                name: Some(self.intern_name(&child)),
+                value,
+                spread: false,
+            });
+        }
+        Ok(Some(self.push_expr(
+            expr_id,
+            DocumentValueClass::DynamicStructure,
+            DocumentExprOp::Record { fields },
         )))
     }
 

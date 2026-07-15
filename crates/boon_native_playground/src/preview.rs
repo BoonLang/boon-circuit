@@ -2447,7 +2447,8 @@ fn authoritative_state_evidence(
     runtime: &mut RuntimeView,
 ) -> Result<AuthoritativeStateEvidence, Box<dyn std::error::Error + Send + Sync>> {
     let artifact = runtime.export_state_artifact()?;
-    let image = decode_restore_image(&artifact, DecodeLimits::default())?;
+    let image = boon_persistence::decode_application_transfer(&artifact, DecodeLimits::default())?
+        .restore_image;
     let durable_epoch = image.epoch;
     let durable_turn_sequence = image.through_turn_sequence;
     let semantic = semantic_authority_image(image);
@@ -2477,7 +2478,9 @@ fn semantic_authority_image(
 fn importable_authority(
     artifact: &[u8],
 ) -> Result<boon_persistence::RestoreImage, boon_persistence::CodecError> {
-    let mut image = decode_restore_image(artifact, DecodeLimits::default())?;
+    let mut image =
+        boon_persistence::decode_application_transfer(artifact, DecodeLimits::default())?
+            .restore_image;
     image.epoch = 0;
     image.through_turn_sequence = 0;
     image.outbox.clear();

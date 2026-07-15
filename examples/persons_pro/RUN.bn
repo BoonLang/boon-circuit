@@ -136,6 +136,16 @@ store: [
             }
         }
 
+    last_valid_draft_artifact_id:
+        Text/empty() |> HOLD last_valid_draft_artifact_id {
+            elements.draft_program.compiled |> THEN {
+                elements.draft_program.compiled.bootstrap |> WHEN {
+                    True => last_valid_draft_artifact_id
+                    False => elements.draft_program.compiled.artifact_id
+                }
+            }
+        }
+
     active_view:
         LATEST {
             Code

@@ -75,6 +75,8 @@ pub struct EmbeddedProgramDescriptor {
     #[serde(default)]
     pub bootstrap_source_digest: String,
     #[serde(default)]
+    pub bootstrap_artifact_id: String,
+    #[serde(default)]
     pub bootstrap_revision: u64,
     pub capability_profile: ProgramCapabilityProfile,
     #[serde(default)]
@@ -93,6 +95,7 @@ impl Default for EmbeddedProgramDescriptor {
             persist_artifact: false,
             bootstrap_source: String::new(),
             bootstrap_source_digest: String::new(),
+            bootstrap_artifact_id: String::new(),
             bootstrap_revision: 0,
             capability_profile: ProgramCapabilityProfile::default(),
             session_key: String::new(),
@@ -112,6 +115,7 @@ impl Debug for EmbeddedProgramDescriptor {
             .field("persist_artifact", &self.persist_artifact)
             .field("bootstrap_source_digest", &self.bootstrap_source_digest)
             .field("bootstrap_source_bytes", &self.bootstrap_source.len())
+            .field("bootstrap_artifact_id", &self.bootstrap_artifact_id)
             .field("bootstrap_revision", &self.bootstrap_revision)
             .field("capability_profile", &self.capability_profile)
             .field("session_key", &self.session_key)
@@ -134,6 +138,7 @@ impl Serialize for EmbeddedProgramDescriptor {
             persist_artifact: bool,
             bootstrap_source_digest: &'a str,
             bootstrap_source_bytes: usize,
+            bootstrap_artifact_id: &'a str,
             bootstrap_revision: u64,
             capability_profile: ProgramCapabilityProfile,
             session_key: &'a str,
@@ -148,6 +153,7 @@ impl Serialize for EmbeddedProgramDescriptor {
             persist_artifact: self.persist_artifact,
             bootstrap_source_digest: &self.bootstrap_source_digest,
             bootstrap_source_bytes: self.bootstrap_source.len(),
+            bootstrap_artifact_id: &self.bootstrap_artifact_id,
             bootstrap_revision: self.bootstrap_revision,
             capability_profile: self.capability_profile,
             session_key: &self.session_key,

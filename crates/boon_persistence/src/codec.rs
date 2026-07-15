@@ -1,7 +1,7 @@
 use super::{
-    CheckpointBatch, DurableChange, DurableEffectRow, DurableOutboxChange, DurableOutboxItem,
-    DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow, StoredScalar,
-    StoredValue,
+    ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactId, DurableChange,
+    DurableEffectRow, DurableOutboxChange, DurableOutboxItem, DurableOutboxState, OutboxItemId,
+    RestoreImage, StoredList, StoredRow, StoredScalar, StoredValue, validate_application_transfer,
 };
 use boon_plan::{
     ApplicationIdentity, EffectId, EffectInvocationId, MemoryId, MemoryLeafId, MigrationEdgeId,
@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 const RESTORE_IMAGE_FORMAT: u32 = 3;
+const APPLICATION_TRANSFER_FORMAT: u32 = 1;
 const CHECKPOINT_BATCH_FORMAT: u32 = 2;
 const OUTBOX_RECORD_FORMAT: u32 = 2;
 const BLOB_RECORD_FORMAT: u32 = 1;
@@ -207,6 +208,96 @@ pub fn decode_restore_image(
         completed_migration_edges,
         outbox,
     })
+}
+
+pub fn encode_application_transfer(transfer: &ApplicationTransfer) -> Result<Vec<u8>, CodecError> {
+    validate_application_transfer(transfer).map_err(|error| CodecError::new(error.to_string()))?;
+    let restore = encode_restore_image(&transfer.restore_image)?;
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::new(&mut bytes);
+    encoder
+        .array(3)
+        .and_then(|encoder| encoder.u32(APPLICATION_TRANSFER_FORMAT))
+        .and_then(|encoder| encoder.bytes(&restore))
+        .and_then(|encoder| encoder.map(transfer.content_artifacts.len() as u64))
+        .map_err(encode_error)?;
+    for (id, artifact) in &transfer.content_artifacts {
+        encode_digest(&mut encoder, id.as_bytes())?;
+        encoder
+            .array(2)
+            .and_then(|encoder| encoder.str(&artifact.media_type))
+            .and_then(|encoder| encoder.bytes(&artifact.bytes))
+            .map_err(encode_error)?;
+    }
+    Ok(bytes)
+}
+
+pub fn decode_application_transfer(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<ApplicationTransfer, CodecError> {
+    if bytes.len() > limits.max_total_bytes {
+        return Err(CodecError::new(
+            "application transfer exceeds total byte limit",
+        ));
+    }
+    let mut decoder = Decoder::new(bytes);
+    let root_len = definite_len(
+        decoder.array().map_err(decode_error)?,
+        "application transfer",
+    )?;
+    let format = decoder.u32().map_err(decode_error)?;
+    if format != APPLICATION_TRANSFER_FORMAT || root_len != 3 {
+        return Err(CodecError::new(format!(
+            "unsupported application transfer format {format} with {root_len} fields"
+        )));
+    }
+    let restore_bytes = decoder.bytes().map_err(decode_error)?;
+    if restore_bytes.len() > limits.max_total_bytes {
+        return Err(CodecError::new(
+            "application transfer restore image exceeds total byte limit",
+        ));
+    }
+    let restore_image = decode_restore_image(restore_bytes, limits)?;
+    let artifact_count = collection_len(&mut decoder, limits, "content artifact map", false)?;
+    let mut content_artifacts = BTreeMap::new();
+    let mut artifact_bytes = 0usize;
+    for _ in 0..artifact_count {
+        let id = ContentArtifactId(decode_digest(&mut decoder)?);
+        let len = definite_len(decoder.array().map_err(decode_error)?, "content artifact")?;
+        if len != 2 {
+            return Err(CodecError::new(format!(
+                "content artifact has {len} fields, expected 2"
+            )));
+        }
+        let media_type = decode_text(&mut decoder, limits)?;
+        let payload = decoder.bytes().map_err(decode_error)?;
+        artifact_bytes = artifact_bytes
+            .checked_add(payload.len())
+            .ok_or_else(|| CodecError::new("content artifact byte count overflow"))?;
+        if artifact_bytes > limits.max_total_bytes {
+            return Err(CodecError::new("content artifacts exceed total byte limit"));
+        }
+        let artifact = ContentArtifact {
+            id,
+            media_type,
+            bytes: payload.to_vec(),
+        };
+        if content_artifacts.insert(id, artifact).is_some() {
+            return Err(CodecError::new(
+                "application transfer repeats a content artifact ID",
+            ));
+        }
+    }
+    if decoder.position() != bytes.len() {
+        return Err(CodecError::new("application transfer has trailing bytes"));
+    }
+    let transfer = ApplicationTransfer {
+        restore_image,
+        content_artifacts,
+    };
+    validate_application_transfer(&transfer).map_err(|error| CodecError::new(error.to_string()))?;
+    Ok(transfer)
 }
 
 pub fn encode_checkpoint_batch(batch: &CheckpointBatch) -> Result<Vec<u8>, CodecError> {
@@ -1552,6 +1643,55 @@ mod tests {
             image
         );
         assert_eq!(encode_restore_image(&image).unwrap(), bytes);
+    }
+
+    #[test]
+    fn application_transfer_round_trips_authority_and_artifacts_canonically() {
+        let mut restore_image = RestoreImage::empty(
+            ApplicationIdentity::new("dev.boon.codec-transfer", "test", "local"),
+            2,
+            [4; 32],
+        );
+        restore_image.epoch = 3;
+        restore_image.through_turn_sequence = 7;
+        restore_image.scalars.insert(
+            memory("artifact_id"),
+            StoredScalar {
+                touched: true,
+                value: StoredValue::Text("published".to_owned()),
+            },
+        );
+        let first = ContentArtifact::new(
+            "application/vnd.boon.program",
+            b"first immutable program".to_vec(),
+        )
+        .unwrap();
+        let second = ContentArtifact::new(
+            "application/vnd.boon.program",
+            b"second immutable program".to_vec(),
+        )
+        .unwrap();
+        let transfer = ApplicationTransfer {
+            restore_image,
+            content_artifacts: BTreeMap::from([
+                (first.id, first.clone()),
+                (second.id, second.clone()),
+            ]),
+        };
+        let bytes = encode_application_transfer(&transfer).unwrap();
+        assert_eq!(
+            decode_application_transfer(&bytes, DecodeLimits::default()).unwrap(),
+            transfer
+        );
+        assert_eq!(encode_application_transfer(&transfer).unwrap(), bytes);
+
+        let mut corrupt = bytes;
+        let payload = corrupt
+            .windows(first.bytes.len())
+            .position(|window| window == first.bytes)
+            .expect("encoded transfer contains first artifact payload");
+        corrupt[payload] ^= 1;
+        assert!(decode_application_transfer(&corrupt, DecodeLimits::default()).is_err());
     }
 
     #[test]

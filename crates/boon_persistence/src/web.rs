@@ -846,6 +846,9 @@ enum CoordinatorResultKind {
     Barrier,
     Inspect,
     Compact,
+    ExportApplication,
+    PutContentArtifact,
+    LoadContentArtifact,
     Shutdown,
 }
 
@@ -861,6 +864,9 @@ impl CoordinatorResultKind {
             PersistenceCommand::Barrier(_) => Self::Barrier,
             PersistenceCommand::Inspect(_) => Self::Inspect,
             PersistenceCommand::Compact(_) => Self::Compact,
+            PersistenceCommand::ExportApplication(_) => Self::ExportApplication,
+            PersistenceCommand::PutContentArtifact(_) => Self::PutContentArtifact,
+            PersistenceCommand::LoadContentArtifact(_) => Self::LoadContentArtifact,
             PersistenceCommand::Shutdown(_) => Self::Shutdown,
         }
     }
@@ -875,6 +881,9 @@ impl CoordinatorResultKind {
             Self::Barrier => PersistenceResult::BarrierComplete(Err(error)),
             Self::Inspect => PersistenceResult::Inspected(Err(error)),
             Self::Compact => PersistenceResult::Compacted(Err(error)),
+            Self::ExportApplication => PersistenceResult::ApplicationExported(Err(error)),
+            Self::PutContentArtifact => PersistenceResult::ContentArtifactStored(Err(error)),
+            Self::LoadContentArtifact => PersistenceResult::ContentArtifactLoaded(Err(error)),
             Self::Shutdown => PersistenceResult::ShutdownComplete(Err(error)),
         }
     }
@@ -1193,6 +1202,24 @@ impl IndexedDbBackend {
             PersistenceCommand::Compact(request) => {
                 PersistenceResult::Compacted(self.compact(request).await)
             }
+            PersistenceCommand::ExportApplication(_) => {
+                PersistenceResult::ApplicationExported(Err(StoreError::Backend(
+                    "browser content-artifact transfer belongs to the later browser-host milestone"
+                        .to_owned(),
+                )))
+            }
+            PersistenceCommand::PutContentArtifact(_) => {
+                PersistenceResult::ContentArtifactStored(Err(StoreError::Backend(
+                    "browser content artifacts belong to the later browser-host milestone"
+                        .to_owned(),
+                )))
+            }
+            PersistenceCommand::LoadContentArtifact(_) => {
+                PersistenceResult::ContentArtifactLoaded(Err(StoreError::Backend(
+                    "browser content artifacts belong to the later browser-host milestone"
+                        .to_owned(),
+                )))
+            }
             PersistenceCommand::Shutdown(_) => {
                 PersistenceResult::ShutdownComplete(self.shutdown().await)
             }
@@ -1375,6 +1402,12 @@ impl IndexedDbBackend {
 
     async fn activate(&self, batch: ActivationBatch) -> Result<ActivationAck, StoreError> {
         super::validate_activation(&batch)?;
+        if !batch.content_artifacts.is_empty() {
+            return Err(StoreError::Backend(
+                "browser atomic content-artifact activation belongs to the later browser-host milestone"
+                    .to_owned(),
+            ));
+        }
         let plan = SparseTransactionPlan::activation(&batch);
         let store_names = plan.store_names();
         let transaction = self
@@ -3251,6 +3284,9 @@ fn persistence_result_error(result: &PersistenceResult) -> Option<&StoreError> {
         | PersistenceResult::BarrierComplete(Err(error))
         | PersistenceResult::Inspected(Err(error))
         | PersistenceResult::Compacted(Err(error))
+        | PersistenceResult::ApplicationExported(Err(error))
+        | PersistenceResult::ContentArtifactStored(Err(error))
+        | PersistenceResult::ContentArtifactLoaded(Err(error))
         | PersistenceResult::ShutdownComplete(Err(error)) => Some(error),
         _ => None,
     }
@@ -3572,6 +3608,7 @@ mod tests {
             authority_changes: Vec::new(),
             completed_migration_edges: vec![MigrationEdgeId([0x51; 32])],
             deleted_memory: vec![memory],
+            content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         };
         assert_eq!(

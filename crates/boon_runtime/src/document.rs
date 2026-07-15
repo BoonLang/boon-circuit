@@ -3154,6 +3154,9 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                 program.bootstrap_source_digest =
                     crate::sha256_bytes(program.bootstrap_source.as_bytes());
             }
+            "bootstrap_artifact_id" => {
+                program.bootstrap_artifact_id = value.text();
+            }
             "bootstrap_revision" => {
                 program.bootstrap_revision = value.number().unwrap_or(0.0).max(0.0) as u64;
             }
@@ -3180,6 +3183,7 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
                 | "artifact_id"
                 | "persist_artifact"
                 | "bootstrap_source"
+                | "bootstrap_artifact_id"
                 | "bootstrap_revision"
                 | "capability_profile"
                 | "session_key"

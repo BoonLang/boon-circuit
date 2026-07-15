@@ -20,8 +20,9 @@ mod worker;
 mod native;
 
 pub use codec::{
-    CodecError, DecodeLimits, INLINE_BYTES_THRESHOLD, decode_checkpoint_batch,
-    decode_restore_image, encode_checkpoint_batch, encode_restore_image,
+    CodecError, DecodeLimits, INLINE_BYTES_THRESHOLD, decode_application_transfer,
+    decode_checkpoint_batch, decode_restore_image, encode_application_transfer,
+    encode_checkpoint_batch, encode_restore_image,
 };
 pub use migration::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -345,6 +346,9 @@ pub struct ActivationBatch {
     pub authority_changes: Vec<DurableChange>,
     pub completed_migration_edges: Vec<MigrationEdgeId>,
     pub deleted_memory: Vec<MemoryId>,
+    /// Immutable content that must become visible atomically with this authority.
+    /// Existing content-addressed artifacts are retained.
+    pub content_artifacts: BTreeMap<ContentArtifactId, ContentArtifact>,
     pub checksum: [u8; 32],
 }
 
@@ -422,6 +426,7 @@ impl ActivationBatch {
             authority_changes,
             completed_migration_edges,
             deleted_memory,
+            content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         }
         .seal())
@@ -452,6 +457,8 @@ pub struct CompactRequest {
 
 pub const MAX_CONTENT_ARTIFACT_MEDIA_TYPE_BYTES: usize = 128;
 pub const MAX_CONTENT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_APPLICATION_TRANSFER_ARTIFACTS: usize = 4_096;
+pub const MAX_APPLICATION_TRANSFER_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -526,6 +533,28 @@ impl ContentArtifact {
     }
 }
 
+/// A portable, self-contained snapshot of one application namespace.
+///
+/// The restore image remains the sole semantic authority. Content artifacts are
+/// immutable dependencies referenced by that authority, bundled so activation
+/// cannot create dangling artifact pointers on another store.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApplicationTransfer {
+    pub restore_image: RestoreImage,
+    pub content_artifacts: BTreeMap<ContentArtifactId, ContentArtifact>,
+}
+
+impl ApplicationTransfer {
+    pub fn validate(&self) -> Result<(), StoreError> {
+        validate_application_transfer(self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExportApplicationRequest {
+    pub application: ApplicationIdentity,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PutContentArtifactRequest {
     pub application: ApplicationIdentity,
@@ -551,6 +580,7 @@ pub enum PersistenceCommand {
     Barrier(BarrierRequest),
     Inspect(InspectRequest),
     Compact(CompactRequest),
+    ExportApplication(ExportApplicationRequest),
     PutContentArtifact(PutContentArtifactRequest),
     LoadContentArtifact(LoadContentArtifactRequest),
     Shutdown(ShutdownRequest),
@@ -653,6 +683,7 @@ pub enum PersistenceResult {
     BarrierComplete(Result<BarrierAck, StoreError>),
     Inspected(Result<Option<PersistenceInspectorSnapshot>, StoreError>),
     Compacted(Result<CompactAck, StoreError>),
+    ApplicationExported(Result<ApplicationTransfer, StoreError>),
     ContentArtifactStored(Result<PutContentArtifactAck, StoreError>),
     ContentArtifactLoaded(Result<Option<ContentArtifact>, StoreError>),
     ShutdownComplete(Result<ShutdownAck, StoreError>),
@@ -772,8 +803,25 @@ impl InMemoryDriver {
             .get(&batch.application)
             .cloned()
             .ok_or(StoreError::MissingApplication)?;
+        let mut candidate_artifacts = self.artifacts.clone();
+        for (id, artifact) in &batch.content_artifacts {
+            let key = (batch.application.clone(), *id);
+            match candidate_artifacts.get(&key) {
+                Some(existing) if existing == artifact => {}
+                Some(_) => {
+                    return Err(StoreError::InvalidContentArtifact(
+                        "content digest collides with different artifact bytes".to_owned(),
+                    ));
+                }
+                None => {
+                    candidate_artifacts.insert(key, artifact.clone());
+                }
+            }
+        }
         let (candidate, ack) = apply_activation_to_image(current, &batch)?;
-        self.applications.insert(batch.application, candidate);
+        self.applications
+            .insert(batch.application.clone(), candidate);
+        self.artifacts = candidate_artifacts;
         Ok(ack)
     }
 
@@ -837,6 +885,30 @@ impl InMemoryDriver {
         }
         Ok(artifact)
     }
+
+    fn export_application(
+        &self,
+        request: ExportApplicationRequest,
+    ) -> Result<ApplicationTransfer, StoreError> {
+        let restore_image = self
+            .applications
+            .get(&request.application)
+            .cloned()
+            .ok_or(StoreError::MissingApplication)?;
+        let content_artifacts = self
+            .artifacts
+            .iter()
+            .filter_map(|((application, id), artifact)| {
+                (application == &request.application).then_some((*id, artifact.clone()))
+            })
+            .collect();
+        let transfer = ApplicationTransfer {
+            restore_image,
+            content_artifacts,
+        };
+        validate_application_transfer(&transfer)?;
+        Ok(transfer)
+    }
 }
 
 impl PersistenceDriver for InMemoryDriver {
@@ -895,6 +967,9 @@ impl PersistenceDriver for InMemoryDriver {
                     .map(|image| CompactAck { epoch: image.epoch })
                     .ok_or(StoreError::MissingApplication);
                 PersistenceResult::Compacted(result)
+            }
+            PersistenceCommand::ExportApplication(request) => {
+                PersistenceResult::ApplicationExported(self.export_application(request))
             }
             PersistenceCommand::PutContentArtifact(request) => {
                 PersistenceResult::ContentArtifactStored(self.put_content_artifact(request))
@@ -1151,6 +1226,9 @@ pub fn apply_durable_outbox_changes(
                         _ => false,
                     },
                 )?;
+                // The same checkpoint persisted the authoritative outcome, so
+                // this external obligation is fully consumed atomically.
+                outbox.remove(item_id);
             }
         }
     }
@@ -1595,6 +1673,48 @@ fn validate_activation(batch: &ActivationBatch) -> Result<(), StoreError> {
             "target schema version must be positive".to_owned(),
         ));
     }
+    validate_content_artifact_map(&batch.content_artifacts)?;
+    Ok(())
+}
+
+pub fn validate_application_transfer(transfer: &ApplicationTransfer) -> Result<(), StoreError> {
+    for list in transfer.restore_image.lists.values() {
+        validate_list(list)?;
+    }
+    validate_outbox(&transfer.restore_image.outbox)?;
+    validate_content_artifact_map(&transfer.content_artifacts)
+}
+
+fn validate_content_artifact_map(
+    artifacts: &BTreeMap<ContentArtifactId, ContentArtifact>,
+) -> Result<(), StoreError> {
+    if artifacts.len() > MAX_APPLICATION_TRANSFER_ARTIFACTS {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "application transfer contains {} artifacts, limit is {MAX_APPLICATION_TRANSFER_ARTIFACTS}",
+            artifacts.len()
+        )));
+    }
+    let mut total_bytes = 0usize;
+    for (id, artifact) in artifacts {
+        if id != &artifact.id {
+            return Err(StoreError::InvalidContentArtifact(
+                "application transfer artifact key does not match its content ID".to_owned(),
+            ));
+        }
+        validate_content_artifact(artifact)?;
+        total_bytes = total_bytes
+            .checked_add(artifact.bytes.len())
+            .ok_or_else(|| {
+                StoreError::InvalidContentArtifact(
+                    "application transfer artifact byte count overflow".to_owned(),
+                )
+            })?;
+    }
+    if total_bytes > MAX_APPLICATION_TRANSFER_ARTIFACT_BYTES {
+        return Err(StoreError::InvalidContentArtifact(format!(
+            "application transfer contains {total_bytes} artifact bytes, limit is {MAX_APPLICATION_TRANSFER_ARTIFACT_BYTES}"
+        )));
+    }
     Ok(())
 }
 
@@ -1653,6 +1773,7 @@ fn reset_checksum(batch: &ResetApplicationBatch) -> [u8; 32] {
 
 fn activation_checksum(batch: &ActivationBatch) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    hasher.update(b"boon.persistence.activation.v2");
     hash_application(&mut hasher, &batch.application);
     hasher.update(batch.expected_base_epoch.to_be_bytes());
     hasher.update(batch.next_epoch.to_be_bytes());
@@ -1666,6 +1787,13 @@ fn activation_checksum(batch: &ActivationBatch) -> [u8; 32] {
     }
     for memory in &batch.deleted_memory {
         hasher.update(memory.as_bytes());
+    }
+    for (id, artifact) in &batch.content_artifacts {
+        hasher.update(id.as_bytes());
+        hasher.update((artifact.media_type.len() as u64).to_be_bytes());
+        hasher.update(artifact.media_type.as_bytes());
+        hasher.update((artifact.bytes.len() as u64).to_be_bytes());
+        hasher.update(&artifact.bytes);
     }
     hasher.finalize().into()
 }
@@ -2005,6 +2133,9 @@ fn error_result(command: PersistenceCommand, error: StoreError) -> PersistenceRe
         PersistenceCommand::Barrier(_) => PersistenceResult::BarrierComplete(Err(error)),
         PersistenceCommand::Inspect(_) => PersistenceResult::Inspected(Err(error)),
         PersistenceCommand::Compact(_) => PersistenceResult::Compacted(Err(error)),
+        PersistenceCommand::ExportApplication(_) => {
+            PersistenceResult::ApplicationExported(Err(error))
+        }
         PersistenceCommand::PutContentArtifact(_) => {
             PersistenceResult::ContentArtifactStored(Err(error))
         }
@@ -2291,6 +2422,7 @@ mod tests {
             }],
             completed_migration_edges: Vec::new(),
             deleted_memory: vec![memory("count")],
+            content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -2335,6 +2467,7 @@ mod tests {
             }],
             completed_migration_edges: Vec::new(),
             deleted_memory: vec![old_memory],
+            content_artifacts: BTreeMap::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -2489,6 +2622,67 @@ mod tests {
             PersistenceResult::Committed(Err(StoreError::InvalidOutboxTransition(_)))
         ));
         assert_eq!(driver.image(&application()), Some(&before_invalid));
+
+        let mut completions = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if index != 0 {
+                completions.push(DurableOutboxChange::BeginDispatch {
+                    item_id: item.item_id,
+                    expected_revision: 0,
+                    next_revision: 1,
+                    attempt: 1,
+                    turn_sequence: 3,
+                });
+            }
+            completions.push(DurableOutboxChange::Complete {
+                item_id: item.item_id,
+                expected_revision: 1,
+                next_revision: 2,
+                attempt: 1,
+                outcome: StoredValue::Text(format!("completed-{index}")),
+                turn_sequence: 3,
+            });
+        }
+        let outcome_memory = memory("all_effects_completed");
+        let complete = CheckpointBatch {
+            application: application(),
+            schema_hash: [1; 32],
+            base_epoch: 2,
+            next_epoch: 3,
+            first_turn_sequence: 3,
+            last_turn_sequence: 3,
+            changes: vec![DurableChange::SetScalar {
+                memory_id: outcome_memory,
+                value: StoredScalar {
+                    touched: true,
+                    value: StoredValue::Bool(true),
+                },
+            }],
+            outbox_changes: completions,
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(complete)),
+            PersistenceResult::Committed(Ok(_))
+        ));
+        let image = driver.image(&application()).unwrap();
+        assert!(image.outbox.is_empty());
+        assert_eq!(
+            image.scalars[&outcome_memory].value,
+            StoredValue::Bool(true)
+        );
+        let snapshot = match driver.execute(PersistenceCommand::Inspect(InspectRequest {
+            application: application(),
+        })) {
+            PersistenceResult::Inspected(Ok(Some(snapshot))) => snapshot,
+            result => panic!("unexpected inspector result: {result:?}"),
+        };
+        assert_eq!(snapshot.outbox_pending_count, 0);
+        assert_eq!(snapshot.outbox_dispatching_count, 0);
+        assert_eq!(snapshot.outbox_reconciliation_count, 0);
+        assert_eq!(snapshot.outbox_completed_count, 0);
+        assert!(snapshot.outbox_samples.is_empty());
     }
 
     #[test]

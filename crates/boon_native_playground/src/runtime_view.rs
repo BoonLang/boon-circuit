@@ -2795,7 +2795,11 @@ mod tests {
             model.resolve_program_artifact_requests().unwrap();
             let requests = model.take_program_requests();
             if requests.is_empty() {
-                return completed;
+                settle_program_artifact_stores(model);
+                if model.pending_program_requests.is_empty() {
+                    return completed;
+                }
+                continue;
             }
             for request in requests {
                 assert!(
@@ -2826,7 +2830,11 @@ mod tests {
             model.resolve_program_artifact_requests().unwrap();
             let requests = model.take_program_requests();
             if requests.is_empty() {
-                return (activated, rejected);
+                settle_program_artifact_stores(model);
+                if model.pending_program_requests.is_empty() {
+                    return (activated, rejected);
+                }
+                continue;
             }
             for request in requests {
                 assert!(
@@ -3142,6 +3150,7 @@ document: Document/new(
                 "store.active_view",
                 "store.draft_compile_digest",
                 "store.draft_revision",
+                "store.last_valid_draft_artifact_id",
                 "store.last_valid_draft_revision",
                 "store.last_valid_draft_source",
                 "store.mode",
@@ -3761,15 +3770,19 @@ document: Document/new(
             .expect("corrected child revision requested");
         assert_eq!(corrected_request.compile.units[0].source, corrected_source);
         let corrected_artifact = boon_runtime::compile_program_artifact(&corrected_request.compile);
-        assert!(
-            model
-                .complete_program(
-                    &corrected_request.session,
-                    &corrected_request.request_id,
-                    corrected_artifact,
-                )
-                .unwrap()
-        );
+        let completion = model
+            .complete_program_observed(
+                &corrected_request.session,
+                &corrected_request.request_id,
+                corrected_artifact,
+            )
+            .unwrap();
+        assert!(matches!(
+            completion.completion,
+            ProgramCompletionObservation::ArtifactStorePending { .. }
+        ));
+        assert!(!completion.changed);
+        assert!(settle_program_artifact_stores(&mut model) >= 1);
         complete_pending_programs_successfully(&mut model);
         assert!(model.program_diagnostics().is_empty());
         assert!(model.retained_frame().nodes.values().any(|node| {
@@ -4493,6 +4506,7 @@ document: Document/new(
                 boon_runtime::compile_program_artifact(&request.compile),
             )
             .unwrap();
+        assert!(settle_program_artifact_stores(&mut model) >= 1);
         let after_completion = model.runtime.runtime().document_materialization_stats();
         let patches = model.take_patches();
         let structural = patches
@@ -4576,6 +4590,22 @@ document: Document/new(
             .unwrap();
         settle_program_artifact_stores(&mut first);
         let published_digest = boon_runtime::sha256_bytes(valid_source.as_bytes());
+        let published_artifact_id = match first
+            .runtime
+            .inspect_value_current("store.published_artifact_id", 1)
+            .unwrap()
+        {
+            Value::Text(value) if !value.is_empty() => value,
+            value => panic!("published artifact identity is not populated: {value:?}"),
+        };
+        let last_valid_draft_artifact_id = match first
+            .runtime
+            .inspect_value_current("store.last_valid_draft_artifact_id", 1)
+            .unwrap()
+        {
+            Value::Text(value) if !value.is_empty() => value,
+            value => panic!("last-valid draft artifact identity is not populated: {value:?}"),
+        };
 
         first
             .dispatch_source(
@@ -4649,6 +4679,25 @@ document: Document/new(
             ],
         );
         let first_frame = restored.frame();
+        let parent_bootstrap_artifacts = restored
+            .runtime
+            .runtime()
+            .primary_retained_output_frame()
+            .unwrap()
+            .nodes
+            .values()
+            .filter_map(|node| {
+                node.embedded_program
+                    .as_ref()
+                    .map(|program| program.bootstrap_artifact_id.clone())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            parent_bootstrap_artifacts
+                .iter()
+                .any(|id| id == &last_valid_draft_artifact_id),
+            "restored parent document omitted bootstrap artifact; ids={parent_bootstrap_artifacts:?}"
+        );
         assert!(first_frame.nodes.values().any(|node| {
             node.kind == DocumentNodeKind::TextInput
                 && node
@@ -4665,10 +4714,31 @@ document: Document/new(
                 .as_ref()
                 .is_some_and(|text| text.text == "2 passkeys")
         }));
+        assert_eq!(
+            restored
+                .program_host
+                .active_artifact(&ProgramSessionId("persons-public-draft".to_owned()))
+                .map(ProgramArtifact::id_text),
+            Some(last_valid_draft_artifact_id),
+            "restart did not mount the last-valid immutable child before the first frame"
+        );
+        assert!(
+            first_frame.nodes.values().any(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text == "Restart-safe page")
+            }),
+            "first frame omitted the mounted last-valid child; texts={:?}",
+            first_frame
+                .nodes
+                .values()
+                .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+                .collect::<Vec<_>>()
+        );
         assert!(restored.program_diagnostics().is_empty());
 
         let (activated, rejected) = complete_pending_programs(&mut restored);
-        assert!(activated >= 1);
+        assert_eq!(activated, 0, "stored bootstrap must not be recompiled");
         assert_eq!(rejected, 1);
         assert_eq!(restored.program_diagnostics().len(), 1);
         assert_eq!(
@@ -4737,6 +4807,27 @@ document: Document/new(
                 ("store.credential_count", Value::Number(2)),
             ],
         );
+        restored
+            .dispatch_source(
+                "store.elements.show_published_page",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        assert!(restored.resolve_program_artifact_requests().unwrap());
+        assert_eq!(
+            restored
+                .program_host
+                .active_artifact(&ProgramSessionId("persons-public-published".to_owned()))
+                .map(ProgramArtifact::id_text),
+            Some(published_artifact_id),
+            "self-contained import did not restore the immutable published child artifact"
+        );
+        assert!(restored.retained_frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "Restart-safe page")
+        }));
 
         restored.runtime.shutdown().unwrap();
         drop(restored);
@@ -4943,7 +5034,50 @@ document: Document/new(
                 .unwrap(),
             Value::Text(workspace_id.clone())
         );
-        assert_eq!(restored.take_program_requests().len(), 1);
+        assert!(
+            restored.take_program_requests().is_empty(),
+            "restart must mount the acknowledged child artifact without recompiling it"
+        );
+        let restored_texts = restored
+            .retained_frame()
+            .nodes
+            .values()
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.clone()))
+            .collect::<Vec<_>>();
+        let active_draft = restored
+            .program_host
+            .active_artifact(&ProgramSessionId("persons-public-draft".to_owned()))
+            .map(|artifact| (artifact.id_text(), artifact.source_digest().to_owned()));
+        let draft_hosts = restored
+            .runtime
+            .runtime()
+            .primary_retained_output_frame()
+            .unwrap()
+            .nodes
+            .values()
+            .filter_map(|node| {
+                node.embedded_program.as_ref().and_then(|program| {
+                    (program.session_key == "persons-public-draft").then_some((
+                        node.id.0.clone(),
+                        program.mount,
+                        program.bootstrap_artifact_id.clone(),
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        let stored_draft = draft_hosts
+            .first()
+            .and_then(|(_, _, id)| boon_persistence::ContentArtifactId::from_hex(id).ok())
+            .map(|id| restored.runtime.load_content_artifact(id))
+            .transpose()
+            .unwrap()
+            .flatten()
+            .map(|artifact| (artifact.id, artifact.media_type, artifact.bytes.len()));
+        let diagnostics = restored.program_diagnostics();
+        assert!(
+            restored_texts.iter().any(|text| text == "Durable profile"),
+            "restart did not mount the acknowledged draft child; active={active_draft:?}, stored={stored_draft:?}, diagnostics={diagnostics:?}, hosts={draft_hosts:?}, retained texts={restored_texts:?}"
+        );
 
         let preview = restored.preview_state_artifact(&artifact).unwrap();
         assert_eq!(preview.source_schema_version, 1);

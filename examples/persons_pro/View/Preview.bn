@@ -71,7 +71,13 @@ FUNCTION draft_compiler() {
         style: [width: 0, height: 0, paint: False]
         source: PASSED.store.source_draft
         revision: PASSED.store.draft_revision
-        bootstrap_source: PASSED.store.last_valid_draft_source
+        persist_artifact: True
+        bootstrap_source:
+            Text/is_empty(PASSED.store.last_valid_draft_artifact_id) |> WHEN {
+                True => PASSED.store.last_valid_draft_source
+                False => Text/empty()
+            }
+        bootstrap_artifact_id: PASSED.store.last_valid_draft_artifact_id
         bootstrap_revision: PASSED.store.last_valid_draft_revision
         capability_profile: PublicDocument
         session_key: TEXT { persons-public-draft }
@@ -88,7 +94,13 @@ FUNCTION draft_program() {
         ]
         source: PASSED.store.source_draft
         revision: PASSED.store.draft_revision
-        bootstrap_source: PASSED.store.last_valid_draft_source
+        persist_artifact: True
+        bootstrap_source:
+            Text/is_empty(PASSED.store.last_valid_draft_artifact_id) |> WHEN {
+                True => PASSED.store.last_valid_draft_source
+                False => Text/empty()
+            }
+        bootstrap_artifact_id: PASSED.store.last_valid_draft_artifact_id
         bootstrap_revision: PASSED.store.last_valid_draft_revision
         capability_profile: PublicDocument
         session_key: TEXT { persons-public-draft }

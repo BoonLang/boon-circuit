@@ -843,6 +843,8 @@ struct HostedProgram {
     controller: ProgramController,
     request_diagnostic: Option<ProgramDiagnostic>,
     latest_request_id: Option<ProgramRequestId>,
+    latest_request_artifact_id: Option<ContentArtifactId>,
+    latest_request_persists_artifact: bool,
     bootstrapping: bool,
 }
 
@@ -1042,6 +1044,8 @@ impl ProgramDocumentHost {
                     descriptor: descriptor.clone(),
                     request_diagnostic: None,
                     latest_request_id: None,
+                    latest_request_artifact_id: None,
+                    latest_request_persists_artifact: false,
                     bootstrapping: false,
                 });
             if let Some((conflicting_host, conflicting)) = descriptors
@@ -1099,6 +1103,8 @@ impl ProgramDocumentHost {
                     let request_id =
                         program_request_id(&self.parent_application, &session, &request_descriptor);
                     program.latest_request_id = Some(request_id.clone());
+                    program.latest_request_artifact_id = artifact_id;
+                    program.latest_request_persists_artifact = request_descriptor.persist_artifact;
                     let units = artifact_id.map_or_else(
                         || {
                             vec![RuntimeSourceUnit {
@@ -1354,7 +1360,7 @@ impl ProgramDocumentHost {
     ) -> bool {
         self.programs.get(session).is_some_and(|program| {
             program.latest_request_id.as_ref() == Some(request_id)
-                && program.descriptor.persist_artifact
+                && program.latest_request_persists_artifact
         })
     }
 
@@ -1365,8 +1371,18 @@ impl ProgramDocumentHost {
     ) -> bool {
         self.programs.get(session).is_some_and(|program| {
             program.latest_request_id.as_ref() == Some(request_id)
-                && !program.descriptor.artifact_id.is_empty()
+                && program.latest_request_artifact_id.is_some()
         })
+    }
+
+    pub fn request_is_current(
+        &self,
+        session: &ProgramSessionId,
+        request_id: &ProgramRequestId,
+    ) -> bool {
+        self.programs
+            .get(session)
+            .is_some_and(|program| program.latest_request_id.as_ref() == Some(request_id))
     }
 
     pub fn lifecycle_source_paths(&self, session: &ProgramSessionId, intent: &str) -> Vec<String> {
@@ -1729,6 +1745,7 @@ fn same_program_definition(
         && left.persist_artifact == right.persist_artifact
         && left.revision == right.revision
         && left.bootstrap_source_digest == right.bootstrap_source_digest
+        && left.bootstrap_artifact_id == right.bootstrap_artifact_id
         && left.bootstrap_revision == right.bootstrap_revision
         && left.capability_profile == right.capability_profile
 }
@@ -1747,26 +1764,46 @@ fn same_current_program_definition(
 fn bootstrap_descriptor(
     descriptor: &EmbeddedProgramDescriptor,
 ) -> Result<Option<EmbeddedProgramDescriptor>, ProgramDiagnostic> {
-    let has_bootstrap =
-        descriptor.bootstrap_revision > 0 && !descriptor.bootstrap_source.is_empty();
-    let differs = descriptor.bootstrap_revision != descriptor.revision
-        || descriptor.bootstrap_source_digest != descriptor.source_digest;
-    if !has_bootstrap || !differs {
-        return Ok(None);
-    }
-    if descriptor.bootstrap_revision >= descriptor.revision {
+    let has_source = !descriptor.bootstrap_source.is_empty();
+    let has_artifact = !descriptor.bootstrap_artifact_id.trim().is_empty();
+    if has_source && has_artifact {
         return Err(ProgramDiagnostic::new(
             descriptor.revision,
             ProgramDiagnosticPhase::Request,
-            "bootstrap_revision must be lower than the current program revision",
+            "embedded program bootstrap cannot provide both source and artifact_id",
+        ));
+    }
+    let has_bootstrap = descriptor.bootstrap_revision > 0 && (has_source || has_artifact);
+    let differs = descriptor.bootstrap_revision != descriptor.revision
+        || descriptor.bootstrap_source_digest != descriptor.source_digest
+        || descriptor.bootstrap_artifact_id != descriptor.artifact_id;
+    if !has_bootstrap || !differs {
+        return Ok(None);
+    }
+    if descriptor.bootstrap_revision > descriptor.revision {
+        return Err(ProgramDiagnostic::new(
+            descriptor.revision,
+            ProgramDiagnosticPhase::Request,
+            "bootstrap_revision must not exceed the current program revision",
         ));
     }
     let mut bootstrap = descriptor.clone();
-    bootstrap.source = descriptor.bootstrap_source.clone();
-    bootstrap.source_digest = descriptor.bootstrap_source_digest.clone();
+    bootstrap.source = if has_artifact {
+        String::new()
+    } else {
+        descriptor.bootstrap_source.clone()
+    };
+    bootstrap.source_digest = if has_artifact {
+        String::new()
+    } else {
+        descriptor.bootstrap_source_digest.clone()
+    };
+    bootstrap.artifact_id = descriptor.bootstrap_artifact_id.clone();
+    bootstrap.persist_artifact = false;
     bootstrap.revision = descriptor.bootstrap_revision;
     bootstrap.bootstrap_source.clear();
     bootstrap.bootstrap_source_digest.clear();
+    bootstrap.bootstrap_artifact_id.clear();
     bootstrap.bootstrap_revision = 0;
     Ok(Some(bootstrap))
 }
@@ -2515,6 +2552,109 @@ scene: Scene/Element/program(
     }
 
     #[test]
+    fn stored_bootstrap_artifact_mounts_before_invalid_current_without_recompile() {
+        let bootstrap_source = child_source("stored bootstrap");
+        let bootstrap_parent = parent_frame(1, &bootstrap_source);
+        let (_, bootstrap_requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "bootstrap-build", "local"),
+            &bootstrap_parent,
+        );
+        let artifact = compile_program_artifact(&bootstrap_requests[0].compile).unwrap();
+
+        let mut parent = parent_frame(2, "scene: Missing/constructor(");
+        let descriptor = parent
+            .nodes
+            .get_mut(&DocumentNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap();
+        descriptor.bootstrap_artifact_id = artifact.id_text();
+        descriptor.bootstrap_revision = 1;
+
+        let (mut host, requests) = ProgramDocumentHost::mount(
+            ApplicationIdentity::new("dev.boon.parent", "artifact-bootstrap", "local"),
+            &parent,
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].artifact_id, Some(artifact.id()));
+        assert!(requests[0].compile.units.is_empty());
+        assert!(host.request_is_artifact_load(&requests[0].session, &requests[0].request_id));
+        assert!(!host.request_persists_artifact(&requests[0].session, &requests[0].request_id));
+        let (completion, update) =
+            host.complete(&requests[0].session, &requests[0].request_id, Ok(artifact));
+        assert_eq!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
+        );
+        assert!(update.bootstrap);
+        assert_eq!(update.requests.len(), 1);
+        assert_eq!(update.requests[0].compile.revision, 2);
+        assert!(update.requests[0].artifact_id.is_none());
+
+        let (completion, update) = host.complete(
+            &update.requests[0].session,
+            &update.requests[0].request_id,
+            compile_program_artifact(&update.requests[0].compile),
+        );
+        assert!(matches!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Rejected { .. })
+        ));
+        assert!(update.patches.is_empty());
+        assert_eq!(
+            host.active_artifact(&ProgramSessionId("program".to_owned()))
+                .unwrap()
+                .revision(),
+            1
+        );
+    }
+
+    #[test]
+    fn stored_bootstrap_artifact_can_restore_the_exact_current_revision() {
+        let source = child_source("exact current");
+        let parent = parent_frame(2, &source);
+        let application =
+            ApplicationIdentity::new("dev.boon.parent", "exact-artifact-bootstrap", "local");
+        let (_, build_requests) = ProgramDocumentHost::mount(application.clone(), &parent);
+        let artifact = compile_program_artifact(&build_requests[0].compile).unwrap();
+
+        let mut restored_parent = parent;
+        let descriptor = restored_parent
+            .nodes
+            .get_mut(&DocumentNodeId("program".to_owned()))
+            .unwrap()
+            .embedded_program
+            .as_mut()
+            .unwrap();
+        descriptor.bootstrap_artifact_id = artifact.id_text();
+        descriptor.bootstrap_revision = 2;
+
+        let (mut host, requests) = ProgramDocumentHost::mount(application, &restored_parent);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].artifact_id, Some(artifact.id()));
+        let (completion, update) =
+            host.complete(&requests[0].session, &requests[0].request_id, Ok(artifact));
+        assert_eq!(
+            completion,
+            ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 2 })
+        );
+        assert!(update.bootstrap);
+        assert!(update.requests.is_empty());
+        assert_eq!(
+            host.active_artifact(&ProgramSessionId("program".to_owned()))
+                .unwrap()
+                .revision(),
+            2
+        );
+        assert!(host.frame().nodes.values().any(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text == "exact current")
+        }));
+    }
+
+    #[test]
     fn bootstrap_metadata_change_does_not_recompile_current_program() {
         let source = child_source("current");
         let first_parent = parent_frame(2, &source);
@@ -2566,7 +2706,7 @@ scene: Scene/Element/program(
         descriptor.bootstrap_source = child_source("not older");
         descriptor.bootstrap_source_digest =
             crate::sha256_bytes(descriptor.bootstrap_source.as_bytes());
-        descriptor.bootstrap_revision = 2;
+        descriptor.bootstrap_revision = 3;
 
         let (host, requests) = ProgramDocumentHost::mount(
             ApplicationIdentity::new("dev.boon.parent", "bad-bootstrap", "local"),
@@ -2577,7 +2717,7 @@ scene: Scene/Element/program(
             host.diagnostics()[0]
                 .diagnostic
                 .message
-                .contains("must be lower")
+                .contains("must not exceed")
         );
     }
 }

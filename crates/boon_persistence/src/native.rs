@@ -5,14 +5,14 @@ use super::codec::{
     scalar_component_blob_references,
 };
 use super::{
-    ActivationAck, ActivationBatch, BarrierAck, CheckpointBatch, CommitAck, CompactAck,
-    ContentArtifact, ContentArtifactId, DecodeLimits, DurableChange, DurableOutboxItem,
-    LoadContentArtifactRequest, OutboxItemId, PersistenceCommand, PersistenceDriver,
-    PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
+    ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, CheckpointBatch, CommitAck,
+    CompactAck, ContentArtifact, ContentArtifactId, DecodeLimits, DurableChange, DurableOutboxItem,
+    ExportApplicationRequest, LoadContentArtifactRequest, OutboxItemId, PersistenceCommand,
+    PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
     PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
     ShutdownAck, StoreError, StoredList, StoredRow, encode_restore_image, hash_application,
-    validate_activation, validate_checkpoint, validate_content_artifact, validate_initial_image,
-    validate_list,
+    validate_activation, validate_application_transfer, validate_checkpoint,
+    validate_content_artifact, validate_initial_image, validate_list,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
 use minicbor::{Decoder, Encoder};
@@ -106,21 +106,6 @@ impl RedbDriver {
 
     fn database(&self) -> Result<&Database, StoreError> {
         self.database.as_ref().ok_or(StoreError::Closed)
-    }
-
-    fn load_outbox(
-        &self,
-        application: &ApplicationIdentity,
-    ) -> Result<BTreeMap<OutboxItemId, DurableOutboxItem>, StoreError> {
-        let transaction = self.database()?.begin_read().map_err(backend)?;
-        let table = transaction.open_table(OUTBOX).map_err(backend)?;
-        let mut decoded_bytes = 0;
-        load_outbox_read(
-            &table,
-            &application_key(application),
-            self.limits,
-            &mut decoded_bytes,
-        )
     }
 
     fn load_image(
@@ -249,7 +234,7 @@ impl RedbDriver {
             }
         }
 
-        let outbox = load_outbox_read(
+        let outbox = load_outbox_table(
             &transaction.open_table(OUTBOX).map_err(backend)?,
             &app,
             self.limits,
@@ -368,10 +353,6 @@ impl RedbDriver {
     fn commit(&self, batch: CheckpointBatch) -> Result<CommitAck, StoreError> {
         validate_checkpoint(&batch)?;
         let app = application_key(&batch.application);
-        let current_outbox = self.load_outbox(&batch.application)?;
-        let mut candidate_outbox = current_outbox.clone();
-        super::apply_durable_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
-        super::validate_outbox(&candidate_outbox)?;
         let database = self.database()?;
         let mut transaction = database.begin_write().map_err(backend)?;
         immediate(&mut transaction)?;
@@ -382,6 +363,13 @@ impl RedbDriver {
             let mut meta = read_meta_write(&meta_table, &batch.application, self.limits)?
                 .ok_or(StoreError::MissingApplication)?;
             validate_checkpoint_header(&meta, &batch)?;
+
+            let mut outbox = transaction.open_table(OUTBOX).map_err(backend)?;
+            let mut decoded_bytes = 0;
+            let current_outbox = load_outbox_table(&outbox, &app, self.limits, &mut decoded_bytes)?;
+            let mut candidate_outbox = current_outbox.clone();
+            super::apply_durable_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
+            super::validate_outbox(&candidate_outbox)?;
 
             let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
             let mut lists = transaction.open_table(LISTS).map_err(backend)?;
@@ -399,7 +387,6 @@ impl RedbDriver {
                 &mut candidate_blobs,
             )?;
             sync_blobs(&mut blob_table, &app, &current_blobs, &candidate_blobs)?;
-            let mut outbox = transaction.open_table(OUTBOX).map_err(backend)?;
             replace_outbox(&mut outbox, &app, &current_outbox, &candidate_outbox)?;
 
             let mut checkpoints = transaction.open_table(CHECKPOINTS).map_err(backend)?;
@@ -529,6 +516,32 @@ impl RedbDriver {
                 .ok_or(StoreError::MissingApplication)?;
             validate_activation_header(&meta, &batch)?;
 
+            let mut artifacts = transaction.open_table(ARTIFACTS).map_err(backend)?;
+            for (id, artifact) in &batch.content_artifacts {
+                let key = content_artifact_storage_key(&app, *id);
+                let existing = artifacts
+                    .get(key.as_slice())
+                    .map_err(backend)?
+                    .map(|value| value.value().to_vec());
+                match existing {
+                    Some(existing) => {
+                        let decoded = decode_content_artifact(*id, &existing, self.limits)?;
+                        if decoded != *artifact {
+                            return Err(StoreError::InvalidContentArtifact(
+                                "content digest collides with different artifact bytes".to_owned(),
+                            ));
+                        }
+                    }
+                    None => {
+                        let bytes = encode_content_artifact(artifact)?;
+                        artifacts
+                            .insert(key.as_slice(), bytes.as_slice())
+                            .map_err(backend)?;
+                    }
+                }
+            }
+            drop(artifacts);
+
             let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
             let mut lists = transaction.open_table(LISTS).map_err(backend)?;
             let mut rows = transaction.open_table(ROWS).map_err(backend)?;
@@ -656,7 +669,7 @@ impl RedbDriver {
         .try_fold(0u64, u64::checked_add)
         .ok_or_else(|| corrupt("stored byte count overflow"))?;
         let mut decoded_bytes = 0;
-        let outbox = load_outbox_read(
+        let outbox = load_outbox_table(
             &transaction.open_table(OUTBOX).map_err(backend)?,
             &app,
             self.limits,
@@ -790,6 +803,47 @@ impl RedbDriver {
             .transpose()
     }
 
+    fn export_application(
+        &self,
+        request: ExportApplicationRequest,
+    ) -> Result<ApplicationTransfer, StoreError> {
+        // RedbDriver is owned exclusively by the persistence worker. No write
+        // can interleave between these reads within one driver command.
+        let restore_image = self
+            .load_image(&request.application)?
+            .ok_or(StoreError::MissingApplication)?;
+        let transaction = self.database()?.begin_read().map_err(backend)?;
+        let table = transaction.open_table(ARTIFACTS).map_err(backend)?;
+        let app = application_key(&request.application);
+        let mut content_artifacts = BTreeMap::new();
+        let mut decoded_bytes = 0usize;
+        for entry in table.iter().map_err(backend)? {
+            let (key, value) = entry.map_err(backend)?;
+            let key = key.value();
+            if !key.starts_with(&app) {
+                continue;
+            }
+            if key.len() != 64 {
+                return Err(corrupt("invalid content artifact key"));
+            }
+            let mut digest = [0; 32];
+            digest.copy_from_slice(&key[32..]);
+            let id = ContentArtifactId(digest);
+            let bytes = value.value();
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), self.limits)?;
+            let artifact = decode_content_artifact(id, bytes, self.limits)?;
+            if content_artifacts.insert(id, artifact).is_some() {
+                return Err(corrupt("duplicate content artifact key"));
+            }
+        }
+        let transfer = ApplicationTransfer {
+            restore_image,
+            content_artifacts,
+        };
+        validate_application_transfer(&transfer)?;
+        Ok(transfer)
+    }
+
     fn mark_clean_shutdown(&self) -> Result<(), StoreError> {
         let database = self.database()?;
         let mut transaction = database.begin_write().map_err(backend)?;
@@ -889,6 +943,9 @@ impl PersistenceDriver for RedbDriver {
             PersistenceCommand::Compact(request) => {
                 PersistenceResult::Compacted(self.compact(&request.application))
             }
+            PersistenceCommand::ExportApplication(request) => {
+                PersistenceResult::ApplicationExported(self.export_application(request))
+            }
             PersistenceCommand::PutContentArtifact(request) => {
                 PersistenceResult::ContentArtifactStored(self.put_content_artifact(request))
             }
@@ -917,12 +974,15 @@ fn create_tables(transaction: &WriteTransaction) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn load_outbox_read(
-    table: &ReadOnlyTable<&[u8], &[u8]>,
+fn load_outbox_table<T>(
+    table: &T,
     app: &[u8; 32],
     limits: DecodeLimits,
     decoded_bytes: &mut usize,
-) -> Result<BTreeMap<OutboxItemId, DurableOutboxItem>, StoreError> {
+) -> Result<BTreeMap<OutboxItemId, DurableOutboxItem>, StoreError>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
     let mut outbox = BTreeMap::new();
     for entry in table.iter().map_err(backend)? {
         let (key, value) = entry.map_err(backend)?;
@@ -2574,6 +2634,7 @@ mod tests {
                 }],
                 completed_migration_edges: vec![edge],
                 deleted_memory: vec![old],
+                content_artifacts: BTreeMap::new(),
                 checksum: [0; 32],
             }
             .seal();
@@ -2729,10 +2790,10 @@ mod tests {
             PersistenceResult::Committed(Ok(_))
         ));
         let acknowledged = load(&mut driver, app.clone());
-        assert!(matches!(
-            acknowledged.outbox[&item_id].state,
-            DurableOutboxState::Completed { attempt: 1, .. }
-        ));
+        assert!(
+            !acknowledged.outbox.contains_key(&item_id),
+            "the atomically acknowledged outcome must consume its durable obligation"
+        );
         assert_eq!(
             acknowledged.scalars[&completed_memory].value,
             StoredValue::Bool(true)

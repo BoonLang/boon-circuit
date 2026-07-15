@@ -12,7 +12,8 @@ use boon_persistence::{
     PersistenceInspectorSnapshot, PersistenceWorkerConfig, PersistenceWorkerStartError,
     PersistenceWorkerStatus, PutContentArtifactAck, ResetApplicationAck, ResetApplicationBatch,
     RestoreImage, StoredValue, TurnEnqueueError, TurnReservationError,
-    apply_durable_outbox_changes, decode_restore_image, encode_restore_image, stage_migration,
+    apply_durable_outbox_changes, decode_application_transfer, encode_application_transfer,
+    stage_migration,
 };
 use boon_plan::{MachinePlan, MemoryKind};
 use boon_plan_executor::{SessionOptions, SourceEvent, Value};
@@ -642,12 +643,11 @@ impl PersistentRuntime {
         self.persistence
             .barrier()
             .map_err(PersistentActivationError::Persistence)?;
-        let image = self
+        let transfer = self
             .persistence
-            .load()
-            .map_err(PersistentActivationError::Persistence)?
-            .ok_or(PersistentActivationError::MissingDurableState)?;
-        encode_restore_image(&image)
+            .export_application()
+            .map_err(PersistentActivationError::Persistence)?;
+        encode_application_transfer(&transfer)
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))
     }
 
@@ -656,7 +656,7 @@ impl PersistentRuntime {
         artifact: &[u8],
         options: SessionOptions,
     ) -> Result<PersistentStateArtifactPreview, PersistentActivationError> {
-        let (_, preview, _, _) = self.prepare_state_artifact(artifact, options)?;
+        let (_, preview, _, _, _) = self.prepare_state_artifact(artifact, options)?;
         Ok(preview)
     }
 
@@ -665,12 +665,15 @@ impl PersistentRuntime {
         artifact: &[u8],
         options: SessionOptions,
     ) -> Result<PersistentStateArtifactActivation, PersistentActivationError> {
-        let (candidate, preview, completed_migration_edges, rebuild_derived_us) =
+        let (candidate, preview, completed_migration_edges, content_artifacts, rebuild_derived_us) =
             self.prepare_state_artifact(artifact, options)?;
         self.last_rebuild_derived_us = rebuild_derived_us;
         let mount = candidate.mount();
-        let acknowledgement =
-            self.activate_settled_candidate(candidate, completed_migration_edges)?;
+        let acknowledgement = self.activate_settled_candidate_with_artifacts(
+            candidate,
+            completed_migration_edges,
+            content_artifacts,
+        )?;
         Ok(PersistentStateArtifactActivation {
             mount,
             acknowledgement,
@@ -766,6 +769,7 @@ impl PersistentRuntime {
             LiveRuntime,
             PersistentStateArtifactPreview,
             BTreeSet<boon_plan::MigrationEdgeId>,
+            BTreeMap<ContentArtifactId, ContentArtifact>,
             u64,
         ),
         PersistentActivationError,
@@ -779,8 +783,9 @@ impl PersistentRuntime {
             .map_err(PersistentActivationError::Persistence)?
             .ok_or(PersistentActivationError::MissingDurableState)?;
         reject_unfinished_outbox(&current, "import state")?;
-        let imported = decode_restore_image(artifact, DecodeLimits::default())
+        let transfer = decode_application_transfer(artifact, DecodeLimits::default())
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
+        let imported = transfer.restore_image;
         if imported.application != current.application {
             return Err(PersistentActivationError::Runtime(
                 "state artifact belongs to a different application namespace".to_owned(),
@@ -834,6 +839,7 @@ impl PersistentRuntime {
             candidate,
             preview,
             completed_migration_edges,
+            transfer.content_artifacts,
             rebuild_derived_us,
         ))
     }
@@ -1110,6 +1116,19 @@ impl PersistentRuntime {
         candidate: LiveRuntime,
         completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
     ) -> Result<ActivationAck, PersistentActivationError> {
+        self.activate_settled_candidate_with_artifacts(
+            candidate,
+            completed_migration_edges,
+            BTreeMap::new(),
+        )
+    }
+
+    fn activate_settled_candidate_with_artifacts(
+        &mut self,
+        candidate: LiveRuntime,
+        completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
+        content_artifacts: BTreeMap<ContentArtifactId, ContentArtifact>,
+    ) -> Result<ActivationAck, PersistentActivationError> {
         let current = self
             .persistence
             .load()
@@ -1119,8 +1138,10 @@ impl PersistentRuntime {
             .durable_restore_image(current.epoch, completed_migration_edges)
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         candidate_image.outbox = current.outbox.clone();
-        let batch = ActivationBatch::between(&current, &candidate_image)
+        let mut batch = ActivationBatch::between(&current, &candidate_image)
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
+        batch.content_artifacts = content_artifacts;
+        batch = batch.seal();
         let acknowledgement = self
             .persistence
             .activate(batch)
@@ -2027,10 +2048,10 @@ mod tests {
         assert_eq!(load_count.load(Ordering::Acquire), restart_loads);
         let durable = restarted.load_durable_image().unwrap().unwrap();
         assert_eq!(load_count.load(Ordering::Acquire), restart_loads + 1);
-        assert!(matches!(
-            durable.outbox.values().next().map(|item| &item.state),
-            Some(DurableOutboxState::Completed { attempt: 1, .. })
-        ));
+        assert!(
+            durable.outbox.is_empty(),
+            "the atomically persisted effect outcome must consume its outbox obligation"
+        );
         restarted.shutdown().unwrap();
 
         let (mut restored, _) = PersistentRuntime::from_shared_machine_plan(
@@ -2461,6 +2482,103 @@ mod tests {
                 .is_empty()
         );
         runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn state_artifact_moves_immutable_content_to_an_independent_store_atomically() {
+        let source = include_str!("../../../examples/counter.bn");
+        let compiled = LiveRuntime::from_source_with_identity(
+            "persistent-transfer-source.bn",
+            source,
+            boon_plan::ApplicationIdentity::new("dev.boon.persistent-transfer", "test", "local"),
+        )
+        .unwrap();
+        let plan = compiled.shared_machine_plan();
+        let content = ContentArtifact::new(
+            "application/vnd.boon.test-program",
+            b"immutable child artifact".to_vec(),
+        )
+        .unwrap();
+        let mut source_driver = InMemoryDriver::default();
+        source_driver.seed(RestoreImage::empty(
+            plan.application.identity.clone(),
+            plan.persistence.schema_version,
+            plan.persistence.schema_hash,
+        ));
+        assert!(matches!(
+            source_driver.execute(boon_persistence::PersistenceCommand::PutContentArtifact(
+                boon_persistence::PutContentArtifactRequest {
+                    application: plan.application.identity.clone(),
+                    artifact: content.clone(),
+                },
+            )),
+            boon_persistence::PersistenceResult::ContentArtifactStored(Ok(_))
+        ));
+        let (mut source_runtime, _) = PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(&plan),
+            SessionOptions::default(),
+            source_driver,
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        let increment = source_runtime
+            .runtime()
+            .source_event(
+                1,
+                "store.sources.increment_button.press",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        source_runtime.dispatch(increment).unwrap();
+        source_runtime.barrier().unwrap();
+        let artifact = source_runtime.export_state_artifact().unwrap();
+
+        let (mut destination, _) = PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(&plan),
+            SessionOptions::default(),
+            InMemoryDriver::default(),
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        destination
+            .activate_state_artifact(&artifact, SessionOptions::default())
+            .unwrap();
+        assert_eq!(
+            destination
+                .runtime
+                .root_value_current("store.count")
+                .unwrap(),
+            Value::Number(1)
+        );
+        assert_eq!(
+            destination.load_content_artifact(content.id).unwrap(),
+            Some(content.clone())
+        );
+
+        let authority_before = destination.load_durable_image().unwrap().unwrap();
+        let mut corrupt = artifact;
+        let payload = corrupt
+            .windows(content.bytes.len())
+            .position(|window| window == content.bytes)
+            .expect("transfer contains immutable content payload");
+        corrupt[payload] ^= 1;
+        assert!(
+            destination
+                .activate_state_artifact(&corrupt, SessionOptions::default())
+                .is_err()
+        );
+        assert_eq!(
+            destination.load_durable_image().unwrap().unwrap(),
+            authority_before
+        );
+        assert_eq!(
+            destination.load_content_artifact(content.id).unwrap(),
+            Some(content)
+        );
+
+        source_runtime.shutdown().unwrap();
+        destination.shutdown().unwrap();
     }
 
     #[test]

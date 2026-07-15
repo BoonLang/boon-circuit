@@ -1,8 +1,9 @@
 use super::{
-    ActivationAck, ActivationBatch, BarrierAck, BarrierRequest, CheckpointBatch, CommitAck,
-    CompactAck, CompactRequest, ContentArtifact, ContentArtifactId, DurableChange,
-    DurableOutboxChange, InspectRequest, LoadContentArtifactRequest, PersistenceCommand,
-    PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
+    ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, BarrierRequest,
+    CheckpointBatch, CommitAck, CompactAck, CompactRequest, ContentArtifact, ContentArtifactId,
+    DurableChange, DurableOutboxChange, ExportApplicationRequest, InspectRequest,
+    LoadContentArtifactRequest, PersistenceCommand, PersistenceDriver,
+    PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
     PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
     RestoreRequest, ShutdownAck, ShutdownRequest, StoreError,
 };
@@ -456,6 +457,7 @@ enum ControlReply {
     Activate(Result<ActivationAck, StoreError>),
     ResetApplication(Result<ResetApplicationAck, StoreError>),
     Compact(Result<CompactAck, StoreError>),
+    ExportApplication(Result<ApplicationTransfer, StoreError>),
     PutContentArtifact(Result<PutContentArtifactAck, StoreError>),
     LoadContentArtifact(Result<Option<ContentArtifact>, StoreError>),
     Shutdown(Result<ShutdownAck, StoreError>),
@@ -470,6 +472,7 @@ enum WorkerMessage {
     Activate(Box<ActivationBatch>, SyncSender<ControlReply>),
     ResetApplication(Box<ResetApplicationBatch>, SyncSender<ControlReply>),
     Compact(SyncSender<ControlReply>),
+    ExportApplication(SyncSender<ControlReply>),
     PutContentArtifact(Box<ContentArtifact>, SyncSender<ControlReply>),
     PutContentArtifactAsync(ContentArtifactStoreTicket, Box<ContentArtifact>),
     LoadContentArtifact(ContentArtifactId, SyncSender<ControlReply>),
@@ -761,6 +764,17 @@ impl PersistenceCoordinator {
             ControlReply::Compact(result) => result.map_err(PersistenceControlError::Store),
             _ => Err(PersistenceControlError::Protocol(
                 "worker returned a non-compact response".to_owned(),
+            )),
+        }
+    }
+
+    pub fn export_application(&self) -> Result<ApplicationTransfer, PersistenceControlError> {
+        match self.control_request(WorkerMessage::ExportApplication, false)? {
+            ControlReply::ExportApplication(result) => {
+                result.map_err(PersistenceControlError::Store)
+            }
+            _ => Err(PersistenceControlError::Protocol(
+                "worker returned a non-application-export response".to_owned(),
             )),
         }
     }
@@ -1373,6 +1387,21 @@ where
             let _ = reply.send(ControlReply::Compact(result));
             false
         }
+        WorkerMessage::ExportApplication(reply) => {
+            let result = match driver.execute(PersistenceCommand::ExportApplication(
+                ExportApplicationRequest {
+                    application: durable.application.clone(),
+                },
+            )) {
+                PersistenceResult::ApplicationExported(result) => result,
+                _ => Err(StoreError::Backend(
+                    "driver returned the wrong result for ExportApplication".to_owned(),
+                )),
+            };
+            record_result_error(shared, &result);
+            let _ = reply.send(ControlReply::ExportApplication(result));
+            false
+        }
         WorkerMessage::PutContentArtifact(artifact, reply) => {
             let result = match driver.execute(PersistenceCommand::PutContentArtifact(
                 PutContentArtifactRequest {
@@ -1463,6 +1492,9 @@ fn send_control_error(message: WorkerMessage, error: StoreError, shared: &Shared
         }
         WorkerMessage::Compact(reply) => {
             let _ = reply.send(ControlReply::Compact(Err(error)));
+        }
+        WorkerMessage::ExportApplication(reply) => {
+            let _ = reply.send(ControlReply::ExportApplication(Err(error)));
         }
         WorkerMessage::PutContentArtifact(_, reply) => {
             let _ = reply.send(ControlReply::PutContentArtifact(Err(error)));

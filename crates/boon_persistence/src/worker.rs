@@ -232,6 +232,9 @@ pub struct PendingTurnRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistenceWorkerStatus {
     pub pending: Option<PendingTurnRange>,
+    /// Checkpoint commits needed to make the currently accepted authority
+    /// durable. Multiple logical turns may share one worker-owned checkpoint.
+    pub pending_checkpoint_batches: usize,
     pub durable_epoch: u64,
     pub durable_through_turn_sequence: u64,
     /// Turns waiting in the channel. Worker-owned batch turns remain visible in
@@ -338,11 +341,13 @@ struct AdmissionState {
     reservations: usize,
     next_turn_sequence: u64,
     pending: VecDeque<PendingMeta>,
+    active_checkpoint_turns: usize,
 }
 
 #[derive(Debug)]
 struct SharedState {
     capacity: usize,
+    max_batch_turns: usize,
     admission: Mutex<AdmissionState>,
     reservation_changed: Condvar,
     queue_depth: AtomicUsize,
@@ -365,15 +370,17 @@ struct SharedState {
 }
 
 impl SharedState {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, max_batch_turns: usize) -> Self {
         Self {
             capacity,
+            max_batch_turns,
             admission: Mutex::new(AdmissionState {
                 accepting: false,
                 closed: false,
                 reservations: 0,
                 next_turn_sequence: 1,
                 pending: VecDeque::new(),
+                active_checkpoint_turns: 0,
             }),
             reservation_changed: Condvar::new(),
             queue_depth: AtomicUsize::new(0),
@@ -439,10 +446,21 @@ impl SharedState {
                 "worker durable acknowledgement split the admitted turn sequence".to_owned(),
             ));
         }
+        admission.active_checkpoint_turns = 0;
         self.durable_epoch.store(epoch, Ordering::Release);
         self.durable_turn
             .store(through_turn_sequence, Ordering::Release);
         Ok(())
+    }
+
+    fn begin_checkpoint_batch(&self, turn_count: usize) {
+        let mut admission = lock(&self.admission);
+        debug_assert_eq!(admission.active_checkpoint_turns, 0);
+        admission.active_checkpoint_turns = turn_count;
+    }
+
+    fn clear_checkpoint_batch(&self) {
+        lock(&self.admission).active_checkpoint_turns = 0;
     }
 
     fn mark_activation(&self, epoch: u64, through_turn_sequence: u64) {
@@ -456,6 +474,15 @@ impl SharedState {
     fn status(&self) -> PersistenceWorkerStatus {
         let now = Instant::now();
         let admission = lock(&self.admission);
+        let active_checkpoint_turns = admission
+            .active_checkpoint_turns
+            .min(admission.pending.len());
+        let queued_checkpoint_turns = admission
+            .pending
+            .len()
+            .saturating_sub(active_checkpoint_turns);
+        let pending_checkpoint_batches = usize::from(active_checkpoint_turns > 0)
+            .saturating_add(queued_checkpoint_turns.div_ceil(self.max_batch_turns));
         let pending = admission.pending.front().map(|first| PendingTurnRange {
             first_turn_sequence: first.turn_sequence,
             last_turn_sequence: admission
@@ -467,6 +494,7 @@ impl SharedState {
         });
         PersistenceWorkerStatus {
             pending,
+            pending_checkpoint_batches,
             durable_epoch: self.durable_epoch.load(Ordering::Acquire),
             durable_through_turn_sequence: self.durable_turn.load(Ordering::Acquire),
             queue_depth: self.queue_depth.load(Ordering::Acquire),
@@ -657,7 +685,10 @@ impl PersistenceCoordinator {
 
         let (sender, receiver) = mpsc::sync_channel(config.queue_capacity);
         let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
-        let shared = Arc::new(SharedState::new(config.queue_capacity));
+        let shared = Arc::new(SharedState::new(
+            config.queue_capacity,
+            config.max_batch_turns,
+        ));
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("boon-persistence".to_owned())
@@ -1252,67 +1283,73 @@ where
         .expect("first pending turn exists")
         .turn
         .turn_sequence;
-    let encode_started = Instant::now();
-    let changes = pending
-        .iter()
-        .flat_map(|queued| queued.turn.changes.iter().cloned())
-        .collect();
-    let outbox_changes = pending
-        .iter()
-        .flat_map(|queued| queued.turn.outbox_changes.iter().cloned())
-        .collect();
-    let content_artifact_changes = pending
-        .iter()
-        .flat_map(|queued| queued.turn.content_artifact_changes.iter().cloned())
-        .collect();
-    let batch = CheckpointBatch {
-        application: durable.application.clone(),
-        schema_hash: durable.schema_hash,
-        base_epoch: durable.epoch,
-        next_epoch,
-        first_turn_sequence: first.turn.turn_sequence,
-        last_turn_sequence,
-        changes,
-        outbox_changes,
-        content_artifact_changes,
-        checksum: [0; 32],
-    }
-    .seal();
-    shared
-        .encode_us
-        .store(duration_us(encode_started.elapsed()), Ordering::Release);
+    let first_turn_sequence = first.turn.turn_sequence;
+    shared.begin_checkpoint_batch(pending.len());
+    let result = (|| {
+        let encode_started = Instant::now();
+        let changes = pending
+            .iter()
+            .flat_map(|queued| queued.turn.changes.iter().cloned())
+            .collect();
+        let outbox_changes = pending
+            .iter()
+            .flat_map(|queued| queued.turn.outbox_changes.iter().cloned())
+            .collect();
+        let content_artifact_changes = pending
+            .iter()
+            .flat_map(|queued| queued.turn.content_artifact_changes.iter().cloned())
+            .collect();
+        let batch = CheckpointBatch {
+            application: durable.application.clone(),
+            schema_hash: durable.schema_hash,
+            base_epoch: durable.epoch,
+            next_epoch,
+            first_turn_sequence,
+            last_turn_sequence,
+            changes,
+            outbox_changes,
+            content_artifact_changes,
+            checksum: [0; 32],
+        }
+        .seal();
+        shared
+            .encode_us
+            .store(duration_us(encode_started.elapsed()), Ordering::Release);
 
-    let checkpoint_started = Instant::now();
-    let result = driver.execute(PersistenceCommand::Commit(batch));
-    shared
-        .checkpoint_us
-        .store(duration_us(checkpoint_started.elapsed()), Ordering::Release);
-    match result {
-        PersistenceResult::Committed(Ok(ack)) => {
-            if ack.epoch != next_epoch || ack.through_turn_sequence != last_turn_sequence {
-                let error = StoreError::Backend(
-                    "driver returned an inconsistent checkpoint acknowledgement".to_owned(),
-                );
-                shared.record_store_error(error.clone());
-                return Err(error);
+        let checkpoint_started = Instant::now();
+        let result = driver.execute(PersistenceCommand::Commit(batch));
+        shared
+            .checkpoint_us
+            .store(duration_us(checkpoint_started.elapsed()), Ordering::Release);
+        match result {
+            PersistenceResult::Committed(Ok(ack)) => {
+                if ack.epoch != next_epoch || ack.through_turn_sequence != last_turn_sequence {
+                    let error = StoreError::Backend(
+                        "driver returned an inconsistent checkpoint acknowledgement".to_owned(),
+                    );
+                    shared.record_store_error(error.clone());
+                    return Err(error);
+                }
+                shared.mark_durable(ack.epoch, ack.through_turn_sequence)?;
+                durable.epoch = ack.epoch;
+                durable.through_turn_sequence = ack.through_turn_sequence;
+                pending.clear();
+                Ok(())
             }
-            shared.mark_durable(ack.epoch, ack.through_turn_sequence)?;
-            durable.epoch = ack.epoch;
-            durable.through_turn_sequence = ack.through_turn_sequence;
-            pending.clear();
-            Ok(())
+            PersistenceResult::Committed(Err(error)) => {
+                shared.record_store_error(error.clone());
+                Err(error)
+            }
+            _ => {
+                let error =
+                    StoreError::Backend("driver returned the wrong result for Commit".to_owned());
+                shared.record_store_error(error.clone());
+                Err(error)
+            }
         }
-        PersistenceResult::Committed(Err(error)) => {
-            shared.record_store_error(error.clone());
-            Err(error)
-        }
-        _ => {
-            let error =
-                StoreError::Backend("driver returned the wrong result for Commit".to_owned());
-            shared.record_store_error(error.clone());
-            Err(error)
-        }
-    }
+    })();
+    shared.clear_checkpoint_batch();
+    result
 }
 
 fn commit_immediate_turn<D>(
@@ -1849,12 +1886,55 @@ mod tests {
                 .map(|pending| (pending.first_turn_sequence, pending.last_turn_sequence)),
             Some((1, 1))
         );
+        assert_eq!(status.pending_checkpoint_batches, 1);
 
         gate.release();
         coordinator.barrier().unwrap();
         coordinator.try_enqueue_turn(rejected).unwrap();
         coordinator.barrier().unwrap();
         assert_eq!(coordinator.status().durable_through_turn_sequence, 2);
+        coordinator.shutdown().unwrap();
+    }
+
+    #[test]
+    fn status_counts_checkpoint_batches_instead_of_logical_turn_span() {
+        let gate = Arc::new(CommitGate::new());
+        let trace = DriverTrace::default();
+        let driver = RecordingDriver {
+            inner: InMemoryDriver::default(),
+            trace,
+            commit_gate: Some(Arc::clone(&gate)),
+        };
+        let (coordinator, startup) = PersistenceCoordinator::start(
+            driver,
+            initial_image(),
+            PersistenceWorkerConfig {
+                queue_capacity: 4,
+                max_batch_turns: 2,
+                coalesce_delay: Duration::ZERO,
+            },
+        )
+        .unwrap();
+        assert!(startup.initialized);
+
+        coordinator.try_enqueue_turn(turn(1, 1)).unwrap();
+        gate.wait_until_entered();
+        coordinator.try_enqueue_turn(turn(2, 2)).unwrap();
+        coordinator.try_enqueue_turn(turn(3, 3)).unwrap();
+
+        let status = coordinator.status();
+        assert_eq!(
+            status
+                .pending
+                .as_ref()
+                .map(|pending| (pending.first_turn_sequence, pending.last_turn_sequence)),
+            Some((1, 3))
+        );
+        assert_eq!(status.pending_checkpoint_batches, 2);
+
+        gate.release();
+        coordinator.barrier().unwrap();
+        assert_eq!(coordinator.status().pending_checkpoint_batches, 0);
         coordinator.shutdown().unwrap();
     }
 

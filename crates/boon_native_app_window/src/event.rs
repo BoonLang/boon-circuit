@@ -133,7 +133,6 @@ impl EventAdapter {
             WindowEvent::PointerLeft => {
                 let (x, y) = self
                     .pointer_position
-                    .take()
                     .ok_or(NativeHostError::MissingPointerPosition("pointer leave"))?;
                 HostEvent::Pointer(PointerEvent {
                     surface: self.ids.surface.clone(),
@@ -547,6 +546,40 @@ mod tests {
         };
         assert_eq!((pressed.x, pressed.y), (12.5, 24.0));
         assert_eq!(pressed.phase, PointerPhase::Down);
+    }
+
+    #[test]
+    fn pointer_release_keeps_the_last_position_after_leave() {
+        let mut adapter = adapter();
+        adapter
+            .adapt(WindowEvent::PointerEntered {
+                position: Position::new(18.0, 32.0),
+            })
+            .unwrap();
+        adapter
+            .adapt(WindowEvent::PointerButton {
+                button: NativePointerButton::Primary,
+                state: ButtonState::Pressed,
+            })
+            .unwrap();
+        let left = adapter.adapt(WindowEvent::PointerLeft).unwrap();
+        let AdaptedWindowEvent::Host(HostEvent::Pointer(left)) = left else {
+            panic!("expected pointer leave");
+        };
+        assert_eq!((left.x, left.y), (18.0, 32.0));
+        assert_eq!(left.phase, PointerPhase::Leave);
+
+        let released = adapter
+            .adapt(WindowEvent::PointerButton {
+                button: NativePointerButton::Primary,
+                state: ButtonState::Released,
+            })
+            .unwrap();
+        let AdaptedWindowEvent::Host(HostEvent::Pointer(released)) = released else {
+            panic!("expected pointer release");
+        };
+        assert_eq!((released.x, released.y), (18.0, 32.0));
+        assert_eq!(released.phase, PointerPhase::Up);
     }
 
     #[test]

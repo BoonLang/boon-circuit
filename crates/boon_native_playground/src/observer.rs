@@ -489,7 +489,7 @@ pub enum ObserverEvent {
         pending_program_artifact_loads: u32,
         pending_persistence_artifact_stores: u32,
         pending_persistence_artifact_loads: u32,
-        pending_durable_turns: u32,
+        pending_durable_batches: u32,
         trusted_parent_rebuilds: u32,
         source_revision: u64,
         runtime_sequence: u64,
@@ -939,7 +939,7 @@ impl ObserverEvent {
                 pending_program_artifact_loads,
                 pending_persistence_artifact_stores,
                 pending_persistence_artifact_loads,
-                pending_durable_turns,
+                pending_durable_batches,
                 trusted_parent_rebuilds,
                 source_revision,
                 runtime_sequence,
@@ -972,7 +972,7 @@ impl ObserverEvent {
                 out.u32(*pending_program_artifact_loads);
                 out.u32(*pending_persistence_artifact_stores);
                 out.u32(*pending_persistence_artifact_loads);
-                out.u32(*pending_durable_turns);
+                out.u32(*pending_durable_batches);
                 out.u32(*trusted_parent_rebuilds);
                 out.u64(*source_revision);
                 out.u64(*runtime_sequence);
@@ -1410,7 +1410,7 @@ impl ObserverEvent {
                 pending_program_artifact_loads: input.u32()?,
                 pending_persistence_artifact_stores: input.u32()?,
                 pending_persistence_artifact_loads: input.u32()?,
-                pending_durable_turns: input.u32()?,
+                pending_durable_batches: input.u32()?,
                 trusted_parent_rebuilds: input.u32()?,
                 source_revision: input.u64()?,
                 runtime_sequence: input.u64()?,
@@ -2094,7 +2094,7 @@ mod tests {
             pending_program_artifact_loads: 0,
             pending_persistence_artifact_stores: 1,
             pending_persistence_artifact_loads: 0,
-            pending_durable_turns: 1,
+            pending_durable_batches: 1,
             trusted_parent_rebuilds: 0,
             source_revision: 4,
             runtime_sequence: 11,

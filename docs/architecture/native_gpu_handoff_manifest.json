@@ -168,7 +168,7 @@
               "pending-program-artifact-load-max",
               "pending-persistence-artifact-store-max",
               "pending-persistence-artifact-load-max",
-              "pending-durable-turn-max",
+              "pending-durable-batch-max",
               "proof-replacement-max",
               "proof-result-drop-max",
               "trusted-parent-rebuilds-per-edit"

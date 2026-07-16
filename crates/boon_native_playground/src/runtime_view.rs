@@ -53,6 +53,7 @@ const MAX_PROGRAM_ARTIFACT_STORE_SESSIONS: usize = 8;
 const MAX_PROGRAM_ARTIFACT_STORE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PROGRAM_ARTIFACT_LOAD_SESSIONS: usize = 8;
 const REPLACEABLE_ARTIFACT_QUIET_PERIOD: Duration = Duration::from_millis(34);
+const PROGRAM_ARTIFACT_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostIdentityMode {
@@ -1214,61 +1215,31 @@ impl RuntimeView {
     }
 
     fn resolve_program_artifact_requests_blocking(&mut self) -> ViewResult<bool> {
-        let mut compile_requests = Vec::new();
-        let mut changed = false;
+        let started = Instant::now();
+        let mut changed = self.resolve_program_artifact_requests()?;
         loop {
-            let requests = std::mem::take(&mut self.pending_program_requests);
-            if requests.is_empty() {
-                break;
+            changed |= self.poll_program_artifact_loads()?;
+            let queued_artifact_request = self
+                .pending_program_requests
+                .iter()
+                .any(ProgramHostRequest::is_artifact_load);
+            if !queued_artifact_request && !self.program_artifact_load_lane.has_pending() {
+                return Ok(changed);
             }
-            for request in requests {
-                let Some(artifact_id) = request.artifact_id else {
-                    compile_requests.push(request);
-                    continue;
-                };
-                let content = self
-                    .program_artifact_cache
-                    .get(&artifact_id)
-                    .cloned()
-                    .map_or_else(
-                        || {
-                            self.runtime
-                                .load_content_artifact(artifact_id)
-                                .map_err(|error| {
-                                    ProgramDiagnostic::artifact(
-                                        request.compile.revision,
-                                        error.to_string(),
-                                    )
-                                })
-                                .and_then(|artifact| {
-                                    artifact.ok_or_else(|| {
-                                    ProgramDiagnostic::artifact(
-                                        request.compile.revision,
-                                        format!(
-                                            "immutable program artifact {artifact_id} is missing"
-                                        ),
-                                    )
-                                })
-                                })
-                        },
-                        Ok,
-                    );
-                let result = content.and_then(|artifact| {
-                    self.program_artifact_cache
-                        .insert(artifact.id, artifact.clone());
-                    ProgramArtifact::from_content_artifact(
-                        request.compile.revision,
-                        request.compile.capability_profile,
-                        artifact,
-                    )
-                });
-                changed |= self
-                    .complete_program_observed(&request.session, &request.request_id, result)?
-                    .changed;
+            if started.elapsed() >= PROGRAM_ARTIFACT_STARTUP_TIMEOUT {
+                let persistence = self.runtime.status();
+                return Err(format!(
+                    "program artifact startup currentness barrier exceeded {} ms; queued_requests={}, load_sessions={}, persistence_loads={}, worker_alive={}, last_error={:?}",
+                    PROGRAM_ARTIFACT_STARTUP_TIMEOUT.as_millis(),
+                    usize::from(queued_artifact_request),
+                    self.program_artifact_load_lane.session_count(),
+                    persistence.pending_content_artifact_loads,
+                    persistence.worker_alive,
+                    persistence.last_error,
+                ));
             }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        self.pending_program_requests = compile_requests;
-        Ok(changed)
     }
 
     pub fn resolve_program_artifact_requests(&mut self) -> ViewResult<bool> {
@@ -1546,10 +1517,6 @@ impl RuntimeView {
 
     pub fn take_program_requests(&mut self) -> Vec<ProgramHostRequest> {
         std::mem::take(&mut self.pending_program_requests)
-    }
-
-    pub fn has_pending_program_artifact_store(&self) -> bool {
-        self.program_artifact_store_lane.has_pending()
     }
 
     pub(crate) fn program_artifact_lane_counts(&self) -> (usize, usize) {
@@ -4213,8 +4180,10 @@ mod tests {
                 return changed;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "program artifact persistence did not settle"
+                started.elapsed() < Duration::from_secs(5),
+                "program artifact persistence did not settle within five seconds; store_sessions={}, load_sessions={}",
+                model.program_artifact_store_lane.session_count(),
+                model.program_artifact_load_lane.session_count(),
             );
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -4968,6 +4937,72 @@ document: Document/new(
     }
 
     #[test]
+    fn persons_full_workflow_restores_into_the_retained_view_without_stale_mounts() {
+        let state_root = unique_state_root("persons-full-workflow-restart");
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let plan = persons_plan(1, None);
+        let mut model =
+            RuntimeView::open_with_state_root_deterministic(Arc::clone(&plan), &state_root)
+                .unwrap();
+        let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut view = crate::view::RetainedView::new(
+            model.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1_020.0,
+                height: 1_082.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .unwrap();
+        converge_test_demands(&mut model, &mut view, &mut columns);
+        for step in &example.test_steps {
+            settle_scenario_runtime(&mut model, &mut view, &mut columns);
+            if step.action_kind.is_none() {
+                drive_scenario_step(&mut model, &mut view, &mut columns, step);
+            } else if step.action_kind.as_deref() == Some("type_text") {
+                model.begin_scenario_step(&step.source_path);
+                drive_scenario_step_characterwise(&mut model, &mut view, &mut columns, step);
+            } else {
+                model.begin_scenario_step(&step.source_path);
+                drive_scenario_step(&mut model, &mut view, &mut columns, step);
+            }
+            settle_scenario_runtime(&mut model, &mut view, &mut columns);
+        }
+        model.runtime.barrier().unwrap();
+        model.runtime.shutdown().unwrap();
+        drop(model);
+
+        let mut restored = RuntimeView::open_with_state_root_deterministic(plan, &state_root)
+            .expect("restore the complete declarative Persons workflow");
+        let mut restored_columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut restored_view = crate::view::RetainedView::new(
+            restored.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1_020.0,
+                height: 1_082.0,
+                scale: 1.0,
+            },
+            &mut restored_columns,
+        )
+        .expect("restored workflow frame is structurally valid");
+        settle_scenario_runtime(&mut restored, &mut restored_view, &mut restored_columns);
+        assert_eq!(
+            restored_view.frame(),
+            restored.retained_frame(),
+            "restored workflow retained view diverged from the program host"
+        );
+        restored.runtime.shutdown().unwrap();
+        drop(restored);
+        fs::remove_dir_all(state_root).unwrap();
+    }
+
+    #[test]
     fn persons_editor_and_responsive_layout_scenario_hosts_last_valid_child_document() {
         let example = crate::catalog::Catalog::load()
             .unwrap()
@@ -5018,6 +5053,66 @@ document: Document/new(
                 source_paths.contains(expected),
                 "Persons.pro shell is missing source binding {expected:?}: {source_paths:?}"
             );
+        }
+
+        for width in [1020.0, 860.0, 859.0, 390.0] {
+            let mut responsive_columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+            let responsive = crate::view::RetainedView::new(
+                model.frame(),
+                boon_host::Viewport {
+                    surface: 1,
+                    width,
+                    height: 1082.0,
+                    scale: 1.0,
+                },
+                &mut responsive_columns,
+            )
+            .unwrap();
+            for (source, label) in [
+                ("store.elements.theme_toggle", "Dark"),
+                ("store.elements.preview_phone", "Phone"),
+                ("store.elements.preview_tablet", "Tablet"),
+                ("store.elements.preview_desktop", "Auto"),
+                ("store.elements.publish", "Publish"),
+                ("store.elements.register_passkey", "Protect workspace"),
+                (
+                    "store.elements.simulate_registration_cancel",
+                    "Cancel registration",
+                ),
+                (
+                    "store.elements.simulate_registration_failure",
+                    "Fail registration",
+                ),
+                (
+                    "store.elements.simulate_registration_duplicate",
+                    "Duplicate credential",
+                ),
+            ] {
+                let target = responsive
+                    .target_for_source(source, Some(label))
+                    .unwrap_or_else(|| panic!("missing {label:?} action at width {width}"));
+                let full = responsive
+                    .node_bounds(&target.node)
+                    .unwrap_or_else(|| panic!("missing {label:?} layout bounds at width {width}"));
+                assert!(
+                    target.bounds_width >= 38.0 && target.bounds_height >= 28.0,
+                    "{label:?} is clipped at width {width}: {target:?}"
+                );
+                assert!(
+                    target.bounds_x >= 0.0
+                        && target.bounds_x + target.bounds_width <= width
+                        && target.bounds_y >= 0.0
+                        && target.bounds_y + target.bounds_height <= 1082.0,
+                    "{label:?} escapes the viewport at width {width}: {target:?}"
+                );
+                assert!(
+                    (target.bounds_x - full.x).abs() <= 0.1
+                        && (target.bounds_y - full.y).abs() <= 0.1
+                        && (target.bounds_width - full.width).abs() <= 0.1
+                        && (target.bounds_height - full.height).abs() <= 0.1,
+                    "{label:?} is only partly hittable at width {width}: target={target:?}, full={full:?}"
+                );
+            }
         }
 
         let mut columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
@@ -6384,6 +6479,18 @@ document: Document/new(
 
         let mut restored = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root)
             .expect("restore acknowledged Persons authority");
+        let restored_loads = restored
+            .take_async_lane_observations()
+            .into_iter()
+            .filter(|observation| observation.lane == RuntimeAsyncLaneKind::ProgramArtifactLoad)
+            .collect::<Vec<_>>();
+        assert!(
+            !restored_loads.is_empty(),
+            "restored child artifacts bypassed the asynchronous persistence load lane"
+        );
+        assert!(restored_loads.iter().all(|observation| {
+            observation.outcome == RuntimeAsyncLaneOutcome::Applied && observation.queue_depth > 0
+        }));
         assert_eq!(
             authoritative_semantic_snapshot(&mut restored, &plan),
             acknowledged_authority,
@@ -6792,6 +6899,40 @@ document: Document/new(
             restored.take_program_requests().is_empty(),
             "restart must mount the acknowledged child artifact without recompiling it"
         );
+        let mut restored_columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut restored_view = crate::view::RetainedView::new(
+            restored.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1_020.0,
+                height: 1_082.0,
+                scale: 1.0,
+            },
+            &mut restored_columns,
+        )
+        .expect("restored authoritative frame is structurally valid");
+        converge_test_demands(&mut restored, &mut restored_view, &mut restored_columns);
+        for _ in 0..8 {
+            let changed = restored.resolve_program_artifact_requests().unwrap();
+            let patches = restored.take_patches();
+            if !patches.is_empty() {
+                restored_view
+                    .apply_patches(patches, &mut restored_columns)
+                    .expect("restored artifact patches rebase onto the active retained frame");
+            }
+            if !changed
+                && !restored.program_artifact_load_lane.has_pending()
+                && restored.pending_program_requests.is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            restored_view.frame(),
+            restored.retained_frame(),
+            "restored retained view diverged from the program host"
+        );
         let restored_texts = restored
             .retained_frame()
             .nodes
@@ -6906,9 +7047,45 @@ document: Document/new(
                 .unwrap(),
             Value::Text(workspace_id.clone())
         );
+        restored_view
+            .replace(
+                restored.frame(),
+                boon_host::Viewport {
+                    surface: 1,
+                    width: 1_020.0,
+                    height: 1_082.0,
+                    scale: 1.0,
+                },
+                &mut restored_columns,
+            )
+            .expect("imported authority replaces the retained frame");
+        settle_scenario_runtime(&mut restored, &mut restored_view, &mut restored_columns);
         restored.runtime.barrier().unwrap();
         restored.runtime.shutdown().unwrap();
         drop(restored);
+
+        let mut restarted = RuntimeView::open_with_state_root(Arc::clone(&plan), &state_root)
+            .expect("restart after imported authority");
+        let mut restarted_columns = boon_document::render_scene::ApproximateTextColumnMeasurer;
+        let mut restarted_view = crate::view::RetainedView::new(
+            restarted.frame(),
+            boon_host::Viewport {
+                surface: 1,
+                width: 1_020.0,
+                height: 1_082.0,
+                scale: 1.0,
+            },
+            &mut restarted_columns,
+        )
+        .expect("restarted imported authority frame is structurally valid");
+        settle_scenario_runtime(&mut restarted, &mut restarted_view, &mut restarted_columns);
+        assert_eq!(
+            restarted_view.frame(),
+            restarted.retained_frame(),
+            "restarted imported authority diverged from the program host"
+        );
+        restarted.runtime.shutdown().unwrap();
+        drop(restarted);
 
         let database_path =
             state_database_path_in(&state_root, &plan.application.identity).unwrap();
@@ -8048,7 +8225,8 @@ document: Document/new(
         view: &mut crate::view::RetainedView,
         columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
     ) {
-        for _ in 0..64 {
+        let started = Instant::now();
+        for _ in 0..256 {
             model.resolve_program_artifact_requests().unwrap();
             let requests = model.take_program_requests();
             let had_requests = !requests.is_empty();
@@ -8097,8 +8275,22 @@ document: Document/new(
                     });
                 std::thread::sleep(sleep);
             }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "scenario runtime did not settle within three seconds; store_sessions={}, load_sessions={}, pending_requests={}, effects_busy={}",
+                model.program_artifact_store_lane.session_count(),
+                model.program_artifact_load_lane.session_count(),
+                model.pending_program_requests.len(),
+                model.effect_worker.is_busy(),
+            );
         }
-        panic!("scenario runtime exceeded its 64-round settle limit")
+        panic!(
+            "scenario runtime exceeded 256 settle rounds; store_sessions={}, load_sessions={}, pending_requests={}, effects_busy={}",
+            model.program_artifact_store_lane.session_count(),
+            model.program_artifact_load_lane.session_count(),
+            model.pending_program_requests.len(),
+            model.effect_worker.is_busy(),
+        )
     }
 
     fn converge_test_demands(

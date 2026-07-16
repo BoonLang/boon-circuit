@@ -716,6 +716,53 @@ fn run_linux_harness(profile: &VerifierProfile, run_id: &str, artifact_dir: &Pat
         }
     };
 
+    let mount_start = capture.events.len();
+    let mounted_key = match wait_for_value(
+        &mut observer,
+        &mut capture.events,
+        EVENT_TIMEOUT,
+        mount_start,
+        |event| match event {
+            ObserverEvent::StateMounted { key, .. } => Some(Ok(key.clone())),
+            ObserverEvent::SourceFailed {
+                revision,
+                stage,
+                message,
+            } => Some(Err(format!(
+                "source revision {revision} failed during {stage}: {message}"
+            ))),
+            _ => None,
+        },
+    ) {
+        Ok(Ok(key)) => key,
+        Ok(Err(error)) | Err(error) => {
+            capture
+                .checks
+                .push(Check::fail("authoritative-preview-before-layout", error));
+            capture.checks.push(cleanup_check(session.shutdown()));
+            return capture.into_evidence(profile);
+        }
+    };
+    if !mounted_key.is_complete()
+        || !frame_key_matches_session(
+            &capture.events,
+            &mounted_key,
+            &session,
+            ObserverRole::Preview,
+        )
+    {
+        capture.checks.push(Check::fail(
+            "authoritative-preview-before-layout",
+            "the first state mount was not owned by the current preview session",
+        ));
+        capture.checks.push(cleanup_check(session.shutdown()));
+        return capture.into_evidence(profile);
+    }
+    capture.checks.push(Check::pass(
+        "authoritative-preview-before-layout",
+        "the app-owned state mount mapped the preview before COSMIC layout authorization",
+    ));
+
     if let Err(error) = session.prepare_background_workspace(&executable) {
         capture
             .checks
@@ -971,7 +1018,6 @@ fn run_restart_phase(
                 "restart reused the primary preview process or native session identity".to_owned(),
             );
         }
-        session.prepare_background_workspace(executable)?;
         let mounted = wait_for_value(
             observer,
             events,
@@ -1040,6 +1086,7 @@ fn run_restart_phase(
                 baseline.state_digest,
             ));
         }
+        session.prepare_background_workspace(executable)?;
         let first_preview_frame = events[start..].iter().find_map(|event| match event {
             ObserverEvent::FramePresented(frame) if frame.role == ObserverRole::Preview => {
                 Some(frame.key.clone())
@@ -1072,6 +1119,7 @@ fn run_restart_phase(
                     |event| match event {
                         ObserverEvent::PersistenceEvidence {
                             kind: PersistenceEvidenceKind::MigrationActivated,
+                            source_revision,
                             durable_epoch,
                             durable_turn_sequence,
                             before_state_digest,
@@ -1079,6 +1127,7 @@ fn run_restart_phase(
                             key,
                             ..
                         } => Some((
+                            *source_revision,
                             *durable_epoch,
                             *durable_turn_sequence,
                             before_state_digest.clone(),
@@ -1088,17 +1137,31 @@ fn run_restart_phase(
                         _ => None,
                     },
                 )?;
-            if migration.0 == 0
+            if migration.0 != baseline.source_revision
                 || migration.1 == 0
-                || migration.2 != baseline.state_digest
-                || migration.3 == migration.2
-                || !migration.4.is_complete()
-                || !frame_key_matches_session(events, &migration.4, &session, ObserverRole::Preview)
+                || migration.2 == 0
+                || migration.3.len() != 64
+                || migration.4.len() != 64
+                || migration.4 == migration.3
+                || !migration.5.is_complete()
+                || !frame_key_matches_session(events, &migration.5, &session, ObserverRole::Preview)
             {
-                return Err(
-                    "restart process did not activate a durable, frame-linked schema migration"
-                        .to_owned(),
-                );
+                return Err(format!(
+                    "restart schema migration evidence is incomplete: source_revision={} (expected {}), durable_epoch={}, durable_turn={}, before={}, after={}, frame_complete={}, frame_owned={}",
+                    migration.0,
+                    baseline.source_revision,
+                    migration.1,
+                    migration.2,
+                    migration.3,
+                    migration.4,
+                    migration.5.is_complete(),
+                    frame_key_matches_session(
+                        events,
+                        &migration.5,
+                        &session,
+                        ObserverRole::Preview,
+                    ),
+                ));
             }
         }
         wait_for_evidence_proofs(observer, events)
@@ -2035,7 +2098,7 @@ fn drive_native_workflow(
             for _ in 0..pointer_cycles {
                 let down_start = events.len();
                 session.run_driver(&["button", "down", "left"])?;
-                wait_for_native_workflow_pointer_phase(
+                let down = wait_for_native_workflow_pointer_phase(
                     session,
                     observer,
                     events,
@@ -2043,10 +2106,14 @@ fn drive_native_workflow(
                     test_request_id,
                     index,
                     TestPointerPhase::Down,
-                )?;
-                thread::sleep(crate::native_input::POINTER_CLICK_HOLD);
+                );
+                if down.is_ok() {
+                    thread::sleep(crate::native_input::POINTER_CLICK_HOLD);
+                }
                 let up_start = events.len();
-                session.run_driver(&["button", "up", "left"])?;
+                let release = session.run_driver(&["button", "up", "left"]);
+                down?;
+                release?;
                 wait_for_native_workflow_pointer_phase(
                     session,
                     observer,
@@ -2286,7 +2353,8 @@ fn wait_for_native_workflow_pointer_phase(
     )
     .map_err(|error| {
         format!(
-            "native workflow step {step_index} did not present its {phase:?} cursor frame: {error}"
+            "native workflow step {step_index} did not present its {phase:?} cursor frame: {error}; pointer_tail={}",
+            native_pointer_input_tail(events, start),
         )
     })?;
     if !frame_key_matches_session(events, &key, session, ObserverRole::Preview) {
@@ -2295,6 +2363,37 @@ fn wait_for_native_workflow_pointer_phase(
         ));
     }
     Ok(key)
+}
+
+#[cfg(target_os = "linux")]
+fn native_pointer_input_tail(events: &[ObserverEvent], start: usize) -> String {
+    let mut tail = events[start..]
+        .iter()
+        .filter_map(|event| match event {
+            ObserverEvent::InputAccepted(input)
+                if input.role == ObserverRole::Preview
+                    && matches!(
+                        input.kind,
+                        InputKind::PointerMove | InputKind::PointerButton
+                    ) =>
+            {
+                Some(format!(
+                    "{}:{:?}:pressed={:?}:at={:?},{:?}:target={:?}",
+                    input.event_sequence,
+                    input.kind,
+                    input.pointer_button_pressed,
+                    input.pointer_x,
+                    input.pointer_y,
+                    input.target,
+                ))
+            }
+            _ => None,
+        })
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>();
+    tail.reverse();
+    format!("{tail:?}")
 }
 
 #[cfg(target_os = "linux")]
@@ -2514,20 +2613,20 @@ fn drive_responsive_resize(
     drag?;
     release?;
 
-    let observed = wait_for_value(
+    let responsive = wait_for_value(
         observer,
         events,
         EVENT_TIMEOUT,
         start,
         |event| match event {
-            ObserverEvent::ResponsiveResizeObserved {
-                event_sequence,
+            ObserverEvent::ResponsiveLayoutEvidence {
+                resize_sequence,
                 logical_width,
                 logical_height,
-                previous_surface_epoch,
                 key,
+                ..
             } if (*logical_width, *logical_height) == (ready.0, ready.1) => {
-                Some((*event_sequence, *previous_surface_epoch, key.clone()))
+                Some((*resize_sequence, key.clone()))
             }
             _ => None,
         },
@@ -2571,36 +2670,44 @@ fn drive_responsive_resize(
             ready.0, ready.1, ready.2, ready.3
         )
     })?;
-    let exact_resize = observed.2.surface_epoch > observed.1
-        && frame_key_matches_session(events, &observed.2, session, ObserverRole::Preview)
-        && events.iter().any(|event| {
-            matches!(event, ObserverEvent::InputAccepted(input)
-                if input.role == ObserverRole::Preview
-                    && input.real_os
-                    && input.kind == InputKind::Resize
-                    && input.event_sequence == observed.0
-                    && input.surface_epoch == observed.2.surface_epoch)
-        })
-        && events.iter().any(|event| {
-            matches!(event, ObserverEvent::FramePresented(frame)
-                if frame.role == ObserverRole::Preview
-                    && frame.key == observed.2)
-        })
-        && events.iter().any(|event| {
-            matches!(event, ObserverEvent::ResponsiveLayoutEvidence {
-                resize_sequence,
-                logical_width,
-                logical_height,
-                key,
-                ..
-            } if *resize_sequence == observed.0
-                && (*logical_width, *logical_height) == (ready.0, ready.1)
-                && key == &observed.2)
-        });
+    let observed_previous_epoch = events[start..].iter().find_map(|event| match event {
+        ObserverEvent::ResponsiveResizeObserved {
+            event_sequence,
+            logical_width,
+            logical_height,
+            previous_surface_epoch,
+            key,
+        } if *event_sequence == responsive.0
+            && (*logical_width, *logical_height) == (ready.0, ready.1)
+            && key == &responsive.1 =>
+        {
+            Some(*previous_surface_epoch)
+        }
+        _ => None,
+    });
+    let session_matches =
+        frame_key_matches_session(events, &responsive.1, session, ObserverRole::Preview);
+    let input_matches = events[start..].iter().any(|event| {
+        matches!(event, ObserverEvent::InputAccepted(input)
+            if input.role == ObserverRole::Preview
+                && input.real_os
+                && input.kind == InputKind::Resize
+                && input.event_sequence == responsive.0
+                && input.surface_epoch == responsive.1.surface_epoch)
+    });
+    let frame_matches = events[start..].iter().any(|event| {
+        matches!(event, ObserverEvent::FramePresented(frame)
+            if frame.role == ObserverRole::Preview
+                && frame.key == responsive.1)
+    });
+    let epoch_advances =
+        observed_previous_epoch.is_some_and(|previous| responsive.1.surface_epoch > previous);
+    let exact_resize = epoch_advances && session_matches && input_matches && frame_matches;
     if !exact_resize {
-        return Err(
-            "responsive checkpoint is not bound to one exact native Resize frame".to_owned(),
-        );
+        return Err(format!(
+            "responsive checkpoint is not bound to one exact native Resize frame: sequence={}, key={:?}, previous_epoch={observed_previous_epoch:?}, epoch_advances={epoch_advances}, session_matches={session_matches}, input_matches={input_matches}, frame_matches={frame_matches}",
+            responsive.0, responsive.1,
+        ));
     }
     let status = query_isolation_status(&session.launch_id)?;
     status.require_safe(&session.isolated_seat_name)?;
@@ -4465,7 +4572,7 @@ fn budget_observations(
                 pending_program_artifact_loads,
                 pending_persistence_artifact_stores,
                 pending_persistence_artifact_loads,
-                pending_durable_turns,
+                pending_durable_batches,
                 trusted_parent_rebuilds,
                 editor_key,
                 key,
@@ -4490,7 +4597,7 @@ fn budget_observations(
                         u64::from(*pending_program_artifact_loads),
                         u64::from(*pending_persistence_artifact_stores),
                         u64::from(*pending_persistence_artifact_loads),
-                        u64::from(*pending_durable_turns),
+                        u64::from(*pending_durable_batches),
                         u64::from(*trusted_parent_rebuilds),
                     ],
                 ))
@@ -4624,7 +4731,7 @@ fn budget_observations(
         )?,
         budget_observation(
             budget,
-            "pending-durable-turn-max",
+            "pending-durable-batch-max",
             BudgetUnit::Count,
             measured
                 .iter()
@@ -4719,7 +4826,7 @@ fn observed_budget_unit(metric: &str) -> Option<BudgetUnit> {
         | "pending-program-artifact-load-max"
         | "pending-persistence-artifact-store-max"
         | "pending-persistence-artifact-load-max"
-        | "pending-durable-turn-max"
+        | "pending-durable-batch-max"
         | "proof-replacement-max"
         | "proof-result-drop-max"
         | "trusted-parent-rebuilds-per-edit" => Some(BudgetUnit::Count),

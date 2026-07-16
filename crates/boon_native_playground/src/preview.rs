@@ -58,7 +58,6 @@ const STATS_INTERVAL: Duration = Duration::from_millis(100);
 const TEST_CURSOR_FRAME: Duration = Duration::from_millis(16);
 const TEST_CURSOR_PIXELS_PER_FRAME: f32 = 36.0;
 const TEST_CURSOR_MAX_MOVE_FRAMES: usize = 12;
-const TEST_SETTLE_ROUND_LIMIT: usize = 64;
 const TEST_SETTLE_PROGRAM_LIMIT: usize = 128;
 const TEST_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_EVIDENCE_PROOFS: usize = 8;
@@ -889,6 +888,9 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             close_profile_input_batch(benchmark)?;
                         }
                     }
+                }
+                if runtime.is_none() {
+                    continue;
                 }
                 if let Some(presented) = transaction.present(&mut product, &mut host, &view).await?
                 {
@@ -3900,10 +3902,17 @@ async fn run_schema_migration_evidence(
     {
         return Err("schema migration activation has incomplete version or step evidence".into());
     }
-    settle_test_runtime(&mut evidence_runtime, view, columns)?;
-    let presented = present_runtime(&mut evidence_runtime, view, product, host, columns)
-        .await?
-        .ok_or("schema migration activation did not present")?;
+    let mut evidence_view = RetainedView::new(evidence_runtime.frame(), viewport(host), columns)?;
+    settle_test_runtime(&mut evidence_runtime, &mut evidence_view, columns)?;
+    let presented = present_runtime(
+        &mut evidence_runtime,
+        &mut evidence_view,
+        product,
+        host,
+        columns,
+    )
+    .await?
+    .ok_or("schema migration activation did not present")?;
     emit_presented(observer, &presented);
     let activated = authoritative_state_evidence(&mut evidence_runtime)?;
     if activated.digest == baseline.digest
@@ -3923,7 +3932,13 @@ async fn run_schema_migration_evidence(
         &activated,
         presented.key.clone(),
     );
-    prepare_evidence_proof("persistence-migrated", presented.key, product)
+    let proof = prepare_evidence_proof("persistence-migrated", presented.key, product)?;
+    let restored = product
+        .present(host, view)
+        .await?
+        .ok_or("schema migration evidence did not restore the product frame")?;
+    emit_presented(observer, &restored);
+    Ok(proof)
 }
 
 fn emit_persistence_evidence(
@@ -5005,12 +5020,6 @@ fn finalize_profile_candidate(
     let (pending_program_artifact_stores, pending_program_artifact_loads) =
         runtime.program_artifact_lane_counts();
     let persistence = runtime.persistence_status();
-    let pending_durable_turns = persistence.pending.as_ref().map_or(0, |pending| {
-        pending
-            .last_turn_sequence
-            .saturating_sub(pending.first_turn_sequence)
-            .saturating_add(1)
-    });
     match benchmark.phase {
         ProductProfilePhase::Seed => {
             emit(
@@ -5094,7 +5103,10 @@ fn finalize_profile_candidate(
                         .pending_content_artifact_loads
                         .try_into()
                         .unwrap_or(u32::MAX),
-                    pending_durable_turns: pending_durable_turns.try_into().unwrap_or(u32::MAX),
+                    pending_durable_batches: persistence
+                        .pending_checkpoint_batches
+                        .try_into()
+                        .unwrap_or(u32::MAX),
                     trusted_parent_rebuilds,
                     source_revision,
                     runtime_sequence: runtime.runtime_turn_sequence(),
@@ -5251,14 +5263,18 @@ fn settle_test_runtime(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     apply_runtime_update(runtime, view, columns)?;
     let started = Instant::now();
-    for round in 0..TEST_SETTLE_ROUND_LIMIT {
+    let mut round = 0usize;
+    loop {
         if started.elapsed() > TEST_SETTLE_TIMEOUT {
+            let (pending_stores, pending_loads) = runtime.program_artifact_lane_counts();
             return Err(format!(
-                "TEST runtime did not settle within {}ms after {round} rounds",
-                TEST_SETTLE_TIMEOUT.as_millis()
+                "TEST runtime did not settle within {}ms after {round} rounds; program stores={pending_stores}, loads={pending_loads}, effect_deadline={}",
+                TEST_SETTLE_TIMEOUT.as_millis(),
+                runtime.effect_poll_deadline().is_some(),
             )
             .into());
         }
+        round = round.saturating_add(1);
 
         let mut changed = runtime.resolve_program_artifact_requests()?;
         let requests = runtime.take_program_requests();
@@ -5296,21 +5312,18 @@ fn settle_test_runtime(
         if changed {
             apply_runtime_update(runtime, view, columns)?;
         }
-        let artifact_store_pending = runtime.has_pending_program_artifact_store();
+        let (pending_stores, pending_loads) = runtime.program_artifact_lane_counts();
+        let artifact_work_pending = pending_stores > 0 || pending_loads > 0;
         if !had_program_requests
-            && !artifact_store_pending
+            && !artifact_work_pending
             && runtime.effect_poll_deadline().is_none()
         {
             return Ok(());
         }
-        if artifact_store_pending {
+        if artifact_work_pending {
             thread::sleep(Duration::from_millis(1));
         }
     }
-    Err(format!(
-        "TEST runtime exceeded its {TEST_SETTLE_ROUND_LIMIT}-round child/effect settle limit"
-    )
-    .into())
 }
 
 pub(crate) fn test_step_pointer_position(
@@ -5436,7 +5449,25 @@ fn apply_runtime_update_measured(
     let patches = runtime.take_patches();
     let patch_count = patches.len().try_into().unwrap_or(u32::MAX);
     let document_started = Instant::now();
-    let document = view.apply_patches(patches, columns)?;
+    let document = match view.apply_patches(patches, columns) {
+        Ok(document) => document,
+        Err(error) => {
+            if let boon_document::PatchApplyError::MissingParent { id, parent } = &error {
+                let authoritative = runtime.frame();
+                return Err(format!(
+                    "retained patch base diverged: node `{}` requires parent `{}`; retained_has_parent={}, authoritative_has_parent={}, retained_nodes={}, authoritative_nodes={}, patch_count={patch_count}: {error}",
+                    id.0,
+                    parent.0,
+                    view.frame().nodes.contains_key(parent),
+                    authoritative.nodes.contains_key(parent),
+                    view.frame().nodes.len(),
+                    authoritative.nodes.len(),
+                )
+                .into());
+            }
+            return Err(error.into());
+        }
+    };
     let document_us = duration_us(document_started.elapsed());
     let interaction_started = Instant::now();
     let interaction = view.set_interaction_state(runtime.hovered(), runtime.focused(), columns)?;

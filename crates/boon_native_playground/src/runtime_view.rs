@@ -52,6 +52,7 @@ const HOST_LIFECYCLE_STARTED_SOURCE: &str = "host.lifecycle.started";
 const MAX_PROGRAM_ARTIFACT_STORE_SESSIONS: usize = 8;
 const MAX_PROGRAM_ARTIFACT_STORE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PROGRAM_ARTIFACT_LOAD_SESSIONS: usize = 8;
+const REPLACEABLE_ARTIFACT_QUIET_PERIOD: Duration = Duration::from_millis(34);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostIdentityMode {
@@ -216,6 +217,7 @@ struct PendingProgramArtifactStore {
     ownership: ProgramArtifactOwnership,
     activated_before_store: bool,
     queued_at: Instant,
+    store_after: Instant,
     queue_depth: u32,
     queue_wait_us: u64,
     worker_us: u64,
@@ -290,6 +292,13 @@ impl ProgramArtifactStoreLane {
     fn next_sequence(&mut self) -> u64 {
         self.next_candidate_sequence = self.next_candidate_sequence.saturating_add(1);
         self.next_candidate_sequence
+    }
+
+    fn next_store_deadline(&self) -> Option<Instant> {
+        self.pending_by_session
+            .values()
+            .map(|candidate| candidate.store_after)
+            .min()
     }
 
     fn remove_waiter_bytes(&mut self, waiter: &PendingProgramArtifactStore) {
@@ -1623,6 +1632,12 @@ impl RuntimeView {
         ownership: ProgramArtifactOwnership,
         activated_before_store: bool,
     ) -> PendingProgramArtifactStore {
+        let queued_at = Instant::now();
+        let store_after = if ownership.retention == ContentArtifactRetention::Replaceable {
+            queued_at + REPLACEABLE_ARTIFACT_QUIET_PERIOD
+        } else {
+            queued_at
+        };
         PendingProgramArtifactStore {
             candidate_sequence: self.program_artifact_store_lane.next_sequence(),
             mount_epoch: self.program_artifact_store_lane.mount_epoch,
@@ -1631,7 +1646,8 @@ impl RuntimeView {
             artifact,
             ownership,
             activated_before_store,
-            queued_at: Instant::now(),
+            queued_at,
+            store_after,
             queue_depth: self
                 .program_artifact_store_lane
                 .session_count()
@@ -1775,10 +1791,12 @@ impl RuntimeView {
         {
             return Ok(false);
         }
+        let now = Instant::now();
         let Some(session) = self
             .program_artifact_store_lane
             .pending_by_session
             .iter()
+            .filter(|(_, candidate)| candidate.store_after <= now)
             .min_by_key(|(_, candidate)| candidate.candidate_sequence)
             .map(|(session, _)| session.clone())
         else {
@@ -6015,6 +6033,84 @@ document: Document/new(
     }
 
     #[test]
+    fn replaceable_program_artifact_storage_waits_for_quiet_and_keeps_only_latest() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .into_iter()
+            .map(|unit| RuntimeSourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut model = RuntimeView::open_in_memory(runtime).unwrap();
+        complete_pending_programs_successfully(&mut model);
+
+        let complete_draft = |model: &mut RuntimeView, source: &str| {
+            model
+                .dispatch_source(
+                    "store.elements.source_editor",
+                    None,
+                    SourcePayload {
+                        text: Some(source.to_owned()),
+                        ..SourcePayload::default()
+                    },
+                )
+                .unwrap();
+            let request = model
+                .take_program_requests()
+                .into_iter()
+                .find(|request| request.session.0 == "persons-public-draft")
+                .expect("draft compile request");
+            let artifact = boon_runtime::compile_program_artifact(&request.compile).unwrap();
+            let identity = artifact.id();
+            let bytes = artifact.content_bytes_len();
+            model
+                .complete_program(&request.session, &request.request_id, Ok(artifact))
+                .unwrap();
+            (request.session, identity, bytes)
+        };
+
+        let first_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { First quiet draft })\n";
+        let (session, first_id, _) = complete_draft(&mut model, first_source);
+        let first = model
+            .program_artifact_store_lane
+            .pending_by_session
+            .get(&session)
+            .expect("replaceable artifact remains in the quiet-period lane");
+        assert_eq!(first.artifact.id(), first_id);
+        assert!(first.store_after > Instant::now());
+        assert!(model.program_artifact_store_lane.in_flight.is_none());
+
+        let second_source = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Latest quiet draft })\n";
+        let (_, second_id, second_bytes) = complete_draft(&mut model, second_source);
+        assert_ne!(second_id, first_id);
+        let latest = model
+            .program_artifact_store_lane
+            .pending_by_session
+            .get(&session)
+            .expect("latest replaceable artifact remains queued");
+        assert_eq!(latest.artifact.id(), second_id);
+        assert_eq!(
+            model.program_artifact_store_lane.pending_by_session.len(),
+            1
+        );
+        assert_eq!(model.program_artifact_store_lane.queued_bytes, second_bytes);
+        assert!(model.program_artifact_store_lane.in_flight.is_none());
+        assert_eq!(
+            model
+                .program_host
+                .active_artifact(&session)
+                .map(ProgramArtifact::id),
+            Some(second_id)
+        );
+    }
+
+    #[test]
     fn persons_profile_edit_reports_bounded_dependency_breadth() {
         let example = crate::catalog::Catalog::load()
             .unwrap()
@@ -7904,7 +8000,15 @@ document: Document/new(
             if model.program_artifact_store_lane.has_pending()
                 || model.program_artifact_load_lane.has_pending()
             {
-                std::thread::sleep(Duration::from_millis(1));
+                let sleep = model
+                    .program_artifact_store_lane
+                    .next_store_deadline()
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                    .filter(|remaining| !remaining.is_zero())
+                    .map_or(Duration::from_millis(1), |remaining| {
+                        remaining.min(Duration::from_millis(25))
+                    });
+                std::thread::sleep(sleep);
             }
         }
         panic!("scenario runtime exceeded its 64-round settle limit")

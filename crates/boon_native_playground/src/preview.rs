@@ -2300,90 +2300,113 @@ async fn service_native_workflow(
         );
     }
 
-    while workflow
-        .current()
-        .is_some_and(|step| step.action_kind.is_none())
-    {
-        let step = workflow
+    loop {
+        while workflow
             .current()
-            .cloned()
-            .ok_or("native workflow lost its assertion-only step")?;
-        let assertion_count = assert_test_step_semantics(runtime, &step)?;
-        let state = authoritative_state_evidence(runtime)?;
-        let durable_acked = state.durable_turn_sequence >= runtime.runtime_turn_sequence();
-        if !durable_acked {
-            return Err(format!(
-                "native workflow step `{}` was observed before its durable acknowledgement",
-                step.id
-            )
-            .into());
-        }
-        let frame = present_runtime(runtime, view, product, host, columns)
-            .await?
-            .ok_or("native workflow assertion frame did not present")?;
-        emit_presented(observer, &frame);
-        *latest_presented_key = Some(frame.key.clone());
-        let ordinal = workflow.completed.saturating_add(1);
-        let request_id = native_workflow_request_id(workflow.test_request_id, ordinal);
-        let before_state_digest = workflow
-            .current_state_digest
-            .clone()
-            .ok_or("native workflow assertion has no prior state digest")?;
-        emit(
-            observer,
-            ObserverEvent::NativeWorkflowStep {
-                request_id,
-                ordinal: ordinal.try_into().unwrap_or(u32::MAX),
-                step_id: step.id.clone(),
-                source_path: "assertion-only".to_owned(),
-                action_kind: "assertion_only".to_owned(),
-                action_digest: native_workflow_action_digest(&step),
-                input_first_sequence: 0,
-                input_last_sequence: 0,
-                input_event_count: 0,
-                input_event_digest: native_workflow_input_digest(&[]),
-                assertion_count: assertion_count.try_into().unwrap_or(u32::MAX),
-                source_revision,
-                runtime_sequence: runtime.runtime_turn_sequence(),
-                durable_epoch: state.durable_epoch,
-                durable_turn_sequence: state.durable_turn_sequence,
-                durable_acked,
-                before_state_digest,
-                state_digest: state.digest.clone(),
-                key: frame.key.clone(),
-            },
-        );
-        emit_native_workflow_state_frame(
-            observer,
-            workflow,
-            cursor,
-            runtime.runtime_turn_sequence(),
-            frame.key.clone(),
-        );
-        if workflow.proof_steps.contains(&step.id) {
-            queue_evidence_proofs(
+            .is_some_and(|step| step.action_kind.is_none())
+        {
+            let step = workflow
+                .current()
+                .cloned()
+                .ok_or("native workflow lost its assertion-only step")?;
+            let assertion_count = assert_test_step_semantics(runtime, &step)?;
+            let state = authoritative_state_evidence(runtime)?;
+            let durable_acked = state.durable_turn_sequence >= runtime.runtime_turn_sequence();
+            if !durable_acked {
+                return Err(format!(
+                    "native workflow step `{}` was observed before its durable acknowledgement",
+                    step.id
+                )
+                .into());
+            }
+            let frame = present_runtime(runtime, view, product, host, columns)
+                .await?
+                .ok_or("native workflow assertion frame did not present")?;
+            emit_presented(observer, &frame);
+            *latest_presented_key = Some(frame.key.clone());
+            let ordinal = workflow.completed.saturating_add(1);
+            let request_id = native_workflow_request_id(workflow.test_request_id, ordinal);
+            let before_state_digest = workflow
+                .current_state_digest
+                .clone()
+                .ok_or("native workflow assertion has no prior state digest")?;
+            emit(
                 observer,
-                proof,
-                queued_evidence_proofs,
-                evidence_proof_in_flight,
-                [prepare_evidence_proof(
-                    &format!("native-workflow-{}", step.id),
-                    frame.key.clone(),
-                    product,
-                )?],
-            )?;
+                ObserverEvent::NativeWorkflowStep {
+                    request_id,
+                    ordinal: ordinal.try_into().unwrap_or(u32::MAX),
+                    step_id: step.id.clone(),
+                    source_path: "assertion-only".to_owned(),
+                    action_kind: "assertion_only".to_owned(),
+                    action_digest: native_workflow_action_digest(&step),
+                    input_first_sequence: 0,
+                    input_last_sequence: 0,
+                    input_event_count: 0,
+                    input_event_digest: native_workflow_input_digest(&[]),
+                    assertion_count: assertion_count.try_into().unwrap_or(u32::MAX),
+                    source_revision,
+                    runtime_sequence: runtime.runtime_turn_sequence(),
+                    durable_epoch: state.durable_epoch,
+                    durable_turn_sequence: state.durable_turn_sequence,
+                    durable_acked,
+                    before_state_digest,
+                    state_digest: state.digest.clone(),
+                    key: frame.key.clone(),
+                },
+            );
+            emit_native_workflow_state_frame(
+                observer,
+                workflow,
+                cursor,
+                runtime.runtime_turn_sequence(),
+                frame.key.clone(),
+            );
+            if workflow.proof_steps.contains(&step.id) {
+                queue_evidence_proofs(
+                    observer,
+                    proof,
+                    queued_evidence_proofs,
+                    evidence_proof_in_flight,
+                    [prepare_evidence_proof(
+                        &format!("native-workflow-{}", step.id),
+                        frame.key.clone(),
+                        product,
+                    )?],
+                )?;
+            }
+            workflow.current_state_digest = Some(state.digest);
+            workflow.completed = workflow.completed.saturating_add(1);
         }
-        workflow.current_state_digest = Some(state.digest);
-        workflow.completed = workflow.completed.saturating_add(1);
-    }
 
-    if let Some(pending) = workflow.pending.as_ref()
-        && pending.action_complete
-    {
+        if !workflow
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.action_complete)
+        {
+            if let Some(pending) = workflow.pending.as_ref()
+                && pending
+                    .started_at
+                    .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT)
+            {
+                return Err(format!(
+                    "native workflow step `{}` did not complete its declared real-input span",
+                    workflow
+                        .current()
+                        .map_or("unknown", |step| step.id.as_str())
+                )
+                .into());
+            }
+            break;
+        }
+
         let step = workflow
             .current()
             .cloned()
             .ok_or("native workflow accepted input after its final step")?;
+        let pending_started_at = workflow
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.started_at);
         match assert_test_step_semantics(runtime, &step) {
             Ok(assertion_count) => {
                 let pending = workflow
@@ -2461,10 +2484,10 @@ async fn service_native_workflow(
                 }
                 workflow.current_state_digest = Some(state.digest);
                 workflow.completed = workflow.completed.saturating_add(1);
+                continue;
             }
             Err(error)
-                if pending
-                    .started_at
+                if pending_started_at
                     .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT) =>
             {
                 return Err(format!(
@@ -2475,18 +2498,6 @@ async fn service_native_workflow(
             }
             Err(_) => return Ok(()),
         }
-    } else if let Some(pending) = workflow.pending.as_ref()
-        && pending
-            .started_at
-            .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT)
-    {
-        return Err(format!(
-            "native workflow step `{}` did not complete its declared real-input span",
-            workflow
-                .current()
-                .map_or("unknown", |step| step.id.as_str())
-        )
-        .into());
     }
 
     if workflow.complete() {

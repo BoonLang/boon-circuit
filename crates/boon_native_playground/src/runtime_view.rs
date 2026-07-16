@@ -4806,7 +4806,7 @@ document: Document/new(
     }
 
     #[test]
-    fn persons_declarative_scenario_runs_every_action_and_semantic_expectation() {
+    fn persons_declarative_scenario_is_transport_independent_and_semantically_complete() {
         let example = crate::catalog::Catalog::load()
             .unwrap()
             .open("persons_pro")
@@ -4843,7 +4843,11 @@ document: Document/new(
                 continue;
             }
             model.begin_scenario_step(&step.source_path);
-            drive_scenario_step(&mut model, &mut view, &mut columns, step);
+            if step.action_kind.as_deref() == Some("type_text") {
+                drive_scenario_step_characterwise(&mut model, &mut view, &mut columns, step);
+            } else {
+                drive_scenario_step(&mut model, &mut view, &mut columns, step);
+            }
             settle_scenario_runtime(&mut model, &mut view, &mut columns);
             model
                 .assert_scenario_step(&boon_runtime::ScenarioStep {
@@ -7613,6 +7617,25 @@ document: Document/new(
         columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
         step: &crate::protocol::TestStep,
     ) {
+        drive_scenario_step_with_text_delivery(model, view, columns, step, false);
+    }
+
+    fn drive_scenario_step_characterwise(
+        model: &mut RuntimeView,
+        view: &mut crate::view::RetainedView,
+        columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
+        step: &crate::protocol::TestStep,
+    ) {
+        drive_scenario_step_with_text_delivery(model, view, columns, step, true);
+    }
+
+    fn drive_scenario_step_with_text_delivery(
+        model: &mut RuntimeView,
+        view: &mut crate::view::RetainedView,
+        columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
+        step: &crate::protocol::TestStep,
+        characterwise_text: bool,
+    ) {
         if step.action_kind.is_none() {
             assert!(step.source_path.is_empty());
             model
@@ -7743,15 +7766,29 @@ document: Document/new(
                     )
                     .unwrap();
             }
-            dirty |= model
-                .handle_event(
-                    &HostEvent::TextInput(TextInputEvent {
-                        surface: surface.clone(),
-                        text: text.clone(),
-                    }),
-                    None,
-                )
-                .unwrap();
+            if characterwise_text {
+                for character in text.chars() {
+                    dirty |= model
+                        .handle_event(
+                            &HostEvent::TextInput(TextInputEvent {
+                                surface: surface.clone(),
+                                text: character.to_string(),
+                            }),
+                            None,
+                        )
+                        .unwrap();
+                }
+            } else {
+                dirty |= model
+                    .handle_event(
+                        &HostEvent::TextInput(TextInputEvent {
+                            surface: surface.clone(),
+                            text: text.clone(),
+                        }),
+                        None,
+                    )
+                    .unwrap();
+            }
         }
         if let Some(key) = &step.key {
             dirty |= model

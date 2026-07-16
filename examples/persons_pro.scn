@@ -24,13 +24,15 @@ expect_root_text = { "store.source_draft" = "scene: Scene/Element/text(element: 
 id = "invalid-edit-retains-last-valid"
 user_action = { kind = "type_text", target = "profile source", text = "scene: Missing/constructor(" }
 expected_source_event = { source = "store.elements.source_editor", text = "scene: Missing/constructor(" }
-expect_root_text = { "store.source_draft" = "scene: Missing/constructor(", "store.last_valid_draft_revision" = "2", "store.draft_compile_state" = "Invalid", "store.publish_state" = "Draft" }
+expect_root_nonempty = ["store.last_valid_draft_artifact_id"]
+expect_root_text = { "store.source_draft" = "scene: Missing/constructor(", "store.draft_compile_state" = "Invalid", "store.publish_state" = "Draft" }
 
 [[step]]
 id = "diagnostic-focuses-source-location"
 user_action = { kind = "click", target = "draft diagnostic" }
 expected_source_event = { source = "store.elements.focus_diagnostic" }
-expect_root_text = { "store.draft_compile_state" = "Invalid", "store.last_valid_draft_revision" = "2" }
+expect_root_nonempty = ["store.last_valid_draft_artifact_id"]
+expect_root_text = { "store.draft_compile_state" = "Invalid" }
 
 [[step]]
 id = "corrected-edit-preview"

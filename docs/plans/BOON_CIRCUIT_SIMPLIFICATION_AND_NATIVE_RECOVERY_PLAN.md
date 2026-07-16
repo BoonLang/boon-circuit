@@ -15,13 +15,16 @@ remained unresponsive.
 
 ## Current Implementation State
 
-Mandatory slices 1 through 5 are implemented in the current worktree. The
-workspace contains 98,403 tracked Rust lines and 12,537 test Rust lines.
-Relative to the cleanup checkpoint, the current diff removes about 289,000
-lines and adds fewer than 8,000, a net reduction above 281,000 lines. The fresh
-architecture report passes every check. `app_window` is published at
+Mandatory slices 1 through 5 are implemented. At commit `9b4ed71`, the fresh
+architecture report passes every check with 183,763 tracked Rust lines, 31,703
+test Rust lines, 31,361 playground production lines, 5,117 xtask production
+lines, and 20,544 runtime-plus-executor production lines. The counter now
+partitions trailing inline test modules from production instead of hiding them
+or double-counting them. Duplicate private playground behavior oracles were
+deleted, reducing its focused suite from 118 tests taking roughly 34 seconds to
+62 tests taking roughly 1.5 seconds. `app_window` is published at
 `BoonLang/app_window`, pinned to immutable revision
-`554dea12623618cad5f4d2ae53b99793a05905d8`, and measures 1,140 net code lines
+`6aec9831f281df355736df28a4c3aacdef7cf8a1`, and measures 1,192 net code lines
 over v0.3.3 against the 1,200-line cap.
 
 The recovered execution path now preserves generic scoped row sources from the
@@ -35,9 +38,10 @@ every test dispatch. NovyWave now uses canonical row-owned scope and signal
 events instead of parallel scenario-only controls.
 
 Fresh semantic runs pass through `MachinePlan`, `Session`, and typed document
-patches: Counter 6 turns, TodoMVC 26, physical TodoMVC 22, Cells 28, and
-NovyWave 90. `cargo fmt --all -- --check`, `cargo check --workspace`, all 260
-workspace unit tests, and all doc tests pass.
+patches. `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`,
+and `cargo test --workspace --all-targets --quiet` pass. The architecture and
+negative manifest reports pass from current HEAD; product-native reports await
+the compositor restart described below.
 
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
@@ -136,7 +140,7 @@ The remaining completion work is explicit:
 4. Create the external app_window fork event API, delete `vendor/app_window`,
    and rewrite native host/playground roles around it.
 5. Replace report/verifier v1 and duplicated tests with compact report v2 and
-   the six manifest gates.
+   the manifest-owned gate inventory.
 6. Run final structural, semantic, native, visual, performance, idle, and manual
    verification once.
 

@@ -2,8 +2,8 @@
 
 Date: 2026-07-15
 
-Status: local-first release verifier passes; final workspace and native handoff
-aggregate pending
+Status: local-first release verifier passed at the implementation checkpoint;
+current-HEAD native handoff awaits the installed compositor restart
 
 Persons.pro is a Boon-hosted personal publishing workspace. A visitor receives
 an immediately usable anonymous workspace, edits a small Boon program, sees the
@@ -471,13 +471,21 @@ when this checkpoint was recorded still mapped the prior deleted binary. A
 session restart is required before rerunning `verify-persons-pro`; stale reports
 must not be used to satisfy the stop conditions.
 
-Current release evidence (2026-07-16, commits `aaad56a` and `9354fd1`):
+Current implementation evidence (2026-07-16, commits `aaad56a`, `9354fd1`,
+`12176d6`, and `9b4ed71`):
 
 - `cargo test -p boon_persistence --lib` passes all 52 tests.
-- `cargo test -p boon_native_playground` passes all 118 tests, including the
-  complete Persons.pro workflow, retained-view restart, corruption, migration,
-  and asynchronous immutable-artifact restoration regressions.
-- Fresh `cargo xtask verify-persons-pro --report
+- `cargo test -p boon_native_playground -p xtask --quiet` passes 62 focused
+  playground tests and 19 tooling tests. Duplicate private playground behavior
+  oracles were deleted; public product behavior remains owned by versioned
+  scenarios and manifest-backed native gates.
+- `cargo check --workspace --all-targets` and `cargo test --workspace
+  --all-targets --quiet` pass after the cleanup.
+- Fresh `cargo xtask verify-architecture` and `cargo xtask verify-negative`
+  reports pass. The architecture report records 183,763 tracked Rust lines,
+  31,703 test lines, and 31,361 playground production lines without raising any
+  cap.
+- The last fresh `cargo xtask verify-persons-pro --report
   target/reports/report-v2/persons-pro.json` reports `status=pass`, completes all
   29 declared native workflow steps, restores the exact acknowledged authority
   in a second native process, and records an applied `program-artifact-load`
@@ -491,6 +499,12 @@ Current release evidence (2026-07-16, commits `aaad56a` and `9354fd1`):
   worker-owned checkpoint batches. The profile observed one pending checkpoint
   batch at most; the worker regression proves that an active commit plus queued
   future work reports two batches rather than disguising queue depth.
+
+That Persons report was produced from the implementation worktree before the
+subsequent test-only cleanup commits, so its measurements are evidence for the
+product implementation but are intentionally stale for the final aggregate.
+The Persons gate and all other manifest-native gates must be regenerated from
+current HEAD after the compositor restart.
 
 The latest isolated-seat release-ownership fix is installed in `/usr/bin`, but
 the current COSMIC session still maps the preceding compositor image. A session

@@ -85,11 +85,10 @@ FUNCTION header_spacer() {
 FUNCTION desktop_toolbar() {
     Scene/Element/stripe(
         element: []
-        direction: Row
-        gap: 10
+        direction: Column
+        gap: 8
         style: [
             width: Fill
-            height: 56
             visible_min_width: 860
             padding: [left: 20, right: 20, top: 8, bottom: 8]
             background: [color: PersonsTheme/header_background(mode: PASSED.store.mode)]
@@ -97,10 +96,22 @@ FUNCTION desktop_toolbar() {
             border_width: 1
         ]
         items: LIST {
+            desktop_primary_actions()
+            Auth/controls(PASS: [store: PASSED.store])
+        }
+    )
+}
+
+FUNCTION desktop_primary_actions() {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [width: Fill, height: 40, paint: False]
+        items: LIST {
             preview_width_controls()
             header_spacer()
             Publish/controls(PASS: [store: PASSED.store])
-            Auth/controls(PASS: [store: PASSED.store])
         }
     )
 }

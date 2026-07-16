@@ -3,7 +3,12 @@ FUNCTION controls() {
         element: []
         direction: Row
         gap: 7
-        style: [width: Auto, paint: False]
+        style: [
+            width: Fill
+            wrap: True
+            wrap_min_width: 190
+            paint: False
+        ]
         items: LIST {
             Components/status(
                 PASS: [store: PASSED.store]
@@ -103,7 +108,12 @@ FUNCTION development_outcomes() {
                     element: []
                     direction: Row
                     gap: 6
-                    style: [width: Fill, paint: False]
+                    style: [
+                        width: Fill
+                        wrap: True
+                        wrap_min_width: 180
+                        paint: False
+                    ]
                     items: LIST {
                         Components/button(
                             PASS: [store: PASSED.store]
@@ -125,7 +135,12 @@ FUNCTION development_outcomes() {
                     element: []
                     direction: Row
                     gap: 6
-                    style: [width: Fill, paint: False]
+                    style: [
+                        width: Fill
+                        wrap: True
+                        wrap_min_width: 180
+                        paint: False
+                    ]
                     items: LIST {
                         Components/button(
                             PASS: [store: PASSED.store]

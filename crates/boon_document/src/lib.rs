@@ -5380,12 +5380,53 @@ impl LayoutBuilder<'_, '_> {
 
     fn preferred_row_child_width(&mut self, node: &DocumentNode) -> Option<f32> {
         let typed_layout = self.typed_layout_style(node);
-        if layout_dimension_is_auto(&node.style, typed_layout.as_ref(), "width")
-            && let Some(width) = self.auto_control_intrinsic_width(node)
-        {
-            return Some(width);
+        if layout_dimension_is_auto(&node.style, typed_layout.as_ref(), "width") {
+            if let Some(width) = self.auto_control_intrinsic_width(node) {
+                return Some(width);
+            }
+            if let Some(width) = self.auto_container_intrinsic_width(node) {
+                return Some(width);
+            }
         }
         preferred_row_child_width_with_typed(node, typed_layout.as_ref(), self.text)
+    }
+
+    fn auto_container_intrinsic_width(&mut self, node: &DocumentNode) -> Option<f32> {
+        if node.children.is_empty()
+            || matches!(
+                node.kind,
+                DocumentNodeKind::Button
+                    | DocumentNodeKind::Checkbox
+                    | DocumentNodeKind::Text
+                    | DocumentNodeKind::TextInput
+                    | DocumentNodeKind::EmbeddedMedia
+            )
+        {
+            return None;
+        }
+        let typed_layout = self.typed_layout_style(node);
+        let padding = layout_edges(&node.style, typed_layout.as_ref(), "padding");
+        let gap = layout_spacing(&node.style, typed_layout.as_ref(), "gap").unwrap_or(0.0);
+        let mut widths = Vec::with_capacity(node.children.len());
+        for child in &node.children {
+            let Some(child) = self.document.nodes.get(child).cloned() else {
+                continue;
+            };
+            if !self.node_is_visible(&child) {
+                continue;
+            }
+            let preferred = self.preferred_row_child_width(&child).unwrap_or(1.0);
+            widths.push(self.constrain_row_child_width(&child, preferred, preferred));
+        }
+        if widths.is_empty() {
+            return None;
+        }
+        let content_width = if matches!(node.kind, DocumentNodeKind::Row) {
+            widths.iter().sum::<f32>() + gap * widths.len().saturating_sub(1) as f32
+        } else {
+            widths.into_iter().fold(0.0_f32, f32::max)
+        };
+        Some((content_width + padding.horizontal()).max(1.0))
     }
 
     fn auto_control_intrinsic_width(&mut self, node: &DocumentNode) -> Option<f32> {
@@ -5467,6 +5508,12 @@ impl LayoutBuilder<'_, '_> {
             _ => None,
         };
         let auto_width = layout_dimension_is_auto(&node.style, typed_layout, "width");
+        let auto_control_width = auto_width
+            .then(|| self.auto_control_intrinsic_width(&node))
+            .flatten();
+        let auto_container_width = (auto_width && auto_control_width.is_none())
+            .then(|| self.auto_container_intrinsic_width(&node))
+            .flatten();
         let explicit_width =
             layout_dimension(&node.style, typed_layout, "width", available_width).or(box_size);
         let explicit_height =
@@ -5496,11 +5543,6 @@ impl LayoutBuilder<'_, '_> {
         {
             measured.width += 8.0;
         }
-        if auto_width && let Some(intrinsic_width) = self.auto_control_intrinsic_width(&node) {
-            measured.width = measured
-                .width
-                .max((intrinsic_width - padding.horizontal()).max(1.0));
-        }
         let shrink_to_child_width = explicit_width.is_none()
             && text.is_none()
             && !node.children.is_empty()
@@ -5508,7 +5550,11 @@ impl LayoutBuilder<'_, '_> {
                 node.kind,
                 DocumentNodeKind::Button | DocumentNodeKind::Checkbox
             );
-        let mut width = if auto_width {
+        let mut width = if let Some(intrinsic_width) = auto_control_width {
+            intrinsic_width.max(1.0)
+        } else if let Some(intrinsic_width) = auto_container_width {
+            intrinsic_width.max(1.0)
+        } else if auto_width {
             let auto_padding = layout_spacing(&node.style, typed_layout, "auto_padding")
                 .unwrap_or(font_size * 0.9);
             (measured.width + auto_padding + padding.horizontal()).max(1.0)

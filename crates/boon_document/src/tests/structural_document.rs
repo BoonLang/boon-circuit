@@ -292,6 +292,113 @@ fn row_fill_reserves_intrinsic_width_for_auto_button_labels() {
 }
 
 #[test]
+fn row_fill_reserves_recursive_intrinsic_width_for_auto_action_groups() {
+    let mut frame = DocumentFrame::empty("root");
+    let mut toolbar = DocumentNode::new("toolbar", DocumentNodeKind::Row);
+    toolbar.parent = Some(frame.root.clone());
+    toolbar
+        .style
+        .insert("width".to_owned(), StyleValue::Number(500.0));
+    toolbar
+        .style
+        .insert("height".to_owned(), StyleValue::Number(48.0));
+    toolbar
+        .style
+        .insert("gap".to_owned(), StyleValue::Number(8.0));
+    toolbar
+        .style
+        .insert("padding_left".to_owned(), StyleValue::Number(10.0));
+    toolbar
+        .style
+        .insert("padding_right".to_owned(), StyleValue::Number(10.0));
+
+    let mut fixed = DocumentNode::new("fixed", DocumentNodeKind::Stack);
+    fixed.parent = Some(toolbar.id.clone());
+    fixed
+        .style
+        .insert("width".to_owned(), StyleValue::Number(40.0));
+    let mut spacer = DocumentNode::new("spacer", DocumentNodeKind::Stack);
+    spacer.parent = Some(toolbar.id.clone());
+    spacer
+        .style
+        .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+    let mut actions = DocumentNode::new("actions", DocumentNodeKind::Row);
+    actions.parent = Some(toolbar.id.clone());
+    actions
+        .style
+        .insert("width".to_owned(), StyleValue::Text("Auto".to_owned()));
+    actions
+        .style
+        .insert("gap".to_owned(), StyleValue::Number(6.0));
+
+    for (button_id, label_id, text) in [
+        ("publish", "publish-label", "Publish"),
+        ("protect", "protect-label", "Protect workspace"),
+    ] {
+        let mut button = DocumentNode::new(button_id, DocumentNodeKind::Button);
+        button.parent = Some(actions.id.clone());
+        button
+            .style
+            .insert("width".to_owned(), StyleValue::Text("Auto".to_owned()));
+        button
+            .style
+            .insert("auto_padding".to_owned(), StyleValue::Number(20.0));
+        let mut label = DocumentNode::new(label_id, DocumentNodeKind::Text);
+        label.parent = Some(button.id.clone());
+        label.text = Some(TextValue {
+            text: text.to_owned(),
+        });
+        label
+            .style
+            .insert("width".to_owned(), StyleValue::Text("Fill".to_owned()));
+        button.children.push(label.id.clone());
+        actions.children.push(button.id.clone());
+        frame.nodes.insert(button.id.clone(), button);
+        frame.nodes.insert(label.id.clone(), label);
+    }
+
+    toolbar.children = vec![fixed.id.clone(), spacer.id.clone(), actions.id.clone()];
+    frame
+        .nodes
+        .get_mut(&frame.root)
+        .unwrap()
+        .children
+        .push(toolbar.id.clone());
+    frame.nodes.insert(toolbar.id.clone(), toolbar);
+    frame.nodes.insert(fixed.id.clone(), fixed);
+    frame.nodes.insert(spacer.id.clone(), spacer);
+    frame.nodes.insert(actions.id.clone(), actions);
+
+    let mut text = SimpleTextMeasurer;
+    let layout = layout(LayoutInput {
+        document: &frame,
+        viewport: Viewport {
+            surface: 1,
+            width: 500.0,
+            height: 80.0,
+            scale: 1.0,
+        },
+        text: &mut text,
+        capabilities: RenderCapabilities::fake_portable(),
+    });
+    let bounds = |id: &str| {
+        layout
+            .display_list
+            .iter()
+            .find(|item| item.node.0 == id)
+            .unwrap()
+            .bounds
+    };
+    let actions = bounds("actions");
+    let publish = bounds("publish");
+    let protect = bounds("protect");
+    assert!(actions.width > 160.0, "actions={actions:?}");
+    assert!(protect.x > publish.x + publish.width);
+    assert!(protect.x + protect.width <= actions.x + actions.width);
+    assert!(actions.x + actions.width <= 490.0);
+}
+
+#[test]
 fn aspect_ratio_is_not_replaced_by_empty_child_height() {
     let mut frame = DocumentFrame::empty("root");
     let mut image = DocumentNode::new("image", DocumentNodeKind::Stack);

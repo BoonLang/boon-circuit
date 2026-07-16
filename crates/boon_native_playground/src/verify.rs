@@ -44,7 +44,7 @@ use crate::proof::frame_capture_token_digest;
 use crate::{
     native_input::NativeInput,
     ui::DEV_EDITOR_INPUT_TARGET,
-    view::{OPERATOR_CURSOR_DARK, OPERATOR_CURSOR_LIGHT},
+    view::{OPERATOR_CURSOR_DARK, OPERATOR_CURSOR_LIGHT, OPERATOR_CURSOR_PARTS},
     workspace_control::WorkspaceGuard,
 };
 
@@ -356,7 +356,7 @@ impl VerifierProfile {
         if self.required_checkpoints.len() > 32 {
             return Err("required checkpoint count exceeds 32".to_owned());
         }
-        if self.required_native_workflow_steps.len() > 32
+        if self.required_native_workflow_steps.len() > crate::preview::TEST_STEP_LIMIT
             || self
                 .required_native_workflow_steps
                 .iter()
@@ -2452,6 +2452,13 @@ fn drive_native_workflow(
                 .collect::<Vec<_>>(),
         );
         let assertion_only = action.action_kind == "assertion_only";
+        let keyboard_change_required = matches!(
+            action.action_kind.as_str(),
+            "key" | "focused_key" | "focused_chord"
+        ) && action.key.as_deref() != Some("ctrl+c");
+        let keyboard_visible_change = input_events
+            .iter()
+            .any(|input| input.kind == InputKind::Keyboard && input.visible_change);
         let input_span_valid = if assertion_only {
             completed.4 == 0 && completed.5 == 0 && completed.6 == 0 && input_events.is_empty()
         } else {
@@ -2470,6 +2477,7 @@ fn drive_native_workflow(
             || completed.2 != action.action_kind
             || completed.3 != action.action_digest
             || !input_span_valid
+            || (keyboard_change_required && !keyboard_visible_change)
             || completed.7 != observed_input_digest
             || completed.8 == 0
             || completed.9 == 0
@@ -3772,11 +3780,12 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
                 format!("TEST #{request_id} cursor proof has no exact preview scale"),
             );
         };
-        if let Err(error) = boon_native_gpu::verify_bordered_marker_pixels(
+        if let Err(error) = boon_native_gpu::verify_bordered_shape_pixels(
             Path::new(&proof.artifact.path),
             frame.2,
             frame.3,
             scale,
+            &OPERATOR_CURSOR_PARTS,
             OPERATOR_CURSOR_DARK,
             OPERATOR_CURSOR_LIGHT,
         ) {
@@ -7927,33 +7936,39 @@ mod tests {
                 .as_nanos()
         ));
         let mut pixels = image::RgbaImage::from_pixel(32, 32, image::Rgba(OPERATOR_CURSOR_LIGHT));
-        for y in 8..20 {
-            for x in 8..10 {
-                pixels.put_pixel(x, y, image::Rgba(OPERATOR_CURSOR_DARK));
+        for (layer, color) in [OPERATOR_CURSOR_LIGHT, OPERATOR_CURSOR_DARK]
+            .into_iter()
+            .enumerate()
+        {
+            for [x, y, width, height] in OPERATOR_CURSOR_PARTS {
+                let grow = i32::from(layer == 0);
+                for py in 8 + y as i32 - grow..8 + (y + height) as i32 + grow {
+                    for px in 8 + x as i32 - grow..8 + (x + width) as i32 + grow {
+                        pixels.put_pixel(px as u32, py as u32, image::Rgba(color));
+                    }
+                }
             }
         }
         pixels.save(&path).unwrap();
-        let artifact = ProofArtifact {
-            path: path.display().to_string(),
-            sha256: "a".repeat(64),
-            byte_len: 1,
-            capture_method: "app-owned-render-target-readback".to_owned(),
-            capture_token_digest: "b".repeat(64),
-            nonblank_samples: 1,
-            unique_rgba_values: 2,
-        };
         let probe = |x, y| {
-            boon_native_gpu::verify_bordered_marker_pixels(
-                Path::new(&artifact.path),
+            boon_native_gpu::verify_bordered_shape_pixels(
+                &path,
                 x,
                 y,
                 1.0,
+                &OPERATOR_CURSOR_PARTS,
                 OPERATOR_CURSOR_DARK,
                 OPERATOR_CURSOR_LIGHT,
             )
         };
         assert!(probe(8.0, 8.0).is_ok());
-        assert!(probe(20.0, 20.0).is_err());
+        pixels = image::RgbaImage::from_pixel(32, 32, image::Rgba(OPERATOR_CURSOR_LIGHT));
+        for y in 8..22 {
+            pixels.put_pixel(8, y, image::Rgba(OPERATOR_CURSOR_DARK));
+            pixels.put_pixel(9, y, image::Rgba(OPERATOR_CURSOR_DARK));
+        }
+        pixels.save(&path).unwrap();
+        assert!(probe(8.0, 8.0).is_err());
         fs::remove_file(path).unwrap();
     }
 

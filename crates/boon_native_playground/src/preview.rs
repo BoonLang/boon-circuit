@@ -53,7 +53,7 @@ use crate::runtime_view::{
 };
 use crate::view::{HitTarget, RetainedView};
 
-pub(crate) const TEST_STEP_LIMIT: usize = 32;
+pub(crate) const TEST_STEP_LIMIT: usize = 64;
 const OUTBOUND_QUEUE_DEPTH: usize = 8;
 const STATS_INTERVAL: Duration = Duration::from_millis(100);
 const TEST_CURSOR_FRAME: Duration = Duration::from_millis(16);
@@ -158,16 +158,17 @@ struct ResponsiveActionId {
 struct NativeWorkflowPending {
     request_id: u64,
     action_digest: String,
+    target_node: String,
     before_state_digest: String,
     started_at: Option<Instant>,
     first_sequence: Option<u64>,
     last_sequence: Option<u64>,
     event_digests: Vec<String>,
-    event_summaries: Vec<String>,
     batch_text: String,
     pointer_up_count: u8,
     last_pointer_up_source_path: Option<String>,
     last_pointer_up_dispatched_source_paths: Vec<String>,
+    keyboard_phase: u8,
     action_complete: bool,
 }
 
@@ -861,6 +862,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 workflow,
                                 envelope,
                                 target_source_path.as_deref(),
+                                model.focused(),
                                 &outcome.dispatches,
                             )?;
                         }
@@ -2104,6 +2106,7 @@ fn observe_native_workflow_input(
     workflow: &mut NativeWorkflowState,
     envelope: &HostEventEnvelope,
     pointer_source_path: Option<&str>,
+    focused_node: Option<&str>,
     dispatches: &[RuntimeSourceDispatch],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !workflow.prepared || workflow.complete() || envelope.origin != HostEventOrigin::RealOs {
@@ -2134,7 +2137,8 @@ fn observe_native_workflow_input(
             && matches!(
                 envelope.event,
                 HostEvent::Keyboard(KeyEvent { pressed: true, .. })
-            );
+            )
+            && focused_node == Some(pending.target_node.as_str());
         if !starts_on_target && !starts_on_blur && !starts_focused {
             return Ok(());
         }
@@ -2160,16 +2164,6 @@ fn observe_native_workflow_input(
     pending.first_sequence.get_or_insert(envelope.sequence);
     pending.last_sequence = Some(envelope.sequence);
     pending.event_digests.push(host_event_digest(envelope));
-    pending.event_summaries.push(format!(
-        "{}:{}:target={:?}:dispatch={:?}",
-        envelope.sequence,
-        native_workflow_event_shape(&envelope.event),
-        pointer_source_path,
-        dispatches
-            .iter()
-            .map(|dispatch| dispatch.source_path.as_str())
-            .collect::<Vec<_>>()
-    ));
     if pending.event_digests.len() > MAX_NATIVE_WORKFLOW_INPUT_EVENTS {
         return Err(format!(
             "native workflow step `{}` exceeded its bounded {}-event input span",
@@ -2235,21 +2229,21 @@ fn observe_native_workflow_input(
                 .into());
             }
         }
-        ("key" | "focused_key", HostEvent::Keyboard(key)) if !key.pressed => {
-            pending.action_complete = step.key.as_deref().is_some_and(|expected| {
-                matches!(&key.logical_key, LogicalKey::Named(actual) if actual.eq_ignore_ascii_case(expected))
-            });
-        }
-        ("focused_chord", HostEvent::Keyboard(key)) if !key.pressed => {
-            pending.action_complete = step
+        ("key" | "focused_key" | "focused_chord", HostEvent::Keyboard(key)) => {
+            let expected = step
                 .key
                 .as_deref()
-                .and_then(|chord| chord.split_once('+'))
-                .is_some_and(|(modifier, _)| match (&key.logical_key, modifier) {
-                    (LogicalKey::Named(actual), "ctrl") => actual.starts_with("Control"),
-                    (LogicalKey::Named(actual), "shift") => actual.starts_with("Shift"),
-                    _ => false,
-                });
+                .ok_or("native workflow key step has no declared key")?;
+            let (phase, complete_phase) =
+                native_workflow_keyboard_phase(action_kind, key, expected)
+                    .ok_or("native workflow received an undeclared key")?;
+            if focused_node != Some(pending.target_node.as_str())
+                || phase != pending.keyboard_phase.saturating_add(1)
+            {
+                return Err("native workflow key sequence or focus mismatch".into());
+            }
+            pending.keyboard_phase = phase;
+            pending.action_complete = phase == complete_phase;
         }
         ("blur", HostEvent::Focus { focused: false, .. }) => {
             pending.action_complete = true;
@@ -2259,15 +2253,36 @@ fn observe_native_workflow_input(
     Ok(())
 }
 
-fn native_workflow_event_shape(event: &HostEvent) -> String {
-    match event {
-        HostEvent::Pointer(pointer) => {
-            format!("pointer/{:?}/{:?}", pointer.phase, pointer.button)
+fn native_workflow_keyboard_phase(
+    action_kind: &str,
+    key: &KeyEvent,
+    expected: &str,
+) -> Option<(u8, u8)> {
+    let actual = match &key.logical_key {
+        LogicalKey::Named(actual) | LogicalKey::Character(actual) => actual,
+        LogicalKey::Dead(_) | LogicalKey::Unidentified => return None,
+    };
+    match action_kind {
+        "key" | "focused_key" if actual.eq_ignore_ascii_case(expected) => {
+            Some((if key.pressed { 1 } else { 2 }, 2))
         }
-        HostEvent::TextInput(text) => format!("text/{}bytes", text.text.len()),
-        HostEvent::Keyboard(key) => format!("key/{:?}/{}", key.logical_key, key.pressed),
-        HostEvent::Focus { focused, .. } => format!("focus/{focused}"),
-        _ => format!("{:?}", input_kind(event)),
+        "focused_chord" => {
+            let (modifier, expected_key) = expected.split_once('+')?;
+            let modifier_matches = match modifier {
+                "ctrl" => actual.starts_with("Control"),
+                "shift" => actual.starts_with("Shift"),
+                _ => false,
+            };
+            let phase = if modifier_matches {
+                if key.pressed { 1 } else { 4 }
+            } else if actual.eq_ignore_ascii_case(expected_key) {
+                if key.pressed { 2 } else { 3 }
+            } else {
+                return None;
+            };
+            Some((phase, 4))
+        }
+        _ => None,
     }
 }
 
@@ -2489,7 +2504,7 @@ async fn service_native_workflow(
                     .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT)
             {
                 return Err(format!(
-                    "native workflow step `{}` did not complete its declared real-input span; events={}, pointer_ups={}, first_sequence={:?}, last_sequence={:?}, pointer_up_source={:?}, pointer_up_dispatch={:?}, event_span={:?}",
+                    "native workflow step `{}` did not complete its declared real-input span; events={}, pointer_ups={}, first_sequence={:?}, last_sequence={:?}, pointer_up_source={:?}, pointer_up_dispatch={:?}",
                     workflow
                         .current()
                         .map_or("unknown", |step| step.id.as_str()),
@@ -2499,7 +2514,6 @@ async fn service_native_workflow(
                     pending.last_sequence,
                     pending.last_pointer_up_source_path,
                     pending.last_pointer_up_dispatched_source_paths,
-                    pending.event_summaries,
                 )
                 .into());
             }
@@ -2732,6 +2746,7 @@ fn emit_current_native_workflow_target(
     workflow.pending = Some(NativeWorkflowPending {
         request_id,
         action_digest: action_digest.clone(),
+        target_node: target.node.clone(),
         before_state_digest: workflow
             .current_state_digest
             .clone()
@@ -2740,11 +2755,11 @@ fn emit_current_native_workflow_target(
         first_sequence: None,
         last_sequence: None,
         event_digests: Vec::new(),
-        event_summaries: Vec::new(),
         batch_text: String::new(),
         pointer_up_count: 0,
         last_pointer_up_source_path: None,
         last_pointer_up_dispatched_source_paths: Vec::new(),
+        keyboard_phase: 0,
         action_complete: false,
     });
     emit(
@@ -6106,16 +6121,17 @@ mod tests {
             pending: Some(NativeWorkflowPending {
                 request_id: 43,
                 action_digest: "action".to_owned(),
+                target_node: "button".to_owned(),
                 before_state_digest: "before".to_owned(),
                 started_at: None,
                 first_sequence: None,
                 last_sequence: None,
                 event_digests: Vec::new(),
-                event_summaries: Vec::new(),
                 batch_text: String::new(),
                 pointer_up_count: 0,
                 last_pointer_up_source_path: None,
                 last_pointer_up_dispatched_source_paths: Vec::new(),
+                keyboard_phase: 0,
                 action_complete: false,
             }),
             test_completed_emitted: false,
@@ -6152,6 +6168,7 @@ mod tests {
             &mut workflow,
             &native_pointer_envelope(1, PointerPhase::Down),
             Some("store.button"),
+            None,
             std::slice::from_ref(&expected),
         )
         .unwrap();
@@ -6159,6 +6176,7 @@ mod tests {
             &mut workflow,
             &native_pointer_envelope(2, PointerPhase::Up),
             Some("store.button"),
+            None,
             &[],
         )
         .unwrap();
@@ -6182,6 +6200,7 @@ mod tests {
             &mut workflow,
             &native_pointer_envelope(1, PointerPhase::Down),
             Some("store.button"),
+            None,
             &[],
         )
         .unwrap();
@@ -6189,6 +6208,7 @@ mod tests {
             &mut workflow,
             &native_pointer_envelope(2, PointerPhase::Up),
             Some("store.button"),
+            None,
             &dispatches,
         )
         .unwrap();
@@ -6526,6 +6546,7 @@ scene: Scene/Element/program(
                 .unwrap()
                 .unwrap();
         assert_eq!(workflow.steps.len(), 36);
+        assert!(workflow.steps.len() <= TEST_STEP_LIMIT);
     }
 
     #[test]

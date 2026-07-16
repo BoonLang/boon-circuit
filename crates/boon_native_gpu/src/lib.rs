@@ -3799,17 +3799,30 @@ pub fn complete_presented_texture_readback(
     })
 }
 
-pub fn verify_bordered_marker_pixels(
+pub fn verify_bordered_shape_pixels(
     artifact_path: &Path,
     x: f32,
     y: f32,
     scale: f64,
+    parts: &[[f32; 4]],
     foreground: [u8; 4],
     border_color: [u8; 4],
 ) -> Result<usize, RenderError> {
-    if !x.is_finite() || !y.is_finite() || !scale.is_finite() || scale <= 0.0 {
+    if !x.is_finite()
+        || !y.is_finite()
+        || !scale.is_finite()
+        || scale <= 0.0
+        || parts.is_empty()
+        || parts.len() > 64
+        || parts.iter().any(|part| {
+            part.iter().any(|value| !value.is_finite())
+                || part[2] <= 0.0
+                || part[3] <= 0.0
+                || part.iter().any(|value| value.abs() > 512.0)
+        })
+    {
         return Err(RenderError {
-            message: "pixel marker probe has invalid coordinates or scale".to_owned(),
+            message: "pixel shape probe has invalid coordinates, scale, or parts".to_owned(),
         });
     }
     let pixels = image::open(artifact_path)
@@ -3817,30 +3830,81 @@ pub fn verify_bordered_marker_pixels(
             message: format!("decode marker proof `{}`: {error}", artifact_path.display()),
         })?
         .into_rgba8();
-    let origin_x = (f64::from(x) * scale).round() as i64;
-    let origin_y = (f64::from(y) * scale).round() as i64;
-    let stroke = (3.0 * scale).ceil().max(2.0) as i64;
-    let border = (2.0 * scale).ceil().max(1.0) as i64;
-    let row_end = (origin_y + (12.0 * scale).ceil() as i64).min(i64::from(pixels.height()));
-    let mut matched_rows = 0usize;
-    for py in origin_y.max(0)..row_end {
-        let row_matches =
-            ((origin_x - 1).max(0)..(origin_x + stroke).min(i64::from(pixels.width()))).any(|px| {
-                pixel_near(pixels.get_pixel(px as u32, py as u32).0, foreground)
-                    && ((px - border).max(0)..px).any(|border_x| {
-                        pixel_near(pixels.get_pixel(border_x as u32, py as u32).0, border_color)
-                    })
-            });
-        matched_rows = matched_rows.saturating_add(usize::from(row_matches));
+    let min_x = parts
+        .iter()
+        .map(|part| part[0] - 1.0)
+        .fold(f32::INFINITY, f32::min);
+    let min_y = parts
+        .iter()
+        .map(|part| part[1] - 1.0)
+        .fold(f32::INFINITY, f32::min);
+    let max_x = parts
+        .iter()
+        .map(|part| part[0] + part[2] + 1.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max_y = parts
+        .iter()
+        .map(|part| part[1] + part[3] + 1.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let px_start = ((f64::from(x + min_x) * scale).floor() as i64).max(0);
+    let py_start = ((f64::from(y + min_y) * scale).floor() as i64).max(0);
+    let px_end = ((f64::from(x + max_x) * scale).ceil() as i64).min(i64::from(pixels.width()));
+    let py_end = ((f64::from(y + max_y) * scale).ceil() as i64).min(i64::from(pixels.height()));
+    let mut part_expected = vec![0usize; parts.len()];
+    let mut part_matched = vec![0usize; parts.len()];
+    let mut border_expected = 0usize;
+    let mut border_matched = 0usize;
+    for py in py_start..py_end {
+        for px in px_start..px_end {
+            let logical_x = ((px as f64 + 0.5) / scale - f64::from(x)) as f32;
+            let logical_y = ((py as f64 + 0.5) / scale - f64::from(y)) as f32;
+            let actual = pixels.get_pixel(px as u32, py as u32).0;
+            let mut foreground_expected = false;
+            for (index, part) in parts.iter().enumerate() {
+                if shape_part_contains(*part, logical_x, logical_y, 0.0) {
+                    foreground_expected = true;
+                    part_expected[index] += 1;
+                    part_matched[index] += usize::from(pixel_near(actual, foreground));
+                }
+            }
+            if !foreground_expected
+                && parts
+                    .iter()
+                    .any(|part| shape_part_contains(*part, logical_x, logical_y, 1.0))
+            {
+                border_expected += 1;
+                border_matched += usize::from(pixel_near(actual, border_color));
+            }
+        }
     }
-    let required_rows = (6.0 * scale).ceil().max(4.0) as usize;
-    (matched_rows >= required_rows)
-        .then_some(matched_rows)
-        .ok_or_else(|| RenderError {
+    let weakest_part = part_expected
+        .iter()
+        .zip(&part_matched)
+        .enumerate()
+        .min_by_key(|(_, (expected, matched))| matched.saturating_mul(1_000) / (**expected).max(1));
+    let parts_match = part_expected
+        .iter()
+        .zip(&part_matched)
+        .all(|(expected, matched)| *expected > 0 && matched.saturating_mul(5) >= expected * 3);
+    let border_matches =
+        border_expected > 0 && border_matched.saturating_mul(5) >= border_expected * 3;
+    if parts_match && border_matches {
+        Ok(part_matched.into_iter().sum::<usize>() + border_matched)
+    } else {
+        Err(RenderError {
             message: format!(
-                "marker at ({x:.1}, {y:.1}) matched {matched_rows}/{required_rows} required rows"
+                "bordered shape at ({x:.1}, {y:.1}) did not match all {} parts; weakest={weakest_part:?}, border={border_matched}/{border_expected}",
+                parts.len()
             ),
         })
+    }
+}
+
+fn shape_part_contains(part: [f32; 4], x: f32, y: f32, expansion: f32) -> bool {
+    x >= part[0] - expansion
+        && x < part[0] + part[2] + expansion
+        && y >= part[1] - expansion
+        && y < part[1] + part[3] + expansion
 }
 
 fn pixel_near(actual: [u8; 4], expected: [u8; 4]) -> bool {

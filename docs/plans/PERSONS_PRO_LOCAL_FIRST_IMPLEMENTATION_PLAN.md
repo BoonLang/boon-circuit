@@ -479,13 +479,13 @@ Current implementation evidence (2026-07-16, beginning with commit `be6ff21`):
   Host-only scenario ownership is assigned to the manifest-backed native
   verifier.
 - `cargo test -p boon_persistence --lib` passes all 54 tests.
-- `cargo test -p boon_native_playground` passes all 63 tests and `cargo test -p
+- `cargo test -p boon_native_playground` passes all 65 tests and `cargo test -p
   xtask` passes all 19 tooling tests.
 - `cargo check --workspace --all-targets`, `cargo test --workspace
   --all-targets --quiet`, and `cargo build --release
   -p boon_native_playground` pass from the current implementation.
-- The architecture gate passes with 184,571 tracked Rust lines, 31,926 test
-  lines, 31,876 playground production lines, 5,117 xtask production lines, and
+- The architecture gate passes with 184,950 tracked Rust lines, 31,999 test
+  lines, 31,993 playground production lines, 5,197 xtask production lines, and
   20,544 runtime-plus-executor production lines, all within their caps.
 - No tracked Python source exists. Production engine/playground scans contain
   no Persons.pro branch; remaining Persons literals are source-controlled
@@ -499,9 +499,14 @@ Current implementation evidence (2026-07-16, beginning with commit `be6ff21`):
   36 ordered isolated-input steps, including PageDown caret reveal, select all,
   copy, End navigation, paste, select again, Delete, and subsequent valid
   typing. Twenty-four state frames require exact app-owned readback proof.
-- TEST evidence now decodes exact production-target artifacts and requires the
-  cursor's bordered vertical marker at the logical event coordinate and matching
-  surface scale. Frame sequencing plus a merely nonblank PNG is insufficient.
+- The preview and verifier share one bounded 64-step workflow limit. Keyboard
+  steps require the exact resolved target node to own focus, and key/chord
+  evidence accepts only the complete ordered down/up sequence. Navigation and
+  editing steps other than copy must also produce a visible keyboard frame.
+- TEST evidence decodes exact production-target artifacts and requires every
+  foreground and border region of the cursor's six-part geometry at the logical
+  event coordinate and matching surface scale. A nonblank image or plain dark
+  stripe at that coordinate fails the deterministic pixel regression.
 - Responsive evidence requires exact multiplicity for every desktop product
   action identity. Narrow-only navigation remains allowed, but is excluded from
   the equivalent-action digest instead of masking duplicate product controls.

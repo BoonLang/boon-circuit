@@ -8,6 +8,14 @@ use boon_host::Viewport;
 
 pub(crate) const OPERATOR_CURSOR_LIGHT: [u8; 4] = [255, 255, 255, 255];
 pub(crate) const OPERATOR_CURSOR_DARK: [u8; 4] = [24, 28, 36, 255];
+pub(crate) const OPERATOR_CURSOR_PARTS: [[f32; 4]; 6] = [
+    [0.0, 0.0, 2.0, 14.0],
+    [2.0, 2.0, 2.0, 12.0],
+    [4.0, 4.0, 2.0, 10.0],
+    [6.0, 6.0, 2.0, 8.0],
+    [8.0, 8.0, 2.0, 4.0],
+    [5.0, 11.0, 3.0, 9.0],
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HitTarget {
@@ -115,49 +123,17 @@ impl RetainedView {
             font_id: 0,
             pseudo_state_id: 0,
         };
-        let pointer_parts = [
-            Rect {
-                x,
-                y,
-                width: 2.0,
-                height: 14.0,
-            },
-            Rect {
-                x: x + 2.0,
-                y: y + 2.0,
-                width: 2.0,
-                height: 12.0,
-            },
-            Rect {
-                x: x + 4.0,
-                y: y + 4.0,
-                width: 2.0,
-                height: 10.0,
-            },
-            Rect {
-                x: x + 6.0,
-                y: y + 6.0,
-                width: 2.0,
-                height: 8.0,
-            },
-            Rect {
-                x: x + 8.0,
-                y: y + 8.0,
-                width: 2.0,
-                height: 4.0,
-            },
-            Rect {
-                x: x + 5.0,
-                y: y + 11.0,
-                width: 3.0,
-                height: 9.0,
-            },
-        ];
         for (layer, color) in [OPERATOR_CURSOR_LIGHT, OPERATOR_CURSOR_DARK]
             .into_iter()
             .enumerate()
         {
-            for (part, bounds) in pointer_parts.into_iter().enumerate() {
+            for (part, [dx, dy, width, height]) in OPERATOR_CURSOR_PARTS.into_iter().enumerate() {
+                let bounds = Rect {
+                    x: x + dx,
+                    y: y + dy,
+                    width,
+                    height,
+                };
                 let bounds = if layer == 0 {
                     Rect {
                         x: bounds.x - 1.0,

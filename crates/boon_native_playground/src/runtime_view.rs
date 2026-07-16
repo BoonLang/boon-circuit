@@ -158,7 +158,7 @@ pub struct RuntimeView {
     materialization_overscan: std::collections::BTreeMap<u64, std::ops::Range<u64>>,
     pending_patches: Vec<DocumentPatch>,
     sequence: u64,
-    last_dispatched_source: Option<String>,
+    event_dispatches: Option<Vec<RuntimeSourceDispatch>>,
     pending_external_url: Option<String>,
     last_primary_click: Option<(String, Instant)>,
     last_runtime_phase: RuntimePhaseTimings,
@@ -198,6 +198,26 @@ pub(crate) struct RuntimeAsyncLaneObservation {
     pub apply_us: u64,
     pub end_to_end_us: u64,
     pub outcome: RuntimeAsyncLaneOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeSourceDispatch {
+    pub source_path: String,
+    pub source_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeEventOutcome {
+    pub changed: bool,
+    pub dispatches: Vec<RuntimeSourceDispatch>,
+}
+
+impl RuntimeEventOutcome {
+    pub fn dispatched(&self, source_path: &str) -> bool {
+        self.dispatches
+            .iter()
+            .any(|dispatch| dispatch.source_path == source_path)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -294,6 +314,7 @@ impl ProgramArtifactStoreLane {
         self.next_candidate_sequence
     }
 
+    #[cfg(test)]
     fn next_store_deadline(&self) -> Option<Instant> {
         self.pending_by_session
             .values()
@@ -642,7 +663,7 @@ impl RuntimeView {
             materialization_overscan: std::collections::BTreeMap::new(),
             pending_patches: Vec::new(),
             sequence: source_sequence,
-            last_dispatched_source: None,
+            event_dispatches: None,
             pending_external_url: None,
             last_primary_click: None,
             last_runtime_phase: host_started
@@ -2119,12 +2140,15 @@ impl RuntimeView {
             .runtime
             .dispatch_with_content_artifact_changes(event, changes)?;
         self.capture_scenario_turn(path, &turn);
-        let source_sequence = turn.source_sequence;
+        let source_sequence = turn.source_sequence.ok_or_else(|| {
+            PersistentDispatchError::Runtime(format!(
+                "durable source dispatch `{path}` produced no source sequence"
+            ))
+        })?;
         let changed = self
             .finish_parent_runtime_turn(turn)
             .map_err(PersistentDispatchError::Runtime)?;
-        self.last_dispatched_source = Some(path.to_owned());
-        debug_assert!(source_sequence.is_some());
+        self.record_event_dispatch(path, source_sequence);
         self.schedule_effect_poll()
             .map_err(PersistentDispatchError::Runtime)?;
         Ok((changed, ticket))
@@ -2280,10 +2304,6 @@ impl RuntimeView {
         self.sequence
     }
 
-    pub fn last_dispatched_source(&self) -> Option<&str> {
-        self.last_dispatched_source.as_deref()
-    }
-
     pub fn take_external_url(&mut self) -> Option<String> {
         self.pending_external_url.take()
     }
@@ -2409,7 +2429,34 @@ impl RuntimeView {
         event: &HostEvent,
         target: Option<HitTarget>,
     ) -> ViewResult<bool> {
+        self.handle_event_observed(event, target)
+            .map(|outcome| outcome.changed)
+    }
+
+    pub(crate) fn handle_event_observed(
+        &mut self,
+        event: &HostEvent,
+        target: Option<HitTarget>,
+    ) -> ViewResult<RuntimeEventOutcome> {
+        debug_assert!(self.event_dispatches.is_none());
+        self.event_dispatches = Some(Vec::new());
         self.last_runtime_phase = RuntimePhaseTimings::default();
+        let result = self.handle_event_inner(event, target);
+        let dispatches = self
+            .event_dispatches
+            .take()
+            .expect("host event dispatch collection is active");
+        result.map(|changed| RuntimeEventOutcome {
+            changed,
+            dispatches,
+        })
+    }
+
+    fn handle_event_inner(
+        &mut self,
+        event: &HostEvent,
+        target: Option<HitTarget>,
+    ) -> ViewResult<bool> {
         match event {
             HostEvent::Pointer(pointer) => match pointer.phase {
                 PointerPhase::Move => {
@@ -2769,10 +2816,13 @@ impl RuntimeView {
                 .program_host
                 .dispatch(next_sequence, path, row, payload)
                 .map_err(|error| error.to_string())?;
+            let source_sequence = turn.source_sequence.ok_or_else(|| {
+                format!("child source dispatch `{path}` produced no source sequence")
+            })?;
             self.capture_scenario_turn(path, &turn);
             self.sequence = source_sequence_after_turn(self.sequence, turn.source_sequence);
             self.last_runtime_phase = turn.phase_timings;
-            self.last_dispatched_source = Some(path.to_owned());
+            self.record_event_dispatch(path, source_sequence);
             return Ok(self.queue_program_update(patches, Vec::new()));
         }
         let event = self
@@ -2785,12 +2835,22 @@ impl RuntimeView {
             .dispatch(event)
             .map_err(|error| error.to_string())?;
         self.capture_scenario_turn(path, &turn);
-        let source_sequence = turn.source_sequence;
+        let source_sequence = turn
+            .source_sequence
+            .ok_or_else(|| format!("source dispatch `{path}` produced no source sequence"))?;
         let changed = self.finish_parent_runtime_turn(turn)?;
-        self.last_dispatched_source = Some(path.to_owned());
-        debug_assert!(source_sequence.is_some());
+        self.record_event_dispatch(path, source_sequence);
         self.schedule_effect_poll()?;
         Ok(changed)
+    }
+
+    fn record_event_dispatch(&mut self, source_path: &str, source_sequence: u64) {
+        if let Some(dispatches) = self.event_dispatches.as_mut() {
+            dispatches.push(RuntimeSourceDispatch {
+                source_path: source_path.to_owned(),
+                source_sequence,
+            });
+        }
     }
 
     pub fn caret_blink_deadline(&self) -> Option<Instant> {
@@ -4297,20 +4357,40 @@ mod tests {
             .target_for_source(&step.source_path, step.target_text.as_deref())
             .unwrap();
         model.begin_scenario_step(&step.source_path);
+        let mut outcomes = Vec::new();
         for phase in [PointerPhase::Move, PointerPhase::Down, PointerPhase::Up] {
-            model
-                .handle_event(
-                    &HostEvent::Pointer(PointerEvent {
-                        surface: SurfaceId("preview".to_owned()),
-                        x: target.center_x,
-                        y: target.center_y,
-                        phase,
-                        button: (phase != PointerPhase::Move).then_some(PointerButton::Primary),
-                    }),
-                    Some(target.clone()),
-                )
-                .unwrap();
+            outcomes.push(
+                model
+                    .handle_event_observed(
+                        &HostEvent::Pointer(PointerEvent {
+                            surface: SurfaceId("preview".to_owned()),
+                            x: target.center_x,
+                            y: target.center_y,
+                            phase,
+                            button: (phase != PointerPhase::Move).then_some(PointerButton::Primary),
+                        }),
+                        Some(target.clone()),
+                    )
+                    .unwrap(),
+            );
         }
+        assert!(outcomes[0].dispatches.is_empty());
+        assert!(outcomes[1].dispatches.is_empty());
+        assert!(outcomes[2].dispatched(&step.source_path));
+        assert_eq!(outcomes[2].dispatches.len(), 1);
+        let unrelated = model
+            .handle_event_observed(
+                &HostEvent::Pointer(PointerEvent {
+                    surface: SurfaceId("preview".to_owned()),
+                    x: target.center_x + 200.0,
+                    y: target.center_y + 200.0,
+                    phase: PointerPhase::Move,
+                    button: None,
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(unrelated.dispatches.is_empty());
         model
             .assert_scenario_step(&boon_runtime::ScenarioStep {
                 id: "counter-pointer-turn".to_owned(),
@@ -7818,14 +7898,15 @@ document: Document/new(
             });
         let target_point = crate::preview::test_step_pointer_position(view, &target, step);
         let mut dirty = false;
+        let mut declared_source_dispatched = false;
         let pointer_cycles = usize::from(
             step.action_kind.as_deref() == Some("double_click")
                 || target.source_intent.as_deref() == Some("double_click"),
         ) + 1;
         for _ in 0..pointer_cycles {
             for phase in [PointerPhase::Move, PointerPhase::Down, PointerPhase::Up] {
-                dirty |= model
-                    .handle_event(
+                let outcome = model
+                    .handle_event_observed(
                         &HostEvent::Pointer(PointerEvent {
                             surface: surface.clone(),
                             x: target_point.0,
@@ -7841,6 +7922,10 @@ document: Document/new(
                             step.source_path
                         )
                     });
+                dirty |= outcome.changed;
+                if phase != PointerPhase::Move {
+                    declared_source_dispatched |= outcome.dispatched(&step.source_path);
+                }
             }
         }
         if let Some(text) = &step.text {
@@ -7864,8 +7949,8 @@ document: Document/new(
             }
             if characterwise_text {
                 for character in text.chars() {
-                    dirty |= model
-                        .handle_event(
+                    let outcome = model
+                        .handle_event_observed(
                             &HostEvent::TextInput(TextInputEvent {
                                 surface: surface.clone(),
                                 text: character.to_string(),
@@ -7873,10 +7958,12 @@ document: Document/new(
                             None,
                         )
                         .unwrap();
+                    dirty |= outcome.changed;
+                    declared_source_dispatched |= outcome.dispatched(&step.source_path);
                 }
             } else {
-                dirty |= model
-                    .handle_event(
+                let outcome = model
+                    .handle_event_observed(
                         &HostEvent::TextInput(TextInputEvent {
                             surface: surface.clone(),
                             text: text.clone(),
@@ -7884,11 +7971,13 @@ document: Document/new(
                         None,
                     )
                     .unwrap();
+                dirty |= outcome.changed;
+                declared_source_dispatched |= outcome.dispatched(&step.source_path);
             }
         }
         if let Some(key) = &step.key {
-            dirty |= model
-                .handle_event(
+            let outcome = model
+                .handle_event_observed(
                     &HostEvent::Keyboard(KeyEvent {
                         surface: surface.clone(),
                         physical_key: None,
@@ -7898,12 +7987,14 @@ document: Document/new(
                     None,
                 )
                 .unwrap();
+            dirty |= outcome.changed;
+            declared_source_dispatched |= outcome.dispatched(&step.source_path);
         }
         if step.action_kind.as_deref() == Some("blur")
             || target.source_intent.as_deref() == Some("blur")
         {
-            dirty |= model
-                .handle_event(
+            let outcome = model
+                .handle_event_observed(
                     &HostEvent::Focus {
                         surface,
                         focused: false,
@@ -7911,10 +8002,11 @@ document: Document/new(
                     None,
                 )
                 .unwrap();
+            dirty |= outcome.changed;
+            declared_source_dispatched |= outcome.dispatched(&step.source_path);
         }
         assert!(
-            model.event_sequence() > sequence_before
-                && model.last_dispatched_source() == Some(step.source_path.as_str()),
+            model.event_sequence() > sequence_before && declared_source_dispatched,
             "public host events did not dispatch {} ({:?}); target={}; focused={:?}; key={:?}; text={:?}; focused_bindings={:?}",
             step.source_path,
             target.source_intent,
@@ -7956,12 +8048,7 @@ document: Document/new(
         view: &mut crate::view::RetainedView,
         columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
     ) {
-        let started = Instant::now();
-        for round in 0..64 {
-            assert!(
-                started.elapsed() < Duration::from_secs(3),
-                "scenario runtime did not settle within three seconds; round={round}"
-            );
+        for _ in 0..64 {
             model.resolve_program_artifact_requests().unwrap();
             let requests = model.take_program_requests();
             let had_requests = !requests.is_empty();

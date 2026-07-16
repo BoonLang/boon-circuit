@@ -48,7 +48,7 @@ use crate::protocol::{
 };
 use crate::runtime_view::{
     ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneOutcome,
-    RuntimeStartupDisposition, RuntimeView, STATE_ROOT_ENV, digest_hex,
+    RuntimeSourceDispatch, RuntimeStartupDisposition, RuntimeView, STATE_ROOT_ENV, digest_hex,
 };
 use crate::view::{HitTarget, RetainedView};
 
@@ -156,7 +156,7 @@ struct NativeWorkflowPending {
     batch_text: String,
     pointer_up_count: u8,
     last_pointer_up_source_path: Option<String>,
-    last_pointer_up_dispatched_source_path: Option<String>,
+    last_pointer_up_dispatched_source_paths: Vec<String>,
     action_complete: bool,
 }
 
@@ -797,7 +797,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         let started = Instant::now();
                         let sequence_before = model.event_sequence();
                         let runtime_turn_before = model.runtime_turn_sequence();
-                        let changed = model.handle_event(&envelope.event, target)?;
+                        let outcome = model.handle_event_observed(&envelope.event, target)?;
+                        let changed = outcome.changed;
                         sync_sensitive_input_focus(model, &mut host)?;
                         let sequence_after = model.event_sequence();
                         persistence_turn_changed |=
@@ -839,6 +840,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 phase,
                                 update,
                                 submitted,
+                                &outcome.dispatches,
                             )?;
                         }
                         if let Some(workflow) = native_workflow.as_mut() {
@@ -846,7 +848,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 workflow,
                                 envelope,
                                 target_source_path.as_deref(),
-                                model.last_dispatched_source(),
+                                &outcome.dispatches,
                             )?;
                         }
                         changed
@@ -2061,7 +2063,7 @@ fn observe_native_workflow_input(
     workflow: &mut NativeWorkflowState,
     envelope: &HostEventEnvelope,
     pointer_source_path: Option<&str>,
-    dispatched_source_path: Option<&str>,
+    dispatches: &[RuntimeSourceDispatch],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !workflow.prepared || workflow.complete() || envelope.origin != HostEventOrigin::RealOs {
         return Ok(());
@@ -2129,8 +2131,15 @@ fn observe_native_workflow_input(
         })
     ) {
         pending.last_pointer_up_source_path = pointer_source_path.map(str::to_owned);
-        pending.last_pointer_up_dispatched_source_path = dispatched_source_path.map(str::to_owned);
+        pending.last_pointer_up_dispatched_source_paths = dispatches
+            .iter()
+            .map(|dispatch| dispatch.source_path.clone())
+            .collect();
     }
+
+    let dispatched_declared_source = dispatches
+        .iter()
+        .any(|dispatch| dispatch.source_path == step.source_path);
 
     match (action_kind, &envelope.event) {
         (
@@ -2141,14 +2150,12 @@ fn observe_native_workflow_input(
                 ..
             }),
         ) if pointer_source_path == Some(step.source_path.as_str())
-            && dispatched_source_path == Some(step.source_path.as_str()) =>
+            && dispatched_declared_source =>
         {
             pending.pointer_up_count = pending.pointer_up_count.saturating_add(1);
             pending.action_complete = action_kind == "click" || pending.pointer_up_count == 2;
         }
-        ("type_text", HostEvent::TextInput(text))
-            if dispatched_source_path == Some(step.source_path.as_str()) =>
-        {
+        ("type_text", HostEvent::TextInput(text)) if dispatched_declared_source => {
             let expected = step
                 .text
                 .as_deref()
@@ -2412,7 +2419,7 @@ async fn service_native_workflow(
                     pending.first_sequence,
                     pending.last_sequence,
                     pending.last_pointer_up_source_path,
-                    pending.last_pointer_up_dispatched_source_path,
+                    pending.last_pointer_up_dispatched_source_paths,
                 )
                 .into());
             }
@@ -2656,7 +2663,7 @@ fn emit_current_native_workflow_target(
         batch_text: String::new(),
         pointer_up_count: 0,
         last_pointer_up_source_path: None,
-        last_pointer_up_dispatched_source_path: None,
+        last_pointer_up_dispatched_source_paths: Vec::new(),
         action_complete: false,
     });
     emit(
@@ -4449,6 +4456,7 @@ async fn run_test(
             step.action_kind.as_deref() == Some("double_click")
                 || target.source_intent.as_deref() == Some("double_click"),
         ) + 1;
+        let mut declared_source_dispatched = false;
         for _ in 0..pointer_cycles {
             for (phase, playback_phase, dwell_frames) in [
                 (PointerPhase::Down, TestPointerPhase::Down, 2),
@@ -4461,7 +4469,9 @@ async fn run_test(
                     phase,
                     button: Some(PointerButton::Primary),
                 });
-                let changed = runtime.handle_event(&event, Some(final_target.clone()))?;
+                let outcome = runtime.handle_event_observed(&event, Some(final_target.clone()))?;
+                let changed = outcome.changed;
+                declared_source_dispatched |= outcome.dispatched(&step.source_path);
                 sync_sensitive_input_focus(runtime, host)?;
                 if phase == PointerPhase::Down
                     && runtime.focused() != Some(final_target.node.as_str())
@@ -4511,7 +4521,9 @@ async fn run_test(
                 surface: surface.clone(),
                 text: text.clone(),
             });
-            dirty |= runtime.handle_event(&event, None)?;
+            let outcome = runtime.handle_event_observed(&event, None)?;
+            dirty |= outcome.changed;
+            declared_source_dispatched |= outcome.dispatched(&step.source_path);
         }
         if let Some(key) = &step.key {
             let event = HostEvent::Keyboard(KeyEvent {
@@ -4520,28 +4532,28 @@ async fn run_test(
                 logical_key: LogicalKey::Named(key.clone()),
                 pressed: true,
             });
-            dirty |= runtime.handle_event(&event, None)?;
+            let outcome = runtime.handle_event_observed(&event, None)?;
+            dirty |= outcome.changed;
+            declared_source_dispatched |= outcome.dispatched(&step.source_path);
         }
         if step.action_kind.as_deref() == Some("blur")
             || target.source_intent.as_deref() == Some("blur")
         {
-            dirty |= runtime.handle_event(
+            let outcome = runtime.handle_event_observed(
                 &HostEvent::Focus {
                     surface: surface.clone(),
                     focused: false,
                 },
                 None,
             )?;
+            dirty |= outcome.changed;
+            declared_source_dispatched |= outcome.dispatched(&step.source_path);
             sync_sensitive_input_focus(runtime, host)?;
         }
-        if runtime.event_sequence() == sequence_before
-            || runtime.last_dispatched_source() != Some(step.source_path.as_str())
-        {
+        if runtime.event_sequence() == sequence_before || !declared_source_dispatched {
             return Err(format!(
-                "TEST host events did not dispatch declared source `{}` (intent {:?}); last dispatch was {:?}",
-                step.source_path,
-                target.source_intent,
-                runtime.last_dispatched_source()
+                "TEST host events did not dispatch declared source `{}` (intent {:?}) in their event-local outcomes",
+                step.source_path, target.source_intent,
             )
             .into());
         }
@@ -4714,13 +4726,16 @@ fn record_profile_text_input(
     parent_phase: RuntimePhaseTimings,
     update: RuntimeUpdateMeasurement,
     requests: Vec<SubmittedProgramRequest>,
+    dispatches: &[RuntimeSourceDispatch],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if matches!(benchmark.phase, ProductProfilePhase::Complete) {
         return Ok(());
     }
     if envelope.origin != HostEventOrigin::RealOs
         || runtime.focused() != Some(benchmark.target_node.as_str())
-        || runtime.last_dispatched_source() != Some(benchmark.source_path.as_str())
+        || !dispatches
+            .iter()
+            .any(|dispatch| dispatch.source_path == benchmark.source_path)
     {
         return Err("profile text did not arrive through the focused real native source".into());
     }
@@ -5804,6 +5819,121 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn native_click_workflow() -> NativeWorkflowState {
+        NativeWorkflowState {
+            test_request_id: 42,
+            steps: vec![TestStep {
+                id: "click".to_owned(),
+                source_path: "store.button".to_owned(),
+                action_kind: Some("click".to_owned()),
+                target_text: None,
+                text: None,
+                key: None,
+                address: None,
+                target_occurrence: None,
+                pointer_x: None,
+                pointer_y: None,
+                pointer_width: None,
+                pointer_height: None,
+                expectations: vec![boon_runtime::ScenarioExpectation::DocumentChanged],
+            }],
+            proof_steps: BTreeSet::new(),
+            prepared: true,
+            host_evidence_complete: true,
+            completed: 0,
+            initial_state_digest: Some("initial".to_owned()),
+            current_state_digest: Some("current".to_owned()),
+            pending: Some(NativeWorkflowPending {
+                request_id: 43,
+                action_digest: "action".to_owned(),
+                before_state_digest: "before".to_owned(),
+                started_at: None,
+                first_sequence: None,
+                last_sequence: None,
+                event_digests: Vec::new(),
+                batch_text: String::new(),
+                pointer_up_count: 0,
+                last_pointer_up_source_path: None,
+                last_pointer_up_dispatched_source_paths: Vec::new(),
+                action_complete: false,
+            }),
+            test_completed_emitted: false,
+        }
+    }
+
+    fn native_pointer_envelope(sequence: u64, phase: PointerPhase) -> HostEventEnvelope {
+        let surface = boon_host::SurfaceId("preview".to_owned());
+        HostEventEnvelope {
+            sequence,
+            origin: HostEventOrigin::RealOs,
+            callback_to_host_ns: boon_host::CallbackToHostNs::ZERO,
+            window: boon_host::WindowId("preview-window".to_owned()),
+            surface: surface.clone(),
+            surface_epoch: 1,
+            event: HostEvent::Pointer(PointerEvent {
+                surface,
+                x: 120.0,
+                y: 84.0,
+                phase,
+                button: Some(PointerButton::Primary),
+            }),
+        }
+    }
+
+    #[test]
+    fn native_workflow_click_uses_only_up_event_dispatch_evidence() {
+        let expected = RuntimeSourceDispatch {
+            source_path: "store.button".to_owned(),
+            source_sequence: 11,
+        };
+        let mut workflow = native_click_workflow();
+        observe_native_workflow_input(
+            &mut workflow,
+            &native_pointer_envelope(1, PointerPhase::Down),
+            Some("store.button"),
+            std::slice::from_ref(&expected),
+        )
+        .unwrap();
+        observe_native_workflow_input(
+            &mut workflow,
+            &native_pointer_envelope(2, PointerPhase::Up),
+            Some("store.button"),
+            &[],
+        )
+        .unwrap();
+        assert!(!workflow.pending.as_ref().unwrap().action_complete);
+    }
+
+    #[test]
+    fn native_workflow_click_accepts_expected_before_secondary_dispatch() {
+        let dispatches = [
+            RuntimeSourceDispatch {
+                source_path: "store.button".to_owned(),
+                source_sequence: 11,
+            },
+            RuntimeSourceDispatch {
+                source_path: "store.activation_focus".to_owned(),
+                source_sequence: 12,
+            },
+        ];
+        let mut workflow = native_click_workflow();
+        observe_native_workflow_input(
+            &mut workflow,
+            &native_pointer_envelope(1, PointerPhase::Down),
+            Some("store.button"),
+            &[],
+        )
+        .unwrap();
+        observe_native_workflow_input(
+            &mut workflow,
+            &native_pointer_envelope(2, PointerPhase::Up),
+            Some("store.button"),
+            &dispatches,
+        )
+        .unwrap();
+        assert!(workflow.pending.as_ref().unwrap().action_complete);
     }
 
     fn profile_test_frame(

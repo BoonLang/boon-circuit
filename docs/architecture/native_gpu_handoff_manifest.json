@@ -331,7 +331,7 @@
             {
               "id": "responsive-layout-parity",
               "kind": "responsive-layout",
-              "baseline_checkpoint": "sign-out-sign-in",
+              "baseline_checkpoint": "native-auto-preview",
               "logical_width": 390
             },
             {

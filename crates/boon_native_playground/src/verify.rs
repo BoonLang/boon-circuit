@@ -435,10 +435,17 @@ impl VerifierProfile {
             }
         }
         for checkpoint in &self.required_checkpoints {
-            if let VerifierCheckpointRequirementKind::RestartRestore {
-                baseline_checkpoint,
-            } = &checkpoint.evidence
-            {
+            let baseline_checkpoint = match &checkpoint.evidence {
+                VerifierCheckpointRequirementKind::RestartRestore {
+                    baseline_checkpoint,
+                }
+                | VerifierCheckpointRequirementKind::ResponsiveLayout {
+                    baseline_checkpoint,
+                    ..
+                } => Some(baseline_checkpoint),
+                _ => None,
+            };
+            if let Some(baseline_checkpoint) = baseline_checkpoint {
                 let valid_baseline = self.required_checkpoints.iter().any(|candidate| {
                     candidate.id == *baseline_checkpoint
                         && matches!(
@@ -449,7 +456,7 @@ impl VerifierProfile {
                 });
                 if !valid_baseline {
                     return Err(format!(
-                        "restart checkpoint {} must reference a declared scenario checkpoint",
+                        "stateful checkpoint {} must reference a declared scenario checkpoint",
                         checkpoint.id
                     ));
                 }
@@ -1152,6 +1159,55 @@ fn run_restart_phase(
                 } if key == &mounted.9
             ) && async_lane_event_is_valid(event, events)
         });
+        let mounted_frame_index = events[start..]
+            .iter()
+            .position(|event| {
+                matches!(event, ObserverEvent::FramePresented(frame) if frame.key == mounted.9)
+            })
+            .map(|index| start + index)
+            .ok_or("restart mounted frame disappeared from observer history")?;
+        let pre_present_load =
+            events[start..mounted_frame_index]
+                .iter()
+                .find_map(|event| match event {
+                    ObserverEvent::AsyncLaneCompletedBeforePresent {
+                        surface_id,
+                        process_id,
+                        lane: AsyncLaneKind::ProgramArtifactLoad,
+                        request_id,
+                        revision,
+                        queue_depth,
+                        queue_wait_us,
+                        worker_us,
+                        apply_us,
+                        end_to_end_us,
+                        outcome,
+                    } => Some((
+                        surface_id,
+                        *process_id,
+                        request_id,
+                        *revision,
+                        *queue_depth,
+                        *queue_wait_us,
+                        *worker_us,
+                        *apply_us,
+                        *end_to_end_us,
+                        *outcome,
+                    )),
+                    _ => None,
+                });
+        let load_pair_is_exact = pre_present_load.is_some_and(|pre| {
+            pre.0 == &mounted.9.surface_id
+                && pre.1 == mounted.9.process_id
+                && pre.2 == &artifact_load.0
+                && pre.3 == artifact_load.1
+                && pre.4 == artifact_load.2
+                && pre.5 == artifact_load.3
+                && pre.6 == artifact_load.4
+                && pre.7 == artifact_load.5
+                && pre.8 == artifact_load.6
+                && pre.9 == artifact_load.7
+        });
         if artifact_load.0.is_empty()
             || artifact_load.1 == 0
             || artifact_load.2 == 0
@@ -1163,9 +1219,10 @@ fn run_restart_phase(
             || artifact_load.7 != AsyncLaneOutcome::Applied
             || artifact_load.8 != mounted.9
             || !artifact_load_is_valid
+            || !load_pair_is_exact
         {
             return Err(format!(
-                "restart artifact restoration was not applied through the async load lane before the exact first frame: request={}, revision={}, queue_depth={}, queue_wait_us={}, worker_us={}, apply_us={}, end_to_end_us={}, outcome={:?}, frame_matches={}, event_valid={artifact_load_is_valid}",
+                "restart artifact restoration was not applied before and linked after the exact first frame: request={}, revision={}, queue_depth={}, queue_wait_us={}, worker_us={}, apply_us={}, end_to_end_us={}, outcome={:?}, frame_matches={}, event_valid={artifact_load_is_valid}, pre_present_pair={load_pair_is_exact}",
                 artifact_load.0,
                 artifact_load.1,
                 artifact_load.2,
@@ -1268,6 +1325,9 @@ fn run_restart_phase(
                 || !frame_key_matches_session(events, &restored.5, &session, ObserverRole::Preview)
                 || restored.5.frame_id <= migration.5.frame_id
                 || restored.5.present_id <= migration.5.present_id
+                || restored.5.content_id != mounted.9.content_id
+                || restored.5.layout_id != mounted.9.layout_id
+                || restored.5.render_id != mounted.9.render_id
             {
                 return Err(format!(
                     "post-migration product restoration is incomplete: source_revision={} (expected {}), durable_epoch={} (expected >= {}), durable_turn={} (expected >= {}), before={}, after={}, expected={}, frame={:?}, migration_frame={:?}",
@@ -2682,6 +2742,7 @@ fn drive_responsive_resize(
                 current_width,
                 current_height,
                 key,
+                ..
             } => Some((
                 *desired_width,
                 *desired_height,
@@ -5025,39 +5086,78 @@ fn checkpoint_proof(
         VerifierCheckpointRequirementKind::ResponsiveLayout {
             baseline_checkpoint,
             logical_width,
-        } => events.iter().rev().find_map(|event| match event {
-            ObserverEvent::ResponsiveLayoutEvidence {
-                logical_width: observed_width,
-                logical_height: observed_height,
-                action_count,
-                action_digest,
-                state_digest,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                durable_turn_sequence,
-                key,
-                ..
-            } if observed_width == logical_width && *action_count > 0 => {
-                Some(StateCheckpointProof {
-                    id: required.id.clone(),
-                    source_revision: *source_revision,
-                    runtime_sequence: *runtime_sequence,
-                    durable_epoch: *durable_epoch,
-                    durable_turn_sequence: *durable_turn_sequence,
-                    state_digest: state_digest.clone(),
-                    frame: key.clone().into(),
-                    evidence: StateCheckpointEvidence::ResponsiveLayout {
-                        baseline_checkpoint: baseline_checkpoint.clone(),
-                        logical_width: *observed_width,
-                        logical_height: *observed_height,
-                        action_count: *action_count,
-                        action_digest: action_digest.clone(),
-                    },
-                })
-            }
-            _ => None,
-        }),
+        } => {
+            let baseline_requirement = profile
+                .required_checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == *baseline_checkpoint)?;
+            let baseline = checkpoint_proof(profile, baseline_requirement, completion, events)?;
+            let baseline_frame: FrameEvidenceKey = baseline.frame.clone().into();
+            events.iter().rev().find_map(|event| match event {
+                ObserverEvent::ResponsiveLayoutEvidence {
+                    logical_width: observed_width,
+                    logical_height: observed_height,
+                    baseline_key,
+                    baseline_action_count,
+                    baseline_action_digest,
+                    action_count,
+                    action_digest,
+                    state_digest,
+                    source_revision,
+                    runtime_sequence,
+                    durable_epoch,
+                    durable_turn_sequence,
+                    key,
+                    ..
+                } if observed_width == logical_width
+                    && baseline_key == &baseline_frame
+                    && *source_revision == baseline.source_revision
+                    && *runtime_sequence == baseline.runtime_sequence
+                    && *durable_epoch == baseline.durable_epoch
+                    && *durable_turn_sequence == baseline.durable_turn_sequence
+                    && state_digest == &baseline.state_digest
+                    && *baseline_action_count > 0
+                    && *action_count >= *baseline_action_count
+                    && baseline_action_digest.len() == 64
+                    && action_digest.len() == 64
+                    && baseline_key.same_producer_surface(key)
+                    && key.frame_id > baseline_key.frame_id
+                    && key.present_id > baseline_key.present_id
+                    && events.iter().any(|candidate| {
+                        matches!(candidate,
+                        ObserverEvent::ResponsiveResizeReady {
+                            baseline_action_count: ready_count,
+                            baseline_action_digest: ready_digest,
+                            key: ready_key,
+                            ..
+                        } if ready_key == baseline_key
+                            && ready_count == baseline_action_count
+                            && ready_digest == baseline_action_digest)
+                    }) =>
+                {
+                    Some(StateCheckpointProof {
+                        id: required.id.clone(),
+                        source_revision: *source_revision,
+                        runtime_sequence: *runtime_sequence,
+                        durable_epoch: *durable_epoch,
+                        durable_turn_sequence: *durable_turn_sequence,
+                        state_digest: state_digest.clone(),
+                        frame: key.clone().into(),
+                        evidence: StateCheckpointEvidence::ResponsiveLayout {
+                            baseline_checkpoint: baseline_checkpoint.clone(),
+                            baseline_frame: baseline.frame.clone(),
+                            baseline_action_count: *baseline_action_count,
+                            baseline_action_digest: baseline_action_digest.clone(),
+                            logical_width: *observed_width,
+                            logical_height: *observed_height,
+                            action_count: *action_count,
+                            action_digest: action_digest.clone(),
+                        },
+                    })
+                }
+                _ => None,
+            })
+        }
         VerifierCheckpointRequirementKind::StaleCompileRejection => {
             events.iter().rev().find_map(|event| match event {
                 ObserverEvent::StaleProgramRejected {
@@ -7452,6 +7552,9 @@ enum StateCheckpointEvidence {
     },
     ResponsiveLayout {
         baseline_checkpoint: String,
+        baseline_frame: ReportFrameEvidenceKey,
+        baseline_action_count: u32,
+        baseline_action_digest: String,
         logical_width: u32,
         logical_height: u32,
         action_count: u32,

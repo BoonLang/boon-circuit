@@ -455,6 +455,9 @@ pub enum ObserverEvent {
         resize_sequence: u64,
         logical_width: u32,
         logical_height: u32,
+        baseline_key: FrameEvidenceKey,
+        baseline_action_count: u32,
+        baseline_action_digest: String,
         action_count: u32,
         action_digest: String,
         state_digest: String,
@@ -530,6 +533,8 @@ pub enum ObserverEvent {
         desired_height: u32,
         current_width: u32,
         current_height: u32,
+        baseline_action_count: u32,
+        baseline_action_digest: String,
         key: FrameEvidenceKey,
     },
     ResponsiveResizeObserved {
@@ -604,6 +609,19 @@ pub enum ObserverEvent {
         outcome: AsyncLaneOutcome,
         key: FrameEvidenceKey,
     },
+    AsyncLaneCompletedBeforePresent {
+        surface_id: String,
+        process_id: u32,
+        lane: AsyncLaneKind,
+        request_id: String,
+        revision: u64,
+        queue_depth: u32,
+        queue_wait_us: u64,
+        worker_us: u64,
+        apply_us: u64,
+        end_to_end_us: u64,
+        outcome: AsyncLaneOutcome,
+    },
 }
 
 impl ObserverEvent {
@@ -637,6 +655,7 @@ impl ObserverEvent {
             Self::NativeWorkflowStep { .. } => 26,
             Self::NativeWorkflowCompleted { .. } => 27,
             Self::AsyncLaneCompleted { .. } => 28,
+            Self::AsyncLaneCompletedBeforePresent { .. } => 29,
         }
     }
 
@@ -893,6 +912,9 @@ impl ObserverEvent {
                 resize_sequence,
                 logical_width,
                 logical_height,
+                baseline_key,
+                baseline_action_count,
+                baseline_action_digest,
                 action_count,
                 action_digest,
                 state_digest,
@@ -905,6 +927,9 @@ impl ObserverEvent {
                 out.u64(*resize_sequence);
                 out.u32(*logical_width);
                 out.u32(*logical_height);
+                baseline_key.encode(out)?;
+                out.u32(*baseline_action_count);
+                out.string(baseline_action_digest)?;
                 out.u32(*action_count);
                 out.string(action_digest)?;
                 out.string(state_digest)?;
@@ -1037,12 +1062,16 @@ impl ObserverEvent {
                 desired_height,
                 current_width,
                 current_height,
+                baseline_action_count,
+                baseline_action_digest,
                 key,
             } => {
                 out.u32(*desired_width);
                 out.u32(*desired_height);
                 out.u32(*current_width);
                 out.u32(*current_height);
+                out.u32(*baseline_action_count);
+                out.string(baseline_action_digest)?;
                 key.encode(out)?;
             }
             Self::ResponsiveResizeObserved {
@@ -1178,6 +1207,31 @@ impl ObserverEvent {
                 out.u64(*end_to_end_us);
                 out.u8(*outcome as u8);
                 key.encode(out)?;
+            }
+            Self::AsyncLaneCompletedBeforePresent {
+                surface_id,
+                process_id,
+                lane,
+                request_id,
+                revision,
+                queue_depth,
+                queue_wait_us,
+                worker_us,
+                apply_us,
+                end_to_end_us,
+                outcome,
+            } => {
+                out.string(surface_id)?;
+                out.u32(*process_id);
+                out.u8(*lane as u8);
+                out.string(request_id)?;
+                out.u64(*revision);
+                out.u32(*queue_depth);
+                out.u64(*queue_wait_us);
+                out.u64(*worker_us);
+                out.u64(*apply_us);
+                out.u64(*end_to_end_us);
+                out.u8(*outcome as u8);
             }
         }
         Ok(())
@@ -1376,6 +1430,9 @@ impl ObserverEvent {
                 resize_sequence: input.u64()?,
                 logical_width: input.u32()?,
                 logical_height: input.u32()?,
+                baseline_key: FrameEvidenceKey::decode(input)?,
+                baseline_action_count: input.u32()?,
+                baseline_action_digest: input.string()?,
                 action_count: input.u32()?,
                 action_digest: input.string()?,
                 state_digest: input.string()?,
@@ -1451,6 +1508,8 @@ impl ObserverEvent {
                 desired_height: input.u32()?,
                 current_width: input.u32()?,
                 current_height: input.u32()?,
+                baseline_action_count: input.u32()?,
+                baseline_action_digest: input.string()?,
                 key: FrameEvidenceKey::decode(input)?,
             },
             22 => Self::ResponsiveResizeObserved {
@@ -1524,6 +1583,19 @@ impl ObserverEvent {
                 end_to_end_us: input.u64()?,
                 outcome: AsyncLaneOutcome::decode(input.u8()?)?,
                 key: FrameEvidenceKey::decode(input)?,
+            },
+            29 => Self::AsyncLaneCompletedBeforePresent {
+                surface_id: input.string()?,
+                process_id: input.u32()?,
+                lane: AsyncLaneKind::decode(input.u8()?)?,
+                request_id: input.string()?,
+                revision: input.u64()?,
+                queue_depth: input.u32()?,
+                queue_wait_us: input.u64()?,
+                worker_us: input.u64()?,
+                apply_us: input.u64()?,
+                end_to_end_us: input.u64()?,
+                outcome: AsyncLaneOutcome::decode(input.u8()?)?,
             },
             _ => return Err(ObserverError::UnknownEvent(tag)),
         };
@@ -2060,6 +2132,9 @@ mod tests {
             resize_sequence: 12,
             logical_width: 390,
             logical_height: 844,
+            baseline_key: key(42),
+            baseline_action_count: 11,
+            baseline_action_digest: "e".repeat(64),
             action_count: 12,
             action_digest: "f".repeat(64),
             state_digest: "0".repeat(64),
@@ -2124,6 +2199,8 @@ mod tests {
             desired_height: 844,
             current_width: 960,
             current_height: 844,
+            baseline_action_count: 11,
+            baseline_action_digest: "e".repeat(64),
             key: key(48),
         });
         roundtrip(ObserverEvent::ResponsiveResizeObserved {
@@ -2197,6 +2274,19 @@ mod tests {
             end_to_end_us: 60,
             outcome: AsyncLaneOutcome::Applied,
             key: key(54),
+        });
+        roundtrip(ObserverEvent::AsyncLaneCompletedBeforePresent {
+            surface_id: "preview".to_owned(),
+            process_id: 42,
+            lane: AsyncLaneKind::ProgramArtifactLoad,
+            request_id: "startup-load-7".to_owned(),
+            revision: 7,
+            queue_depth: 1,
+            queue_wait_us: 10,
+            worker_us: 20,
+            apply_us: 30,
+            end_to_end_us: 60,
+            outcome: AsyncLaneOutcome::Applied,
         });
         roundtrip(ObserverEvent::StaleProgramRejected {
             session: "profile-draft".to_owned(),

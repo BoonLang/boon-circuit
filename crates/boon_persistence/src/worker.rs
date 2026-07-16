@@ -462,8 +462,11 @@ impl SharedState {
 
     fn begin_checkpoint_batch(&self, turn_count: usize) {
         let mut admission = lock(&self.admission);
-        debug_assert_eq!(admission.active_checkpoint_turns, 0);
-        admission.active_checkpoint_turns = turn_count;
+        if admission.active_checkpoint_turns == 0 {
+            admission.active_checkpoint_turns = turn_count;
+        } else {
+            debug_assert_eq!(admission.active_checkpoint_turns, turn_count);
+        }
         update_pending_checkpoint_batches_peak(&mut admission, self.max_batch_turns);
     }
 
@@ -1155,15 +1158,22 @@ fn worker_main<D>(
             WorkerMessage::Turn(turn) => {
                 shared.queue_depth.fetch_sub(1, Ordering::AcqRel);
                 pending.push(turn);
+                let mut async_artifacts = Vec::new();
                 collect_batch(
-                    &mut driver,
-                    &durable,
                     &receiver,
                     &config,
                     &mut pending,
+                    &mut async_artifacts,
                     &mut deferred,
                     &shared,
                 );
+                shared.begin_checkpoint_batch(pending.len());
+                for artifact in async_artifacts {
+                    assert!(
+                        handle_async_artifact(&mut driver, &durable, artifact, &shared).is_ok(),
+                        "batch collection must retain only asynchronous artifact messages"
+                    );
+                }
                 let _ = flush_pending(&mut driver, &mut durable, &mut pending, &shared);
             }
             message => {
@@ -1299,17 +1309,14 @@ where
     }
 }
 
-fn collect_batch<D>(
-    driver: &mut D,
-    durable: &DurableCursor,
+fn collect_batch(
     receiver: &Receiver<WorkerMessage>,
     config: &PersistenceWorkerConfig,
     pending: &mut Vec<QueuedTurn>,
+    async_artifacts: &mut Vec<WorkerMessage>,
     deferred: &mut Option<WorkerMessage>,
     shared: &SharedState,
-) where
-    D: PersistenceDriver,
-{
+) {
     if pending.len() >= config.max_batch_turns {
         return;
     }
@@ -1338,11 +1345,13 @@ fn collect_batch<D>(
                 shared.queue_depth.fetch_sub(1, Ordering::AcqRel);
                 pending.push(turn);
             }
-            message => {
-                if let Err(control) = handle_async_artifact(driver, durable, message, shared) {
-                    *deferred = Some(control);
-                    return;
-                }
+            message @ (WorkerMessage::PutContentArtifactAsync(_, _)
+            | WorkerMessage::LoadContentArtifactAsync(_, _)) => {
+                async_artifacts.push(message);
+            }
+            control => {
+                *deferred = Some(control);
+                return;
             }
         }
     }
@@ -1829,10 +1838,22 @@ mod tests {
         inner: InMemoryDriver,
         trace: DriverTrace,
         commit_gate: Option<Arc<CommitGate>>,
+        artifact_gate: Option<Arc<CommitGate>>,
+        artifact_delay: Duration,
     }
 
     impl PersistenceDriver for RecordingDriver {
         fn execute(&mut self, command: PersistenceCommand) -> PersistenceResult {
+            if matches!(
+                &command,
+                PersistenceCommand::PutContentArtifact(_)
+                    | PersistenceCommand::LoadContentArtifact(_)
+            ) {
+                if let Some(gate) = &self.artifact_gate {
+                    gate.block_commit();
+                }
+                thread::sleep(self.artifact_delay);
+            }
             if let PersistenceCommand::Commit(batch) = &command {
                 if let Some(gate) = &self.commit_gate {
                     gate.block_commit();
@@ -1916,6 +1937,8 @@ mod tests {
             inner: InMemoryDriver::default(),
             trace: trace.clone(),
             commit_gate: gate,
+            artifact_gate: None,
+            artifact_delay: Duration::ZERO,
         };
         let (coordinator, startup) = PersistenceCoordinator::start(
             driver,
@@ -1965,6 +1988,8 @@ mod tests {
             inner: InMemoryDriver::default(),
             trace,
             commit_gate: Some(Arc::clone(&gate)),
+            artifact_gate: None,
+            artifact_delay: Duration::ZERO,
         };
         let (coordinator, startup) = PersistenceCoordinator::start(
             driver,
@@ -2132,7 +2157,21 @@ mod tests {
 
     #[test]
     fn asynchronous_artifact_work_does_not_split_an_authority_batch() {
-        let (coordinator, trace) = coordinator(8, Duration::from_millis(100), None);
+        let trace = DriverTrace::default();
+        let driver = RecordingDriver {
+            inner: InMemoryDriver::default(),
+            trace: trace.clone(),
+            commit_gate: None,
+            artifact_gate: None,
+            artifact_delay: Duration::from_millis(150),
+        };
+        let (coordinator, startup) = PersistenceCoordinator::start(
+            driver,
+            initial_image(),
+            config(8, Duration::from_millis(100)),
+        )
+        .unwrap();
+        assert!(startup.initialized);
         let artifact = ContentArtifact::new(
             "application/vnd.boon.worker-test",
             b"interleaved background artifact".to_vec(),
@@ -2153,6 +2192,39 @@ mod tests {
             .find(|completion| completion.ticket == ticket)
             .expect("interleaved artifact store must complete");
         assert_eq!(completion.result.unwrap().id, artifact.id);
+        coordinator.shutdown().unwrap();
+    }
+
+    #[test]
+    fn sealed_batch_is_counted_while_slow_artifact_work_runs() {
+        let trace = DriverTrace::default();
+        let artifact_gate = Arc::new(CommitGate::new());
+        let driver = RecordingDriver {
+            inner: InMemoryDriver::default(),
+            trace: trace.clone(),
+            commit_gate: None,
+            artifact_gate: Some(Arc::clone(&artifact_gate)),
+            artifact_delay: Duration::ZERO,
+        };
+        let (coordinator, _) = PersistenceCoordinator::start(
+            driver,
+            initial_image(),
+            config(8, Duration::from_millis(100)),
+        )
+        .unwrap();
+        let artifact = ContentArtifact::new("application/test", vec![1]).unwrap();
+
+        coordinator.try_enqueue_turn(turn(1, 11)).unwrap();
+        coordinator.try_put_content_artifact(artifact).unwrap();
+        artifact_gate.wait_until_entered();
+        coordinator.try_enqueue_turn(turn(2, 22)).unwrap();
+        let status = coordinator.status();
+        assert_eq!(status.pending_checkpoint_batches, 2);
+        assert_eq!(status.pending_checkpoint_batches_peak, 2);
+
+        artifact_gate.release();
+        coordinator.barrier().unwrap();
+        assert_eq!(&*lock(&trace.commits), &[(1, 1), (2, 2)]);
         coordinator.shutdown().unwrap();
     }
 

@@ -47,8 +47,9 @@ use crate::protocol::{
     TestStep,
 };
 use crate::runtime_view::{
-    ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneOutcome,
-    RuntimeSourceDispatch, RuntimeStartupDisposition, RuntimeView, STATE_ROOT_ENV, digest_hex,
+    ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneObservation,
+    RuntimeAsyncLaneOutcome, RuntimeSourceDispatch, RuntimeStartupDisposition, RuntimeView,
+    STATE_ROOT_ENV, digest_hex,
 };
 use crate::view::{HitTarget, RetainedView};
 
@@ -139,10 +140,19 @@ struct ProductProfileBenchmark {
 struct ResponsiveEvidenceState {
     desired_width: u32,
     desired_height: u32,
-    expected_actions: BTreeSet<String>,
+    baseline_key: crate::observer::FrameEvidenceKey,
+    expected_actions: BTreeMap<ResponsiveActionId, u32>,
+    baseline_action_count: u32,
+    baseline_action_digest: String,
     last_surface_epoch: u64,
     resize_started: bool,
     complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ResponsiveActionId {
+    source_path: String,
+    intent: String,
 }
 
 struct NativeWorkflowPending {
@@ -975,22 +985,6 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             )?;
                         }
                     }
-                    if let Some(state) = responsive_evidence.as_mut()
-                        && !state.resize_started
-                    {
-                        let current_action_bounds = visible_action_bounds(&view);
-                        if !current_action_bounds.is_empty() {
-                            let size = host.viewport().logical_size;
-                            validate_action_bounds(
-                                "desktop",
-                                &current_action_bounds,
-                                size.width.round().max(0.0) as u32,
-                                size.height.round().max(0.0) as u32,
-                            )?;
-                            state.expected_actions =
-                                current_action_bounds.keys().cloned().collect();
-                        }
-                    }
                     if let Some((sequence, width, height, previous_surface_epoch)) =
                         resize_observation
                         && let Some(state) = responsive_evidence.as_mut()
@@ -1425,8 +1419,18 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             deterministic_runtime,
                         ) {
                             Ok(activation) => {
+                                let mut startup_async_lanes = Vec::new();
                                 let presented = match activation {
-                                    RuntimeActivation::Opened(next) => {
+                                    RuntimeActivation::Opened(mut next) => {
+                                        if state_evidence.enabled() {
+                                            startup_async_lanes =
+                                                next.take_async_lane_observations();
+                                            emit_runtime_async_lanes_before_present(
+                                                &observer,
+                                                &host.ids().surface.0,
+                                                &startup_async_lanes,
+                                            );
+                                        }
                                         install_runtime(
                                             *next,
                                             key,
@@ -1478,6 +1482,11 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             &mut evidence_proof_in_flight,
                                             [request],
                                         )?;
+                                        emit_runtime_async_observations(
+                                            &observer,
+                                            startup_async_lanes,
+                                            presented.key.clone(),
+                                        );
                                         emit_runtime_async_lanes(
                                             &observer,
                                             runtime.as_mut().expect("mounted runtime"),
@@ -1574,15 +1583,6 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                                     &state_evidence.profile_steps,
                                                     initial_key.clone(),
                                                 )?);
-                                        }
-                                        if let Some(width) = state_evidence.responsive_width {
-                                            responsive_evidence = Some(arm_responsive_evidence(
-                                                &observer,
-                                                &view,
-                                                &host,
-                                                width,
-                                                initial_key,
-                                            )?);
                                         }
                                         if let Some(target) = first_test_target(
                                             runtime.as_mut().expect("mounted runtime"),
@@ -2078,6 +2078,20 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 cursor,
             )
             .await?;
+            if responsive_evidence.is_none()
+                && workflow.complete()
+                && let Some(width) = state_evidence.responsive_width
+            {
+                responsive_evidence = Some(arm_responsive_evidence(
+                    &observer,
+                    &view,
+                    &host,
+                    width,
+                    latest_presented_key
+                        .clone()
+                        .ok_or("responsive workflow completed without a baseline frame")?,
+                )?);
+            }
         }
         if let Some(model) = runtime.as_mut() {
             emit_runtime_async_lanes(&observer, model, &product)?;
@@ -3843,6 +3857,10 @@ async fn run_schema_migration_evidence(
     migration: &MigrationBundle,
 ) -> Result<Vec<PreparedProofRequest>, Box<dyn std::error::Error + Send + Sync>> {
     let product_before = authoritative_state_evidence(runtime)?;
+    let product_frame_before = product
+        .last_presented_key()
+        .cloned()
+        .ok_or("migration evidence has no mounted product frame")?;
     let target_stage = if migration.launch_stage != migration.initial_stage {
         migration.launch_stage.as_str()
     } else {
@@ -3959,6 +3977,17 @@ async fn run_schema_migration_evidence(
     {
         return Err("schema migration evidence changed the mounted product authority".into());
     }
+    if !product_frame_before.same_producer_surface(&restored.key)
+        || restored.key.content_id != product_frame_before.content_id
+        || restored.key.layout_id != product_frame_before.layout_id
+        || restored.key.render_id != product_frame_before.render_id
+        || restored.key.frame_id <= product_frame_before.frame_id
+        || restored.key.present_id <= product_frame_before.present_id
+    {
+        return Err(
+            "schema migration evidence did not restore the mounted product revisions".into(),
+        );
+    }
     emit_persistence_evidence(
         observer,
         PersistenceEvidenceKind::MigrationProductRestored,
@@ -4020,7 +4049,9 @@ fn arm_responsive_evidence(
         current_width,
         current_height,
     )?;
-    let expected_actions = desktop_action_bounds.keys().cloned().collect();
+    let expected_actions = responsive_action_counts(&desktop_action_bounds);
+    let baseline_action_count = responsive_action_count(&expected_actions);
+    let baseline_action_digest = responsive_action_digest(&expected_actions);
     emit(
         observer,
         ObserverEvent::ResponsiveResizeReady {
@@ -4028,13 +4059,18 @@ fn arm_responsive_evidence(
             desired_height: current_height,
             current_width,
             current_height,
+            baseline_action_count,
+            baseline_action_digest: baseline_action_digest.clone(),
             key: key.clone(),
         },
     );
     Ok(ResponsiveEvidenceState {
         desired_width,
         desired_height: current_height,
+        baseline_key: key.clone(),
         expected_actions,
+        baseline_action_count,
+        baseline_action_digest,
         last_surface_epoch: key.surface_epoch,
         resize_started: false,
         complete: false,
@@ -4059,15 +4095,13 @@ fn capture_responsive_layout_evidence(
         evidence.desired_width,
         evidence.desired_height,
     )?;
-    let observed_actions = observed_action_bounds
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let observed_actions = responsive_action_counts(&observed_action_bounds);
     let missing_actions = missing_responsive_actions(&evidence.expected_actions, &observed_actions);
     if !missing_actions.is_empty() {
         let narrow_only_actions = observed_actions
-            .difference(&evidence.expected_actions)
-            .cloned()
+            .keys()
+            .filter(|action| !evidence.expected_actions.contains_key(*action))
+            .map(|action| format!("{} [{}]", action.source_path, action.intent))
             .collect::<Vec<_>>();
         return Err(format!(
             "narrow layout is missing desktop public actions {missing_actions:?}; narrow-only navigation actions are {narrow_only_actions:?}"
@@ -4075,19 +4109,17 @@ fn capture_responsive_layout_evidence(
         .into());
     }
     let state = authoritative_state_evidence(runtime)?;
-    let mut action_hasher = Sha256::new();
-    for action in &observed_actions {
-        action_hasher.update((action.len() as u64).to_le_bytes());
-        action_hasher.update(action.as_bytes());
-    }
     emit(
         observer,
         ObserverEvent::ResponsiveLayoutEvidence {
             resize_sequence,
             logical_width: evidence.desired_width,
             logical_height: evidence.desired_height,
-            action_count: observed_actions.len().try_into().unwrap_or(u32::MAX),
-            action_digest: format!("{:x}", action_hasher.finalize()),
+            baseline_key: evidence.baseline_key.clone(),
+            baseline_action_count: evidence.baseline_action_count,
+            baseline_action_digest: evidence.baseline_action_digest.clone(),
+            action_count: responsive_action_count(&observed_actions),
+            action_digest: responsive_action_digest(&observed_actions),
             state_digest: state.digest,
             source_revision,
             runtime_sequence: runtime.runtime_turn_sequence(),
@@ -4287,24 +4319,32 @@ async fn run_stale_program_evidence(
     Ok(proof)
 }
 
-fn visible_action_bounds(view: &RetainedView) -> BTreeMap<String, Vec<boon_document::Rect>> {
-    let mut actions = BTreeMap::<String, Vec<boon_document::Rect>>::new();
-    for (source_path, bounds) in view.visible_source_action_bounds() {
-        actions.entry(source_path).or_default().push(bounds);
+fn visible_action_bounds(
+    view: &RetainedView,
+) -> BTreeMap<ResponsiveActionId, Vec<boon_document::Rect>> {
+    let mut actions = BTreeMap::<ResponsiveActionId, Vec<boon_document::Rect>>::new();
+    for (source_path, intent, bounds) in view.visible_source_action_bounds() {
+        actions
+            .entry(ResponsiveActionId {
+                source_path,
+                intent,
+            })
+            .or_default()
+            .push(bounds);
     }
     actions
 }
 
 fn validate_action_bounds(
     layout: &str,
-    actions: &BTreeMap<String, Vec<boon_document::Rect>>,
+    actions: &BTreeMap<ResponsiveActionId, Vec<boon_document::Rect>>,
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if actions.is_empty() {
         return Err(format!("{layout} layout rendered no visible public controls").into());
     }
-    for (source_path, targets) in actions {
+    for (action, targets) in actions {
         for bounds in targets {
             if !bounds.x.is_finite()
                 || !bounds.y.is_finite()
@@ -4318,7 +4358,9 @@ fn validate_action_bounds(
                 || bounds.y + bounds.height > height as f32 + 0.5
             {
                 return Err(format!(
-                    "{layout} action `{source_path}` has invalid bounds ({}, {}, {}, {}) in {width}x{height}",
+                    "{layout} action `{} [{}]` has invalid bounds ({}, {}, {}, {}) in {width}x{height}",
+                    action.source_path,
+                    action.intent,
                     bounds.x, bounds.y, bounds.width, bounds.height
                 )
                 .into());
@@ -4329,13 +4371,39 @@ fn validate_action_bounds(
 }
 
 fn missing_responsive_actions(
-    desktop_actions: &BTreeSet<String>,
-    narrow_actions: &BTreeSet<String>,
+    desktop_actions: &BTreeMap<ResponsiveActionId, u32>,
+    narrow_actions: &BTreeMap<ResponsiveActionId, u32>,
 ) -> Vec<String> {
     desktop_actions
-        .difference(narrow_actions)
-        .cloned()
+        .iter()
+        .filter(|(action, count)| narrow_actions.get(*action).copied().unwrap_or(0) < **count)
+        .map(|(action, count)| format!("{} [{}] x{count}", action.source_path, action.intent))
         .collect()
+}
+
+fn responsive_action_counts(
+    actions: &BTreeMap<ResponsiveActionId, Vec<boon_document::Rect>>,
+) -> BTreeMap<ResponsiveActionId, u32> {
+    actions
+        .iter()
+        .map(|(action, bounds)| (action.clone(), bounds.len().try_into().unwrap_or(u32::MAX)))
+        .collect()
+}
+
+fn responsive_action_count(actions: &BTreeMap<ResponsiveActionId, u32>) -> u32 {
+    actions.values().copied().fold(0, u32::saturating_add)
+}
+
+fn responsive_action_digest(actions: &BTreeMap<ResponsiveActionId, u32>) -> String {
+    let mut hasher = Sha256::new();
+    for (action, count) in actions {
+        for value in [&action.source_path, &action.intent] {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+        hasher.update(count.to_le_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn queue_evidence_proofs(
@@ -5625,23 +5693,21 @@ fn emit_runtime_async_lanes(
         .last_presented_key()
         .cloned()
         .ok_or("async runtime lane completed before a production frame existed")?;
+    emit_runtime_async_observations(observer, observations, key);
+    Ok(())
+}
+
+fn emit_runtime_async_observations(
+    observer: &Option<ObserverClient>,
+    observations: Vec<RuntimeAsyncLaneObservation>,
+    key: crate::observer::FrameEvidenceKey,
+) {
     for observation in observations {
-        let end_to_end_us = accounted_end_to_end_us(
-            observation.end_to_end_us,
-            observation.queue_wait_us,
-            observation.worker_us,
-            observation.apply_us,
-        );
+        let end_to_end_us = observed_async_end_to_end(&observation);
         emit(
             observer,
             ObserverEvent::AsyncLaneCompleted {
-                lane: match observation.lane {
-                    RuntimeAsyncLaneKind::PersistenceTurn => AsyncLaneKind::PersistenceTurn,
-                    RuntimeAsyncLaneKind::ProgramArtifactStore => {
-                        AsyncLaneKind::ProgramArtifactStore
-                    }
-                    RuntimeAsyncLaneKind::ProgramArtifactLoad => AsyncLaneKind::ProgramArtifactLoad,
-                },
+                lane: observed_async_lane(observation.lane),
                 request_id: observation.request_id,
                 revision: observation.revision,
                 queue_depth: observation.queue_depth,
@@ -5649,16 +5715,61 @@ fn emit_runtime_async_lanes(
                 worker_us: observation.worker_us,
                 apply_us: observation.apply_us,
                 end_to_end_us,
-                outcome: match observation.outcome {
-                    RuntimeAsyncLaneOutcome::Applied => AsyncLaneOutcome::Applied,
-                    RuntimeAsyncLaneOutcome::StaleRejected => AsyncLaneOutcome::StaleRejected,
-                    RuntimeAsyncLaneOutcome::Failed => AsyncLaneOutcome::Failed,
-                },
+                outcome: observed_async_outcome(observation.outcome),
                 key: key.clone(),
             },
         );
     }
-    Ok(())
+}
+
+fn emit_runtime_async_lanes_before_present(
+    observer: &Option<ObserverClient>,
+    surface_id: &str,
+    observations: &[RuntimeAsyncLaneObservation],
+) {
+    for observation in observations {
+        emit(
+            observer,
+            ObserverEvent::AsyncLaneCompletedBeforePresent {
+                surface_id: surface_id.to_owned(),
+                process_id: std::process::id(),
+                lane: observed_async_lane(observation.lane),
+                request_id: observation.request_id.clone(),
+                revision: observation.revision,
+                queue_depth: observation.queue_depth,
+                queue_wait_us: observation.queue_wait_us,
+                worker_us: observation.worker_us,
+                apply_us: observation.apply_us,
+                end_to_end_us: observed_async_end_to_end(observation),
+                outcome: observed_async_outcome(observation.outcome),
+            },
+        );
+    }
+}
+
+fn observed_async_lane(lane: RuntimeAsyncLaneKind) -> AsyncLaneKind {
+    match lane {
+        RuntimeAsyncLaneKind::PersistenceTurn => AsyncLaneKind::PersistenceTurn,
+        RuntimeAsyncLaneKind::ProgramArtifactStore => AsyncLaneKind::ProgramArtifactStore,
+        RuntimeAsyncLaneKind::ProgramArtifactLoad => AsyncLaneKind::ProgramArtifactLoad,
+    }
+}
+
+fn observed_async_outcome(outcome: RuntimeAsyncLaneOutcome) -> AsyncLaneOutcome {
+    match outcome {
+        RuntimeAsyncLaneOutcome::Applied => AsyncLaneOutcome::Applied,
+        RuntimeAsyncLaneOutcome::StaleRejected => AsyncLaneOutcome::StaleRejected,
+        RuntimeAsyncLaneOutcome::Failed => AsyncLaneOutcome::Failed,
+    }
+}
+
+fn observed_async_end_to_end(observation: &RuntimeAsyncLaneObservation) -> u64 {
+    accounted_end_to_end_us(
+        observation.end_to_end_us,
+        observation.queue_wait_us,
+        observation.worker_us,
+        observation.apply_us,
+    )
 }
 
 fn program_async_lane_outcome(
@@ -5816,21 +5927,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn responsive_action_coverage_allows_narrow_only_navigation() {
-        let desktop = BTreeSet::from([
-            "store.elements.publish".to_owned(),
-            "store.elements.theme_toggle".to_owned(),
-        ]);
-        let narrow = BTreeSet::from([
-            "store.elements.publish".to_owned(),
-            "store.elements.theme_toggle".to_owned(),
-            "store.elements.show_preview".to_owned(),
+    fn responsive_action_coverage_preserves_intent_and_multiplicity() {
+        let action = |source_path: &str, intent: &str| ResponsiveActionId {
+            source_path: source_path.to_owned(),
+            intent: intent.to_owned(),
+        };
+        let publish = action("store.elements.publish", "click");
+        let theme = action("store.elements.theme_toggle", "click");
+        let desktop = BTreeMap::from([(publish.clone(), 2), (theme.clone(), 1)]);
+        let narrow = BTreeMap::from([
+            (publish.clone(), 2),
+            (theme, 1),
+            (action("store.elements.show_preview", "click"), 1),
         ]);
 
         assert!(missing_responsive_actions(&desktop, &narrow).is_empty());
         assert_eq!(
-            missing_responsive_actions(&narrow, &desktop),
-            ["store.elements.show_preview".to_owned()]
+            missing_responsive_actions(&desktop, &BTreeMap::from([(publish, 1)])),
+            [
+                "store.elements.publish [click] x2".to_owned(),
+                "store.elements.theme_toggle [click] x1".to_owned(),
+            ]
         );
     }
 

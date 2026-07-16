@@ -290,17 +290,27 @@ impl RetainedView {
         self.target_for_scenario(source_path, None, target_text, None, None)
     }
 
-    pub fn visible_source_action_bounds(&self) -> Vec<(String, Rect)> {
+    pub fn visible_source_action_bounds(&self) -> Vec<(String, String, Rect)> {
         self.retained
             .hits()
             .entries
             .iter()
-            .filter(|entry| self.visible_hit_target(entry).is_some())
-            .flat_map(|entry| {
+            .filter_map(|entry| {
+                self.visible_hit_target(entry).map(|target| {
+                    let bounds = Rect {
+                        x: target.bounds_x,
+                        y: target.bounds_y,
+                        width: target.bounds_width,
+                        height: target.bounds_height,
+                    };
+                    (entry, bounds)
+                })
+            })
+            .flat_map(|(entry, bounds)| {
                 entry
                     .source_routes
                     .iter()
-                    .map(move |route| (route.source_path.clone(), entry.bounds))
+                    .map(move |route| (route.source_path.clone(), route.intent.clone(), bounds))
             })
             .collect()
     }
@@ -366,21 +376,24 @@ impl RetainedView {
     }
 
     fn visible_hit_target(&self, entry: &boon_document::HitSideTableEntry) -> Option<HitTarget> {
-        let viewport = self.retained.scene().viewport;
-        let left = entry.bounds.x.max(viewport.x);
-        let top = entry.bounds.y.max(viewport.y);
-        let right = (entry.bounds.x + entry.bounds.width).min(viewport.x + viewport.width);
-        let bottom = (entry.bounds.y + entry.bounds.height).min(viewport.y + viewport.height);
-        if right <= left || bottom <= top {
-            return None;
+        let mut visible = rect_intersection(entry.bounds, self.retained.scene().viewport)?;
+        if let Some(item) = self
+            .retained
+            .layout()
+            .display_list
+            .iter()
+            .find(|item| item.node == entry.node)
+            && let Some(clip) = clip_rect(&item.style)
+        {
+            visible = rect_intersection(visible, clip)?;
         }
         let mut target = hit_target(entry);
-        target.bounds_x = left;
-        target.bounds_y = top;
-        target.bounds_width = right - left;
-        target.bounds_height = bottom - top;
-        target.center_x = left + target.bounds_width * 0.5;
-        target.center_y = top + target.bounds_height * 0.5;
+        target.bounds_x = visible.x;
+        target.bounds_y = visible.y;
+        target.bounds_width = visible.width;
+        target.bounds_height = visible.height;
+        target.center_x = visible.x + visible.width * 0.5;
+        target.center_y = visible.y + visible.height * 0.5;
         self.retained
             .hits()
             .hit_test(target.center_x, target.center_y)
@@ -640,6 +653,32 @@ fn style_bool(style: &boon_document::StyleMap, key: &str) -> bool {
 
 fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
     x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
+}
+
+fn rect_intersection(left: Rect, right: Rect) -> Option<Rect> {
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let width = (left.x + left.width).min(right.x + right.width) - x;
+    let height = (left.y + left.height).min(right.y + right.height) - y;
+    (width > 0.0 && height > 0.0).then_some(Rect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn clip_rect(style: &boon_document::StyleMap) -> Option<Rect> {
+    let number = |name| match style.get(name) {
+        Some(boon_document::StyleValue::Number(value)) if value.is_finite() => Some(*value as f32),
+        _ => None,
+    };
+    Some(Rect {
+        x: number("__clip_x")?,
+        y: number("__clip_y")?,
+        width: number("__clip_width")?,
+        height: number("__clip_height")?,
+    })
 }
 
 fn rect_area(rect: Rect) -> f32 {

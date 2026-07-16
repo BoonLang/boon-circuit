@@ -3956,8 +3956,16 @@ fn capture_responsive_layout_evidence(
     key: crate::observer::FrameEvidenceKey,
 ) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
     let observed_actions = document_action_paths(view.frame());
-    if observed_actions != evidence.expected_actions {
-        return Err("narrow layout does not expose the same public actions".into());
+    let missing_actions = missing_responsive_actions(&evidence.expected_actions, &observed_actions);
+    if !missing_actions.is_empty() {
+        let narrow_only_actions = observed_actions
+            .difference(&evidence.expected_actions)
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "narrow layout is missing desktop public actions {missing_actions:?}; narrow-only navigation actions are {narrow_only_actions:?}"
+        )
+        .into());
     }
     let mut bounded_actions = BTreeSet::new();
     for node in view
@@ -4214,6 +4222,16 @@ fn document_action_paths(frame: &boon_document::DocumentFrame) -> BTreeSet<Strin
         .values()
         .flat_map(|node| node.source_bindings.iter())
         .map(|binding| binding.source_path.clone())
+        .collect()
+}
+
+fn missing_responsive_actions(
+    desktop_actions: &BTreeSet<String>,
+    narrow_actions: &BTreeSet<String>,
+) -> Vec<String> {
+    desktop_actions
+        .difference(narrow_actions)
+        .cloned()
         .collect()
 }
 
@@ -5669,6 +5687,25 @@ fn accounted_end_to_end_us(measured: u64, queue_wait: u64, worker: u64, apply: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responsive_action_coverage_allows_narrow_only_navigation() {
+        let desktop = BTreeSet::from([
+            "store.elements.publish".to_owned(),
+            "store.elements.theme_toggle".to_owned(),
+        ]);
+        let narrow = BTreeSet::from([
+            "store.elements.publish".to_owned(),
+            "store.elements.theme_toggle".to_owned(),
+            "store.elements.show_preview".to_owned(),
+        ]);
+
+        assert!(missing_responsive_actions(&desktop, &narrow).is_empty());
+        assert_eq!(
+            missing_responsive_actions(&narrow, &desktop),
+            ["store.elements.show_preview".to_owned()]
+        );
+    }
 
     #[test]
     fn canonical_state_artifact_envelope_rejects_payload_corruption() {

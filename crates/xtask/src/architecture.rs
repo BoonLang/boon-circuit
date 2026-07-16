@@ -85,7 +85,7 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
                 "playground-rust-loc-cap",
                 counts.playground,
                 PLAYGROUND_RUST_CAP,
-                "playground Rust",
+                "playground production Rust",
             );
             push_cap(
                 &mut checks,
@@ -565,25 +565,53 @@ fn rust_line_counts(workspace: &Path) -> Result<RustLineCounts, String> {
             continue;
         }
         let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let lines = bytes.iter().filter(|byte| **byte == b'\n').count()
-            + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
-        counts.total += lines;
-        if is_test_path(&relative) {
-            counts.tests += lines;
-        }
+        let lines = rust_file_line_counts(&relative, &bytes)?;
+        counts.total += lines.total;
+        counts.tests += lines.tests;
         if relative.starts_with("crates/boon_native_playground/") {
-            counts.playground += lines;
+            counts.playground += lines.production;
         }
         if relative.starts_with("crates/xtask/") {
-            counts.xtask += lines;
+            counts.xtask += lines.production;
         }
         if relative.starts_with("crates/boon_runtime/")
             || relative.starts_with("crates/boon_plan_executor/")
         {
-            counts.runtime_executor += lines;
+            counts.runtime_executor += lines.production;
         }
     }
     Ok(counts)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RustFileLineCounts {
+    total: usize,
+    tests: usize,
+    production: usize,
+}
+
+fn rust_file_line_counts(path: &str, bytes: &[u8]) -> Result<RustFileLineCounts, String> {
+    let total = bytes.iter().filter(|byte| **byte == b'\n').count()
+        + usize::from(!bytes.is_empty() && !bytes.ends_with(b"\n"));
+    if is_test_path(path) {
+        return Ok(RustFileLineCounts {
+            total,
+            tests: total,
+            production: 0,
+        });
+    }
+    let source = std::str::from_utf8(bytes)
+        .map_err(|error| format!("Rust source `{path}` is not UTF-8: {error}"))?;
+    let lines = source.lines().collect::<Vec<_>>();
+    let inline_test_start = lines
+        .windows(2)
+        .rposition(|pair| pair[0].trim() == "#[cfg(test)]" && pair[1].trim() == "mod tests {");
+    let tests = inline_test_start.map_or(0, |start| total.saturating_sub(start));
+    Ok(RustFileLineCounts {
+        total,
+        tests,
+        production: total.saturating_sub(tests),
+    })
 }
 
 fn is_test_path(path: &str) -> bool {
@@ -644,4 +672,31 @@ fn bounded_list(values: &[String]) -> String {
         text.push_str(&format!(", and {} more", values.len() - 12));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_line_counts_partition_trailing_inline_tests_once() {
+        let source =
+            b"fn product() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn works() {}\n}\n";
+        assert_eq!(
+            rust_file_line_counts("crates/example/src/lib.rs", source).unwrap(),
+            RustFileLineCounts {
+                total: 7,
+                tests: 5,
+                production: 2,
+            }
+        );
+        assert_eq!(
+            rust_file_line_counts("crates/example/tests/public.rs", source).unwrap(),
+            RustFileLineCounts {
+                total: 7,
+                tests: 7,
+                production: 0,
+            }
+        );
+    }
 }

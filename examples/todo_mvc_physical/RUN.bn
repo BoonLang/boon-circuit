@@ -543,7 +543,7 @@ FUNCTION todos_element() {
             width: Fill
             material: Theme/material(of: SurfaceVariant)
             ...Theme/material(of: TodoListFrame)
-            height: [sizing: Fit, maximum: 200]
+            height: [sizing: Fit, maximum: 300]
         ]
         items: visible_todos
             |> List/map(old, new: old |> todo_element())

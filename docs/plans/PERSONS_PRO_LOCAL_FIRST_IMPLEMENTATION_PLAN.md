@@ -454,15 +454,13 @@ frame-bound workflow checkpoints for restart, asynchronous artifact load,
 responsive desktop/narrow layouts, migration activation, scrolling, and
 visible TEST cursor playback.
 
-Current implementation evidence (2026-07-16, commits `be6ff21` through
-`c73d276`):
+Current implementation evidence (2026-07-16, through commit `3bf365c`):
 
 - Asynchronous program-artifact store/load work no longer acts as a persistence
-  checkpoint boundary. A 150 ms slow-I/O regression proves that an interleaved
-  artifact does not split a collected authority batch. A second deterministic
-  regression holds artifact execution with a condition-variable gate, queues
-  another turn, and proves both the current and peak pending-checkpoint counts
-  include the sealed batch without relying on scheduler timing.
+  checkpoint boundary. Sealed authority is committed before slower artifact
+  work begins. Worker status reports the one redb transaction in flight, queued
+  successor batches, and total outstanding commits separately; the Persons
+  backlog budget applies to queued batches and does not hide active work.
 - Restart verification requires the applied program-artifact load observation
   before the first product presentation and an exact metadata-identical event
   linked to the mounted `FrameEvidenceKey` afterward. It no longer infers
@@ -480,14 +478,14 @@ Current implementation evidence (2026-07-16, commits `be6ff21` through
   Host-only scenario ownership is assigned to the manifest-backed native
   verifier.
 - `cargo test -p boon_persistence --lib` passes all 54 tests.
-- `cargo test -p boon_native_playground` passes all 65 tests and `cargo test -p
+- `cargo test -p boon_native_playground` passes all 64 tests and `cargo test -p
   xtask` passes all 19 tooling tests.
 - `cargo check --workspace --all-targets`, `cargo test --workspace
   --all-targets --quiet`, and `cargo build --release
   -p boon_native_playground` pass from the current implementation.
-- The architecture gate passes with 184,953 tracked Rust lines, 31,998 test
-  lines, 31,998 playground production lines, 5,197 xtask production lines, and
-  20,544 runtime-plus-executor production lines, all within their caps.
+- The architecture gate passes with 185,234 tracked Rust lines, 31,963 test
+  lines, 31,985 playground production lines, 5,226 xtask production lines, and
+  20,572 runtime-plus-executor production lines, all within their caps.
 - No tracked Python source exists. Production engine/playground scans contain
   no Persons.pro branch; remaining Persons literals are source-controlled
   fixtures and tests.
@@ -508,6 +506,10 @@ Current implementation evidence (2026-07-16, commits `be6ff21` through
   foreground and border region of the cursor's six-part geometry at the logical
   event coordinate and matching surface scale. A nonblank image or plain dark
   stripe at that coordinate fails the deterministic pixel regression.
+- Native rendering now preserves the exact WGPU attachment extent instead of
+  silently normalizing geometry to 1920x1080. A retained post-text overlay lane
+  keeps operator cursors above labels and is an explicit product render-graph
+  pass rather than an example or verifier paint shortcut.
 - Every verifier product uses a clean launch-scoped redb root, including gates
   that do not require restart reporting. Ordinary TEST playback uses a fresh
   in-memory deterministic runtime and never clears or rewrites manual state;
@@ -547,11 +549,13 @@ named by `docs/architecture/native_gpu_handoff_manifest.json`, culminating in
 copied timing prose in this plan, are the canonical measurements for the final
 HEAD; no tracked edit may follow their generation.
 
-The older release Persons report remains useful only as a historical timing
-sample: editor-visible p95 8.257 ms, child-preview p95 10.648 ms and p99
-11.152 ms, starter compile p95 2.852 ms and max 2.952 ms, passive scroll p95
-0.841 ms, and maximum interaction-frame blocking 9.803 ms. It predates the
-current clean commits and cannot satisfy final handoff evidence.
+The passing implementation-worktree release run immediately before `3bf365c`
+measured editor-visible p95 8.230 ms, child-preview p95 10.598 ms and p99
+11.217 ms, starter compile p95 2.814 ms and max 2.861 ms, passive scroll p95
+0.894 ms, and maximum interaction-frame blocking 9.249 ms. It also proved one
+queued durable batch, no proof replacement or result drops, and no trusted
+parent rebuild per edit. These values are a development checkpoint; the final
+source-bound manifest reports remain the acceptance evidence.
 
 The installed and running `/usr/bin/cosmic-comp` now both have SHA-256
 `f1efface3d67ac6b011712a812b406f8775e4ab23835ea1bb54a098310422e38`.

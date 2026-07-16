@@ -382,56 +382,62 @@ impl RedbDriver {
                 .ok_or(StoreError::MissingApplication)?;
             validate_checkpoint_header(&meta, &batch)?;
 
-            let mut outbox = transaction.open_table(OUTBOX).map_err(backend)?;
-            let mut decoded_bytes = 0;
-            let current_outbox = load_outbox_table(&outbox, &app, self.limits, &mut decoded_bytes)?;
-            let mut candidate_outbox = current_outbox.clone();
-            super::apply_durable_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
-            super::validate_outbox(&candidate_outbox)?;
+            if !batch.outbox_changes.is_empty() {
+                let mut outbox = transaction.open_table(OUTBOX).map_err(backend)?;
+                let mut decoded_bytes = 0;
+                let current_outbox =
+                    load_outbox_table(&outbox, &app, self.limits, &mut decoded_bytes)?;
+                let mut candidate_outbox = current_outbox.clone();
+                super::apply_durable_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
+                super::validate_outbox(&candidate_outbox)?;
+                replace_outbox(&mut outbox, &app, &current_outbox, &candidate_outbox)?;
+            }
 
-            let mut artifact_owners = transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?;
-            let mut owner_decode_bytes = 0;
-            let current_manifest = load_content_artifact_manifest(
-                &artifact_owners,
-                &app,
-                self.limits,
-                &mut owner_decode_bytes,
-            )?;
-            let mut candidate_manifest = current_manifest.clone();
-            apply_durable_content_artifact_changes(
-                &mut candidate_manifest,
-                &batch.content_artifact_changes,
-            )?;
-            let artifacts = transaction.open_table(ARTIFACTS).map_err(backend)?;
-            let available_artifacts = load_content_artifacts(&artifacts, &app, self.limits)?;
-            validate_content_artifact_storage(&candidate_manifest, &available_artifacts)?;
-            drop(artifacts);
-            replace_content_artifact_manifest(
-                &mut artifact_owners,
-                &app,
-                &current_manifest,
-                &candidate_manifest,
-            )?;
-            drop(artifact_owners);
+            if !batch.content_artifact_changes.is_empty() {
+                let mut artifact_owners =
+                    transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?;
+                let mut owner_decode_bytes = 0;
+                let current_manifest = load_content_artifact_manifest(
+                    &artifact_owners,
+                    &app,
+                    self.limits,
+                    &mut owner_decode_bytes,
+                )?;
+                let mut candidate_manifest = current_manifest.clone();
+                apply_durable_content_artifact_changes(
+                    &mut candidate_manifest,
+                    &batch.content_artifact_changes,
+                )?;
+                let artifacts = transaction.open_table(ARTIFACTS).map_err(backend)?;
+                let available_artifacts = load_content_artifacts(&artifacts, &app, self.limits)?;
+                validate_content_artifact_storage(&candidate_manifest, &available_artifacts)?;
+                drop(artifacts);
+                replace_content_artifact_manifest(
+                    &mut artifact_owners,
+                    &app,
+                    &current_manifest,
+                    &candidate_manifest,
+                )?;
+            }
 
-            let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
-            let mut lists = transaction.open_table(LISTS).map_err(backend)?;
-            let mut rows = transaction.open_table(ROWS).map_err(backend)?;
-            let mut blob_table = transaction.open_table(BLOBS).map_err(backend)?;
-            let current_blobs = load_blobs_write(&blob_table, &app, self.limits)?;
-            let mut candidate_blobs = current_blobs.clone();
-            apply_changes(
-                &mut slots,
-                &mut lists,
-                &mut rows,
-                &app,
-                &batch.changes,
-                self.limits,
-                &mut candidate_blobs,
-            )?;
-            sync_blobs(&mut blob_table, &app, &current_blobs, &candidate_blobs)?;
-            replace_outbox(&mut outbox, &app, &current_outbox, &candidate_outbox)?;
-
+            if !batch.changes.is_empty() {
+                let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
+                let mut lists = transaction.open_table(LISTS).map_err(backend)?;
+                let mut rows = transaction.open_table(ROWS).map_err(backend)?;
+                let mut blob_table = transaction.open_table(BLOBS).map_err(backend)?;
+                let current_blobs = load_blobs_write(&blob_table, &app, self.limits)?;
+                let mut candidate_blobs = current_blobs.clone();
+                apply_changes(
+                    &mut slots,
+                    &mut lists,
+                    &mut rows,
+                    &app,
+                    &batch.changes,
+                    self.limits,
+                    &mut candidate_blobs,
+                )?;
+                sync_blobs(&mut blob_table, &app, &current_blobs, &candidate_blobs)?;
+            }
             let mut checkpoints = transaction.open_table(CHECKPOINTS).map_err(backend)?;
             record_checkpoint(
                 &mut checkpoints,

@@ -451,4 +451,112 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn persons_semantic_memory_is_the_exact_authority_contract() {
+        let persons = Catalog::load()
+            .expect("catalog")
+            .open("persons_pro")
+            .expect("Persons.pro sources");
+        let migration = persons
+            .migration
+            .as_ref()
+            .expect("Persons.pro migration sequence");
+        let plan = crate::compile::compile_migration_stage(
+            &persons.application,
+            migration,
+            &migration.launch_stage,
+        )
+        .expect("Persons.pro launch plan");
+
+        let scalar_paths = plan
+            .persistence
+            .memory
+            .iter()
+            .map(|memory| memory.semantic_path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            scalar_paths,
+            [
+                "store.account_id",
+                "store.active_view",
+                "store.draft_revision",
+                "store.last_valid_draft_artifact_id",
+                "store.last_valid_draft_revision",
+                "store.mode",
+                "store.passkey_workflow_state",
+                "store.preview_surface",
+                "store.preview_width_mode",
+                "store.publish_candidate_revision",
+                "store.publish_candidate_source",
+                "store.publish_request_sequence",
+                "store.publish_settled_sequence",
+                "store.published_artifact_id",
+                "store.published_capability_profile",
+                "store.published_compiler",
+                "store.published_plan_digest",
+                "store.published_revision",
+                "store.published_source",
+                "store.published_source_digest",
+                "store.published_target",
+                "store.signed_out",
+                "store.source_draft",
+                "store.workspace_grant_id",
+                "store.workspace_grant_state",
+                "store.workspace_id",
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let list_paths = plan
+            .persistence
+            .lists
+            .iter()
+            .map(|list| list.semantic_path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            list_paths,
+            ["store.credential_descriptors", "store.published_revisions"]
+                .into_iter()
+                .collect()
+        );
+        let row_fields = plan
+            .persistence
+            .lists
+            .iter()
+            .flat_map(|list| list.row_fields.iter())
+            .map(|field| field.semantic_path.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            row_fields,
+            [
+                "store.credential_descriptors.credential_id",
+                "store.credential_descriptors.label",
+                "store.published_revisions.artifact_id",
+                "store.published_revisions.capability_profile",
+                "store.published_revisions.compiler",
+                "store.published_revisions.draft_revision",
+                "store.published_revisions.plan_digest",
+                "store.published_revisions.request",
+                "store.published_revisions.source",
+                "store.published_revisions.source_digest",
+                "store.published_revisions.target",
+            ]
+            .into_iter()
+            .collect()
+        );
+        for forbidden in [
+            "store.draft_compile_column",
+            "store.draft_compile_diagnostic",
+            "store.draft_compile_line",
+            "store.draft_compile_path",
+            "store.passkey_message",
+            "store.publish_diagnostic",
+            "store.publish_state",
+        ] {
+            assert!(!scalar_paths.contains(forbidden));
+        }
+        assert_eq!(plan.persistence.effect_outbox.len(), 2);
+    }
 }

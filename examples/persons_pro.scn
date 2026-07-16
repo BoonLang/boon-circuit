@@ -2,8 +2,8 @@ name = "persons_pro_local_first"
 source = "examples/persons_pro/RUN.bn"
 
 # This file owns document-action playback. Host-control checkpoints that the
-# current scenario transport cannot represent are deterministic scenarios in
-# runtime_view.rs: restart/start-over/export/import/corruption/migration,
+# current scenario transport cannot represent are owned by the manifest-backed
+# native verifier: restart/start-over/export/import/corruption/migration,
 # reordered stale child completions, and desktop/narrow retained-layout parity.
 # Promoting those checkpoints here requires typed host_action variants rather
 # than fake source routes.

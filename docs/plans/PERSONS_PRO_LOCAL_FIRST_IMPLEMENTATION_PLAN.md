@@ -2,7 +2,8 @@
 
 Date: 2026-07-15
 
-Status: local-first implementation checkpoint; final native handoff evidence pending
+Status: local-first release verifier passes; final workspace and native handoff
+aggregate pending
 
 Persons.pro is a Boon-hosted personal publishing workspace. A visitor receives
 an immediately usable anonymous workspace, edits a small Boon program, sees the
@@ -469,6 +470,33 @@ launch-scoped isolated-seat tiled-resize fix, but the compositor process running
 when this checkpoint was recorded still mapped the prior deleted binary. A
 session restart is required before rerunning `verify-persons-pro`; stale reports
 must not be used to satisfy the stop conditions.
+
+Current release evidence (2026-07-16, commits `aaad56a` and `9354fd1`):
+
+- `cargo test -p boon_persistence --lib` passes all 52 tests.
+- `cargo test -p boon_native_playground` passes all 118 tests, including the
+  complete Persons.pro workflow, retained-view restart, corruption, migration,
+  and asynchronous immutable-artifact restoration regressions.
+- Fresh `cargo xtask verify-persons-pro --report
+  target/reports/report-v2/persons-pro.json` reports `status=pass`, completes all
+  29 declared native workflow steps, restores the exact acknowledged authority
+  in a second native process, and records an applied `program-artifact-load`
+  worker-lane completion linked to a presented restart frame.
+- Release budget observations are: editor-visible p95 8.257 ms, child-preview
+  p95 10.648 ms and p99 11.152 ms, starter compile p95 2.852 ms and max
+  2.952 ms, passive scroll p95 0.841 ms, and maximum interaction-frame blocking
+  9.803 ms. Trusted-parent rebuilds, proof replacements, and proof-result drops
+  are zero.
+- Persistence acceptance now distinguishes logical pending turns from actual
+  worker-owned checkpoint batches. The profile observed one pending checkpoint
+  batch at most; the worker regression proves that an active commit plus queued
+  future work reports two batches rather than disguising queue depth.
+
+The latest isolated-seat release-ownership fix is installed in `/usr/bin`, but
+the current COSMIC session still maps the preceding compositor image. A session
+restart remains required before the final manifest-backed handoff run. The
+passing Persons report is current code evidence, but it does not waive that
+final environment refresh or the remaining workspace-wide gates.
 
 ### Slice 5: Browser host
 

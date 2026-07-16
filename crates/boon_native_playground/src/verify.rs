@@ -1899,6 +1899,37 @@ fn declared_native_workflow(
 }
 
 #[cfg(target_os = "linux")]
+fn next_native_workflow_event_cursor(
+    events: &[ObserverEvent],
+    start: usize,
+    expected_request_id: u64,
+    expected_ordinal: u32,
+    expected_step_id: &str,
+) -> Result<usize, String> {
+    events
+        .get(start..)
+        .and_then(|events| {
+            events.iter().position(|event| {
+                matches!(
+                    event,
+                    ObserverEvent::NativeWorkflowStep {
+                        request_id,
+                        ordinal,
+                        step_id,
+                        ..
+                    } if *request_id == expected_request_id
+                        && *ordinal == expected_ordinal
+                        && step_id == expected_step_id
+                )
+            })
+        })
+        .map(|offset| start.saturating_add(offset).saturating_add(1))
+        .ok_or_else(|| {
+            format!("native workflow step `{expected_step_id}` has no matching observer event")
+        })
+}
+
+#[cfg(target_os = "linux")]
 fn drive_native_workflow(
     profile: &VerifierProfile,
     session: &mut NativeSession,
@@ -1951,10 +1982,11 @@ fn drive_native_workflow(
 
     let mut previous_frame_id = ready.6.frame_id;
     let mut previous_state_digest = ready.5.clone();
+    let mut workflow_event_start = start;
     for (index, action) in actions.iter().enumerate() {
         let ordinal = u32::try_from(index + 1).unwrap_or(u32::MAX);
         let expected_request_id = native_workflow_request_id(test_request_id, index + 1);
-        let action_start = events.len();
+        let action_start = workflow_event_start;
         if action.action_kind != "assertion_only" {
             let target = wait_for_native_workflow_target(
                 session,
@@ -2106,6 +2138,13 @@ fn drive_native_workflow(
                     action.id
                 )
             })?;
+        workflow_event_start = next_native_workflow_event_cursor(
+            events,
+            action_start,
+            expected_request_id,
+            ordinal,
+            &action.id,
+        )?;
         let mut input_events = events[action_start..]
             .iter()
             .filter_map(|event| match event {
@@ -7451,6 +7490,53 @@ mod tests {
         assert_eq!(profile.scroll_samples, 148);
         assert_eq!(profile.selection_samples, 0);
         assert_eq!(profile.visible_mode, VisibleSampleMode::Hover);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_workflow_cursor_keeps_events_buffered_during_prior_proof_waits() {
+        let step = |request_id, ordinal, step_id: &str| ObserverEvent::NativeWorkflowStep {
+            request_id,
+            ordinal,
+            step_id: step_id.to_owned(),
+            source_path: "assertion-only".to_owned(),
+            action_kind: "assertion_only".to_owned(),
+            action_digest: "a".repeat(64),
+            input_first_sequence: 0,
+            input_last_sequence: 0,
+            input_event_count: 0,
+            input_event_digest: "b".repeat(64),
+            assertion_count: 1,
+            source_revision: 1,
+            runtime_sequence: u64::from(ordinal),
+            durable_epoch: u64::from(ordinal),
+            durable_turn_sequence: u64::from(ordinal),
+            durable_acked: true,
+            before_state_digest: "c".repeat(64),
+            state_digest: "d".repeat(64),
+            key: FrameEvidenceKey {
+                surface_id: "preview".to_owned(),
+                process_id: 1,
+                session_id: "session".to_owned(),
+                frame_id: u64::from(ordinal),
+                input_id: u64::from(ordinal),
+                content_id: u64::from(ordinal),
+                layout_id: u64::from(ordinal),
+                render_id: u64::from(ordinal),
+                surface_epoch: 1,
+                present_id: u64::from(ordinal),
+                proof_id: u64::from(ordinal),
+            },
+        };
+        let events = vec![step(65, 1, "first"), step(66, 2, "second")];
+
+        let cursor = next_native_workflow_event_cursor(&events, 0, 65, 1, "first").unwrap();
+        assert_eq!(cursor, 1);
+        assert_eq!(
+            next_native_workflow_event_cursor(&events, cursor, 66, 2, "second").unwrap(),
+            2
+        );
+        assert!(next_native_workflow_event_cursor(&events, events.len(), 66, 2, "second").is_err());
     }
 
     #[test]

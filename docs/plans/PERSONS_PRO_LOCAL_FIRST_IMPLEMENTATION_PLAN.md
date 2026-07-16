@@ -454,57 +454,46 @@ frame-bound workflow checkpoints for restart, asynchronous artifact load,
 responsive desktop/narrow layouts, migration activation, scrolling, and
 visible TEST cursor playback.
 
-Current local evidence at commit `23f7d96`:
-
-- `cargo fmt --all -- --check` passes.
-- `cargo check --workspace --all-targets` passes without warnings.
-- `cargo test --workspace --all-targets` passes after all 112 native
-  playground tests and every compiler/runtime/persistence/xtask test complete.
-- `cargo build --release -p boon_native_playground` passes.
-- repository scans find no Python source and no Persons.pro literal in
-  production compiler, runtime, persistence, document, renderer, playground,
-  or verifier control flow; Persons literals remain only in fixtures and tests.
-
-This is not final native evidence. The installed compositor contains the
-launch-scoped isolated-seat tiled-resize fix, but the compositor process running
-when this checkpoint was recorded still mapped the prior deleted binary. A
-session restart is required before rerunning `verify-persons-pro`; stale reports
-must not be used to satisfy the stop conditions.
-
-Current implementation evidence (2026-07-16, through commits `62d19d2` and
-`3aa1d0e`):
+Current implementation evidence (2026-07-16, through commit `be6ff21`):
 
 - Asynchronous program-artifact store/load work no longer acts as a persistence
-  checkpoint boundary. A worker regression proves `Turn(1)`, asynchronous
-  artifact work, and `Turn(2)` produce one contiguous authority checkpoint.
-- `pending_checkpoint_batches_peak` is updated under the admission lock and is
-  the value used by release profiling, so transient durable backlog cannot be
-  hidden between profile samples.
-- Responsive parity is derived from visible topmost retained hit targets.
-  Hidden document branches no longer count, and every counted desktop/narrow
-  control must have finite positive bounds wholly inside the native viewport.
-- Restart verification now requires an applied `program-artifact-load` event
-  from the restarted preview process linked to its exact first mounted frame.
-  Migration verification separately proves the isolated migrated frame and a
-  later app-owned WGPU frame where the original product authority and digest
-  are restored unchanged.
+  checkpoint boundary. A 150 ms slow-I/O regression proves that an interleaved
+  artifact does not split a collected authority batch. A second deterministic
+  regression holds artifact execution with a condition-variable gate, queues
+  another turn, and proves both the current and peak pending-checkpoint counts
+  include the sealed batch without relying on scheduler timing.
+- Restart verification requires the applied program-artifact load observation
+  before the first product presentation and an exact metadata-identical event
+  linked to the mounted `FrameEvidenceKey` afterward. It no longer infers
+  startup ordering from a post-presentation event.
+- Responsive evidence is armed only after the declared final native workflow
+  baseline. It preserves source path, route intent, and control multiplicity,
+  uses viewport plus propagated retained clip intersections, and binds the
+  desktop baseline key/action digest to the narrow-layout proof.
+- Migration verification proves the isolated migrated frame and a later
+  app-owned WGPU frame where authority and the original mounted content,
+  layout, and render revisions are all restored unchanged.
 - A compact compiled-plan test pins the exact Persons.pro semantic-memory
   allowlist, its two authoritative lists and row fields, two durable effect
   contracts, and the exclusion of diagnostics and derived workflow status.
-  Host-only scenario ownership is explicitly assigned to the manifest-backed
-  native verifier rather than deleted private `runtime_view.rs` harnesses.
-- `cargo test -p boon_persistence --lib` passes all 53 tests.
-- `cargo test -p boon_native_playground -p xtask --quiet` passes 63 focused
-  playground tests and 19 tooling tests.
+  Host-only scenario ownership is assigned to the manifest-backed native
+  verifier.
+- `cargo test -p boon_persistence --lib` passes all 54 tests.
+- `cargo test -p boon_native_playground` passes all 63 tests and `cargo test -p
+  xtask` passes all 19 tooling tests.
 - `cargo check --workspace --all-targets`, `cargo test --workspace
   --all-targets --quiet`, and `cargo build --release
   -p boon_native_playground` pass from the current implementation.
-- The architecture gate passes with 184,150 tracked Rust lines, 31,839 test
-  lines, 31,551 playground production lines, 5,117 xtask production lines, and
+- The architecture gate passes with 184,571 tracked Rust lines, 31,926 test
+  lines, 31,876 playground production lines, 5,117 xtask production lines, and
   20,544 runtime-plus-executor production lines, all within their caps.
 - No tracked Python source exists. Production engine/playground scans contain
   no Persons.pro branch; remaining Persons literals are source-controlled
   fixtures and tests.
+- Independent persistence and native-verifier re-audits confirmed the corrected
+  production batching, startup ordering, responsive identity/clip, and
+  migration-revision contracts. Their timing-based test concern was replaced
+  by the deterministic gate described above.
 
 The older release Persons report remains useful only as a historical timing
 sample: editor-visible p95 8.257 ms, child-preview p95 10.648 ms and p99

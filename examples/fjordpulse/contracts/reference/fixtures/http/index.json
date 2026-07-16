@@ -1,0 +1,14 @@
+{
+  "getHealth": "health-response.json",
+  "getHealth:503": "unhealthy-health-response.json",
+  "getMapConfig": "map-config-response.json",
+  "getStationMap": "station-map-response.json",
+  "search": "search-response.json",
+  "getStation": "station-response.json",
+  "getStationDepartures": "station-departures-response.json",
+  "getStationNearbyVehicles": "nearby-vehicles-response.json",
+  "getVehicle": "vehicle-response.json",
+  "getAdminDemoCredentials": "admin-demo-credentials-response.json",
+  "getAdminStatus": "admin-status-response.json",
+  "error": "error-response.json"
+}

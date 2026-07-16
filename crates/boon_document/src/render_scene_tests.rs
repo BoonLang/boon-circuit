@@ -1,7 +1,9 @@
 use super::*;
 use crate::{
     AccessibilityTree, DocumentDerivedIndexBundle, DocumentFrame, DocumentNode, LayoutMetrics,
-    TextValue,
+    MapCamera, MapCoordinate, MapHitIdentity, MapInteractionPolicy, MapOverlayDescriptor,
+    MapOverlayGeometry, MapOverlayId, MapOverlayPaint, MapTileSourceId, MapTileSourceRef,
+    MapViewportBounds, MapViewportDescriptor, MapViewportGeneration, TextValue,
 };
 
 fn identity() -> ComputedStyleIdentity {
@@ -12,6 +14,115 @@ fn identity() -> ComputedStyleIdentity {
         material_id: 4,
         font_id: 5,
         pseudo_state_id: 6,
+    }
+}
+
+fn generic_map_descriptor(generation: u64) -> MapViewportDescriptor {
+    let overlay = |id: &str, geometry: MapOverlayGeometry, z_order: i32| MapOverlayDescriptor {
+        id: MapOverlayId(id.to_owned()),
+        hit_identity: MapHitIdentity(format!("hit:{id}")),
+        z_order,
+        selected: id == "selected-point",
+        focused: false,
+        paint: MapOverlayPaint {
+            fill: Some("#267a66".to_owned()),
+            stroke: Some("#ffffff".to_owned()),
+            stroke_width: 2.0,
+            opacity: 1.0,
+        },
+        geometry,
+    };
+    MapViewportDescriptor {
+        generation: MapViewportGeneration(generation),
+        camera: MapCamera {
+            longitude: 10.75,
+            latitude: 59.91,
+            zoom: 5.0,
+            bearing: 12.0,
+        },
+        bounds: MapViewportBounds {
+            width: 280.0,
+            height: 180.0,
+            scale: 1.0,
+        },
+        tile_source: MapTileSourceRef {
+            id: MapTileSourceId("generic-fixture".to_owned()),
+            url_template_capability: "generic_fixture_tiles".to_owned(),
+            min_zoom: 0,
+            max_zoom: 10,
+            tile_size: 256,
+            attribution: "Generic fixture".to_owned(),
+            allowed_origins: vec!["boon-local://generic-map".to_owned()],
+        },
+        interaction: MapInteractionPolicy {
+            pan: true,
+            wheel_zoom: true,
+            pinch_zoom: true,
+            keyboard_zoom: true,
+        },
+        overlays: vec![
+            overlay(
+                "selected-point",
+                MapOverlayGeometry::Point {
+                    position: MapCoordinate {
+                        longitude: 10.75,
+                        latitude: 59.91,
+                    },
+                    radius: 8.0,
+                    symbol_ref: None,
+                },
+                5,
+            ),
+            overlay(
+                "route",
+                MapOverlayGeometry::Polyline {
+                    points: vec![
+                        MapCoordinate {
+                            longitude: 10.70,
+                            latitude: 59.90,
+                        },
+                        MapCoordinate {
+                            longitude: 10.80,
+                            latitude: 59.92,
+                        },
+                    ],
+                },
+                2,
+            ),
+            overlay(
+                "area",
+                MapOverlayGeometry::Polygon {
+                    rings: vec![vec![
+                        MapCoordinate {
+                            longitude: 10.72,
+                            latitude: 59.90,
+                        },
+                        MapCoordinate {
+                            longitude: 10.78,
+                            latitude: 59.90,
+                        },
+                        MapCoordinate {
+                            longitude: 10.75,
+                            latitude: 59.94,
+                        },
+                    ]],
+                },
+                1,
+            ),
+            overlay(
+                "label",
+                MapOverlayGeometry::Label {
+                    position: MapCoordinate {
+                        longitude: 10.77,
+                        latitude: 59.93,
+                    },
+                    text: "Generic map".to_owned(),
+                    collision_priority: 1,
+                    font_size: 13.0,
+                },
+                3,
+            ),
+        ],
     }
 }
 
@@ -46,6 +157,7 @@ fn interactive_controls_have_generic_hover_and_focus_fallbacks() {
         },
         style,
         text: Some("Button".to_owned()),
+        map_viewport: None,
         focused: true,
         style_identity: identity(),
     };
@@ -100,6 +212,7 @@ fn render_scene_contract_is_renderer_neutral_and_serializable() {
         },
         items: vec![item],
         visual_primitives: Vec::new(),
+        map_viewports: Vec::new(),
         overlay_visual_primitives: Vec::new(),
         quad_batches: vec![RenderQuadBatch {
             retained_chunk_id: Some("chunk:row-1".to_owned()),
@@ -141,6 +254,7 @@ fn render_visual_primitives_lower_default_fill_asset_and_checkbox_before_gpu() {
         },
         style: row_style,
         text: None,
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     };
@@ -157,6 +271,7 @@ fn render_visual_primitives_lower_default_fill_asset_and_checkbox_before_gpu() {
         },
         style: checkbox_style,
         text: None,
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     };
@@ -248,6 +363,7 @@ fn render_visual_primitives_lower_checkbox_raster_semantics_before_gpu() {
         },
         style: checkbox_style,
         text: None,
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     };
@@ -320,6 +436,7 @@ fn render_visual_primitives_skip_checkbox_raster_when_asset_icon_covers_control(
         },
         style: StyleMap::new(),
         text: None,
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     };
@@ -339,6 +456,7 @@ fn render_visual_primitives_skip_checkbox_raster_when_asset_icon_covers_control(
         },
         style: icon_style,
         text: None,
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     };
@@ -396,6 +514,7 @@ fn render_visual_primitives_apply_material_fill_adjustments_before_gpu() {
             },
             style,
             text: None,
+            map_viewport: None,
             focused: false,
             style_identity: identity(),
         }],
@@ -464,6 +583,7 @@ fn render_visual_primitives_lower_material_layers_before_gpu() {
             },
             style,
             text: None,
+            map_viewport: None,
             focused: false,
             style_identity: identity(),
         }],
@@ -554,6 +674,7 @@ fn render_visual_primitives_lower_shadows_before_fill_before_gpu() {
             },
             style,
             text: None,
+            map_viewport: None,
             focused: false,
             style_identity: identity(),
         }],
@@ -643,6 +764,7 @@ fn render_visual_primitives_lower_borders_after_descendant_fills_before_gpu() {
                 },
                 style: parent_style,
                 text: None,
+                map_viewport: None,
                 focused: false,
                 style_identity: identity(),
             },
@@ -657,6 +779,7 @@ fn render_visual_primitives_lower_borders_after_descendant_fills_before_gpu() {
                 },
                 style: child_style,
                 text: None,
+                map_viewport: None,
                 focused: false,
                 style_identity: identity(),
             },
@@ -731,6 +854,7 @@ fn render_visual_primitives_lower_text_overlays_before_gpu() {
         },
         style: editor_style,
         text: Some("abcd".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     };
@@ -752,6 +876,7 @@ fn render_visual_primitives_lower_text_overlays_before_gpu() {
         },
         style: input_style,
         text: Some("xy".to_owned()),
+        map_viewport: None,
         focused: true,
         style_identity: identity(),
     };
@@ -817,6 +942,7 @@ fn multiline_text_input_hit_testing_and_overlays_preserve_line_coordinates() {
         },
         style,
         text: Some("ab\ncdef\ng".to_owned()),
+        map_viewport: None,
         focused: true,
         style_identity: identity(),
     };
@@ -852,6 +978,7 @@ fn lower_layout_frame_to_render_scene_combines_items_primitives_and_text() {
         },
         style,
         text: Some("Ready".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -889,6 +1016,7 @@ fn render_scene_patch_updates_fill_and_invalidates_quad_batches() {
         },
         style,
         text: Some("Ready".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -950,6 +1078,7 @@ fn render_scene_patch_updates_text_color_without_changing_text_shape() {
         },
         style,
         text: Some("Ready".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -996,6 +1125,7 @@ fn render_scene_patch_updates_text_content_and_invalidates_quad_batches() {
         },
         style,
         text: Some("Ready".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1043,6 +1173,7 @@ fn render_scene_patch_rejects_stale_scene_references() {
         },
         style: StyleMap::new(),
         text: None,
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1102,6 +1233,7 @@ fn checked_render_scene_uses_retained_layout_keys_for_chunk_identity() {
         },
         style,
         text: Some("Ready".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1140,6 +1272,7 @@ fn checked_render_scene_rejects_real_nodes_missing_retained_keys() {
         },
         style,
         text: Some("Ready".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1182,6 +1315,7 @@ fn render_text_runs_lower_placeholder_and_widget_defaults_before_gpu() {
         },
         style,
         text: Some(String::new()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1213,6 +1347,7 @@ fn render_text_runs_honor_public_text_align_style() {
         },
         style,
         text: Some("todos".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1238,6 +1373,7 @@ fn render_text_runs_treat_public_center_style_as_text_alignment() {
         },
         style,
         text: Some("Centered footer".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1260,6 +1396,7 @@ fn checkbox_accessibility_label_is_not_a_visual_text_run() {
         },
         style: StyleMap::new(),
         text: Some("Reference[element:todo-title]".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1305,6 +1442,7 @@ fn render_text_runs_lower_syntax_spans_and_type_hints_before_gpu() {
         },
         style,
         text: Some("SOURCE".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1350,6 +1488,7 @@ fn render_text_contract_keys_track_shape_and_placement_inputs() {
         },
         style,
         text: Some("SOURCE".to_owned()),
+        map_viewport: None,
         focused: false,
         style_identity: identity(),
     });
@@ -1373,4 +1512,230 @@ fn render_text_contract_keys_track_shape_and_placement_inputs() {
     assert_ne!(shape_key, recolored_run.shape_key());
     assert_eq!(shape_key.rich_spans[0].font_style, RenderFontStyle::Italic);
     assert_eq!(shape_key.rich_spans[0].font_weight, RenderFontWeight(700));
+}
+
+#[test]
+fn map_viewport_lowers_tiles_overlays_labels_and_generic_hit_identities() {
+    let frame = frame_with_item(DisplayItem {
+        node: DocumentNodeId("generic-map".to_owned()),
+        kind: DocumentNodeKind::MapViewport,
+        map_viewport: Some(Box::new(generic_map_descriptor(1))),
+        bounds: Rect {
+            x: 20.0,
+            y: 16.0,
+            width: 280.0,
+            height: 180.0,
+        },
+        style: StyleMap::new(),
+        text: None,
+        focused: false,
+        style_identity: identity(),
+    });
+    let mut columns = ApproximateTextColumnMeasurer;
+    let scene = lower_layout_frame_to_render_scene(&frame, 340, 220, &mut columns);
+
+    assert_eq!(scene.map_viewports.len(), 1);
+    let map = &scene.map_viewports[0];
+    assert!(!map.visible_tiles.is_empty());
+    assert!(
+        map.overlay_primitives
+            .iter()
+            .any(|primitive| primitive.primitive == RenderVisualPrimitiveKind::MapCircle)
+    );
+    assert!(
+        map.overlay_primitives
+            .iter()
+            .any(|primitive| primitive.primitive == RenderVisualPrimitiveKind::MapPolyline)
+    );
+    assert!(
+        map.overlay_primitives
+            .iter()
+            .any(|primitive| primitive.primitive == RenderVisualPrimitiveKind::MapPolygon)
+    );
+    assert!(
+        map.overlay_text_runs
+            .iter()
+            .any(|run| run.text == "Generic map")
+    );
+    let selected = map
+        .hit_regions
+        .iter()
+        .find(|hit| hit.overlay_id.0 == "selected-point")
+        .unwrap();
+    assert!(!selected.contains(selected.bounds.x, selected.bounds.y));
+    let hit = map
+        .hit_test(
+            selected.bounds.x + selected.bounds.width / 2.0,
+            selected.bounds.y + selected.bounds.height / 2.0,
+        )
+        .unwrap();
+    assert_eq!(hit.hit_identity.0, "hit:selected-point");
+}
+
+#[test]
+fn map_viewport_patch_changes_one_retained_map_and_rejects_stale_identity() {
+    let frame = frame_with_item(DisplayItem {
+        node: DocumentNodeId("generic-map".to_owned()),
+        kind: DocumentNodeKind::MapViewport,
+        map_viewport: Some(Box::new(generic_map_descriptor(1))),
+        bounds: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 280.0,
+            height: 180.0,
+        },
+        style: StyleMap::new(),
+        text: None,
+        focused: false,
+        style_identity: identity(),
+    });
+    let mut columns = ApproximateTextColumnMeasurer;
+    let mut scene = lower_layout_frame_to_render_scene(&frame, 320, 200, &mut columns);
+    let item_count = scene.items.len();
+    let previous_camera = scene.map_viewports[0].descriptor.camera;
+    let patch = scene.map_viewports[0]
+        .descriptor
+        .patch_for_input(crate::MapViewportInput::PanPixels {
+            delta_x: 40.0,
+            delta_y: 0.0,
+        })
+        .unwrap();
+    let report = scene
+        .apply_patch(&RenderScenePatch {
+            operations: vec![RenderScenePatchOperation::MapViewport {
+                node: DocumentNodeId("generic-map".to_owned()),
+                patch: Box::new(patch),
+                retained_chunk_id: "chunk:generic-map:camera:2".to_owned(),
+            }],
+        })
+        .unwrap();
+    assert_eq!(scene.items.len(), item_count);
+    assert_eq!(report.patched_items, 1);
+    assert_ne!(scene.map_viewports[0].descriptor.camera, previous_camera);
+    assert_eq!(
+        scene.map_viewports[0].retained_chunk_id,
+        "chunk:generic-map:camera:2"
+    );
+
+    let error = scene
+        .apply_patch(&RenderScenePatch {
+            operations: vec![RenderScenePatchOperation::MapViewport {
+                node: DocumentNodeId("missing-map".to_owned()),
+                patch: Box::new(MapViewportDescriptorPatch::default()),
+                retained_chunk_id: "missing".to_owned(),
+            }],
+        })
+        .unwrap_err();
+    assert!(matches!(error, PatchApplyError::StaleReference { .. }));
+}
+
+#[test]
+fn map_label_collision_keeps_the_highest_generic_priority() {
+    let mut descriptor = generic_map_descriptor(1);
+    descriptor
+        .overlays
+        .retain(|overlay| !matches!(overlay.geometry, MapOverlayGeometry::Label { .. }));
+    for (id, text, priority) in [("low", "Low", 1), ("high", "High", 10)] {
+        descriptor.overlays.push(MapOverlayDescriptor {
+            id: MapOverlayId(id.to_owned()),
+            hit_identity: MapHitIdentity(format!("hit:{id}")),
+            z_order: priority,
+            selected: false,
+            focused: false,
+            paint: MapOverlayPaint::default(),
+            geometry: MapOverlayGeometry::Label {
+                position: MapCoordinate {
+                    longitude: 10.75,
+                    latitude: 59.91,
+                },
+                text: text.to_owned(),
+                collision_priority: priority,
+                font_size: 14.0,
+            },
+        });
+    }
+    let frame = frame_with_item(DisplayItem {
+        node: DocumentNodeId("generic-map".to_owned()),
+        kind: DocumentNodeKind::MapViewport,
+        map_viewport: Some(Box::new(descriptor)),
+        bounds: Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 280.0,
+            height: 180.0,
+        },
+        style: StyleMap::new(),
+        text: None,
+        focused: false,
+        style_identity: identity(),
+    });
+    let mut columns = ApproximateTextColumnMeasurer;
+    let scene = lower_layout_frame_to_render_scene(&frame, 320, 200, &mut columns);
+    let labels = scene.map_viewports[0]
+        .overlay_text_runs
+        .iter()
+        .map(|run| run.text.as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"High"));
+    assert!(!labels.contains(&"Low"));
+}
+
+#[test]
+fn document_diff_applies_camera_change_as_one_retained_nonstructural_map_patch() {
+    let mut frame = DocumentFrame::empty("root");
+    let root_id = frame.root.clone();
+    let mut map_node = DocumentNode::new("generic-map", DocumentNodeKind::MapViewport);
+    map_node.parent = Some(root_id.clone());
+    map_node.map_viewport = Some(Box::new(generic_map_descriptor(1)));
+    map_node
+        .style
+        .insert("width".to_owned(), StyleValue::Number(280.0));
+    map_node
+        .style
+        .insert("height".to_owned(), StyleValue::Number(180.0));
+    frame
+        .nodes
+        .get_mut(&root_id)
+        .unwrap()
+        .children
+        .push(map_node.id.clone());
+    frame.nodes.insert(map_node.id.clone(), map_node);
+    let mut columns = ApproximateTextColumnMeasurer;
+    let mut retained = crate::RetainedDocument::new(
+        frame.clone(),
+        crate::Viewport {
+            surface: 1,
+            width: 320.0,
+            height: 220.0,
+            scale: 1.0,
+        },
+        &mut columns,
+    )
+    .unwrap();
+    let before = retained.stats();
+    let mut next = frame;
+    let descriptor = next
+        .nodes
+        .get_mut(&DocumentNodeId("generic-map".to_owned()))
+        .unwrap()
+        .map_viewport
+        .as_deref_mut()
+        .unwrap();
+    descriptor.generation = MapViewportGeneration(2);
+    descriptor.camera.longitude += 0.25;
+    let patches = crate::diff_document_frames(retained.frame(), &next);
+    assert_eq!(patches.len(), 1);
+    assert!(matches!(patches[0], crate::DocumentPatch::UpsertNode(_)));
+    let update = retained.apply_patches(patches, &mut columns).unwrap();
+    let after = retained.stats();
+
+    assert!(!update.full_lowered);
+    assert!(!update.layout_changed);
+    assert!(update.render_changed);
+    assert_eq!(after.full_lower_count, before.full_lower_count);
+    assert_eq!(after.retained_patch_count, before.retained_patch_count + 1);
+    assert_eq!(
+        retained.scene().map_viewports[0].descriptor.generation,
+        MapViewportGeneration(2)
+    );
 }

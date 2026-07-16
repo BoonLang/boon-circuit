@@ -1,0 +1,18 @@
+store: [
+    request: SOURCE
+]
+
+outputs: [
+    response: [
+        status: 200
+        body: Contract/response_text()
+    ]
+]
+
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]
+

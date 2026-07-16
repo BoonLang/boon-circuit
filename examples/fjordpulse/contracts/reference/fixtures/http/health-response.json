@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "data": {
+    "status": "healthy",
+    "mode": "normal",
+    "dataMode": "real",
+    "checkedAt": "2026-07-10T10:00:00Z",
+    "version": "1.0.0-dev",
+    "fallbackAvailable": true,
+    "dependencies": {
+      "http": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "realtime": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "surrealdb": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "entur": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "mapTiles": { "status": "configured", "checkedAt": "2026-07-10T10:00:00Z" },
+      "liveQueryBridge": {
+        "status": "healthy",
+        "checkedAt": "2026-07-10T10:00:00Z",
+        "lastSuccessAt": "2026-07-10T09:59:58Z"
+      }
+    }
+  },
+  "meta": {
+    "requestId": "req_health",
+    "updatedAt": "2026-07-10T10:00:00Z"
+  }
+}

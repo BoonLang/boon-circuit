@@ -1,0 +1,15 @@
+[latency_ms]
+cached_interaction_to_present_p95 = 16.7
+cached_interaction_to_present_max = 33.4
+map_pan_zoom_frame_p95 = 16.7
+mobile_sheet_drag_frame_p95 = 16.7
+indexed_search_p95 = 25.0
+viewport_query_p95 = 16.7
+
+[count]
+full_runtime_rebuild_per_interaction_max = 0
+full_document_rebuild_per_interaction_max = 0
+full_render_scene_rebuild_per_interaction_max = 0
+full_station_scan_per_query_max = 0
+pending_server_request_max = 64
+pending_map_tile_decode_max = 8

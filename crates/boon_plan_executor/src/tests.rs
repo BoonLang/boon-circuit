@@ -2,6 +2,113 @@ use super::*;
 use boon_plan::*;
 use std::collections::BTreeMap;
 
+const INDEXED_PREFIX_QUERY_SOURCE: &str = r#"
+store: [
+    change: SOURCE
+    prefix:
+        TEXT { al } |> HOLD prefix {
+            change.text |> THEN { change.text }
+        }
+    catalog: LIST {
+        [id: TEXT { 1 }, name: TEXT { Alpha }]
+        [id: TEXT { 2 }, name: TEXT { Alpine }]
+        [id: TEXT { 3 }, name: TEXT { Beta }]
+    }
+    results:
+        List/query_prefix(
+            catalog
+            field: name
+            prefix: prefix
+            limit: 20
+            normalization: TrimLowercase
+        )
+]
+"#;
+
+const GENERIC_COMPOUND_QUERY_SOURCE: &str = r#"
+store: [
+    catalog: LIST {
+        [id: TEXT { 1 }, city: TEXT { Oslo }, name: TEXT { Alpha }, score: 10, modes: TEXT { rail bus }]
+        [id: TEXT { 2 }, city: TEXT { Oslo }, name: TEXT { Beta }, score: 20, modes: TEXT { rail }]
+        [id: TEXT { 3 }, city: TEXT { Bergen }, name: TEXT { Alpha }, score: 30, modes: TEXT { bus }]
+    }
+    exact_key: [city: TEXT { OSLO }, name: TEXT { alpha }]
+    exact_page:
+        List/query(
+            catalog
+            fields: TEXT { city,name }
+            normalization: TEXT { TrimLowercase,TrimLowercase }
+            select: Exact
+            key: exact_key
+            limit: 2
+            order: Ascending
+            residual: None
+        )
+    mode_keys: [first: TEXT { rail }, second: TEXT { bus }]
+    union_page:
+        List/query(
+            catalog
+            fields: TEXT { modes }
+            normalization: TEXT { Tokens }
+            select: Union
+            keys: mode_keys
+            limit: 10
+            order: Ascending
+            residual: None
+        )
+    intersection_page:
+        List/query(
+            catalog
+            fields: TEXT { modes }
+            normalization: TEXT { Tokens }
+            select: Intersection
+            keys: mode_keys
+            limit: 10
+            order: Ascending
+            residual: None
+        )
+]
+"#;
+
+const GENERIC_QUERY_MUTATION_SOURCE: &str = r#"
+store: [
+    add: SOURCE
+    value_to_add:
+        add.text |> THEN { add.text }
+    catalog:
+        LIST {}
+        |> List/append(item: value_to_add |> THEN {
+            [id: value_to_add, name: value_to_add]
+        })
+    prefix: TEXT { al }
+    page:
+        List/query(
+            catalog
+            fields: TEXT { name }
+            normalization: TEXT { TrimLowercase }
+            select: Prefix
+            prefix: prefix
+            limit: 10
+            order: Ascending
+            residual: None
+        )
+]
+"#;
+
+fn number(value: i64) -> Value {
+    Value::integer(value).unwrap()
+}
+
+fn stored_number(value: i64) -> boon_persistence::StoredValue {
+    boon_persistence::StoredValue::integer(value).unwrap()
+}
+
+fn number_constant(value: i64) -> PlanConstantValue {
+    PlanConstantValue::Number {
+        value: FiniteReal::from_i64_exact(value).unwrap(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan(
     demand: RootOutputDemand,
@@ -96,10 +203,14 @@ fn plan(
     MachinePlan {
         version: PlanVersion::default(),
         target_profile: TargetProfile::SoftwareDefault,
+        program_role: ProgramRole::Document,
         application,
         persistence,
         effects: Vec::new(),
         outputs: Vec::new(),
+        host_ports: Vec::new(),
+        query_collections: Vec::new(),
+        query_indexes: Vec::new(),
         demand: DemandPlan {
             root_derived_outputs: demand,
         },
@@ -184,6 +295,7 @@ fn test_data_type(value_type: PlanValueType) -> DataTypePlan {
         PlanValueType::Enum => DataTypePlan::Variant {
             variants: Vec::new(),
         },
+        PlanValueType::Data => DataTypePlan::Unknown,
         PlanValueType::RootInitialField
         | PlanValueType::RowInitialField
         | PlanValueType::Unknown => DataTypePlan::Unknown,
@@ -299,9 +411,9 @@ fn root_value_comparison_tracks_both_state_inputs() {
         plan(
             RootOutputDemand::All,
             vec![
-                constant(0, PlanConstantValue::Number { value: 3 }),
-                constant(1, PlanConstantValue::Number { value: 3 }),
-                constant(2, PlanConstantValue::Number { value: 4 }),
+                constant(0, number_constant(3)),
+                constant(1, number_constant(3)),
+                constant(2, number_constant(4)),
             ],
             vec![route(0, None)],
             vec![number_slot(0, 0), number_slot(1, 1)],
@@ -332,8 +444,8 @@ fn fully_qualified_state_lookup_wins_over_an_unrelated_field_local_name() {
         plan(
             RootOutputDemand::All,
             vec![
-                constant(0, PlanConstantValue::Number { value: 1 }),
-                constant(1, PlanConstantValue::Number { value: 0 }),
+                constant(0, number_constant(1)),
+                constant(1, number_constant(0)),
             ],
             Vec::new(),
             vec![number_slot(0, 0)],
@@ -356,17 +468,17 @@ fn fully_qualified_state_lookup_wins_over_an_unrelated_field_local_name() {
 
     assert_eq!(
         session.root_value_current("store.draft_revision").unwrap(),
-        Value::Number(1)
+        number(1)
     );
     assert_eq!(
         session.root_value_current("draft_revision").unwrap(),
-        Value::Number(1)
+        number(1)
     );
     assert_eq!(
         session
             .root_value_current("revision.draft_revision")
             .unwrap(),
-        Value::Number(0)
+        number(0)
     );
 }
 
@@ -376,8 +488,8 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         plan(
             RootOutputDemand::Selected(Vec::new()),
             vec![
-                constant(0, PlanConstantValue::Number { value: default }),
-                constant(1, PlanConstantValue::Number { value: 0 }),
+                constant(0, number_constant(default)),
+                constant(1, number_constant(0)),
             ],
             vec![route(0, None)],
             vec![number_slot(0, 0)],
@@ -398,7 +510,7 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         turn.authority_deltas,
         vec![AuthorityDelta::SetRoot {
             state: StateId(0),
-            value: Value::Number(0),
+            value: number(0),
         }]
     );
     let authority = original.authority_snapshot().unwrap();
@@ -420,7 +532,7 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         .unwrap();
     assert_eq!(
         restored.authority_snapshot().unwrap().states[&StateId(0)].value,
-        Value::Number(0)
+        number(0)
     );
 }
 
@@ -429,8 +541,8 @@ fn failed_turn_rolls_back_authority_and_touch_provenance() {
     let machine = plan(
         RootOutputDemand::Selected(Vec::new()),
         vec![
-            constant(0, PlanConstantValue::Number { value: 1 }),
-            constant(1, PlanConstantValue::Number { value: 2 }),
+            constant(0, number_constant(1)),
+            constant(1, number_constant(2)),
         ],
         vec![route(0, None)],
         vec![number_slot(0, 0), number_slot(1, 0)],
@@ -452,8 +564,8 @@ fn unsettled_turn_can_rollback_authority_sequence_and_durable_delta() {
     let machine = plan(
         RootOutputDemand::Selected(Vec::new()),
         vec![
-            constant(0, PlanConstantValue::Number { value: 1 }),
-            constant(1, PlanConstantValue::Number { value: 2 }),
+            constant(0, number_constant(1)),
+            constant(1, number_constant(2)),
         ],
         vec![route(0, None)],
         vec![number_slot(0, 0)],
@@ -1087,7 +1199,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
                         value: "match_const".into(),
                     },
                 ),
-                constant(4, PlanConstantValue::Number { value: 2 }),
+                constant(4, number_constant(2)),
                 constant(
                     5,
                     PlanConstantValue::Text {
@@ -1243,6 +1355,272 @@ fn list_find_uses_typed_index_without_scanning() {
 }
 
 #[test]
+fn compiled_prefix_query_uses_bounded_index_and_tracks_currentness() {
+    let mut compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "indexed-prefix-query.bn",
+        INDEXED_PREFIX_QUERY_SOURCE,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    compiled.plan.demand.root_derived_outputs = RootOutputDemand::All;
+    let source = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.change")
+        .unwrap()
+        .source_id;
+    let results = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.results")
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap();
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    let initial = session
+        .project_current(&[ValueTarget::Field(results)])
+        .unwrap()
+        .remove(&ValueTarget::Field(results))
+        .unwrap();
+    assert!(matches!(initial, Value::List(rows) if rows.len() == 2));
+
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                text: Some("be".into()),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+    assert_eq!(turn.metrics.query_full_scan_count, 0);
+    assert!(turn.metrics.query_index_range_count >= 1);
+    assert_eq!(turn.metrics.query_rows_examined_count, 1);
+    assert_eq!(turn.metrics.query_result_count, 1);
+    let updated = session
+        .project_current(&[ValueTarget::Field(results)])
+        .unwrap()
+        .remove(&ValueTarget::Field(results))
+        .unwrap();
+    assert!(matches!(updated, Value::List(rows) if rows.len() == 1));
+}
+
+#[test]
+fn compiled_compound_query_executes_through_canonical_query_collection() {
+    let mut compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "generic-compound-query.bn",
+        GENERIC_COMPOUND_QUERY_SOURCE,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    compiled.plan.demand.root_derived_outputs = RootOutputDemand::All;
+    let selections = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::ListProjection {
+                projection: PlanListProjection::IndexedQuery { selection, .. },
+            } => Some(selection),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selections
+            .iter()
+            .filter(|selection| matches!(selection, PlanQuerySelection::Union { .. }))
+            .count(),
+        1,
+        "query selections: {selections:#?}"
+    );
+    assert_eq!(
+        selections
+            .iter()
+            .filter(|selection| matches!(selection, PlanQuerySelection::Intersection { .. }))
+            .count(),
+        1,
+        "query selections: {selections:#?}"
+    );
+    let page = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.exact_page")
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap();
+    let union_page = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.union_page")
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap();
+    let intersection_page = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.intersection_page")
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap();
+    let mode_keys = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.mode_keys")
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap();
+    let mode_index = compiled
+        .plan
+        .query_indexes
+        .iter()
+        .find(|index| {
+            index
+                .fields
+                .iter()
+                .any(|field| field.normalization == boon_plan::QueryTextNormalization::Tokens)
+        })
+        .unwrap()
+        .clone();
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mode_values = session
+        .list_row_snapshots(mode_index.source_list)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.fields[&mode_index.fields[0].field].clone())
+        .collect::<Vec<_>>();
+    assert!(
+        mode_values
+            .iter()
+            .any(|value| value == &Value::Text("rail bus".to_owned())),
+        "multi-value row authority: {mode_values:#?}"
+    );
+    let mut projected = session
+        .project_current(&[
+            ValueTarget::Field(page),
+            ValueTarget::Field(union_page),
+            ValueTarget::Field(intersection_page),
+            ValueTarget::Field(mode_keys),
+        ])
+        .unwrap();
+    assert_eq!(
+        projected.remove(&ValueTarget::Field(mode_keys)),
+        Some(Value::Record(BTreeMap::from([
+            ("first".to_owned(), Value::Text("rail".to_owned())),
+            ("second".to_owned(), Value::Text("bus".to_owned())),
+        ])))
+    );
+    let value = projected.remove(&ValueTarget::Field(page)).unwrap();
+    let Value::Record(page) = value else {
+        panic!("indexed query did not return a page record");
+    };
+    assert!(matches!(page.get("rows"), Some(Value::List(rows)) if rows.len() == 1));
+    assert_eq!(page.get("cursor"), Some(&Value::Bytes(Vec::new())));
+    assert!(matches!(
+        projected.remove(&ValueTarget::Field(union_page)),
+        Some(Value::Record(page)) if matches!(page.get("rows"), Some(Value::List(rows)) if rows.len() == 3)
+    ));
+    let intersection = projected.remove(&ValueTarget::Field(intersection_page));
+    assert!(
+        matches!(
+            &intersection,
+            Some(Value::Record(page)) if matches!(page.get("rows"), Some(Value::List(rows)) if rows.len() == 1)
+        ),
+        "unexpected intersection page: {intersection:#?}"
+    );
+}
+
+#[test]
+fn indexed_query_mutation_is_atomic_current_and_never_scans() {
+    let mut compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "generic-query-mutation.bn",
+        GENERIC_QUERY_MUTATION_SOURCE,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    compiled.plan.demand.root_derived_outputs = RootOutputDemand::All;
+    assert!(
+        compiled
+            .plan
+            .debug_map
+            .unresolved_executable_refs
+            .is_empty(),
+        "mutation query has unresolved refs: {:?}",
+        compiled.plan.debug_map.unresolved_executable_refs
+    );
+    let source = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.add")
+        .unwrap()
+        .source_id;
+    let page = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|entry| entry.label == "store.page")
+        .and_then(|entry| entry.id.strip_prefix("field:"))
+        .and_then(|id| id.parse::<usize>().ok())
+        .map(FieldId)
+        .unwrap();
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    let initial = session
+        .project_current(&[ValueTarget::Field(page)])
+        .unwrap()
+        .remove(&ValueTarget::Field(page))
+        .unwrap();
+    assert!(matches!(
+        initial,
+        Value::Record(page) if matches!(page.get("rows"), Some(Value::List(rows)) if rows.is_empty())
+    ));
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                text: Some("Alpine".to_owned()),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+    assert_eq!(turn.metrics.query_full_scan_count, 0);
+    assert_eq!(turn.metrics.query_selected_indexes.len(), 1);
+    assert!(turn.metrics.query_index_key_count <= 1);
+    assert!(turn.metrics.query_rows_examined_count <= 1);
+    let updated = session
+        .project_current(&[ValueTarget::Field(page)])
+        .unwrap()
+        .remove(&ValueTarget::Field(page))
+        .unwrap();
+    assert!(matches!(
+        updated,
+        Value::Record(page) if matches!(page.get("rows"), Some(Value::List(rows)) if rows.len() == 1)
+    ));
+}
+
+#[test]
 fn list_map_records_preserve_source_row_identity() {
     let list = ListStorageSlot {
         id: PlanStorageId(1),
@@ -1327,8 +1705,8 @@ fn selected_demand_stays_current_without_eager_unrequested_work() {
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
             vec![
-                constant(0, PlanConstantValue::Number { value: 1 }),
-                constant(1, PlanConstantValue::Number { value: 2 }),
+                constant(0, number_constant(1)),
+                constant(1, number_constant(2)),
             ],
             vec![route(0, None)],
             vec![number_slot(0, 0)],
@@ -1345,7 +1723,7 @@ fn selected_demand_stays_current_without_eager_unrequested_work() {
         session
             .project_current(&[ValueTarget::Field(FieldId(0))])
             .unwrap()[&ValueTarget::Field(FieldId(0))],
-        Value::Number(1)
+        number(1)
     );
     assert_eq!(
         session
@@ -1356,10 +1734,7 @@ fn selected_demand_stays_current_without_eager_unrequested_work() {
 
     let turn = session.apply(event(1, 0, None)).unwrap();
     assert_eq!(turn.metrics.recomputed_field_count, 1);
-    assert_eq!(
-        session.snapshot().unwrap().fields[&FieldId(0)],
-        Value::Number(2)
-    );
+    assert_eq!(session.snapshot().unwrap().fields[&FieldId(0)], number(2));
 }
 
 #[test]
@@ -1367,7 +1742,7 @@ fn deterministic_work_budget_bounds_startup_without_affecting_unbounded_sessions
     let make_plan = || {
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
-            vec![constant(0, PlanConstantValue::Number { value: 1 })],
+            vec![constant(0, number_constant(1))],
             Vec::new(),
             vec![number_slot(0, 0)],
             Vec::new(),
@@ -1425,7 +1800,7 @@ fn source_turn_work_budget_rolls_back_authority_and_current_outputs() {
     let mut session = Session::new(
         plan(
             RootOutputDemand::Selected(vec![FieldId(1)]),
-            vec![constant(0, PlanConstantValue::Number { value: 1 })],
+            vec![constant(0, number_constant(1))],
             vec![route(0, None)],
             vec![number_slot(0, 0), number_slot(1, 0)],
             Vec::new(),
@@ -1707,8 +2082,8 @@ fn reverse_dependencies_recompute_every_dependent_once() {
         plan(
             RootOutputDemand::All,
             vec![
-                constant(0, PlanConstantValue::Number { value: 0 }),
-                constant(1, PlanConstantValue::Number { value: 1 }),
+                constant(0, number_constant(0)),
+                constant(1, number_constant(1)),
             ],
             vec![route(0, None)],
             vec![number_slot(0, 0)],
@@ -1749,9 +2124,9 @@ fn same_turn_recompute_does_not_suppress_later_invalidation() {
         plan(
             RootOutputDemand::All,
             vec![
-                constant(0, PlanConstantValue::Number { value: 0 }),
-                constant(1, PlanConstantValue::Number { value: 1 }),
-                constant(2, PlanConstantValue::Number { value: 2 }),
+                constant(0, number_constant(0)),
+                constant(1, number_constant(1)),
+                constant(2, number_constant(2)),
             ],
             vec![route(0, None)],
             vec![number_slot(0, 0), number_slot(1, 0)],
@@ -1788,10 +2163,7 @@ fn same_turn_recompute_does_not_suppress_later_invalidation() {
 
     session.apply(event(1, 0, None)).unwrap();
 
-    assert_eq!(
-        session.snapshot().unwrap().states[&StateId(1)],
-        Value::Number(2)
-    );
+    assert_eq!(session.snapshot().unwrap().states[&StateId(1)], number(2));
 }
 
 #[test]
@@ -2164,13 +2536,13 @@ fn durable_variants_round_trip_tag_only_and_structured_values() {
 
     let runtime = Value::Record(BTreeMap::from([
         ("$tag".to_owned(), Value::Text("Ready".to_owned())),
-        ("count".to_owned(), Value::Number(4)),
+        ("count".to_owned(), number(4)),
     ]));
     let stored = crate::session::stored_value(&runtime).unwrap();
     assert!(matches!(
         &stored,
         boon_persistence::StoredValue::Variant { tag, fields }
-            if tag == "Ready" && fields["count"] == boon_persistence::StoredValue::Number(4)
+            if tag == "Ready" && fields["count"] == stored_number(4)
     ));
     assert_eq!(crate::session::runtime_value(stored).unwrap(), runtime);
 }
@@ -2203,13 +2575,13 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
         session.output_value_current("api_response").unwrap(),
         Value::Record(BTreeMap::from([
             ("body".to_owned(), Value::Text("accepted".to_owned())),
-            ("request_count".to_owned(), Value::Number(0)),
-            ("status".to_owned(), Value::Number(200)),
+            ("request_count".to_owned(), number(0)),
+            ("status".to_owned(), number(200)),
         ]))
     );
     assert_eq!(
         session.output_value_current("pending_priorities").unwrap(),
-        Value::List(vec![Value::Number(1), Value::Number(2)])
+        Value::List(vec![number(1), number(2)])
     );
 
     let turn = session
@@ -2230,7 +2602,212 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
     let Value::Record(response) = session.output_value_current("api_response").unwrap() else {
         panic!("response output must remain a record");
     };
-    assert_eq!(response["request_count"], Value::Number(1));
+    assert_eq!(response["request_count"], number(1));
+}
+
+#[test]
+fn recursive_http_source_payload_executes_list_get_and_current_response() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "server-http-echo.bn",
+        include_str!("../../../examples/server_http_echo.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    let source = source_id(&compiled.plan, "store.request");
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([
+                    ("method".to_owned(), Value::Text("GET".to_owned())),
+                    (
+                        "path_segments".to_owned(),
+                        Value::List(vec![
+                            Value::Text("health".to_owned()),
+                            Value::Text("detail".to_owned()),
+                        ]),
+                    ),
+                ]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+
+    assert_eq!(
+        session.output_value_current("response").unwrap(),
+        Value::Record(BTreeMap::from([
+            ("body".to_owned(), Value::Text("GET:health".to_owned())),
+            ("status".to_owned(), number(200)),
+        ]))
+    );
+}
+
+#[test]
+fn fjordpulse_server_routes_one_structural_http_source_to_one_response() {
+    let compiled = boon_compiler::compile_source_path_to_machine_plan(
+        std::path::Path::new("examples/fjordpulse/Server/RUN.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    let source = source_id(&compiled.plan, "store.http_request");
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([
+                    ("method".to_owned(), Value::Text("GET".to_owned())),
+                    ("path".to_owned(), Value::Text("/api/health".to_owned())),
+                    (
+                        "path_segments".to_owned(),
+                        Value::List(vec![
+                            Value::Text("api".to_owned()),
+                            Value::Text("health".to_owned()),
+                        ]),
+                    ),
+                    ("query".to_owned(), Value::List(Vec::new())),
+                ]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+
+    let Value::Record(response) = session.output_value_current("http_response").unwrap() else {
+        panic!("FjordPulse HTTP output must be a record");
+    };
+    assert_eq!(response["status"], number(200));
+    let Value::Record(body) = &response["body"] else {
+        panic!("FjordPulse HTTP body must remain structural until the host JSON boundary");
+    };
+    assert_eq!(body["ok"], Value::Bool(true));
+    assert_eq!(body["route"], Value::Text("/api/health".to_owned()));
+    assert_eq!(body["request_count"], number(1));
+
+    session
+        .apply(SourceEvent {
+            sequence: 2,
+            source,
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([
+                    ("method".to_owned(), Value::Text("GET".to_owned())),
+                    ("path".to_owned(), Value::Text("/api/search".to_owned())),
+                    (
+                        "path_segments".to_owned(),
+                        Value::List(vec![
+                            Value::Text("api".to_owned()),
+                            Value::Text("search".to_owned()),
+                        ]),
+                    ),
+                    (
+                        "query".to_owned(),
+                        Value::List(vec![Value::Record(BTreeMap::from([
+                            ("name".to_owned(), Value::Text("q".to_owned())),
+                            ("value".to_owned(), Value::Text("ber".to_owned())),
+                        ]))]),
+                    ),
+                ]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+    let Value::Record(search) = session.output_value_current("search_results").unwrap() else {
+        panic!("FjordPulse search output must be a record");
+    };
+    let Value::List(matches) = &search["data"] else {
+        panic!("FjordPulse search data must be a list");
+    };
+    let [Value::Record(station)] = matches.as_slice() else {
+        panic!("indexed prefix search must return exactly one station DTO: {matches:?}");
+    };
+    assert_eq!(station["name"], Value::Text("Bergen stasjon".to_owned()));
+}
+
+#[test]
+fn decimal_numbers_execute_arithmetic_and_host_output_without_integer_coercion() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "real-arithmetic.bn",
+        r#"
+store: [
+    tick: SOURCE
+    half: 1 / 2
+    floor: 1.9 |> Number/floor()
+    ceil: -1.9 |> Number/ceil()
+    round: -1.5 |> Number/round()
+    truncate: -1.9 |> Number/truncate()
+    latitude:
+        59.91 |> HOLD latitude {
+            LATEST {
+                store.tick |> THEN { latitude + 0.1 }
+            }
+        }
+]
+
+outputs: [
+    latitude: store.latitude
+    half: store.half
+    floor: store.floor
+    ceil: store.ceil
+    round: store.round
+    truncate: store.truncate
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let source = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.tick")
+        .unwrap()
+        .source_id;
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    assert_eq!(
+        session.output_value_current("half").unwrap(),
+        Value::Number(FiniteReal::new(0.5).unwrap())
+    );
+    assert_eq!(session.output_value_current("floor").unwrap(), number(1));
+    assert_eq!(session.output_value_current("ceil").unwrap(), number(-1));
+    assert_eq!(session.output_value_current("round").unwrap(), number(-2));
+    assert_eq!(
+        session.output_value_current("truncate").unwrap(),
+        number(-1)
+    );
+
+    let Value::Number(initial) = session.output_value_current("latitude").unwrap() else {
+        panic!("decimal output must remain a real number");
+    };
+    assert!((initial.get() - 59.91).abs() < 1e-12);
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    let Value::Number(updated) = session.output_value_current("latitude").unwrap() else {
+        panic!("decimal arithmetic must produce a real number");
+    };
+    assert!((updated.get() - 60.01).abs() < 1e-12);
+}
+
+#[test]
+fn whole_and_decimal_numbers_share_one_value_identity() {
+    let whole = Value::Number(FiniteReal::from_i64_exact(1).unwrap());
+    let decimal = Value::Number(FiniteReal::new(1.0).unwrap());
+    assert_eq!(whole, decimal);
 }
 
 #[test]
@@ -2269,7 +2846,7 @@ store: [
 
     assert_eq!(
         session.root_value_current("store.value").unwrap(),
-        Value::Number(42)
+        number(42)
     );
 }
 
@@ -2395,6 +2972,184 @@ effects: [
     )
     .unwrap()
     .plan
+}
+
+fn outbound_http_effect_machine() -> MachinePlan {
+    boon_compiler::compile_source_path_to_machine_plan(
+        std::path::Path::new("examples/outbound_http_effect.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan
+}
+
+fn outbound_http_payload() -> SourcePayload {
+    SourcePayload {
+        fields: BTreeMap::from([
+            ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
+            ("method".to_owned(), Value::Text("Get".to_owned())),
+            (
+                "path_segments".to_owned(),
+                Value::List(vec![
+                    Value::Text("v1".to_owned()),
+                    Value::Text("items".to_owned()),
+                ]),
+            ),
+            (
+                "query".to_owned(),
+                Value::List(vec![Value::Record(BTreeMap::from([
+                    ("name".to_owned(), Value::Text("limit".to_owned())),
+                    ("value".to_owned(), Value::Text("10".to_owned())),
+                ]))]),
+            ),
+            (
+                "headers".to_owned(),
+                Value::List(vec![Value::Record(BTreeMap::from([
+                    ("name".to_owned(), Value::Text("accept".to_owned())),
+                    (
+                        "value".to_owned(),
+                        Value::Bytes(b"application/json".to_vec()),
+                    ),
+                ]))]),
+            ),
+            ("body".to_owned(), Value::Bytes(Vec::new())),
+            ("connect_timeout_ms".to_owned(), number(500)),
+            ("overall_timeout_ms".to_owned(), number(2_000)),
+            (
+                "cancellation".to_owned(),
+                Value::Text("CancelPrevious".to_owned()),
+            ),
+        ]),
+        ..SourcePayload::default()
+    }
+}
+
+fn outbound_http_success(status: i64) -> Value {
+    Value::Record(BTreeMap::from([
+        ("$tag".to_owned(), Value::Text("HttpSucceeded".to_owned())),
+        ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
+        ("status".to_owned(), number(status)),
+        (
+            "headers".to_owned(),
+            Value::List(vec![Value::Record(BTreeMap::from([
+                ("name".to_owned(), Value::Text("content-type".to_owned())),
+                (
+                    "value".to_owned(),
+                    Value::Bytes(b"application/json".to_vec()),
+                ),
+            ]))]),
+        ),
+        ("body".to_owned(), Value::Bytes(br#"{"ok":true}"#.to_vec())),
+        ("redirects_followed".to_owned(), number(0)),
+    ]))
+}
+
+#[test]
+fn read_only_http_effect_is_transient_typed_correlated_and_cycle_safe() {
+    let machine = outbound_http_effect_machine();
+    let contract = machine
+        .effects
+        .iter()
+        .find(|contract| contract.host_operation == "Http/request")
+        .unwrap();
+    assert_eq!(contract.replay, EffectReplay::ReadOnly);
+    assert_eq!(contract.barrier, EffectBarrier::None);
+    assert!(machine.persistence.effect_outbox.is_empty());
+
+    let request = source_id(&machine, "store.request");
+    let mut session = Session::new(machine.clone(), SessionOptions::default()).unwrap();
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: request,
+            target: None,
+            payload: outbound_http_payload(),
+        })
+        .unwrap();
+    assert!(turn.outbox_changes.is_empty());
+    let [invocation] = turn.transient_effects.as_slice() else {
+        panic!("HTTP request must emit exactly one transient effect");
+    };
+    assert_eq!(invocation.effect_id, contract.effect_id);
+    assert_eq!(invocation.trigger_source_sequence, 1);
+    assert!(matches!(
+        &invocation.intent,
+        Value::Record(fields)
+            if matches!(fields.get("path_segments"), Some(Value::List(values)) if values.len() == 2)
+    ));
+    assert_eq!(session.pending_transient_effect_count(), 1);
+
+    let completion = session
+        .complete_transient_effect(invocation.call_id, outbound_http_success(201))
+        .unwrap();
+    assert!(completion.outbox_changes.is_empty());
+    assert!(completion.transient_effects.is_empty());
+    assert_eq!(
+        session.root_value_current("store.last_status").unwrap(),
+        number(201)
+    );
+    assert_eq!(session.pending_transient_effect_count(), 0);
+    assert!(
+        session
+            .complete_transient_effect(invocation.call_id, outbound_http_success(202))
+            .is_err()
+    );
+
+    let stale = Session::new(machine, SessionOptions::default())
+        .unwrap()
+        .complete_transient_effect(invocation.call_id, outbound_http_success(200));
+    assert!(
+        matches!(stale, Err(Error::InvalidEvent(detail)) if detail.contains("different session launch"))
+    );
+}
+
+#[test]
+fn transient_http_cancel_and_rollback_preserve_one_shot_ownership() {
+    let machine = outbound_http_effect_machine();
+    let request = source_id(&machine, "store.request");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+
+    let first = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: request,
+            target: None,
+            payload: outbound_http_payload(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    assert!(session.cancel_transient_effect(first.call_id).unwrap());
+    assert!(!session.cancel_transient_effect(first.call_id).unwrap());
+    assert!(
+        session
+            .complete_transient_effect(first.call_id, outbound_http_success(200))
+            .is_err()
+    );
+
+    let second = session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: request,
+            target: None,
+            payload: outbound_http_payload(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    session
+        .complete_transient_effect(second.call_id, outbound_http_success(204))
+        .unwrap();
+    assert_eq!(session.pending_transient_effect_count(), 0);
+    session.rollback_unsettled_turn().unwrap();
+    assert_eq!(session.pending_transient_effect_count(), 1);
+    assert_eq!(
+        session.root_value_current("store.last_status").unwrap(),
+        number(0)
+    );
+    session
+        .complete_transient_effect(second.call_id, outbound_http_success(205))
+        .unwrap();
 }
 
 fn source_id(machine: &MachinePlan, path: &str) -> SourceId {
@@ -2846,7 +3601,7 @@ store: [
         .unwrap();
     let authority = session.authority_snapshot().unwrap();
     assert_eq!(authority.states.len(), 1);
-    assert_eq!(authority.states[&count].value, Value::Number(1));
+    assert_eq!(authority.states[&count].value, number(1));
     assert!(authority.states[&count].touched);
 
     let mut restored = SessionBuilder::new(machine, SessionOptions::default())
@@ -2856,7 +3611,7 @@ store: [
         .unwrap();
     assert_eq!(
         restored.root_value_current("store.count").unwrap(),
-        Value::Number(1)
+        number(1)
     );
 }
 

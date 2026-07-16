@@ -1,11 +1,17 @@
 pub use boon_document_model::{
     Axis, ChangeBatch, DocumentFrame, DocumentNode, DocumentNodeId, DocumentNodeKind,
-    DocumentPatch, EmbeddedProgramDescriptor, LayoutStylePatch, MaterialStylePatch,
-    MaterializedRange, PaintStylePatch, ProgramCapabilityProfile, Rect,
-    SENSITIVE_INPUT_REDACTED_GLYPHS, SENSITIVE_INPUT_REDACTED_VALUE, SENSITIVE_INPUT_STYLE_KEY,
-    ScrollRootId, ScrollState, SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch,
-    StyleRichTextSpan, StyleValue, TextInputFocusRequest, TextInputId, TextStylePatch, TextValue,
-    UiSemanticChange,
+    DocumentPatch, EmbeddedProgramDescriptor, LayoutStylePatch, MapCamera, MapCoordinate,
+    MapHitIdentity, MapInteractionPolicy, MapOverlayDescriptor, MapOverlayGeometry, MapOverlayId,
+    MapOverlayPaint, MapOverlayPatchSet, MapScreenPoint, MapScreenRect, MapTileCacheKey,
+    MapTileRequestIdentity, MapTileResultFreshness, MapTileScaleKey, MapTileScreenQuad,
+    MapTileSourceId, MapTileSourceRef, MapViewportBounds, MapViewportDescriptor,
+    MapViewportDescriptorPatch, MapViewportError, MapViewportGeneration, MapViewportInput,
+    MapVisibleTile, MaterialStylePatch, MaterializedRange, PaintStylePatch,
+    ProgramCapabilityProfile, Rect, SENSITIVE_INPUT_REDACTED_GLYPHS,
+    SENSITIVE_INPUT_REDACTED_VALUE, SENSITIVE_INPUT_STYLE_KEY, ScrollRootId, ScrollState,
+    SourceBindingId, StyleEditorTypeHint, StyleMap, StylePatch, StyleRichTextSpan, StyleValue,
+    TextInputFocusRequest, TextInputId, TextStylePatch, TextValue, UiSemanticChange,
+    project_to_map_viewport, unproject_from_map_viewport,
 };
 pub mod render_scene;
 pub mod source_actions;
@@ -16,11 +22,12 @@ pub use boon_host::{
     SemanticState, SemanticValue,
 };
 pub use render_scene::{
-    RenderFontStyle, RenderFontWeight, RenderQuadBatch, RenderRichTextSpan, RenderScene,
-    RenderSceneItem, RenderSceneMetrics, RenderScenePaintPatch, RenderScenePatch,
-    RenderScenePatchOperation, RenderScenePatchReport, RenderTextAlign, RenderTextPlacementKey,
-    RenderTextRun, RenderTextShapeKey, RenderTextVerticalAlign, RenderTextureRef,
-    RenderVisualPrimitive, RenderVisualPrimitiveKind, RetainedRenderChunkDescriptor,
+    RenderFontStyle, RenderFontWeight, RenderMapHitRegion, RenderMapHitShape, RenderMapViewport,
+    RenderQuadBatch, RenderRichTextSpan, RenderScene, RenderSceneItem, RenderSceneMetrics,
+    RenderScenePaintPatch, RenderScenePatch, RenderScenePatchOperation, RenderScenePatchReport,
+    RenderTextAlign, RenderTextPlacementKey, RenderTextRun, RenderTextShapeKey,
+    RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive, RenderVisualPrimitiveKind,
+    RetainedRenderChunkDescriptor,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -148,6 +155,8 @@ pub struct LayoutFrame {
 pub struct DisplayItem {
     pub node: DocumentNodeId,
     pub kind: DocumentNodeKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_viewport: Option<Box<MapViewportDescriptor>>,
     pub bounds: Rect,
     pub text: Option<String>,
     pub style_identity: ComputedStyleIdentity,
@@ -642,7 +651,9 @@ fn semantic_node_from_document_node(
 fn semantic_role_for_document_kind(kind: &DocumentNodeKind) -> SemanticRole {
     match kind {
         DocumentNodeKind::Root => SemanticRole::Application,
-        DocumentNodeKind::Stack | DocumentNodeKind::EmbeddedProgram => SemanticRole::Group,
+        DocumentNodeKind::Stack
+        | DocumentNodeKind::EmbeddedProgram
+        | DocumentNodeKind::MapViewport => SemanticRole::Group,
         DocumentNodeKind::Row => SemanticRole::Row,
         DocumentNodeKind::Text => SemanticRole::Text,
         DocumentNodeKind::Button => SemanticRole::Button,
@@ -1832,6 +1843,11 @@ pub enum PatchApplyError {
     SensitiveTextOwnedByHost {
         id: DocumentNodeId,
     },
+    InvalidMapViewport {
+        id: DocumentNodeId,
+        path: String,
+        message: String,
+    },
     UnsupportedTrustedNonstructuralPatch {
         patch_kind: &'static str,
     },
@@ -1894,6 +1910,9 @@ impl fmt::Display for PatchApplyError {
                 "sensitive text input `{}` must keep its editable value in the host-owned buffer",
                 id.0
             ),
+            Self::InvalidMapViewport { id, path, message } => {
+                write!(f, "map viewport `{}` {path}: {message}", id.0)
+            }
             Self::UnsupportedTrustedNonstructuralPatch { patch_kind } => write!(
                 f,
                 "{patch_kind} cannot be applied through trusted nonstructural document patching"
@@ -3079,7 +3098,7 @@ impl DocumentState {
         batch: DocumentChangeBatch,
     ) -> Result<(DocumentFrame, DocumentChangeSet), PatchApplyError> {
         for patch in &batch.patches {
-            if let Some(patch_kind) = document_patch_structural_kind(patch) {
+            if let Some(patch_kind) = document_patch_structural_kind(&frame, patch) {
                 return Err(PatchApplyError::UnsupportedTrustedNonstructuralPatch { patch_kind });
             }
         }
@@ -3133,6 +3152,7 @@ pub fn diff_document_frames(previous: &DocumentFrame, next: &DocumentFrame) -> V
         if previous_node.kind != next_node.kind
             || previous_node.parent != next_node.parent
             || previous_node.materialized != next_node.materialized
+            || previous_node.map_viewport != next_node.map_viewport
         {
             patches.push(DocumentPatch::UpsertNode(next_node.clone()));
             continue;
@@ -3352,7 +3372,7 @@ impl RetainedDocument {
         }
         let structural = patches
             .iter()
-            .any(|patch| document_patch_structural_kind(patch).is_some());
+            .any(|patch| document_patch_structural_kind(self.document.frame(), patch).is_some());
         let geometry_stable = !structural
             && patches
                 .iter()
@@ -3375,6 +3395,17 @@ impl RetainedDocument {
             .collect::<Vec<_>>();
         let hit_metadata_nodes = patch_hit_metadata_nodes(&patches);
         let render_nodes = patch_render_nodes(&patches);
+        let retained_map_nodes = patches
+            .iter()
+            .filter_map(|patch| match patch {
+                DocumentPatch::UpsertNode(node)
+                    if map_viewport_only_upsert(self.document.frame(), node) =>
+                {
+                    Some(node.id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         let batch = DocumentChangeBatch { patches };
 
         if structural {
@@ -3449,6 +3480,7 @@ impl RetainedDocument {
         }
         refresh_scroll_demands(self.document.frame(), &mut self.layout);
         self.refresh_display_nodes(&changed_nodes);
+        let map_rendered = self.patch_retained_map_nodes(&retained_map_nodes)?;
         if !hit_metadata_nodes.is_empty() {
             self.hits.update_node_metadata(
                 self.document.frame(),
@@ -3457,7 +3489,8 @@ impl RetainedDocument {
                 &hit_metadata_nodes,
             )?;
         }
-        let rendered = self.replace_scene_nodes(&render_nodes, columns)? || translated;
+        let rendered =
+            self.replace_scene_nodes(&render_nodes, columns)? || translated || map_rendered;
         self.retained_patch_count = self.retained_patch_count.saturating_add(1);
         if rendered {
             self.render_revision = self.render_revision.saturating_add(1);
@@ -3629,6 +3662,12 @@ impl RetainedDocument {
                 .collect::<StyleMap>();
             let focused = self.focused.as_ref() == Some(&item.node);
             item.kind = node.kind.clone();
+            item.map_viewport = node.map_viewport.as_deref().map(|descriptor| {
+                let mut descriptor = descriptor.clone();
+                descriptor.bounds.width = f64::from(item.bounds.width);
+                descriptor.bounds.height = f64::from(item.bounds.height);
+                Box::new(descriptor)
+            });
             item.text = node.presentation_text(focused);
             item.style = node.artifact_style().into_owned();
             item.style.extend(clip);
@@ -3683,8 +3722,71 @@ impl RetainedDocument {
             }],
         })?;
         self.scene.metrics.visible_source_item_count = self.scene.items.len() as u32;
-        self.scene.metrics.visual_primitive_count = self.scene.visual_primitives.len() as u32;
-        self.scene.metrics.rendered_rect_count = self.scene.visual_primitives.len() as u32;
+        let map_primitives = self
+            .scene
+            .map_viewports
+            .iter()
+            .map(|map| map.overlay_primitives.len())
+            .sum::<usize>();
+        self.scene.metrics.visual_primitive_count =
+            self.scene
+                .visual_primitives
+                .len()
+                .saturating_add(map_primitives) as u32;
+        self.scene.metrics.rendered_rect_count = self.scene.metrics.visual_primitive_count;
+        Ok(true)
+    }
+
+    fn patch_retained_map_nodes(
+        &mut self,
+        changed: &BTreeSet<DocumentNodeId>,
+    ) -> Result<bool, PatchApplyError> {
+        if changed.is_empty() {
+            return Ok(false);
+        }
+        let mut operations = Vec::new();
+        for node in changed {
+            let Some(next) = self
+                .layout
+                .display_list
+                .iter()
+                .find(|item| item.node == *node)
+                .and_then(|item| item.map_viewport.as_deref())
+            else {
+                continue;
+            };
+            let Some(previous) = self
+                .scene
+                .map_viewports
+                .iter()
+                .find(|map| map.node == *node)
+            else {
+                continue;
+            };
+            let patch = previous
+                .descriptor
+                .retained_patch_to(next)
+                .map_err(|error| PatchApplyError::InvalidMapViewport {
+                    id: node.clone(),
+                    path: error.path,
+                    message: error.message,
+                })?;
+            if patch.is_empty() {
+                continue;
+            }
+            operations.push(RenderScenePatchOperation::MapViewport {
+                node: node.clone(),
+                patch: Box::new(patch),
+                retained_chunk_id: format!(
+                    "{}:map-generation:{}",
+                    previous.retained_chunk_id, next.generation.0
+                ),
+            });
+        }
+        if operations.is_empty() {
+            return Ok(false);
+        }
+        self.scene.apply_patch(&RenderScenePatch { operations })?;
         Ok(true)
     }
 }
@@ -4190,6 +4292,7 @@ fn patch_preserves_layout_geometry(frame: &DocumentFrame, patch: &DocumentPatch)
                 )
         }),
         DocumentPatch::SetScroll { .. } => true,
+        DocumentPatch::UpsertNode(node) if map_viewport_only_upsert(frame, node) => true,
         DocumentPatch::SetListMaterialization { .. }
         | DocumentPatch::UpsertNode(_)
         | DocumentPatch::RemoveNode { .. }
@@ -4222,6 +4325,21 @@ fn patch_render_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
             | DocumentPatch::SetListMaterialization { .. } => None,
         })
         .collect()
+}
+
+fn map_viewport_only_upsert(frame: &DocumentFrame, next: &DocumentNode) -> bool {
+    let Some(previous) = frame.nodes.get(&next.id) else {
+        return false;
+    };
+    if previous.kind != DocumentNodeKind::MapViewport
+        || next.kind != DocumentNodeKind::MapViewport
+        || previous.map_viewport == next.map_viewport
+    {
+        return false;
+    }
+    let mut normalized = previous.clone();
+    normalized.map_viewport = next.map_viewport.clone();
+    normalized == *next
 }
 
 fn patch_hit_metadata_nodes(patches: &[DocumentPatch]) -> BTreeSet<DocumentNodeId> {
@@ -4332,8 +4450,12 @@ fn apply_typed_style_patch_unchecked(
     })
 }
 
-fn document_patch_structural_kind(patch: &DocumentPatch) -> Option<&'static str> {
+fn document_patch_structural_kind(
+    frame: &DocumentFrame,
+    patch: &DocumentPatch,
+) -> Option<&'static str> {
     match patch {
+        DocumentPatch::UpsertNode(node) if map_viewport_only_upsert(frame, node) => None,
         DocumentPatch::UpsertNode(_) => Some("upsert_node"),
         DocumentPatch::RemoveNode { .. } => Some("remove_node"),
         DocumentPatch::InsertChild { .. } => Some("insert_child"),
@@ -4354,7 +4476,7 @@ fn verify_nonstructural_patch(
     frame: &DocumentFrame,
     patch: &DocumentPatch,
 ) -> Result<(), PatchApplyError> {
-    if let Some(patch_kind) = document_patch_structural_kind(patch) {
+    if let Some(patch_kind) = document_patch_structural_kind(frame, patch) {
         return Err(PatchApplyError::UnsupportedTrustedNonstructuralPatch { patch_kind });
     }
     let (patch_kind, id) = match patch {
@@ -4384,6 +4506,7 @@ fn verify_nonstructural_patch(
         DocumentPatch::SetTextInputFocus { id, .. } => ("set_text_input_focus", id),
         DocumentPatch::SetScroll { id, .. } => ("set_scroll", id),
         DocumentPatch::SetListMaterialization { id, .. } => ("set_list_materialization", id),
+        DocumentPatch::UpsertNode(node) if map_viewport_only_upsert(frame, node) => return Ok(()),
         DocumentPatch::UpsertNode(_)
         | DocumentPatch::RemoveNode { .. }
         | DocumentPatch::InsertChild { .. }
@@ -4407,19 +4530,31 @@ fn apply_document_patch_unchecked(
     match patch {
         DocumentPatch::UpsertNode(node) => {
             let target = node.id.clone();
+            let retained_map_only = map_viewport_only_upsert(frame, &node);
             apply_upsert_node(frame, node)?;
             Ok(PatchApplyReport {
-                patch_kind: "upsert_node",
+                patch_kind: if retained_map_only {
+                    "set_map_viewport"
+                } else {
+                    "upsert_node"
+                },
                 target: Some(target),
-                invalidation: vec![
-                    PatchInvalidationClass::Structure,
-                    PatchInvalidationClass::ListStructure,
-                    PatchInvalidationClass::ConditionalStructure,
-                    PatchInvalidationClass::Layout,
-                    PatchInvalidationClass::LayoutOnly,
-                    PatchInvalidationClass::HitRegion,
-                    PatchInvalidationClass::FullDocument,
-                ],
+                invalidation: if retained_map_only {
+                    vec![
+                        PatchInvalidationClass::PaintOnly,
+                        PatchInvalidationClass::HitRegion,
+                    ]
+                } else {
+                    vec![
+                        PatchInvalidationClass::Structure,
+                        PatchInvalidationClass::ListStructure,
+                        PatchInvalidationClass::ConditionalStructure,
+                        PatchInvalidationClass::Layout,
+                        PatchInvalidationClass::LayoutOnly,
+                        PatchInvalidationClass::HitRegion,
+                        PatchInvalidationClass::FullDocument,
+                    ]
+                },
                 removed_nodes: Vec::new(),
                 node_count_after: frame.nodes.len(),
                 materialization: None,
@@ -4733,6 +4868,7 @@ fn required_node_mut<'a>(
 
 fn apply_upsert_node(frame: &mut DocumentFrame, node: DocumentNode) -> Result<(), PatchApplyError> {
     validate_sensitive_node_boundary(&node)?;
+    validate_map_viewport_boundary(&node)?;
     let id = node.id.clone();
     if id == frame.root && node.parent.is_some() {
         return Err(PatchApplyError::InvalidParentChildLink {
@@ -5012,6 +5148,7 @@ fn validate_frame_integrity(frame: &DocumentFrame) -> Result<(), PatchApplyError
     }
     for node in frame.nodes.values() {
         validate_sensitive_node_boundary(node)?;
+        validate_map_viewport_boundary(node)?;
         validate_child_refs(frame, node)?;
         if node.id != frame.root {
             let Some(parent) = node.parent.as_ref() else {
@@ -5056,6 +5193,31 @@ fn validate_sensitive_node_boundary(node: &DocumentNode) -> Result<(), PatchAppl
         });
     }
     Ok(())
+}
+
+fn validate_map_viewport_boundary(node: &DocumentNode) -> Result<(), PatchApplyError> {
+    match (&node.kind, node.map_viewport.as_deref()) {
+        (DocumentNodeKind::MapViewport, Some(descriptor)) => {
+            descriptor
+                .validate()
+                .map_err(|error| PatchApplyError::InvalidMapViewport {
+                    id: node.id.clone(),
+                    path: error.path,
+                    message: error.message,
+                })
+        }
+        (DocumentNodeKind::MapViewport, None) => Err(PatchApplyError::InvalidMapViewport {
+            id: node.id.clone(),
+            path: "descriptor".to_owned(),
+            message: "is required for a MapViewport node".to_owned(),
+        }),
+        (_, Some(_)) => Err(PatchApplyError::InvalidMapViewport {
+            id: node.id.clone(),
+            path: "descriptor".to_owned(),
+            message: "is only valid on a MapViewport node".to_owned(),
+        }),
+        (_, None) => Ok(()),
+    }
 }
 
 fn validate_parent_chain_reaches_root(
@@ -5635,6 +5797,12 @@ impl LayoutBuilder<'_, '_> {
         self.display_list.push(DisplayItem {
             node: node.id.clone(),
             kind: node.kind.clone(),
+            map_viewport: node.map_viewport.as_deref().map(|descriptor| {
+                let mut descriptor = descriptor.clone();
+                descriptor.bounds.width = f64::from(width);
+                descriptor.bounds.height = f64::from(height);
+                Box::new(descriptor)
+            }),
             bounds: Rect {
                 x: node_x,
                 y,

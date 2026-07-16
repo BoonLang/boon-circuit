@@ -1,7 +1,8 @@
 use crate::{
     ComputedStyleIdentity, DisplayItem, DocumentHotIdTable, DocumentNodeId, DocumentNodeKind,
-    DocumentRetainedLayoutKeyTable, LayoutFrame, PatchApplyError, Rect, ScrollState,
-    StyleEditorTypeHint, StyleMap, StyleRichTextSpan, StyleValue,
+    DocumentRetainedLayoutKeyTable, LayoutFrame, MapHitIdentity, MapOverlayGeometry, MapOverlayId,
+    MapViewportDescriptor, MapViewportDescriptorPatch, MapVisibleTile, PatchApplyError, Rect,
+    ScrollState, StyleEditorTypeHint, StyleMap, StyleRichTextSpan, StyleValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -121,11 +122,118 @@ pub struct RenderScene {
     pub viewport: Rect,
     pub items: Vec<RenderSceneItem>,
     pub visual_primitives: Vec<RenderVisualPrimitive>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub map_viewports: Vec<RenderMapViewport>,
     #[serde(default)]
     pub overlay_visual_primitives: Vec<RenderVisualPrimitive>,
     pub quad_batches: Vec<RenderQuadBatch>,
     pub text_runs: Vec<RenderTextRun>,
     pub metrics: RenderSceneMetrics,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenderMapViewport {
+    pub node: DocumentNodeId,
+    pub retained_chunk_id: String,
+    pub bounds: Rect,
+    pub clip: Option<Rect>,
+    pub descriptor: MapViewportDescriptor,
+    pub visible_tiles: Vec<MapVisibleTile>,
+    pub overlay_primitives: Vec<RenderVisualPrimitive>,
+    pub overlay_text_runs: Vec<RenderTextRun>,
+    pub hit_regions: Vec<RenderMapHitRegion>,
+}
+
+impl RenderMapViewport {
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<&RenderMapHitRegion> {
+        self.hit_regions
+            .iter()
+            .filter(|hit| hit.contains(x, y))
+            .max_by(|left, right| {
+                left.focused
+                    .cmp(&right.focused)
+                    .then_with(|| left.selected.cmp(&right.selected))
+                    .then_with(|| left.z_order.cmp(&right.z_order))
+                    .then_with(|| left.overlay_id.cmp(&right.overlay_id))
+            })
+    }
+
+    pub fn apply_descriptor_patch(
+        &mut self,
+        patch: &MapViewportDescriptorPatch,
+        retained_chunk_id: &str,
+    ) -> Result<(), crate::MapViewportError> {
+        patch.apply_to(&mut self.descriptor)?;
+        self.retained_chunk_id = retained_chunk_id.to_owned();
+        if patch.bounds.is_some() {
+            self.bounds.width = self.descriptor.bounds.width as f32;
+            self.bounds.height = self.descriptor.bounds.height as f32;
+            self.clip = Some(self.bounds);
+        }
+        let refreshed = render_map_viewport_entries(
+            &self.node,
+            retained_chunk_id,
+            self.bounds,
+            self.clip,
+            &self.descriptor,
+        )?;
+        self.visible_tiles = refreshed.visible_tiles;
+        self.overlay_primitives = refreshed.overlay_primitives;
+        self.overlay_text_runs = refreshed.overlay_text_runs;
+        self.hit_regions = refreshed.hit_regions;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RenderMapHitRegion {
+    pub node: DocumentNodeId,
+    pub overlay_id: MapOverlayId,
+    pub hit_identity: MapHitIdentity,
+    pub bounds: Rect,
+    pub z_order: i32,
+    pub selected: bool,
+    pub focused: bool,
+    pub shape: RenderMapHitShape,
+}
+
+impl RenderMapHitRegion {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        if !render_rect_contains(self.bounds, x, y) {
+            return false;
+        }
+        match &self.shape {
+            RenderMapHitShape::Rect => true,
+            RenderMapHitShape::Circle { center, radius } => {
+                let dx = x - center[0];
+                let dy = y - center[1];
+                dx.mul_add(dx, dy * dy) <= radius * radius
+            }
+            RenderMapHitShape::Polyline { points, tolerance } => points
+                .windows(2)
+                .any(|segment| point_segment_distance(x, y, segment[0], segment[1]) <= *tolerance),
+            RenderMapHitShape::Polygon { rings } => rings
+                .iter()
+                .fold(false, |inside, ring| inside ^ point_in_polygon(x, y, ring)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderMapHitShape {
+    Rect,
+    Circle {
+        center: [f32; 2],
+        radius: f32,
+    },
+    Polyline {
+        points: Vec<[f32; 2]>,
+        tolerance: f32,
+    },
+    Polygon {
+        rings: Vec<Vec<[f32; 2]>>,
+    },
 }
 
 impl RenderScene {
@@ -134,6 +242,18 @@ impl RenderScene {
         patch: &RenderScenePatch,
     ) -> Result<RenderScenePatchReport, PatchApplyError> {
         apply_render_scene_patch(self, patch)
+    }
+
+    pub fn map_hit_test(
+        &self,
+        node: &DocumentNodeId,
+        x: f32,
+        y: f32,
+    ) -> Option<&RenderMapHitRegion> {
+        self.map_viewports
+            .iter()
+            .find(|map| map.node == *node)
+            .and_then(|map| map.hit_test(x, y))
     }
 }
 
@@ -176,6 +296,11 @@ pub enum RenderScenePatchOperation {
         nodes: Vec<DocumentNodeId>,
         delta_x: f32,
         delta_y: f32,
+    },
+    MapViewport {
+        node: DocumentNodeId,
+        patch: Box<MapViewportDescriptorPatch>,
+        retained_chunk_id: String,
     },
 }
 
@@ -273,8 +398,57 @@ pub fn apply_render_scene_patch(
                     .patched_text_runs
                     .saturating_add(op_report.patched_text_runs);
             }
+            RenderScenePatchOperation::MapViewport {
+                node,
+                patch,
+                retained_chunk_id,
+            } => {
+                let map = scene
+                    .map_viewports
+                    .iter_mut()
+                    .find(|map| map.node == *node)
+                    .ok_or_else(|| PatchApplyError::StaleReference {
+                        reference_kind: "render_scene_map_viewport",
+                        id: node.clone(),
+                    })?;
+                map.apply_descriptor_patch(patch, retained_chunk_id)
+                    .map_err(|_| PatchApplyError::StaleReference {
+                        reference_kind: "render_scene_map_viewport_patch",
+                        id: node.clone(),
+                    })?;
+                scene
+                    .text_runs
+                    .retain(|run| !map_text_run_belongs_to_node(run, node));
+                scene
+                    .text_runs
+                    .extend(map.overlay_text_runs.iter().cloned());
+                if let Some(item) = scene.items.iter_mut().find(|item| item.node == *node) {
+                    item.retained_chunk_id = retained_chunk_id.clone();
+                    item.bounds = map.bounds;
+                    item.clip = map.clip;
+                    item.transform[4] = map.bounds.x;
+                    item.transform[5] = map.bounds.y;
+                }
+                report.patched_items = report.patched_items.saturating_add(1);
+                report.patched_primitives = report
+                    .patched_primitives
+                    .saturating_add(map.overlay_primitives.len());
+                report.patched_text_runs = report
+                    .patched_text_runs
+                    .saturating_add(map.overlay_text_runs.len());
+                scene.quad_batches.clear();
+            }
         }
     }
+    scene.metrics.visible_source_item_count = scene.items.len() as u32;
+    let map_primitives = scene
+        .map_viewports
+        .iter()
+        .map(|map| map.overlay_primitives.len())
+        .sum::<usize>();
+    scene.metrics.visual_primitive_count =
+        scene.visual_primitives.len().saturating_add(map_primitives) as u32;
+    scene.metrics.rendered_rect_count = scene.metrics.visual_primitive_count;
     Ok(report)
 }
 
@@ -306,6 +480,33 @@ fn apply_render_scene_translate_node_entries_patch(
         if node_set.contains(&text_run.owner_node) {
             translate_rect(&mut text_run.bounds, delta_x, delta_y);
             report.patched_text_runs = report.patched_text_runs.saturating_add(1);
+        }
+    }
+    for map in &mut scene.map_viewports {
+        if node_set.contains(&map.node) {
+            translate_rect(&mut map.bounds, delta_x, delta_y);
+            if let Some(clip) = &mut map.clip {
+                translate_rect(clip, delta_x, delta_y);
+            }
+            for primitive in &mut map.overlay_primitives {
+                translate_rect(&mut primitive.bounds, delta_x, delta_y);
+                if let Some(clip) = &mut primitive.clip {
+                    translate_rect(clip, delta_x, delta_y);
+                }
+                for point in &mut primitive.control_points {
+                    point[0] += delta_x;
+                    point[1] += delta_y;
+                }
+            }
+            for run in &mut map.overlay_text_runs {
+                translate_rect(&mut run.bounds, delta_x, delta_y);
+                if let Some(clip) = &mut run.clip {
+                    translate_rect(clip, delta_x, delta_y);
+                }
+            }
+            for hit in &mut map.hit_regions {
+                translate_rect(&mut hit.bounds, delta_x, delta_y);
+            }
         }
     }
     scene.quad_batches.clear();
@@ -630,6 +831,9 @@ pub enum RenderVisualPrimitiveKind {
     BorderRight,
     BorderBottom,
     BorderLeft,
+    MapCircle,
+    MapPolyline,
+    MapPolygon,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -878,17 +1082,29 @@ pub fn lower_layout_frame_to_render_scene(
     };
     let items = render_scene_items(frame, width, height);
     let visual_primitives = render_visual_primitives(frame, width, height, columns);
-    let text_runs = render_text_runs(frame, width, height, columns);
+    let mut text_runs = render_text_runs(frame, width, height, columns);
+    let map_viewports = render_map_viewports(frame, width, height);
+    text_runs.extend(
+        map_viewports
+            .iter()
+            .flat_map(|map| map.overlay_text_runs.iter().cloned()),
+    );
+    let map_primitive_count = map_viewports
+        .iter()
+        .map(|map| map.overlay_primitives.len())
+        .sum::<usize>();
     RenderScene {
         viewport,
         metrics: RenderSceneMetrics {
             visible_source_item_count: items.len() as u32,
-            visual_primitive_count: visual_primitives.len() as u32,
-            rendered_rect_count: visual_primitives.len() as u32,
+            visual_primitive_count: visual_primitives.len().saturating_add(map_primitive_count)
+                as u32,
+            rendered_rect_count: visual_primitives.len().saturating_add(map_primitive_count) as u32,
             cap_hit: false,
         },
         items,
         visual_primitives,
+        map_viewports,
         overlay_visual_primitives: Vec::new(),
         quad_batches: Vec::new(),
         text_runs,
@@ -924,6 +1140,22 @@ pub fn lower_layout_frame_to_render_scene_with_retained_keys(
                 })?;
         primitive.retained_chunk_id = retained_chunk_id.clone();
     }
+    for map in &mut scene.map_viewports {
+        let retained_chunk_id = retained_chunk_ids_by_node
+            .get(&map.node)
+            .ok_or_else(|| PatchApplyError::StaleReference {
+                reference_kind: "render_scene_map_retained_chunk",
+                id: map.node.clone(),
+            })?
+            .clone();
+        map.retained_chunk_id = retained_chunk_id.clone();
+        for primitive in &mut map.overlay_primitives {
+            primitive.retained_chunk_id = format!(
+                "{retained_chunk_id}:{}",
+                map_overlay_identity_from_dependencies(&primitive.dependency_set)
+            );
+        }
+    }
     Ok(scene)
 }
 
@@ -940,6 +1172,12 @@ pub fn render_scene_items_for_touched_nodes(
     render_scene_items_for_nodes(frame, width, height, Some(nodes))
 }
 
+pub type RenderSceneNodeEntries = (
+    Vec<RenderSceneItem>,
+    Vec<RenderVisualPrimitive>,
+    Vec<RenderTextRun>,
+);
+
 pub fn render_scene_entries_for_touched_nodes_with_retained_keys(
     frame: &LayoutFrame,
     hot_ids: &DocumentHotIdTable,
@@ -948,14 +1186,7 @@ pub fn render_scene_entries_for_touched_nodes_with_retained_keys(
     height: u32,
     columns: &mut impl RenderTextColumnMeasurer,
     nodes: &BTreeSet<DocumentNodeId>,
-) -> Result<
-    (
-        Vec<RenderSceneItem>,
-        Vec<RenderVisualPrimitive>,
-        Vec<RenderTextRun>,
-    ),
-    PatchApplyError,
-> {
+) -> Result<RenderSceneNodeEntries, PatchApplyError> {
     let mut items = render_scene_items_for_touched_nodes(frame, width, height, nodes);
     let mut retained_chunk_ids_by_node = BTreeMap::new();
     for item in &mut items {
@@ -1028,6 +1259,555 @@ fn render_scene_item(item: &DisplayItem) -> RenderSceneItem {
             .unwrap_or_default(),
         estimated_vertex_count: retained_chunk_vertex_estimate_for_bounds(item.bounds),
     }
+}
+
+fn render_map_viewports(frame: &LayoutFrame, width: u32, height: u32) -> Vec<RenderMapViewport> {
+    let viewport = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+    };
+    frame
+        .display_list
+        .iter()
+        .filter(|item| item.kind == DocumentNodeKind::MapViewport)
+        .filter(|item| rect_intersects(item.bounds, viewport))
+        .filter_map(|item| {
+            let descriptor = item.map_viewport.as_deref()?;
+            render_map_viewport_entries(
+                &item.node,
+                &retained_chunk_id_for_item(item),
+                item.bounds,
+                clip_rect_for_style(&item.style).and_then(|clip| rect_intersection(clip, viewport)),
+                descriptor,
+            )
+            .ok()
+        })
+        .collect()
+}
+
+fn render_map_viewport_entries(
+    node: &DocumentNodeId,
+    retained_chunk_id: &str,
+    bounds: Rect,
+    clip: Option<Rect>,
+    descriptor: &MapViewportDescriptor,
+) -> Result<RenderMapViewport, crate::MapViewportError> {
+    descriptor.validate()?;
+    let visible_tiles = descriptor.visible_xyz_tiles(1)?;
+    let map_clip = clip.or(Some(bounds));
+    let mut overlay_primitives = Vec::new();
+    let mut overlay_text_runs = Vec::new();
+    let mut hit_regions = Vec::new();
+    let accepted_labels = accepted_map_label_ids(descriptor, bounds)?;
+    let mut overlays = descriptor.overlays.iter().collect::<Vec<_>>();
+    overlays.sort_by(|left, right| {
+        left.focused
+            .cmp(&right.focused)
+            .then_with(|| left.selected.cmp(&right.selected))
+            .then_with(|| left.z_order.cmp(&right.z_order))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    for overlay in overlays {
+        let chunk = format!("{retained_chunk_id}:map-overlay:{}", overlay.id.0);
+        let fill = map_overlay_color(overlay.paint.fill.as_deref(), [42, 118, 94, 230], overlay);
+        let stroke = map_overlay_color(
+            overlay.paint.stroke.as_deref(),
+            [246, 250, 248, 255],
+            overlay,
+        );
+        let stroke_width = overlay.paint.stroke_width as f32
+            + if overlay.selected || overlay.focused {
+                1.5
+            } else {
+                0.0
+            };
+        let dependencies = vec![
+            format!("node:{}", node.0),
+            format!("map-overlay:{}", overlay.id.0),
+            format!("map-hit:{}", overlay.hit_identity.0),
+            format!("map-generation:{}", descriptor.generation.0),
+        ];
+        match &overlay.geometry {
+            MapOverlayGeometry::Point {
+                position,
+                radius,
+                symbol_ref,
+            } => {
+                let center = absolute_map_point(descriptor, bounds, *position)?;
+                let radius = *radius as f32 + if overlay.selected { 2.0 } else { 0.0 };
+                let circle_bounds = centered_rect(center, radius);
+                let mut dependencies = dependencies.clone();
+                if let Some(symbol_ref) = symbol_ref {
+                    dependencies.push(format!("map-symbol:{symbol_ref}"));
+                }
+                overlay_primitives.push(map_overlay_primitive(
+                    node,
+                    &chunk,
+                    RenderVisualPrimitiveKind::MapCircle,
+                    circle_bounds,
+                    map_clip,
+                    radius,
+                    stroke_width,
+                    fill,
+                    stroke,
+                    Vec::new(),
+                    dependencies,
+                ));
+                hit_regions.push(map_hit_region(
+                    node,
+                    overlay,
+                    circle_bounds,
+                    RenderMapHitShape::Circle { center, radius },
+                ));
+            }
+            MapOverlayGeometry::Cluster {
+                position,
+                count,
+                radius,
+            } => {
+                let center = absolute_map_point(descriptor, bounds, *position)?;
+                let radius = *radius as f32 + if overlay.selected { 2.0 } else { 0.0 };
+                let circle_bounds = centered_rect(center, radius);
+                overlay_primitives.push(map_overlay_primitive(
+                    node,
+                    &chunk,
+                    RenderVisualPrimitiveKind::MapCircle,
+                    circle_bounds,
+                    map_clip,
+                    radius,
+                    stroke_width,
+                    fill,
+                    stroke,
+                    Vec::new(),
+                    dependencies.clone(),
+                ));
+                overlay_text_runs.push(map_label_text_run(
+                    node,
+                    &overlay.id,
+                    &count.to_string(),
+                    center,
+                    (radius * 0.85).clamp(10.0, 18.0),
+                    [255, 255, 255, 255],
+                    map_clip,
+                ));
+                hit_regions.push(map_hit_region(
+                    node,
+                    overlay,
+                    circle_bounds,
+                    RenderMapHitShape::Circle { center, radius },
+                ));
+            }
+            MapOverlayGeometry::Polyline { points } => {
+                let control_points = points
+                    .iter()
+                    .map(|point| absolute_map_point(descriptor, bounds, *point))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let line_bounds = point_bounds(&control_points, stroke_width.max(2.0));
+                overlay_primitives.push(map_overlay_primitive(
+                    node,
+                    &chunk,
+                    RenderVisualPrimitiveKind::MapPolyline,
+                    line_bounds,
+                    map_clip,
+                    0.0,
+                    stroke_width.max(2.0),
+                    stroke,
+                    [0, 0, 0, 0],
+                    control_points.clone(),
+                    dependencies.clone(),
+                ));
+                hit_regions.push(map_hit_region(
+                    node,
+                    overlay,
+                    line_bounds,
+                    RenderMapHitShape::Polyline {
+                        points: control_points,
+                        tolerance: stroke_width.max(2.0) + 3.0,
+                    },
+                ));
+            }
+            MapOverlayGeometry::Polygon { rings } => {
+                let mut combined_bounds = None;
+                let mut hit_rings = Vec::with_capacity(rings.len());
+                for (ring_index, ring) in rings.iter().enumerate() {
+                    let control_points = ring
+                        .iter()
+                        .map(|point| absolute_map_point(descriptor, bounds, *point))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let polygon_bounds = point_bounds(&control_points, stroke_width);
+                    combined_bounds = Some(match combined_bounds {
+                        Some(current) => rect_union(current, polygon_bounds),
+                        None => polygon_bounds,
+                    });
+                    hit_rings.push(control_points.clone());
+                    overlay_primitives.push(map_overlay_primitive(
+                        node,
+                        &format!("{chunk}:ring:{ring_index}"),
+                        RenderVisualPrimitiveKind::MapPolygon,
+                        polygon_bounds,
+                        map_clip,
+                        0.0,
+                        stroke_width,
+                        fill,
+                        stroke,
+                        control_points,
+                        dependencies.clone(),
+                    ));
+                }
+                if let Some(combined_bounds) = combined_bounds {
+                    hit_regions.push(map_hit_region(
+                        node,
+                        overlay,
+                        combined_bounds,
+                        RenderMapHitShape::Polygon { rings: hit_rings },
+                    ));
+                }
+            }
+            MapOverlayGeometry::Label {
+                position,
+                text,
+                font_size,
+                ..
+            } => {
+                if !accepted_labels.contains(&overlay.id) {
+                    continue;
+                }
+                let center = absolute_map_point(descriptor, bounds, *position)?;
+                let label_bounds = approximate_map_label_bounds(center, text, *font_size as f32);
+                let color =
+                    map_overlay_color(overlay.paint.fill.as_deref(), [24, 43, 37, 255], overlay);
+                overlay_text_runs.push(map_label_text_run(
+                    node,
+                    &overlay.id,
+                    text,
+                    center,
+                    *font_size as f32,
+                    color,
+                    map_clip,
+                ));
+                hit_regions.push(map_hit_region(
+                    node,
+                    overlay,
+                    label_bounds,
+                    RenderMapHitShape::Rect,
+                ));
+            }
+        }
+    }
+    let attribution =
+        map_attribution_text_run(node, &descriptor.tile_source.attribution, bounds, map_clip);
+    overlay_primitives.push(RenderVisualPrimitive {
+        node: node.clone(),
+        retained_chunk_id: format!("{retained_chunk_id}:map-attribution-background"),
+        source_kind: DocumentNodeKind::MapViewport,
+        primitive: RenderVisualPrimitiveKind::Fill,
+        bounds: Rect {
+            x: attribution.bounds.x - 4.0,
+            y: attribution.bounds.y - 2.0,
+            width: attribution.bounds.width + 8.0,
+            height: attribution.bounds.height + 4.0,
+        },
+        clip: map_clip,
+        radius: 2.0,
+        stroke_width: 0.0,
+        color: [16, 27, 24, 180],
+        secondary_color: [0, 0, 0, 0],
+        antialias: 1.0,
+        control_points: Vec::new(),
+        texture: RenderTextureRef::Solid,
+        style_identity: ComputedStyleIdentity::from_style(&StyleMap::new()),
+        dependency_set: vec![
+            format!("node:{}", node.0),
+            format!("map-attribution:{}", descriptor.tile_source.id.0),
+        ],
+    });
+    overlay_text_runs.push(attribution);
+    hit_regions.sort_by(|left, right| {
+        left.z_order
+            .cmp(&right.z_order)
+            .then_with(|| left.overlay_id.cmp(&right.overlay_id))
+    });
+    Ok(RenderMapViewport {
+        node: node.clone(),
+        retained_chunk_id: retained_chunk_id.to_owned(),
+        bounds,
+        clip: map_clip,
+        descriptor: descriptor.clone(),
+        visible_tiles,
+        overlay_primitives,
+        overlay_text_runs,
+        hit_regions,
+    })
+}
+
+fn accepted_map_label_ids(
+    descriptor: &MapViewportDescriptor,
+    bounds: Rect,
+) -> Result<BTreeSet<MapOverlayId>, crate::MapViewportError> {
+    let mut labels = descriptor
+        .overlays
+        .iter()
+        .filter_map(|overlay| match &overlay.geometry {
+            MapOverlayGeometry::Label {
+                position,
+                text,
+                collision_priority,
+                font_size,
+            } => Some((
+                overlay,
+                *position,
+                text.as_str(),
+                *collision_priority,
+                *font_size as f32,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    labels.sort_by(|left, right| {
+        right
+            .0
+            .focused
+            .cmp(&left.0.focused)
+            .then_with(|| right.0.selected.cmp(&left.0.selected))
+            .then_with(|| right.3.cmp(&left.3))
+            .then_with(|| right.0.z_order.cmp(&left.0.z_order))
+            .then_with(|| left.0.id.cmp(&right.0.id))
+    });
+    let mut occupied = Vec::new();
+    let mut accepted = BTreeSet::new();
+    for (overlay, position, text, _, font_size) in labels {
+        let center = absolute_map_point(descriptor, bounds, position)?;
+        let label_bounds = approximate_map_label_bounds(center, text, font_size);
+        if !overlay.selected
+            && !overlay.focused
+            && occupied
+                .iter()
+                .any(|previous| rect_intersects(*previous, label_bounds))
+        {
+            continue;
+        }
+        occupied.push(label_bounds);
+        accepted.insert(overlay.id.clone());
+    }
+    Ok(accepted)
+}
+
+fn absolute_map_point(
+    descriptor: &MapViewportDescriptor,
+    bounds: Rect,
+    coordinate: crate::MapCoordinate,
+) -> Result<[f32; 2], crate::MapViewportError> {
+    let point = crate::project_to_map_viewport(descriptor, coordinate)?;
+    Ok([bounds.x + point.x as f32, bounds.y + point.y as f32])
+}
+
+fn centered_rect(center: [f32; 2], radius: f32) -> Rect {
+    Rect {
+        x: center[0] - radius,
+        y: center[1] - radius,
+        width: radius * 2.0,
+        height: radius * 2.0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn map_overlay_primitive(
+    node: &DocumentNodeId,
+    retained_chunk_id: &str,
+    primitive: RenderVisualPrimitiveKind,
+    bounds: Rect,
+    clip: Option<Rect>,
+    radius: f32,
+    stroke_width: f32,
+    color: [u8; 4],
+    secondary_color: [u8; 4],
+    control_points: Vec<[f32; 2]>,
+    dependency_set: Vec<String>,
+) -> RenderVisualPrimitive {
+    RenderVisualPrimitive {
+        node: node.clone(),
+        retained_chunk_id: retained_chunk_id.to_owned(),
+        source_kind: DocumentNodeKind::MapViewport,
+        primitive,
+        bounds,
+        clip,
+        radius,
+        stroke_width,
+        color,
+        secondary_color,
+        antialias: 1.0,
+        control_points,
+        texture: RenderTextureRef::Solid,
+        style_identity: ComputedStyleIdentity::from_style(&StyleMap::new()),
+        dependency_set,
+    }
+}
+
+fn map_hit_region(
+    node: &DocumentNodeId,
+    overlay: &crate::MapOverlayDescriptor,
+    bounds: Rect,
+    shape: RenderMapHitShape,
+) -> RenderMapHitRegion {
+    RenderMapHitRegion {
+        node: node.clone(),
+        overlay_id: overlay.id.clone(),
+        hit_identity: overlay.hit_identity.clone(),
+        bounds,
+        z_order: overlay.z_order,
+        selected: overlay.selected,
+        focused: overlay.focused,
+        shape,
+    }
+}
+
+fn map_label_text_run(
+    node: &DocumentNodeId,
+    overlay_id: &MapOverlayId,
+    text: &str,
+    center: [f32; 2],
+    font_size: f32,
+    color: [u8; 4],
+    clip: Option<Rect>,
+) -> RenderTextRun {
+    let bounds = approximate_map_label_bounds(center, text, font_size);
+    RenderTextRun {
+        node: DocumentNodeId(format!("__map-label:{}:{}", node.0, overlay_id.0)),
+        owner_node: node.clone(),
+        font_id: 0,
+        paint_id: 0,
+        bounds,
+        clip,
+        text: text.to_owned(),
+        rich_spans: Vec::new(),
+        font_family: DEFAULT_DOCUMENT_FONT_FAMILY.to_owned(),
+        font_style: RenderFontStyle::Normal,
+        font_weight: RenderFontWeight(600),
+        font_features: String::new(),
+        text_inset: 0.0,
+        text_clip_padding: 0.0,
+        color,
+        size: font_size,
+        line_height: font_size * 1.2,
+        align: RenderTextAlign::Center,
+        vertical_align: RenderTextVerticalAlign::Center,
+        rotate_degrees: 0,
+        wrap: false,
+    }
+}
+
+fn map_attribution_text_run(
+    node: &DocumentNodeId,
+    attribution: &str,
+    map_bounds: Rect,
+    clip: Option<Rect>,
+) -> RenderTextRun {
+    let font_size = 10.0;
+    let width = (attribution.chars().count() as f32 * font_size * 0.56)
+        .clamp(font_size, (map_bounds.width - 16.0).max(font_size));
+    let height = font_size * 1.2;
+    RenderTextRun {
+        node: DocumentNodeId(format!("__map-attribution:{}", node.0)),
+        owner_node: node.clone(),
+        font_id: 0,
+        paint_id: 0,
+        bounds: Rect {
+            x: map_bounds.x + map_bounds.width - width - 8.0,
+            y: map_bounds.y + map_bounds.height - height - 6.0,
+            width,
+            height,
+        },
+        clip,
+        text: attribution.to_owned(),
+        rich_spans: Vec::new(),
+        font_family: DEFAULT_DOCUMENT_FONT_FAMILY.to_owned(),
+        font_style: RenderFontStyle::Normal,
+        font_weight: RenderFontWeight(400),
+        font_features: String::new(),
+        text_inset: 0.0,
+        text_clip_padding: 0.0,
+        color: [255, 255, 255, 255],
+        size: font_size,
+        line_height: height,
+        align: RenderTextAlign::Right,
+        vertical_align: RenderTextVerticalAlign::Center,
+        rotate_degrees: 0,
+        wrap: false,
+    }
+}
+
+fn approximate_map_label_bounds(center: [f32; 2], text: &str, font_size: f32) -> Rect {
+    let width = (text.chars().count() as f32 * font_size * 0.62).max(font_size);
+    let height = font_size * 1.2;
+    Rect {
+        x: center[0] - width / 2.0,
+        y: center[1] - height / 2.0,
+        width,
+        height,
+    }
+}
+
+fn point_bounds(points: &[[f32; 2]], padding: f32) -> Rect {
+    let min_x = points
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::INFINITY, f32::min);
+    let min_y = points
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::INFINITY, f32::min);
+    let max_x = points
+        .iter()
+        .map(|point| point[0])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max_y = points
+        .iter()
+        .map(|point| point[1])
+        .fold(f32::NEG_INFINITY, f32::max);
+    Rect {
+        x: min_x - padding,
+        y: min_y - padding,
+        width: (max_x - min_x + padding * 2.0).max(1.0),
+        height: (max_y - min_y + padding * 2.0).max(1.0),
+    }
+}
+
+fn rect_union(left: Rect, right: Rect) -> Rect {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    let right_edge = (left.x + left.width).max(right.x + right.width);
+    let bottom = (left.y + left.height).max(right.y + right.height);
+    Rect {
+        x,
+        y,
+        width: right_edge - x,
+        height: bottom - y,
+    }
+}
+
+fn map_overlay_color(
+    value: Option<&str>,
+    fallback: [u8; 4],
+    overlay: &crate::MapOverlayDescriptor,
+) -> [u8; 4] {
+    let mut color = value.and_then(parse_hex_color).unwrap_or(fallback);
+    color[3] = ((f32::from(color[3]) * overlay.paint.opacity as f32).round() as u8).min(color[3]);
+    color
+}
+
+fn map_text_run_belongs_to_node(run: &RenderTextRun, node: &DocumentNodeId) -> bool {
+    run.owner_node == *node
+        && (run.node.0.starts_with("__map-label:") || run.node.0.starts_with("__map-attribution:"))
+}
+
+fn map_overlay_identity_from_dependencies(dependencies: &[String]) -> &str {
+    dependencies
+        .iter()
+        .find_map(|dependency| dependency.strip_prefix("map-overlay:"))
+        .unwrap_or("overlay")
 }
 
 fn retained_chunk_id_for_item(item: &DisplayItem) -> String {
@@ -2236,7 +3016,10 @@ fn text_overlay_dependency_name(primitive: RenderVisualPrimitiveKind) -> &'stati
         | RenderVisualPrimitiveKind::BorderTop
         | RenderVisualPrimitiveKind::BorderRight
         | RenderVisualPrimitiveKind::BorderBottom
-        | RenderVisualPrimitiveKind::BorderLeft => "visual",
+        | RenderVisualPrimitiveKind::BorderLeft
+        | RenderVisualPrimitiveKind::MapCircle
+        | RenderVisualPrimitiveKind::MapPolyline
+        | RenderVisualPrimitiveKind::MapPolygon => "visual",
     }
 }
 
@@ -2783,6 +3566,7 @@ fn default_fill_for_kind(kind: &DocumentNodeKind, index: usize) -> [u8; 4] {
         }
         DocumentNodeKind::TextInput => [255, 255, 255, 255],
         DocumentNodeKind::EmbeddedProgram | DocumentNodeKind::EmbeddedMedia => [255, 255, 255, 0],
+        DocumentNodeKind::MapViewport => [218, 231, 224, 255],
         DocumentNodeKind::Button | DocumentNodeKind::Checkbox | DocumentNodeKind::Text => {
             [255, 255, 255, 0]
         }
@@ -3070,6 +3854,39 @@ fn rect_intersects(rect: Rect, viewport: Rect) -> bool {
         && rect.x + rect.width > viewport.x
         && rect.y < viewport.y + viewport.height
         && rect.y + rect.height > viewport.y
+}
+
+fn render_rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
+}
+
+fn point_segment_distance(x: f32, y: f32, start: [f32; 2], end: [f32; 2]) -> f32 {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    let length_squared = dx.mul_add(dx, dy * dy);
+    if length_squared <= f32::EPSILON {
+        return (x - start[0]).hypot(y - start[1]);
+    }
+    let projection = (((x - start[0]) * dx + (y - start[1]) * dy) / length_squared).clamp(0.0, 1.0);
+    let nearest_x = start[0] + projection * dx;
+    let nearest_y = start[1] + projection * dy;
+    (x - nearest_x).hypot(y - nearest_y)
+}
+
+fn point_in_polygon(x: f32, y: f32, points: &[[f32; 2]]) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut previous = points[points.len() - 1];
+    for current in points.iter().copied() {
+        let crosses = (current[1] > y) != (previous[1] > y)
+            && x < (previous[0] - current[0]) * (y - current[1]) / (previous[1] - current[1])
+                + current[0];
+        inside ^= crosses;
+        previous = current;
+    }
+    inside
 }
 
 fn rect_intersection(a: Rect, b: Rect) -> Option<Rect> {

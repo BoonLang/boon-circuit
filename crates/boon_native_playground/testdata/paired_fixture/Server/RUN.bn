@@ -1,0 +1,14 @@
+store: [
+    request_received: SOURCE
+
+    server_count:
+        0 |> HOLD server_count {
+            LATEST {
+                store.request_received |> THEN { server_count + 1 }
+            }
+        }
+]
+
+outputs: [
+    api_response: PairContract/response(count: store.server_count)
+]

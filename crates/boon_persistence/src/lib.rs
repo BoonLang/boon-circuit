@@ -10,6 +10,8 @@ use std::fmt;
 mod codec;
 mod migration;
 
+pub use boon_data::Value as StoredValue;
+
 #[cfg(any(target_arch = "wasm32", test))]
 mod web;
 
@@ -34,26 +36,6 @@ pub use web::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use worker::*;
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum StoredValue {
-    Null,
-    Bool(bool),
-    Number(i64),
-    Text(String),
-    Bytes(Vec<u8>),
-    List(Vec<StoredValue>),
-    Record(BTreeMap<String, StoredValue>),
-    Variant {
-        tag: String,
-        fields: BTreeMap<String, StoredValue>,
-    },
-    Error {
-        code: String,
-        fields: BTreeMap<String, StoredValue>,
-    },
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoredScalar {
@@ -1500,7 +1482,10 @@ fn validate_stored_value_type(
         | (StoredValue::Bool(_), DataTypePlan::Bool)
         | (StoredValue::Number(_), DataTypePlan::Number)
         | (StoredValue::Text(_), DataTypePlan::Text) => true,
-        (StoredValue::Number(value), DataTypePlan::Byte) => (0..=u8::MAX as i64).contains(value),
+        (StoredValue::Number(value), DataTypePlan::Byte) => value
+            .to_i64_exact()
+            .ok()
+            .is_some_and(|value| (0..=u8::MAX as i64).contains(&value)),
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
             fixed_len.is_none_or(|expected| u64::try_from(value.len()).ok() == Some(expected))
         }
@@ -2423,8 +2408,8 @@ fn hash_stored_value(hasher: &mut Sha256, value: &StoredValue) {
             hasher.update([1, u8::from(*value)]);
         }
         StoredValue::Number(value) => {
-            hasher.update([2]);
-            hasher.update(value.to_be_bytes());
+            hasher.update([10]);
+            hasher.update(value.get().to_bits().to_be_bytes());
         }
         StoredValue::Text(value) => {
             hasher.update([3]);
@@ -2578,6 +2563,10 @@ fn error_result(command: PersistenceCommand, error: StoreError) -> PersistenceRe
 mod tests {
     use super::*;
     use boon_plan::{MemoryKind, MemoryOwnerPath};
+
+    fn number(value: i64) -> StoredValue {
+        StoredValue::integer(value).unwrap()
+    }
 
     fn application() -> ApplicationIdentity {
         ApplicationIdentity::new("dev.boon.counter", "manual", "local")
@@ -3061,11 +3050,8 @@ mod tests {
         DurableOutboxItem::pending(
             invocation(),
             effect(),
-            StoredValue::Number(key),
-            StoredValue::Record(BTreeMap::from([(
-                "amount".to_owned(),
-                StoredValue::Number(key * 10),
-            )])),
+            number(key),
+            StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(key * 10))])),
             None,
             turn_sequence,
         )
@@ -3073,10 +3059,7 @@ mod tests {
 
     #[test]
     fn indexed_effect_rows_keep_distinct_local_completion_obligations() {
-        let intent = StoredValue::Record(BTreeMap::from([(
-            "amount".to_owned(),
-            StoredValue::Number(10),
-        )]));
+        let intent = StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(10))]));
         let key = canonical_intent_key(&intent);
         let row = |row_key| DurableEffectRow {
             list_memory_id: memory("todos"),
@@ -3112,7 +3095,7 @@ mod tests {
                 memory_id: memory("count"),
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Number(0),
+                    value: number(0),
                 },
             }],
             outbox_changes: Vec::new(),
@@ -3195,7 +3178,7 @@ mod tests {
                 memory_id: memory("click_count"),
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Number(7),
+                    value: number(7),
                 },
             }],
             completed_migration_edges: Vec::new(),
@@ -3225,7 +3208,7 @@ mod tests {
                 old_memory,
                 StoredScalar {
                     touched: true,
-                    value: StoredValue::Number(3),
+                    value: number(3),
                 },
             );
         let new_memory = memory("click_count");
@@ -3241,7 +3224,7 @@ mod tests {
                 memory_id: new_memory,
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Number(3),
+                    value: number(3),
                 },
             }],
             completed_migration_edges: Vec::new(),
@@ -3261,7 +3244,7 @@ mod tests {
         ));
         let image = driver.image(&application()).unwrap();
         assert!(!image.scalars.contains_key(&old_memory));
-        assert_eq!(image.scalars[&new_memory].value, StoredValue::Number(3));
+        assert_eq!(image.scalars[&new_memory].value, number(3));
         assert_eq!(image.schema_hash, [2; 32]);
         assert_eq!(image.through_turn_sequence, 4);
     }
@@ -3277,7 +3260,7 @@ mod tests {
             old_memory,
             StoredScalar {
                 touched: true,
-                value: StoredValue::Number(3),
+                value: number(3),
             },
         );
         let mut candidate = RestoreImage::empty(application(), 2, [2; 32]);
@@ -3286,7 +3269,7 @@ mod tests {
             new_memory,
             StoredScalar {
                 touched: true,
-                value: StoredValue::Number(3),
+                value: number(3),
             },
         );
         candidate.content_artifact_manifest.bindings.insert(
@@ -3312,7 +3295,7 @@ mod tests {
         let (activated, ack) = apply_activation_to_image(current, &batch).unwrap();
         assert_eq!(ack.epoch, 5);
         assert!(!activated.scalars.contains_key(&old_memory));
-        assert_eq!(activated.scalars[&new_memory].value, StoredValue::Number(3));
+        assert_eq!(activated.scalars[&new_memory].value, number(3));
         assert_eq!(
             activated.content_artifact_manifest,
             candidate.content_artifact_manifest
@@ -3494,7 +3477,7 @@ mod tests {
             memory("count"),
             StoredScalar {
                 touched: true,
-                value: StoredValue::Number(7),
+                value: number(7),
             },
         );
         let item = pending_outbox(7, 9);

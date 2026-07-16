@@ -1,0 +1,364 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fjordpulse.kavik.cz/contracts/realtime/client-message.schema.json",
+  "title": "FjordPulse client realtime message",
+  "description": "Exactly one protocol v1 browser command. Unknown types, unsupported versions, unknown payload fields, and missing identifiers are invalid.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/WatchStationMessage"
+    },
+    {
+      "$ref": "#/$defs/UnwatchStationMessage"
+    },
+    {
+      "$ref": "#/$defs/WatchVehicleMessage"
+    },
+    {
+      "$ref": "#/$defs/UnwatchVehicleMessage"
+    },
+    {
+      "$ref": "#/$defs/FocusVehicleMessage"
+    },
+    {
+      "$ref": "#/$defs/UnfocusVehicleMessage"
+    },
+    {
+      "$ref": "#/$defs/PauseFocusMessage"
+    },
+    {
+      "$ref": "#/$defs/ResumeFocusMessage"
+    },
+    {
+      "$ref": "#/$defs/PingMessage"
+    }
+  ],
+  "$defs": {
+    "StationId": {
+      "type": "string",
+      "pattern": "^NSR:StopPlace:[A-Za-z0-9_-]+$",
+      "maxLength": 200
+    },
+    "VehicleId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._-]{0,199}$"
+    },
+    "KnownStateFields": {
+      "type": "object",
+      "properties": {
+        "knownVersion": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastEventId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    },
+    "WatchStationPayload": {
+      "type": "object",
+      "required": ["stationId"],
+      "properties": {
+        "stationId": {
+          "$ref": "#/$defs/StationId"
+        },
+        "knownVersion": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastEventId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      },
+      "additionalProperties": false
+    },
+    "StationPayload": {
+      "type": "object",
+      "required": ["stationId"],
+      "properties": {
+        "stationId": {
+          "$ref": "#/$defs/StationId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "WatchVehiclePayload": {
+      "type": "object",
+      "required": ["vehicleId"],
+      "properties": {
+        "vehicleId": {
+          "$ref": "#/$defs/VehicleId"
+        },
+        "knownVersion": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lastEventId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      },
+      "additionalProperties": false
+    },
+    "VehiclePayload": {
+      "type": "object",
+      "required": ["vehicleId"],
+      "properties": {
+        "vehicleId": {
+          "$ref": "#/$defs/VehicleId"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PingPayload": {
+      "type": "object",
+      "properties": {
+        "sentAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "WatchStationMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "watch_station"
+            },
+            "payload": {
+              "$ref": "#/$defs/WatchStationPayload"
+            }
+          }
+        }
+      ]
+    },
+    "UnwatchStationMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "unwatch_station"
+            },
+            "payload": {
+              "$ref": "#/$defs/StationPayload"
+            }
+          }
+        }
+      ]
+    },
+    "WatchVehicleMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "watch_vehicle"
+            },
+            "payload": {
+              "$ref": "#/$defs/WatchVehiclePayload"
+            }
+          }
+        }
+      ]
+    },
+    "UnwatchVehicleMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "unwatch_vehicle"
+            },
+            "payload": {
+              "$ref": "#/$defs/VehiclePayload"
+            }
+          }
+        }
+      ]
+    },
+    "FocusVehicleMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "focus_vehicle"
+            },
+            "payload": {
+              "$ref": "#/$defs/WatchVehiclePayload"
+            }
+          }
+        }
+      ]
+    },
+    "UnfocusVehicleMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "unfocus_vehicle"
+            },
+            "payload": {
+              "$ref": "#/$defs/VehiclePayload"
+            }
+          }
+        }
+      ]
+    },
+    "PauseFocusMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "pause_focus"
+            },
+            "payload": {
+              "$ref": "#/$defs/VehiclePayload"
+            }
+          }
+        }
+      ]
+    },
+    "ResumeFocusMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "resume_focus"
+            },
+            "payload": {
+              "$ref": "#/$defs/VehiclePayload"
+            }
+          }
+        }
+      ]
+    },
+    "PingMessage": {
+      "allOf": [
+        {
+          "$ref": "./envelope.schema.json#/$defs/ClientEnvelope"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "ping"
+            },
+            "payload": {
+              "$ref": "#/$defs/PingPayload"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "examples": [
+    {
+      "protocolVersion": 1,
+      "id": "msg_001",
+      "type": "watch_station",
+      "payload": {
+        "stationId": "NSR:StopPlace:548"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_002",
+      "type": "unwatch_station",
+      "payload": {
+        "stationId": "NSR:StopPlace:548"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_003",
+      "type": "watch_vehicle",
+      "payload": {
+        "vehicleId": "SKY:Vehicle:12345"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_004",
+      "type": "unwatch_vehicle",
+      "payload": {
+        "vehicleId": "SKY:Vehicle:12345"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_005",
+      "type": "focus_vehicle",
+      "payload": {
+        "vehicleId": "SKY:Vehicle:12345"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_006",
+      "type": "unfocus_vehicle",
+      "payload": {
+        "vehicleId": "SKY:Vehicle:12345"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_007",
+      "type": "pause_focus",
+      "payload": {
+        "vehicleId": "SKY:Vehicle:12345"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_008",
+      "type": "resume_focus",
+      "payload": {
+        "vehicleId": "SKY:Vehicle:12345"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "id": "msg_009",
+      "type": "ping",
+      "payload": {
+        "sentAt": "2026-07-10T10:00:00Z"
+      }
+    }
+  ]
+}

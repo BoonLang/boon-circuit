@@ -1,0 +1,274 @@
+FUNCTION viewport() {
+    Scene/Element/map(
+        element: [
+            event: [press: SOURCE]
+            accessibility_label: FjordPulseModel/locale_text(
+                language: PASSED.store.language
+                norwegian: TEXT { Interaktivt kollektivkart }
+                english: TEXT { Interactive public transport map }
+            )
+        ]
+        style: [
+            width: Fill
+            height: Fill
+            overlay_children: True
+            background: [color: FjordPulseTheme/map_water()]
+            accessibility_label: FjordPulseModel/locale_text(
+                language: PASSED.store.language
+                norwegian: TEXT { Interaktivt kollektivkart }
+                english: TEXT { Interactive public transport map }
+            )
+            map_center_latitude: FjordPulseModel/map_latitude(route: PASSED.store.route, station: PASSED.store.selected_station)
+            map_center_longitude: FjordPulseModel/map_longitude(route: PASSED.store.route, station: PASSED.store.selected_station)
+            map_zoom: PASSED.store.map_zoom
+            map_basemap: PASSED.store.basemap |> WHEN {
+                Streets => TEXT { streets-v4 }
+                Satellite => TEXT { hybrid-v4 }
+            }
+            map_attribution: TEXT { Deterministic fixture · Map data © OpenStreetMap contributors }
+        ]
+        generation: 1
+        camera: [
+            longitude: FjordPulseModel/map_longitude(route: PASSED.store.route, station: PASSED.store.selected_station)
+            latitude: FjordPulseModel/map_latitude(route: PASSED.store.route, station: PASSED.store.selected_station)
+            zoom: PASSED.store.map_zoom
+            bearing: 0
+        ]
+        bounds: [width: 720, height: 620, scale: 1]
+        tile_source: [
+            id: PASSED.store.basemap |> WHEN {
+                Streets => TEXT { fjordpulse-deterministic-streets }
+                Satellite => TEXT { fjordpulse-deterministic-satellite }
+            }
+            url_template_capability: PASSED.store.basemap |> WHEN {
+                Streets => TEXT { fjordpulse_fixture_streets_xyz }
+                Satellite => TEXT { fjordpulse_fixture_satellite_xyz }
+            }
+            min_zoom: 0
+            max_zoom: 18
+            tile_size: 256
+            attribution: TEXT { Map data © OpenStreetMap contributors }
+            allowed_origins: LIST {
+                TEXT { boon-local://fjordpulse-map-fixture }
+            }
+        ]
+        interaction: [
+            pan: True
+            wheel_zoom: True
+            pinch_zoom: True
+            keyboard_zoom: True
+        ]
+        overlays: LIST {}
+        items: LIST {
+            land_shape()
+            road(top: 78, left: 36, width: 560, rotation: -4)
+            road(top: 228, left: 110, width: 510, rotation: 7)
+            road(top: 350, left: 18, width: 620, rotation: -2)
+            marker(station: Forde, top: 252, left: 244)
+                |> SOURCE { PASSED.store.elements.station.forde }
+            marker(station: FordeFerry, top: 300, left: 194)
+                |> SOURCE { PASSED.store.elements.station.forde_ferry }
+            marker(station: OsloS, top: 166, left: 286)
+                |> SOURCE { PASSED.store.elements.station.oslo }
+            marker(station: Bergen, top: 292, left: 128)
+                |> SOURCE { PASSED.store.elements.station.bergen }
+            marker(station: Trondheim, top: 86, left: 462)
+                |> SOURCE { PASSED.store.elements.station.trondheim }
+            marker(station: Bodo, top: 376, left: 520)
+                |> SOURCE { PASSED.store.elements.station.bodo }
+            selected_vehicle_marker()
+            map_controls()
+            attribution()
+            map_state_overlay()
+        }
+    )
+}
+
+FUNCTION land_shape() {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: Fill, padding: [top: 18, left: 58], paint: False]
+        child: Scene/Element/block(
+            element: []
+            style: [
+                width: 610
+                height: 480
+                rounded_corners: 54
+                ...FjordPulseTheme/physical_surface(of: MapLand)
+                border: [color: FjordPulseTheme/map_land_border()]
+                border_width: 1
+            ]
+            child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())
+        )
+    )
+}
+
+FUNCTION road(top, left, width, rotation) {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: Fill, padding: [top: top, left: left], paint: False]
+        child: Scene/Element/block(
+            element: []
+            style: [
+                width: width
+                height: 9
+                rotation: rotation
+                rounded_corners: 5
+                ...FjordPulseTheme/physical_surface(of: MapRoad)
+                border: [color: FjordPulseTheme/map_road_border()]
+                border_width: 1
+            ]
+            child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())
+        )
+    )
+}
+
+FUNCTION marker(station, top, left) {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: Fill, padding: [top: top, left: left], paint: False]
+        child: Scene/Element/button(
+            element: [event: [press: SOURCE], hovered: SOURCE]
+            style: [
+                width: 132
+                height: 42
+                padding: [left: 8, right: 8, top: 5, bottom: 5]
+                ...FjordPulseTheme/map_pin(selected: marker_selected(station: station), hovered: element.hovered)
+                accessibility_label: FjordPulseModel/station_name(station: station)
+                selected: marker_selected(station: station)
+            ]
+            label: Scene/Element/text(
+                element: []
+                style: [width: Fill, height: Fill, center: True, vertical_align: Center, color: FjordPulseTheme/text_on_accent(), weight: 700, size: 12]
+                text: FjordPulseModel/station_name(station: station)
+            )
+        )
+    )
+}
+
+FUNCTION marker_selected(station) {
+    PASSED.store.route |> WHEN {
+        PublicStation => station == PASSED.store.selected_station
+        PublicVehicle => station == PASSED.store.selected_station
+        __ => False
+    }
+}
+
+FUNCTION selected_vehicle_marker() {
+    PASSED.store.route |> WHEN {
+        PublicVehicle => Scene/Element/block(
+            element: []
+            style: [width: Fill, height: Fill, padding: [top: 208, left: 352], paint: False]
+            child: Scene/Element/block(
+                element: []
+                style: [
+                    width: 112
+                    height: 38
+                    padding: [left: 8, right: 8, top: 5, bottom: 5]
+                    ...FjordPulseTheme/vehicle_pin()
+                ]
+                child: Scene/Element/text(
+                    element: []
+                    style: [width: Fill, height: Fill, center: True, vertical_align: Center, color: FjordPulseTheme/text_on_accent(), weight: 700, size: 11]
+                    text: FjordPulseModel/vehicle_title(
+                        vehicle: PASSED.store.selected_vehicle
+                        passenger_state: PASSED.store.passenger_state
+                        language: PASSED.store.language
+                    )
+                )
+            )
+        )
+        __ => Scene/Element/text(element: [], style: [width: 0, height: 0, paint: False], text: Text/empty())
+    }
+}
+
+FUNCTION map_controls() {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: Fill, padding: [top: 14, left: 14], paint: False]
+        child: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 4
+            style: [width: 46, paint: False]
+            items: LIST {
+                FjordPulseComponents/icon_button(label: TEXT { + }, selected: False)
+                    |> SOURCE { PASSED.store.elements.map.zoom_in }
+                FjordPulseComponents/icon_button(label: TEXT { − }, selected: False)
+                    |> SOURCE { PASSED.store.elements.map.zoom_out }
+                FjordPulseComponents/icon_button(label: TEXT { ◎ }, selected: PASSED.store.map_locating)
+                    |> SOURCE { PASSED.store.elements.map.locate }
+            }
+        )
+    )
+}
+
+FUNCTION attribution() {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: Fill, padding: [top: 498, left: 14], paint: False]
+        child: Scene/Element/text(
+            element: []
+            style: [
+                width: Auto
+                auto_padding: 360
+                height: 24
+                padding: [left: 6, right: 6, top: 2, bottom: 2]
+                ...FjordPulseTheme/physical_surface(of: Attribution)
+                color: FjordPulseTheme/text_muted()
+                size: 10
+                rounded_corners: 3
+            ]
+            text: TEXT { Deterministic fixture · Map data © OpenStreetMap contributors }
+        )
+    )
+}
+
+FUNCTION map_state_overlay() {
+    PASSED.store.map_state |> WHEN {
+        Ready => Scene/Element/text(element: [], style: [width: 0, height: 0, paint: False], text: Text/empty())
+        Loading => map_state_card(
+            status: Loading
+            title: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Laster kartgrunnlag }, english: TEXT { Loading map })
+            message: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Den deterministiske kartscenen klargjøres. }, english: TEXT { Preparing the deterministic map scene. })
+            retry: False
+        )
+        Retrying => map_state_card(
+            status: Retrying
+            title: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøver kartet igjen }, english: TEXT { Retrying map })
+            message: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Forrige feil er beholdt til en ny scene er klar. }, english: TEXT { The prior failure remains explicit until a new scene is ready. })
+            retry: False
+        )
+        Error => map_state_card(
+            status: Error
+            title: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Kartet er utilgjengelig }, english: TEXT { Map unavailable })
+            message: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Søk og valgte transportdetaljer er fortsatt tilgjengelige. }, english: TEXT { Search and selected transport details remain available. })
+            retry: True
+        )
+        __ => Scene/Element/text(element: [], style: [width: 0, height: 0, paint: False], text: Text/empty())
+    }
+}
+
+FUNCTION map_state_card(status, title, message, retry) {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: Fill, padding: [top: 76, left: 86, right: 86], paint: False]
+        child: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 10
+            style: [...FjordPulseTheme/panel(), width: Fill, padding: 14]
+            items: LIST {
+                FjordPulseComponents/state_message(status: status, title: title, message: message)
+                retry |> WHEN {
+                    True => FjordPulseComponents/button(
+                        label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv kartet igjen }, english: TEXT { Retry map })
+                        selected: False
+                        width: Fill
+                    ) |> SOURCE { PASSED.store.elements.map.retry }
+                    False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
+                }
+            }
+        )
+    )
+}

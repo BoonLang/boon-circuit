@@ -1,0 +1,131 @@
+{
+  "ok": true,
+  "data": {
+    "build": {
+      "version": "1.0.0-dev",
+      "environment": "development",
+      "dataMode": "fake"
+    },
+    "database": {
+      "engine": "surrealdb",
+      "endpointOrigin": "ws://127.0.0.1:8000",
+      "namespace": "fjordpulse",
+      "name": "fjordpulse_demo",
+      "warning": null
+    },
+    "resources": {
+      "checkedAt": "2026-07-10T10:00:00Z",
+      "cpu": {
+        "usagePercent": 18.4,
+        "load1": 0.62,
+        "load5": 0.48,
+        "load15": 0.41,
+        "logicalCores": 4
+      },
+      "memory": {
+        "totalBytes": 4294967296,
+        "availableBytes": 2684354560,
+        "usedBytes": 1610612736,
+        "usedPercent": 37.5,
+        "scope": "cgroup"
+      },
+      "disk": {
+        "path": "/app/backend",
+        "totalBytes": 85899345920,
+        "freeBytes": 53687091200,
+        "usedBytes": 32212254720,
+        "usedPercent": 37.5
+      }
+    },
+    "services": {
+      "backend": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "realtime": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "surrealdb": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "entur": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "mapTiles": { "status": "configured", "checkedAt": "2026-07-10T10:00:00Z" },
+      "liveQueryBridge": {
+        "status": "healthy",
+        "checkedAt": "2026-07-10T10:00:00Z",
+        "lastSuccessAt": "2026-07-10T09:59:59Z"
+      }
+    },
+    "metrics": {
+      "activeClients": 2,
+      "stationWatches": 1,
+      "vehicleWatches": 1,
+      "focusWatches": 1,
+      "messagesPerMinute": 12
+    },
+    "dataCounts": {
+      "stations": 12000,
+      "stationSnapshots": 1,
+      "stationTimetables": 2,
+      "currentVehicles": 1,
+      "journeySnapshots": 3,
+      "vehicleObservations": 4,
+      "watches": 2,
+      "realtimeEvents": 12,
+      "enturRequestLogs": 8
+    },
+    "stationImport": {
+      "count": 12000,
+      "lastImportedAt": "2026-07-10T08:00:00Z",
+      "sourceVersion": "netex-2026-07-10"
+    },
+    "enturBudgets": [
+      {
+        "service": "global",
+        "limit": 60,
+        "remaining": 52,
+        "windowSeconds": 60,
+        "backoffUntil": null
+      },
+      {
+        "service": "stop_place_register",
+        "limit": 60,
+        "remaining": 59,
+        "windowSeconds": 60,
+        "backoffUntil": null
+      },
+      {
+        "service": "geocoder",
+        "limit": 20,
+        "remaining": 19,
+        "windowSeconds": 60,
+        "backoffUntil": null
+      },
+      {
+        "service": "journey_planner",
+        "limit": 30,
+        "remaining": 26,
+        "windowSeconds": 60,
+        "backoffUntil": null
+      },
+      {
+        "service": "vehicle_positions",
+        "limit": 30,
+        "remaining": 28,
+        "windowSeconds": 60,
+        "backoffUntil": null
+      }
+    ],
+    "recentEvents": [
+      {
+        "eventId": "evt_vehicle_moved",
+        "type": "vehicle_moved",
+        "scope": "vehicle:SKY:Vehicle:12345",
+        "entityId": "SKY:Vehicle:12345",
+        "version": "2026-07-10T09:59:59Z",
+        "source": "current_vehicle",
+        "payload": {
+          "state": "live"
+        },
+        "createdAt": "2026-07-10T09:59:59Z"
+      }
+    ]
+  },
+  "meta": {
+    "requestId": "req_admin_status",
+    "updatedAt": "2026-07-10T10:00:00Z"
+  }
+}

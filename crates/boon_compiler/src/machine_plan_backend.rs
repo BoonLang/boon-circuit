@@ -3,7 +3,7 @@
 use boon_ir::{
     self as ir, BytesScalarArg, DerivedValueKind, FileBytesPath, InitialValue,
     ListAppendFieldValue, ListInitializer, ListOperationKind, ListPredicate, ListProjectionKind,
-    TypedProgram, UpdateExpression, UpdateGuard, UpdateValueExpression,
+    ListTextNormalization, TypedProgram, UpdateExpression, UpdateGuard, UpdateValueExpression,
 };
 use boon_parser::{
     AstCallArg, AstExpr, AstExprKind, AstStatement, AstStatementKind, BytesSizeSyntax,
@@ -123,15 +123,12 @@ fn bind_effect_outbox_invocations(
             .push(invocation.invocation_id);
     }
     for (effect_id, invocation_ids) in invocations {
-        let schema = schemas
+        if let Some(schema) = schemas
             .iter_mut()
             .find(|schema| schema.effect_id == effect_id)
-            .ok_or_else(|| {
-                PlanError::new(format!(
-                    "effect invocation for {effect_id} has no durable outbox schema"
-                ))
-            })?;
-        schema.bind_invocations(invocation_ids);
+        {
+            schema.bind_invocations(invocation_ids);
+        }
     }
     Ok(())
 }
@@ -215,9 +212,9 @@ fn host_effect_plan_op(
             declaration.operation
         ))
     })?;
-    let schema = builtin_effect_outbox_schema(&declaration.operation)?.ok_or_else(|| {
+    let schema = contract.schema.as_ref().ok_or_else(|| {
         PlanError::new(format!(
-            "typed host effect `{}` has no centralized outbox schema",
+            "typed host effect `{}` has no centralized typed schema",
             declaration.operation
         ))
     })?;
@@ -286,6 +283,8 @@ fn host_effect_plan_op(
                 declaration.name, field.name
             ))
         })?;
+        let input =
+            normalize_semantic_list_memory_value_ref(program, input, &schema_field.data_type);
         intent_fields.push(EffectIntentFieldPlan {
             name: schema_field.name.clone(),
             input,
@@ -377,6 +376,24 @@ fn host_effect_plan_op(
         indexed,
         0,
     ))
+}
+
+fn normalize_semantic_list_memory_value_ref(
+    program: &TypedProgram,
+    value_ref: ValueRef,
+    expected_type: &DataTypePlan,
+) -> ValueRef {
+    let ValueRef::Field(field_id) = value_ref else {
+        return value_ref;
+    };
+    if !matches!(expected_type, DataTypePlan::List { .. })
+        || field_has_derived_computation(program, field_id)
+    {
+        return ValueRef::Field(field_id);
+    }
+    list_id_for_semantic_list_memory_field(program, field_id)
+        .map(ValueRef::List)
+        .unwrap_or(ValueRef::Field(field_id))
 }
 
 fn host_effect_intent_value_ref(
@@ -473,6 +490,69 @@ fn output_root_plans(
         return Err(PlanError::new("typed output root names must be unique"));
     }
     Ok(outputs)
+}
+
+fn host_port_plans(
+    program: &TypedProgram,
+    outputs: &[OutputRootPlan],
+) -> Result<Vec<HostPortPlan>, PlanError> {
+    let source_id = |path: &str, line: usize| {
+        program
+            .sources
+            .iter()
+            .find(|source| source.path == path)
+            .map(|source| plan_source_id(source.id))
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "host port at line {line} references missing source `{path}`"
+                ))
+            })
+    };
+    let output_id = |name: &str, line: usize| {
+        outputs
+            .iter()
+            .find(|output| output.name == name)
+            .map(|output| output.id)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "host port at line {line} references missing output root `{name}`"
+                ))
+            })
+    };
+
+    program
+        .host_ports
+        .iter()
+        .map(|port| match port {
+            ir::HostPortDeclaration::HttpServer {
+                line,
+                request_source,
+                disconnect_source,
+                response_output,
+            } => Ok(HostPortPlan::HttpServer {
+                request_source: source_id(request_source, *line)?,
+                disconnect_source: disconnect_source
+                    .as_deref()
+                    .map(|source| source_id(source, *line))
+                    .transpose()?,
+                response_output: output_id(response_output, *line)?,
+            }),
+            ir::HostPortDeclaration::WebSocketServer {
+                line,
+                open_source,
+                message_source,
+                close_source,
+                error_source,
+                actions_output,
+            } => Ok(HostPortPlan::WebSocketServer {
+                open_source: source_id(open_source, *line)?,
+                message_source: source_id(message_source, *line)?,
+                close_source: source_id(close_source, *line)?,
+                error_source: source_id(error_source, *line)?,
+                actions_output: output_id(actions_output, *line)?,
+            }),
+        })
+        .collect()
 }
 
 fn statement_is_source_group(program: &TypedProgram, statement: &AstStatement) -> bool {
@@ -575,16 +655,7 @@ fn source_payload_descriptor_from_ir(
 ) -> SourcePayloadDescriptor {
     SourcePayloadDescriptor {
         field: source_payload_field_from_ir(&value.field),
-        value_type: source_payload_value_type_from_ir(value.value_type),
-    }
-}
-
-fn source_payload_value_type_from_ir(value: ir::SourcePayloadValueType) -> SourcePayloadValueType {
-    match value {
-        ir::SourcePayloadValueType::Bytes => SourcePayloadValueType::Bytes,
-        ir::SourcePayloadValueType::Bool => SourcePayloadValueType::Bool,
-        ir::SourcePayloadValueType::Number => SourcePayloadValueType::Number,
-        ir::SourcePayloadValueType::Text => SourcePayloadValueType::Text,
+        data_type: semantic_data_type_plan(&value.data_type).canonicalized(),
     }
 }
 
@@ -608,6 +679,7 @@ fn plan_value_type_from_initial(value: &InitialValue) -> PlanValueType {
             fixed_len: fixed_len.map(|len| len as u64),
         },
         InitialValue::Enum { .. } => PlanValueType::Enum,
+        InitialValue::Data { .. } => PlanValueType::Data,
         InitialValue::RootInitialField { .. } => PlanValueType::RootInitialField,
         InitialValue::RowInitialField { .. } => PlanValueType::RowInitialField,
         InitialValue::Unknown { .. } => PlanValueType::Unknown,
@@ -676,6 +748,7 @@ fn initial_value_kind_from_ir(value: &InitialValue) -> InitialValueKind {
         InitialValue::Bool { .. } => InitialValueKind::Bool,
         InitialValue::Bytes { .. } => InitialValueKind::Bytes,
         InitialValue::Enum { .. } => InitialValueKind::Enum,
+        InitialValue::Data { .. } => InitialValueKind::Data,
         InitialValue::RootInitialField { .. } => InitialValueKind::RootInitialField,
         InitialValue::RowInitialField { .. } => InitialValueKind::RowInitialField,
         InitialValue::Unknown { .. } => InitialValueKind::Unknown,
@@ -722,6 +795,7 @@ fn state_initial_provenance(slot: &ScalarStorageSlot) -> InitialProvenance {
         | InitialValueKind::Bool
         | InitialValueKind::Bytes
         | InitialValueKind::Enum
+        | InitialValueKind::Data
         | InitialValueKind::RootInitialField
         | InitialValueKind::RowInitialField => InitialProvenance::ReconstructableDefault,
     }
@@ -748,8 +822,8 @@ fn plan_value_type_from_semantic_data_type(data_type: &DataTypePlan) -> PlanValu
         DataTypePlan::Null
         | DataTypePlan::Record { .. }
         | DataTypePlan::List { .. }
-        | DataTypePlan::Error { .. }
-        | DataTypePlan::Unknown => PlanValueType::Unknown,
+        | DataTypePlan::Error { .. } => PlanValueType::Data,
+        DataTypePlan::Unknown => PlanValueType::Unknown,
     }
 }
 
@@ -761,6 +835,7 @@ fn initial_value_kind_from_plan_type(value_type: PlanValueType) -> InitialValueK
         PlanValueType::Bool => InitialValueKind::Bool,
         PlanValueType::Bytes { .. } => InitialValueKind::Bytes,
         PlanValueType::Enum => InitialValueKind::Enum,
+        PlanValueType::Data => InitialValueKind::Data,
         PlanValueType::RootInitialField => InitialValueKind::RootInitialField,
         PlanValueType::RowInitialField => InitialValueKind::RowInitialField,
         PlanValueType::Unknown => InitialValueKind::Unknown,
@@ -772,7 +847,9 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
         DataTypePlan::Text => Some(PlanConstantValue::Text {
             value: String::new(),
         }),
-        DataTypePlan::Number => Some(PlanConstantValue::Number { value: 0 }),
+        DataTypePlan::Number => Some(PlanConstantValue::Number {
+            value: FiniteReal::ZERO,
+        }),
         DataTypePlan::Byte => Some(PlanConstantValue::Byte { value: 0 }),
         DataTypePlan::Bool => Some(PlanConstantValue::Bool { value: false }),
         DataTypePlan::Bytes {
@@ -1453,6 +1530,7 @@ fn data_type_plan_from_initial_value(value: &InitialValue) -> Option<DataTypePla
                 open: false,
             }],
         },
+        InitialValue::Data { value } => data_type_plan_from_data(value),
         InitialValue::RootInitialField { .. }
         | InitialValue::RowInitialField { .. }
         | InitialValue::Unknown { .. } => return None,
@@ -1557,6 +1635,7 @@ fn data_type_plan_for_value_ref(
         PlanValueType::Enum => DataTypePlan::Variant {
             variants: Vec::new(),
         },
+        PlanValueType::Data => return None,
         PlanValueType::RootInitialField
         | PlanValueType::RowInitialField
         | PlanValueType::Unknown => return None,
@@ -1585,24 +1664,27 @@ fn plan_value_type_for_value_ref(
                 .sources
                 .iter()
                 .find(|source| plan_source_id(source.id) == *source_id)?;
-            source
+            let typed = source
                 .payload_schema
                 .typed_fields
                 .iter()
                 .find(|descriptor| source_payload_field_from_ir(&descriptor.field) == *field)
-                .map(|descriptor| match descriptor.value_type {
-                    ir::SourcePayloadValueType::Bytes => PlanValueType::Bytes { fixed_len: None },
-                    ir::SourcePayloadValueType::Bool => PlanValueType::Bool,
-                    ir::SourcePayloadValueType::Number => PlanValueType::Number,
-                    ir::SourcePayloadValueType::Text => PlanValueType::Text,
-                })
-                .unwrap_or_else(|| match field {
+                .map(|descriptor| {
+                    plan_value_type_from_semantic_data_type(&semantic_data_type_plan(
+                        &descriptor.data_type,
+                    ))
+                });
+            match typed {
+                Some(PlanValueType::Unknown) => return None,
+                Some(value_type) => value_type,
+                None => match field {
                     SourcePayloadField::Bytes => PlanValueType::Bytes { fixed_len: None },
                     SourcePayloadField::Key => PlanValueType::Number,
                     SourcePayloadField::Address
                     | SourcePayloadField::Named(_)
                     | SourcePayloadField::Text => PlanValueType::Text,
-                })
+                },
+            }
         }
         ValueRef::Constant(_) | ValueRef::List(_) => return None,
     })
@@ -1965,9 +2047,9 @@ impl MigrationExpressionLowerer<'_> {
                 })
             }
             AstExprKind::Number(value) => Ok(MigrationExpressionPlan::Number {
-                value: value.parse::<i64>().map_err(|_| {
+                value: value.parse::<FiniteReal>().map_err(|error| {
                     PlanError::new(format!(
-                        "migration numeric literal `{value}` is not a target-neutral integer"
+                        "migration numeric literal `{value}` is not a finite canonical Number: {error}"
                     ))
                 })?,
             }),
@@ -2928,6 +3010,7 @@ pub fn compile_typed_program(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> Result<MachinePlan, PlanError> {
+    validate_number_literals(program)?;
     let effects = effect_contracts(program)?;
     let mut effect_outbox = effect_outbox_schemas(&effects)?;
     let row_initial_field_types = row_initial_field_value_types(program);
@@ -3398,6 +3481,7 @@ pub fn compile_typed_program(
         })
         .collect::<Vec<_>>();
 
+    let mut query_indexes = BTreeMap::<QueryIndexId, QueryIndexPlan>::new();
     let list_projection_ops = program
         .list_projections
         .iter()
@@ -3442,6 +3526,385 @@ pub fn compile_typed_program(
                         field: field.clone(),
                         value,
                     })
+                }
+                (
+                    ListProjectionKind::IndexedQuery {
+                        fields,
+                        selection,
+                        residual,
+                        limit: Some(limit),
+                        cursor,
+                        unique,
+                        order,
+                    },
+                    _,
+                    Some(source_list),
+                ) if *limit > 0 && *limit <= boon_query::MAX_QUERY_LIMIT => {
+                    let row_type = query_row_data_type(program, &index, source_list);
+                    if row_type.is_none() || fields.is_empty() {
+                        unresolved += 1;
+                        unresolved_refs
+                            .insert(format!("{}.List/query.index_projection", projection.target));
+                    }
+                    let row_schema_hash = row_type
+                        .as_ref()
+                        .and_then(|row_type| data_type_fingerprint(row_type).ok());
+                    let mut query_fields = Vec::new();
+                    if let Some(row_type) = row_type.as_ref() {
+                        for field in fields {
+                            let Some(root) = field.path.first() else {
+                                unresolved += 1;
+                                unresolved_refs
+                                    .insert(format!("{}.List/query.fields", projection.target));
+                                continue;
+                            };
+                            let Some(field_id) =
+                                row_input_field_id_for_list_id(program, source_list, root)
+                            else {
+                                unresolved += 1;
+                                unresolved_refs.insert(format!(
+                                    "{}.{}",
+                                    projection.list,
+                                    field.path.join(".")
+                                ));
+                                continue;
+                            };
+                            let Some(key_type) =
+                                query_key_type(row_type, &field.path, field.multi_value)
+                            else {
+                                unresolved += 1;
+                                unresolved_refs.insert(format!(
+                                    "{}.List/query.unsupported_key_type.{}",
+                                    projection.target,
+                                    field.path.join(".")
+                                ));
+                                continue;
+                            };
+                            let normalization = match &field.normalization {
+                                ListTextNormalization::Exact => Some(QueryTextNormalization::Exact),
+                                ListTextNormalization::TrimLowercase => {
+                                    Some(QueryTextNormalization::TrimLowercase)
+                                }
+                                ListTextNormalization::Tokens => {
+                                    Some(QueryTextNormalization::Tokens)
+                                }
+                                ListTextNormalization::Unknown { value } => {
+                                    unresolved += 1;
+                                    unresolved_refs.insert(format!(
+                                        "{}.List/query.normalization.{value}",
+                                        projection.target
+                                    ));
+                                    None
+                                }
+                            };
+                            if normalization == Some(QueryTextNormalization::Tokens)
+                                && key_type != QueryKeyType::Text
+                            {
+                                unresolved += 1;
+                                unresolved_refs.insert(format!(
+                                    "{}.List/query.tokens_require_text.{}",
+                                    projection.target,
+                                    field.path.join(".")
+                                ));
+                                continue;
+                            }
+                            if let Some(normalization) = normalization {
+                                query_fields.push(QueryIndexFieldPlan {
+                                    field: field_id,
+                                    path: field.path.clone(),
+                                    semantic_path: format!(
+                                        "{}.{}",
+                                        projection.list,
+                                        field.path.join(".")
+                                    ),
+                                    key_type,
+                                    normalization,
+                                    multi_value: field.multi_value,
+                                });
+                            }
+                        }
+                    }
+                    let order = match order {
+                        ir::ListQueryOrder::Ascending => Some(QueryIndexOrder::Ascending),
+                        ir::ListQueryOrder::Descending => Some(QueryIndexOrder::Descending),
+                        ir::ListQueryOrder::Unknown { value } => {
+                            unresolved += 1;
+                            unresolved_refs
+                                .insert(format!("{}.List/query.order.{value}", projection.target));
+                            None
+                        }
+                    };
+                    let selection = match selection {
+                        ir::ListQuerySelection::Exact { key } => resolve_query_ref(
+                            &index,
+                            key,
+                            &mut inputs,
+                            &mut unresolved,
+                            &mut unresolved_refs,
+                        )
+                        .map(|key| PlanQuerySelection::Exact { key }),
+                        ir::ListQuerySelection::TextPrefix { leading, prefix } => {
+                            let leading = leading.as_ref().and_then(|leading| {
+                                resolve_query_ref(
+                                    &index,
+                                    leading,
+                                    &mut inputs,
+                                    &mut unresolved,
+                                    &mut unresolved_refs,
+                                )
+                            });
+                            resolve_query_ref(
+                                &index,
+                                prefix,
+                                &mut inputs,
+                                &mut unresolved,
+                                &mut unresolved_refs,
+                            )
+                            .map(|prefix| PlanQuerySelection::TextPrefix { leading, prefix })
+                        }
+                        ir::ListQuerySelection::Range {
+                            lower,
+                            lower_inclusive,
+                            upper,
+                            upper_inclusive,
+                        } => {
+                            let lower = lower.as_ref().and_then(|lower| {
+                                resolve_query_ref(
+                                    &index,
+                                    lower,
+                                    &mut inputs,
+                                    &mut unresolved,
+                                    &mut unresolved_refs,
+                                )
+                            });
+                            let upper = upper.as_ref().and_then(|upper| {
+                                resolve_query_ref(
+                                    &index,
+                                    upper,
+                                    &mut inputs,
+                                    &mut unresolved,
+                                    &mut unresolved_refs,
+                                )
+                            });
+                            Some(PlanQuerySelection::Range {
+                                lower,
+                                lower_inclusive: *lower_inclusive,
+                                upper,
+                                upper_inclusive: *upper_inclusive,
+                            })
+                        }
+                        ir::ListQuerySelection::Union { keys } => resolve_query_ref(
+                            &index,
+                            keys,
+                            &mut inputs,
+                            &mut unresolved,
+                            &mut unresolved_refs,
+                        )
+                        .map(|keys| PlanQuerySelection::Union { keys }),
+                        ir::ListQuerySelection::Intersection { keys } => resolve_query_ref(
+                            &index,
+                            keys,
+                            &mut inputs,
+                            &mut unresolved,
+                            &mut unresolved_refs,
+                        )
+                        .map(|keys| PlanQuerySelection::Intersection { keys }),
+                        ir::ListQuerySelection::Unknown { value } => {
+                            unresolved += 1;
+                            unresolved_refs
+                                .insert(format!("{}.List/query.select.{value}", projection.target));
+                            None
+                        }
+                    };
+                    let residual = residual.as_ref().and_then(|residual| {
+                        plan_query_residual(
+                            residual,
+                            &index,
+                            &mut inputs,
+                            &mut unresolved,
+                            &mut unresolved_refs,
+                        )
+                    });
+                    let cursor = cursor.as_ref().and_then(|cursor| {
+                        resolve_query_ref(
+                            &index,
+                            cursor,
+                            &mut inputs,
+                            &mut unresolved,
+                            &mut unresolved_refs,
+                        )
+                    });
+                    match (
+                        row_schema_hash,
+                        (query_fields.len() == fields.len()).then_some(query_fields),
+                        order,
+                        selection,
+                    ) {
+                        (
+                            Some(row_schema_hash),
+                            Some(query_fields),
+                            Some(order),
+                            Some(selection),
+                        ) => {
+                            match QueryIndexPlan::new(
+                                source_list,
+                                projection.list.clone(),
+                                row_schema_hash,
+                                query_fields,
+                                *unique,
+                                order,
+                            ) {
+                                Ok(query_index) => {
+                                    query_indexes
+                                        .entry(query_index.id)
+                                        .or_insert_with(|| query_index.clone());
+                                    Some(PlanListProjection::IndexedQuery {
+                                        index: query_index.id,
+                                        source_list,
+                                        selection,
+                                        residual: residual.into_iter().collect(),
+                                        limit: *limit,
+                                        cursor,
+                                    })
+                                }
+                                Err(error) => {
+                                    unresolved += 1;
+                                    unresolved_refs.insert(format!(
+                                        "{}.List/query.index.{error}",
+                                        projection.target
+                                    ));
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+                (ListProjectionKind::IndexedQuery { limit, .. }, _, _) => {
+                    unresolved += 1;
+                    unresolved_refs.insert(format!(
+                        "{}.List/query.{}",
+                        projection.target,
+                        if limit.is_some() {
+                            "source_or_contract"
+                        } else {
+                            "limit"
+                        }
+                    ));
+                    None
+                }
+                (
+                    ListProjectionKind::TextPrefix {
+                        field,
+                        prefix,
+                        limit: Some(limit),
+                        normalization,
+                    },
+                    _,
+                    Some(source_list),
+                ) if *limit > 0 => {
+                    let prefix_ref = match index.resolve(prefix) {
+                        Some(value_ref) => {
+                            inputs.push(value_ref.clone());
+                            Some(value_ref)
+                        }
+                        None => {
+                            unresolved += 1;
+                            unresolved_refs.insert(prefix.clone());
+                            None
+                        }
+                    };
+                    let field_id = row_input_field_id_for_list_id(program, source_list, field);
+                    if field_id.is_none() {
+                        unresolved += 1;
+                        unresolved_refs.insert(format!("{}.{}", projection.list, field));
+                    }
+                    let normalization = match normalization {
+                        ListTextNormalization::Exact => Some(QueryTextNormalization::Exact),
+                        ListTextNormalization::TrimLowercase => {
+                            Some(QueryTextNormalization::TrimLowercase)
+                        }
+                        ListTextNormalization::Tokens => Some(QueryTextNormalization::Tokens),
+                        ListTextNormalization::Unknown { value } => {
+                            unresolved += 1;
+                            unresolved_refs.insert(format!(
+                                "{}.List/query_prefix.normalization.{value}",
+                                projection.target
+                            ));
+                            None
+                        }
+                    };
+                    match (prefix_ref, field_id, normalization) {
+                        (Some(prefix), Some(field_id), Some(normalization)) => {
+                            let row_type = query_row_data_type(program, &index, source_list);
+                            let row_schema_hash = row_type
+                                .as_ref()
+                                .and_then(|row_type| data_type_fingerprint(row_type).ok());
+                            let key_type = row_type.as_ref().and_then(|row_type| {
+                                query_key_type(row_type, std::slice::from_ref(field), false)
+                            });
+                            let query_index = match (row_schema_hash, key_type) {
+                                (Some(row_schema_hash), Some(key_type)) => QueryIndexPlan::new(
+                                    source_list,
+                                    projection.list.clone(),
+                                    row_schema_hash,
+                                    vec![QueryIndexFieldPlan {
+                                        field: field_id,
+                                        path: vec![field.clone()],
+                                        semantic_path: format!("{}.{}", projection.list, field),
+                                        key_type,
+                                        normalization,
+                                        multi_value: false,
+                                    }],
+                                    false,
+                                    QueryIndexOrder::Ascending,
+                                )
+                                .ok(),
+                                _ => None,
+                            };
+                            let query_index = match query_index {
+                                Some(query_index) => query_index,
+                                None => {
+                                    unresolved += 1;
+                                    unresolved_refs.insert(format!(
+                                        "{}.List/query_prefix.index",
+                                        projection.target
+                                    ));
+                                    return op(
+                                        &mut next_op,
+                                        PlanOpKind::ListProjection {
+                                            projection: PlanListProjection::Unknown {
+                                                summary: projection.target.clone(),
+                                            },
+                                        },
+                                        unique_value_refs(inputs),
+                                        output,
+                                        true,
+                                        unresolved,
+                                    );
+                                }
+                            };
+                            query_indexes
+                                .entry(query_index.id)
+                                .or_insert_with(|| query_index.clone());
+                            Some(PlanListProjection::TextPrefix {
+                                index: query_index.id,
+                                source_list,
+                                prefix,
+                                limit: *limit,
+                            })
+                        }
+                        _ => None,
+                    }
+                }
+                (ListProjectionKind::TextPrefix { limit, .. }, _, _) => {
+                    unresolved += 1;
+                    unresolved_refs.insert(format!(
+                        "{}.List/query_prefix.{}",
+                        projection.target,
+                        if limit.is_some() { "source" } else { "limit" }
+                    ));
+                    None
                 }
                 (
                     ListProjectionKind::Chunk {
@@ -3542,6 +4005,12 @@ pub fn compile_typed_program(
     let document =
         super::document_plan_backend::compile_document_plan(program, &executable_fields)?;
     let outputs = output_root_plans(program, document.as_ref(), &index)?;
+    let host_ports = host_port_plans(program, &outputs)?;
+    let program_role = if document.is_none() && !outputs.is_empty() {
+        boon_plan::ProgramRole::Server
+    } else {
+        boon_plan::ProgramRole::Document
+    };
 
     let operation_count = regions.iter().map(|region| region.ops.len()).sum::<usize>();
     let unresolved_executable_ref_count = regions
@@ -3598,14 +4067,34 @@ pub fn compile_typed_program(
         effect_outbox,
         migration_predecessors,
     )?;
+    let query_indexes = query_indexes.into_values().collect::<Vec<_>>();
+    let query_collections = query_indexes
+        .iter()
+        .map(|index| {
+            let collection = QueryCollectionPlan::new(
+                index.source_list,
+                index.source_semantic_path.clone(),
+                index.row_schema_hash,
+                schema_version,
+                QueryRetentionPlan::KeepAll,
+            )?;
+            Ok((collection.id, collection))
+        })
+        .collect::<Result<BTreeMap<_, _>, PlanError>>()?
+        .into_values()
+        .collect();
 
     let mut plan = MachinePlan {
         version: PlanVersion::default(),
         target_profile,
+        program_role,
         application,
         persistence,
         effects,
         outputs,
+        host_ports,
+        query_collections,
+        query_indexes,
         demand: demand_plan(program),
         document,
         constants,
@@ -3726,6 +4215,20 @@ pub fn compile_typed_program(
     Ok(plan)
 }
 
+fn validate_number_literals(program: &TypedProgram) -> Result<(), PlanError> {
+    for expression in &program.expressions {
+        let AstExprKind::Number(literal) = &expression.kind else {
+            continue;
+        };
+        literal.parse::<FiniteReal>().map_err(|error| {
+            PlanError::new(format!(
+                "numeric literal `{literal}` is not a finite canonical Number: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 fn include_output_root_demand(plan: &mut MachinePlan) {
     let indexed = plan
         .storage_layout
@@ -3791,7 +4294,9 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
         InitialValue::Text { value } => Some(PlanConstantValue::Text {
             value: value.clone(),
         }),
-        InitialValue::Number { value } => Some(PlanConstantValue::Number { value: *value }),
+        InitialValue::Number { value } => Some(PlanConstantValue::Number {
+            value: value.parse().ok()?,
+        }),
         InitialValue::Byte { value } => Some(PlanConstantValue::Byte { value: *value }),
         InitialValue::Bool { value } => Some(PlanConstantValue::Bool { value: *value }),
         InitialValue::Bytes { bytes, .. } => {
@@ -3804,6 +4309,9 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
             })
         }
         InitialValue::Enum { value } => Some(PlanConstantValue::Enum {
+            value: value.clone(),
+        }),
+        InitialValue::Data { value } => Some(PlanConstantValue::Data {
             value: value.clone(),
         }),
         InitialValue::RootInitialField { .. }
@@ -3820,6 +4328,7 @@ fn initial_value_kind_from_constant(value: &PlanConstantValue) -> InitialValueKi
         PlanConstantValue::Bool { .. } => InitialValueKind::Bool,
         PlanConstantValue::Bytes { .. } => InitialValueKind::Bytes,
         PlanConstantValue::Enum { .. } => InitialValueKind::Enum,
+        PlanConstantValue::Data { .. } => InitialValueKind::Data,
     }
 }
 
@@ -3842,7 +4351,7 @@ fn constant_initial_expression_value_inner(
             })
         }
         AstExprKind::Number(value) => value
-            .parse::<i64>()
+            .parse()
             .ok()
             .map(|value| PlanConstantValue::Number { value }),
         AstExprKind::ByteLiteral { value, .. } => Some(PlanConstantValue::Byte { value: *value }),
@@ -4372,13 +4881,18 @@ fn source_payload_value_type_lookup(
     let mut payload_types = BTreeMap::new();
     for source in &program.sources {
         for descriptor in &source.payload_schema.typed_fields {
-            payload_types.insert(
-                (
-                    source.path.clone(),
-                    source_payload_field_from_ir(&descriptor.field),
-                ),
-                plan_value_type_from_source_payload_type(descriptor.value_type),
-            );
+            let value_type = plan_value_type_from_semantic_data_type(&semantic_data_type_plan(
+                &descriptor.data_type,
+            ));
+            if value_type != PlanValueType::Unknown {
+                payload_types.insert(
+                    (
+                        source.path.clone(),
+                        source_payload_field_from_ir(&descriptor.field),
+                    ),
+                    value_type,
+                );
+            }
         }
     }
     payload_types
@@ -4429,23 +4943,13 @@ fn update_expression_output_type_for_root_initial(
         | UpdateExpression::BytesWriteSigned { .. }
         | UpdateExpression::FileReadBytes { .. } => Some(PlanValueType::Bytes { fixed_len: None }),
         UpdateExpression::PreviousValue { .. }
+        | UpdateExpression::ListGet { .. }
         | UpdateExpression::MatchConst { .. }
         | UpdateExpression::MatchValueConst { .. }
         | UpdateExpression::MatchTextIsEmptyConst { .. }
         | UpdateExpression::MatchInfixConst { .. }
         | UpdateExpression::ListFindValue { .. }
         | UpdateExpression::Unknown { .. } => None,
-    }
-}
-
-fn plan_value_type_from_source_payload_type(
-    value_type: ir::SourcePayloadValueType,
-) -> PlanValueType {
-    match value_type {
-        ir::SourcePayloadValueType::Bytes => PlanValueType::Bytes { fixed_len: None },
-        ir::SourcePayloadValueType::Bool => PlanValueType::Bool,
-        ir::SourcePayloadValueType::Number => PlanValueType::Number,
-        ir::SourcePayloadValueType::Text => PlanValueType::Text,
     }
 }
 
@@ -4503,7 +5007,60 @@ fn plan_value_type_is_concrete(value_type: PlanValueType) -> bool {
             | PlanValueType::Bool
             | PlanValueType::Bytes { .. }
             | PlanValueType::Enum
+            | PlanValueType::Data
     )
+}
+
+fn data_type_plan_from_data(value: &boon_data::Value) -> DataTypePlan {
+    match value {
+        boon_data::Value::Null => DataTypePlan::Null,
+        boon_data::Value::Bool(_) => DataTypePlan::Bool,
+        boon_data::Value::Number(_) => DataTypePlan::Number,
+        boon_data::Value::Text(_) => DataTypePlan::Text,
+        boon_data::Value::Bytes(_) => DataTypePlan::Bytes { fixed_len: None },
+        boon_data::Value::List(values) => {
+            let item = values
+                .first()
+                .map(data_type_plan_from_data)
+                .unwrap_or(DataTypePlan::Unknown);
+            DataTypePlan::List {
+                item: Box::new(item),
+            }
+        }
+        boon_data::Value::Record(fields) => DataTypePlan::Record {
+            fields: fields
+                .iter()
+                .map(|(name, value)| DataTypeFieldPlan {
+                    name: name.clone(),
+                    data_type: data_type_plan_from_data(value),
+                })
+                .collect(),
+            open: false,
+        },
+        boon_data::Value::Variant { tag, fields } => DataTypePlan::Variant {
+            variants: vec![DataVariantPlan {
+                tag: tag.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(name, value)| DataTypeFieldPlan {
+                        name: name.clone(),
+                        data_type: data_type_plan_from_data(value),
+                    })
+                    .collect(),
+                open: false,
+            }],
+        },
+        boon_data::Value::Error { fields, .. } => DataTypePlan::Error {
+            fields: fields
+                .iter()
+                .map(|(name, value)| DataTypeFieldPlan {
+                    name: name.clone(),
+                    data_type: data_type_plan_from_data(value),
+                })
+                .collect(),
+            open: false,
+        },
+    }
 }
 
 fn expression_value_type_lookup(program: &TypedProgram) -> BTreeMap<usize, PlanValueType> {
@@ -4762,6 +5319,10 @@ fn inferred_builtin_call_value_type(
         | "Number/min"
         | "Number/max"
         | "Number/bit_width"
+        | "Number/ceil"
+        | "Number/floor"
+        | "Number/round"
+        | "Number/truncate"
         | "Number/interpolate"
         | "Number/project_width"
         | "Number/project_offset"
@@ -4960,6 +5521,319 @@ fn row_input_field_id_for_list_id(
     storage_input_field_id(program, &list.name, field_name, &synthetic_field_ids)
 }
 
+fn query_row_data_type(
+    program: &TypedProgram,
+    index: &ValueIndex,
+    list_id: ListId,
+) -> Option<DataTypePlan> {
+    let list = program
+        .lists
+        .iter()
+        .find(|list| plan_list_id(list.id) == list_id)?;
+    let semantic_row = program
+        .semantic_memory
+        .iter()
+        .find(|memory| {
+            matches!(
+                memory.runtime_backing,
+                ir::SemanticMemoryRuntimeBacking::List { list_id: owner, .. } if owner == list.id
+            )
+        })
+        .and_then(|memory| {
+            let DataTypePlan::List { item } =
+                semantic_data_type_plan(&memory.data_type).canonicalized()
+            else {
+                return None;
+            };
+            matches!(&*item, DataTypePlan::Record { fields, .. } if !fields.is_empty())
+                .then_some(*item)
+        });
+    let synthetic = synthetic_initial_list_field_ids(program);
+    let runtime_row = list_row_field_ids(program, list, &synthetic)
+        .into_iter()
+        .map(|field_id| {
+            let name = program
+                .semantic_index
+                .fields
+                .iter()
+                .find(|field| plan_field_id(field.id) == field_id)
+                .map(|field| {
+                    field
+                        .path
+                        .rsplit_once('.')
+                        .map_or_else(|| field.path.clone(), |(_, name)| name.to_owned())
+                })
+                .or_else(|| {
+                    synthetic.iter().find_map(|((owner, name), candidate)| {
+                        (owner == &list.name && *candidate == field_id).then(|| name.clone())
+                    })
+                })?;
+            let data_type =
+                data_type_plan_for_value_ref(program, index, &ValueRef::Field(field_id))?;
+            Some(DataTypeFieldPlan { name, data_type })
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|fields| !fields.is_empty())
+        .map(|fields| {
+            DataTypePlan::Record {
+                fields,
+                open: false,
+            }
+            .canonicalized()
+        });
+    let initializer_row = match &list.initializer {
+        ListInitializer::RecordLiteral { rows } => {
+            let mut fields = BTreeMap::<String, DataTypePlan>::new();
+            for field in rows.iter().flat_map(|row| &row.fields) {
+                let data_type = data_type_plan_from_initial_value(&field.value)?;
+                match fields.entry(field.name.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(data_type);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        *entry.get_mut() = merge_query_data_types(entry.get(), &data_type)?;
+                    }
+                }
+            }
+            (!fields.is_empty()).then(|| DataTypePlan::Record {
+                fields: fields
+                    .into_iter()
+                    .map(|(name, data_type)| DataTypeFieldPlan { name, data_type })
+                    .collect(),
+                open: false,
+            })
+        }
+        ListInitializer::Range { .. } => Some(DataTypePlan::Record {
+            fields: vec![
+                DataTypeFieldPlan {
+                    name: "index".to_owned(),
+                    data_type: DataTypePlan::Number,
+                },
+                DataTypeFieldPlan {
+                    name: "value".to_owned(),
+                    data_type: DataTypePlan::Number,
+                },
+            ],
+            open: false,
+        }),
+        ListInitializer::Empty | ListInitializer::Unknown { .. } => {
+            let fields = list_append_authoritative_field_types(program, index, &list.name).ok()?;
+            (!fields.is_empty()).then(|| DataTypePlan::Record {
+                fields: fields
+                    .into_iter()
+                    .map(|(name, data_type)| DataTypeFieldPlan { name, data_type })
+                    .collect(),
+                open: false,
+            })
+        }
+    };
+    let mut merged = None;
+    for next in [semantic_row, runtime_row, initializer_row]
+        .into_iter()
+        .flatten()
+    {
+        merged = Some(match merged {
+            Some(current) => merge_query_data_types(&current, &next)?,
+            None => next,
+        });
+    }
+    merged
+}
+
+fn merge_query_data_types(left: &DataTypePlan, right: &DataTypePlan) -> Option<DataTypePlan> {
+    if left == right {
+        return Some(left.clone());
+    }
+    match (left, right) {
+        (DataTypePlan::Variant { variants: left }, DataTypePlan::Variant { variants: right }) => {
+            let mut variants = left
+                .iter()
+                .map(|variant| (variant.tag.clone(), variant.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for variant in right {
+                if variants
+                    .insert(variant.tag.clone(), variant.clone())
+                    .is_some_and(|previous| previous != *variant)
+                {
+                    return None;
+                }
+            }
+            Some(DataTypePlan::Variant {
+                variants: variants.into_values().collect(),
+            })
+        }
+        (DataTypePlan::List { item: left }, DataTypePlan::List { item: right }) => {
+            Some(DataTypePlan::List {
+                item: Box::new(merge_query_data_types(left, right)?),
+            })
+        }
+        (
+            DataTypePlan::Record {
+                fields: left,
+                open: left_open,
+            },
+            DataTypePlan::Record {
+                fields: right,
+                open: right_open,
+            },
+        ) => {
+            let mut fields = left
+                .iter()
+                .map(|field| (field.name.clone(), field.data_type.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for field in right {
+                match fields.entry(field.name.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(field.data_type.clone());
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        *entry.get_mut() = merge_query_data_types(entry.get(), &field.data_type)?;
+                    }
+                }
+            }
+            Some(DataTypePlan::Record {
+                fields: fields
+                    .into_iter()
+                    .map(|(name, data_type)| DataTypeFieldPlan { name, data_type })
+                    .collect(),
+                open: *left_open || *right_open,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn query_path_data_type<'a>(
+    mut data_type: &'a DataTypePlan,
+    path: &[String],
+) -> Option<&'a DataTypePlan> {
+    for component in path {
+        let DataTypePlan::Record { fields, .. } = data_type else {
+            return None;
+        };
+        data_type = &fields
+            .iter()
+            .find(|field| field.name == *component)?
+            .data_type;
+    }
+    Some(data_type)
+}
+
+fn query_key_type(
+    row_type: &DataTypePlan,
+    path: &[String],
+    multi_value: bool,
+) -> Option<QueryKeyType> {
+    let mut data_type = query_path_data_type(row_type, path)?;
+    if multi_value {
+        let DataTypePlan::List { item } = data_type else {
+            return None;
+        };
+        data_type = item;
+    }
+    Some(match data_type {
+        DataTypePlan::Bool => QueryKeyType::Bool,
+        DataTypePlan::Number | DataTypePlan::Byte => QueryKeyType::Number,
+        DataTypePlan::Text => QueryKeyType::Text,
+        DataTypePlan::Variant { variants }
+            if !variants.is_empty()
+                && variants
+                    .iter()
+                    .all(|variant| variant.fields.is_empty() && !variant.open) =>
+        {
+            QueryKeyType::Tag
+        }
+        _ => return None,
+    })
+}
+
+fn plan_query_residual(
+    residual: &ir::ListQueryResidual,
+    index: &ValueIndex,
+    inputs: &mut Vec<ValueRef>,
+    unresolved_count: &mut usize,
+    unresolved: &mut BTreeSet<String>,
+) -> Option<PlanQueryResidual> {
+    let path_is_valid =
+        |path: &[String]| !path.is_empty() && path.iter().all(|part| !part.is_empty());
+    match residual {
+        ir::ListQueryResidual::FieldEqual { path, value } if path_is_valid(path) => {
+            resolve_query_ref(index, value, inputs, unresolved_count, unresolved).map(|value| {
+                PlanQueryResidual::FieldEqual {
+                    path: path.clone(),
+                    value,
+                }
+            })
+        }
+        ir::ListQueryResidual::TextContains { path, needle } if path_is_valid(path) => {
+            resolve_query_ref(index, needle, inputs, unresolved_count, unresolved).map(|needle| {
+                PlanQueryResidual::TextContains {
+                    path: path.clone(),
+                    needle,
+                }
+            })
+        }
+        ir::ListQueryResidual::NumberRange {
+            path,
+            minimum,
+            maximum,
+        } if path_is_valid(path) && (minimum.is_some() || maximum.is_some()) => {
+            let minimum = minimum.as_ref().and_then(|value| {
+                resolve_query_ref(index, value, inputs, unresolved_count, unresolved)
+            });
+            let maximum = maximum.as_ref().and_then(|value| {
+                resolve_query_ref(index, value, inputs, unresolved_count, unresolved)
+            });
+            Some(PlanQueryResidual::NumberRange {
+                path: path.clone(),
+                minimum,
+                maximum,
+            })
+        }
+        ir::ListQueryResidual::Wgs84Radius {
+            latitude_path,
+            longitude_path,
+            center_latitude,
+            center_longitude,
+            radius_meters,
+        } if path_is_valid(latitude_path) && path_is_valid(longitude_path) => {
+            let center_latitude =
+                resolve_query_ref(index, center_latitude, inputs, unresolved_count, unresolved);
+            let center_longitude = resolve_query_ref(
+                index,
+                center_longitude,
+                inputs,
+                unresolved_count,
+                unresolved,
+            );
+            let radius_meters =
+                resolve_query_ref(index, radius_meters, inputs, unresolved_count, unresolved);
+            match (center_latitude, center_longitude, radius_meters) {
+                (Some(center_latitude), Some(center_longitude), Some(radius_meters)) => {
+                    Some(PlanQueryResidual::Wgs84Radius {
+                        latitude_path: latitude_path.clone(),
+                        longitude_path: longitude_path.clone(),
+                        center_latitude,
+                        center_longitude,
+                        radius_meters,
+                    })
+                }
+                _ => None,
+            }
+        }
+        ir::ListQueryResidual::Unknown { value } => {
+            *unresolved_count += 1;
+            unresolved.insert(format!("List/query.residual.{value}"));
+            None
+        }
+        _ => {
+            *unresolved_count += 1;
+            unresolved.insert("List/query.residual.invalid".to_owned());
+            None
+        }
+    }
+}
+
 fn list_row_field_ids(
     program: &TypedProgram,
     list: &boon_ir::ListMemory,
@@ -5026,7 +5900,7 @@ fn synthetic_initial_list_field_ids(program: &TypedProgram) -> BTreeMap<(String,
                         });
                 }
             }
-            ListInitializer::Empty if list_has_runtime_constructor_map(program, list) => {
+            ListInitializer::Empty | ListInitializer::Unknown { .. } => {
                 for field in program
                     .list_operations
                     .iter()
@@ -5045,7 +5919,6 @@ fn synthetic_initial_list_field_ids(program: &TypedProgram) -> BTreeMap<(String,
                         });
                 }
             }
-            ListInitializer::Empty | ListInitializer::Unknown { .. } => {}
         }
     }
     ids
@@ -5130,13 +6003,30 @@ fn append_constant_value(value: &str) -> PlanConstantValue {
     match value {
         "True" => PlanConstantValue::Bool { value: true },
         "False" => PlanConstantValue::Bool { value: false },
-        _ => value
-            .parse::<i64>()
-            .map(|value| PlanConstantValue::Number { value })
-            .unwrap_or_else(|_| PlanConstantValue::Text {
-                value: value.to_owned(),
-            }),
+        _ => plan_number_constant(value).unwrap_or_else(|| PlanConstantValue::Text {
+            value: value.to_owned(),
+        }),
     }
+}
+
+fn plan_number_constant(value: &str) -> Option<PlanConstantValue> {
+    value
+        .parse()
+        .ok()
+        .map(|value| PlanConstantValue::Number { value })
+}
+
+fn plan_integer_constant(value: i64) -> Option<PlanConstantValue> {
+    FiniteReal::from_i64_exact(value)
+        .ok()
+        .map(|value| PlanConstantValue::Number { value })
+}
+
+fn push_integer_plan_constant(
+    constants: &mut Vec<PlanConstant>,
+    value: i64,
+) -> Option<PlanConstantId> {
+    Some(push_plan_constant(constants, plan_integer_constant(value)?))
 }
 
 fn derived_expression_for_value(
@@ -5325,7 +6215,9 @@ fn source_event_transform_fresh_value(
         Some(PlanValueType::Text) => PlanConstantValue::Text {
             value: String::new(),
         },
-        Some(PlanValueType::Number) => PlanConstantValue::Number { value: 0 },
+        Some(PlanValueType::Number) => PlanConstantValue::Number {
+            value: FiniteReal::ZERO,
+        },
         Some(PlanValueType::Byte) => PlanConstantValue::Byte { value: 0 },
         Some(PlanValueType::Bool) => PlanConstantValue::Bool { value: false },
         Some(PlanValueType::Bytes { fixed_len }) => {
@@ -5355,6 +6247,9 @@ fn source_event_transform_fresh_value(
             .unwrap_or_else(|| PlanConstantValue::Text {
                 value: String::new(),
             }),
+        Some(PlanValueType::Data) => PlanConstantValue::Data {
+            value: boon_data::Value::Null,
+        },
         Some(
             PlanValueType::RootInitialField
             | PlanValueType::RowInitialField
@@ -6072,7 +6967,7 @@ fn number_compare_const_derived_expression(
     let AstExprKind::Number(right_value) = &right_expr.kind else {
         return None;
     };
-    let right = right_value.parse::<i64>().ok()?;
+    let right = right_value.parse::<FiniteReal>().ok()?;
     let canonical_path = canonical_sibling_path(&derived.path, &left_path);
     let left = index.resolve(&canonical_path)?;
     inputs.push(left.clone());
@@ -6189,7 +7084,7 @@ fn lower_root_bool_expr(
             let AstExprKind::Number(right_value) = &right_expr.kind else {
                 return None;
             };
-            let right = right_value.parse::<i64>().ok()?;
+            let right = right_value.parse::<FiniteReal>().ok()?;
             let canonical_path = canonical_sibling_path(derived_path, &left_path);
             let left = index.resolve(&canonical_path)?;
             if !inputs.contains(&left) {
@@ -6289,6 +7184,26 @@ fn lower_row_expr(
     expr_id: usize,
 ) -> Option<LoweredRowValue> {
     let expr = expr_by_id(program, expr_id)?;
+    if matches!(&expr.kind, AstExprKind::Call { args, .. } if args.is_empty())
+        && let Some(statement) = statement_for_expression(program, expr_id)
+        && statement
+            .children
+            .iter()
+            .any(|child| matches!(child.kind, AstStatementKind::Field { .. }))
+        && let Some(value) = lower_row_call_statement_with_field_args(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            env,
+            expr_value_types,
+            statement,
+            expr_id,
+        )
+    {
+        return Some(value);
+    }
     match &expr.kind {
         AstExprKind::Delimiter => env.get(ROW_PREVIOUS_BINDING).cloned(),
         AstExprKind::Drain { .. } => env.get(&migration_drain_environment_key(expr_id)).cloned(),
@@ -6390,6 +7305,13 @@ fn lower_row_expr(
             row_field_expression(program, derived, index, inputs, &path)
                 .map(LoweredRowValue::Scalar)
         }
+        AstExprKind::Path(parts) if parts.len() > 2 => {
+            let mut value = env.get(parts.first()?)?.clone();
+            for field in &parts[1..] {
+                value = lower_row_value_field(program, inputs, value, field)?;
+            }
+            Some(value)
+        }
         AstExprKind::Path(parts) => {
             let path = parts.join(".");
             env.get(&path).cloned().or_else(|| {
@@ -6409,11 +7331,9 @@ fn lower_row_expr(
             *input,
         ),
         AstExprKind::Number(value) => {
-            let value = value.parse::<i64>().ok()?;
+            let value = plan_number_constant(value)?;
             Some(LoweredRowValue::Scalar(row_constant_expression(
-                constants,
-                inputs,
-                PlanConstantValue::Number { value },
+                constants, inputs, value,
             )))
         }
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
@@ -6733,6 +7653,70 @@ fn lower_row_expr(
     }
 }
 
+fn lower_row_value_field(
+    program: &TypedProgram,
+    inputs: &mut Vec<ValueRef>,
+    value: LoweredRowValue,
+    field_name: &str,
+) -> Option<LoweredRowValue> {
+    match value {
+        LoweredRowValue::CurrentRow { list_id } => {
+            let field = row_input_field_id_for_list_id(program, list_id, field_name)?;
+            let input = ValueRef::Field(field);
+            if !inputs.contains(&input) {
+                inputs.push(input.clone());
+            }
+            Some(LoweredRowValue::Scalar(PlanRowExpression::Field { input }))
+        }
+        LoweredRowValue::ListRow { list_id, index } => {
+            let field = row_field_id_for_list_id(program, list_id, field_name)?;
+            Some(LoweredRowValue::Scalar(PlanRowExpression::ListGetField {
+                list_id,
+                index: Box::new(index),
+                field,
+            }))
+        }
+        LoweredRowValue::ListFindRow {
+            list_id,
+            field,
+            value,
+        } => {
+            let target = row_field_id_for_list_id(program, list_id, field_name)?;
+            Some(LoweredRowValue::Scalar(PlanRowExpression::ListFindValue {
+                list_id,
+                field,
+                value: Box::new(value),
+                target,
+                fallback: None,
+            }))
+        }
+        LoweredRowValue::ListMapItem { binding, list_id } => {
+            let row = PlanRowExpression::ListMapItem { binding };
+            let expression = if let Some(list_id) = list_id {
+                let field = row_field_id_for_list_id(program, list_id, field_name)
+                    .or_else(|| row_input_field_id_for_list_id(program, list_id, field_name))?;
+                PlanRowExpression::ListRowField {
+                    row: Box::new(row),
+                    list_id,
+                    field,
+                }
+            } else {
+                PlanRowExpression::ObjectField {
+                    object: Box::new(row),
+                    field: field_name.to_owned(),
+                }
+            };
+            Some(LoweredRowValue::Scalar(expression))
+        }
+        LoweredRowValue::Scalar(object) => {
+            Some(LoweredRowValue::Scalar(PlanRowExpression::ObjectField {
+                object: Box::new(object),
+                field: field_name.to_owned(),
+            }))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_inline_row_select(
     program: &TypedProgram,
@@ -6946,6 +7930,7 @@ fn row_expression_value_type(
                     fixed_len: Some(byte_len),
                 },
                 PlanConstantValue::Enum { .. } => PlanValueType::Enum,
+                PlanConstantValue::Data { .. } => PlanValueType::Data,
             }),
         PlanRowExpression::TextTrim { .. }
         | PlanRowExpression::TextSubstring { .. }
@@ -7024,7 +8009,7 @@ fn lower_row_number_expr(
             constants,
             inputs,
             PlanConstantValue::Number {
-                value: i64::from(*value),
+                value: FiniteReal::new(f64::from(*value)).ok()?,
             },
         ));
     }
@@ -7108,8 +8093,7 @@ fn lower_row_statement_value(
         if !statement.children.is_empty()
             && let AstExprKind::Pipe { input, op, args } = &expr_by_id(program, expr_id)?.kind
             && row_list_builtin(op)
-            && let Some(multiline_args) =
-                row_list_multiline_predicate_args(program, op, args, statement)
+            && let Some(multiline_args) = row_list_multiline_args(program, op, args, statement)
         {
             return lower_row_list_builtin(
                 program,
@@ -7268,7 +8252,7 @@ fn lower_row_pipeline_child_statement(
     let expr = expr_by_id(program, expr_id)?;
     let result = match &expr.kind {
         AstExprKind::Pipe { input, op, args } if row_list_builtin(op) => {
-            let multiline_args = row_list_multiline_predicate_args(program, op, args, statement);
+            let multiline_args = row_list_multiline_args(program, op, args, statement);
             lower_row_list_builtin(
                 program,
                 derived,
@@ -7328,29 +8312,60 @@ fn lower_row_pipeline_child_statement(
     result
 }
 
-fn row_list_multiline_predicate_args(
+fn row_list_multiline_args(
     program: &TypedProgram,
     function: &str,
     args: &[AstCallArg],
     statement: &AstStatement,
 ) -> Option<Vec<AstCallArg>> {
-    if !matches!(function, "List/any" | "List/retain") || named_arg(args, "if").is_some() {
-        return None;
-    }
-    let marker = args
-        .iter()
-        .position(|arg| row_raw_symbol(program, arg.value).as_deref() == Some("if"))?;
-    let predicate = statement.children.first()?;
-    let value = predicate.expr?;
     let mut resolved = args.to_vec();
-    resolved.remove(marker);
-    resolved.push(AstCallArg {
-        name: Some("if".to_owned()),
-        value,
-        start: predicate.start,
-        end: predicate.end,
-    });
-    Some(resolved)
+    let mut changed = false;
+    let multiline_value_arg = match function {
+        "List/any" | "List/retain" => Some("if"),
+        "List/map" => Some("new"),
+        _ => None,
+    };
+    if let Some(arg_name) = multiline_value_arg
+        && named_arg(args, arg_name).is_none()
+    {
+        let marker = args
+            .iter()
+            .position(|arg| row_raw_symbol(program, arg.value).as_deref() == Some(arg_name));
+        if let Some(marker) = marker {
+            let predicate = statement
+                .children
+                .iter()
+                .find(|child| matches!(child.kind, AstStatementKind::Expression))?;
+            let value = predicate.expr?;
+            resolved.remove(marker);
+            resolved.push(AstCallArg {
+                name: Some(arg_name.to_owned()),
+                value,
+                start: predicate.start,
+                end: predicate.end,
+            });
+            changed = true;
+        }
+    }
+    for child in &statement.children {
+        let AstStatementKind::Field { name } = &child.kind else {
+            continue;
+        };
+        if resolved
+            .iter()
+            .any(|arg| arg.name.as_deref() == Some(name.as_str()))
+        {
+            continue;
+        }
+        resolved.push(AstCallArg {
+            name: Some(name.clone()),
+            value: child.expr?,
+            start: child.start,
+            end: child.end,
+        });
+        changed = true;
+    }
+    changed.then_some(resolved)
 }
 
 fn lower_row_call_statement_with_field_args(
@@ -7795,7 +8810,7 @@ fn row_select_pattern_for_expr(
 ) -> Option<PlanRowSelectPattern> {
     match &expr_by_id(program, expr_id)?.kind {
         AstExprKind::Number(value) => value
-            .parse::<i64>()
+            .parse::<FiniteReal>()
             .ok()
             .map(|value| PlanRowSelectPattern::Number { value }),
         AstExprKind::Bool(value) => Some(PlanRowSelectPattern::Bool { value: *value }),
@@ -7829,7 +8844,7 @@ fn row_select_pattern_and_binding(
         "NaN" => Some((PlanRowSelectPattern::NaN, None)),
         "__" => Some((PlanRowSelectPattern::Wildcard, None)),
         _ => label
-            .parse::<i64>()
+            .parse::<FiniteReal>()
             .map(|value| (PlanRowSelectPattern::Number { value }, None))
             .ok()
             .or_else(|| {
@@ -7930,6 +8945,10 @@ fn row_generic_builtin(function: &str) -> bool {
             | "Error/text"
             | "Number/min"
             | "Number/max"
+            | "Number/ceil"
+            | "Number/floor"
+            | "Number/round"
+            | "Number/truncate"
             | "Number/interpolate"
             | "Number/project_offset"
             | "Number/project_time"
@@ -9518,7 +10537,11 @@ fn update_constant_id_for_expression(
         }
         UpdateExpression::BytesGet { index, .. } => {
             let value = i64::try_from(*index).ok()?;
-            PlanConstantValue::Number { value }
+            plan_integer_constant(value)?
+        }
+        UpdateExpression::ListGet { index, .. } => {
+            let value = i64::try_from(*index).ok()?;
+            plan_integer_constant(value)?
         }
         _ => return None,
     };
@@ -9546,10 +10569,7 @@ fn update_constant_value(value: &str, target_type: &PlanValueType) -> Option<Pla
         PlanValueType::Text => Some(PlanConstantValue::Text {
             value: value.to_owned(),
         }),
-        PlanValueType::Number => value
-            .parse::<i64>()
-            .ok()
-            .map(|value| PlanConstantValue::Number { value }),
+        PlanValueType::Number => plan_number_constant(value),
         PlanValueType::Byte => value
             .parse::<u8>()
             .ok()
@@ -9563,20 +10583,17 @@ fn update_constant_value(value: &str, target_type: &PlanValueType) -> Option<Pla
             value: value.to_owned(),
         }),
         PlanValueType::Bytes { .. } => None,
+        PlanValueType::Data => None,
         PlanValueType::RootInitialField
         | PlanValueType::RowInitialField
         | PlanValueType::Unknown => match value {
             "True" => Some(PlanConstantValue::Bool { value: true }),
             "False" => Some(PlanConstantValue::Bool { value: false }),
-            _ => value
-                .parse::<i64>()
-                .ok()
-                .map(|value| PlanConstantValue::Number { value })
-                .or_else(|| {
-                    Some(PlanConstantValue::Text {
-                        value: value.to_owned(),
-                    })
-                }),
+            _ => plan_number_constant(value).or_else(|| {
+                Some(PlanConstantValue::Text {
+                    value: value.to_owned(),
+                })
+            }),
         },
     }
 }
@@ -9648,6 +10665,26 @@ fn resolve_path(
     }
 }
 
+fn resolve_query_ref(
+    index: &ValueIndex,
+    path: &str,
+    refs: &mut Vec<ValueRef>,
+    unresolved_count: &mut usize,
+    unresolved: &mut BTreeSet<String>,
+) -> Option<ValueRef> {
+    match index.resolve(path) {
+        Some(value_ref) => {
+            refs.push(value_ref.clone());
+            Some(value_ref)
+        }
+        None => {
+            *unresolved_count += 1;
+            unresolved.insert(path.to_owned());
+            None
+        }
+    }
+}
+
 fn collect_update_expression_refs(
     index: &ValueIndex,
     source: &str,
@@ -9679,6 +10716,9 @@ fn collect_update_expression_refs(
         | UpdateExpression::BytesWriteSigned { path, .. }
         | UpdateExpression::TextToBytes { path, .. }
         | UpdateExpression::BytesToText { path, .. } => {
+            resolve_update_path(index, source, target, indexed, path, refs, unresolved)
+        }
+        UpdateExpression::ListGet { path, .. } => {
             resolve_update_path(index, source, target, indexed, path, refs, unresolved)
         }
         UpdateExpression::BytesSlice {
@@ -9891,7 +10931,7 @@ fn collect_number_operand_ref(
     refs: &mut Vec<ValueRef>,
     unresolved: &mut BTreeSet<String>,
 ) -> usize {
-    if operand.parse::<i64>().is_ok() {
+    if plan_number_constant(operand).is_some() {
         return 0;
     }
     resolve_update_path(index, source, target, indexed, operand, refs, unresolved)
@@ -9928,6 +10968,26 @@ fn ordered_update_expression_inputs(
                 .into_iter()
                 .collect()
         }
+        UpdateExpression::BytesLength { path } | UpdateExpression::BytesIsEmpty { path } => {
+            resolve_update_value_ref(index, source, target, indexed, path)
+                .into_iter()
+                .collect()
+        }
+        UpdateExpression::ListGet {
+            path,
+            index: list_index,
+        } => {
+            let Some(input) = resolve_update_value_ref(index, source, target, indexed, path) else {
+                return Vec::new();
+            };
+            let Some(index_value) = i64::try_from(*list_index).ok() else {
+                return Vec::new();
+            };
+            let Some(index_constant_id) = push_integer_plan_constant(constants, index_value) else {
+                return Vec::new();
+            };
+            vec![input, ValueRef::Constant(index_constant_id)]
+        }
         UpdateExpression::BytesConcat { left, right } => [left, right]
             .into_iter()
             .filter_map(|path| resolve_update_value_ref(index, source, target, indexed, path))
@@ -9955,8 +11015,9 @@ fn ordered_update_expression_inputs(
             let Some(index_value) = i64::try_from(*byte_index).ok() else {
                 return Vec::new();
             };
-            let index_constant_id =
-                push_plan_constant(constants, PlanConstantValue::Number { value: index_value });
+            let Some(index_constant_id) = push_integer_plan_constant(constants, index_value) else {
+                return Vec::new();
+            };
             let value_constant_id =
                 push_plan_constant(constants, PlanConstantValue::Byte { value: *value });
             vec![
@@ -10001,12 +11062,11 @@ fn ordered_update_expression_inputs(
             let Some(byte_count_value) = i64::try_from(*byte_count).ok() else {
                 return Vec::new();
             };
-            let byte_count_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: byte_count_value,
-                },
-            );
+            let Some(byte_count_constant_id) =
+                push_integer_plan_constant(constants, byte_count_value)
+            else {
+                return Vec::new();
+            };
             vec![ValueRef::Constant(byte_count_constant_id)]
         }
         UpdateExpression::FileReadBytes { path } => {
@@ -10082,18 +11142,15 @@ fn ordered_update_expression_inputs(
             let Some(byte_count_value) = i64::try_from(*byte_count).ok() else {
                 return Vec::new();
             };
-            let offset_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: offset_value,
-                },
-            );
-            let byte_count_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: byte_count_value,
-                },
-            );
+            let Some(offset_constant_id) = push_integer_plan_constant(constants, offset_value)
+            else {
+                return Vec::new();
+            };
+            let Some(byte_count_constant_id) =
+                push_integer_plan_constant(constants, byte_count_value)
+            else {
+                return Vec::new();
+            };
             let endian_constant_id = push_plan_constant(
                 constants,
                 PlanConstantValue::Text {
@@ -10130,26 +11187,24 @@ fn ordered_update_expression_inputs(
             let Some(byte_count_value) = i64::try_from(*byte_count).ok() else {
                 return Vec::new();
             };
-            let offset_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: offset_value,
-                },
-            );
-            let byte_count_constant_id = push_plan_constant(
-                constants,
-                PlanConstantValue::Number {
-                    value: byte_count_value,
-                },
-            );
+            let Some(offset_constant_id) = push_integer_plan_constant(constants, offset_value)
+            else {
+                return Vec::new();
+            };
+            let Some(byte_count_constant_id) =
+                push_integer_plan_constant(constants, byte_count_value)
+            else {
+                return Vec::new();
+            };
             let endian_constant_id = push_plan_constant(
                 constants,
                 PlanConstantValue::Text {
                     value: endian.clone(),
                 },
             );
-            let value_constant_id =
-                push_plan_constant(constants, PlanConstantValue::Number { value: *value });
+            let Some(value_constant_id) = push_integer_plan_constant(constants, *value) else {
+                return Vec::new();
+            };
             vec![
                 input,
                 ValueRef::Constant(offset_constant_id),
@@ -10452,8 +11507,8 @@ fn number_operand_value_ref(
     indexed: bool,
     operand: &str,
 ) -> Option<ValueRef> {
-    if let Ok(value) = operand.parse::<i64>() {
-        let constant_id = push_plan_constant(constants, PlanConstantValue::Number { value });
+    if let Some(value) = plan_number_constant(operand) {
+        let constant_id = push_plan_constant(constants, value);
         return Some(ValueRef::Constant(constant_id));
     }
     resolve_update_value_ref(index, source, target, indexed, operand)
@@ -10472,12 +11527,9 @@ fn infix_operand_value_ref(
             let value = match value.as_str() {
                 "True" => PlanConstantValue::Bool { value: true },
                 "False" => PlanConstantValue::Bool { value: false },
-                _ => value
-                    .parse::<i64>()
-                    .map(|value| PlanConstantValue::Number { value })
-                    .unwrap_or_else(|_| PlanConstantValue::Text {
-                        value: value.clone(),
-                    }),
+                _ => plan_number_constant(value).unwrap_or_else(|| PlanConstantValue::Text {
+                    value: value.clone(),
+                }),
             };
             Some(ValueRef::Constant(push_plan_constant(constants, value)))
         }
@@ -10551,7 +11603,7 @@ fn ordered_update_value_expression_inputs(
             let input_ref = resolve_update_value_ref(index, source, target, indexed, input)?;
             let arm_count = i64::try_from(arms.len()).ok()?;
             let arm_count_constant_id =
-                push_plan_constant(constants, PlanConstantValue::Number { value: arm_count });
+                push_plan_constant(constants, plan_integer_constant(arm_count)?);
             let mut refs = vec![
                 ValueRef::Constant(tag_constant_id),
                 input_ref,
@@ -10587,7 +11639,7 @@ fn ordered_update_value_expression_inputs(
             let input_ref = resolve_update_value_ref(index, source, target, indexed, input)?;
             let arm_count = i64::try_from(arms.len()).ok()?;
             let arm_count_constant_id =
-                push_plan_constant(constants, PlanConstantValue::Number { value: arm_count });
+                push_plan_constant(constants, plan_integer_constant(arm_count)?);
             let mut refs = vec![
                 ValueRef::Constant(tag_constant_id),
                 input_ref,
@@ -10653,7 +11705,7 @@ fn ordered_update_value_expression_inputs(
                 number_operand_value_ref(index, constants, source, target, indexed, right)?;
             let arm_count = i64::try_from(arms.len()).ok()?;
             let arm_count_constant_id =
-                push_plan_constant(constants, PlanConstantValue::Number { value: arm_count });
+                push_plan_constant(constants, plan_integer_constant(arm_count)?);
             let mut refs = vec![
                 ValueRef::Constant(tag_constant_id),
                 left_ref,
@@ -11048,6 +12100,13 @@ fn source_payload_field_for_expression(
         UpdateExpression::TextTrimOrPrevious { path, .. } => {
             source_payload_field_from_path(source, path, true)
         }
+        UpdateExpression::BytesLength { path }
+        | UpdateExpression::BytesIsEmpty { path }
+        | UpdateExpression::BytesToHex { path }
+        | UpdateExpression::BytesToBase64 { path }
+        | UpdateExpression::BytesToText { path, .. } => {
+            source_payload_field_from_path(source, path, true)
+        }
         _ => None,
     }?;
     index
@@ -11153,7 +12212,7 @@ fn bytes_scalar_arg_value_ref(
             let value = i64::try_from(*value).ok()?;
             Some(ValueRef::Constant(push_plan_constant(
                 constants,
-                PlanConstantValue::Number { value },
+                plan_integer_constant(value)?,
             )))
         }
         BytesScalarArg::Path(path) => {
@@ -11211,6 +12270,7 @@ fn update_expression_kind(expression: &UpdateExpression) -> PlanExpressionKind {
         UpdateExpression::BytesLength { .. } => PlanExpressionKind::BytesLength,
         UpdateExpression::BytesIsEmpty { .. } => PlanExpressionKind::BytesIsEmpty,
         UpdateExpression::BytesGet { .. } => PlanExpressionKind::BytesGet,
+        UpdateExpression::ListGet { .. } => PlanExpressionKind::ListGet,
         UpdateExpression::BytesSet { .. } => PlanExpressionKind::BytesSet,
         UpdateExpression::BytesSlice { .. } => PlanExpressionKind::BytesSlice,
         UpdateExpression::BytesTake { .. } => PlanExpressionKind::BytesTake,

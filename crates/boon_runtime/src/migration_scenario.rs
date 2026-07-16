@@ -14,7 +14,8 @@ use boon_persistence::{
     stage_migration,
 };
 use boon_plan::{
-    ApplicationIdentity, MachinePlan, MemoryId, MigrationPredecessorBinding, TargetProfile,
+    ApplicationIdentity, FiniteReal, MachinePlan, MemoryId, MigrationPredecessorBinding,
+    TargetProfile,
 };
 use boon_plan_executor::{RowId, SessionOptions, SourcePayload, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1763,7 +1764,10 @@ fn source_payload(
 fn scenario_value(value: &MigrationScenarioValue) -> Value {
     match value {
         MigrationScenarioValue::Bool(value) => Value::Bool(*value),
-        MigrationScenarioValue::Integer(value) => Value::Number(*value),
+        MigrationScenarioValue::Integer(value) => Value::Number(
+            FiniteReal::from_i64_exact(*value)
+                .expect("validated migration scenario integer must be exactly representable"),
+        ),
         MigrationScenarioValue::Text(value) => Value::Text(value.clone()),
     }
 }

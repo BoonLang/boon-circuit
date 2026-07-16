@@ -19,6 +19,7 @@ boon_document_model.workspace = true
 boon_editor.workspace = true
 boon_host.workspace = true
 boon_native_gpu.workspace = true
+boon_web_host.workspace = true
 boon_native_app_window.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -29,6 +30,8 @@ wgpu.workspace = true
 libc.workspace = true
 open.workspace = true
 uuid.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev.workspace = true

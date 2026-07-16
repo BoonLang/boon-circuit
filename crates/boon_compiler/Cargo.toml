@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+boon_data.workspace = true
 boon_example_manifest.workspace = true
 boon_ir.workspace = true
 boon_parser.workspace = true
 boon_plan.workspace = true
+boon_query.workspace = true
 boon_typecheck.workspace = true
 serde.workspace = true
 sha2.workspace = true

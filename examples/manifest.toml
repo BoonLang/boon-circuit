@@ -580,6 +580,95 @@ performance_thresholds = [
 ]
 
 [[example]]
+id = "fjordpulse"
+label = "FjordPulse"
+source = "examples/fjordpulse/Client/RUN.bn"
+source_files = [
+  "examples/fjordpulse/Theme/FjordPulseTheme.bn",
+  "examples/fjordpulse/Model/FjordPulseModel.bn",
+  "examples/fjordpulse/View/FjordPulseComponents.bn",
+  "examples/fjordpulse/View/FjordPulseMap.bn",
+  "examples/fjordpulse/View/FjordPulseView.bn",
+  "examples/fjordpulse/Client/RUN.bn",
+]
+asset_files = [
+  "examples/fjordpulse/assets/fjordpulse-mark.svg",
+]
+scenario = "examples/fjordpulse.scn"
+budget = "examples/fjordpulse.budget.toml"
+application = { package_id = "cz.kavik.fjordpulse", state_namespace = "client-v1", deployment_domain = "builtin" }
+category = "main"
+order = 29
+default_tab_order = 29
+shown_by_default = true
+required_evidence_tier = "host-synthetic"
+human_testing_needed = true
+initial_visible_assertions = [
+  "fjordpulse-brand-visible",
+  "map-viewport-visible",
+  "search-visible",
+  "selected-station-visible",
+  "departures-visible",
+  "desktop-and-mobile-layouts-bounded",
+  "map-attribution-visible",
+  "no-large-blank-regions",
+]
+input_scenarios = [
+  "select-bergen",
+  "open-vehicles",
+  "open-details",
+  "switch-language",
+  "switch-satellite",
+  "search-station",
+  "mobile-sheet-full",
+  "follow-location",
+]
+native_preview_scenarios = [
+  "select-bergen",
+  "open-vehicles",
+  "switch-satellite",
+]
+scroll_focus_scenarios = [
+  "map-wheel-zoom",
+  "map-pointer-pan",
+  "mobile-sheet-drag",
+]
+visual_artifacts = [
+  "preview-desktop-app-owned-framebuffer",
+  "preview-mobile-app-owned-framebuffer",
+  "selected-station-panel-crop",
+  "map-attribution-crop",
+]
+performance_thresholds = [
+  "preview-interaction-p95-frame-ms <= 16.7",
+  "map-pan-zoom-p95-frame-ms <= 16.7",
+  "mobile-sheet-drag-p95-frame-ms <= 16.7",
+  "indexed-search-p95-ms <= 25.0",
+]
+
+[[example.programs]]
+role = "document"
+source = "examples/fjordpulse/Client/RUN.bn"
+source_files = [
+  "examples/fjordpulse/Theme/FjordPulseTheme.bn",
+  "examples/fjordpulse/Model/FjordPulseModel.bn",
+  "examples/fjordpulse/View/FjordPulseComponents.bn",
+  "examples/fjordpulse/View/FjordPulseMap.bn",
+  "examples/fjordpulse/View/FjordPulseView.bn",
+  "examples/fjordpulse/Client/RUN.bn",
+]
+state_namespace = "client-v1"
+
+[[example.programs]]
+role = "server"
+source = "examples/fjordpulse/Server/RUN.bn"
+source_files = [
+  "examples/fjordpulse/Shared/FjordPulseContract.bn",
+  "examples/fjordpulse/Server/RUN.bn",
+]
+state_namespace = "server-v1"
+
+[[example]]
 id = "counter"
 label = "Counter"
 source = "examples/counter.bn"

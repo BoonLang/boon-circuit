@@ -1,0 +1,24 @@
+document: Document/new(
+    root: Element/container(
+        element: []
+        style: [
+            width: Fill
+            height: Fill
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.96,chroma:0.01,hue:150]]
+            depth: 1
+            material: [color: TEXT { #f1f6f3 }, gloss: 0.02]
+        ]
+        child: Element/label(
+            element: []
+            style: [
+                width: 320
+                height: 64
+                align: [row: Center]
+                background: [color: Oklch[lightness:1]]
+                font: [size: 24, color: Oklch[lightness:0.22,chroma:0.04,hue:150]]
+            ]
+            label: Contract/title()
+        )
+    )
+)

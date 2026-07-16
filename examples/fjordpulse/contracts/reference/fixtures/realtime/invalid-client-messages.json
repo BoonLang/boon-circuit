@@ -1,0 +1,51 @@
+[
+  {
+    "reason": "unsupported protocol version",
+    "message": {
+      "protocolVersion": 2,
+      "id": "msg_bad_version",
+      "type": "ping",
+      "payload": {}
+    }
+  },
+  {
+    "reason": "unknown message type",
+    "message": {
+      "protocolVersion": 1,
+      "id": "msg_unknown",
+      "type": "watch_everything",
+      "payload": {}
+    }
+  },
+  {
+    "reason": "missing station identifier",
+    "message": {
+      "protocolVersion": 1,
+      "id": "msg_missing_station",
+      "type": "watch_station",
+      "payload": {}
+    }
+  },
+  {
+    "reason": "unknown payload property",
+    "message": {
+      "protocolVersion": 1,
+      "id": "msg_extra",
+      "type": "watch_vehicle",
+      "payload": {
+        "vehicleId": "SKY:Vehicle:12345",
+        "admin": true
+      }
+    }
+  },
+  {
+    "reason": "client command contains server-only event identity",
+    "message": {
+      "protocolVersion": 1,
+      "id": "msg_spoofed_event",
+      "type": "ping",
+      "eventId": "evt_spoofed",
+      "payload": {}
+    }
+  }
+]

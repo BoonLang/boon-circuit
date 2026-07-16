@@ -1,0 +1,145 @@
+version = 1
+reference_commit = "dd6e750c2ca9dec3041f66ceda31d30379d4027a"
+client_source = "examples/fjordpulse/Client/RUN.bn"
+theme_source = "examples/fjordpulse/Theme/FjordPulseTheme.bn"
+renderer_contract = "shared-retained-physical-scene"
+default_locale = "nb-NO"
+default_basemap = "satellite"
+initial_product_surface = "map"
+initial_live_vehicle_policy = "none"
+
+required_named_materials = [
+  "Page",
+  "AdminPage",
+  "Chrome",
+  "ChromeElevated",
+  "Surface",
+  "SurfaceMuted",
+  "Panel",
+  "Interactive",
+  "SearchOption",
+  "StateSurface",
+  "MapPin",
+  "VehiclePin",
+  "DataRow",
+  "MetricSurface",
+  "MapLand",
+  "MapRoad",
+  "Attribution",
+]
+
+required_resource_states = ["loading", "fresh", "empty", "stale", "error", "retrying"]
+required_station_tabs = ["departures", "vehicles", "details"]
+required_search_result_types = ["station", "ferry_station", "place", "line"]
+required_keyboard_actions = ["ArrowDown", "ArrowUp", "Enter", "Escape"]
+
+[[viewport]]
+id = "desktop"
+width = 1440
+height = 900
+layout = "rail-map-side-panel"
+max_horizontal_overflow_px = 0
+
+[[viewport]]
+id = "phone"
+width = 390
+height = 844
+layout = "map-bottom-sheet-navigation"
+max_horizontal_overflow_px = 0
+
+[[viewport]]
+id = "narrow-phone"
+width = 320
+height = 700
+layout = "map-bottom-sheet-navigation"
+max_horizontal_overflow_px = 0
+
+[[viewport]]
+id = "short-landscape"
+width = 844
+height = 390
+layout = "compact-map-bottom-sheet-navigation"
+max_horizontal_overflow_px = 0
+
+[[viewport]]
+id = "intermediate"
+width = 900
+height = 720
+layout = "map-bottom-sheet-navigation"
+max_horizontal_overflow_px = 0
+
+[[semantic_target]]
+id = "search-input"
+source_path = "store.elements.search.change"
+role = "text_input"
+name_nb = "Søk etter holdeplass, sted, linje eller kjøretøy"
+name_en = "Search station, place, line, or vehicle"
+
+[[semantic_target]]
+id = "search-result-forde-station"
+source_path = "store.elements.search_result.forde_station"
+role = "button"
+name_nb = "Førde rutebilstasjon"
+selected_state = "store.search_highlight == FordeStationResult"
+
+[[semantic_target]]
+id = "search-result-line-100"
+source_path = "store.elements.search_result.line_100"
+role = "button"
+name_nb = "Linje 100"
+selected_state = "store.search_highlight == Line100Result"
+
+[[semantic_target]]
+id = "map-forde-station"
+source_path = "store.elements.station.forde"
+role = "button"
+name_nb = "Førde rutebilstasjon"
+
+[[semantic_target]]
+id = "station-tab-departures"
+source_path = "store.elements.tab.departures"
+role = "button"
+selected_state = "store.station_tab == Departures"
+
+[[semantic_target]]
+id = "admin-watches"
+source_path = "store.elements.admin.watches"
+role = "button"
+selected_state = "store.route == AdminWatches"
+
+[[visual_state]]
+id = "desktop-search-results"
+scenario = "examples/fjordpulse/scenarios/client_station_first.scn"
+after_step = "receive-four-search-results"
+requires = ["map-visible", "query-visible", "four-result-types-visible", "first-option-selected", "keyboard-help-visible"]
+
+[[visual_state]]
+id = "desktop-station-loading"
+scenario = "examples/fjordpulse/scenarios/client_station_first.scn"
+after_step = "keyboard-open-highlighted-station"
+requires = ["selected-pin-visible", "station-panel-visible", "loading-state-visible", "map-retained"]
+
+[[visual_state]]
+id = "desktop-station-fresh"
+scenario = "examples/fjordpulse/scenarios/client_station_first.scn"
+after_step = "station-vehicles-fresh"
+requires = ["station-title-visible", "resource-status-visible", "departures-visible", "tabs-visible"]
+
+[[visual_state]]
+id = "mobile-full-station-sheet"
+scenario = "examples/fjordpulse/scenarios/client_station_first.scn"
+after_step = "expand-mobile-sheet-state"
+requires = ["map-retained", "sheet-full", "touch-targets-at-least-42px", "bottom-navigation-visible"]
+
+[[visual_state]]
+id = "admin-watches"
+scenario = "examples/fjordpulse/scenarios/client_station_first.scn"
+after_step = "admin-watches-fresh"
+requires = ["admin-navigation-visible", "active-page-selected", "read-only-status-visible", "public-map-action-visible"]
+
+[[known_engine_blocker]]
+id = "context-sensitive-enter-submit"
+owning_layer = "compiler-plan-source-guards"
+behavior = "Enter selects a highlighted result, but Enter-before-results cannot also submit until dynamic key-arm source guards retain non-constant branches. The visible Search button is the deterministic submit path in this slice."
+required_resolution = "Compile all matching Key arms whose outputs depend on held state; do not narrow source_guard to only constant-output arms."
+evidence = "search_state key_down plan guard previously retained Escape while dropping dynamic Enter"

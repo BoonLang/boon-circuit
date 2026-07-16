@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "data": {
+    "provider": "maptiler",
+    "defaultBasemap": "satellite",
+    "basemaps": [
+      {
+        "id": "satellite",
+        "label": "Satellite",
+        "styleUrl": "https://api.maptiler.com/maps/hybrid-v4/style.json?key=fixture-browser-key"
+      },
+      {
+        "id": "streets",
+        "label": "Map",
+        "styleUrl": "https://api.maptiler.com/maps/streets-v4/style.json?key=fixture-browser-key"
+      }
+    ]
+  },
+  "meta": {
+    "requestId": "req_map_config",
+    "updatedAt": "2026-07-10T10:00:00Z"
+  }
+}

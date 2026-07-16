@@ -1,0 +1,600 @@
+{
+  "schema_version": 1,
+  "artifact": "fjordpulse_phase_0_compatibility_delta_ledger",
+  "generated_by": "cargo xtask fjordpulse-traceability import",
+  "reference": {
+    "repository": "FjordPulse",
+    "commit": "dd6e750c2ca9dec3041f66ceda31d30379d4027a",
+    "tree": "615bce38d6f9741f37fff68d408abcdc209c8894",
+    "read_mode": "git_objects_at_pinned_commit"
+  },
+  "ledger_status": "skeleton_not_implemented",
+  "default_policy": "Public DTOs, routes, envelopes, commands, events, validation failures, status codes, schemas, and fixtures are unchanged unless an approved delta below names the exact affected surface.",
+  "unchanged_surface_rule": "Pinned SHA-256 values freeze reference bytes only. target_path, target schema/fixture lists, compatible versions, and report IDs must be populated and verified before any implementation compatibility claim.",
+  "contract_assets": [
+    {
+      "source": {
+        "path": "contracts/http/openapi.yaml",
+        "bytes": 84247,
+        "sha256": "480dc3509724a5d4237744efab009e92c072aa9fa1a93028bfa294f0552cf38f"
+      },
+      "required_disposition": "mixed: listed fields may change; every unlisted OpenAPI operation, field, validation failure, status, and envelope must remain exact",
+      "approved_delta_ids": [
+        "FPCD-001",
+        "FPCD-002",
+        "FPCD-003"
+      ],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/admin-demo-credentials-response.json",
+        "bytes": 217,
+        "sha256": "3b1a3f454e250a226510cf635529c5394447ca7770c2859b38607326e6d2aa91"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/admin-status-response.json",
+        "bytes": 3381,
+        "sha256": "86db9a40c5ba5faf4109d383eb93bcfeca2d5dfe5dca8b92aeb81c6a1c081209"
+      },
+      "required_disposition": "paired old/new schema and valid/invalid fixtures required before implementation can claim compatibility",
+      "approved_delta_ids": [
+        "FPCD-002",
+        "FPCD-003"
+      ],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/error-response.json",
+        "bytes": 204,
+        "sha256": "691eb7f7df01df8477a581875dd5fb61ff6f403f5c0f44edcd81abfaa21bdbc1"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/health-response.json",
+        "bytes": 875,
+        "sha256": "8cd9728829c2848270765b0a85b04e18a53ce5dbd4a6d695d5b840156d9f7ee8"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/index.json",
+        "bytes": 585,
+        "sha256": "31cb53794f2372e1b8a7f2c080376b6131ec988c4a9cc45a0fe59daf821b46a4"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/invalid-station-departures-responses.json",
+        "bytes": 5238,
+        "sha256": "7790e6db90e28ed60407eb4c984ac5c7865b693ff39548aaa904c342d9d4004b"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/invalid-station-responses.json",
+        "bytes": 5969,
+        "sha256": "84e7375858848b6d2cd0c1c1fab557c77d2374b3b7cd2fcf839f8c39d1baec0f"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/invalid-vehicle-responses.json",
+        "bytes": 3213,
+        "sha256": "9b6ad4c109dbcc70df24ddab942ee3af8f2559b712cf5ce63bbd99483ea2fb04"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/map-config-response.json",
+        "bytes": 547,
+        "sha256": "db9a5675e82c6c6a1d495e15293efd5e09e1bd105349ced3f36dcc26d019ca06"
+      },
+      "required_disposition": "paired old/new schema and valid/invalid fixtures required before implementation can claim compatibility",
+      "approved_delta_ids": [
+        "FPCD-001"
+      ],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/nearby-vehicles-response.json",
+        "bytes": 844,
+        "sha256": "7f03b27c47a44bef01bd4b1d6af65fa969ae55dfc345684d1787d6a1eeab0939"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/search-response.json",
+        "bytes": 1032,
+        "sha256": "33d802941c259a82947a6031dc82463c388c3ab39004d92779e533a9e28b94c0"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/station-departures-response.json",
+        "bytes": 1128,
+        "sha256": "5b359ad62145fcff746f0fcd642bea3e0a26aa91cec7b9a30733d991980ad56e"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/station-map-response.json",
+        "bytes": 835,
+        "sha256": "31caaac3ef9045599af30b84d799eb5100c8fd03c66d53a1e6e1e1ba26dd2ff6"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/station-response.json",
+        "bytes": 2726,
+        "sha256": "3bd9ada319f91d49fc74e40910cfaea95609837092c25f4fe3f876cbb341aacc"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/unhealthy-health-response.json",
+        "bytes": 915,
+        "sha256": "4382b2f0bd90ebd36272a00471d3c6918c91abc27bd869e31ceea307564ad9c1"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/http/vehicle-response.json",
+        "bytes": 3408,
+        "sha256": "2d0652a7e43cdfdd01946942c1d759589e6bdba325a8f281587b1ae97d6f3aad"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/realtime/client-message.schema.json",
+        "bytes": 8017,
+        "sha256": "13d97987f6a0705f040cc2b5c66cd8d7cc469a8c4960b517d743cc19ba6660ed"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/realtime/envelope.schema.json",
+        "bytes": 4789,
+        "sha256": "e944b258cc64ef007e37f9c6a189dbf6e448832fb78522b2ad95ec2930ed312c"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/realtime/server-message.schema.json",
+        "bytes": 33137,
+        "sha256": "3c739946e15424c752367e5d13a2d45dd3b12f198f11ec1e0d56119db8600bf3"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/realtime/client-messages.json",
+        "bytes": 1516,
+        "sha256": "77b1cccd4af69c6a6773b53321466931e5b7192903af07102e33f226065f21ef"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/realtime/invalid-client-messages.json",
+        "bytes": 1035,
+        "sha256": "eded288c95d7f67b7fefa39108063dfcceca4c675f37edc5272d6a7494e0d8c7"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/realtime/invalid-server-messages.json",
+        "bytes": 14782,
+        "sha256": "eb4453133d1052cc7b50e4754196aee9b54490f06ed917f2b28083903620cde7"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    },
+    {
+      "source": {
+        "path": "contracts/fixtures/realtime/server-messages.json",
+        "bytes": 13252,
+        "sha256": "8f165cbdc48c1268fe4835a8643f32ffaf1dca94c77d41973f2541b56adaddc0"
+      },
+      "required_disposition": "byte-exact compatibility required",
+      "approved_delta_ids": [],
+      "target_path": null,
+      "implementation_status": "not_implemented",
+      "evidence_report_ids": []
+    }
+  ],
+  "approved_deltas": [
+    {
+      "id": "FPCD-001",
+      "class": "map_config_raster_sources",
+      "rationale": "The Boon client owns retained raster rendering and must receive truthful allowlisted raster-source capabilities rather than MapLibre style documents or browser-exposed provider keys.",
+      "reference_assets": [
+        {
+          "path": "contracts/http/openapi.yaml",
+          "bytes": 84247,
+          "sha256": "480dc3509724a5d4237744efab009e92c072aa9fa1a93028bfa294f0552cf38f"
+        },
+        {
+          "path": "contracts/fixtures/http/map-config-response.json",
+          "bytes": 547,
+          "sha256": "db9a5675e82c6c6a1d495e15293efd5e09e1bd105349ced3f36dcc26d019ca06"
+        }
+      ],
+      "field_mappings": [
+        {
+          "reference_field_or_scope": "MapConfigData.provider",
+          "target_field": null,
+          "required_target_semantics": "A versioned identity for the allowlisted raster-source configuration; the exact target field is intentionally unset until its schema exists.",
+          "rationale": "Preserve provider provenance without claiming a MapLibre style-document contract."
+        },
+        {
+          "reference_field_or_scope": "MapConfigData.basemaps[].styleUrl",
+          "target_field": null,
+          "required_target_semantics": "Allowlisted raster source descriptors with attribution, zoom/tile bounds, and opaque capability references; the exact target fields are intentionally unset.",
+          "rationale": "A style URL and browser key describe the removed MapLibre integration and cannot remain truthful."
+        },
+        {
+          "reference_field_or_scope": "MapConfigData.defaultBasemap",
+          "target_field": null,
+          "required_target_semantics": "A default selection that references one declared raster source.",
+          "rationale": "Preserve the user's default-map intent while changing only technology-bound source description."
+        }
+      ],
+      "target_contract": {
+        "schema_paths": [],
+        "valid_fixture_paths": [],
+        "invalid_fixture_paths": [],
+        "compatible_client_versions": [],
+        "compatible_server_versions": [],
+        "status": "not_implemented"
+      },
+      "black_box_evidence": {
+        "required_story_ids": [
+          "FP-001",
+          "FP-002",
+          "FP-005",
+          "FP-008"
+        ],
+        "report_ids": [],
+        "status": "not_implemented"
+      },
+      "implementation_status": "skeleton_not_implemented"
+    },
+    {
+      "id": "FPCD-002",
+      "class": "admin_boon_redb_database_diagnostics",
+      "rationale": "Admin diagnostics must report Boon semantic collections, indexes, migrations, and redb health instead of exposing SurrealDB INFO or SurrealQL-shaped objects.",
+      "reference_assets": [
+        {
+          "path": "contracts/http/openapi.yaml",
+          "bytes": 84247,
+          "sha256": "480dc3509724a5d4237744efab009e92c072aa9fa1a93028bfa294f0552cf38f"
+        },
+        {
+          "path": "contracts/fixtures/http/admin-status-response.json",
+          "bytes": 3381,
+          "sha256": "86db9a40c5ba5faf4109d383eb93bcfeca2d5dfe5dca8b92aeb81c6a1c081209"
+        },
+        {
+          "path": "docs/03_api_contract.md",
+          "bytes": 14401,
+          "sha256": "030af8c5f5b36e3a3954d2c84fd9043093816f86da30e635bdb4dfc25022ebc6"
+        }
+      ],
+      "field_mappings": [
+        {
+          "reference_field_or_scope": "AdminStatusData.database.{engine,endpointOrigin,namespace,name,warning}",
+          "target_field": null,
+          "required_target_semantics": "Credential-free redb namespace, storage health, and compatibility identity; exact target fields remain unset.",
+          "rationale": "SurrealDB endpoint and namespace fields would falsely describe the rewritten authority."
+        },
+        {
+          "reference_field_or_scope": "AdminDatabaseSchemaData.tables[] and DatabaseSchema*",
+          "target_field": null,
+          "required_target_semantics": "Read-only allowlisted Boon collection, field, index, bound, and migration metadata; exact target fields remain unset.",
+          "rationale": "SurrealDB table permissions, events, and schema modes do not model Boon/redb semantics truthfully."
+        },
+        {
+          "reference_field_or_scope": "AdminDatabaseMigrationsData and DatabaseMigration*",
+          "target_field": null,
+          "required_target_semantics": "Read-only source-controlled Boon migration graph, checksums, attempts, and compatibility state; exact target fields remain unset.",
+          "rationale": "Preserve operator intent and failure states while removing SurrealQL source/object terminology."
+        }
+      ],
+      "target_contract": {
+        "schema_paths": [],
+        "valid_fixture_paths": [],
+        "invalid_fixture_paths": [],
+        "compatible_client_versions": [],
+        "compatible_server_versions": [],
+        "status": "not_implemented"
+      },
+      "black_box_evidence": {
+        "required_story_ids": [
+          "FP-057",
+          "FP-058",
+          "FP-059",
+          "FP-065",
+          "FP-089"
+        ],
+        "report_ids": [],
+        "status": "not_implemented"
+      },
+      "implementation_status": "skeleton_not_implemented"
+    },
+    {
+      "id": "FPCD-003",
+      "class": "admin_single_boon_server_topology",
+      "rationale": "The rewritten deployment has one Boon Server process and one durable publication path, so Admin and health responses must not report separate FrankenPHP, AMPHP, SurrealDB, or live-query-bridge services.",
+      "reference_assets": [
+        {
+          "path": "contracts/http/openapi.yaml",
+          "bytes": 84247,
+          "sha256": "480dc3509724a5d4237744efab009e92c072aa9fa1a93028bfa294f0552cf38f"
+        },
+        {
+          "path": "contracts/fixtures/http/admin-status-response.json",
+          "bytes": 3381,
+          "sha256": "86db9a40c5ba5faf4109d383eb93bcfeca2d5dfe5dca8b92aeb81c6a1c081209"
+        },
+        {
+          "path": "docs/03_api_contract.md",
+          "bytes": 14401,
+          "sha256": "030af8c5f5b36e3a3954d2c84fd9043093816f86da30e635bdb4dfc25022ebc6"
+        }
+      ],
+      "field_mappings": [
+        {
+          "reference_field_or_scope": "AdminStatusData.services.{backend,realtime,surrealdb,liveQueryBridge}",
+          "target_field": null,
+          "required_target_semantics": "One Boon Server lifecycle plus listener, durable publication, redb, Entur, and map capability health; exact target fields remain unset.",
+          "rationale": "Retain diagnosability while describing the real single-process ownership graph."
+        },
+        {
+          "reference_field_or_scope": "HealthData.services.{http,realtime,surrealdb,liveQueryBridge}",
+          "target_field": null,
+          "required_target_semantics": "Truthful generic host and Boon Server readiness/degradation states; exact target fields remain unset.",
+          "rationale": "Removed services cannot be reported as independently healthy."
+        }
+      ],
+      "target_contract": {
+        "schema_paths": [],
+        "valid_fixture_paths": [],
+        "invalid_fixture_paths": [],
+        "compatible_client_versions": [],
+        "compatible_server_versions": [],
+        "status": "not_implemented"
+      },
+      "black_box_evidence": {
+        "required_story_ids": [
+          "FP-065",
+          "FP-069",
+          "FP-087",
+          "FP-088"
+        ],
+        "report_ids": [],
+        "status": "not_implemented"
+      },
+      "implementation_status": "skeleton_not_implemented"
+    },
+    {
+      "id": "FPCD-004",
+      "class": "deployment_identity_and_single_container",
+      "rationale": "The rewrite deploys at fjordpulse-boon.kavik.cz as one Boon server container instead of the pinned multi-service fjordpulse.kavik.cz topology.",
+      "reference_assets": [
+        {
+          "path": "docs/04_realtime_protocol.md",
+          "bytes": 5964,
+          "sha256": "a118129ca9275124f9a5944b67bc58310f15ba7e5d4d98301785ffe2e3b6a75e"
+        },
+        {
+          "path": "docs/user-stories/11_epic_K_deployment_and_operations.md",
+          "bytes": 5325,
+          "sha256": "c3f241c189a1679c128b242aee928de35ef4173650c2de14fbfcd90bff785e01"
+        }
+      ],
+      "field_mappings": [
+        {
+          "reference_field_or_scope": "public origin fjordpulse.kavik.cz and wss://fjordpulse.kavik.cz/live",
+          "target_field": null,
+          "required_target_semantics": "Public HTTP/WSS identity fjordpulse-boon.kavik.cz with routes preserved unless another approved delta says otherwise.",
+          "rationale": "Keep externally observable product intent while avoiding a false deployment identity."
+        },
+        {
+          "reference_field_or_scope": "Coolify frontend/app/realtime/SurrealDB service topology",
+          "target_field": null,
+          "required_target_semantics": "One Coolify-managed Boon Server container and mounted redb volume; exact deployment manifest paths remain unset.",
+          "rationale": "The old service list cannot be used as rewrite readiness evidence."
+        }
+      ],
+      "target_contract": {
+        "schema_paths": [],
+        "valid_fixture_paths": [],
+        "invalid_fixture_paths": [],
+        "compatible_client_versions": [],
+        "compatible_server_versions": [],
+        "status": "not_implemented"
+      },
+      "black_box_evidence": {
+        "required_story_ids": [
+          "FP-085",
+          "FP-086",
+          "FP-105"
+        ],
+        "report_ids": [],
+        "status": "not_implemented"
+      },
+      "implementation_status": "skeleton_not_implemented"
+    },
+    {
+      "id": "FPCD-005",
+      "class": "backup_restore_automation_deferment",
+      "rationale": "Only backup/restore automation, retention, off-host storage, and backup-based disaster-recovery drills are outside this milestone; persistence across process, container, host-service, and normal Coolify redeploy restarts remains mandatory.",
+      "reference_assets": [
+        {
+          "path": "docs/user-stories/11_epic_K_deployment_and_operations.md",
+          "bytes": 5325,
+          "sha256": "c3f241c189a1679c128b242aee928de35ef4173650c2de14fbfcd90bff785e01"
+        }
+      ],
+      "field_mappings": [
+        {
+          "reference_field_or_scope": "FP-089 scenario 2 backup task/artifact and scenario 3 staging restore",
+          "target_field": null,
+          "required_target_semantics": "No target implementation in this milestone.",
+          "rationale": "The rewrite plan explicitly defers these whole backup/restore automation scenarios without waiving persistence."
+        },
+        {
+          "reference_field_or_scope": "FP-092 scenario 1 scheduled backup portion",
+          "target_field": null,
+          "required_target_semantics": "No backup scheduler target in this milestone; cleanup and import scheduling remain required.",
+          "rationale": "This is a partial-scenario deferment and must not broaden into a waiver of maintenance orchestration."
+        }
+      ],
+      "target_contract": {
+        "schema_paths": [],
+        "valid_fixture_paths": [],
+        "invalid_fixture_paths": [],
+        "compatible_client_versions": [],
+        "compatible_server_versions": [],
+        "status": "not_applicable_explicitly_deferred"
+      },
+      "black_box_evidence": {
+        "required_story_ids": [
+          "FP-089",
+          "FP-092"
+        ],
+        "report_ids": [],
+        "status": "explicitly_deferred_without_completion_evidence"
+      },
+      "implementation_status": "explicitly_deferred"
+    }
+  ],
+  "deferred_evidence_scopes": [
+    {
+      "scenario_id": "FP-089-S02",
+      "coverage": "whole_scenario",
+      "deferred_scope": "Backup automation, backup artifact production, retention, and off-host storage.",
+      "still_required_scope": null
+    },
+    {
+      "scenario_id": "FP-089-S03",
+      "coverage": "whole_scenario",
+      "deferred_scope": "Restore automation and backup-based disaster-recovery drills.",
+      "still_required_scope": null
+    },
+    {
+      "scenario_id": "FP-092-S01",
+      "coverage": "partial_scenario",
+      "deferred_scope": "Scheduling the backup task only.",
+      "still_required_scope": "Cleanup and import tasks must still be scheduled and visible to operators."
+    }
+  ]
+}

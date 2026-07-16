@@ -14,7 +14,8 @@ pub use boon_plan::{ApplicationIdentity, MachinePlan};
 use boon_plan::{MigrationEdgeId, OutputContractKind, OutputRootPlan, SourceId, TargetProfile};
 pub use boon_plan_executor::{
     AuthorityDelta, Delta, RowId, RowSnapshot, SessionOptions, Snapshot, SourceEvent,
-    SourcePayload, TurnMetrics, Value, ValueTarget,
+    SourcePayload, TransientEffectCallId, TransientEffectInvocation, TurnMetrics, Value,
+    ValueTarget,
 };
 use boon_plan_executor::{Session, SessionBuilder, Turn};
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,7 @@ pub struct RuntimeTurn {
     pub authority_deltas: Vec<AuthorityDelta>,
     pub durable_changes: Vec<DurableChange>,
     pub outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
+    pub transient_effects: Vec<TransientEffectInvocation>,
     pub document_patches: Vec<DocumentPatch>,
     pub document_patch_status: DocumentPatchStatus,
     pub metrics: TurnMetrics,
@@ -335,6 +337,7 @@ impl LiveRuntime {
             authority_deltas: Vec::new(),
             durable_changes: Vec::new(),
             outbox_changes: Vec::new(),
+            transient_effects: Vec::new(),
             document_patches: self
                 .document
                 .as_ref()
@@ -392,6 +395,37 @@ impl LiveRuntime {
         outcome: boon_persistence::StoredValue,
     ) -> RuntimeResult<RuntimeTurn> {
         self.effect_turn(|session| session.complete_effect(item, outcome))
+    }
+
+    pub fn complete_transient_effect_unsettled(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    ) -> RuntimeResult<RuntimeTurn> {
+        self.effect_turn(|session| session.complete_transient_effect(call_id, outcome))
+    }
+
+    pub fn complete_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    ) -> RuntimeResult<RuntimeTurn> {
+        let turn = self.complete_transient_effect_unsettled(call_id, outcome)?;
+        self.settle_turn();
+        Ok(turn)
+    }
+
+    pub fn cancel_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+    ) -> RuntimeResult<bool> {
+        self.session
+            .cancel_transient_effect(call_id)
+            .map_err(Into::into)
+    }
+
+    pub fn pending_transient_effect_count(&self) -> usize {
+        self.session.pending_transient_effect_count()
     }
 
     fn effect_turn(
@@ -1075,6 +1109,7 @@ impl LiveRuntime {
             authority_deltas: turn.authority_deltas,
             durable_changes: turn.durable_changes,
             outbox_changes: turn.outbox_changes,
+            transient_effects: turn.transient_effects,
             document_patches,
             document_patch_status: DocumentPatchStatus::Complete,
             metrics: turn.metrics,

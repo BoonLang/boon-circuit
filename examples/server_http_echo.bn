@@ -1,0 +1,34 @@
+store: [
+    request: SOURCE
+
+    first_path_segment:
+        TEXT { none } |> HOLD first_path_segment {
+            LATEST {
+                request.method |> THEN {
+                    List/get(request.path_segments, index: 0)
+                }
+            }
+        }
+
+    request_method:
+        TEXT { NONE } |> HOLD request_method {
+            LATEST {
+                request.method |> THEN { request.method }
+            }
+        }
+]
+
+outputs: [
+    response: [
+        status: 200
+        body: store.request_method
+            |> Text/concat(with: store.first_path_segment, separator: ":")
+    ]
+]
+
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]

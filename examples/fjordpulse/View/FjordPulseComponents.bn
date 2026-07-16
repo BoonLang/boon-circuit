@@ -1,0 +1,362 @@
+FUNCTION text(value) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...FjordPulseTheme/body()
+            width: Fill
+            text_wrap: True
+        ]
+        text: value
+    )
+}
+
+FUNCTION muted(value) {
+    Scene/Element/text(
+        element: []
+        style: [
+            ...FjordPulseTheme/muted()
+            width: Fill
+            text_wrap: True
+        ]
+        text: value
+    )
+}
+
+FUNCTION heading(value, size) {
+    Scene/Element/text(
+        element: [tag: Heading]
+        style: [
+            ...FjordPulseTheme/heading(size: size)
+            width: Fill
+            text_wrap: True
+            heading_level: 2
+            accessibility_label: value
+        ]
+        text: value
+    )
+}
+
+FUNCTION divider() {
+    Scene/Element/block(
+        element: []
+        style: [width: Fill, height: 1, background: [color: FjordPulseTheme/border()]]
+        child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())
+    )
+}
+
+FUNCTION button(label, selected, width) {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            ...FjordPulseTheme/control(selected: selected, hovered: element.hovered)
+            width: width
+            height: 38
+            padding: [left: 10, right: 10, top: 7, bottom: 7]
+            accessibility_label: label
+            selected: selected
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...FjordPulseTheme/control_text(selected: selected)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+            ]
+            text: label
+        )
+    )
+}
+
+FUNCTION icon_button(label, selected) {
+    Scene/Element/button(
+        element: [
+            event: [press: SOURCE]
+            hovered: SOURCE
+        ]
+        style: [
+            ...FjordPulseTheme/control(selected: selected, hovered: element.hovered)
+            width: 46
+            height: 42
+            accessibility_label: label
+            selected: selected
+        ]
+        label: Scene/Element/text(
+            element: []
+            style: [
+                ...FjordPulseTheme/control_text(selected: selected)
+                width: Fill
+                height: Fill
+                center: True
+                vertical_align: Center
+                accessibility_label: label
+            ]
+            text: label
+        )
+    )
+}
+
+FUNCTION status_pill(status, label) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 7
+        style: [width: Auto, auto_padding: 22, height: 30, paint: False, accessibility_label: label]
+        items: LIST {
+            Scene/Element/block(
+                element: []
+                style: [
+                    width: 9
+                    height: 9
+                    rounded_corners: 5
+                    background: [color: FjordPulseTheme/status_color(status: status)]
+                ]
+                child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...FjordPulseTheme/muted()
+                    width: Auto
+                    auto_padding: 16
+                    height: 24
+                    vertical_align: Center
+                    size: 12
+                    weight: 600
+                ]
+                text: label
+            )
+        }
+    )
+}
+
+FUNCTION departure(time, line, destination, platform, delayed) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [
+            width: Fill
+            height: 62
+            padding: [left: 10, right: 10, top: 8, bottom: 8]
+            ...FjordPulseTheme/surface_frame(of: Surface)
+            border: [color: FjordPulseTheme/border()]
+            border_width: 1
+            rounded_corners: 5
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...FjordPulseTheme/heading(size: 17)
+                    width: 54
+                    height: Fill
+                    vertical_align: Center
+                    color: delayed |> WHEN {
+                        True => FjordPulseTheme/warning()
+                        False => FjordPulseTheme/text()
+                    }
+                ]
+                text: time
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    width: 38
+                    height: 28
+                    center: True
+                    vertical_align: Center
+                    rounded_corners: 4
+                    background: [color: FjordPulseTheme/info()]
+                    color: FjordPulseTheme/text_on_accent()
+                    weight: 700
+                ]
+                text: line
+            )
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                gap: 1
+                style: [width: Fill, height: Fill, paint: False]
+                items: LIST {
+                    Scene/Element/text(
+                        element: []
+                        style: [...FjordPulseTheme/body(), width: Fill, height: 24, weight: 600]
+                        text: destination
+                    )
+                    Scene/Element/text(
+                        element: []
+                        style: [...FjordPulseTheme/muted(), width: Fill, height: 20, size: 12]
+                        text: platform
+                    )
+                }
+            )
+        }
+    )
+}
+
+FUNCTION state_message(status, title, message) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [
+            width: Fill
+            padding: [left: 12, right: 12, top: 11, bottom: 11]
+            ...FjordPulseTheme/state_surface(status: status)
+            accessibility_label: title
+            accessibility_description: message
+        ]
+        items: LIST {
+            Scene/Element/block(
+                element: []
+                style: [
+                    width: 8
+                    height: Fill
+                    rounded_corners: 4
+                    background: [color: FjordPulseTheme/status_color(status: status)]
+                ]
+                child: Scene/Element/text(element: [], style: [height: 1], text: Text/empty())
+            )
+            Scene/Element/stripe(
+                element: []
+                direction: Column
+                gap: 2
+                style: [width: Fill, paint: False]
+                items: LIST {
+                    Scene/Element/text(
+                        element: []
+                        style: [...FjordPulseTheme/body(), width: Fill, height: 23, weight: 700]
+                        text: title
+                    )
+                    Scene/Element/text(
+                        element: []
+                        style: [...FjordPulseTheme/muted(), width: Fill, text_wrap: True]
+                        text: message
+                    )
+                }
+            )
+        }
+    )
+}
+
+FUNCTION data_row(label, value) {
+    Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [
+            width: Fill
+            padding: [left: 8, right: 8, top: 9, bottom: 9]
+            ...FjordPulseTheme/surface_frame(of: DataRow)
+            rounded_corners: 4
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [...FjordPulseTheme/muted(), width: 126, height: 24, vertical_align: Center, size: 12]
+                text: label
+            )
+            Scene/Element/text(
+                element: []
+                style: [...FjordPulseTheme/body(), width: Fill, height: 24, vertical_align: Center, weight: 600, text_wrap: True]
+                text: value
+            )
+        }
+    )
+}
+
+FUNCTION metric(label, value, status) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 3
+        style: [
+            width: Fill
+            height: 82
+            padding: [left: 12, right: 12, top: 10, bottom: 10]
+            ...FjordPulseTheme/surface_frame(of: MetricSurface)
+            rounded_corners: 5
+        ]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [...FjordPulseTheme/muted(), width: Fill, height: 22, size: 12]
+                text: label
+            )
+            Scene/Element/text(
+                element: []
+                style: [
+                    ...FjordPulseTheme/heading(size: 18)
+                    width: Fill
+                    height: 30
+                    color: FjordPulseTheme/status_color(status: status)
+                ]
+                text: value
+            )
+        }
+    )
+}
+
+FUNCTION search_result(title, detail, kind) {
+    search_option(title: title, detail: detail, kind: kind, selected: False)
+}
+
+FUNCTION search_option(title, detail, kind, selected) {
+    Scene/Element/button(
+        element: [event: [press: SOURCE], hovered: SOURCE]
+        style: [
+            width: Fill
+            height: 62
+            padding: [left: 12, right: 12, top: 8, bottom: 8]
+            ...FjordPulseTheme/search_option(selected: selected, hovered: element.hovered)
+            accessibility_label: title
+            accessibility_description: detail
+            selected: selected
+        ]
+        label: Scene/Element/stripe(
+            element: []
+            direction: Column
+            gap: 1
+            style: [width: Fill, height: Fill, paint: False]
+            items: LIST {
+                Scene/Element/stripe(
+                    element: []
+                    direction: Row
+                    gap: 8
+                    style: [width: Fill, height: 24, paint: False]
+                    items: LIST {
+                        Scene/Element/text(element: [], style: [...FjordPulseTheme/body(), width: Fill, height: 24, weight: 700], text: title)
+                        Scene/Element/text(element: [], style: [...FjordPulseTheme/muted(), width: 82, height: 24, size: 11], text: kind)
+                    }
+                )
+                Scene/Element/text(element: [], style: [...FjordPulseTheme/muted(), width: Fill, height: 20, size: 12], text: detail)
+            }
+        )
+    )
+}
+
+FUNCTION section_heading(eyebrow, title) {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 1
+        style: [width: Fill, paint: False, accessibility_label: title]
+        items: LIST {
+            Scene/Element/text(
+                element: []
+                style: [...FjordPulseTheme/muted(), width: Fill, height: 18, size: 10, weight: 700]
+                text: eyebrow
+            )
+            Scene/Element/text(
+                element: [tag: Heading]
+                style: [...FjordPulseTheme/heading(size: 18), width: Fill, height: 28, text_wrap: True, heading_level: 2]
+                text: title
+            )
+        }
+    )
+}

@@ -44,6 +44,92 @@ FUNCTION root() {
 }
 
 #[test]
+fn cross_module_record_function_keeps_closed_call_site_argument_types() {
+    let parsed = boon_parser::parse_project(
+        "RUN.bn",
+        [
+            (
+                "Contract.bn".to_owned(),
+                r#"
+FUNCTION health(version, request_count) {
+    [status: TEXT { ok }, version: version, request_count: request_count]
+}
+"#
+                .to_owned(),
+            ),
+            (
+                "RUN.bn".to_owned(),
+                r#"
+store: [
+    request: SOURCE
+    request_count:
+        0 |> HOLD request_count {
+            request |> THEN { request_count + 1 }
+        }
+]
+outputs: [
+    health: Contract/health(version: TEXT { test }, request_count: store.request_count)
+]
+"#
+                .to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}; functions: {:?}",
+        report.diagnostics,
+        report.function_type_table
+    );
+}
+
+#[test]
+fn fjordpulse_server_contract_functions_keep_closed_types() {
+    let parsed = boon_parser::parse_project(
+        "examples/fjordpulse/Server/RUN.bn",
+        [
+            (
+                "examples/fjordpulse/Shared/FjordPulseContract.bn".to_owned(),
+                include_str!("../../../../examples/fjordpulse/Shared/FjordPulseContract.bn")
+                    .to_owned(),
+            ),
+            (
+                "examples/fjordpulse/Server/RUN.bn".to_owned(),
+                include_str!("../../../../examples/fjordpulse/Server/RUN.bn").to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+    let function_statements = function_statement_map(&parsed.ast.statements);
+    let function_args = function_args_by_statement_map(&function_statements);
+    let call_sites = function_arg_call_site_index(&parsed, &function_args);
+    let calls = parsed
+        .expressions
+        .iter()
+        .filter_map(|expression| match &expression.kind {
+            boon_parser::AstExprKind::Call { function, args } => Some((
+                function.clone(),
+                args.iter().map(|arg| arg.name.clone()).collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}; functions: {:?}; definitions: {:?}; calls: {:?}; call sites: {:?}",
+        report.diagnostics,
+        report.function_type_table,
+        function_args,
+        calls,
+        call_sites
+    );
+}
+
+#[test]
 fn todomvc_completed_hints_use_widened_true_false_shape() {
     let source = include_str!("../../../../examples/todomvc.bn");
     let parsed = boon_parser::parse_source("examples/todomvc.bn", source).unwrap();

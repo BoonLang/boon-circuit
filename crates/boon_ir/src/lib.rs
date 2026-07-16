@@ -27,6 +27,8 @@ pub struct TypedProgram {
     pub sources: Vec<SourcePort>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_effects: Vec<HostEffectDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_ports: Vec<HostPortDeclaration>,
     pub state_cells: Vec<StateCell>,
     pub lists: Vec<ListMemory>,
     #[serde(default)]
@@ -374,6 +376,26 @@ pub struct HostEffectResultRoute {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostPortDeclaration {
+    HttpServer {
+        line: usize,
+        request_source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disconnect_source: Option<String>,
+        response_output: String,
+    },
+    WebSocketServer {
+        line: usize,
+        open_source: String,
+        message_source: String,
+        close_source: String,
+        error_source: String,
+        actions_output: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RowScope {
     pub id: ScopeId,
     pub list: String,
@@ -399,16 +421,7 @@ impl SourcePayloadSchema {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourcePayloadDescriptor {
     pub field: SourcePayloadField,
-    pub value_type: SourcePayloadValueType,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourcePayloadValueType {
-    Bytes,
-    Bool,
-    Number,
-    Text,
+    pub data_type: SemanticDataType,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -472,7 +485,7 @@ pub enum InitialValue {
         value: String,
     },
     Number {
-        value: i64,
+        value: String,
     },
     Byte {
         value: u8,
@@ -486,6 +499,9 @@ pub enum InitialValue {
     },
     Enum {
         value: String,
+    },
+    Data {
+        value: boon_data::Value,
     },
     RootInitialField {
         path: String,
@@ -522,6 +538,96 @@ pub enum ListProjectionKind {
     },
     Find {
         field: String,
+        value: String,
+    },
+    TextPrefix {
+        field: String,
+        prefix: String,
+        limit: Option<usize>,
+        normalization: ListTextNormalization,
+    },
+    IndexedQuery {
+        fields: Vec<ListQueryIndexField>,
+        selection: ListQuerySelection,
+        residual: Option<ListQueryResidual>,
+        limit: Option<usize>,
+        cursor: Option<String>,
+        unique: bool,
+        order: ListQueryOrder,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ListTextNormalization {
+    Exact,
+    TrimLowercase,
+    Tokens,
+    Unknown { value: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListQueryIndexField {
+    pub path: Vec<String>,
+    pub normalization: ListTextNormalization,
+    pub multi_value: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ListQueryOrder {
+    Ascending,
+    Descending,
+    Unknown { value: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ListQuerySelection {
+    Exact {
+        key: String,
+    },
+    TextPrefix {
+        leading: Option<String>,
+        prefix: String,
+    },
+    Range {
+        lower: Option<String>,
+        lower_inclusive: bool,
+        upper: Option<String>,
+        upper_inclusive: bool,
+    },
+    Union {
+        keys: String,
+    },
+    Intersection {
+        keys: String,
+    },
+    Unknown {
+        value: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ListQueryResidual {
+    FieldEqual {
+        path: Vec<String>,
+        value: String,
+    },
+    TextContains {
+        path: Vec<String>,
+        needle: String,
+    },
+    NumberRange {
+        path: Vec<String>,
+        minimum: Option<String>,
+        maximum: Option<String>,
+    },
+    Wgs84Radius {
+        latitude_path: Vec<String>,
+        longitude_path: Vec<String>,
+        center_latitude: String,
+        center_longitude: String,
+        radius_meters: String,
+    },
+    Unknown {
         value: String,
     },
 }
@@ -712,6 +818,10 @@ pub enum UpdateExpression {
         path: String,
     },
     BytesGet {
+        path: String,
+        index: u64,
+    },
+    ListGet {
         path: String,
         index: u64,
     },
@@ -1164,6 +1274,7 @@ fn lower_with_typecheck(
         row_scopes,
         sources,
         host_effects: host_effect_declarations(&typecheck_report),
+        host_ports: host_port_declarations(&typecheck_report),
         output_values,
         dependencies,
         possible_causes,
@@ -2318,10 +2429,9 @@ fn source_payload_schema(
         .into_iter()
         .flat_map(|entry| &entry.fields)
         .filter_map(|field| {
-            Some((
-                SourcePayloadField::from_name(&field.name),
-                source_payload_value_type_from_checked_type(&field.ty)?,
-            ))
+            let data_type = semantic_data_type(&field.ty);
+            (!matches!(data_type, SemanticDataType::Unknown { .. }))
+                .then(|| (SourcePayloadField::from_name(&field.name), data_type))
         })
         .collect::<BTreeMap<_, _>>();
     payload_fields.extend(typed_payload_fields.keys().cloned());
@@ -2331,10 +2441,10 @@ fn source_payload_schema(
             .iter()
             .cloned()
             .map(|field| SourcePayloadDescriptor {
-                value_type: typed_payload_fields
+                data_type: typed_payload_fields
                     .get(&field)
-                    .copied()
-                    .unwrap_or_else(|| source_payload_value_type(&field)),
+                    .cloned()
+                    .unwrap_or_else(|| source_payload_data_type(&field)),
                 field,
             })
             .collect(),
@@ -2342,26 +2452,14 @@ fn source_payload_schema(
     }
 }
 
-fn source_payload_value_type(field: &SourcePayloadField) -> SourcePayloadValueType {
+fn source_payload_data_type(field: &SourcePayloadField) -> SemanticDataType {
     match field {
-        SourcePayloadField::Bytes => SourcePayloadValueType::Bytes,
-        SourcePayloadField::Named(name) if name == "press" => SourcePayloadValueType::Bool,
+        SourcePayloadField::Bytes => SemanticDataType::Bytes { fixed_len: None },
+        SourcePayloadField::Named(name) if name == "press" => SemanticDataType::Bool,
         SourcePayloadField::Address | SourcePayloadField::Key | SourcePayloadField::Text => {
-            SourcePayloadValueType::Text
+            SemanticDataType::Text
         }
-        SourcePayloadField::Named(_) => SourcePayloadValueType::Text,
-    }
-}
-
-fn source_payload_value_type_from_checked_type(
-    ty: &boon_typecheck::Type,
-) -> Option<SourcePayloadValueType> {
-    match semantic_data_type(ty) {
-        SemanticDataType::Bytes { .. } => Some(SourcePayloadValueType::Bytes),
-        SemanticDataType::Bool => Some(SourcePayloadValueType::Bool),
-        SemanticDataType::Number | SemanticDataType::Byte => Some(SourcePayloadValueType::Number),
-        SemanticDataType::Text => Some(SourcePayloadValueType::Text),
-        _ => None,
+        SourcePayloadField::Named(_) => SemanticDataType::Text,
     }
 }
 
@@ -2398,6 +2496,32 @@ fn host_effect_declarations(
                 .collect(),
         })
         .collect()
+}
+
+fn host_port_declarations(report: &boon_typecheck::TypeCheckReport) -> Vec<HostPortDeclaration> {
+    let mut declarations = Vec::with_capacity(
+        usize::from(report.host_port_table.http.is_some())
+            + usize::from(report.host_port_table.websocket.is_some()),
+    );
+    if let Some(http) = &report.host_port_table.http {
+        declarations.push(HostPortDeclaration::HttpServer {
+            line: http.line,
+            request_source: http.request_source.clone(),
+            disconnect_source: http.disconnect_source.clone(),
+            response_output: http.response_output.clone(),
+        });
+    }
+    if let Some(websocket) = &report.host_port_table.websocket {
+        declarations.push(HostPortDeclaration::WebSocketServer {
+            line: websocket.line,
+            open_source: websocket.open_source.clone(),
+            message_source: websocket.message_source.clone(),
+            close_source: websocket.close_source.clone(),
+            error_source: websocket.error_source.clone(),
+            actions_output: websocket.actions_output.clone(),
+        });
+    }
+    declarations
 }
 
 fn source_row_lookup_field(
@@ -4349,12 +4473,35 @@ fn push_canonical_view_event_group_bindings(
 
 fn normalized_document_source_path(path: &str) -> String {
     path.split('.')
-        .filter(|part| *part != "PASSED" && *part != "events")
+        .filter(|part| *part != "PASSED")
         .collect::<Vec<_>>()
         .join(".")
 }
 
+fn document_source_path_candidates(path: &str) -> Vec<String> {
+    let normalized = normalized_document_source_path(path);
+    let without_event_groups = normalized
+        .split('.')
+        .filter(|part| *part != "events")
+        .collect::<Vec<_>>()
+        .join(".");
+    if normalized == without_event_groups {
+        vec![normalized]
+    } else {
+        vec![normalized, without_event_groups]
+    }
+}
+
 fn canonical_view_source_path<'a>(
+    source_paths: &'a [(&'a str, SourceId)],
+    normalized_value: &str,
+) -> Option<(&'a str, SourceId)> {
+    document_source_path_candidates(normalized_value)
+        .into_iter()
+        .find_map(|candidate| canonical_view_source_path_candidate(source_paths, &candidate))
+}
+
+fn canonical_view_source_path_candidate<'a>(
     source_paths: &'a [(&'a str, SourceId)],
     normalized_value: &str,
 ) -> Option<(&'a str, SourceId)> {
@@ -4386,6 +4533,15 @@ fn canonical_view_source_path<'a>(
 }
 
 fn canonical_view_source_group_path(
+    source_paths: &[(&str, SourceId)],
+    normalized_group: &str,
+) -> Option<String> {
+    document_source_path_candidates(normalized_group)
+        .into_iter()
+        .find_map(|candidate| canonical_view_source_group_path_candidate(source_paths, &candidate))
+}
+
+fn canonical_view_source_group_path_candidate(
     source_paths: &[(&str, SourceId)],
     normalized_group: &str,
 ) -> Option<String> {
@@ -4801,10 +4957,10 @@ fn verify_scheduled_update_expression(
         UpdateExpression::SourcePayload { .. } | UpdateExpression::Const { .. } => Ok(()),
         UpdateExpression::NumberInfix { left, op, right } => {
             require_supported_numeric_update_op(op, "number infix")?;
-            if left.parse::<i64>().is_err() {
+            if !is_number_literal(left) {
                 require_known_symbol("number infix left", left, known_symbols)?;
             }
-            if right.parse::<i64>().is_err() {
+            if !is_number_literal(right) {
                 require_known_symbol("number infix right", right, known_symbols)?;
             }
             Ok(())
@@ -4823,7 +4979,7 @@ fn verify_scheduled_update_expression(
                 ("project time viewport_end", viewport_end),
                 ("project time fallback", fallback),
             ] {
-                if path.parse::<i64>().is_err() && !source_payload_input_matches(path, source) {
+                if !is_number_literal(path) && !source_payload_input_matches(path, source) {
                     require_known_symbol(context, path, known_symbols)?;
                 }
             }
@@ -4879,6 +5035,13 @@ fn verify_scheduled_update_expression(
         | UpdateExpression::TextToBytes { path, .. }
         | UpdateExpression::BytesToText { path, .. } => {
             require_known_symbol("bytes update path", path, known_symbols)
+        }
+        UpdateExpression::ListGet { path, .. } => {
+            if source_payload_input_matches(path, source) {
+                Ok(())
+            } else {
+                require_known_symbol("list get path", path, known_symbols)
+            }
         }
         UpdateExpression::BytesSlice {
             path,
@@ -5063,10 +5226,10 @@ fn verify_update_value_expression(
         }
         UpdateValueExpression::NumberInfix { left, op, right } => {
             require_supported_numeric_update_op(op, &format!("{context} number infix"))?;
-            if left.parse::<i64>().is_err() {
+            if !is_number_literal(left) {
                 require_known_symbol(&format!("{context} number infix left"), left, known_symbols)?;
             }
-            if right.parse::<i64>().is_err() {
+            if !is_number_literal(right) {
                 require_known_symbol(
                     &format!("{context} number infix right"),
                     right,
@@ -5082,14 +5245,14 @@ fn verify_update_value_expression(
             arms,
         } => {
             require_supported_numeric_update_op(op, &format!("{context} match number infix"))?;
-            if left.parse::<i64>().is_err() {
+            if !is_number_literal(left) {
                 require_known_symbol(
                     &format!("{context} match number infix left"),
                     left,
                     known_symbols,
                 )?;
             }
-            if right.parse::<i64>().is_err() {
+            if !is_number_literal(right) {
                 require_known_symbol(
                     &format!("{context} match number infix right"),
                     right,
@@ -5378,9 +5541,79 @@ fn verify_identity_clean_identifiers(program: &TypedProgram) -> Result<(), Strin
                 reject_hidden_identity_identifier("list find field", field)?;
                 reject_hidden_identity_identifier("list find value", value)?;
             }
+            ListProjectionKind::TextPrefix { field, prefix, .. } => {
+                reject_hidden_identity_identifier("list query field", field)?;
+                reject_hidden_identity_identifier("list query prefix", prefix)?;
+            }
+            ListProjectionKind::IndexedQuery {
+                fields,
+                selection,
+                residual,
+                cursor,
+                ..
+            } => {
+                for field in fields {
+                    reject_hidden_identity_identifier(
+                        "indexed query field",
+                        &field.path.join("."),
+                    )?;
+                }
+                for value in list_query_selection_paths(selection) {
+                    reject_hidden_identity_identifier("indexed query selection", value)?;
+                }
+                if let Some(residual) = residual {
+                    for value in list_query_residual_paths(residual) {
+                        reject_hidden_identity_identifier("indexed query residual", value)?;
+                    }
+                }
+                if let Some(cursor) = cursor {
+                    reject_hidden_identity_identifier("indexed query cursor", cursor)?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn list_query_selection_paths(selection: &ListQuerySelection) -> Vec<&str> {
+    match selection {
+        ListQuerySelection::Exact { key } => vec![key],
+        ListQuerySelection::TextPrefix { leading, prefix } => leading
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(prefix.as_str()))
+            .collect(),
+        ListQuerySelection::Range { lower, upper, .. } => lower
+            .iter()
+            .chain(upper.iter())
+            .map(String::as_str)
+            .collect(),
+        ListQuerySelection::Union { keys } | ListQuerySelection::Intersection { keys } => {
+            vec![keys]
+        }
+        ListQuerySelection::Unknown { .. } => Vec::new(),
+    }
+}
+
+fn list_query_residual_paths(residual: &ListQueryResidual) -> Vec<&str> {
+    match residual {
+        ListQueryResidual::FieldEqual { value, .. } => vec![value],
+        ListQueryResidual::TextContains { needle, .. } => vec![needle],
+        ListQueryResidual::NumberRange {
+            minimum, maximum, ..
+        } => minimum
+            .iter()
+            .chain(maximum.iter())
+            .map(String::as_str)
+            .collect(),
+        ListQueryResidual::Wgs84Radius {
+            center_latitude,
+            center_longitude,
+            radius_meters,
+            ..
+        } => vec![center_latitude, center_longitude, radius_meters],
+        ListQueryResidual::Unknown { .. } => Vec::new(),
+    }
 }
 
 fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
@@ -5399,7 +5632,8 @@ fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
         | InitialValue::Number { .. }
         | InitialValue::Byte { .. }
         | InitialValue::Bool { .. }
-        | InitialValue::Bytes { .. } => Ok(()),
+        | InitialValue::Bytes { .. }
+        | InitialValue::Data { .. } => Ok(()),
     }
 }
 
@@ -5446,6 +5680,9 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
         | UpdateExpression::TextToBytes { path, .. }
         | UpdateExpression::BytesToText { path, .. } => {
             reject_hidden_identity_identifier("update expression path", path)
+        }
+        UpdateExpression::ListGet { path, .. } => {
+            reject_hidden_identity_identifier("list get path", path)
         }
         UpdateExpression::BytesSlice {
             path,
@@ -6598,6 +6835,183 @@ fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
     typed_field_defs(program)
         .into_iter()
         .filter_map(|field| {
+            if field.has_operator("List/query") {
+                let field_paths = ast_named_call_argument(&field, "List/query", "fields")
+                    .map(|value| parse_query_csv(&value))
+                    .unwrap_or_default();
+                let normalizations = ast_named_call_argument(&field, "List/query", "normalization")
+                    .map(|value| parse_query_csv(&value))
+                    .unwrap_or_else(|| vec!["Exact".to_owned()]);
+                let multi_value = ast_named_call_argument(&field, "List/query", "multi_value")
+                    .map(|value| parse_query_csv(&value))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let query_fields = field_paths
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, path)| ListQueryIndexField {
+                        multi_value: multi_value.contains(&path),
+                        path: parse_query_path(&path),
+                        normalization: parse_query_normalization(
+                            normalizations
+                                .get(index)
+                                .or_else(|| (normalizations.len() == 1).then(|| &normalizations[0]))
+                                .map(String::as_str)
+                                .unwrap_or("Unknown"),
+                        ),
+                    })
+                    .collect::<Vec<_>>();
+                let dynamic = |name: &str| {
+                    ast_named_call_argument(&field, "List/query", name)
+                        .map(|value| canonical_local_path(&value, &field.parent_path))
+                };
+                let selection_name =
+                    ast_named_call_argument(&field, "List/query", "select").unwrap_or_default();
+                let selection = match selection_name.as_str() {
+                    "Exact" => dynamic("key")
+                        .map(|key| ListQuerySelection::Exact { key })
+                        .unwrap_or_else(|| ListQuerySelection::Unknown {
+                            value: "Exact.key".to_owned(),
+                        }),
+                    "Prefix" => dynamic("prefix")
+                        .map(|prefix| ListQuerySelection::TextPrefix {
+                            leading: dynamic("leading"),
+                            prefix,
+                        })
+                        .unwrap_or_else(|| ListQuerySelection::Unknown {
+                            value: "Prefix.prefix".to_owned(),
+                        }),
+                    "Range" => ListQuerySelection::Range {
+                        lower: dynamic("lower"),
+                        lower_inclusive: static_query_bool(&field, "lower_inclusive", true),
+                        upper: dynamic("upper"),
+                        upper_inclusive: static_query_bool(&field, "upper_inclusive", true),
+                    },
+                    "Union" => dynamic("keys")
+                        .map(|keys| ListQuerySelection::Union { keys })
+                        .unwrap_or_else(|| ListQuerySelection::Unknown {
+                            value: "Union.keys".to_owned(),
+                        }),
+                    "Intersection" => dynamic("keys")
+                        .map(|keys| ListQuerySelection::Intersection { keys })
+                        .unwrap_or_else(|| ListQuerySelection::Unknown {
+                            value: "Intersection.keys".to_owned(),
+                        }),
+                    _ => ListQuerySelection::Unknown {
+                        value: selection_name,
+                    },
+                };
+                let residual_name = ast_named_call_argument(&field, "List/query", "residual")
+                    .unwrap_or_else(|| "None".to_owned());
+                let residual_path = |name: &str| {
+                    ast_named_call_argument(&field, "List/query", name)
+                        .map(|value| parse_query_path(&value))
+                        .unwrap_or_default()
+                };
+                let residual = match residual_name.as_str() {
+                    "None" => None,
+                    "FieldEqual" => Some(
+                        dynamic("residual_value")
+                            .map(|value| ListQueryResidual::FieldEqual {
+                                path: residual_path("residual_field"),
+                                value,
+                            })
+                            .unwrap_or_else(|| ListQueryResidual::Unknown {
+                                value: "FieldEqual.residual_value".to_owned(),
+                            }),
+                    ),
+                    "TextContains" => Some(
+                        dynamic("needle")
+                            .map(|needle| ListQueryResidual::TextContains {
+                                path: residual_path("residual_field"),
+                                needle,
+                            })
+                            .unwrap_or_else(|| ListQueryResidual::Unknown {
+                                value: "TextContains.needle".to_owned(),
+                            }),
+                    ),
+                    "NumberRange" => Some(ListQueryResidual::NumberRange {
+                        path: residual_path("residual_field"),
+                        minimum: dynamic("minimum"),
+                        maximum: dynamic("maximum"),
+                    }),
+                    "Wgs84Radius" => Some(
+                        match (
+                            dynamic("center_latitude"),
+                            dynamic("center_longitude"),
+                            dynamic("radius_meters"),
+                        ) {
+                            (
+                                Some(center_latitude),
+                                Some(center_longitude),
+                                Some(radius_meters),
+                            ) => ListQueryResidual::Wgs84Radius {
+                                latitude_path: residual_path("latitude_field"),
+                                longitude_path: residual_path("longitude_field"),
+                                center_latitude,
+                                center_longitude,
+                                radius_meters,
+                            },
+                            _ => ListQueryResidual::Unknown {
+                                value: "Wgs84Radius.bounds".to_owned(),
+                            },
+                        },
+                    ),
+                    _ => Some(ListQueryResidual::Unknown {
+                        value: residual_name,
+                    }),
+                };
+                return Some(ListProjection {
+                    target: field.path.clone(),
+                    list: ast_list_projection_argument(program, &field, "List/query")?,
+                    kind: ListProjectionKind::IndexedQuery {
+                        fields: query_fields,
+                        selection,
+                        residual,
+                        limit: ast_named_call_argument(&field, "List/query", "limit")
+                            .and_then(|value| value.parse::<usize>().ok()),
+                        cursor: dynamic("cursor"),
+                        unique: static_query_bool(&field, "unique", false),
+                        order: match ast_named_call_argument(&field, "List/query", "order")
+                            .as_deref()
+                            .unwrap_or("Ascending")
+                        {
+                            "Ascending" => ListQueryOrder::Ascending,
+                            "Descending" => ListQueryOrder::Descending,
+                            value => ListQueryOrder::Unknown {
+                                value: value.to_owned(),
+                            },
+                        },
+                    },
+                });
+            }
+            if field.has_operator("List/query_prefix") {
+                let normalization =
+                    ast_named_call_argument(&field, "List/query_prefix", "normalization")
+                        .unwrap_or_else(|| "Exact".to_owned());
+                return Some(ListProjection {
+                    target: field.path.clone(),
+                    list: ast_list_projection_argument(program, &field, "List/query_prefix")?,
+                    kind: ListProjectionKind::TextPrefix {
+                        field: ast_named_call_argument(&field, "List/query_prefix", "field")?,
+                        prefix: canonical_local_path(
+                            &ast_named_call_argument(&field, "List/query_prefix", "prefix")?,
+                            &field.parent_path,
+                        ),
+                        limit: ast_named_call_argument(&field, "List/query_prefix", "limit")
+                            .and_then(|value| value.parse::<usize>().ok()),
+                        normalization: match normalization.as_str() {
+                            "Exact" => ListTextNormalization::Exact,
+                            "TrimLowercase" => ListTextNormalization::TrimLowercase,
+                            "Tokens" => ListTextNormalization::Tokens,
+                            _ => ListTextNormalization::Unknown {
+                                value: normalization,
+                            },
+                        },
+                    },
+                });
+            }
             if field.has_operator("List/chunk") {
                 return Some(ListProjection {
                     target: field.path.clone(),
@@ -6628,6 +7042,39 @@ fn list_projections(program: &ParsedProgram) -> Vec<ListProjection> {
             None
         })
         .collect()
+}
+
+fn parse_query_csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_query_path(value: &str) -> Vec<String> {
+    value
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_query_normalization(value: &str) -> ListTextNormalization {
+    match value {
+        "Exact" => ListTextNormalization::Exact,
+        "TrimLowercase" => ListTextNormalization::TrimLowercase,
+        "Tokens" => ListTextNormalization::Tokens,
+        value => ListTextNormalization::Unknown {
+            value: value.to_owned(),
+        },
+    }
+}
+
+fn static_query_bool(field: &FieldDef, name: &str, default: bool) -> bool {
+    ast_named_call_argument(field, "List/query", name).map_or(default, |value| value == "True")
 }
 
 fn ast_list_projection_argument(
@@ -6782,9 +7229,11 @@ fn field_is_derived_list_memory_view(field: &FieldDef, program: &ParsedProgram) 
     }
 }
 
-const DERIVED_LIST_VIEW_OPERATORS: [&str; 8] = [
+const DERIVED_LIST_VIEW_OPERATORS: [&str; 10] = [
     "List/map",
     "List/retain",
+    "List/query",
+    "List/query_prefix",
     "List/filter_text_contains",
     "List/filter_field_equal",
     "List/filter_field_not_equal",
@@ -6861,6 +7310,8 @@ fn derived_value_kind(field: &FieldDef, sources: &[String]) -> DerivedValueKind 
         "List/map",
         "List/chunk",
         "List/find",
+        "List/query",
+        "List/query_prefix",
         "List/filter_text_contains",
         "List/filter_field_equal",
         "List/filter_field_not_equal",
@@ -6893,16 +7344,18 @@ fn field_terminal_pipeline_operator(field: &FieldDef) -> Option<&str> {
 }
 
 fn top_level_pipeline_statement_expr_id(statement: &AstStatement) -> Option<usize> {
+    if let Some(expr_id) = statement
+        .children
+        .iter()
+        .rev()
+        .find_map(top_level_pipeline_statement_expr_id)
+    {
+        return Some(expr_id);
+    }
     match statement.kind {
         AstStatementKind::Expression
         | AstStatementKind::Hold { .. }
-        | AstStatementKind::List { field: None, .. } => statement.expr.or_else(|| {
-            statement
-                .children
-                .iter()
-                .rev()
-                .find_map(top_level_pipeline_statement_expr_id)
-        }),
+        | AstStatementKind::List { field: None, .. } => statement.expr,
         _ => None,
     }
 }
@@ -6973,12 +7426,9 @@ fn ast_initial_value(
         AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => InitialValue::Text {
             value: value.clone(),
         },
-        AstExprKind::Number(value) => value
-            .parse::<i64>()
-            .map(|value| InitialValue::Number { value })
-            .unwrap_or_else(|_| InitialValue::Unknown {
-                summary: value.clone(),
-            }),
+        AstExprKind::Number(value) => InitialValue::Number {
+            value: value.clone(),
+        },
         AstExprKind::ByteLiteral { value, .. } => InitialValue::Byte { value: *value },
         AstExprKind::BytesLiteral { size, items } => initial_bytes_value(size, items, expressions)
             .unwrap_or_else(|| InitialValue::Unknown {
@@ -7134,10 +7584,270 @@ fn structured_list_record_rows(
     let rows = statement
         .children
         .iter()
-        .filter(|row| matches!(row.kind, AstStatementKind::Block))
-        .filter_map(|row| structured_list_record_row(program, row))
+        .filter_map(|row| {
+            if matches!(row.kind, AstStatementKind::Block) {
+                structured_list_record_row(program, row)
+            } else {
+                row.expr
+                    .and_then(|expr_id| {
+                        static_initial_data_expr(
+                            program,
+                            expr_id,
+                            &BTreeMap::new(),
+                            &mut Vec::new(),
+                        )
+                    })
+                    .and_then(initial_record_from_data)
+            }
+        })
         .collect::<Vec<_>>();
     Some(rows)
+}
+
+fn initial_record_from_data(value: boon_data::Value) -> Option<ListInitialRecord> {
+    let boon_data::Value::Record(fields) = value else {
+        return None;
+    };
+    Some(ListInitialRecord {
+        fields: fields
+            .into_iter()
+            .map(|(name, value)| ListRowInitialField {
+                name,
+                value: initial_value_from_data(value),
+            })
+            .collect(),
+    })
+}
+
+fn initial_value_from_data(value: boon_data::Value) -> InitialValue {
+    match value {
+        boon_data::Value::Bool(value) => InitialValue::Bool { value },
+        boon_data::Value::Number(value) => InitialValue::Number {
+            value: value.to_string(),
+        },
+        boon_data::Value::Text(value) => InitialValue::Text { value },
+        boon_data::Value::Bytes(bytes) => InitialValue::Bytes {
+            fixed_len: Some(bytes.len()),
+            bytes,
+        },
+        boon_data::Value::Variant { tag, fields } if fields.is_empty() => {
+            InitialValue::Enum { value: tag }
+        }
+        value => InitialValue::Data { value },
+    }
+}
+
+fn static_initial_data_expr(
+    program: &ParsedProgram,
+    expr_id: usize,
+    env: &BTreeMap<String, boon_data::Value>,
+    call_stack: &mut Vec<String>,
+) -> Option<boon_data::Value> {
+    let expr = program.expressions.iter().find(|expr| expr.id == expr_id)?;
+    match &expr.kind {
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+            Some(boon_data::Value::Text(value.clone()))
+        }
+        AstExprKind::Number(value) => value
+            .parse::<boon_data::FiniteReal>()
+            .ok()
+            .map(boon_data::Value::Number),
+        AstExprKind::ByteLiteral { value, .. } => boon_data::Value::integer(i64::from(*value)).ok(),
+        AstExprKind::BytesLiteral { size, items } => {
+            let InitialValue::Bytes { bytes, .. } =
+                initial_bytes_value(size, items, &program.expressions)?
+            else {
+                return None;
+            };
+            Some(boon_data::Value::Bytes(bytes))
+        }
+        AstExprKind::Bool(value) => Some(boon_data::Value::Bool(*value)),
+        AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => Some(boon_data::Value::Variant {
+            tag: tag.clone(),
+            fields: BTreeMap::new(),
+        }),
+        AstExprKind::Identifier(name) => env.get(name).cloned(),
+        AstExprKind::Path(parts) if parts.len() == 1 => env.get(&parts[0]).cloned(),
+        AstExprKind::Record(fields) | AstExprKind::Object(fields) => fields
+            .iter()
+            .filter(|field| !field.spread)
+            .map(|field| {
+                Some((
+                    field.name.clone(),
+                    static_initial_data_expr(program, field.value, env, call_stack)?,
+                ))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(boon_data::Value::Record),
+        AstExprKind::TaggedObject { tag, fields } => fields
+            .iter()
+            .filter(|field| !field.spread)
+            .map(|field| {
+                Some((
+                    field.name.clone(),
+                    static_initial_data_expr(program, field.value, env, call_stack)?,
+                ))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(|fields| boon_data::Value::Variant {
+                tag: tag.clone(),
+                fields,
+            }),
+        AstExprKind::ListLiteral { items, .. } => items
+            .iter()
+            .map(|item| static_initial_data_expr(program, *item, env, call_stack))
+            .collect::<Option<Vec<_>>>()
+            .map(boon_data::Value::List),
+        AstExprKind::Call { function, .. } if function == "Text/empty" => {
+            Some(boon_data::Value::Text(String::new()))
+        }
+        AstExprKind::Call { function, args } => {
+            static_initial_function_call(program, expr.id, function, args, env, call_stack)
+        }
+        _ => None,
+    }
+}
+
+fn static_initial_function_call(
+    program: &ParsedProgram,
+    call_expr_id: usize,
+    function: &str,
+    inline_args: &[boon_parser::AstCallArg],
+    outer_env: &BTreeMap<String, boon_data::Value>,
+    call_stack: &mut Vec<String>,
+) -> Option<boon_data::Value> {
+    if call_stack.len() >= 64 || call_stack.iter().any(|active| active == function) {
+        return None;
+    }
+    let definition = find_function_statement(&program.ast.statements, function)?;
+    let AstStatementKind::Function { args, .. } = &definition.kind else {
+        return None;
+    };
+    let mut argument_exprs = BTreeMap::<String, usize>::new();
+    let mut positional = 0usize;
+    for arg in inline_args {
+        let name = match &arg.name {
+            Some(name) => name.clone(),
+            None => {
+                let name = args.get(positional)?.clone();
+                positional += 1;
+                name
+            }
+        };
+        argument_exprs.insert(name, arg.value);
+    }
+    if inline_args.is_empty() {
+        let statement = find_statement_by_expr(&program.ast.statements, call_expr_id)?;
+        for child in &statement.children {
+            match &child.kind {
+                AstStatementKind::Field { name } => {
+                    argument_exprs.insert(name.clone(), child.expr?);
+                }
+                AstStatementKind::Expression => {
+                    let name = args.get(positional)?.clone();
+                    positional += 1;
+                    argument_exprs.insert(name, child.expr?);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut env = BTreeMap::new();
+    for name in args {
+        let expr_id = *argument_exprs.get(name)?;
+        env.insert(
+            name.clone(),
+            static_initial_data_expr(program, expr_id, outer_env, call_stack)?,
+        );
+    }
+    call_stack.push(function.to_owned());
+    let result = static_initial_function_body(program, definition, &env, call_stack);
+    call_stack.pop();
+    result
+}
+
+fn static_initial_function_body(
+    program: &ParsedProgram,
+    definition: &AstStatement,
+    env: &BTreeMap<String, boon_data::Value>,
+    call_stack: &mut Vec<String>,
+) -> Option<boon_data::Value> {
+    if let Some(block) = definition.children.iter().find(|child| {
+        matches!(child.kind, AstStatementKind::Block)
+            && child
+                .children
+                .iter()
+                .any(|field| matches!(field.kind, AstStatementKind::Field { .. }))
+    }) {
+        let fields = block
+            .children
+            .iter()
+            .filter_map(|field| {
+                let AstStatementKind::Field { name } = &field.kind else {
+                    return None;
+                };
+                Some((
+                    name.clone(),
+                    static_initial_data_expr(program, field.expr?, env, call_stack)?,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if !fields.is_empty() {
+            return Some(boon_data::Value::Record(fields));
+        }
+    }
+    let result_expr = function_result_expr_id(definition, &program.expressions)?;
+    static_initial_data_expr(program, result_expr, env, call_stack)
+}
+
+fn find_function_statement<'a>(
+    statements: &'a [AstStatement],
+    function: &str,
+) -> Option<&'a AstStatement> {
+    statements.iter().find_map(|statement| {
+        let matches = matches!(
+            &statement.kind,
+            AstStatementKind::Function { name, .. }
+                if name == function
+                    || function.rsplit_once('/').is_some_and(|(_, suffix)| suffix == name)
+        );
+        matches
+            .then_some(statement)
+            .or_else(|| find_function_statement(&statement.children, function))
+    })
+}
+
+fn find_statement_by_expr(statements: &[AstStatement], expr_id: usize) -> Option<&AstStatement> {
+    statements.iter().find_map(|statement| {
+        (statement.expr == Some(expr_id))
+            .then_some(statement)
+            .or_else(|| find_statement_by_expr(&statement.children, expr_id))
+    })
+}
+
+fn function_result_expr_id(statement: &AstStatement, expressions: &[AstExpr]) -> Option<usize> {
+    statement
+        .expr
+        .filter(|expr_id| {
+            expressions.iter().any(|expr| {
+                expr.id == *expr_id
+                    && matches!(
+                        expr.kind,
+                        AstExprKind::Record(_)
+                            | AstExprKind::Object(_)
+                            | AstExprKind::TaggedObject { .. }
+                            | AstExprKind::Call { .. }
+                            | AstExprKind::ListLiteral { .. }
+                    )
+            })
+        })
+        .or_else(|| {
+            statement
+                .children
+                .iter()
+                .rev()
+                .find_map(|child| function_result_expr_id(child, expressions))
+        })
 }
 
 fn find_list_statement<'a>(
@@ -7257,7 +7967,9 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
         return InitialValue::Text { value };
     }
     if let Some(value) = signed_integer_literal_value(tokens) {
-        return InitialValue::Number { value };
+        return InitialValue::Number {
+            value: value.to_string(),
+        };
     }
     if let Some(value) = byte_literal_value(tokens) {
         return InitialValue::Byte { value };
@@ -7269,8 +7981,8 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
     match value.as_str() {
         "True" => InitialValue::Bool { value: true },
         "False" => InitialValue::Bool { value: false },
-        value if value.parse::<i64>().is_ok() => InitialValue::Number {
-            value: value.parse().unwrap_or_default(),
+        value if is_number_literal(value) => InitialValue::Number {
+            value: value.to_owned(),
         },
         value if value_starts_uppercase_identifier(value) => InitialValue::Enum {
             value: value.to_owned(),
@@ -7299,6 +8011,10 @@ fn signed_integer_literal_value(tokens: &[String]) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+fn is_number_literal(value: &str) -> bool {
+    value.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
 fn byte_literal_value(tokens: &[String]) -> Option<u8> {
@@ -7472,7 +8188,7 @@ fn ast_call_argument(field: &FieldDef, function: &str) -> Option<String> {
 }
 
 fn ast_call_arguments(field: &FieldDef, function: &str) -> Vec<String> {
-    field
+    let inline = field
         .ast_exprs
         .iter()
         .find_map(|expr| match &expr.kind {
@@ -7487,11 +8203,21 @@ fn ast_call_arguments(field: &FieldDef, function: &str) -> Vec<String> {
         .flatten()
         .filter(|arg| arg.name.is_none())
         .filter_map(|arg| ast_argument_value(field, arg.value))
+        .collect::<Vec<_>>();
+    if !inline.is_empty() {
+        return inline;
+    }
+    ast_multiline_call_statement(field, function)
+        .into_iter()
+        .flat_map(|statement| &statement.children)
+        .filter(|child| matches!(child.kind, AstStatementKind::Expression))
+        .filter_map(|child| child.expr)
+        .filter_map(|expr_id| ast_argument_value(field, expr_id))
         .collect()
 }
 
 fn ast_named_call_argument(field: &FieldDef, function: &str, name: &str) -> Option<String> {
-    field
+    let inline = field
         .ast_exprs
         .iter()
         .find_map(|expr| match &expr.kind {
@@ -7504,7 +8230,43 @@ fn ast_named_call_argument(field: &FieldDef, function: &str, name: &str) -> Opti
         })?
         .iter()
         .find(|arg| arg.name.as_deref() == Some(name))
-        .and_then(|arg| ast_argument_value(field, arg.value))
+        .and_then(|arg| ast_argument_value(field, arg.value));
+    inline.or_else(|| {
+        ast_multiline_call_statement(field, function)?
+            .children
+            .iter()
+            .find(|child| {
+                matches!(&child.kind, AstStatementKind::Field { name: field } if field == name)
+            })
+            .and_then(|child| child.expr)
+            .and_then(|expr_id| ast_argument_value(field, expr_id))
+    })
+}
+
+fn ast_multiline_call_statement<'a>(
+    field: &'a FieldDef,
+    function: &str,
+) -> Option<&'a AstStatement> {
+    fn find<'a>(
+        statement: &'a AstStatement,
+        expressions: &[AstExpr],
+        function: &str,
+    ) -> Option<&'a AstStatement> {
+        if statement.expr.is_some_and(|expr_id| {
+            expressions.iter().find(|expr| expr.id == expr_id).is_some_and(|expr| {
+                matches!(&expr.kind, AstExprKind::Call { function: called, .. } if called == function)
+                    || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == function)
+            })
+        }) {
+            return Some(statement);
+        }
+        statement
+            .children
+            .iter()
+            .find_map(|child| find(child, expressions, function))
+    }
+
+    find(&field.statement, &field.ast_exprs, function)
 }
 
 fn ast_argument_value(field: &FieldDef, expr_id: usize) -> Option<String> {
@@ -7513,7 +8275,7 @@ fn ast_argument_value(field: &FieldDef, expr_id: usize) -> Option<String> {
 
 fn scalar_number_operand(field: &FieldDef, expr_id: usize, target: &str) -> Option<String> {
     let value = ast_argument_value(field, expr_id)?;
-    if value.parse::<i64>().is_ok() {
+    if is_number_literal(&value) {
         return Some(value);
     }
     let target_field = target
@@ -8973,9 +9735,20 @@ fn dotted_path_parts(path: &str) -> Vec<&str> {
 fn path_parts_match_source_ref(candidate: &[String], expected: &[&str]) -> bool {
     let candidate = candidate
         .iter()
-        .filter(|part| part.as_str() != "PASSED" && part.as_str() != "events")
+        .filter(|part| part.as_str() != "PASSED")
         .map(String::as_str)
         .collect::<Vec<_>>();
+    if source_ref_parts_match(&candidate, expected) {
+        return true;
+    }
+    let candidate = candidate
+        .into_iter()
+        .filter(|part| *part != "events")
+        .collect::<Vec<_>>();
+    source_ref_parts_match(&candidate, expected)
+}
+
+fn source_ref_parts_match(candidate: &[&str], expected: &[&str]) -> bool {
     if candidate
         .iter()
         .take(expected.len())
@@ -9046,6 +9819,8 @@ fn symbol_is_list_operator(symbol: &str) -> bool {
             | "List/range"
             | "List/chunk"
             | "List/find"
+            | "List/query"
+            | "List/query_prefix"
             | "List/find_value"
             | "List/filter_text_contains"
             | "List/filter_field_equal"
@@ -9280,6 +10055,27 @@ fn non_skip_literal_match_patterns_after_when(
         .map(|expr| expr.line)
         .min()
         .unwrap_or(usize::MAX);
+    let has_non_skip_catch_all = branch
+        .ast_exprs
+        .iter()
+        .filter(|expr| expr.line >= when_line && expr.line < end_line)
+        .any(|expr| {
+            let AstExprKind::MatchArm { pattern, output } = &expr.kind else {
+                return false;
+            };
+            let Some(pattern) = match_const_pattern_label(pattern) else {
+                return false;
+            };
+            let catch_all = pattern == "__" || value_starts_lowercase_identifier(&pattern);
+            let skips = output.is_some_and(|output| {
+                ast_simple_update_value_in_exprs(&branch.ast_exprs, output)
+                    == Some("SKIP".to_owned())
+            });
+            catch_all && !skips
+        });
+    if has_non_skip_catch_all {
+        return Vec::new();
+    }
     let mut values = branch
         .ast_exprs
         .iter()
@@ -9397,6 +10193,11 @@ fn update_expression_for_routed_branch(
     }
     if let Some(expression) =
         branch.then_bytes_get_expression(field, target, fields, resolved_constants)
+    {
+        return expression;
+    }
+    if let Some(expression) =
+        branch.then_list_get_expression(field, target, fields, branch_source, resolved_constants)
     {
         return expression;
     }
@@ -11718,6 +12519,50 @@ impl RoutedBranch {
         })
     }
 
+    fn then_list_get_expression(
+        &self,
+        field: &FieldDef,
+        target: &str,
+        fields: &[FieldDef],
+        branch_source: &str,
+        resolved_constants: &ResolvedConstantLookup<'_>,
+    ) -> Option<UpdateExpression> {
+        self.ast_exprs.iter().find_map(|expr| {
+            let AstExprKind::Then {
+                output: Some(output),
+                ..
+            } = expr.kind
+            else {
+                return None;
+            };
+            let output = field
+                .ast_exprs
+                .iter()
+                .find(|candidate| candidate.id == output)?;
+            let (raw_path, index) = match &output.kind {
+                AstExprKind::Pipe { input, op, args } if op == "List/get" => (
+                    ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
+                    bytes_get_index_arg_in_exprs(resolved_constants, args, true)?,
+                ),
+                AstExprKind::Call { function, args } if function == "List/get" => (
+                    bytes_get_input_arg_in_exprs(&field.ast_exprs, args)?,
+                    bytes_get_index_arg_in_exprs(resolved_constants, args, false)?,
+                ),
+                _ => return None,
+            };
+            Some(UpdateExpression::ListGet {
+                path: canonical_scalar_update_path_for_source(
+                    field,
+                    target,
+                    &raw_path,
+                    fields,
+                    branch_source,
+                ),
+                index,
+            })
+        })
+    }
+
     fn then_bytes_set_expression(
         &self,
         field: &FieldDef,
@@ -13513,6 +14358,19 @@ fn gather_field_defs_from_statements(
                     push_field_def(statement, name, scope, program, items, fields);
                 }
             }
+            AstStatementKind::Expression
+                if statement.expr.is_some_and(|expr_id| {
+                    program.ast.expressions.get(expr_id).is_some_and(|expr| {
+                        matches!(
+                            expr.kind,
+                            AstExprKind::Call { .. } | AstExprKind::Pipe { .. }
+                        )
+                    })
+                }) =>
+            {
+                // Multiline call children are arguments owned by this expression,
+                // not independently addressable semantic fields.
+            }
             AstStatementKind::Block
             | AstStatementKind::Spread
             | AstStatementKind::Expression
@@ -13946,12 +14804,14 @@ fn should_record_field_statement(
     } else {
         format!("{}.{}", scope.join("."), local_name)
     };
-    let top_level_data_scope = scope
-        .first()
-        .is_some_and(|root| !matches!(root.as_str(), "store" | "document" | "scene"));
+    let top_level_data_scope = scope.first().is_some_and(|root| {
+        !matches!(root.as_str(), "store" | "document" | "scene" | "host_ports")
+    });
     local_name != "sources"
+        && local_name != "host_ports"
         && !scope.iter().any(|name| name == "sources")
-        && !scope.first().is_some_and(|name| name == "effects")
+        && !scope.iter().any(|name| name == "host_ports")
+        && scope.first().is_none_or(|name| name != "effects")
         && (program
             .state_cells
             .iter()

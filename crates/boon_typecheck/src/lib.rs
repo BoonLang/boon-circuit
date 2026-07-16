@@ -381,6 +381,33 @@ pub struct HostEffectTable {
     pub declarations: Vec<HostEffectDeclaration>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostPortTable {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpServerPortTypeEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket: Option<WebSocketServerPortTypeEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HttpServerPortTypeEntry {
+    pub line: usize,
+    pub request_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnect_source: Option<String>,
+    pub response_output: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WebSocketServerPortTypeEntry {
+    pub line: usize,
+    pub open_source: String,
+    pub message_source: String,
+    pub close_source: String,
+    pub error_source: String,
+    pub actions_output: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostEffectDeclaration {
     pub name: String,
@@ -421,6 +448,8 @@ pub struct TypeCheckReport {
     pub source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
     #[serde(default)]
     pub host_effect_table: HostEffectTable,
+    #[serde(default)]
+    pub host_port_table: HostPortTable,
     pub full_document_typecheck_coverage: bool,
     pub list_map_binding_count_runtime_value: usize,
     pub list_map_binding_count_render_slot_materialization: usize,
@@ -463,7 +492,7 @@ struct HostEffectSignature {
 
 fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
     let spec = boon_effect_schema::host_effect_spec(operation)?;
-    let schema = spec.durable_schema?;
+    let schema = spec.schema?;
     if spec.result_policy != boon_effect_schema::ResultPolicySpec::CorrelatedSource {
         return None;
     }
@@ -504,6 +533,9 @@ fn effect_schema_type_to_type(value_type: &boon_effect_schema::ValueType) -> Typ
                     usize::try_from(len).expect("host effect fixed byte length fits usize"),
                 )
             }))
+        }
+        boon_effect_schema::ValueType::List { item } => {
+            Type::List(Box::new(effect_schema_type_to_type(item)))
         }
         boon_effect_schema::ValueType::Record { fields, open } => {
             Type::Object(ObjectShape::from_ordered_fields(
@@ -811,6 +843,250 @@ fn host_effect_table(
     (table, diagnostics)
 }
 
+fn host_port_table(
+    program: &ParsedProgram,
+    source_lookup: &SourcePayloadPathLookup,
+) -> (HostPortTable, Vec<TypeDiagnostic>) {
+    let mut table = HostPortTable::default();
+    let mut diagnostics = Vec::new();
+    let registries = program
+        .ast
+        .statements
+        .iter()
+        .filter(|statement| statement_field_name(statement) == Some("host_ports"))
+        .collect::<Vec<_>>();
+    if registries.len() > 1 {
+        diagnostics.push(diagnostic_for_statement(
+            registries.get(1).copied(),
+            "top-level `host_ports` may be declared only once".to_owned(),
+        ));
+    }
+    let Some(registry) = registries.first().copied() else {
+        return (table, diagnostics);
+    };
+
+    let mut ports = BTreeMap::<&str, &AstStatement>::new();
+    for port in &registry.children {
+        let Some(name) = statement_field_name(port) else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(port),
+                "each `host_ports` entry must be a named record".to_owned(),
+            ));
+            continue;
+        };
+        if !matches!(name, "http" | "websocket") {
+            diagnostics.push(diagnostic_for_statement(
+                Some(port),
+                format!("unsupported host port `{name}`; expected `http` or `websocket`"),
+            ));
+            continue;
+        }
+        if ports.insert(name, port).is_some() {
+            diagnostics.push(diagnostic_for_statement(
+                Some(port),
+                format!("host port `{name}` is declared more than once"),
+            ));
+        }
+    }
+    if ports.is_empty() {
+        diagnostics.push(diagnostic_for_statement(
+            Some(registry),
+            "`host_ports` must declare `http`, `websocket`, or both".to_owned(),
+        ));
+    }
+
+    if let Some(port) = ports.get("http").copied() {
+        let diagnostic_start = diagnostics.len();
+        let members = host_port_members(
+            port,
+            "http",
+            &["request", "disconnect", "response"],
+            &["request", "response"],
+            &mut diagnostics,
+        );
+        let request_source = members.get("request").and_then(|statement| {
+            host_port_source_reference(
+                program,
+                source_lookup,
+                statement,
+                "http.request",
+                &mut diagnostics,
+            )
+        });
+        let disconnect_source = members.get("disconnect").and_then(|statement| {
+            host_port_source_reference(
+                program,
+                source_lookup,
+                statement,
+                "http.disconnect",
+                &mut diagnostics,
+            )
+        });
+        let response_output = members.get("response").and_then(|statement| {
+            host_port_output_reference(program, statement, "http.response", &mut diagnostics)
+        });
+        if diagnostics.len() == diagnostic_start
+            && let (Some(request_source), Some(response_output)) = (request_source, response_output)
+        {
+            table.http = Some(HttpServerPortTypeEntry {
+                line: port.line,
+                request_source,
+                disconnect_source,
+                response_output,
+            });
+        }
+    }
+
+    if let Some(port) = ports.get("websocket").copied() {
+        let diagnostic_start = diagnostics.len();
+        let members = host_port_members(
+            port,
+            "websocket",
+            &["open", "message", "close", "error", "actions"],
+            &["open", "message", "close", "error", "actions"],
+            &mut diagnostics,
+        );
+        let source = |member: &str, diagnostics: &mut Vec<TypeDiagnostic>| {
+            members.get(member).and_then(|statement| {
+                host_port_source_reference(
+                    program,
+                    source_lookup,
+                    statement,
+                    &format!("websocket.{member}"),
+                    diagnostics,
+                )
+            })
+        };
+        let open_source = source("open", &mut diagnostics);
+        let message_source = source("message", &mut diagnostics);
+        let close_source = source("close", &mut diagnostics);
+        let error_source = source("error", &mut diagnostics);
+        let actions_output = members.get("actions").and_then(|statement| {
+            host_port_output_reference(program, statement, "websocket.actions", &mut diagnostics)
+        });
+        if diagnostics.len() == diagnostic_start
+            && let (
+                Some(open_source),
+                Some(message_source),
+                Some(close_source),
+                Some(error_source),
+                Some(actions_output),
+            ) = (
+                open_source,
+                message_source,
+                close_source,
+                error_source,
+                actions_output,
+            )
+        {
+            table.websocket = Some(WebSocketServerPortTypeEntry {
+                line: port.line,
+                open_source,
+                message_source,
+                close_source,
+                error_source,
+                actions_output,
+            });
+        }
+    }
+
+    (table, diagnostics)
+}
+
+fn host_port_members<'a>(
+    port: &'a AstStatement,
+    port_name: &str,
+    allowed: &[&str],
+    required: &[&str],
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> BTreeMap<&'a str, &'a AstStatement> {
+    let mut members = BTreeMap::new();
+    for member in &port.children {
+        let Some(name) = statement_field_name(member) else {
+            diagnostics.push(diagnostic_for_statement(
+                Some(member),
+                format!("host port `{port_name}` contains an unnamed member"),
+            ));
+            continue;
+        };
+        if !allowed.contains(&name) {
+            diagnostics.push(diagnostic_for_statement(
+                Some(member),
+                format!("host port `{port_name}` has unsupported member `{name}`"),
+            ));
+            continue;
+        }
+        if members.insert(name, member).is_some() {
+            diagnostics.push(diagnostic_for_statement(
+                Some(member),
+                format!("host port `{port_name}` repeats `{name}`"),
+            ));
+        }
+    }
+    for name in required {
+        if !members.contains_key(name) {
+            diagnostics.push(diagnostic_for_statement(
+                Some(port),
+                format!("host port `{port_name}` is missing `{name}`"),
+            ));
+        }
+    }
+    members
+}
+
+fn host_port_source_reference(
+    program: &ParsedProgram,
+    source_lookup: &SourcePayloadPathLookup,
+    statement: &AstStatement,
+    member: &str,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Option<String> {
+    let Some(expr_id) = direct_statement_value_expr_id(statement, &program.expressions) else {
+        diagnostics.push(diagnostic_for_statement(
+            Some(statement),
+            format!("host port `{member}` has no SOURCE reference"),
+        ));
+        return None;
+    };
+    let Some(source) = effect_source_path(program, expr_id, source_lookup, true) else {
+        diagnostics.push(diagnostic_for_statement(
+            Some(statement),
+            format!("host port `{member}` must reference exactly one direct SOURCE"),
+        ));
+        return None;
+    };
+    Some(source)
+}
+
+fn host_port_output_reference(
+    program: &ParsedProgram,
+    statement: &AstStatement,
+    member: &str,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Option<String> {
+    let Some(expr_id) = direct_statement_value_expr_id(statement, &program.expressions) else {
+        diagnostics.push(diagnostic_for_statement(
+            Some(statement),
+            format!("host port `{member}` has no output reference"),
+        ));
+        return None;
+    };
+    let output = match &program.expressions.get(expr_id)?.kind {
+        AstExprKind::Identifier(name) => Some(name.clone()),
+        AstExprKind::Path(parts) if parts.len() == 2 && parts[0] == "outputs" => {
+            Some(parts[1].clone())
+        }
+        _ => None,
+    };
+    if output.is_none() {
+        diagnostics.push(diagnostic_for_statement(
+            Some(statement),
+            format!("host port `{member}` must reference one named root from top-level `outputs`"),
+        ));
+    }
+    output
+}
+
 fn statement_field_name(statement: &AstStatement) -> Option<&str> {
     match &statement.kind {
         AstStatementKind::Field { name }
@@ -926,6 +1202,7 @@ struct Checker<'a> {
     source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
     source_payload_types: BTreeMap<String, Type>,
     host_effect_table: HostEffectTable,
+    host_port_table: HostPortTable,
     function_statements: BTreeMap<String, &'a AstStatement>,
     function_call_graph: BTreeMap<String, BTreeSet<String>>,
     function_args_by_name: BTreeMap<String, Vec<String>>,
@@ -938,6 +1215,7 @@ struct Checker<'a> {
     function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
     expr_type_vars: BTreeMap<usize, TypeVar>,
     runtime_list_map_exprs: BTreeSet<usize>,
+    builtin_symbol_exprs: BTreeSet<usize>,
     visited: BTreeSet<usize>,
     expr_type_in_progress: BTreeSet<usize>,
     expr_type_cache: Vec<Option<FlowType>>,
@@ -963,12 +1241,15 @@ impl<'a> Checker<'a> {
         let source_payload_lookup = SourcePayloadPathLookup::new(&source_paths);
         let (host_effect_table, host_effect_diagnostics) =
             host_effect_table(program, &source_payload_lookup);
+        let (host_port_table, host_port_diagnostics) =
+            host_port_table(program, &source_payload_lookup);
         let source_payload_shape_table_started = Instant::now();
         let source_payload_shape_table = source_payload_shape_table(
             program,
             &source_paths,
             &source_payload_lookup,
             &host_effect_table,
+            &host_port_table,
         );
         let source_payload_shape_table_ms =
             typecheck_elapsed_ms(source_payload_shape_table_started);
@@ -1015,6 +1296,27 @@ impl<'a> Checker<'a> {
                 "document"
             });
         let render_contracts_ms = typecheck_elapsed_ms(render_contracts_started);
+        let mut builtin_symbol_exprs = program
+            .expressions
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                AstExprKind::Call { function, args }
+                | AstExprKind::Pipe {
+                    op: function, args, ..
+                } => Some((function, args)),
+                _ => None,
+            })
+            .flat_map(|(function, args)| {
+                args.iter()
+                    .filter(move |arg| builtin_argument_is_symbol(function, arg.name.as_deref()))
+                    .map(|arg| arg.value)
+            })
+            .collect();
+        collect_builtin_symbol_statement_exprs(
+            &program.ast.statements,
+            &program.expressions,
+            &mut builtin_symbol_exprs,
+        );
         let mut checker = Self {
             program,
             vars: TypeVarStore::default(),
@@ -1025,6 +1327,7 @@ impl<'a> Checker<'a> {
             source_payload_shape_table,
             source_payload_types,
             host_effect_table,
+            host_port_table,
             function_statements,
             function_call_graph,
             function_args_by_name,
@@ -1037,6 +1340,7 @@ impl<'a> Checker<'a> {
             function_param_requirements,
             expr_type_vars: BTreeMap::new(),
             runtime_list_map_exprs: BTreeSet::new(),
+            builtin_symbol_exprs,
             visited: BTreeSet::new(),
             expr_type_in_progress: BTreeSet::new(),
             expr_type_cache: vec![None; program.expressions.len()],
@@ -1046,9 +1350,13 @@ impl<'a> Checker<'a> {
             render_slot_table: RenderSlotTable::default(),
             list_map_bindings: Vec::new(),
             constraints: Vec::new(),
-            diagnostics: host_effect_diagnostics,
+            diagnostics: host_effect_diagnostics
+                .into_iter()
+                .chain(host_port_diagnostics)
+                .collect(),
         };
         let refresh_started = Instant::now();
+        checker.refresh_static_list_bindings();
         checker.refresh_static_row_scope_bindings();
         let refresh_static_row_scope_bindings_ms = typecheck_elapsed_ms(refresh_started);
         let init_profile = CheckerInitProfile {
@@ -1066,6 +1374,50 @@ impl<'a> Checker<'a> {
             refresh_static_row_scope_bindings_ms,
         };
         (checker, init_profile)
+    }
+
+    fn refresh_static_list_bindings(&mut self) {
+        let mut updates = Vec::new();
+        self.collect_static_list_binding_updates(
+            &self.program.ast.statements,
+            &mut Vec::new(),
+            &mut updates,
+        );
+        for (name, path, value_type) in updates {
+            self.name_bindings.insert(name, value_type.clone());
+            self.name_bindings.insert(path, value_type);
+        }
+    }
+
+    fn collect_static_list_binding_updates(
+        &self,
+        statements: &[AstStatement],
+        scope: &mut Vec<String>,
+        updates: &mut Vec<(String, String, Type)>,
+    ) {
+        for statement in statements {
+            match &statement.kind {
+                AstStatementKind::Function { .. } => continue,
+                AstStatementKind::List {
+                    field: Some(name), ..
+                } => {
+                    if let Some(value_type) =
+                        self.static_list_statement_type(statement, &mut BTreeSet::new())
+                        && type_has_known_user_shape(&value_type)
+                    {
+                        updates.push((name.clone(), scoped_path(scope, name), value_type));
+                    }
+                }
+                AstStatementKind::Field { name } => {
+                    scope.push(name.clone());
+                    self.collect_static_list_binding_updates(&statement.children, scope, updates);
+                    scope.pop();
+                    continue;
+                }
+                _ => {}
+            }
+            self.collect_static_list_binding_updates(&statement.children, scope, updates);
+        }
     }
 
     fn refresh_static_row_scope_bindings(&mut self) {
@@ -1217,6 +1569,7 @@ impl<'a> Checker<'a> {
         }
         let resolved_constant_table = resolved_constant_table(self.program);
         let output_root_types = self.check_output_roots();
+        self.check_host_port_outputs(&output_root_types);
         let assemble_report_started = Instant::now();
         if trace_typecheck {
             eprintln!("boon_typecheck assemble_report:start");
@@ -1237,6 +1590,7 @@ impl<'a> Checker<'a> {
                 .collect(),
             source_payload_shape_table,
             host_effect_table: self.host_effect_table.clone(),
+            host_port_table: self.host_port_table.clone(),
             full_document_typecheck_coverage: document_root(self.program).is_none_or(|root| {
                 statement_expr_ids(root)
                     .into_iter()
@@ -1460,6 +1814,59 @@ impl<'a> Checker<'a> {
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
         entries
+    }
+
+    fn check_host_port_outputs(&mut self, outputs: &[OutputRootTypeEntry]) {
+        if let Some(http) = &self.host_port_table.http {
+            let Some(output) = outputs
+                .iter()
+                .find(|output| output.name == http.response_output)
+            else {
+                self.diagnostics.push(diagnostic_at_line(
+                    http.line,
+                    format!(
+                        "host port `http.response` references missing output root `{}`",
+                        http.response_output
+                    ),
+                ));
+                return;
+            };
+            if !http_response_type_is_valid(&output.ty) {
+                self.diagnostics.push(diagnostic_at_line(
+                    http.line,
+                    format!(
+                        "host port `http.response` output `{}` must be a closed record with numeric `status` and a closed `body`; found {}",
+                        output.name,
+                        boon_facing_type_label(&output.ty)
+                    ),
+                ));
+            }
+        }
+        if let Some(websocket) = &self.host_port_table.websocket {
+            let Some(output) = outputs
+                .iter()
+                .find(|output| output.name == websocket.actions_output)
+            else {
+                self.diagnostics.push(diagnostic_at_line(
+                    websocket.line,
+                    format!(
+                        "host port `websocket.actions` references missing output root `{}`",
+                        websocket.actions_output
+                    ),
+                ));
+                return;
+            };
+            if !websocket_actions_type_is_valid(&output.ty) {
+                self.diagnostics.push(diagnostic_at_line(
+                    websocket.line,
+                    format!(
+                        "host port `websocket.actions` output `{}` must be a list of closed generic WebSocket action envelopes; found {}",
+                        output.name,
+                        boon_facing_type_label(&output.ty)
+                    ),
+                ));
+            }
+        }
     }
 
     fn collect_runtime_document_contracts(&mut self, statement: &AstStatement, in_document: bool) {
@@ -1872,7 +2279,9 @@ impl<'a> Checker<'a> {
             AstExprKind::ListLiteral { .. } => Type::List(Box::new(open_object_type())),
             AstExprKind::Call { function, args } => {
                 for arg in args {
-                    self.ensure_expr(arg.value);
+                    if !builtin_argument_is_symbol(function, arg.name.as_deref()) {
+                        self.ensure_expr(arg.value);
+                    }
                 }
                 self.check_bytes_builtin_arguments(expr.id, function, args, None);
                 self.check_builtin_call_compatibility(function, None, args);
@@ -1909,7 +2318,9 @@ impl<'a> Checker<'a> {
                 let input_flow = self.ensure_expr(*input);
                 let input_is_placeholder = self.expr_id_is_pipe_placeholder(*input);
                 for arg in args {
-                    self.ensure_expr(arg.value);
+                    if !builtin_argument_is_symbol(op, arg.name.as_deref()) {
+                        self.ensure_expr(arg.value);
+                    }
                 }
                 self.check_bytes_builtin_arguments(expr.id, op, args, Some(*input));
                 self.check_builtin_call_compatibility(op, Some(*input), args);
@@ -2072,6 +2483,8 @@ impl<'a> Checker<'a> {
             AstExprKind::Identifier(value) => {
                 if value == "BLOCK" {
                     open_object_type()
+                } else if self.builtin_symbol_exprs.contains(&expr.id) {
+                    Type::Unknown
                 } else if let Some(ty) = self.name_bindings.get(value) {
                     ty.clone()
                 } else {
@@ -3120,7 +3533,7 @@ impl<'a> Checker<'a> {
         for update_expr_id in updates {
             let update_type = self.ensure_expr(update_expr_id).ty;
             if !matches!(update_type, Type::Skip) {
-                ty = widen_structural_type(&ty, &update_type);
+                ty = widen_hold_type(&ty, &update_type);
             }
         }
         ty
@@ -3299,7 +3712,7 @@ impl<'a> Checker<'a> {
                         .and_then(|expr| self.static_expr_type(expr, active_functions))
                         && !matches!(update_type, Type::Skip)
                     {
-                        ty = widen_structural_type(&ty, &update_type);
+                        ty = widen_hold_type(&ty, &update_type);
                     }
                 }
                 Some(ty)
@@ -3779,11 +4192,13 @@ impl<'a> Checker<'a> {
             ty = match op.as_str() {
                 "List/retain"
                 | "List/remove"
+                | "List/query_prefix"
                 | "List/filter_field_equal"
                 | "List/filter_field_not_equal"
                 | "List/move_field_first"
                 | "List/move_field_last"
                 | "SOURCE" => ty,
+                "List/query" => indexed_query_page_type(),
                 "List/count" | "List/sum" => Type::Number,
                 "List/join_field" => Type::Text,
                 "List/append" => {
@@ -4796,6 +5211,16 @@ fn diagnostic_for_statement(statement: Option<&AstStatement>, message: String) -
     }
 }
 
+fn diagnostic_at_line(line: usize, message: String) -> TypeDiagnostic {
+    TypeDiagnostic {
+        severity: DiagnosticSeverity::Error,
+        line,
+        start: 0,
+        end: 0,
+        message,
+    }
+}
+
 fn statement_is_empty_delimiter(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
     statement.children.is_empty()
         && statement
@@ -4831,6 +5256,46 @@ fn host_output_type_is_closed(ty: &Type) -> bool {
         | Type::Var(_)
         | Type::Unknown => false,
     }
+}
+
+fn http_response_type_is_valid(ty: &Type) -> bool {
+    let Type::Object(shape) = ty else {
+        return false;
+    };
+    !shape.open
+        && shape.fields.get("status") == Some(&Type::Number)
+        && shape
+            .fields
+            .get("body")
+            .is_some_and(host_output_type_is_closed)
+        && shape.fields.values().all(host_output_type_is_closed)
+}
+
+fn websocket_actions_type_is_valid(ty: &Type) -> bool {
+    let Type::List(item) = ty else {
+        return false;
+    };
+    let Type::Object(shape) = item.as_ref() else {
+        return false;
+    };
+    if shape.open || shape.fields.len() != 12 {
+        return false;
+    }
+    let expected = BTreeMap::from([
+        ("body_bytes".to_owned(), Type::Bytes(BytesType::Dynamic)),
+        ("body_kind".to_owned(), Type::Text),
+        ("body_text".to_owned(), Type::Text),
+        ("bytes".to_owned(), Type::Bytes(BytesType::Dynamic)),
+        ("code".to_owned(), Type::Number),
+        ("frame_kind".to_owned(), Type::Text),
+        ("include_current".to_owned(), true_false_type()),
+        ("kind".to_owned(), Type::Text),
+        ("reason".to_owned(), Type::Text),
+        ("room".to_owned(), Type::Text),
+        ("status".to_owned(), Type::Number),
+        ("text".to_owned(), Type::Text),
+    ]);
+    shape.fields == expected
 }
 
 fn is_deleted_public_style_field(field_name: &str) -> bool {
@@ -5081,7 +5546,61 @@ fn function_arg_call_site_index(
                 .push(arg_expr_id);
         }
     }
+    collect_multiline_function_arg_call_sites(
+        &program.ast.statements,
+        &program.expressions,
+        function_args_by_name,
+        &mut index,
+    );
+    for parameters in index.values_mut() {
+        for call_sites in parameters.values_mut() {
+            call_sites.sort_unstable();
+            call_sites.dedup();
+        }
+    }
     index
+}
+
+fn collect_multiline_function_arg_call_sites(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    function_args_by_name: &BTreeMap<String, Vec<String>>,
+    index: &mut BTreeMap<String, BTreeMap<String, Vec<usize>>>,
+) {
+    for statement in statements {
+        if let Some(expr) = statement.expr.and_then(|expr_id| expressions.get(expr_id)) {
+            let function = match &expr.kind {
+                AstExprKind::Call { function, .. } => Some(function),
+                AstExprKind::Pipe { op, .. } => Some(op),
+                _ => None,
+            };
+            if let Some(function) = function
+                && let Some(parameters) = function_args_by_name.get(function)
+            {
+                for parameter in parameters {
+                    let value = statement.children.iter().find_map(|child| {
+                        (statement_field(child).as_deref() == Some(parameter.as_str()))
+                            .then(|| direct_statement_value_expr_id(child, expressions))
+                            .flatten()
+                    });
+                    if let Some(value) = value {
+                        index
+                            .entry(function.clone())
+                            .or_default()
+                            .entry(parameter.clone())
+                            .or_default()
+                            .push(value);
+                    }
+                }
+            }
+        }
+        collect_multiline_function_arg_call_sites(
+            &statement.children,
+            expressions,
+            function_args_by_name,
+            index,
+        );
+    }
 }
 
 fn collect_function_statements<'a>(
@@ -5773,6 +6292,10 @@ impl Default for BuiltinSignatureRegistry {
                 "Number/min",
                 "Number/max",
                 "Number/bit_width",
+                "Number/ceil",
+                "Number/floor",
+                "Number/round",
+                "Number/truncate",
                 "Number/interpolate",
                 "Number/project_width",
                 "Number/project_offset",
@@ -5833,6 +6356,7 @@ impl Default for BuiltinSignatureRegistry {
                 "List/remove",
                 "List/range",
                 "List/chunk",
+                "List/query_prefix",
                 "List/filter_text_contains",
                 "List/filter_field_equal",
                 "List/filter_field_not_equal",
@@ -5845,6 +6369,7 @@ impl Default for BuiltinSignatureRegistry {
                 .into_iter()
                 .collect(),
             open_object_functions: [
+                "List/query",
                 "WHILE",
                 "Timer/interval",
                 "Widget/table",
@@ -5864,6 +6389,8 @@ impl BuiltinSignatureRegistry {
     fn type_for_call(&self, function: &str, render_contracts: &RenderContractRegistry) -> Type {
         if let Some(signature) = host_effect_signature(function) {
             signature.result_type
+        } else if function == "List/query" {
+            indexed_query_page_type()
         } else if self.text_functions.contains(function) {
             Type::Text
         } else if self.number_functions.contains(function) {
@@ -5971,6 +6498,7 @@ impl RuntimeRootContract {
             "TextInput",
             "EmbeddedProgram",
             "EmbeddedMedia",
+            "MapViewport",
         ])
         .with_fixed_constructor("Document/new", "Document")
         .with_fixed_constructor("Element/container", "Stack")
@@ -5984,6 +6512,7 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Element/text_input", "TextInput")
         .with_fixed_constructor("Element/program", "EmbeddedProgram")
         .with_fixed_constructor("Element/embedded_media", "EmbeddedMedia")
+        .with_fixed_constructor("Element/map", "MapViewport")
     }
 
     fn scene() -> Self {
@@ -6001,6 +6530,7 @@ impl RuntimeRootContract {
             "TextInput",
             "EmbeddedProgram",
             "EmbeddedMedia",
+            "MapViewport",
         ])
         .with_fixed_constructor("Scene/new", "Scene")
         .with_stripe_direction_constructor("Scene/Element/stripe")
@@ -6014,6 +6544,7 @@ impl RuntimeRootContract {
         .with_fixed_constructor("Scene/Element/paragraph", "Paragraph")
         .with_fixed_constructor("Scene/Element/link", "Link")
         .with_fixed_constructor("Scene/Element/embedded_media", "EmbeddedMedia")
+        .with_fixed_constructor("Scene/Element/map", "MapViewport")
     }
 }
 
@@ -6130,6 +6661,7 @@ const RENDER_CONSTRUCTORS: &[&str] = &[
     "Element/text_input",
     "Element/program",
     "Element/embedded_media",
+    "Element/map",
     "Scene/new",
     "Scene/Element/stripe",
     "Scene/Element/block",
@@ -6142,6 +6674,7 @@ const RENDER_CONSTRUCTORS: &[&str] = &[
     "Scene/Element/paragraph",
     "Scene/Element/link",
     "Scene/Element/embedded_media",
+    "Scene/Element/map",
 ];
 
 pub fn is_registered_render_constructor(function: &str) -> bool {
@@ -6945,7 +7478,14 @@ fn statement_update_value_exprs(statement: &AstStatement, expressions: &[AstExpr
             ..
         }) = expressions.get(expr_id).map(|expr| &expr.kind)
         {
-            return vec![*output];
+            return vec![
+                statement_pipeline_final_expr_id_containing_expr(
+                    &statement.children,
+                    *output,
+                    expressions,
+                )
+                .unwrap_or(*output),
+            ];
         }
         return vec![expr_id];
     }
@@ -6955,7 +7495,14 @@ fn statement_update_value_exprs(statement: &AstStatement, expressions: &[AstExpr
             ..
         }) = expressions.get(expr_id).map(|expr| &expr.kind)
         {
-            return vec![*output];
+            return vec![
+                statement_pipeline_final_expr_id_containing_expr(
+                    &statement.children,
+                    *output,
+                    expressions,
+                )
+                .unwrap_or(*output),
+            ];
         }
         if matches!(
             expressions.get(expr_id).map(|expr| &expr.kind),
@@ -7229,7 +7776,7 @@ fn simple_hold_result_type(
             .map(|expr| simple_expr_type(expr, expressions))
             .unwrap_or_else(open_object_type);
         if !matches!(update_type, Type::Skip) {
-            ty = widen_structural_type(&ty, &update_type);
+            ty = widen_hold_type(&ty, &update_type);
         }
     }
     ty
@@ -7303,6 +7850,10 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Number/min"
                     | "Number/max"
                     | "Number/bit_width"
+                    | "Number/ceil"
+                    | "Number/floor"
+                    | "Number/round"
+                    | "Number/truncate"
                     | "List/count"
                     | "List/sum"
                     | "Text/find"
@@ -7745,6 +8296,8 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
         || matches!(
             function,
             "List/retain"
+                | "List/query"
+                | "List/query_prefix"
                 | "List/count"
                 | "List/every"
                 | "List/any"
@@ -7852,9 +8405,65 @@ fn builtin_argument_expected_type(
         .or_else(|| argument_expected_type(function))
 }
 
+fn builtin_argument_is_symbol(function: &str, arg_name: Option<&str>) -> bool {
+    matches!(
+        (function, arg_name),
+        ("List/query_prefix", Some("field" | "normalization"))
+            | (
+                "List/query",
+                Some(
+                    "select"
+                        | "residual"
+                        | "order"
+                        | "residual_field"
+                        | "latitude_field"
+                        | "longitude_field"
+                )
+            )
+    )
+}
+
+fn collect_builtin_symbol_statement_exprs(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    output: &mut BTreeSet<usize>,
+) {
+    for statement in statements {
+        if let Some(expr_id) = statement.expr
+            && let Some(AstExpr {
+                kind: AstExprKind::Call { function, .. },
+                ..
+            }) = expressions.get(expr_id)
+        {
+            for child in &statement.children {
+                let AstStatementKind::Field { name } = &child.kind else {
+                    continue;
+                };
+                if builtin_argument_is_symbol(function, Some(name))
+                    && let Some(value) = child.expr
+                {
+                    output.insert(value);
+                }
+            }
+        }
+        collect_builtin_symbol_statement_exprs(&statement.children, expressions, output);
+    }
+}
+
 fn list_argument_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
     match (function, arg_name) {
         ("List/retain" | "List/every" | "List/any", Some("if")) => Some(true_false_type()),
+        ("List/query", Some("fields" | "normalization" | "multi_value" | "prefix" | "needle")) => {
+            Some(Type::Text)
+        }
+        (
+            "List/query",
+            Some("limit" | "center_latitude" | "center_longitude" | "radius_meters"),
+        ) => Some(Type::Number),
+        ("List/query", Some("unique" | "lower_inclusive" | "upper_inclusive")) => {
+            Some(true_false_type())
+        }
+        ("List/query", Some("cursor")) => Some(Type::Bytes(BytesType::Dynamic)),
         _ => None,
     }
 }
@@ -9262,6 +9871,14 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
     }
 }
 
+fn widen_hold_type(current: &Type, update: &Type) -> Type {
+    if is_specific_type(current) && !is_specific_type(update) {
+        current.clone()
+    } else {
+        widen_structural_type(current, update)
+    }
+}
+
 fn object_field_order_for_widened_shapes(left: &ObjectShape, right: &ObjectShape) -> Vec<String> {
     let mut order = Vec::new();
     let mut seen = BTreeSet::new();
@@ -9355,15 +9972,31 @@ enum SourcePayloadAccess {
     UnknownField(String),
 }
 
-fn normalized_source_path_parts(parts: &[String]) -> Vec<String> {
-    parts
-        .iter()
-        .filter(|part| !matches!(part.as_str(), "PASSED" | "event" | "events"))
-        .cloned()
-        .collect()
+fn source_path_part_candidates(parts: &[String]) -> Vec<Vec<String>> {
+    let mut candidates = Vec::new();
+    for (strip_event, strip_events) in [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let candidate = parts
+            .iter()
+            .filter(|part| {
+                part.as_str() != "PASSED"
+                    && (!strip_event || part.as_str() != "event")
+                    && (!strip_events || part.as_str() != "events")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 fn source_payload_access_for_suffix(suffix: &str) -> SourcePayloadAccess {
+    let suffix = suffix
+        .strip_prefix("event.")
+        .or_else(|| suffix.strip_prefix("events."))
+        .unwrap_or(suffix);
     match suffix {
         "change.text" => SourcePayloadAccess::Field("text".to_owned()),
         "change.bytes" => SourcePayloadAccess::Field("bytes".to_owned()),
@@ -9451,6 +10084,7 @@ fn source_payload_shape_table(
     source_paths: &BTreeSet<String>,
     source_lookup: &SourcePayloadPathLookup,
     host_effects: &HostEffectTable,
+    host_ports: &HostPortTable,
 ) -> Vec<SourcePayloadShapeEntry> {
     let mut fields_by_source = source_paths
         .iter()
@@ -9476,6 +10110,30 @@ fn source_payload_shape_table(
         &mut fields_by_source,
     );
     for declaration in &host_effects.declarations {
+        for intent_field in &declaration.intent_fields {
+            let Some(AstExpr {
+                kind: AstExprKind::Path(parts),
+                ..
+            }) = program.expressions.get(intent_field.value_expr_id)
+            else {
+                continue;
+            };
+            let Some(SourcePayloadAccess::Field(payload_field)) =
+                source_lookup.access_for_parts(parts)
+            else {
+                continue;
+            };
+            if source_lookup
+                .source_paths_for_parts(parts)
+                .iter()
+                .any(|source| source == &declaration.trigger_source)
+                && let Some(fields) = fields_by_source.get_mut(&declaration.trigger_source)
+            {
+                fields.insert(payload_field, intent_field.value_type.clone());
+            }
+        }
+    }
+    for declaration in &host_effects.declarations {
         let variants = host_effect_variants(&declaration.result_type);
         for route in &declaration.result_routes {
             let Some(fields) = fields_by_source.get_mut(&route.source_path) else {
@@ -9487,6 +10145,14 @@ fn source_payload_shape_table(
             for (name, ty) in result_fields.ordered_fields() {
                 fields.insert(name.clone(), ty.clone());
             }
+        }
+    }
+    for (source_path, host_fields) in host_port_payload_types(host_ports) {
+        let Some(fields) = fields_by_source.get_mut(&source_path) else {
+            continue;
+        };
+        for (name, ty) in host_fields {
+            fields.insert(name, ty);
         }
     }
     program
@@ -9513,6 +10179,92 @@ fn source_payload_shape_table(
             }
         })
         .collect()
+}
+
+fn host_port_payload_types(host_ports: &HostPortTable) -> BTreeMap<String, BTreeMap<String, Type>> {
+    let mut payloads = BTreeMap::new();
+    if let Some(http) = &host_ports.http {
+        payloads.insert(http.request_source.clone(), http_request_payload_fields());
+        if let Some(disconnect) = &http.disconnect_source {
+            payloads.insert(
+                disconnect.clone(),
+                BTreeMap::from([
+                    ("peer".to_owned(), Type::Text),
+                    ("reason".to_owned(), Type::Text),
+                ]),
+            );
+        }
+    }
+    if let Some(websocket) = &host_ports.websocket {
+        payloads.insert(
+            websocket.open_source.clone(),
+            BTreeMap::from([
+                ("path".to_owned(), Type::Text),
+                ("path_segments".to_owned(), Type::List(Box::new(Type::Text))),
+                ("query".to_owned(), named_text_pairs_type()),
+                ("headers".to_owned(), named_text_pairs_type()),
+                ("cookies".to_owned(), named_text_pairs_type()),
+                ("peer".to_owned(), Type::Text),
+                ("protocols".to_owned(), Type::List(Box::new(Type::Text))),
+            ]),
+        );
+        payloads.insert(
+            websocket.message_source.clone(),
+            BTreeMap::from([
+                (
+                    "kind".to_owned(),
+                    Type::VariantSet(vec![
+                        Variant::Tag("TextMessage".to_owned()),
+                        Variant::Tag("BinaryMessage".to_owned()),
+                    ]),
+                ),
+                ("text".to_owned(), Type::Text),
+                ("bytes".to_owned(), Type::Bytes(BytesType::Dynamic)),
+            ]),
+        );
+        payloads.insert(
+            websocket.close_source.clone(),
+            BTreeMap::from([
+                ("code".to_owned(), Type::Number),
+                ("reason".to_owned(), Type::Text),
+                ("clean".to_owned(), true_false_type()),
+            ]),
+        );
+        payloads.insert(
+            websocket.error_source.clone(),
+            BTreeMap::from([
+                ("code".to_owned(), Type::Text),
+                ("message".to_owned(), Type::Text),
+                ("retryable".to_owned(), true_false_type()),
+            ]),
+        );
+    }
+    payloads
+}
+
+fn http_request_payload_fields() -> BTreeMap<String, Type> {
+    BTreeMap::from([
+        ("method".to_owned(), Type::Text),
+        ("scheme".to_owned(), Type::Text),
+        ("path".to_owned(), Type::Text),
+        ("path_segments".to_owned(), Type::List(Box::new(Type::Text))),
+        ("query".to_owned(), named_text_pairs_type()),
+        ("headers".to_owned(), named_text_pairs_type()),
+        ("cookies".to_owned(), named_text_pairs_type()),
+        ("body".to_owned(), Type::Bytes(BytesType::Dynamic)),
+        ("peer".to_owned(), Type::Text),
+        ("deadline_ms".to_owned(), Type::Number),
+    ])
+}
+
+fn named_text_pairs_type() -> Type {
+    Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
+        [
+            ("name".to_owned(), Type::Text),
+            ("value".to_owned(), Type::Text),
+        ],
+        false,
+    ))))
 }
 
 fn type_hint_table(
@@ -9945,11 +10697,13 @@ fn statement_pipeline_hint_type(
         ty = match op.as_str() {
             "List/retain"
             | "List/remove"
+            | "List/query_prefix"
             | "List/filter_field_equal"
             | "List/filter_field_not_equal"
             | "List/move_field_first"
             | "List/move_field_last"
             | "SOURCE" => ty,
+            "List/query" => indexed_query_page_type(),
             "List/count" | "List/sum" => Type::Number,
             "List/join_field" => Type::Text,
             "List/append" => {
@@ -10291,7 +11045,15 @@ impl SourcePayloadPathLookup {
     }
 
     fn access_for_parts(&self, parts: &[String]) -> Option<SourcePayloadAccess> {
-        let normalized_parts = normalized_source_path_parts(parts);
+        source_path_part_candidates(parts)
+            .into_iter()
+            .find_map(|parts| self.access_for_normalized_parts(&parts))
+    }
+
+    fn access_for_normalized_parts(
+        &self,
+        normalized_parts: &[String],
+    ) -> Option<SourcePayloadAccess> {
         let path = normalized_parts.join(".");
         if path.is_empty() {
             return None;
@@ -10336,9 +11098,18 @@ impl SourcePayloadPathLookup {
     }
 
     fn source_paths_for_parts(&self, parts: &[String]) -> Vec<String> {
-        let normalized_parts = normalized_source_path_parts(parts);
+        for normalized_parts in source_path_part_candidates(parts) {
+            let matches = self.source_paths_for_normalized_parts(&normalized_parts);
+            if !matches.is_empty() {
+                return matches;
+            }
+        }
+        Vec::new()
+    }
+
+    fn source_paths_for_normalized_parts(&self, normalized_parts: &[String]) -> Vec<String> {
         let path = normalized_parts.join(".");
-        let path_without_payload = parts_without_payload(&normalized_parts).join(".");
+        let path_without_payload = parts_without_payload(normalized_parts).join(".");
         let mut matches = Vec::new();
         let path_parts = path.split('.').collect::<Vec<_>>();
         for end in 1..=path_parts.len() {
@@ -10441,27 +11212,28 @@ fn source_payload_fields_from_pattern(pattern: &[String]) -> Vec<String> {
 }
 
 fn path_is_source_path(source_paths: &BTreeSet<String>, path: &str) -> bool {
-    let normalized_path = path
-        .split('.')
-        .filter(|part| !matches!(*part, "PASSED" | "event" | "events"))
-        .collect::<Vec<_>>()
-        .join(".");
-    source_paths.iter().any(|source_path| {
-        let store_relative = source_path
-            .strip_prefix("store.")
-            .unwrap_or(source_path.as_str());
-        let scoped_relative = source_path
-            .split_once('.')
-            .map(|(_, relative)| relative)
-            .unwrap_or(source_path.as_str());
-        [source_path.as_str(), store_relative, scoped_relative]
-            .into_iter()
-            .any(|base| {
-                base == normalized_path
-                    || base.ends_with(&format!(".{normalized_path}"))
-                    || normalized_path.starts_with(&format!("{base}."))
+    let parts = path.split('.').map(str::to_owned).collect::<Vec<_>>();
+    source_path_part_candidates(&parts)
+        .into_iter()
+        .map(|parts| parts.join("."))
+        .any(|normalized_path| {
+            source_paths.iter().any(|source_path| {
+                let store_relative = source_path
+                    .strip_prefix("store.")
+                    .unwrap_or(source_path.as_str());
+                let scoped_relative = source_path
+                    .split_once('.')
+                    .map(|(_, relative)| relative)
+                    .unwrap_or(source_path.as_str());
+                [source_path.as_str(), store_relative, scoped_relative]
+                    .into_iter()
+                    .any(|base| {
+                        base == normalized_path
+                            || base.ends_with(&format!(".{normalized_path}"))
+                            || normalized_path.starts_with(&format!("{base}."))
+                    })
             })
-    })
+        })
 }
 
 fn path_is_event_payload_parts(parts: &[String]) -> bool {
@@ -10645,6 +11417,16 @@ fn expr_is_skip(expr: &AstExpr) -> bool {
 
 fn open_object_type() -> Type {
     Type::Object(ObjectShape::new(BTreeMap::new(), true))
+}
+
+fn indexed_query_page_type() -> Type {
+    Type::Object(ObjectShape::from_ordered_fields(
+        [
+            ("rows".to_owned(), Type::List(Box::new(open_object_type()))),
+            ("cursor".to_owned(), Type::Bytes(BytesType::Dynamic)),
+        ],
+        false,
+    ))
 }
 
 fn exact_empty_object_type() -> Type {

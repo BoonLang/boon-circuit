@@ -17,3 +17,10 @@ outputs: [
     ]
     pending_priorities: List/range(from: 1, to: 2)
 ]
+
+host_ports: [
+    http: [
+        request: store.request_received
+        response: api_response
+    ]
+]

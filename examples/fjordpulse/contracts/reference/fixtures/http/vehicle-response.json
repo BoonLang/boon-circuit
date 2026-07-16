@@ -1,0 +1,108 @@
+{
+  "ok": true,
+  "data": {
+    "vehicle": {
+      "id": "SKY:Vehicle:12345",
+      "transportMode": "bus",
+      "passengerServiceState": "passenger",
+      "lineCode": "100",
+      "routeName": "Førde–Nordfjordeid",
+      "destination": "Nordfjordeid",
+      "state": "live",
+      "latitude": 61.453,
+      "longitude": 5.858,
+      "bearing": 42,
+      "delaySeconds": 120,
+      "distanceMeters": null,
+      "lastSeenAt": "2026-07-10T09:59:58Z",
+      "refreshedAt": "2026-07-10T10:00:00Z",
+      "version": "2026-07-10T09:59:58Z",
+      "nextStop": {
+        "stopPlaceId": "NSR:StopPlace:549",
+        "quayId": "NSR:Quay:549",
+        "name": "Førde sentrum",
+        "order": 1,
+        "latitude": 61.456,
+        "longitude": 5.861,
+        "aimedArrivalAt": "2026-07-10T10:05:00Z",
+        "expectedArrivalAt": "2026-07-10T10:07:00Z",
+        "aimedDepartureAt": "2026-07-10T10:06:00Z",
+        "expectedDepartureAt": "2026-07-10T10:08:00Z",
+        "realtime": true,
+        "cancellation": false
+      },
+      "journeyReference": {
+        "serviceJourneyId": "SKY:ServiceJourney:100-1",
+        "operatingDate": "2026-07-10",
+        "datedServiceJourneyId": null,
+        "originRef": "NSR:StopPlace:36025",
+        "originName": "Førde rutebilstasjon",
+        "destinationRef": "NSR:StopPlace:35453",
+        "destinationName": "Nordfjordeid"
+      },
+      "monitoredCall": { "stopPointRef": "NSR:Quay:549", "order": 1, "vehicleAtStop": false },
+      "progressBetweenStops": { "linkDistance": 1200, "percentage": 0.4 },
+      "journeyVersion": "2026-07-10T09:59:57Z",
+      "routeProgress": 0.42
+    },
+    "trail": [
+      {
+        "latitude": 61.452,
+        "longitude": 5.857,
+        "bearing": 40,
+        "observedAt": "2026-07-10T09:59:30Z"
+      }
+    ],
+    "journey": {
+      "serviceJourneyId": "SKY:ServiceJourney:100-1",
+      "operatingDate": "2026-07-10",
+      "datedServiceJourneyId": null,
+      "version": "2026-07-10T09:59:57Z",
+      "state": "fresh",
+      "route": {
+        "type": "LineString",
+        "coordinates": [[5.857, 61.452], [5.861, 61.456], [5.991, 61.906]],
+        "distanceMeters": 52000
+      },
+      "calls": [
+        {
+          "stopPlaceId": "NSR:StopPlace:549",
+          "quayId": "NSR:Quay:549",
+          "name": "Førde sentrum",
+          "order": 1,
+          "latitude": 61.456,
+          "longitude": 5.861,
+          "aimedArrivalAt": "2026-07-10T10:05:00Z",
+          "expectedArrivalAt": "2026-07-10T10:07:00Z",
+          "aimedDepartureAt": "2026-07-10T10:06:00Z",
+          "expectedDepartureAt": "2026-07-10T10:08:00Z",
+          "realtime": true,
+          "cancellation": false
+        }
+      ],
+      "refreshedAt": "2026-07-10T09:59:57Z",
+      "lastSuccessfulAt": "2026-07-10T09:59:57Z",
+      "warning": null
+    },
+    "upcomingStops": [
+      {
+        "stopPlaceId": "NSR:StopPlace:549",
+        "quayId": "NSR:Quay:549",
+        "name": "Førde sentrum",
+        "order": 1,
+        "latitude": 61.456,
+        "longitude": 5.861,
+        "aimedArrivalAt": "2026-07-10T10:05:00Z",
+        "expectedArrivalAt": "2026-07-10T10:07:00Z",
+        "aimedDepartureAt": "2026-07-10T10:06:00Z",
+        "expectedDepartureAt": "2026-07-10T10:08:00Z",
+        "realtime": true,
+        "cancellation": false
+      }
+    ]
+  },
+  "meta": {
+    "requestId": "req_vehicle",
+    "updatedAt": "2026-07-10T10:00:00Z"
+  }
+}

@@ -1,0 +1,142 @@
+-- Deterministic FjordPulse wire-shape fixtures. These records mirror product
+-- intent from the pinned oracle without claiming that a live transport exists.
+
+FUNCTION health(version, request_count, readiness) {
+    [
+        status: TEXT { ok }
+        service: TEXT { fjordpulse-boon }
+        mode: TEXT { deterministic }
+        version: version
+        readiness: readiness
+        request_count: request_count
+    ]
+}
+
+FUNCTION success(data, data_state, source_state, updated_at) {
+    [
+        ok: True
+        data: data
+        data_state: data_state
+        source_state: source_state
+        updated_at: updated_at
+    ]
+}
+
+FUNCTION error(code, message, retryable) {
+    [
+        ok: False
+        error: [
+            code: code
+            message: message
+            retryable: retryable
+        ]
+    ]
+}
+
+FUNCTION coordinate(latitude, longitude) {
+    [latitude: latitude, longitude: longitude]
+}
+
+FUNCTION station(id, name, latitude, longitude, kind, modes) {
+    [
+        id: id
+        name: name
+        coordinate: coordinate(latitude: latitude, longitude: longitude)
+        kind: kind
+        modes: modes
+    ]
+}
+
+FUNCTION departure(expected_time, line, destination, platform, status) {
+    [
+        expected_time: expected_time
+        line: line
+        destination: destination
+        platform: platform
+        status: status
+    ]
+}
+
+FUNCTION vehicle(id, line, mode, passenger_state, freshness, latitude, longitude) {
+    [
+        id: id
+        line: line
+        transport_mode: mode
+        passenger_service_state: passenger_state
+        freshness: freshness
+        coordinate: coordinate(latitude: latitude, longitude: longitude)
+    ]
+}
+
+FUNCTION map_config() {
+    [
+        default_basemap: TEXT { streets }
+        basemaps: TEXT { streets,satellite }
+        tile_policy: TEXT { allowlisted-raster-capability }
+        deterministic_fixture: True
+    ]
+}
+
+FUNCTION admin_status(request_count) {
+    [
+        mode: TEXT { deterministic }
+        overall: TEXT { operational }
+        boon_server: TEXT { ready }
+        persistence: TEXT { redb-ready }
+        realtime: TEXT { fixture-session }
+        request_count: request_count
+        checked_at: TEXT { 2026-07-16T10:00:00+02:00 }
+    ]
+}
+
+FUNCTION admin_infrastructure() {
+    [
+        topology: TEXT { single-boon-server }
+        persistence: TEXT { redb-single-writer }
+        client_renderer: TEXT { retained-webgpu }
+        outbound_transport: TEXT { disabled-in-deterministic-mode }
+    ]
+}
+
+FUNCTION admin_database() {
+    [
+        engine: TEXT { redb }
+        access: TEXT { read-only }
+        collections: TEXT { stations,vehicles,watches,events,timetables }
+        indexes: TEXT { station_name,station_bounds,vehicle_observed_at,event_created_at }
+        schema_version: 3
+        migration_state: TEXT { compatible }
+    ]
+}
+
+FUNCTION http_status(path) {
+    path |> WHEN {
+        TEXT { /api/health } => 200
+        TEXT { /api/readiness } => 200
+        TEXT { /api/map/config } => 200
+        TEXT { /api/stations } => 200
+        TEXT { /api/search } => 200
+        TEXT { /api/realtime-token } => 200
+        TEXT { /api/admin/demo-credentials } => 200
+        TEXT { /api/admin/session } => 200
+        TEXT { /api/admin/status } => 200
+        TEXT { /api/admin/watches } => 200
+        TEXT { /api/admin/entur-log } => 200
+        TEXT { /api/admin/realtime } => 200
+        TEXT { /api/admin/events } => 200
+        TEXT { /api/admin/database/schema } => 200
+        TEXT { /api/admin/database/migrations } => 200
+        TEXT { /api/admin/migrations } => 200
+        __ => 404
+    }
+}
+
+FUNCTION http_body(path, method, request_count) {
+    [
+        ok: http_status(path: path) == 200
+        route: path
+        method: method
+        request_count: request_count
+        mode: TEXT { deterministic }
+    ]
+}

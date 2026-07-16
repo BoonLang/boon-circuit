@@ -1,0 +1,141 @@
+store: [
+    read_clock: SOURCE
+    request_random: SOURCE
+    verify_secret: SOURCE
+    sign_message: SOURCE
+    verify_signature: SOURCE
+    schedule_deadline: SOURCE
+
+    clock_read: SOURCE
+    random_ready: SOURCE
+    secret_verified: SOURCE
+    hmac_signed: SOURCE
+    hmac_verified: SOURCE
+    timer_fired: SOURCE
+    host_failed: SOURCE
+
+    last_clock_seconds:
+        0 |> HOLD last_clock_seconds {
+            LATEST {
+                clock_read.unix_seconds |> THEN { clock_read.unix_seconds }
+            }
+        }
+
+    last_random_byte_count:
+        0 |> HOLD last_random_byte_count {
+            LATEST {
+                random_ready.bytes |> THEN { random_ready.bytes |> Bytes/length }
+            }
+        }
+
+    last_secret_match:
+        False |> HOLD last_secret_match {
+            LATEST {
+                secret_verified.matches |> THEN { secret_verified.matches }
+            }
+        }
+
+    last_hmac_tag:
+        BYTES[32] {} |> HOLD last_hmac_tag {
+            LATEST {
+                hmac_signed.tag |> THEN { hmac_signed.tag }
+            }
+        }
+
+    last_hmac_match:
+        False |> HOLD last_hmac_match {
+            LATEST {
+                hmac_verified.matches |> THEN { hmac_verified.matches }
+            }
+        }
+
+    last_timer_delay_ms:
+        0 |> HOLD last_timer_delay_ms {
+            LATEST {
+                timer_fired.delay_ms |> THEN { timer_fired.delay_ms }
+            }
+        }
+
+    last_error_code:
+        Text/empty() |> HOLD last_error_code {
+            LATEST {
+                host_failed.code |> THEN { host_failed.code }
+            }
+        }
+]
+
+effects: [
+    wall_clock: [
+        on: store.read_clock
+        perform: Clock/wall()
+        results: [
+            WallClockRead: store.clock_read
+            HostServiceFailed: store.host_failed
+        ]
+    ]
+
+    random_bytes: [
+        on: store.request_random
+        perform: Random/bytes(byte_count: store.request_random.byte_count)
+        results: [
+            RandomBytesReady: store.random_ready
+            HostServiceFailed: store.host_failed
+        ]
+    ]
+
+    configured_secret: [
+        on: store.verify_secret
+        perform: Secret/verify(
+            secret: store.verify_secret.secret
+            candidate: store.verify_secret.candidate
+        )
+        results: [
+            SecretVerified: store.secret_verified
+            HostServiceFailed: store.host_failed
+        ]
+    ]
+
+    sign: [
+        on: store.sign_message
+        perform: Crypto/hmac_sha256_sign(
+            secret: store.sign_message.secret
+            message: store.sign_message.message
+        )
+        results: [
+            HmacSigned: store.hmac_signed
+            HostServiceFailed: store.host_failed
+        ]
+    ]
+
+    verify: [
+        on: store.verify_signature
+        perform: Crypto/hmac_sha256_verify(
+            secret: store.verify_signature.secret
+            message: store.verify_signature.message
+            tag: store.verify_signature.tag
+        )
+        results: [
+            HmacVerified: store.hmac_verified
+            HostServiceFailed: store.host_failed
+        ]
+    ]
+
+    deadline: [
+        on: store.schedule_deadline
+        perform: Timer/deadline(delay_ms: store.schedule_deadline.delay_ms)
+        results: [
+            TimerFired: store.timer_fired
+            HostServiceFailed: store.host_failed
+        ]
+    ]
+]
+
+outputs: [
+    clock_seconds: store.last_clock_seconds
+    random_byte_count: store.last_random_byte_count
+    secret_match: store.last_secret_match
+    hmac_tag: store.last_hmac_tag
+    hmac_match: store.last_hmac_match
+    timer_delay_ms: store.last_timer_delay_ms
+    error_code: store.last_error_code
+]

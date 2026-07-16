@@ -1,0 +1,606 @@
+-- FjordPulse deterministic client product slice.
+-- Generic browser transports may deliver the same semantic sources later, but
+-- this example performs no live HTTP, WebSocket, or raster-tile work.
+
+store: [
+    elements: [
+        locale: SOURCE
+        basemap: SOURCE
+        welcome_close: SOURCE
+        navigation: [
+            map: SOURCE
+            search: SOURCE
+            admin: SOURCE
+        ]
+        search: [
+            change: SOURCE
+            key_down: SOURCE
+        ]
+        search_submit: SOURCE
+        search_close: SOURCE
+        search_retry: SOURCE
+        search_result: [
+            forde_station: SOURCE
+            forde_ferry: SOURCE
+            forde_place: SOURCE
+            line_100: SOURCE
+        ]
+        station: [
+            forde: SOURCE
+            forde_ferry: SOURCE
+            oslo: SOURCE
+            bergen: SOURCE
+            trondheim: SOURCE
+            bodo: SOURCE
+            close: SOURCE
+            retry: SOURCE
+            vehicle_train: SOURCE
+            vehicle_bus: SOURCE
+        ]
+        departures_retry: SOURCE
+        station_vehicles_retry: SOURCE
+        tab: [
+            departures: SOURCE
+            vehicles: SOURCE
+            details: SOURCE
+        ]
+        vehicle: [
+            close: SOURCE
+            focus: SOURCE
+            pause: SOURCE
+            resume: SOURCE
+            unfocus: SOURCE
+            stop: SOURCE
+            retry: SOURCE
+        ]
+        sheet: [
+            peek: SOURCE
+            half: SOURCE
+            full: SOURCE
+        ]
+        map: [
+            zoom_in: SOURCE
+            zoom_out: SOURCE
+            locate: SOURCE
+            retry: SOURCE
+        ]
+        admin: [
+            status: SOURCE
+            infrastructure: SOURCE
+            watches: SOURCE
+            entur_log: SOURCE
+            realtime: SOURCE
+            events: SOURCE
+            database_schema: SOURCE
+            database_migrations: SOURCE
+            retry: SOURCE
+            logout: SOURCE
+            login: SOURCE
+            public_map: SOURCE
+        ]
+    ]
+
+    transport: [
+        map: [
+            loading: SOURCE
+            ready: SOURCE
+            error: SOURCE
+        ]
+        search: [
+            loading: SOURCE
+            results: SOURCE
+            empty: SOURCE
+            stale: SOURCE
+            error: SOURCE
+        ]
+        station: [
+            loading: SOURCE
+            fresh: SOURCE
+            empty: SOURCE
+            stale: SOURCE
+            error: SOURCE
+        ]
+        departures: [
+            loading: SOURCE
+            fresh: SOURCE
+            empty: SOURCE
+            stale: SOURCE
+            error: SOURCE
+        ]
+        station_vehicles: [
+            loading: SOURCE
+            fresh: SOURCE
+            empty: SOURCE
+            stale: SOURCE
+            error: SOURCE
+        ]
+        vehicle: [
+            loading: SOURCE
+            live: SOURCE
+            stale: SOURCE
+            lost: SOURCE
+            error: SOURCE
+            passenger: SOURCE
+            non_passenger: SOURCE
+        ]
+        admin: [
+            loading: SOURCE
+            fresh: SOURCE
+            empty: SOURCE
+            stale: SOURCE
+            error: SOURCE
+        ]
+    ]
+
+    run_mode: Deterministic
+    oracle_revision: TEXT { dd6e750c2ca9dec3041f66ceda31d30379d4027a }
+
+    language:
+        Norwegian |> HOLD language {
+            elements.locale.event.press |> THEN {
+                language |> WHEN {
+                    Norwegian => English
+                    English => Norwegian
+                }
+            }
+        }
+
+    route:
+        PublicMap |> HOLD route {
+            LATEST {
+                elements.navigation.map.event.press |> THEN { PublicMap }
+                elements.navigation.admin.event.press |> THEN { AdminStatus }
+                elements.admin.public_map.event.press |> THEN { PublicMap }
+                elements.station.close.event.press |> THEN { PublicMap }
+                elements.vehicle.close.event.press |> THEN { PublicStation }
+                elements.search_result.forde_station.event.press |> THEN { PublicStation }
+                elements.search_result.forde_ferry.event.press |> THEN { PublicStation }
+                elements.search_result.forde_place.event.press |> THEN { PublicPlace }
+                elements.search_result.line_100.event.press |> THEN { PublicLine }
+                elements.station.forde.event.press |> THEN { PublicStation }
+                elements.station.forde_ferry.event.press |> THEN { PublicStation }
+                elements.station.oslo.event.press |> THEN { PublicStation }
+                elements.station.bergen.event.press |> THEN { PublicStation }
+                elements.station.trondheim.event.press |> THEN { PublicStation }
+                elements.station.bodo.event.press |> THEN { PublicStation }
+                elements.station.vehicle_train.event.press |> THEN { PublicVehicle }
+                elements.station.vehicle_bus.event.press |> THEN { PublicVehicle }
+                elements.admin.status.event.press |> THEN { AdminStatus }
+                elements.admin.infrastructure.event.press |> THEN { AdminInfrastructure }
+                elements.admin.watches.event.press |> THEN { AdminWatches }
+                elements.admin.entur_log.event.press |> THEN { AdminEnturLog }
+                elements.admin.realtime.event.press |> THEN { AdminRealtime }
+                elements.admin.events.event.press |> THEN { AdminEvents }
+                elements.admin.database_schema.event.press |> THEN { AdminDatabaseSchema }
+                elements.admin.database_migrations.event.press |> THEN { AdminDatabaseMigrations }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_results_available |> WHEN {
+                        True => search_highlight |> WHEN {
+                            FordeStationResult => PublicStation
+                            FordeFerryResult => PublicStation
+                            FordePlaceResult => PublicPlace
+                            Line100Result => PublicLine
+                        }
+                        False => SKIP
+                    }
+                    __ => SKIP
+                }
+            }
+        }
+
+    basemap:
+        Satellite |> HOLD basemap {
+            elements.basemap.event.press |> THEN {
+                basemap |> WHEN {
+                    Streets => Satellite
+                    Satellite => Streets
+                }
+            }
+        }
+
+    welcome_visible:
+        True |> HOLD welcome_visible {
+            elements.welcome_close.event.press |> THEN { False }
+        }
+
+    search_query:
+        Text/empty() |> HOLD search_query {
+            elements.search.change.text
+        }
+
+    search_highlight:
+        FordeStationResult |> HOLD search_highlight {
+            LATEST {
+                elements.navigation.search.event.press |> THEN { FordeStationResult }
+                elements.search.change |> THEN { FordeStationResult }
+                elements.search.key_down.key |> WHEN {
+                    ArrowDown => search_highlight |> WHEN {
+                        FordeStationResult => FordeFerryResult
+                        FordeFerryResult => FordePlaceResult
+                        FordePlaceResult => Line100Result
+                        Line100Result => FordeStationResult
+                    }
+                    ArrowUp => search_highlight |> WHEN {
+                        FordeStationResult => Line100Result
+                        FordeFerryResult => FordeStationResult
+                        FordePlaceResult => FordeFerryResult
+                        Line100Result => FordePlaceResult
+                    }
+                    Enter => SKIP
+                    Escape => SKIP
+                    __ => FordeStationResult
+                }
+            }
+        }
+
+    search_results_available:
+        False |> HOLD search_results_available {
+            LATEST {
+                elements.navigation.search.event.press |> THEN { False }
+                elements.search.change |> THEN { False }
+                elements.search_submit.event.press |> THEN { False }
+                elements.search_retry.event.press |> THEN { False }
+                elements.search_close.event.press |> THEN { False }
+                elements.search_result.forde_station.event.press |> THEN { False }
+                elements.search_result.forde_ferry.event.press |> THEN { False }
+                elements.search_result.forde_place.event.press |> THEN { False }
+                elements.search_result.line_100.event.press |> THEN { False }
+                transport.search.results |> THEN { True }
+                transport.search.stale |> THEN { True }
+                transport.search.loading |> THEN { False }
+                transport.search.empty |> THEN { False }
+                transport.search.error |> THEN { False }
+            }
+        }
+
+    settled_search_query:
+        Text/empty() |> HOLD settled_search_query {
+            LATEST {
+                elements.search_submit.event.press |> THEN { search_query }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_query
+                    __ => SKIP
+                }
+            }
+        }
+
+    search_state:
+        Closed |> HOLD search_state {
+            LATEST {
+                elements.navigation.search.event.press |> THEN { Ready }
+                elements.search.change |> THEN { Ready }
+                elements.search_submit.event.press |> THEN { Loading }
+                elements.search_retry.event.press |> THEN { Retrying }
+                elements.search_close.event.press |> THEN { Closed }
+                elements.search_result.forde_station.event.press |> THEN { Closed }
+                elements.search_result.forde_ferry.event.press |> THEN { Closed }
+                elements.search_result.forde_place.event.press |> THEN { Closed }
+                elements.search_result.line_100.event.press |> THEN { Closed }
+                elements.search.key_down.key |> WHEN {
+                    Escape => Closed
+                    ArrowDown => SKIP
+                    ArrowUp => SKIP
+                    Enter => Closed
+                    __ => Ready
+                }
+                transport.search.loading |> THEN { Loading }
+                transport.search.results |> THEN { Results }
+                transport.search.empty |> THEN { Empty }
+                transport.search.stale |> THEN { Stale }
+                transport.search.error |> THEN { Error }
+            }
+        }
+
+    search_generation:
+        0 |> HOLD search_generation {
+            LATEST {
+                elements.search_submit.event.press |> THEN { search_generation + 1 }
+                elements.search_retry.event.press |> THEN { search_generation + 1 }
+            }
+        }
+
+    search_retry_count:
+        0 |> HOLD search_retry_count {
+            elements.search_retry.event.press |> THEN { search_retry_count + 1 }
+        }
+
+    selected_station:
+        Forde |> HOLD selected_station {
+            LATEST {
+                elements.search_result.forde_station.event.press |> THEN { Forde }
+                elements.search_result.forde_ferry.event.press |> THEN { FordeFerry }
+                elements.station.forde.event.press |> THEN { Forde }
+                elements.station.forde_ferry.event.press |> THEN { FordeFerry }
+                elements.station.oslo.event.press |> THEN { OsloS }
+                elements.station.bergen.event.press |> THEN { Bergen }
+                elements.station.trondheim.event.press |> THEN { Trondheim }
+                elements.station.bodo.event.press |> THEN { Bodo }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_results_available |> WHEN {
+                        True => search_highlight |> WHEN {
+                            FordeStationResult => Forde
+                            FordeFerryResult => FordeFerry
+                            __ => SKIP
+                        }
+                        False => SKIP
+                    }
+                    __ => SKIP
+                }
+            }
+        }
+
+    station_state:
+        Fresh |> HOLD station_state {
+            LATEST {
+                elements.station.forde.event.press |> THEN { Loading }
+                elements.station.forde_ferry.event.press |> THEN { Loading }
+                elements.station.oslo.event.press |> THEN { Loading }
+                elements.station.bergen.event.press |> THEN { Loading }
+                elements.station.trondheim.event.press |> THEN { Loading }
+                elements.station.bodo.event.press |> THEN { Loading }
+                elements.search_result.forde_station.event.press |> THEN { Loading }
+                elements.search_result.forde_ferry.event.press |> THEN { Loading }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_results_available |> WHEN {
+                        True => search_highlight |> WHEN {
+                            FordeStationResult => Loading
+                            FordeFerryResult => Loading
+                            __ => SKIP
+                        }
+                        False => SKIP
+                    }
+                    __ => SKIP
+                }
+                elements.station.retry.event.press |> THEN { Retrying }
+                transport.station.loading |> THEN { Loading }
+                transport.station.fresh |> THEN { Fresh }
+                transport.station.empty |> THEN { Empty }
+                transport.station.stale |> THEN { Stale }
+                transport.station.error |> THEN { Error }
+            }
+        }
+
+    station_retry_count:
+        0 |> HOLD station_retry_count {
+            elements.station.retry.event.press |> THEN { station_retry_count + 1 }
+        }
+
+    station_tab:
+        Departures |> HOLD station_tab {
+            LATEST {
+                elements.tab.departures.event.press |> THEN { Departures }
+                elements.tab.vehicles.event.press |> THEN { Vehicles }
+                elements.tab.details.event.press |> THEN { Details }
+                elements.station.forde.event.press |> THEN { Departures }
+                elements.station.forde_ferry.event.press |> THEN { Departures }
+                elements.search_result.forde_station.event.press |> THEN { Departures }
+                elements.search_result.forde_ferry.event.press |> THEN { Departures }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_results_available |> WHEN {
+                        True => search_highlight |> WHEN {
+                            FordeStationResult => Departures
+                            FordeFerryResult => Departures
+                            __ => SKIP
+                        }
+                        False => SKIP
+                    }
+                    __ => SKIP
+                }
+            }
+        }
+
+    departures_state:
+        Fresh |> HOLD departures_state {
+            LATEST {
+                elements.station.forde.event.press |> THEN { Loading }
+                elements.station.forde_ferry.event.press |> THEN { Loading }
+                elements.station.oslo.event.press |> THEN { Loading }
+                elements.station.bergen.event.press |> THEN { Loading }
+                elements.station.trondheim.event.press |> THEN { Loading }
+                elements.station.bodo.event.press |> THEN { Loading }
+                elements.search_result.forde_station.event.press |> THEN { Loading }
+                elements.search_result.forde_ferry.event.press |> THEN { Loading }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_results_available |> WHEN {
+                        True => search_highlight |> WHEN {
+                            FordeStationResult => Loading
+                            FordeFerryResult => Loading
+                            __ => SKIP
+                        }
+                        False => SKIP
+                    }
+                    __ => SKIP
+                }
+                elements.departures_retry.event.press |> THEN { Retrying }
+                transport.departures.loading |> THEN { Loading }
+                transport.departures.fresh |> THEN { Fresh }
+                transport.departures.empty |> THEN { Empty }
+                transport.departures.stale |> THEN { Stale }
+                transport.departures.error |> THEN { Error }
+            }
+        }
+
+    departures_retry_count:
+        0 |> HOLD departures_retry_count {
+            elements.departures_retry.event.press |> THEN { departures_retry_count + 1 }
+        }
+
+    station_vehicles_state:
+        Fresh |> HOLD station_vehicles_state {
+            LATEST {
+                elements.station.forde.event.press |> THEN { Loading }
+                elements.station.forde_ferry.event.press |> THEN { Loading }
+                elements.station.oslo.event.press |> THEN { Loading }
+                elements.station.bergen.event.press |> THEN { Loading }
+                elements.station.trondheim.event.press |> THEN { Loading }
+                elements.station.bodo.event.press |> THEN { Loading }
+                elements.search_result.forde_station.event.press |> THEN { Loading }
+                elements.search_result.forde_ferry.event.press |> THEN { Loading }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_results_available |> WHEN {
+                        True => search_highlight |> WHEN {
+                            FordeStationResult => Loading
+                            FordeFerryResult => Loading
+                            __ => SKIP
+                        }
+                        False => SKIP
+                    }
+                    __ => SKIP
+                }
+                elements.station_vehicles_retry.event.press |> THEN { Retrying }
+                transport.station_vehicles.loading |> THEN { Loading }
+                transport.station_vehicles.fresh |> THEN { Fresh }
+                transport.station_vehicles.empty |> THEN { Empty }
+                transport.station_vehicles.stale |> THEN { Stale }
+                transport.station_vehicles.error |> THEN { Error }
+            }
+        }
+
+    station_vehicles_retry_count:
+        0 |> HOLD station_vehicles_retry_count {
+            elements.station_vehicles_retry.event.press |> THEN { station_vehicles_retry_count + 1 }
+        }
+
+    selected_vehicle:
+        NoVehicle |> HOLD selected_vehicle {
+            LATEST {
+                elements.station.vehicle_train.event.press |> THEN { TrainR10 }
+                elements.station.vehicle_bus.event.press |> THEN { Bus31 }
+                elements.vehicle.stop.event.press |> THEN { NoVehicle }
+            }
+        }
+
+    vehicle_state:
+        None |> HOLD vehicle_state {
+            LATEST {
+                elements.station.vehicle_train.event.press |> THEN { Loading }
+                elements.station.vehicle_bus.event.press |> THEN { Loading }
+                elements.vehicle.retry.event.press |> THEN { Retrying }
+                elements.vehicle.stop.event.press |> THEN { None }
+                transport.vehicle.loading |> THEN { Loading }
+                transport.vehicle.live |> THEN { Live }
+                transport.vehicle.stale |> THEN { Stale }
+                transport.vehicle.lost |> THEN { Lost }
+                transport.vehicle.error |> THEN { Error }
+            }
+        }
+
+    passenger_state:
+        Passenger |> HOLD passenger_state {
+            LATEST {
+                transport.vehicle.passenger |> THEN { Passenger }
+                transport.vehicle.non_passenger |> THEN { NonPassenger }
+            }
+        }
+
+    focus_state:
+        None |> HOLD focus_state {
+            LATEST {
+                elements.vehicle.focus.event.press |> THEN { Following }
+                elements.vehicle.pause.event.press |> THEN { Paused }
+                elements.vehicle.resume.event.press |> THEN { Following }
+                elements.vehicle.unfocus.event.press |> THEN { None }
+                elements.vehicle.stop.event.press |> THEN { None }
+                elements.vehicle.close.event.press |> THEN { None }
+            }
+        }
+
+    vehicle_retry_count:
+        0 |> HOLD vehicle_retry_count {
+            elements.vehicle.retry.event.press |> THEN { vehicle_retry_count + 1 }
+        }
+
+    mobile_sheet:
+        Half |> HOLD mobile_sheet {
+            LATEST {
+                elements.sheet.peek.event.press |> THEN { Peek }
+                elements.sheet.half.event.press |> THEN { Half }
+                elements.sheet.full.event.press |> THEN { Full }
+            }
+        }
+
+    map_zoom:
+        5.3 |> HOLD map_zoom {
+            LATEST {
+                elements.map.zoom_in.event.press |> THEN { map_zoom + 0.5 }
+                elements.map.zoom_out.event.press |> THEN { map_zoom - 0.5 }
+                elements.search_result.forde_station.event.press |> THEN { 11.5 }
+                elements.search_result.forde_ferry.event.press |> THEN { 11.5 }
+                elements.search_result.forde_place.event.press |> THEN { 11.5 }
+                elements.search_result.line_100.event.press |> THEN { 8.0 }
+                elements.station.forde.event.press |> THEN { 11.5 }
+                elements.station.forde_ferry.event.press |> THEN { 11.5 }
+                elements.station.oslo.event.press |> THEN { 11.5 }
+                elements.station.bergen.event.press |> THEN { 11.5 }
+                elements.station.trondheim.event.press |> THEN { 11.5 }
+                elements.station.bodo.event.press |> THEN { 11.5 }
+                elements.search.key_down.key |> WHEN {
+                    Enter => search_results_available |> WHEN {
+                        True => search_highlight |> WHEN {
+                            FordeStationResult => 11.5
+                            FordeFerryResult => 11.5
+                            FordePlaceResult => 11.5
+                            Line100Result => 8.0
+                        }
+                        False => SKIP
+                    }
+                    __ => SKIP
+                }
+            }
+        }
+
+    map_locating:
+        False |> HOLD map_locating {
+            elements.map.locate.event.press |> THEN { Bool/not(map_locating) }
+        }
+
+    map_state:
+        Ready |> HOLD map_state {
+            LATEST {
+                elements.map.retry.event.press |> THEN { Retrying }
+                transport.map.loading |> THEN { Loading }
+                transport.map.ready |> THEN { Ready }
+                transport.map.error |> THEN { Error }
+            }
+        }
+
+    map_retry_count:
+        0 |> HOLD map_retry_count {
+            elements.map.retry.event.press |> THEN { map_retry_count + 1 }
+        }
+
+    admin_session_state:
+        Authenticated |> HOLD admin_session_state {
+            LATEST {
+                elements.admin.logout.event.press |> THEN { SignedOut }
+                elements.admin.login.event.press |> THEN { Authenticated }
+            }
+        }
+
+    admin_resource_state:
+        Fresh |> HOLD admin_resource_state {
+            LATEST {
+                elements.admin.status.event.press |> THEN { Loading }
+                elements.admin.infrastructure.event.press |> THEN { Loading }
+                elements.admin.watches.event.press |> THEN { Loading }
+                elements.admin.entur_log.event.press |> THEN { Loading }
+                elements.admin.realtime.event.press |> THEN { Loading }
+                elements.admin.events.event.press |> THEN { Loading }
+                elements.admin.database_schema.event.press |> THEN { Loading }
+                elements.admin.database_migrations.event.press |> THEN { Loading }
+                elements.admin.retry.event.press |> THEN { Retrying }
+                transport.admin.loading |> THEN { Loading }
+                transport.admin.fresh |> THEN { Fresh }
+                transport.admin.empty |> THEN { Empty }
+                transport.admin.stale |> THEN { Stale }
+                transport.admin.error |> THEN { Error }
+            }
+        }
+
+    admin_retry_count:
+        0 |> HOLD admin_retry_count {
+            elements.admin.retry.event.press |> THEN { admin_retry_count + 1 }
+        }
+]
+
+scene: FjordPulseView/main_scene(PASS: [store: store])

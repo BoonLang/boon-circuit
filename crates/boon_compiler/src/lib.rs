@@ -2,7 +2,8 @@ use boon_example_manifest::{ExampleEntry, ExampleManifest};
 use boon_ir::{TypedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_parser::{AstExpr, AstExprKind, AstStatement, ParsedProgram, parse_project, parse_source};
 pub use boon_plan::{
-    ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, TargetProfile,
+    ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, ProgramRole,
+    TargetProfile,
 };
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
@@ -867,6 +868,14 @@ fn source_files_for_path(source_path: &Path) -> CompilerResult<Vec<PathBuf>> {
                 &entry.source,
                 &entry.source_files,
             ));
+        }
+        for program in &entry.programs {
+            if paths_match(&resolve_repo_file(&program.source), &source_path) {
+                return Ok(source_files_for_manifest_source(
+                    &program.source,
+                    &program.source_files,
+                ));
+            }
         }
     }
     Ok(vec![source_path])

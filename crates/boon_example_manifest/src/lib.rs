@@ -1,3 +1,4 @@
+pub use boon_plan::ProgramRole;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,6 +79,11 @@ pub struct ExampleEntry {
     pub source: String,
     #[serde(default)]
     pub source_files: Vec<String>,
+    /// Independently compiled programs that form one application bundle.
+    /// `source` and `source_files` remain the primary editor program and must
+    /// match the document-role entry when this list is present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub programs: Vec<ExampleProgram>,
     #[serde(default)]
     pub build_files: Vec<String>,
     #[serde(default)]
@@ -118,6 +124,26 @@ pub struct ExampleEntry {
     pub migration_sequence: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExampleProgram {
+    pub role: ProgramRole,
+    pub source: String,
+    #[serde(default)]
+    pub source_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_namespace: Option<String>,
+}
+
+impl ExampleProgram {
+    pub fn source_project(&self) -> SourceProject {
+        SourceProject {
+            source: self.source.clone(),
+            source_files: self.source_files.clone(),
+        }
+    }
+}
+
 impl ExampleEntry {
     pub fn source_project(&self) -> SourceProject {
         SourceProject {
@@ -128,6 +154,10 @@ impl ExampleEntry {
 
     pub fn application_identity(&self) -> Option<ApplicationIdentity> {
         self.application.as_ref().map(ApplicationManifest::identity)
+    }
+
+    pub fn program(&self, role: ProgramRole) -> Option<&ExampleProgram> {
+        self.programs.iter().find(|program| program.role == role)
     }
 }
 
@@ -472,6 +502,53 @@ impl ExampleManifest {
                 &format!("example `{}`", entry.id),
                 &entry.source_project(),
             )?;
+            if !entry.programs.is_empty() {
+                let mut roles = BTreeSet::new();
+                let mut namespaces = BTreeSet::new();
+                for program in &entry.programs {
+                    if !roles.insert(program.role.as_str()) {
+                        return Err(context.invalid(format!(
+                            "example `{}` repeats program role `{}`",
+                            entry.id,
+                            program.role.as_str()
+                        )));
+                    }
+                    validate_source_project(
+                        &context,
+                        &format!("example `{}` {} program", entry.id, program.role.as_str()),
+                        &program.source_project(),
+                    )?;
+                    if let Some(namespace) = program.state_namespace.as_deref() {
+                        validate_identity_text(
+                            &context,
+                            &format!(
+                                "example `{}` {} program state_namespace",
+                                entry.id,
+                                program.role.as_str()
+                            ),
+                            namespace,
+                        )?;
+                        if !namespaces.insert(namespace) {
+                            return Err(context.invalid(format!(
+                                "example `{}` repeats program state namespace `{namespace}`",
+                                entry.id
+                            )));
+                        }
+                    }
+                }
+                let Some(primary) = entry.program(ProgramRole::Document) else {
+                    return Err(context.invalid(format!(
+                        "example `{}` program bundle has no document role",
+                        entry.id
+                    )));
+                };
+                if primary.source != entry.source || primary.source_files != entry.source_files {
+                    return Err(context.invalid(format!(
+                        "example `{}` primary source must match its document program",
+                        entry.id
+                    )));
+                }
+            }
             context.required_file(&entry.scenario, &format!("example `{}` scenario", entry.id))?;
             context.required_file(&entry.budget, &format!("example `{}` budget", entry.id))?;
             validate_file_paths(

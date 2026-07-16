@@ -1,0 +1,2059 @@
+openapi: 3.1.0
+info:
+  title: FjordPulse HTTP API
+  version: 1.0.0
+  description: |
+    Canonical browser-to-FjordPulse HTTP contract. All application API calls use
+    these FjordPulse endpoints; Entur and SurrealDB remain backend-only. The one
+    approved third-party browser surface is the allowlisted MapTiler style/tile
+    configuration returned by GET /api/map/config.
+
+    All timestamps are UTC RFC3339 values. Current state returned by snapshot
+    endpoints is authoritative. Realtime notifications are hints to fetch or
+    apply a newer version of that state. Development scenario endpoints MUST
+    return 404 outside local, development, and test environments.
+  contact:
+    name: FjordPulse
+  license:
+    name: UNLICENSED
+    identifier: LicenseRef-UNLICENSED
+servers:
+  - url: /
+    description: Same-origin HTTP API in local, staging, or production environments
+security: []
+tags:
+  - name: Health
+    description: Public liveness, dependency health, and readiness signals.
+  - name: Map
+    description: Public, operator-managed browser basemap configuration.
+  - name: Stations
+    description: Locally stored station map data and authoritative station snapshots.
+  - name: Search
+    description: Backend-mediated station, place, line, and known-vehicle discovery.
+  - name: Vehicles
+    description: Authoritative current vehicle state and observed trails.
+  - name: Realtime
+    description: Short-lived browser authorization for the PHP WebSocket service.
+  - name: Admin session
+    description: Cookie-based operator and public read-only-demo authentication lifecycle.
+  - name: Admin diagnostics
+    description: Protected, read-only operational status, watches, events, database structure, migrations, and Entur logs.
+  - name: Development
+    description: Deterministic local/dev/test scenarios that are absent in production.
+paths:
+  /api/health:
+    get:
+      tags: [Health]
+      summary: Report service and dependency health
+      operationId: getHealth
+      responses:
+        '200':
+          description: Healthy or operational in a degraded fallback mode
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+              examples:
+                healthy:
+                  $ref: '#/components/examples/HealthyResponse'
+                degraded:
+                  $ref: '#/components/examples/DegradedHealthResponse'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Unhealthy; dependency details remain machine-readable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+  /api/readiness:
+    get:
+      tags: [Health]
+      summary: Report whether the HTTP application can serve authoritative snapshots
+      operationId: getReadiness
+      responses:
+        '200':
+          description: The service is ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: Not ready; dependency details remain machine-readable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+  /api/map/config:
+    get:
+      tags: [Map]
+      summary: Get the allowlisted browser basemap configuration
+      operationId: getMapConfig
+      responses:
+        '200':
+          description: MapTiler satellite and street basemaps configured by the operator
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MapConfigResponse' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: The operator has not configured the map provider
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+  /api/stations:
+    get:
+      tags: [Stations]
+      summary: List bounded station markers or clusters for a map viewport
+      operationId: getStationMap
+      parameters:
+        - $ref: '#/components/parameters/BoundingBox'
+        - $ref: '#/components/parameters/Zoom'
+      responses:
+        '200':
+          description: Station markers or clusters sourced from local canonical data
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StationMapResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/search:
+    get:
+      tags: [Search]
+      summary: Search stations, places, lines, and known vehicles
+      operationId: search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: User-entered search query
+          schema: { type: string, minLength: 1, maxLength: 200 }
+          example: førde
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+      responses:
+        '200':
+          description: Ordered search results; an empty array is not an error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/stations/{stationId}:
+    get:
+      tags: [Stations]
+      summary: Get station metadata and its authoritative current snapshot
+      operationId: getStation
+      parameters:
+        - $ref: '#/components/parameters/StationId'
+        - $ref: '#/components/parameters/Refresh'
+      responses:
+        '200':
+          description: Station metadata and current composite snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StationResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/stations/{stationId}/departures:
+    get:
+      tags: [Stations]
+      summary: Get the compact departure preview or an on-demand Oslo-local daily timetable page
+      operationId: getStationDepartures
+      parameters:
+        - $ref: '#/components/parameters/StationId'
+        - name: date
+          in: query
+          required: false
+          description: When present, return this Europe/Oslo calendar day's cached timetable instead of the realtime preview; accepted dates are today through seven days ahead.
+          schema: { type: string, format: date }
+        - name: limit
+          in: query
+          required: false
+          description: Daily-timetable page size; requires `date` and is not accepted for the compact preview.
+          schema: { type: integer, minimum: 1, maximum: 50, default: 50 }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Refresh'
+      responses:
+        '200':
+          description: Bounded preview or stable page from one versioned daily timetable, including explicit completeness
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StationDeparturesResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/stations/{stationId}/nearby-vehicles:
+    get:
+      tags: [Stations]
+      summary: Get vehicle state within the station's circular search radius
+      operationId: getStationNearbyVehicles
+      parameters:
+        - $ref: '#/components/parameters/StationId'
+      responses:
+        '200':
+          description: Nearest-first vehicles within the reported search radius; an empty array is a successful empty state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NearbyVehiclesResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/vehicles/{vehicleId}:
+    get:
+      tags: [Vehicles]
+      summary: Get authoritative vehicle state, scheduled journey, upcoming calls, and bounded observed trail
+      operationId: getVehicle
+      parameters:
+        - $ref: '#/components/parameters/VehicleId'
+        - $ref: '#/components/parameters/Refresh'
+      responses:
+        '200':
+          description: Current vehicle state, full scheduled journey geometry/calls, recent observations, and upcoming stops
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VehicleResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/realtime-token:
+    post:
+      tags: [Realtime]
+      summary: Mint a short-lived token for the browser WebSocket endpoint
+      operationId: createRealtimeToken
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                clientId:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  description: Optional random non-identifying browser session id
+              additionalProperties: false
+      responses:
+        '201':
+          description: Short-lived, scope-limited realtime token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RealtimeTokenResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/admin/demo-credentials:
+    get:
+      tags: [Admin session]
+      summary: Discover the deliberately public, read-only Admin demo identity
+      description: Returns credentials only when public Admin demo access is explicitly enabled. These credentials are separate from the operator account and sessions created with them are server-enforced as read-only.
+      operationId: getAdminDemoCredentials
+      responses:
+        '200':
+          description: Public Admin demo availability and, when enabled, its intentionally public credentials
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDemoCredentialsResponse' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/admin/session:
+    get:
+      tags: [Admin session]
+      summary: Inspect the current admin session
+      operationId: getAdminSession
+      security: [{ adminSession: [] }]
+      responses:
+        '200':
+          description: Authenticated admin session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminSessionResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Admin session]
+      summary: Create an admin session
+      operationId: createAdminSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminLoginRequest' }
+      responses:
+        '200':
+          description: Authenticated admin session; response sets an HttpOnly cookie
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: HttpOnly, SameSite, Secure-in-production admin session cookie
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminSessionResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+    delete:
+      tags: [Admin session]
+      summary: Destroy the current admin session
+      operationId: deleteAdminSession
+      security: [{ adminSession: [] }]
+      responses:
+        '204':
+          description: Session destroyed
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/status:
+    get:
+      tags: [Admin diagnostics]
+      summary: Get operator health, infrastructure, and compatibility diagnostics
+      operationId: getAdminStatus
+      security: [{ adminSession: [] }]
+      responses:
+        '200':
+          description: Operator status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminStatusResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/admin/watches:
+    get:
+      tags: [Admin diagnostics]
+      summary: List active and recently expired demand watches
+      operationId: getAdminWatches
+      security: [{ adminSession: [] }]
+      parameters:
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/WatchType' }
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/WatchState' }
+        - name: scope
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 256 }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Filtered watch rows
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminWatchesResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/entur-log:
+    get:
+      tags: [Admin diagnostics]
+      summary: List structured backend-only Entur request records
+      operationId: getAdminEnturLog
+      security: [{ adminSession: [] }]
+      parameters:
+        - name: service
+          in: query
+          schema: { $ref: '#/components/schemas/EnturService' }
+        - name: outcome
+          in: query
+          schema: { $ref: '#/components/schemas/EnturOutcome' }
+        - name: scope
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 256 }
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Filtered Entur request log rows and aggregate metrics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminEnturLogResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/realtime:
+    get:
+      tags: [Admin diagnostics]
+      summary: Get realtime server, room, and live-query bridge diagnostics
+      operationId: getAdminRealtime
+      security: [{ adminSession: [] }]
+      responses:
+        '200':
+          description: Realtime diagnostics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRealtimeResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/events:
+    get:
+      tags: [Admin diagnostics]
+      summary: List recent persisted realtime events
+      operationId: getAdminEvents
+      security: [{ adminSession: [] }]
+      parameters:
+        - name: scope
+          in: query
+          schema: { type: string, minLength: 1, maxLength: 256 }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/RealtimeEventType' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Recent persisted event records
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminEventsResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/migrations:
+    get:
+      tags: [Admin diagnostics]
+      summary: List SurrealDB migration compatibility diagnostics (legacy alias)
+      description: |
+        Compatibility alias for `GET /api/admin/database/migrations`. This
+        protected endpoint is read-only and cannot execute, retry, edit, or
+        roll back a migration.
+      operationId: getAdminMigrations
+      deprecated: true
+      security: [{ adminSession: [] }]
+      responses:
+        '200':
+          description: Read-only release/database migration compatibility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDatabaseMigrationsResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/database/schema:
+    get:
+      tags: [Admin diagnostics]
+      summary: Inspect the current allowlisted SurrealDB schema structure
+      description: |
+        Returns a typed, read-only mapping of one fixed, backend-owned,
+        allowlisted SurrealDB `INFO ... STRUCTURE` query. The browser never connects to
+        SurrealDB and cannot submit SurrealQL. Raw INFO results are not returned;
+        users, credentials, password hashes, authentication definitions, and
+        any other non-allowlisted metadata are discarded inside the backend.
+      operationId: getAdminDatabaseSchema
+      security: [{ adminSession: [] }]
+      responses:
+        '200':
+          description: Read-only current table, field, index, event, and permission structure
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDatabaseSchemaResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/admin/database/migrations:
+    get:
+      tags: [Admin diagnostics]
+      summary: Inspect SurrealDB release/database migration compatibility
+      description: |
+        Compares the bundled, allowlisted release migration files with the
+        migration ledger and migration-attempt audit records. Source is read
+        only and comes only from discovered bundled migration files; no path or
+        query parameter is accepted. The endpoint cannot execute, retry, edit,
+        or roll back migrations.
+      operationId: getAdminDatabaseMigrations
+      security: [{ adminSession: [] }]
+      responses:
+        '200':
+          description: Read-only release/database migration compatibility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminDatabaseMigrationsResponse' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/dev/scenario:
+    get:
+      tags: [Development]
+      summary: Get the current deterministic scenario
+      description: Returns 404 when development endpoints are disabled.
+      operationId: getDevScenario
+      responses:
+        '200':
+          description: Current scenario
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevScenarioResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Development]
+      summary: Select a deterministic scenario
+      description: Returns 404 when development endpoints are disabled.
+      operationId: setDevScenario
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scenario]
+              properties:
+                scenario: { $ref: '#/components/schemas/DevScenario' }
+              additionalProperties: false
+      responses:
+        '200':
+          description: Scenario selected
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevScenarioResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/dev/scenarios:
+    get:
+      tags: [Development]
+      summary: List deterministic scenarios supported by the final adapter interfaces
+      description: Returns 404 when development endpoints are disabled.
+      operationId: getDevScenarios
+      responses:
+        '200':
+          description: Available scenarios
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DevScenariosResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  securitySchemes:
+    adminSession:
+      type: apiKey
+      in: cookie
+      name: fjordpulse_admin
+      description: HttpOnly admin session cookie; not readable by browser JavaScript.
+  parameters:
+    StationId:
+      name: stationId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^NSR:StopPlace:[A-Za-z0-9_-]+$'
+        maxLength: 200
+      example: NSR:StopPlace:548
+    VehicleId:
+      name: vehicleId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9][A-Za-z0-9:._-]{0,199}$'
+      example: SKY:Vehicle:12345
+    BoundingBox:
+      name: bbox
+      in: query
+      required: true
+      description: minLongitude,minLatitude,maxLongitude,maxLatitude in WGS84
+      schema:
+        type: string
+        pattern: '^-?[0-9]+(?:\.[0-9]+)?,-?[0-9]+(?:\.[0-9]+)?,-?[0-9]+(?:\.[0-9]+)?,-?[0-9]+(?:\.[0-9]+)?$'
+        maxLength: 128
+      example: 4.5,58.0,8.5,63.0
+    Zoom:
+      name: zoom
+      in: query
+      required: true
+      schema: { type: number, minimum: 0, maximum: 24 }
+      example: 7.5
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 512, pattern: '^[A-Za-z0-9_-]+$' }
+    Refresh:
+      name: refresh
+      in: query
+      required: false
+      description: Force an upstream refresh before returning authoritative data. For a daily timetable this requires `date` and cannot be combined with `cursor`.
+      schema: { type: boolean, default: false }
+  responses:
+    BadRequest:
+      description: Request validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            ok: false
+            error:
+              code: invalid_request
+              message: Request parameters are invalid.
+              details: { field: bbox }
+            meta: { requestId: req_01J00000000000000000000000 }
+    Unauthorized:
+      description: Authentication is required or invalid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: Resource does not exist or is intentionally unavailable in this environment
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RateLimited:
+      description: Public action rate limit reached
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    ServiceUnavailable:
+      description: An authoritative dependency is unavailable
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  examples:
+    HealthyResponse:
+      value:
+        ok: true
+        data:
+          status: healthy
+          mode: normal
+          dataMode: real
+          checkedAt: '2026-07-10T10:00:00Z'
+          version: 1.0.0-dev
+          fallbackAvailable: true
+          dependencies:
+            http: { status: healthy, checkedAt: '2026-07-10T10:00:00Z' }
+            realtime: { status: healthy, checkedAt: '2026-07-10T10:00:00Z' }
+            surrealdb: { status: healthy, checkedAt: '2026-07-10T10:00:00Z' }
+            entur: { status: healthy, checkedAt: '2026-07-10T10:00:00Z' }
+            mapTiles: { status: configured, checkedAt: '2026-07-10T10:00:00Z' }
+            liveQueryBridge:
+              status: healthy
+              checkedAt: '2026-07-10T10:00:00Z'
+              lastSuccessAt: '2026-07-10T09:59:58Z'
+        meta:
+          requestId: req_01J00000000000000000000000
+          updatedAt: '2026-07-10T10:00:00Z'
+    DegradedHealthResponse:
+      value:
+        ok: true
+        data:
+          status: degraded
+          mode: fallback_polling
+          dataMode: real
+          checkedAt: '2026-07-10T10:00:00Z'
+          version: 1.0.0-dev
+          fallbackAvailable: true
+          dependencies:
+            http: { status: healthy, checkedAt: '2026-07-10T10:00:00Z' }
+            realtime: { status: unavailable, checkedAt: '2026-07-10T10:00:00Z' }
+            surrealdb: { status: healthy, checkedAt: '2026-07-10T10:00:00Z' }
+            entur: { status: healthy, checkedAt: '2026-07-10T10:00:00Z' }
+            mapTiles: { status: misconfigured, checkedAt: '2026-07-10T10:00:00Z' }
+            liveQueryBridge: { status: reconnecting, checkedAt: '2026-07-10T10:00:00Z' }
+        meta:
+          requestId: req_01J00000000000000000000000
+          updatedAt: '2026-07-10T10:00:00Z'
+  schemas:
+    RequestId:
+      type: string
+      minLength: 1
+      maxLength: 128
+      example: req_01J00000000000000000000000
+    EntityVersion:
+      type: string
+      format: date-time
+      description: Monotonic-per-entity UTC RFC3339 version used to reject old updates.
+      example: '2026-07-10T10:00:00.123456Z'
+    SuccessMeta:
+      type: object
+      required: [requestId, updatedAt]
+      properties:
+        requestId: { $ref: '#/components/schemas/RequestId' }
+        updatedAt: { type: string, format: date-time }
+        nextCursor: { type: [string, 'null'], maxLength: 512, pattern: '^[A-Za-z0-9_-]+$' }
+      additionalProperties: false
+    ErrorMeta:
+      type: object
+      required: [requestId]
+      properties:
+        requestId: { $ref: '#/components/schemas/RequestId' }
+        retryAfterSeconds: { type: [integer, 'null'], minimum: 0 }
+      additionalProperties: false
+    ErrorBody:
+      type: object
+      required: [code, message, details]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: invalid_station
+        message:
+          type: string
+          minLength: 1
+          maxLength: 500
+          example: Station id is invalid.
+        details:
+          type: object
+          additionalProperties: true
+      additionalProperties: false
+    ErrorResponse:
+      type: object
+      required: [ok, error, meta]
+      properties:
+        ok: { const: false }
+        error: { $ref: '#/components/schemas/ErrorBody' }
+        meta: { $ref: '#/components/schemas/ErrorMeta' }
+      additionalProperties: false
+    SourceState:
+      type: string
+      enum: [loading, fresh, refreshing, empty, stale, unavailable, error, backoff, rate_limited]
+    ServiceHealthState:
+      type: string
+      enum: [healthy, configured, degraded, reconnecting, unavailable, misconfigured, unknown]
+    ServiceHealth:
+      type: object
+      required: [status, checkedAt]
+      properties:
+        status: { $ref: '#/components/schemas/ServiceHealthState' }
+        checkedAt: { type: string, format: date-time }
+        lastSuccessAt: { type: [string, 'null'], format: date-time }
+        message: { type: [string, 'null'], maxLength: 500 }
+        latencyMs: { type: [number, 'null'], minimum: 0 }
+      additionalProperties: false
+    HealthData:
+      type: object
+      required: [status, mode, dataMode, checkedAt, version, fallbackAvailable, dependencies]
+      properties:
+        status: { type: string, enum: [healthy, degraded, unhealthy] }
+        mode: { type: string, enum: [normal, fallback_polling] }
+        dataMode: { type: string, enum: [real, fake] }
+        checkedAt: { type: string, format: date-time }
+        version: { type: string, minLength: 1, maxLength: 128 }
+        fallbackAvailable: { type: boolean }
+        dependencies:
+          type: object
+          required: [http, realtime, surrealdb, entur, liveQueryBridge, mapTiles]
+          properties:
+            http: { $ref: '#/components/schemas/ServiceHealth' }
+            realtime: { $ref: '#/components/schemas/ServiceHealth' }
+            surrealdb: { $ref: '#/components/schemas/ServiceHealth' }
+            entur: { $ref: '#/components/schemas/ServiceHealth' }
+            liveQueryBridge: { $ref: '#/components/schemas/ServiceHealth' }
+            mapTiles: { $ref: '#/components/schemas/ServiceHealth' }
+          additionalProperties: false
+      additionalProperties: false
+    HealthResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/HealthData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    BasemapId:
+      type: string
+      enum: [satellite, streets]
+    BasemapConfig:
+      type: object
+      required: [id, label, styleUrl]
+      properties:
+        id: { $ref: '#/components/schemas/BasemapId' }
+        label: { type: string, minLength: 1, maxLength: 50 }
+        styleUrl:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https://api\.maptiler\.com/maps/(hybrid-v4|streets-v4)/style\.json\?key=[^&]+$'
+      additionalProperties: false
+    MapConfigData:
+      type: object
+      required: [provider, defaultBasemap, basemaps]
+      properties:
+        provider: { const: maptiler }
+        defaultBasemap: { $ref: '#/components/schemas/BasemapId' }
+        basemaps:
+          type: array
+          minItems: 2
+          maxItems: 2
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/BasemapConfig' }
+      additionalProperties: false
+    MapConfigResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/MapConfigData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    BoundingBoxValue:
+      type: object
+      required: [minLongitude, minLatitude, maxLongitude, maxLatitude]
+      properties:
+        minLongitude: { type: number, minimum: -180, maximum: 180 }
+        minLatitude: { type: number, minimum: -90, maximum: 90 }
+        maxLongitude: { type: number, minimum: -180, maximum: 180 }
+        maxLatitude: { type: number, minimum: -90, maximum: 90 }
+      additionalProperties: false
+    TransportMode:
+      type: string
+      enum: [bus, coach, tram, rail, metro, water, air, taxi, unknown]
+    StationKind:
+      type: string
+      enum: [stop_place, station, bus_station, ferry_terminal, rail_station, tram_stop, metro_station, airport, unknown]
+    Station:
+      type: object
+      required: [id, name, kind, latitude, longitude, locality, transportModes, importedAt]
+      properties:
+        id:
+          type: string
+          pattern: '^NSR:StopPlace:[A-Za-z0-9_-]+$'
+        name: { type: string, minLength: 1, maxLength: 300 }
+        kind: { $ref: '#/components/schemas/StationKind' }
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        locality: { type: [string, 'null'], maxLength: 200 }
+        municipality: { type: [string, 'null'], maxLength: 200 }
+        transportModes:
+          type: array
+          items: { $ref: '#/components/schemas/TransportMode' }
+          uniqueItems: true
+        importedAt: { type: string, format: date-time }
+      additionalProperties: false
+    StationMarker:
+      type: object
+      required: [kind, id, name, latitude, longitude, transportModes]
+      properties:
+        kind: { const: station }
+        id: { type: string, pattern: '^NSR:StopPlace:[A-Za-z0-9_-]+$' }
+        name: { type: string, minLength: 1, maxLength: 300 }
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        transportModes:
+          type: array
+          items: { $ref: '#/components/schemas/TransportMode' }
+          uniqueItems: true
+      additionalProperties: false
+    StationCluster:
+      type: object
+      required: [kind, id, latitude, longitude, count, bounds]
+      properties:
+        kind: { const: cluster }
+        id: { type: string, minLength: 1, maxLength: 200 }
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        count: { type: integer, minimum: 2 }
+        bounds: { $ref: '#/components/schemas/BoundingBoxValue' }
+      additionalProperties: false
+    StationMapData:
+      type: object
+      required: [bounds, zoom, dataSource, items]
+      properties:
+        bounds: { $ref: '#/components/schemas/BoundingBoxValue' }
+        zoom: { type: number, minimum: 0, maximum: 24 }
+        dataSource: { const: surrealdb }
+        items:
+          type: array
+          maxItems: 2000
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/StationMarker'
+              - $ref: '#/components/schemas/StationCluster'
+            discriminator:
+              propertyName: kind
+      additionalProperties: false
+    StationMapResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/StationMapData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    SearchResultType:
+      type: string
+      enum: [station, place, line, vehicle]
+    SearchResult:
+      type: object
+      required: [type, id, label, secondaryText]
+      properties:
+        type: { $ref: '#/components/schemas/SearchResultType' }
+        id: { type: string, minLength: 1, maxLength: 200 }
+        label: { type: string, minLength: 1, maxLength: 300 }
+        secondaryText: { type: [string, 'null'], maxLength: 500 }
+        stationId: { type: [string, 'null'], maxLength: 200 }
+        lineCode: { type: [string, 'null'], maxLength: 100 }
+        latitude: { type: [number, 'null'], minimum: -90, maximum: 90 }
+        longitude: { type: [number, 'null'], minimum: -180, maximum: 180 }
+        transportMode:
+          oneOf:
+            - $ref: '#/components/schemas/VehicleTransportMode'
+            - type: 'null'
+      additionalProperties: false
+    SearchData:
+      type: object
+      required: [query, results]
+      properties:
+        query: { type: string, minLength: 1, maxLength: 200 }
+        results:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/SearchResult' }
+      additionalProperties: false
+    SearchResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/SearchData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    DepartureStatus:
+      type: string
+      enum: [scheduled, realtime, delayed, cancelled, departed, unknown]
+    Departure:
+      type: object
+      required: [id, lineCode, destination, aimedDepartureAt, expectedDepartureAt, status, realtime]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 300 }
+        serviceJourneyId: { type: [string, 'null'], maxLength: 300 }
+        lineId: { type: [string, 'null'], maxLength: 300 }
+        lineCode: { type: [string, 'null'], maxLength: 100 }
+        destination: { type: [string, 'null'], maxLength: 300 }
+        aimedDepartureAt: { type: string, format: date-time }
+        expectedDepartureAt: { type: [string, 'null'], format: date-time }
+        status: { $ref: '#/components/schemas/DepartureStatus' }
+        delaySeconds: { type: [integer, 'null'] }
+        platform: { type: [string, 'null'], maxLength: 100 }
+        realtime: { type: boolean }
+      additionalProperties: false
+    DepartureBoardPreview:
+      type: object
+      required: [windowStart, windowEnd, limit, hasMore]
+      properties:
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        limit: { type: integer, minimum: 1, maximum: 20 }
+        hasMore: { type: boolean }
+      additionalProperties: false
+    VehicleFreshnessState:
+      type: string
+      enum: [live, stale, lost]
+    VehicleTransportMode:
+      type: string
+      enum: [air, bus, coach, ferry, metro, taxi, tram, rail, unknown]
+    VehiclePassengerServiceState:
+      type: string
+      enum: [passenger, non_passenger, unknown]
+    VehicleSummary:
+      type: object
+      required: [id, transportMode, passengerServiceState, lineCode, state, latitude, longitude, lastSeenAt, version]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 200 }
+        transportMode: { $ref: '#/components/schemas/VehicleTransportMode' }
+        passengerServiceState: { $ref: '#/components/schemas/VehiclePassengerServiceState' }
+        lineCode: { type: [string, 'null'], maxLength: 100 }
+        destination: { type: [string, 'null'], maxLength: 300 }
+        state: { $ref: '#/components/schemas/VehicleFreshnessState' }
+        latitude: { type: [number, 'null'], minimum: -90, maximum: 90 }
+        longitude: { type: [number, 'null'], minimum: -180, maximum: 180 }
+        bearing: { type: [number, 'null'], minimum: 0, maximum: 360 }
+        delaySeconds: { type: [integer, 'null'] }
+        distanceMeters:
+          type: [number, 'null']
+          minimum: 0
+          description: Optional vehicle metric; never the distance from the selected station
+        lastSeenAt: { type: string, format: date-time }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+      additionalProperties: false
+    StationVehicleCallRole:
+      type: string
+      enum: [starts_here, calls_here]
+    StationVehicleProgress:
+      type: string
+      enum: [at_station, before_station, after_station, unknown]
+    StationVehicle:
+      type: object
+      required: [id, transportMode, passengerServiceState, lineCode, state, latitude, longitude, lastSeenAt, version, callRole, progress, stationCallAt]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 200 }
+        transportMode: { $ref: '#/components/schemas/VehicleTransportMode' }
+        passengerServiceState:
+          allOf:
+            - $ref: '#/components/schemas/VehiclePassengerServiceState'
+            - type: string
+              enum: [passenger, unknown]
+        lineCode: { type: [string, 'null'], maxLength: 100 }
+        destination: { type: [string, 'null'], maxLength: 300 }
+        state: { $ref: '#/components/schemas/VehicleFreshnessState' }
+        latitude: { type: [number, 'null'], minimum: -90, maximum: 90 }
+        longitude: { type: [number, 'null'], minimum: -180, maximum: 180 }
+        bearing: { type: [number, 'null'], minimum: 0, maximum: 360 }
+        delaySeconds: { type: [integer, 'null'] }
+        distanceMeters: { type: [number, 'null'], minimum: 0 }
+        lastSeenAt: { type: string, format: date-time }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        callRole: { $ref: '#/components/schemas/StationVehicleCallRole' }
+        progress: { $ref: '#/components/schemas/StationVehicleProgress' }
+        stationCallAt: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+    ServingVehicleCoverage:
+      type: object
+      required: [windowStart, windowEnd, candidateJourneyCount, queriedJourneyCount, truncated]
+      properties:
+        windowStart: { type: [string, 'null'], format: date-time }
+        windowEnd: { type: [string, 'null'], format: date-time }
+        candidateJourneyCount: { type: integer, minimum: 0 }
+        queriedJourneyCount: { type: integer, minimum: 0, maximum: 200 }
+        truncated: { type: boolean }
+      additionalProperties: false
+    StationSnapshot:
+      type: object
+      required: [stationId, state, version, updatedAt, departures, departureBoard, nearbyVehicles, servingVehicles, servingVehicleCoverage]
+      properties:
+        stationId: { type: string, pattern: '^NSR:StopPlace:[A-Za-z0-9_-]+$' }
+        state: { $ref: '#/components/schemas/SourceState' }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        updatedAt: { type: string, format: date-time }
+        lastSuccessfulAt: { type: [string, 'null'], format: date-time }
+        warning: { type: [string, 'null'], maxLength: 500 }
+        departures:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/Departure' }
+        departureBoard: { $ref: '#/components/schemas/DepartureBoardPreview' }
+        nearbyVehicles:
+          type: array
+          items: { $ref: '#/components/schemas/VehicleSummary' }
+        servingVehicles:
+          type: array
+          description: Currently reported vehicles matched by dated service journey to calls at this station, including vehicles outside the nearby radius
+          items: { $ref: '#/components/schemas/StationVehicle' }
+        servingVehicleCoverage:
+          $ref: '#/components/schemas/ServingVehicleCoverage'
+      additionalProperties: false
+    StationData:
+      type: object
+      required: [station, snapshot]
+      properties:
+        station: { $ref: '#/components/schemas/Station' }
+        snapshot: { $ref: '#/components/schemas/StationSnapshot' }
+      additionalProperties: false
+    StationResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/StationData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    DeparturePage:
+      type: object
+      required: [limit, hasMore, nextCursor]
+      properties:
+        limit: { type: integer, minimum: 1, maximum: 50 }
+        hasMore: { type: boolean }
+        nextCursor: { type: [string, 'null'], maxLength: 512, pattern: '^[A-Za-z0-9_-]+$' }
+      additionalProperties: false
+      oneOf:
+        - properties:
+            hasMore: { const: true }
+            nextCursor: { type: string, minLength: 1, maxLength: 512, pattern: '^[A-Za-z0-9_-]+$' }
+        - properties:
+            hasMore: { const: false }
+            nextCursor: { type: 'null' }
+    PreviewDeparturePage:
+      type: object
+      required: [limit, hasMore, nextCursor]
+      properties:
+        limit: { type: integer, minimum: 1, maximum: 20 }
+        hasMore: { type: boolean }
+        nextCursor: { type: 'null' }
+      additionalProperties: false
+    StationDeparturePreviewData:
+      type: object
+      required: [stationId, state, version, updatedAt, mode, date, timeZone, windowStart, windowEnd, departures, page, complete, totalCount]
+      properties:
+        stationId: { type: string, pattern: '^NSR:StopPlace:[A-Za-z0-9_-]+$' }
+        state: { $ref: '#/components/schemas/SourceState' }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        updatedAt: { type: string, format: date-time }
+        lastSuccessfulAt: { type: [string, 'null'], format: date-time }
+        warning: { type: [string, 'null'], maxLength: 500 }
+        mode: { const: preview }
+        date: { type: string, format: date }
+        timeZone: { const: Europe/Oslo }
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        departures:
+          type: array
+          maxItems: 20
+          items: { $ref: '#/components/schemas/Departure' }
+        page: { $ref: '#/components/schemas/PreviewDeparturePage' }
+        complete: { type: boolean }
+        totalCount: { type: [integer, 'null'], minimum: 0 }
+      additionalProperties: false
+      oneOf:
+        - properties:
+            complete: { const: true }
+            totalCount: { type: integer, minimum: 0 }
+        - properties:
+            complete: { const: false }
+            totalCount: { type: 'null' }
+    StationDepartureDayData:
+      type: object
+      required: [stationId, state, version, updatedAt, mode, date, timeZone, windowStart, windowEnd, departures, page, complete, totalCount]
+      properties:
+        stationId: { type: string, pattern: '^NSR:StopPlace:[A-Za-z0-9_-]+$' }
+        state: { $ref: '#/components/schemas/SourceState' }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        updatedAt: { type: string, format: date-time }
+        lastSuccessfulAt: { type: [string, 'null'], format: date-time }
+        warning: { type: [string, 'null'], maxLength: 500 }
+        mode: { const: day }
+        date: { type: string, format: date }
+        timeZone: { const: Europe/Oslo }
+        windowStart: { type: string, format: date-time }
+        windowEnd: { type: string, format: date-time }
+        departures:
+          type: array
+          maxItems: 50
+          items: { $ref: '#/components/schemas/Departure' }
+        page: { $ref: '#/components/schemas/DeparturePage' }
+        complete: { type: boolean }
+        totalCount: { type: [integer, 'null'], minimum: 0 }
+      additionalProperties: false
+      oneOf:
+        - properties:
+            complete: { const: true }
+            totalCount: { type: integer, minimum: 0 }
+        - properties:
+            complete: { const: false }
+            totalCount: { type: 'null' }
+    StationDeparturesResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/StationDeparturePreviewData'
+            - $ref: '#/components/schemas/StationDepartureDayData'
+          discriminator:
+            propertyName: mode
+            mapping:
+              preview: '#/components/schemas/StationDeparturePreviewData'
+              day: '#/components/schemas/StationDepartureDayData'
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    NearbyVehiclesData:
+      type: object
+      required: [stationId, searchRadiusMeters, state, version, updatedAt, vehicles]
+      properties:
+        stationId: { type: string, pattern: '^NSR:StopPlace:[A-Za-z0-9_-]+$' }
+        searchRadiusMeters:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          example: 5000
+          description: Great-circle radius used to filter vehicles around the station before nearest-first ordering and limiting
+        state: { $ref: '#/components/schemas/SourceState' }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        updatedAt: { type: string, format: date-time }
+        lastSuccessfulAt: { type: [string, 'null'], format: date-time }
+        warning: { type: [string, 'null'], maxLength: 500 }
+        vehicles:
+          type: array
+          items: { $ref: '#/components/schemas/VehicleSummary' }
+      additionalProperties: false
+    NearbyVehiclesResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/NearbyVehiclesData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    VehicleState:
+      type: object
+      required: [id, transportMode, passengerServiceState, lineCode, routeName, state, latitude, longitude, lastSeenAt, refreshedAt, version, nextStop, journeyReference, monitoredCall, progressBetweenStops, journeyVersion, routeProgress]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 200 }
+        transportMode: { $ref: '#/components/schemas/VehicleTransportMode' }
+        passengerServiceState: { $ref: '#/components/schemas/VehiclePassengerServiceState' }
+        lineCode: { type: [string, 'null'], maxLength: 100 }
+        routeName: { type: [string, 'null'], maxLength: 300 }
+        destination: { type: [string, 'null'], maxLength: 300 }
+        state: { $ref: '#/components/schemas/VehicleFreshnessState' }
+        latitude: { type: [number, 'null'], minimum: -90, maximum: 90 }
+        longitude: { type: [number, 'null'], minimum: -180, maximum: 180 }
+        bearing: { type: [number, 'null'], minimum: 0, maximum: 360 }
+        delaySeconds: { type: [integer, 'null'] }
+        distanceMeters: { type: [number, 'null'], minimum: 0 }
+        lastSeenAt: { type: string, format: date-time }
+        refreshedAt: { type: string, format: date-time }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        nextStop:
+          oneOf:
+            - $ref: '#/components/schemas/StopCall'
+            - type: 'null'
+        journeyReference:
+          oneOf:
+            - $ref: '#/components/schemas/VehicleJourneyReference'
+            - type: 'null'
+        monitoredCall:
+          oneOf:
+            - $ref: '#/components/schemas/MonitoredCallReference'
+            - type: 'null'
+        progressBetweenStops:
+          oneOf:
+            - $ref: '#/components/schemas/ProgressBetweenStops'
+            - type: 'null'
+        journeyVersion:
+          oneOf:
+            - $ref: '#/components/schemas/EntityVersion'
+            - type: 'null'
+        routeProgress: { type: [number, 'null'], minimum: 0, maximum: 1 }
+      additionalProperties: false
+    VehicleJourneyReference:
+      type: object
+      required: [serviceJourneyId, operatingDate, datedServiceJourneyId, originRef, originName, destinationRef, destinationName]
+      properties:
+        serviceJourneyId: { type: string, minLength: 1, maxLength: 300 }
+        operatingDate: { type: string, format: date }
+        datedServiceJourneyId: { type: [string, 'null'], maxLength: 300 }
+        originRef: { type: [string, 'null'], maxLength: 300 }
+        originName: { type: [string, 'null'], maxLength: 300 }
+        destinationRef: { type: [string, 'null'], maxLength: 300 }
+        destinationName: { type: [string, 'null'], maxLength: 300 }
+      additionalProperties: false
+    MonitoredCallReference:
+      type: object
+      required: [stopPointRef, order, vehicleAtStop]
+      properties:
+        stopPointRef: { type: [string, 'null'], maxLength: 300 }
+        order: { type: integer, minimum: 0, maximum: 999 }
+        vehicleAtStop: { type: boolean }
+      additionalProperties: false
+    ProgressBetweenStops:
+      type: object
+      required: [linkDistance, percentage]
+      properties:
+        linkDistance: { type: [number, 'null'], minimum: 0 }
+        percentage: { type: [number, 'null'], minimum: 0, maximum: 1 }
+      additionalProperties: false
+    VehicleObservation:
+      type: object
+      required: [latitude, longitude, bearing, observedAt]
+      properties:
+        latitude: { type: number, minimum: -90, maximum: 90 }
+        longitude: { type: number, minimum: -180, maximum: 180 }
+        bearing: { type: [number, 'null'], minimum: 0, maximum: 360 }
+        observedAt: { type: string, format: date-time }
+      additionalProperties: false
+    StopCall:
+      type: object
+      required: [stopPlaceId, quayId, name, order, latitude, longitude, aimedArrivalAt, expectedArrivalAt, aimedDepartureAt, expectedDepartureAt, realtime, cancellation]
+      properties:
+        stopPlaceId: { type: [string, 'null'], maxLength: 200 }
+        quayId: { type: [string, 'null'], maxLength: 200 }
+        name: { type: string, minLength: 1, maxLength: 300 }
+        order: { type: integer, minimum: 0, maximum: 999 }
+        latitude: { type: [number, 'null'], minimum: -90, maximum: 90 }
+        longitude: { type: [number, 'null'], minimum: -180, maximum: 180 }
+        aimedArrivalAt: { type: [string, 'null'], format: date-time }
+        expectedArrivalAt: { type: [string, 'null'], format: date-time }
+        aimedDepartureAt: { type: [string, 'null'], format: date-time }
+        expectedDepartureAt: { type: [string, 'null'], format: date-time }
+        realtime: { type: boolean }
+        cancellation: { type: boolean }
+      additionalProperties: false
+    JourneyRoute:
+      type: object
+      required: [type, coordinates, distanceMeters]
+      properties:
+        type: { const: LineString }
+        coordinates:
+          type: array
+          minItems: 2
+          maxItems: 20000
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            prefixItems:
+              - { type: number, minimum: -180, maximum: 180 }
+              - { type: number, minimum: -90, maximum: 90 }
+        distanceMeters: { type: [number, 'null'], minimum: 0 }
+      additionalProperties: false
+    JourneySnapshot:
+      type: object
+      required: [serviceJourneyId, operatingDate, datedServiceJourneyId, version, state, route, calls, refreshedAt, lastSuccessfulAt, warning]
+      properties:
+        serviceJourneyId: { type: string, minLength: 1, maxLength: 300 }
+        operatingDate: { type: string, format: date }
+        datedServiceJourneyId: { type: [string, 'null'], maxLength: 300 }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        state: { $ref: '#/components/schemas/SourceState' }
+        route:
+          oneOf:
+            - $ref: '#/components/schemas/JourneyRoute'
+            - type: 'null'
+        calls:
+          type: array
+          maxItems: 1000
+          items: { $ref: '#/components/schemas/StopCall' }
+        refreshedAt: { type: string, format: date-time }
+        lastSuccessfulAt: { type: [string, 'null'], format: date-time }
+        warning: { type: [string, 'null'], maxLength: 500 }
+      additionalProperties: false
+    VehicleData:
+      type: object
+      required: [vehicle, trail, journey, upcomingStops]
+      properties:
+        vehicle: { $ref: '#/components/schemas/VehicleState' }
+        trail:
+          type: array
+          maxItems: 500
+          items: { $ref: '#/components/schemas/VehicleObservation' }
+        journey:
+          oneOf:
+            - $ref: '#/components/schemas/JourneySnapshot'
+            - type: 'null'
+        upcomingStops:
+          type: array
+          maxItems: 1000
+          items: { $ref: '#/components/schemas/StopCall' }
+      allOf:
+        - if:
+            type: object
+            properties:
+              vehicle:
+                type: object
+                required: [passengerServiceState]
+                properties:
+                  passengerServiceState: { const: non_passenger }
+            required: [vehicle]
+          then:
+            type: object
+            properties:
+              journey: { type: 'null' }
+              upcomingStops: { type: array, maxItems: 0 }
+      additionalProperties: false
+    VehicleResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/VehicleData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    RealtimeTokenData:
+      type: object
+      required: [token, expiresAt, webSocketUrl, protocolVersion]
+      properties:
+        token: { type: string, minLength: 20, maxLength: 4096, writeOnly: true }
+        expiresAt: { type: string, format: date-time }
+        webSocketUrl: { type: string, format: uri, pattern: '^wss?://' }
+        protocolVersion: { const: 1 }
+      additionalProperties: false
+    RealtimeTokenResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/RealtimeTokenData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    AdminLoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, minLength: 1, maxLength: 200 }
+        password: { type: string, minLength: 1, maxLength: 1024, writeOnly: true }
+      additionalProperties: false
+    AdminDemoCredentialsData:
+      oneOf:
+        - type: object
+          required: [enabled]
+          properties:
+            enabled: { const: false }
+          additionalProperties: false
+        - type: object
+          required: [enabled, username, password]
+          properties:
+            enabled: { const: true }
+            username: { type: string, minLength: 1, maxLength: 200 }
+            password:
+              type: string
+              minLength: 1
+              maxLength: 1024
+              description: Intentionally public demo password; never the operator password.
+          additionalProperties: false
+    AdminDemoCredentialsResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminDemoCredentialsData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    AdminSessionData:
+      type: object
+      required: [authenticated, username, access, expiresAt]
+      properties:
+        authenticated: { const: true }
+        username: { type: string, minLength: 1, maxLength: 200 }
+        access:
+          type: string
+          enum: [operator, demo]
+          description: Informational session role; server-side middleware remains the authorization boundary.
+        expiresAt: { type: string, format: date-time }
+      additionalProperties: false
+    AdminSessionResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminSessionData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    MetricsSummary:
+      type: object
+      required: [activeClients, stationWatches, vehicleWatches, focusWatches, messagesPerMinute]
+      properties:
+        activeClients:
+          type: integer
+          minimum: 0
+          description: Open browser WebSocket connections reported by a fresh realtime heartbeat; zero when the heartbeat is missing or stale.
+        stationWatches: { type: integer, minimum: 0 }
+        vehicleWatches: { type: integer, minimum: 0 }
+        focusWatches: { type: integer, minimum: 0 }
+        messagesPerMinute:
+          type: number
+          minimum: 0
+          description: WebSocket messages received from browsers plus messages successfully delivered to browsers during the rolling previous 60 seconds; this is not a process-lifetime average and is zero when the realtime heartbeat is missing or stale.
+      additionalProperties: false
+    EnturBudget:
+      type: object
+      description: FjordPulse's internal rolling request-safety budget. This is not an allowance or quota reported by Entur.
+      required: [service, limit, remaining, windowSeconds, backoffUntil]
+      properties:
+        service:
+          description: The shared aggregate budget when `global`, otherwise the budget for one backend Entur adapter.
+          oneOf:
+            - { const: global }
+            - { $ref: '#/components/schemas/EnturService' }
+        limit:
+          type: integer
+          minimum: 0
+          description: Maximum outbound attempts FjordPulse permits within the rolling window.
+        remaining:
+          type: integer
+          minimum: 0
+          description: Current estimated headroom in FjordPulse's rolling window, derived from backend request history rather than an Entur response.
+        windowSeconds:
+          type: integer
+          minimum: 1
+          description: Rolling-window duration. Because the window rolls per request, it has no single reset timestamp.
+        backoffUntil:
+          type: [string, 'null']
+          format: date-time
+          description: Latest future retry time recorded for this service, or for any service on the global row; null when no recorded backoff is active.
+      additionalProperties: false
+    RealtimeEventType:
+      type: string
+      enum:
+        - station_snapshot_changed
+        - vehicle_moved
+        - vehicle_stale
+        - vehicle_lost
+    RealtimeEventRow:
+      type: object
+      required: [eventId, type, scope, entityId, version, source, payload, createdAt]
+      properties:
+        eventId: { type: string, minLength: 1, maxLength: 200 }
+        type: { $ref: '#/components/schemas/RealtimeEventType' }
+        scope: { type: string, minLength: 1, maxLength: 256 }
+        entityId: { type: string, minLength: 1, maxLength: 200 }
+        version: { $ref: '#/components/schemas/EntityVersion' }
+        source: { type: string, enum: [station_snapshot, current_vehicle] }
+        payload:
+          type: object
+          additionalProperties: true
+        createdAt: { type: string, format: date-time }
+      additionalProperties: false
+    HostResourceSnapshot:
+      type: object
+      description: Point-in-time host or container resource measurements collected by the protected backend endpoint.
+      required: [checkedAt, cpu, memory, disk]
+      properties:
+        checkedAt: { type: string, format: date-time }
+        cpu:
+          type: object
+          required: [usagePercent, load1, load5, load15, logicalCores]
+          properties:
+            usagePercent: { type: [number, 'null'], minimum: 0, maximum: 100 }
+            load1: { type: [number, 'null'], minimum: 0 }
+            load5: { type: [number, 'null'], minimum: 0 }
+            load15: { type: [number, 'null'], minimum: 0 }
+            logicalCores: { type: [integer, 'null'], minimum: 1 }
+          additionalProperties: false
+        memory:
+          type: object
+          required: [totalBytes, availableBytes, usedBytes, usedPercent, scope]
+          properties:
+            totalBytes: { type: [integer, 'null'], minimum: 0 }
+            availableBytes: { type: [integer, 'null'], minimum: 0 }
+            usedBytes: { type: [integer, 'null'], minimum: 0 }
+            usedPercent: { type: [number, 'null'], minimum: 0, maximum: 100 }
+            scope: { type: string, enum: [host, cgroup] }
+          additionalProperties: false
+        disk:
+          type: object
+          required: [path, totalBytes, freeBytes, usedBytes, usedPercent]
+          properties:
+            path: { type: string, minLength: 1, maxLength: 4096 }
+            totalBytes: { type: [integer, 'null'], minimum: 0 }
+            freeBytes: { type: [integer, 'null'], minimum: 0 }
+            usedBytes: { type: [integer, 'null'], minimum: 0 }
+            usedPercent: { type: [number, 'null'], minimum: 0, maximum: 100 }
+          additionalProperties: false
+      additionalProperties: false
+    AdminStatusData:
+      type: object
+      required: [build, database, resources, services, metrics, dataCounts, stationImport, enturBudgets, recentEvents]
+      properties:
+        build:
+          type: object
+          required: [version, environment, dataMode]
+          properties:
+            version: { type: string, minLength: 1, maxLength: 128 }
+            environment: { type: string, enum: [local, development, test, staging, production] }
+            dataMode: { type: string, enum: [fake, real] }
+          additionalProperties: false
+        database:
+          type: object
+          description: Protected, credential-free identity of the configured authoritative database target.
+          required: [engine, endpointOrigin, namespace, name, warning]
+          properties:
+            engine: { type: string, const: surrealdb }
+            endpointOrigin:
+              type: string
+              format: uri
+              pattern: '^wss?://[^/@?#]+$'
+              maxLength: 512
+              description: WebSocket origin only; credentials, RPC path, query, and fragment are omitted.
+            namespace: { type: string, minLength: 1, maxLength: 200 }
+            name: { type: string, minLength: 1, maxLength: 200 }
+            warning:
+              type: [string, 'null']
+              maxLength: 500
+              description: Configuration warning, including staging or production loopback targets, or null.
+          additionalProperties: false
+        resources: { $ref: '#/components/schemas/HostResourceSnapshot' }
+        services:
+          type: object
+          required: [backend, realtime, surrealdb, entur, liveQueryBridge, mapTiles]
+          properties:
+            backend: { $ref: '#/components/schemas/ServiceHealth' }
+            realtime: { $ref: '#/components/schemas/ServiceHealth' }
+            surrealdb: { $ref: '#/components/schemas/ServiceHealth' }
+            entur: { $ref: '#/components/schemas/ServiceHealth' }
+            liveQueryBridge: { $ref: '#/components/schemas/ServiceHealth' }
+            mapTiles: { $ref: '#/components/schemas/ServiceHealth' }
+          additionalProperties: false
+        metrics: { $ref: '#/components/schemas/MetricsSummary' }
+        dataCounts:
+          type: object
+          required: [stations, stationSnapshots, stationTimetables, currentVehicles, journeySnapshots, vehicleObservations, watches, realtimeEvents, enturRequestLogs]
+          properties:
+            stations: { type: integer, minimum: 0 }
+            stationSnapshots: { type: integer, minimum: 0 }
+            stationTimetables: { type: integer, minimum: 0 }
+            currentVehicles: { type: integer, minimum: 0 }
+            journeySnapshots: { type: integer, minimum: 0 }
+            vehicleObservations: { type: integer, minimum: 0 }
+            watches: { type: integer, minimum: 0 }
+            realtimeEvents: { type: integer, minimum: 0 }
+            enturRequestLogs: { type: integer, minimum: 0 }
+          additionalProperties: false
+        stationImport:
+          type: object
+          required: [count, lastImportedAt, sourceVersion]
+          properties:
+            count: { type: integer, minimum: 0 }
+            lastImportedAt: { type: [string, 'null'], format: date-time }
+            sourceVersion: { type: [string, 'null'], maxLength: 200 }
+          additionalProperties: false
+        enturBudgets:
+          type: array
+          description: The global rolling budget followed by the four service-specific rolling budgets enforced by FjordPulse.
+          minItems: 5
+          maxItems: 5
+          items: { $ref: '#/components/schemas/EnturBudget' }
+        recentEvents:
+          type: array
+          description: Bounded compatibility field retained for admin consumers; `/api/admin/events` is the authoritative detailed event log and System status does not render this preview.
+          maxItems: 5
+          items: { $ref: '#/components/schemas/RealtimeEventRow' }
+      additionalProperties: false
+    AdminStatusResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminStatusData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    WatchType:
+      type: string
+      enum: [station, vehicle, focus]
+    WatchState:
+      type: string
+      enum: [active, stale, backoff, failed, expired]
+    WatchPriority:
+      type: string
+      enum: [background, station, selected_vehicle, focus]
+    WatchRow:
+      type: object
+      required: [id, type, scope, entityId, clientCount, priority, state, lastRefreshAt, nextRefreshAt, expiresAt]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 200 }
+        type: { $ref: '#/components/schemas/WatchType' }
+        scope: { type: string, minLength: 1, maxLength: 256 }
+        entityId: { type: string, minLength: 1, maxLength: 200 }
+        clientCount: { type: integer, minimum: 0 }
+        priority: { $ref: '#/components/schemas/WatchPriority' }
+        state: { $ref: '#/components/schemas/WatchState' }
+        lastRefreshAt: { type: [string, 'null'], format: date-time }
+        nextRefreshAt: { type: [string, 'null'], format: date-time }
+        expiresAt: { type: string, format: date-time }
+        lastErrorCode: { type: [string, 'null'], maxLength: 100 }
+      additionalProperties: false
+    AdminWatchesData:
+      type: object
+      required: [summary, watches]
+      properties:
+        summary:
+          type: object
+          required: [total, focus, expiringSoon, failed]
+          properties:
+            total: { type: integer, minimum: 0 }
+            focus: { type: integer, minimum: 0 }
+            expiringSoon: { type: integer, minimum: 0 }
+            failed: { type: integer, minimum: 0 }
+          additionalProperties: false
+        watches:
+          type: array
+          items: { $ref: '#/components/schemas/WatchRow' }
+      additionalProperties: false
+    AdminWatchesResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminWatchesData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    EnturService:
+      type: string
+      enum: [stop_place_register, geocoder, journey_planner, vehicle_positions]
+    EnturOutcome:
+      type: string
+      enum: [success, cache_hit, skipped_budget, rate_limited, backoff, timeout, error]
+    CacheStatus:
+      type: string
+      enum: [hit, miss, bypassed, stale]
+    EnturLogRow:
+      type: object
+      required: [id, requestedAt, service, scope, outcome, httpStatus, latencyMs, itemCount, cache, retryAt, requestId]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 200 }
+        requestedAt: { type: string, format: date-time }
+        service: { $ref: '#/components/schemas/EnturService' }
+        scope: { type: string, minLength: 1, maxLength: 256 }
+        outcome: { $ref: '#/components/schemas/EnturOutcome' }
+        httpStatus: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        latencyMs: { type: [number, 'null'], minimum: 0 }
+        itemCount: { type: [integer, 'null'], minimum: 0 }
+        cache: { $ref: '#/components/schemas/CacheStatus' }
+        retryAt: { type: [string, 'null'], format: date-time }
+        requestId: { $ref: '#/components/schemas/RequestId' }
+        errorCode: { type: [string, 'null'], maxLength: 100 }
+      additionalProperties: false
+    AdminEnturLogData:
+      type: object
+      required: [metrics, entries]
+      properties:
+        metrics:
+          type: object
+          required: [requestsPerMinute, cacheHitRate, p95LatencyMs, inBackoff]
+          properties:
+            requestsPerMinute:
+              type: number
+              minimum: 0
+              description: Actual outbound Entur transport attempts recorded during the previous 60 seconds from a separately database-filtered sample; cache hits and calls skipped by FjordPulse's internal budget or active backoff are excluded.
+            cacheHitRate:
+              type: number
+              minimum: 0
+              maximum: 1
+              description: Cache-hit share among up to 1,000 matching rows in the server metric sample, before the display-entry limit is applied.
+            p95LatencyMs:
+              type: [number, 'null']
+              minimum: 0
+              description: Nearest-rank p95 latency among up to 1,000 actual outbound Entur attempts matching the server filters; null when there were none.
+            inBackoff:
+              type: boolean
+              description: True only while at least one matching database log row has a retry deadline later than the response time.
+          additionalProperties: false
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/EnturLogRow' }
+      additionalProperties: false
+    AdminEnturLogResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminEnturLogData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    AdminRealtimeData:
+      type: object
+      required: [server, liveQueryBridge, activeClients, rooms, messagesPerMinute, reconnectCount, failureCount, lastBroadcastAt]
+      properties:
+        server: { $ref: '#/components/schemas/ServiceHealth' }
+        liveQueryBridge: { $ref: '#/components/schemas/ServiceHealth' }
+        activeClients:
+          type: integer
+          minimum: 0
+          description: Open browser WebSocket connections reported by a fresh realtime heartbeat; zero when the heartbeat is missing or stale.
+        rooms:
+          type: array
+          items:
+            type: object
+            required: [scope, clientCount]
+            properties:
+              scope: { type: string, minLength: 1, maxLength: 256 }
+              clientCount: { type: integer, minimum: 0 }
+            additionalProperties: false
+        messagesPerMinute:
+          type: number
+          minimum: 0
+          description: WebSocket messages received from browsers plus messages successfully delivered to browsers during the rolling previous 60 seconds; zero when the realtime heartbeat is missing or stale.
+        reconnectCount:
+          type: integer
+          minimum: 0
+          description: Successful SurrealDB live-query bridge recoveries since the realtime process started; this is not a browser reconnect count and is zero when the heartbeat is missing or stale.
+        failureCount:
+          type: integer
+          minimum: 0
+          description: Live-query bridge failures plus failed WebSocket deliveries since the realtime process started; zero when the heartbeat is missing or stale.
+        lastBroadcastAt:
+          type: [string, 'null']
+          format: date-time
+          description: Time of the latest room or all-client broadcast delivered to at least one browser; null when no broadcast has reached a browser in this process or the heartbeat is missing or stale.
+      additionalProperties: false
+    AdminRealtimeResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminRealtimeData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    AdminEventsData:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/RealtimeEventRow' }
+      additionalProperties: false
+    AdminEventsResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminEventsData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    DatabasePermissionMode:
+      type: string
+      description: |
+        Normalized permission meaning. `conditional` indicates that SurrealDB
+        has an expression which is intentionally not evaluated by the browser.
+      enum: [full, none, conditional]
+    DatabaseTablePermissions:
+      type: object
+      required: [select, create, update, delete]
+      properties:
+        select: { $ref: '#/components/schemas/DatabasePermissionMode' }
+        create: { $ref: '#/components/schemas/DatabasePermissionMode' }
+        update: { $ref: '#/components/schemas/DatabasePermissionMode' }
+        delete: { $ref: '#/components/schemas/DatabasePermissionMode' }
+      additionalProperties: false
+    DatabaseFieldPermissions:
+      type: object
+      required: [select, create, update]
+      properties:
+        select: { $ref: '#/components/schemas/DatabasePermissionMode' }
+        create: { $ref: '#/components/schemas/DatabasePermissionMode' }
+        update: { $ref: '#/components/schemas/DatabasePermissionMode' }
+      additionalProperties: false
+    DatabaseSchemaField:
+      type: object
+      required: [name, type, readonly, assertion, defaultValue, computedValue, valueExpression, referenceOnDelete, permissions]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 300 }
+        type: { type: string, minLength: 1, maxLength: 1000 }
+        readonly: { type: boolean }
+        assertion: { type: [string, 'null'], maxLength: 10000 }
+        defaultValue: { type: [string, 'null'], maxLength: 10000 }
+        computedValue: { type: [string, 'null'], maxLength: 10000 }
+        valueExpression: { type: [string, 'null'], maxLength: 10000 }
+        referenceOnDelete: { type: [string, 'null'], maxLength: 100 }
+        permissions: { $ref: '#/components/schemas/DatabaseFieldPermissions' }
+      additionalProperties: false
+    DatabaseSchemaIndex:
+      type: object
+      required: [name, fields, unique, mode]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 300 }
+        fields:
+          type: array
+          items: { type: string, minLength: 1, maxLength: 300 }
+        unique: { type: boolean }
+        mode: { type: [string, 'null'], maxLength: 1000 }
+      additionalProperties: false
+    DatabaseSchemaEvent:
+      type: object
+      required: [name, condition, actions]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 300 }
+        condition: { type: [string, 'null'], maxLength: 20000 }
+        actions:
+          type: array
+          items: { type: string, minLength: 1, maxLength: 20000 }
+      additionalProperties: false
+    DatabaseSchemaTable:
+      type: object
+      required: [name, kind, schemaMode, permissions, fields, indexes, events]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 300 }
+        kind:
+          type: string
+          enum: [normal, relation, any]
+        schemaMode:
+          type: string
+          enum: [schemafull, schemaless]
+        permissions: { $ref: '#/components/schemas/DatabaseTablePermissions' }
+        fields:
+          type: array
+          items: { $ref: '#/components/schemas/DatabaseSchemaField' }
+        indexes:
+          type: array
+          items: { $ref: '#/components/schemas/DatabaseSchemaIndex' }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/DatabaseSchemaEvent' }
+      additionalProperties: false
+    AdminDatabaseSchemaData:
+      type: object
+      required: [readOnly, checkedAt, tables]
+      properties:
+        readOnly: { const: true }
+        checkedAt: { type: string, format: date-time }
+        tables:
+          type: array
+          items: { $ref: '#/components/schemas/DatabaseSchemaTable' }
+      additionalProperties: false
+    AdminDatabaseSchemaResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminDatabaseSchemaData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    DatabaseMigrationState:
+      type: string
+      enum: [applied, pending, checksum_mismatch, orphaned, failed]
+    DatabaseMigrationCompatibilityState:
+      type: string
+      enum: [in_sync, pending, drift, failed]
+    DatabaseMigrationAffectedObject:
+      type: object
+      required: [kind, name, table, operation]
+      properties:
+        kind:
+          type: string
+          enum: [table, field, index, event]
+        name: { type: string, minLength: 1, maxLength: 300 }
+        table: { type: [string, 'null'], minLength: 1, maxLength: 300 }
+        operation:
+          type: string
+          enum: [define, remove, rebuild]
+      additionalProperties: false
+    DatabaseMigration:
+      type: object
+      required:
+        - name
+        - description
+        - state
+        - releaseChecksum
+        - databaseChecksum
+        - appliedAt
+        - lastAttemptedAt
+        - failureMessage
+        - source
+        - affectedObjects
+      properties:
+        name: { type: string, minLength: 1, maxLength: 300 }
+        description: { type: string, maxLength: 2000 }
+        state: { $ref: '#/components/schemas/DatabaseMigrationState' }
+        releaseChecksum: { type: [string, 'null'], minLength: 1, maxLength: 128 }
+        databaseChecksum: { type: [string, 'null'], minLength: 1, maxLength: 128 }
+        appliedAt: { type: [string, 'null'], format: date-time }
+        lastAttemptedAt: { type: [string, 'null'], format: date-time }
+        failureMessage: { type: [string, 'null'], maxLength: 2000 }
+        source:
+          type: [string, 'null']
+          maxLength: 250000
+          description: Read-only content of the discovered bundled release migration; never an arbitrary filesystem path.
+        affectedObjects:
+          type: array
+          items: { $ref: '#/components/schemas/DatabaseMigrationAffectedObject' }
+      additionalProperties: false
+    DatabaseMigrationCounts:
+      type: object
+      required: [applied, pending, checksumMismatch, orphaned, failed]
+      properties:
+        applied: { type: integer, minimum: 0 }
+        pending: { type: integer, minimum: 0 }
+        checksumMismatch: { type: integer, minimum: 0 }
+        orphaned: { type: integer, minimum: 0 }
+        failed: { type: integer, minimum: 0 }
+      additionalProperties: false
+    AdminDatabaseMigrationsData:
+      type: object
+      required: [readOnly, checkedAt, state, counts, lastAppliedAt, migrations]
+      properties:
+        readOnly: { const: true }
+        checkedAt: { type: string, format: date-time }
+        state: { $ref: '#/components/schemas/DatabaseMigrationCompatibilityState' }
+        counts: { $ref: '#/components/schemas/DatabaseMigrationCounts' }
+        lastAppliedAt: { type: [string, 'null'], format: date-time }
+        migrations:
+          type: array
+          items: { $ref: '#/components/schemas/DatabaseMigration' }
+      additionalProperties: false
+    AdminDatabaseMigrationsResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/AdminDatabaseMigrationsData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    DevScenario:
+      type: string
+      enum:
+        - normal
+        - station_empty
+        - station_stale
+        - station_error
+        - vehicle_live
+        - vehicle_stale
+        - vehicle_lost
+        - fallback
+        - entur_backoff
+        - realtime_reconnect
+    DevScenarioData:
+      type: object
+      required: [scenario, activatedAt]
+      properties:
+        scenario: { $ref: '#/components/schemas/DevScenario' }
+        activatedAt: { type: string, format: date-time }
+      additionalProperties: false
+    DevScenarioResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/DevScenarioData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false
+    DevScenariosData:
+      type: object
+      required: [scenarios]
+      properties:
+        scenarios:
+          type: array
+          minItems: 10
+          maxItems: 10
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/DevScenario' }
+      additionalProperties: false
+    DevScenariosResponse:
+      type: object
+      required: [ok, data, meta]
+      properties:
+        ok: { const: true }
+        data: { $ref: '#/components/schemas/DevScenariosData' }
+        meta: { $ref: '#/components/schemas/SuccessMeta' }
+      additionalProperties: false

@@ -12,7 +12,7 @@ use boon_persistence::{
     DurableContentArtifactChange, InMemoryDriver, MigrationPreview, OutboxInspectorState,
     PersistenceInspectorSnapshot, PersistenceWorkerConfig, PersistenceWorkerStatus, RedbDriver,
 };
-use boon_plan::{ApplicationIdentity, ApplicationPlan, MachinePlan, MemoryKind};
+use boon_plan::{ApplicationIdentity, ApplicationPlan, FiniteReal, MachinePlan, MemoryKind};
 use boon_runtime::{
     DocumentPatch, DocumentPatchStatus, DurabilityTicket, FileEffectDriver, HostEffectRouter,
     HostEffectWorker, LiveRuntime, PersistentDispatchError, PersistentRuntime,
@@ -3834,19 +3834,25 @@ fn pointer_source_payload(pointer: &boon_host::PointerEvent, target: &HitTarget)
         let local_y = (pointer.y - target.bounds_y).clamp(0.0, target.bounds_height);
         payload.fields.insert(
             "pointer_x".to_owned(),
-            Value::Number(local_x.round() as i64),
+            Value::Number(FiniteReal::new(f64::from(local_x.round())).expect("finite pointer x")),
         );
         payload.fields.insert(
             "pointer_y".to_owned(),
-            Value::Number(local_y.round() as i64),
+            Value::Number(FiniteReal::new(f64::from(local_y.round())).expect("finite pointer y")),
         );
         payload.fields.insert(
             "pointer_width".to_owned(),
-            Value::Number(target.bounds_width.round() as i64),
+            Value::Number(
+                FiniteReal::new(f64::from(target.bounds_width.round()))
+                    .expect("finite pointer width"),
+            ),
         );
         payload.fields.insert(
             "pointer_height".to_owned(),
-            Value::Number(target.bounds_height.round() as i64),
+            Value::Number(
+                FiniteReal::new(f64::from(target.bounds_height.round()))
+                    .expect("finite pointer height"),
+            ),
         );
     }
     payload
@@ -3910,7 +3916,9 @@ fn rejected_program_payload(diagnostic: &ProgramDiagnostic) -> SourcePayload {
 fn style_payload_value(value: &StyleValue) -> Option<Value> {
     match value {
         StyleValue::Text(value) => Some(Value::Text(value.clone())),
-        StyleValue::Number(value) if value.is_finite() => Some(Value::Number(*value as i64)),
+        StyleValue::Number(value) if value.is_finite() => {
+            FiniteReal::new(*value).ok().map(Value::Number)
+        }
         StyleValue::Number(_) => None,
         StyleValue::Bool(value) => Some(Value::Bool(*value)),
         StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => None,

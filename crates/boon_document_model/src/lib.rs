@@ -5,6 +5,10 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::ops::Range;
 
+mod map;
+
+pub use map::*;
+
 pub const SENSITIVE_INPUT_STYLE_KEY: &str = "sensitive";
 pub const SENSITIVE_INPUT_REDACTED_VALUE: &str = "redacted";
 pub const SENSITIVE_INPUT_REDACTED_GLYPHS: &str = "••••••••";
@@ -18,7 +22,15 @@ macro_rules! string_ids {
     };
 }
 
-string_ids!(DocumentNodeId, SourceBindingId, ScrollRootId, TextInputId);
+string_ids!(
+    DocumentNodeId,
+    SourceBindingId,
+    ScrollRootId,
+    TextInputId,
+    MapOverlayId,
+    MapHitIdentity,
+    MapTileSourceId,
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
@@ -40,6 +52,7 @@ pub enum DocumentNodeKind {
     TextInput,
     EmbeddedProgram,
     EmbeddedMedia,
+    MapViewport,
     Table,
     TableCell,
     ScrollRoot,
@@ -50,12 +63,14 @@ pub enum DocumentNodeKind {
 pub enum ProgramCapabilityProfile {
     #[default]
     PublicDocument,
+    TrustedServer,
 }
 
 impl ProgramCapabilityProfile {
     pub fn name(self) -> &'static str {
         match self {
             Self::PublicDocument => "public_document",
+            Self::TrustedServer => "trusted_server",
         }
     }
 }
@@ -406,6 +421,8 @@ pub struct DocumentNode {
     pub text: Option<TextValue>,
     pub style: StyleMap,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map_viewport: Option<Box<MapViewportDescriptor>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedded_program: Option<EmbeddedProgramDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_bindings: Vec<SourceBinding>,
@@ -428,6 +445,7 @@ impl DocumentNode {
             children: Vec::new(),
             text: None,
             style: StyleMap::new(),
+            map_viewport: None,
             embedded_program,
             source_bindings: Vec::new(),
             text_input_id: None,
@@ -522,6 +540,7 @@ impl Debug for DocumentNode {
             .field("children", &self.children)
             .field("text", &self.artifact_text())
             .field("style", &self.artifact_style())
+            .field("map_viewport", &self.map_viewport)
             .field("embedded_program", &self.embedded_program)
             .field("source_bindings", &self.source_bindings)
             .field("text_input_id", &self.text_input_id)
@@ -546,6 +565,8 @@ impl Serialize for DocumentNode {
             text: Option<Cow<'a, TextValue>>,
             style: Cow<'a, StyleMap>,
             #[serde(skip_serializing_if = "Option::is_none")]
+            map_viewport: &'a Option<Box<MapViewportDescriptor>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
             embedded_program: &'a Option<EmbeddedProgramDescriptor>,
             #[serde(default, skip_serializing_if = "<[SourceBinding]>::is_empty")]
             source_bindings: &'a [SourceBinding],
@@ -564,6 +585,7 @@ impl Serialize for DocumentNode {
             children: &self.children,
             text: self.artifact_text(),
             style: self.artifact_style(),
+            map_viewport: &self.map_viewport,
             embedded_program: &self.embedded_program,
             source_bindings: &self.source_bindings,
             text_input_id: &self.text_input_id,
@@ -586,6 +608,7 @@ fn style_flag(style: &StyleMap, key: &str) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum DocumentPatch {
     UpsertNode(DocumentNode),
     RemoveNode {

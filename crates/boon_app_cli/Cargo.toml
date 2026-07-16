@@ -1,0 +1,14 @@
+[package]
+name = "boon_app_cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "boon-app"
+path = "src/main.rs"
+
+[dependencies]
+boon_app_package = { workspace = true, features = ["build"] }
+boon_plan.workspace = true

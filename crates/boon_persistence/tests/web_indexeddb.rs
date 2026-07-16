@@ -20,6 +20,10 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 static NEXT_DATABASE_ID: AtomicU32 = AtomicU32::new(0);
 
+fn number(value: i64) -> StoredValue {
+    StoredValue::integer(value).unwrap()
+}
+
 fn application() -> ApplicationIdentity {
     ApplicationIdentity::new("dev.boon.web-test", "sparse", "browser")
 }
@@ -101,7 +105,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
         EffectInvocationId::from_semantic_route(effect, "browser/source", "browser/target")
             .unwrap();
     let outbox_key = StoredValue::Text("browser-key".to_owned());
-    let outbox_intent = StoredValue::Number(7);
+    let outbox_intent = number(7);
     let outbox_item = DurableOutboxItem::pending(
         invocation,
         effect,
@@ -214,7 +218,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
                 row_key: 0,
                 row_generation: 1,
                 field_id: payload_field,
-                value: StoredValue::Number(9),
+                value: number(9),
             },
             DurableChange::InsertRow {
                 memory_id: list_memory,
@@ -249,7 +253,7 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
     let retained_row = StoredRow {
         key: 0,
         generation: 1,
-        fields: BTreeMap::from([(payload_field, StoredValue::Number(9))]),
+        fields: BTreeMap::from([(payload_field, number(9))]),
         touched_fields: BTreeSet::from([payload_field]),
     };
     let third = CheckpointBatch {

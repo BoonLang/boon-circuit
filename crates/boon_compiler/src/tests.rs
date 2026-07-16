@@ -1,5 +1,312 @@
 use super::*;
+use boon_plan::{
+    HostPortPlan, PlanListProjection, PlanQuerySelection, QueryKeyType, QueryTextNormalization,
+    SourcePayloadField,
+};
 use std::collections::BTreeSet;
+
+const INDEXED_PREFIX_QUERY_SOURCE: &str = r#"
+store: [
+    change: SOURCE
+    prefix:
+        TEXT { al } |> HOLD prefix {
+            change.text |> THEN { change.text }
+        }
+    catalog: LIST {
+        [id: TEXT { 1 }, name: TEXT { Alpha }]
+        [id: TEXT { 2 }, name: TEXT { Alpine }]
+        [id: TEXT { 3 }, name: TEXT { Beta }]
+    }
+    results:
+        List/query_prefix(
+            catalog
+            field: name
+            prefix: prefix
+            limit: 20
+            normalization: TrimLowercase
+        )
+]
+"#;
+
+const GENERIC_COMPOUND_QUERY_SOURCE: &str = r#"
+store: [
+    catalog: LIST {
+        [id: TEXT { 1 }, city: TEXT { Oslo }, name: TEXT { Alpha }, score: 10]
+        [id: TEXT { 2 }, city: TEXT { Oslo }, name: TEXT { Beta }, score: 20]
+        [id: TEXT { 3 }, city: TEXT { Bergen }, name: TEXT { Alpha }, score: 30]
+    }
+    exact_key: [city: TEXT { OSLO }, name: TEXT { alpha }]
+    exact_page:
+        List/query(
+            catalog
+            fields: TEXT { city,name }
+            normalization: TEXT { TrimLowercase,TrimLowercase }
+            select: Exact
+            key: exact_key
+            limit: 2
+            unique: False
+            order: Ascending
+            residual: None
+        )
+]
+"#;
+
+const GENERIC_NUMBER_AND_TAG_QUERY_SOURCE: &str = r#"
+store: [
+    catalog: LIST {
+        [id: TEXT { 1 }, score: 10, kind: Featured]
+        [id: TEXT { 2 }, score: 20, kind: Ordinary]
+        [id: TEXT { 3 }, score: 30, kind: Featured]
+    }
+    lower: 10
+    upper: 25
+    score_page:
+        List/query(
+            catalog
+            fields: TEXT { score }
+            normalization: TEXT { Exact }
+            select: Range
+            lower: lower
+            upper: upper
+            lower_inclusive: True
+            upper_inclusive: False
+            limit: 10
+            order: Descending
+            residual: None
+        )
+    kind: Featured
+    kind_page:
+        List/query(
+            catalog
+            fields: TEXT { kind }
+            normalization: TEXT { Exact }
+            select: Exact
+            key: kind
+            limit: 10
+            order: Ascending
+            residual: None
+        )
+]
+"#;
+
+#[test]
+fn compiler_owns_typed_prefix_query_index_plan() {
+    let compiled = compile_source_text_to_machine_plan(
+        "indexed-prefix-query.bn",
+        INDEXED_PREFIX_QUERY_SOURCE,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert_eq!(
+        compiled.plan.query_indexes.len(),
+        1,
+        "unresolved: {:#?}",
+        compiled.plan.debug_map.unresolved_executable_refs
+    );
+    let index = &compiled.plan.query_indexes[0];
+    assert_eq!(index.source_semantic_path, "catalog");
+    assert_eq!(index.fields[0].semantic_path, "catalog.name");
+    assert_eq!(
+        index.fields[0].normalization,
+        QueryTextNormalization::TrimLowercase
+    );
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .any(|op| matches!(
+                &op.kind,
+                PlanOpKind::ListProjection {
+                    projection: PlanListProjection::TextPrefix {
+                        index: query_index,
+                        limit: 20,
+                        ..
+                    }
+                } if query_index == &index.id
+            ))
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+}
+
+#[test]
+fn compiler_owns_generic_compound_query_and_page_contract() {
+    let compiled = compile_source_text_to_machine_plan(
+        "generic-compound-query.bn",
+        GENERIC_COMPOUND_QUERY_SOURCE,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(
+        compiled.ir.typecheck_report.diagnostics.is_empty(),
+        "{:#?}",
+        compiled.ir.typecheck_report.diagnostics
+    );
+    let [index] = compiled.plan.query_indexes.as_slice() else {
+        panic!(
+            "expected one canonical compound index, got {:?}; unresolved={:?}",
+            compiled.plan.query_indexes, compiled.plan.debug_map.unresolved_executable_refs
+        );
+    };
+    assert_eq!(index.fields.len(), 2);
+    assert!(
+        index
+            .fields
+            .iter()
+            .all(|field| field.key_type == QueryKeyType::Text)
+    );
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    PlanOpKind::ListProjection {
+                        projection: PlanListProjection::IndexedQuery {
+                            selection: PlanQuerySelection::Exact { .. },
+                            limit: 2,
+                            ..
+                        }
+                    }
+                )
+            })
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+}
+
+#[test]
+fn compiler_owns_number_range_and_tag_exact_indexes() {
+    let compiled = compile_source_text_to_machine_plan(
+        "generic-number-tag-query.bn",
+        GENERIC_NUMBER_AND_TAG_QUERY_SOURCE,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(
+        compiled.ir.typecheck_report.diagnostics.is_empty(),
+        "{:#?}",
+        compiled.ir.typecheck_report.diagnostics
+    );
+    assert_eq!(
+        compiled
+            .plan
+            .query_indexes
+            .iter()
+            .flat_map(|index| index.fields.iter().map(|field| field.key_type))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([QueryKeyType::Number, QueryKeyType::Tag])
+    );
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    PlanOpKind::ListProjection {
+                        projection: PlanListProjection::IndexedQuery {
+                            selection: PlanQuerySelection::Range { .. },
+                            ..
+                        }
+                    }
+                )
+            })
+    );
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+}
+
+#[test]
+fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
+    let compiled = compile_source_path_to_machine_plan(
+        std::path::Path::new("examples/outbound_http_effect.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let empty = BTreeSet::new();
+    let unsupported = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter(|op| {
+            !boon_plan::cpu_plan_executor_supports_whole_plan_op(
+                &compiled.plan.storage_layout.scalar_slots,
+                &compiled.plan.storage_layout.list_slots,
+                &compiled.plan.constants,
+                op,
+                &empty,
+                &empty,
+                &empty,
+            )
+        })
+        .map(|op| (op.id, op.kind.clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        compiled.plan.capability_summary.cpu_plan_executor_complete,
+        "outbound HTTP fixture has unsupported ops: {unsupported:#?}"
+    );
+    assert!(compiled.plan.persistence.effect_outbox.is_empty());
+    let [contract] = compiled.plan.effects.as_slice() else {
+        panic!("expected one outbound HTTP contract");
+    };
+    assert_eq!(contract.host_operation, "Http/request");
+    assert_eq!(contract.replay, EffectReplay::ReadOnly);
+    assert_eq!(contract.barrier, EffectBarrier::None);
+    let schema = contract.schema.as_ref().unwrap();
+    assert!(matches!(
+        &schema.intent_type,
+        DataTypePlan::Record { fields, open: false }
+            if fields.iter().any(|field| {
+                field.name == "headers"
+                    && matches!(field.data_type, DataTypePlan::List { .. })
+            })
+    ));
+    let invocation = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                effect: Some(effect),
+                ..
+            } if effect.effect_id == contract.effect_id => Some(effect),
+            _ => None,
+        })
+        .expect("typed outbound invocation");
+    let EffectResultRoute::CorrelatedSources { variants } = &invocation.result else {
+        panic!("outbound completion must route through typed source IDs");
+    };
+    assert_eq!(variants.len(), 2);
+    assert!(variants.iter().all(|route| {
+        compiled
+            .plan
+            .source_routes
+            .iter()
+            .any(|source| source.source_id == route.source_id)
+    }));
+    let verification = verify_plan(&compiled.plan).unwrap();
+    assert_eq!(
+        verification.status,
+        "pass",
+        "failed plan checks: {:#?}",
+        verification
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .collect::<Vec<_>>()
+    );
+}
 
 #[test]
 fn compiler_diagnostic_columns_match_editor_grapheme_positions() {
@@ -133,10 +440,10 @@ store: [
         .expect("typed input source route");
     assert!(route.payload_schema.typed_fields.iter().any(|descriptor| {
         matches!(
-            (&descriptor.field, descriptor.value_type),
+            (&descriptor.field, &descriptor.data_type),
             (
                 boon_plan::SourcePayloadField::Named(name),
-                boon_plan::SourcePayloadValueType::Text
+                boon_plan::DataTypePlan::Text
             ) if name == "amount"
         )
     }));
@@ -283,7 +590,7 @@ fn compile_migration_fixture_chain(
 }
 
 #[test]
-fn compiler_emits_machine_plan_v3_as_its_only_output() {
+fn compiler_emits_machine_plan_v4_as_its_only_output() {
     let compiled = compile_source_text_to_machine_plan(
         "examples/bytes_length_plan_ops.bn",
         include_str!("../../../examples/bytes_length_plan_ops.bn"),
@@ -351,6 +658,7 @@ fn compiler_lowers_typed_output_roots_into_the_generic_registry() {
     )
     .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
+    assert_eq!(compiled.plan.program_role, ProgramRole::Document);
 
     assert_eq!(compiled.plan.outputs.len(), 1);
     assert_eq!(compiled.plan.outputs[0].name, "document");
@@ -387,6 +695,7 @@ fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
     .unwrap();
 
     assert!(compiled.plan.document.is_none());
+    assert_eq!(compiled.plan.program_role, ProgramRole::Server);
     assert_eq!(
         compiled
             .plan
@@ -422,6 +731,52 @@ fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
             value: ValueRef::Field(_)
         }
     ));
+    let [
+        HostPortPlan::HttpServer {
+            request_source,
+            disconnect_source,
+            response_output,
+        },
+    ] = compiled.plan.host_ports.as_slice()
+    else {
+        panic!("server fixture must lower one typed HTTP host port");
+    };
+    assert_eq!(disconnect_source, &None);
+    let request_route = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.source_id == *request_source)
+        .unwrap();
+    assert_eq!(request_route.path, "store.request_received");
+    assert!(
+        request_route
+            .payload_schema
+            .typed_fields
+            .iter()
+            .any(|field| {
+                field.field == SourcePayloadField::Named("path_segments".to_owned())
+                    && matches!(
+                        &field.data_type,
+                        DataTypePlan::List { item } if item.as_ref() == &DataTypePlan::Text
+                    )
+            })
+    );
+    assert!(
+        request_route
+            .payload_schema
+            .typed_fields
+            .iter()
+            .any(|field| {
+                field.field == SourcePayloadField::Named("query".to_owned())
+                    && matches!(
+                        &field.data_type,
+                        DataTypePlan::List { item }
+                            if matches!(item.as_ref(), DataTypePlan::Record { open: false, .. })
+                    )
+            })
+    );
+    assert_eq!(*response_output, response.id);
     let verification = verify_plan(&compiled.plan).unwrap();
     let failures = verification
         .checks
@@ -431,6 +786,217 @@ fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
     assert!(
         failures.is_empty(),
         "non-visual output plan must be closed and executable: {failures:?}"
+    );
+    assert!(
+        verification
+            .checks
+            .iter()
+            .any(|check| check.id == "host-ports-typed-and-resolved" && check.pass)
+    );
+}
+
+#[test]
+fn compiler_executes_recursive_http_payload_list_get() {
+    let compiled = compile_source_text_to_machine_plan(
+        "server-http-echo.bn",
+        include_str!("../../../examples/server_http_echo.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let empty = BTreeSet::new();
+    let unsupported = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter(|op| {
+            !boon_plan::cpu_plan_executor_supports_whole_plan_op(
+                &compiled.plan.storage_layout.scalar_slots,
+                &compiled.plan.storage_layout.list_slots,
+                &compiled.plan.constants,
+                op,
+                &empty,
+                &empty,
+                &empty,
+            )
+        })
+        .map(|op| (op.id, op.kind.clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        compiled.plan.capability_summary.cpu_plan_executor_complete,
+        "recursive HTTP payload plan has unsupported ops: {unsupported:#?}"
+    );
+}
+
+#[test]
+fn compiler_preserves_multiline_list_arguments_in_source_event_transforms() {
+    let compiled = compile_source_text_to_machine_plan(
+        "http-query-list-pipeline.bn",
+        r#"
+store: [
+    request: SOURCE
+    joined:
+        LATEST {
+            request.method |> THEN {
+                request.query
+                    |> List/filter_field_equal(
+                        field: "name"
+                        value: TEXT { q }
+                    )
+                    |> List/join_field(
+                        field: "value"
+                        separator: Text/empty()
+                    )
+            }
+        }
+]
+
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let transform = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::DerivedValue {
+                expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+                ..
+            } => arms.first().map(|arm| &arm.value),
+            _ => None,
+        })
+        .expect("source event transform");
+    let PlanRowExpression::BuiltinCall {
+        function,
+        input: Some(filtered),
+        args: joined_args,
+    } = transform
+    else {
+        panic!("terminal join call was not retained: {transform:#?}");
+    };
+    assert_eq!(function, "List/join_field");
+    assert_eq!(
+        joined_args
+            .iter()
+            .filter_map(|arg| arg.name.as_deref())
+            .collect::<Vec<_>>(),
+        ["field", "separator"]
+    );
+    let PlanRowExpression::BuiltinCall {
+        function,
+        args: filter_args,
+        ..
+    } = filtered.as_ref()
+    else {
+        panic!("filter call was not retained: {filtered:#?}");
+    };
+    assert_eq!(function, "List/filter_field_equal");
+    assert_eq!(
+        filter_args
+            .iter()
+            .filter_map(|arg| arg.name.as_deref())
+            .collect::<Vec<_>>(),
+        ["field", "value"]
+    );
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+}
+
+#[test]
+fn fjordpulse_server_host_boundary_is_cpu_executable() {
+    let compiled = compile_source_path_to_machine_plan(
+        std::path::Path::new("examples/fjordpulse/Server/RUN.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let empty = BTreeSet::new();
+    let unsupported = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter(|op| {
+            !boon_plan::cpu_plan_executor_supports_whole_plan_op(
+                &compiled.plan.storage_layout.scalar_slots,
+                &compiled.plan.storage_layout.list_slots,
+                &compiled.plan.constants,
+                op,
+                &empty,
+                &empty,
+                &empty,
+            )
+        })
+        .map(|op| (op.id, op.kind.clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        compiled.plan.capability_summary.cpu_plan_executor_complete,
+        "FjordPulse server has unsupported ops: {unsupported:#?}"
+    );
+    assert_eq!(compiled.plan.query_indexes.len(), 1);
+    let stations = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id == compiled.plan.query_indexes[0].source_list)
+        .expect("station catalog list");
+    assert_eq!(stations.initial_rows.len(), 4);
+    assert!(stations.initial_rows.iter().all(|row| {
+        ["coordinate", "id", "kind", "modes", "name"]
+            .into_iter()
+            .all(|name| row.fields.iter().any(|field| field.name == name))
+    }));
+}
+
+#[test]
+fn compiler_lowers_decimal_numbers_as_canonical_executable_number_constants() {
+    let compiled = compile_source_text_to_machine_plan(
+        "real-output.bn",
+        r#"
+store: [
+    latitude: 59.91
+]
+
+outputs: [
+    latitude: store.latitude
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    assert!(compiled.plan.constants.iter().any(|constant| {
+        matches!(
+            constant.value,
+            boon_plan::PlanConstantValue::Number { value }
+                if (value.get() - 59.91).abs() < f64::EPSILON
+        )
+    }));
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
+fn compiler_rejects_integer_literals_not_exactly_representable_as_number() {
+    let error = compile_source_text_to_machine_plan(
+        "inexact-number.bn",
+        r#"
+store: [
+    value: 9007199254740993
+]
+outputs: [
+    value: store.value
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap_err();
+    let error = error.to_string();
+    assert!(
+        error.contains("cannot be represented exactly as a Boon Number"),
+        "unexpected error: {error}"
     );
 }
 
@@ -740,6 +1306,51 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
             .iter()
             .filter(|check| !check.pass)
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn host_effect_list_intent_uses_the_semantic_list_runtime_identity() {
+    let compiled = compile_source_text_to_machine_plan(
+        "server-effect-list-intent.bn",
+        include_str!("../../../examples/server_effect_chain.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let http_effect = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                expression_kind: PlanExpressionKind::HostEffect,
+                effect: Some(effect),
+                ..
+            } if compiled.plan.effects.iter().any(|contract| {
+                contract.effect_id == effect.effect_id && contract.host_operation == "Http/request"
+            }) =>
+            {
+                Some(effect)
+            }
+            _ => None,
+        })
+        .expect("HTTP effect invocation");
+    let headers = http_effect
+        .intent_fields
+        .iter()
+        .find(|field| field.name == "headers")
+        .expect("HTTP headers intent field");
+    assert!(
+        matches!(headers.input, ValueRef::List(_)),
+        "semantic list memory must lower to its runtime ListId, not a root FieldId"
+    );
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass)
     );
 }
 
@@ -1403,6 +2014,41 @@ status:
 }
 
 #[test]
+fn compiler_lowers_fractional_number_in_migration_expression() {
+    let source = r#"
+previous: 1 |> HOLD previous { LATEST {} } |> DRAINING
+current:
+    DRAIN { previous } + 0.5
+    |> HOLD current { LATEST {} }
+"#;
+    let plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        "fractional-migration.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+        ApplicationIdentity::new("dev.boon.number", "fractional-migration", "test"),
+        2,
+    )
+    .unwrap()
+    .plan;
+
+    let transfer = &plan.persistence.migration_recipes[0].transfers[0];
+    let MigrationTransformPlan::Expression {
+        root: MigrationExpressionPlan::Infix {
+            right, operator, ..
+        },
+    } = &transfer.transform
+    else {
+        panic!("fractional migration must lower to an infix expression: {transfer:#?}");
+    };
+    assert_eq!(operator, "+");
+    assert!(matches!(
+        right.as_ref(),
+        MigrationExpressionPlan::Number { value }
+            if *value == "0.5".parse().unwrap()
+    ));
+}
+
+#[test]
 fn migration_recipe_ids_ignore_formatting_sibling_and_record_field_order() {
     let ordered = r#"
 left: 1 |> HOLD left { LATEST {} } |> DRAINING
@@ -1607,7 +2253,7 @@ fn indexed_migrations_reconstruct_untouched_row_defaults() {
 }
 
 #[test]
-fn compiled_v3_binary_and_hash_are_deterministic() {
+fn compiled_v4_binary_and_hash_are_deterministic() {
     let source = include_str!("../../../examples/counter.bn");
     let first =
         compile_source_text_to_machine_plan("counter.bn", source, TargetProfile::SoftwareDefault)

@@ -1,0 +1,366 @@
+[
+  {
+    "reason": "database notification missing event identity",
+    "message": {
+      "protocolVersion": 1,
+      "type": "vehicle_moved",
+      "scope": "vehicle:SKY:Vehicle:12345",
+      "entityId": "SKY:Vehicle:12345",
+      "version": "2026-07-10T10:00:00Z",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {}
+    }
+  },
+  {
+    "reason": "server message missing protocol version",
+    "message": {
+      "type": "telemetry_tick",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {}
+    }
+  },
+  {
+    "reason": "ack missing correlation id",
+    "message": {
+      "protocolVersion": 1,
+      "type": "watch_station_ack",
+      "scope": "station:NSR:StopPlace:548",
+      "entityId": "NSR:StopPlace:548",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {}
+    }
+  },
+  {
+    "reason": "authoritative snapshot uses a fabricated database event id",
+    "message": {
+      "protocolVersion": 1,
+      "type": "station_snapshot",
+      "scope": "station:NSR:StopPlace:548",
+      "entityId": "NSR:StopPlace:548",
+      "eventId": "evt_fabricated",
+      "version": "2026-07-10T10:00:00Z",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {}
+    }
+  },
+  {
+    "reason": "non-passenger realtime vehicle snapshot includes a journey",
+    "message": {
+      "protocolVersion": 1,
+      "type": "vehicle_snapshot",
+      "scope": "vehicle:SKY:Vehicle:3350447622",
+      "entityId": "SKY:Vehicle:3350447622",
+      "version": "2026-07-10T10:00:00Z",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {
+        "vehicle": {
+          "id": "SKY:Vehicle:3350447622",
+          "transportMode": "bus",
+          "passengerServiceState": "non_passenger",
+          "lineCode": "4",
+          "routeName": "Flaktveit - Hesjaholtet",
+          "state": "live",
+          "latitude": 60.4,
+          "longitude": 5.3,
+          "lastSeenAt": "2026-07-10T10:00:00Z",
+          "refreshedAt": "2026-07-10T10:00:00Z",
+          "version": "2026-07-10T10:00:00Z",
+          "nextStop": null,
+          "journeyReference": null,
+          "monitoredCall": null,
+          "progressBetweenStops": null,
+          "journeyVersion": null,
+          "routeProgress": null
+        },
+        "trail": [],
+        "journey": {
+          "serviceJourneyId": "SKY:ServiceJourney:4-1",
+          "operatingDate": "2026-07-10",
+          "datedServiceJourneyId": null,
+          "version": "2026-07-10T10:00:00Z",
+          "state": "fresh",
+          "route": null,
+          "calls": [],
+          "refreshedAt": "2026-07-10T10:00:00Z",
+          "lastSuccessfulAt": "2026-07-10T10:00:00Z",
+          "warning": null
+        },
+        "upcomingStops": []
+      }
+    }
+  },
+  {
+    "reason": "non-passenger realtime vehicle snapshot includes upcoming stops",
+    "message": {
+      "protocolVersion": 1,
+      "type": "vehicle_snapshot",
+      "scope": "vehicle:SKY:Vehicle:3350447622",
+      "entityId": "SKY:Vehicle:3350447622",
+      "version": "2026-07-10T10:00:00Z",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {
+        "vehicle": {
+          "id": "SKY:Vehicle:3350447622",
+          "transportMode": "bus",
+          "passengerServiceState": "non_passenger",
+          "lineCode": "4",
+          "routeName": "Flaktveit - Hesjaholtet",
+          "state": "live",
+          "latitude": 60.4,
+          "longitude": 5.3,
+          "lastSeenAt": "2026-07-10T10:00:00Z",
+          "refreshedAt": "2026-07-10T10:00:00Z",
+          "version": "2026-07-10T10:00:00Z",
+          "nextStop": null,
+          "journeyReference": null,
+          "monitoredCall": null,
+          "progressBetweenStops": null,
+          "journeyVersion": null,
+          "routeProgress": null
+        },
+        "trail": [],
+        "journey": null,
+        "upcomingStops": [
+          {
+            "stopPlaceId": "NSR:StopPlace:548",
+            "quayId": "NSR:Quay:548",
+            "name": "Førde rutebilstasjon",
+            "order": 1,
+            "latitude": 61.452,
+            "longitude": 5.857,
+            "aimedArrivalAt": "2026-07-10T10:05:00Z",
+            "expectedArrivalAt": "2026-07-10T10:05:00Z",
+            "aimedDepartureAt": "2026-07-10T10:06:00Z",
+            "expectedDepartureAt": "2026-07-10T10:06:00Z",
+            "realtime": true,
+            "cancellation": false
+          }
+        ]
+      }
+    }
+  },
+  {
+    "reason": "station-serving realtime row includes a non-passenger vehicle",
+    "message": {
+      "protocolVersion": 1,
+      "type": "station_snapshot",
+      "scope": "station:NSR:StopPlace:548",
+      "entityId": "NSR:StopPlace:548",
+      "version": "2026-07-10T10:00:00Z",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {
+        "stationId": "NSR:StopPlace:548",
+        "state": "fresh",
+        "version": "2026-07-10T10:00:00Z",
+        "updatedAt": "2026-07-10T10:00:00Z",
+        "departures": [],
+        "departureBoard": {
+          "windowStart": "2026-07-10T10:00:00Z",
+          "windowEnd": "2026-07-10T22:00:00Z",
+          "limit": 20,
+          "hasMore": false
+        },
+        "nearbyVehicles": [
+          {
+            "id": "SKY:Vehicle:3350447622",
+            "transportMode": "bus",
+            "passengerServiceState": "non_passenger",
+            "lineCode": "4",
+            "state": "live",
+            "latitude": 60.4,
+            "longitude": 5.3,
+            "lastSeenAt": "2026-07-10T10:00:00Z",
+            "version": "2026-07-10T10:00:00Z"
+          }
+        ],
+        "servingVehicles": [
+          {
+            "id": "SKY:Vehicle:3350447622",
+            "transportMode": "bus",
+            "passengerServiceState": "non_passenger",
+            "lineCode": "4",
+            "state": "live",
+            "latitude": 60.4,
+            "longitude": 5.3,
+            "lastSeenAt": "2026-07-10T10:00:00Z",
+            "version": "2026-07-10T10:00:00Z",
+            "callRole": "calls_here",
+            "progress": "before_station",
+            "stationCallAt": "2026-07-10T10:15:00Z"
+          }
+        ],
+        "servingVehicleCoverage": {
+          "windowStart": null,
+          "windowEnd": null,
+          "candidateJourneyCount": 1,
+          "queriedJourneyCount": 1,
+          "truncated": false
+        }
+      }
+    }
+  },
+  {
+    "reason": "station-serving realtime row retains removed legacy relation property",
+    "message": {
+      "protocolVersion": 1,
+      "type": "station_snapshot",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {
+        "stationId": "NSR:StopPlace:548",
+        "state": "fresh",
+        "version": "2026-07-10T10:00:00Z",
+        "updatedAt": "2026-07-10T10:00:00Z",
+        "departures": [],
+        "departureBoard": {
+          "windowStart": "2026-07-10T10:00:00Z",
+          "windowEnd": "2026-07-10T22:00:00Z",
+          "limit": 20,
+          "hasMore": false
+        },
+        "nearbyVehicles": [],
+        "servingVehicles": [
+          {
+            "id": "SKY:Vehicle:3350447622",
+            "transportMode": "bus",
+            "passengerServiceState": "passenger",
+            "lineCode": "4",
+            "state": "live",
+            "latitude": 60.4,
+            "longitude": 5.3,
+            "lastSeenAt": "2026-07-10T10:00:00Z",
+            "version": "2026-07-10T10:00:00Z",
+            "callRole": "calls_here",
+            "progress": "before_station",
+            "stationCallAt": "2026-07-10T10:15:00Z",
+            "relation": "approaching"
+          }
+        ],
+        "servingVehicleCoverage": {
+          "windowStart": null,
+          "windowEnd": null,
+          "candidateJourneyCount": 1,
+          "queriedJourneyCount": 1,
+          "truncated": false
+        }
+      }
+    }
+  },
+  {
+    "reason": "station-serving realtime row omits required progress",
+    "message": {
+      "protocolVersion": 1,
+      "type": "station_snapshot",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {
+        "stationId": "NSR:StopPlace:548",
+        "state": "fresh",
+        "version": "2026-07-10T10:00:00Z",
+        "updatedAt": "2026-07-10T10:00:00Z",
+        "departures": [],
+        "departureBoard": {
+          "windowStart": "2026-07-10T10:00:00Z",
+          "windowEnd": "2026-07-10T22:00:00Z",
+          "limit": 20,
+          "hasMore": false
+        },
+        "nearbyVehicles": [],
+        "servingVehicles": [
+          {
+            "id": "SKY:Vehicle:3350447622",
+            "transportMode": "bus",
+            "passengerServiceState": "passenger",
+            "lineCode": "4",
+            "state": "live",
+            "latitude": 60.4,
+            "longitude": 5.3,
+            "lastSeenAt": "2026-07-10T10:00:00Z",
+            "version": "2026-07-10T10:00:00Z",
+            "callRole": "calls_here",
+            "stationCallAt": "2026-07-10T10:15:00Z"
+          }
+        ],
+        "servingVehicleCoverage": {
+          "windowStart": null,
+          "windowEnd": null,
+          "candidateJourneyCount": 1,
+          "queriedJourneyCount": 1,
+          "truncated": false
+        }
+      }
+    }
+  },
+  {
+    "reason": "station snapshot advertises a compact departure-board limit above twenty",
+    "message": {
+      "protocolVersion": 1,
+      "type": "station_snapshot",
+      "scope": "station:NSR:StopPlace:548",
+      "entityId": "NSR:StopPlace:548",
+      "version": "2026-07-10T10:00:00Z",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {
+        "stationId": "NSR:StopPlace:548",
+        "state": "fresh",
+        "version": "2026-07-10T10:00:00Z",
+        "updatedAt": "2026-07-10T10:00:00Z",
+        "departures": [],
+        "departureBoard": {
+          "windowStart": "2026-07-10T10:00:00Z",
+          "windowEnd": "2026-07-10T22:00:00Z",
+          "limit": 21,
+          "hasMore": true
+        },
+        "nearbyVehicles": [],
+        "servingVehicles": [],
+        "servingVehicleCoverage": {
+          "windowStart": null,
+          "windowEnd": null,
+          "candidateJourneyCount": 0,
+          "queriedJourneyCount": 0,
+          "truncated": false
+        }
+      }
+    }
+  },
+  {
+    "reason": "station departures compatibility event contains more than twenty rows",
+    "message": {
+      "protocolVersion": 1,
+      "type": "station_departures_changed",
+      "scope": "station:NSR:StopPlace:548",
+      "entityId": "NSR:StopPlace:548",
+      "eventId": "evt_too_many_station_departures",
+      "version": "2026-07-10T10:00:00Z",
+      "createdAt": "2026-07-10T10:00:00Z",
+      "payload": {
+        "stationId": "NSR:StopPlace:548",
+        "state": "fresh",
+        "version": "2026-07-10T10:00:00Z",
+        "updatedAt": "2026-07-10T10:00:00Z",
+        "departures": [
+          { "id": "dep_00", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:00:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_01", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:01:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_02", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:02:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_03", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:03:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_04", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:04:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_05", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:05:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_06", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:06:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_07", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:07:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_08", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:08:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_09", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:09:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_10", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:10:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_11", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:11:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_12", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:12:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_13", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:13:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_14", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:14:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_15", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:15:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_16", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:16:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_17", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:17:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_18", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:18:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_19", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:19:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false },
+          { "id": "dep_20", "lineCode": "100", "destination": "Nordfjordeid", "aimedDepartureAt": "2026-07-10T10:20:00Z", "expectedDepartureAt": null, "status": "scheduled", "realtime": false }
+        ]
+      }
+    }
+  }
+]

@@ -235,7 +235,11 @@ fn number_field(
     name: &str,
 ) -> Result<i64, HostEffectError> {
     match intent.get(name) {
-        Some(StoredValue::Number(value)) => Ok(*value),
+        Some(StoredValue::Number(value)) => value.to_i64_exact().map_err(|error| {
+            HostEffectError::rejected(format!(
+                "passkey intent field `{name}` is not a whole Number: {error}"
+            ))
+        }),
         _ => Err(HostEffectError::rejected(format!(
             "passkey intent field `{name}` is not Number"
         ))),
@@ -258,7 +262,11 @@ fn variant_tag_field<'a>(
 mod tests {
     use super::*;
     use boon_persistence::OutboxItemId;
-    use boon_plan::EffectInvocationId;
+    use boon_plan::{EffectInvocationId, FiniteReal};
+
+    fn number(value: i64) -> StoredValue {
+        StoredValue::Number(FiniteReal::from_i64_exact(value).unwrap())
+    }
 
     fn request(operation: &str, intent: BTreeMap<String, StoredValue>) -> HostEffectRequest {
         let effect_id = EffectId::from_host_operation(operation).unwrap();
@@ -299,7 +307,7 @@ mod tests {
                             StoredValue::Text("grant-test".to_owned()),
                         ),
                         ("account_id".to_owned(), StoredValue::Text(String::new())),
-                        ("credential_count".to_owned(), StoredValue::Number(count)),
+                        ("credential_count".to_owned(), number(count)),
                         ("simulation".to_owned(), variant(simulation, [])),
                     ]),
                 ))
@@ -324,7 +332,7 @@ mod tests {
                         StoredValue::Text("workspace-private-grant".to_owned()),
                     ),
                     ("account_id".to_owned(), StoredValue::Text(String::new())),
-                    ("credential_count".to_owned(), StoredValue::Number(0)),
+                    ("credential_count".to_owned(), number(0)),
                     ("simulation".to_owned(), variant("Success", [])),
                 ]),
             ))
@@ -361,7 +369,7 @@ mod tests {
                         "account_id".to_owned(),
                         StoredValue::Text(account_id.clone()),
                     ),
-                    ("credential_count".to_owned(), StoredValue::Number(1)),
+                    ("credential_count".to_owned(), number(1)),
                     ("simulation".to_owned(), variant("Success", [])),
                 ]),
             ))
@@ -381,7 +389,7 @@ mod tests {
                 AUTHENTICATE_OPERATION,
                 BTreeMap::from([
                     ("account_id".to_owned(), StoredValue::Text(String::new())),
-                    ("credential_count".to_owned(), StoredValue::Number(0)),
+                    ("credential_count".to_owned(), number(0)),
                     ("simulation".to_owned(), variant("Success", [])),
                 ]),
             ))
@@ -408,7 +416,7 @@ mod tests {
                             "account_id".to_owned(),
                             StoredValue::Text("account-test".to_owned()),
                         ),
-                        ("credential_count".to_owned(), StoredValue::Number(2)),
+                        ("credential_count".to_owned(), number(2)),
                         ("simulation".to_owned(), variant(simulation, [])),
                     ]),
                 ))

@@ -1,0 +1,432 @@
+-- FjordPulse visual tokens. Application views use named functions rather than
+-- embedding unrelated color decisions in individual controls.
+
+FUNCTION page() {
+    [
+        width: Fill
+        height: [sizing: Fill, minimum: Screen]
+        ...physical_surface(of: Page)
+        font: [family: TEXT { Inter }, weight: 400]
+        color: TEXT { #17231f }
+        size: 15
+        line_height: 21
+    ]
+}
+
+FUNCTION chrome() {
+    TEXT { #102a24 }
+}
+
+FUNCTION chrome_elevated() {
+    TEXT { #173a31 }
+}
+
+FUNCTION surface() {
+    TEXT { #ffffff }
+}
+
+FUNCTION surface_muted() {
+    TEXT { #f4f7f6 }
+}
+
+FUNCTION border() {
+    TEXT { #d7e0dd }
+}
+
+FUNCTION text() {
+    TEXT { #17231f }
+}
+
+FUNCTION text_muted() {
+    TEXT { #66756f }
+}
+
+FUNCTION text_on_dark() {
+    TEXT { #f2f8f6 }
+}
+
+FUNCTION text_on_accent() {
+    TEXT { #ffffff }
+}
+
+FUNCTION text_on_chrome_muted() {
+    TEXT { #b9cbc5 }
+}
+
+FUNCTION text_on_chrome_subtle() {
+    TEXT { #91aaa2 }
+}
+
+FUNCTION accent() {
+    TEXT { #087f71 }
+}
+
+FUNCTION accent_hover() {
+    TEXT { #06685e }
+}
+
+FUNCTION cyan() {
+    TEXT { #21c8d4 }
+}
+
+FUNCTION warning() {
+    TEXT { #c88213 }
+}
+
+FUNCTION danger() {
+    TEXT { #bb3e4a }
+}
+
+FUNCTION info() {
+    TEXT { #3277b3 }
+}
+
+FUNCTION map_water() {
+    TEXT { #b8d5d2 }
+}
+
+FUNCTION map_land() {
+    TEXT { #dbe6de }
+}
+
+FUNCTION map_road() {
+    TEXT { #f8faf4 }
+}
+
+FUNCTION map_land_border() {
+    TEXT { #a9c3b6 }
+}
+
+FUNCTION map_road_border() {
+    TEXT { #c6d2c9 }
+}
+
+FUNCTION attribution_background() {
+    TEXT { #ffffffe8 }
+}
+
+FUNCTION heading(size) {
+    [
+        font: [family: TEXT { Inter }, weight: 700]
+        color: text()
+        size: size
+        line_height: size * 1.18
+    ]
+}
+
+FUNCTION body() {
+    [
+        font: [family: TEXT { Inter }, weight: 400]
+        color: text()
+        size: 14
+        line_height: 20
+    ]
+}
+
+FUNCTION muted() {
+    [
+        ...body()
+        color: text_muted()
+    ]
+}
+
+FUNCTION panel() {
+    [
+        ...physical_surface(of: Panel)
+        border: [color: border()]
+        border_width: 1
+        rounded_corners: 6
+    ]
+}
+
+FUNCTION surface_frame(of) {
+    [
+        ...physical_surface(of: of)
+        border: [color: border()]
+        border_width: 1
+    ]
+}
+
+FUNCTION control(selected, hovered) {
+    [
+        ...physical_surface(of: Interactive[selected: selected, hovered: hovered])
+        border: [color: selected |> WHEN {
+            True => accent()
+            False => border()
+        }]
+        border_width: 1
+        rounded_corners: 5
+    ]
+}
+
+FUNCTION control_text(selected) {
+    [
+        ...body()
+        weight: 600
+        color: selected |> WHEN {
+            True => text_on_accent()
+            False => text()
+        }
+    ]
+}
+
+FUNCTION search_option(selected, hovered) {
+    [
+        ...physical_surface(of: SearchOption[selected: selected, hovered: hovered])
+        border: [color: selected |> WHEN {
+            True => accent()
+            False => border()
+        }]
+        border_width: selected |> WHEN {
+            True => 2
+            False => 1
+        }
+        rounded_corners: 5
+    ]
+}
+
+FUNCTION state_surface(status) {
+    [
+        ...physical_surface(of: StateSurface[status: status])
+        border: [color: status_color(status: status)]
+        border_width: 1
+        rounded_corners: 5
+    ]
+}
+
+FUNCTION map_pin(selected, hovered) {
+    [
+        ...physical_surface(of: MapPin[selected: selected, hovered: hovered])
+        border: [color: cyan()]
+        border_width: 2
+        rounded_corners: 6
+    ]
+}
+
+FUNCTION vehicle_pin() {
+    [
+        ...physical_surface(of: VehiclePin)
+        border: [color: text_on_accent()]
+        border_width: 2
+        rounded_corners: 19
+    ]
+}
+
+FUNCTION status_color(status) {
+    status |> WHEN {
+        Fresh => accent()
+        Ready => accent()
+        Live => accent()
+        Following => accent()
+        Refreshing => info()
+        Loading => info()
+        Retrying => info()
+        Paused => warning()
+        Stale => warning()
+        Empty => text_muted()
+        Error => danger()
+        Lost => danger()
+        Unavailable => danger()
+        __ => text_muted()
+    }
+}
+
+FUNCTION state_background(status) {
+    status |> WHEN {
+        Fresh => TEXT { #e7f4ef }
+        Ready => TEXT { #e7f4ef }
+        Live => TEXT { #e7f4ef }
+        Following => TEXT { #e7f4ef }
+        Loading => TEXT { #e8f1f8 }
+        Retrying => TEXT { #e8f1f8 }
+        Stale => TEXT { #fff3d8 }
+        Paused => TEXT { #fff3d8 }
+        Error => TEXT { #fbe8ea }
+        Lost => TEXT { #fbe8ea }
+        Empty => TEXT { #edf1ef }
+        __ => TEXT { #edf1ef }
+    }
+}
+
+FUNCTION admin_background() {
+    TEXT { #edf1ef }
+}
+
+FUNCTION code_background() {
+    TEXT { #e5ebe8 }
+}
+
+FUNCTION material(of) {
+    of |> WHEN {
+        Page => [
+            color: TEXT { #eef3f1 }
+            gloss: 0.008
+        ]
+        AdminPage => [
+            color: admin_background()
+            gloss: 0.009
+        ]
+        Chrome => [
+            color: chrome()
+            gloss: 0.035
+            shadows: LIST {
+                [y: 3, blur: 12, color: TEXT { #07151030 }]
+            }
+        ]
+        ChromeElevated => [
+            color: chrome_elevated()
+            gloss: 0.045
+            shadows: LIST {
+                [y: 6, blur: 18, color: TEXT { #07151038 }]
+            }
+        ]
+        Surface => [
+            color: surface()
+            gloss: 0.018
+        ]
+        SurfaceMuted => [
+            color: surface_muted()
+            gloss: 0.012
+        ]
+        Panel => [
+            color: surface()
+            gloss: 0.025
+            shadows: LIST {
+                [y: 5, blur: 16, color: TEXT { #102a241c }]
+            }
+        ]
+        Interactive[selected, hovered] => [
+            color: selected |> WHEN {
+                True => accent()
+                False => hovered |> WHEN {
+                    True => TEXT { #e4efeb }
+                    False => TEXT { #00000000 }
+                }
+            }
+            gloss: selected |> WHEN {
+                True => 0.07
+                False => 0.025
+            }
+            shadows: selected |> WHEN {
+                True => LIST { [y: 2, blur: 7, color: TEXT { #087f7138 }] }
+                False => LIST {}
+            }
+        ]
+        SearchOption[selected, hovered] => [
+            color: selected |> WHEN {
+                True => TEXT { #d9eee7 }
+                False => hovered |> WHEN {
+                    True => TEXT { #e7f1ed }
+                    False => surface()
+                }
+            }
+            gloss: selected |> WHEN {
+                True => 0.055
+                False => 0.02
+            }
+            shadows: selected |> WHEN {
+                True => LIST { [y: 2, blur: 8, color: TEXT { #087f7128 }] }
+                False => LIST {}
+            }
+        ]
+        StateSurface[status] => [
+            color: state_background(status: status)
+            gloss: 0.018
+        ]
+        MapPin[selected, hovered] => [
+            color: selected |> WHEN {
+                True => chrome()
+                False => hovered |> WHEN {
+                    True => accent_hover()
+                    False => accent()
+                }
+            }
+            gloss: selected |> WHEN {
+                True => 0.08
+                False => 0.05
+            }
+            shadows: LIST { [y: 4, blur: 10, color: TEXT { #102a2440 }] }
+        ]
+        VehiclePin => [
+            color: danger()
+            gloss: 0.065
+            shadows: LIST { [y: 4, blur: 11, color: TEXT { #6b1d2838 }] }
+        ]
+        DataRow => [color: surface(), gloss: 0.016]
+        MetricSurface => [color: surface(), gloss: 0.022]
+        MapLand => [color: map_land(), gloss: 0.006]
+        MapRoad => [color: map_road(), gloss: 0.012]
+        Attribution => [color: attribution_background(), gloss: 0.006]
+        WarningSurface => [color: TEXT { #fff3d8 }, gloss: 0.015]
+        DangerSurface => [color: TEXT { #fbe8ea }, gloss: 0.015]
+        __ => [color: surface(), gloss: 0.01]
+    }
+}
+
+FUNCTION elevation(of) {
+    of |> WHEN {
+        Page => 0
+        AdminPage => 0
+        Surface => 0.25
+        SurfaceMuted => 0.18
+        Panel => 0.8
+        Chrome => 1.1
+        ChromeElevated => 1.35
+        Interactive[selected, hovered] => selected |> WHEN {
+            True => 1.45
+            False => hovered |> WHEN {
+                True => 1.05
+                False => 0.65
+            }
+        }
+        SearchOption[selected, hovered] => selected |> WHEN {
+            True => 1.15
+            False => hovered |> WHEN {
+                True => 0.85
+                False => 0.45
+            }
+        }
+        StateSurface[status] => status |> WHEN {
+            Error => 0.7
+            Lost => 0.7
+            Stale => 0.6
+            __ => 0.45
+        }
+        MapPin[selected, hovered] => selected |> WHEN {
+            True => 1.6
+            False => hovered |> WHEN {
+                True => 1.35
+                False => 1.15
+            }
+        }
+        VehiclePin => 1.55
+        DataRow => 0.3
+        MetricSurface => 0.5
+        MapLand => 0.08
+        MapRoad => 0.18
+        Attribution => 0.65
+        WarningSurface => 0.55
+        DangerSurface => 0.55
+        __ => 0
+    }
+}
+
+FUNCTION physical_surface(of) {
+    [
+        background: [color: material(of: of).color]
+        material: material(of: of)
+        move: [further: elevation(of: of)]
+    ]
+}
+
+FUNCTION lights() {
+    [
+        key: [x: -0.35, y: -0.8, z: 1.0, intensity: 0.34]
+        secondary: [x: 0.65, y: -0.15, z: 0.7, intensity: 0.11]
+        rim: [x: 0.75, y: 0.25, z: 0.55, intensity: 0.07]
+    ]
+}
+
+FUNCTION geometry() {
+    [depth_scale: 0.16]
+}

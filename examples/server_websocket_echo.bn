@@ -1,0 +1,211 @@
+FUNCTION websocket_action(kind, status, body_kind, body_text, frame_kind, text, bytes, room, code, reason) {
+    [
+        kind: kind
+        status: status
+        body_kind: body_kind
+        body_text: body_text
+        body_bytes: BYTES {}
+        frame_kind: frame_kind
+        text: text
+        bytes: bytes
+        room: room
+        include_current: False
+        code: code
+        reason: reason
+    ]
+}
+
+store: [
+    ws_open: SOURCE
+    ws_message: SOURCE
+    ws_close: SOURCE
+    ws_error: SOURCE
+
+    action_kind:
+        TEXT { Accept } |> HOLD action_kind {
+            LATEST {
+                ws_open.path |> THEN {
+                    ws_open.path |> WHEN {
+                        TEXT { /reject } => TEXT { Reject }
+                        __ => TEXT { Accept }
+                    }
+                }
+                ws_message.kind |> THEN {
+                    ws_message.kind |> WHEN {
+                        TextMessage => ws_message.text |> WHEN {
+                            TEXT { join } => TEXT { JoinRoom }
+                            TEXT { leave } => TEXT { LeaveRoom }
+                            TEXT { broadcast } => TEXT { Broadcast }
+                            TEXT { send } => TEXT { Send }
+                            TEXT { resync } => TEXT { RequestResync }
+                            TEXT { close } => TEXT { Close }
+                            TEXT { malformed } => TEXT { Close }
+                            __ => TEXT { Reply }
+                        }
+                        BinaryMessage => TEXT { Reply }
+                    }
+                }
+                ws_close.code |> THEN { TEXT { Close } }
+                ws_error.code |> THEN { TEXT { Close } }
+            }
+        }
+
+    action_status:
+        0 |> HOLD action_status {
+            LATEST {
+                ws_open.path |> THEN {
+                    ws_open.path |> WHEN {
+                        TEXT { /reject } => 403
+                        __ => 0
+                    }
+                }
+                ws_message.kind |> THEN { 0 }
+                ws_close.code |> THEN { 0 }
+                ws_error.code |> THEN { 0 }
+            }
+        }
+
+    action_body_kind:
+        Text/empty() |> HOLD action_body_kind {
+            LATEST {
+                ws_open.path |> THEN {
+                    ws_open.path |> WHEN {
+                        TEXT { /reject } => TEXT { Text }
+                        __ => Text/empty()
+                    }
+                }
+                ws_message.kind |> THEN { Text/empty() }
+                ws_close.code |> THEN { Text/empty() }
+                ws_error.code |> THEN { Text/empty() }
+            }
+        }
+
+    action_body_text:
+        Text/empty() |> HOLD action_body_text {
+            LATEST {
+                ws_open.path |> THEN {
+                    ws_open.path |> WHEN {
+                        TEXT { /reject } => TEXT { denied }
+                        __ => Text/empty()
+                    }
+                }
+                ws_message.kind |> THEN { Text/empty() }
+                ws_close.code |> THEN { Text/empty() }
+                ws_error.code |> THEN { Text/empty() }
+            }
+        }
+
+    action_frame_kind:
+        Text/empty() |> HOLD action_frame_kind {
+            LATEST {
+                ws_open.path |> THEN { Text/empty() }
+                ws_message.kind |> THEN {
+                    ws_message.kind |> WHEN {
+                        TextMessage => ws_message.text |> WHEN {
+                            TEXT { join } => Text/empty()
+                            TEXT { leave } => Text/empty()
+                            TEXT { close } => Text/empty()
+                            TEXT { malformed } => Text/empty()
+                            __ => TEXT { Text }
+                        }
+                        BinaryMessage => TEXT { Binary }
+                    }
+                }
+                ws_close.code |> THEN { Text/empty() }
+                ws_error.code |> THEN { Text/empty() }
+            }
+        }
+
+    action_text:
+        Text/empty() |> HOLD action_text {
+            LATEST {
+                ws_open.path |> THEN { Text/empty() }
+                ws_message.text |> THEN {
+                    ws_message.text |> WHEN {
+                        TEXT { join } => Text/empty()
+                        TEXT { leave } => Text/empty()
+                        TEXT { broadcast } => TEXT { room:hello }
+                        TEXT { send } => TEXT { sent }
+                        TEXT { resync } => TEXT { snapshot }
+                        TEXT { close } => Text/empty()
+                        TEXT { malformed } => Text/empty()
+                        __ => ws_message.text
+                    }
+                }
+                ws_close.code |> THEN { Text/empty() }
+                ws_error.code |> THEN { Text/empty() }
+            }
+        }
+
+    action_bytes:
+        BYTES {} |> HOLD action_bytes {
+            ws_message.bytes |> THEN { ws_message.bytes }
+        }
+
+    action_room:
+        Text/empty() |> HOLD action_room {
+            LATEST {
+                ws_open.path |> THEN { Text/empty() }
+                ws_message.text |> THEN {
+                    ws_message.text |> WHEN {
+                        TEXT { join } => TEXT { blue }
+                        TEXT { leave } => TEXT { blue }
+                        TEXT { broadcast } => TEXT { blue }
+                        __ => Text/empty()
+                    }
+                }
+                ws_close.code |> THEN { Text/empty() }
+                ws_error.code |> THEN { Text/empty() }
+            }
+        }
+
+    action_code:
+        0 |> HOLD action_code {
+            LATEST {
+                ws_open.path |> THEN { 0 }
+                ws_message.text |> THEN {
+                    ws_message.text |> WHEN {
+                        TEXT { close } => 1000
+                        TEXT { malformed } => 1005
+                        __ => 0
+                    }
+                }
+                ws_close.code |> THEN { 1000 }
+                ws_error.code |> THEN { 1011 }
+            }
+        }
+
+    action_reason:
+        Text/empty() |> HOLD action_reason {
+            LATEST {
+                ws_open.path |> THEN { Text/empty() }
+                ws_message.text |> THEN {
+                    ws_message.text |> WHEN {
+                        TEXT { close } => TEXT { done }
+                        TEXT { malformed } => TEXT { invalid }
+                        __ => Text/empty()
+                    }
+                }
+                ws_close.reason |> THEN { ws_close.reason }
+                ws_error.message |> THEN { ws_error.message }
+            }
+        }
+
+    action_seed: LIST {
+        [value: 0]
+    }
+]
+
+outputs: [
+    websocket_actions: store.action_seed |> List/map(seed, new: websocket_action(kind: store.action_kind, status: store.action_status, body_kind: store.action_body_kind, body_text: store.action_body_text, frame_kind: store.action_frame_kind, text: store.action_text, bytes: store.action_bytes, room: store.action_room, code: store.action_code, reason: store.action_reason))
+]
+
+host_ports: [
+    websocket: [
+        open: store.ws_open
+        message: store.ws_message
+        close: store.ws_close
+        error: store.ws_error
+        actions: websocket_actions
+    ]
+]

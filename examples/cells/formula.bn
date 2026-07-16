@@ -3,7 +3,7 @@
 FUNCTION cell_address(index) {
     BLOCK {
         column_index: index % 26
-        row_index: index / 26
+        row_index: index / 26 |> Number/floor()
         column: List/get(sheet_columns, index: column_index)
         column.label + row_index
     }

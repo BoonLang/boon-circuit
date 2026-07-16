@@ -2,6 +2,7 @@ use super::{
     ActivationBatch, DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow,
     StoredScalar, StoredValue, validate_outbox_item_schema,
 };
+use boon_data::FiniteReal;
 use boon_plan::{
     ApplicationIdentity, DataTypePlan, MachinePlan, MemoryId, MemoryLeafId,
     MigrationArgumentValuePlan, MigrationEdgeId, MigrationEdgePlan, MigrationExpressionPlan,
@@ -752,7 +753,7 @@ fn evaluate_expression(
             .ok_or_else(|| MigrationError::Evaluation("lambda parameter is missing".to_owned())),
         MigrationExpressionPlan::Text { value } => Ok(StoredValue::Text(value.clone())),
         MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(*value)),
-        MigrationExpressionPlan::Byte { value } => Ok(StoredValue::Number(i64::from(*value))),
+        MigrationExpressionPlan::Byte { value } => stored_integer(i64::from(*value)),
         MigrationExpressionPlan::Bool { value } => Ok(StoredValue::Bool(*value)),
         MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::Variant {
             tag: tag.clone(),
@@ -822,9 +823,13 @@ fn evaluate_expression(
             let bytes = values
                 .into_iter()
                 .map(|value| match value {
-                    StoredValue::Number(value) => u8::try_from(value).map_err(|_| {
-                        MigrationError::Evaluation("byte literal is out of range".to_owned())
-                    }),
+                    StoredValue::Number(value) => value
+                        .to_i64_exact()
+                        .ok()
+                        .and_then(|value| u8::try_from(value).ok())
+                        .ok_or_else(|| {
+                            MigrationError::Evaluation("byte literal is out of range".to_owned())
+                        }),
                     _ => Err(MigrationError::Evaluation(
                         "byte expression did not produce a number".to_owned(),
                     )),
@@ -866,6 +871,18 @@ fn evaluate_fields(
         .collect()
 }
 
+fn stored_integer(value: i64) -> Result<StoredValue, MigrationError> {
+    FiniteReal::from_i64_exact(value)
+        .map(StoredValue::Number)
+        .map_err(|error| MigrationError::Evaluation(error.to_string()))
+}
+
+fn stored_number_result(value: f64) -> Result<StoredValue, MigrationError> {
+    FiniteReal::new(value)
+        .map(StoredValue::Number)
+        .map_err(|error| MigrationError::Evaluation(error.to_string()))
+}
+
 fn evaluate_call(
     function: &str,
     input: Option<StoredValue>,
@@ -893,9 +910,9 @@ fn evaluate_call(
         },
         "Text/to_number" => match input.or_else(first_value) {
             Some(StoredValue::Text(value)) => value
-                .parse::<i64>()
+                .parse::<FiniteReal>()
                 .map(StoredValue::Number)
-                .map_err(|_| MigrationError::Evaluation("text is not an integer".to_owned())),
+                .map_err(|_| MigrationError::Evaluation("text is not a number".to_owned())),
             _ => Err(MigrationError::Evaluation(
                 "Text/to_number requires one text value".to_owned(),
             )),
@@ -920,9 +937,9 @@ fn evaluate_call(
         },
         "List/count" | "List/length" => match input.or_else(first_value) {
             Some(StoredValue::List(values)) => {
-                Ok(StoredValue::Number(i64::try_from(values.len()).map_err(
-                    |_| MigrationError::Evaluation("list length exceeds number range".to_owned()),
-                )?))
+                stored_integer(i64::try_from(values.len()).map_err(|_| {
+                    MigrationError::Evaluation("list length exceeds number range".to_owned())
+                })?)
             }
             _ => Err(MigrationError::Evaluation(
                 "List/count requires one list".to_owned(),
@@ -973,27 +990,21 @@ fn evaluate_infix(
     right: StoredValue,
 ) -> Result<StoredValue, MigrationError> {
     match (operator, left, right) {
-        ("+", StoredValue::Number(left), StoredValue::Number(right)) => left
-            .checked_add(right)
-            .map(StoredValue::Number)
-            .ok_or_else(|| MigrationError::Evaluation("number addition overflowed".to_owned())),
-        ("-", StoredValue::Number(left), StoredValue::Number(right)) => left
-            .checked_sub(right)
-            .map(StoredValue::Number)
-            .ok_or_else(|| MigrationError::Evaluation("number subtraction overflowed".to_owned())),
-        ("*", StoredValue::Number(left), StoredValue::Number(right)) => left
-            .checked_mul(right)
-            .map(StoredValue::Number)
-            .ok_or_else(|| {
-                MigrationError::Evaluation("number multiplication overflowed".to_owned())
-            }),
-        ("/", StoredValue::Number(_), StoredValue::Number(0)) => Err(MigrationError::Evaluation(
-            "number division by zero".to_owned(),
-        )),
-        ("/", StoredValue::Number(left), StoredValue::Number(right)) => left
-            .checked_div(right)
-            .map(StoredValue::Number)
-            .ok_or_else(|| MigrationError::Evaluation("number division overflowed".to_owned())),
+        ("+", StoredValue::Number(left), StoredValue::Number(right)) => {
+            stored_number_result(left.get() + right.get())
+        }
+        ("-", StoredValue::Number(left), StoredValue::Number(right)) => {
+            stored_number_result(left.get() - right.get())
+        }
+        ("*", StoredValue::Number(left), StoredValue::Number(right)) => {
+            stored_number_result(left.get() * right.get())
+        }
+        ("/", StoredValue::Number(_), StoredValue::Number(right)) if right.get() == 0.0 => Err(
+            MigrationError::Evaluation("number division by zero".to_owned()),
+        ),
+        ("/", StoredValue::Number(left), StoredValue::Number(right)) => {
+            stored_number_result(left.get() / right.get())
+        }
         ("==", left, right) => Ok(StoredValue::Bool(left == right)),
         ("!=", left, right) => Ok(StoredValue::Bool(left != right)),
         ("&&", StoredValue::Bool(left), StoredValue::Bool(right)) => {
@@ -1048,7 +1059,10 @@ fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<()
         (StoredValue::Null, DataTypePlan::Null) => true,
         (StoredValue::Bool(_), DataTypePlan::Bool) => true,
         (StoredValue::Number(_), DataTypePlan::Number) => true,
-        (StoredValue::Number(value), DataTypePlan::Byte) => u8::try_from(*value).is_ok(),
+        (StoredValue::Number(value), DataTypePlan::Byte) => value
+            .to_i64_exact()
+            .ok()
+            .is_some_and(|value| u8::try_from(value).is_ok()),
         (StoredValue::Text(_), DataTypePlan::Text) => true,
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
             fixed_len.is_none_or(|expected| u64::try_from(value.len()) == Ok(expected))
@@ -1109,6 +1123,23 @@ mod tests {
         MemoryLeafPlan, MemoryOwnerPath, MemoryPlan, MigrationDestinationPlan,
         MigrationLeafRefPlan, MigrationListRowFieldPlan, PlanStorageId,
     };
+
+    fn number(value: i64) -> StoredValue {
+        StoredValue::integer(value).unwrap()
+    }
+
+    #[test]
+    fn migration_number_expression_preserves_fractional_values() {
+        let value = FiniteReal::new(1.25).unwrap();
+        let evaluated = evaluate_expression(
+            &MigrationExpressionPlan::Number { value },
+            &BTreeMap::new(),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(evaluated, StoredValue::Number(value));
+    }
 
     fn scalar_memory(slot: usize, path: &str) -> MemoryPlan {
         MemoryPlan::new(
@@ -1186,7 +1217,7 @@ mod tests {
             source_memory.memory_id,
             StoredScalar {
                 touched: true,
-                value: StoredValue::Number(41),
+                value: number(41),
             },
         );
 
@@ -1206,7 +1237,7 @@ mod tests {
             staged.candidate.scalars.get(&target_memory.memory_id),
             Some(&StoredScalar {
                 touched: true,
-                value: StoredValue::Number(41),
+                value: number(41),
             })
         );
         assert_eq!(staged.preview.steps.len(), 1);

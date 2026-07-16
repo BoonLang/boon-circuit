@@ -6,11 +6,13 @@ mod dev;
 mod dev_state;
 mod frame;
 mod language;
+mod map_host;
 #[cfg(target_os = "linux")]
 mod native_input;
 mod observer;
 mod passkey_simulator;
 mod preview;
+mod program_bundle;
 mod proof;
 mod protocol;
 mod runtime_view;

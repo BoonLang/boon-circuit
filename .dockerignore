@@ -1,0 +1,9 @@
+.git
+.jj
+.codex
+target
+**/target
+**/*.log
+playground/custom_examples
+reports
+

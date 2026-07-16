@@ -1,0 +1,1 @@
+{"ok":true,"data":{"query":"ber","results":[{"type":"station","id":"NSR:StopPlace:58366","label":"Bergen stasjon","secondaryText":"Bergen","stationId":"NSR:StopPlace:58366","lineCode":null,"latitude":60.3905,"longitude":5.3331}]},"meta":{"requestId":"req_search","updatedAt":"2026-07-10T10:00:00Z"}}

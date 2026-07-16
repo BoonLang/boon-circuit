@@ -780,6 +780,10 @@ mod tests {
 
     static NEXT_DATABASE_ID: AtomicU32 = AtomicU32::new(0);
 
+    fn number(value: i64) -> Value {
+        Value::integer(value).unwrap()
+    }
+
     fn counter_plan(identity: ApplicationIdentity) -> Arc<MachinePlan> {
         let runtime = LiveRuntime::from_source_with_identity(
             "web-persistent-counter.bn",
@@ -824,7 +828,7 @@ mod tests {
         assert!(startup.initialized);
         assert_eq!(
             runtime.root_value_current("store.count").unwrap(),
-            Value::Number(0)
+            number(0)
         );
 
         let event = increment_event(&runtime, 1);
@@ -838,7 +842,7 @@ mod tests {
         assert_eq!(acknowledged.acknowledgement.through_turn_sequence, 1);
         assert_eq!(
             runtime.root_value_current("store.count").unwrap(),
-            Value::Number(1)
+            number(1)
         );
         assert_eq!(runtime.flush().await.unwrap().epoch, 1);
         let inspection = runtime.inspect().await.unwrap().unwrap();
@@ -877,7 +881,7 @@ mod tests {
         ));
         assert_eq!(
             runtime.root_value_current("store.count").unwrap(),
-            Value::Number(1)
+            number(1)
         );
         assert!(matches!(
             concurrent
@@ -898,13 +902,13 @@ mod tests {
         assert_eq!(startup.restore_image.through_turn_sequence, 2);
         assert_eq!(
             runtime.root_value_current("store.count").unwrap(),
-            Value::Number(1)
+            number(1)
         );
         let event = increment_event(&runtime, 3);
         runtime.dispatch(event).await.unwrap();
         assert_eq!(
             runtime.root_value_current("store.count").unwrap(),
-            Value::Number(2)
+            number(2)
         );
 
         let activation = runtime
@@ -916,7 +920,7 @@ mod tests {
         assert_eq!(reset.acknowledgement.through_turn_sequence, 3);
         assert_eq!(
             runtime.root_value_current("store.count").unwrap(),
-            Value::Number(0)
+            number(0)
         );
         runtime.shutdown().await.unwrap();
 
@@ -930,7 +934,7 @@ mod tests {
         assert!(!startup.initialized);
         assert_eq!(
             runtime.root_value_current("store.count").unwrap(),
-            Value::Number(0)
+            number(0)
         );
         runtime.shutdown().await.unwrap();
         RexieDriver::delete_database(&database_name).await.unwrap();

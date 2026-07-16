@@ -1,8 +1,10 @@
 mod architecture;
+mod fjordpulse_traceability;
 mod gates;
 mod report_v2;
 mod shaders;
 
+use fjordpulse_traceability::TraceabilityAction;
 use report_v2::{GateName, HandoffManifest, ReportStatus, ToolResult, load_manifest};
 use std::path::{Path, PathBuf};
 
@@ -10,6 +12,10 @@ use std::path::{Path, PathBuf};
 enum ParsedCommand {
     Shaders {
         check: bool,
+    },
+    FjordpulseTraceability {
+        action: TraceabilityAction,
+        reference: PathBuf,
     },
     Gate {
         gate: GateName,
@@ -41,6 +47,10 @@ fn run() -> ToolResult<()> {
         }
         ParsedCommand::Shaders { check } => {
             shaders::run(&workspace, check)?;
+            return Ok(());
+        }
+        ParsedCommand::FjordpulseTraceability { action, reference } => {
+            fjordpulse_traceability::run(&workspace, action, &reference)?;
             return Ok(());
         }
         ParsedCommand::Gate { gate, report } => gates::run_gate(
@@ -77,6 +87,10 @@ fn parse_command(args: &[String], manifest: &HandoffManifest) -> Result<ParsedCo
             };
             Ok(ParsedCommand::Shaders { check })
         }
+        "fjordpulse-traceability" => {
+            let (action, reference) = parse_fjordpulse_traceability_options(&args[1..])?;
+            Ok(ParsedCommand::FjordpulseTraceability { action, reference })
+        }
         command if command == manifest.aggregate.as_str() => {
             let mut check_existing = false;
             let mut report = None;
@@ -99,6 +113,31 @@ fn parse_command(args: &[String], manifest: &HandoffManifest) -> Result<ParsedCo
             })
         }
     }
+}
+
+fn parse_fjordpulse_traceability_options(
+    args: &[String],
+) -> Result<(TraceabilityAction, PathBuf), String> {
+    let (action, options) = match args {
+        [action, options @ ..] if action == "import" => (TraceabilityAction::Import, options),
+        [action, options @ ..] if action == "verify" => (TraceabilityAction::Verify, options),
+        _ => {
+            return Err(
+                "usage: cargo xtask fjordpulse-traceability <import|verify> --reference <FjordPulse-repo>"
+                    .to_owned(),
+            );
+        }
+    };
+    let reference = match options {
+        [flag, path] if flag == "--reference" => PathBuf::from(path),
+        _ => {
+            return Err(
+                "usage: cargo xtask fjordpulse-traceability <import|verify> --reference <FjordPulse-repo>"
+                    .to_owned(),
+            );
+        }
+    };
+    Ok((action, reference))
 }
 
 fn parse_verify_options(
@@ -146,6 +185,7 @@ fn resolve_path(workspace: &Path, path: PathBuf) -> PathBuf {
 fn print_help(manifest: &HandoffManifest) {
     println!("Boon Circuit tooling");
     println!("  shaders");
+    println!("  fjordpulse-traceability <import|verify> --reference <FjordPulse-repo>");
     for gate in &manifest.gates {
         println!("  {}", gate.verifier.as_str());
     }

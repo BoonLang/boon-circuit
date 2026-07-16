@@ -1,0 +1,10 @@
+FUNCTION client_label() {
+    TEXT { Paired bundle fixture }
+}
+
+FUNCTION response(count) {
+    [
+        status: TEXT { accepted }
+        count: count
+    ]
+}

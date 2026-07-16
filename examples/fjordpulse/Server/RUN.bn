@@ -1,0 +1,374 @@
+-- Deterministic FjordPulse public HTTP contract slice. The generic host emits
+-- one normalized request source; all route, method, validation, and payload
+-- decisions below are Boon-owned.
+
+store: [
+    http_request: SOURCE
+
+    mode: Deterministic
+
+    request_count:
+        0 |> HOLD request_count {
+            http_request.method |> THEN { request_count + 1 }
+        }
+
+    request_path:
+        TEXT { / } |> HOLD request_path {
+            http_request.method |> THEN { http_request.path }
+        }
+
+    request_method:
+        TEXT { GET } |> HOLD request_method {
+            http_request.method |> THEN { http_request.method }
+        }
+
+    search_query:
+        LATEST {
+            http_request.method |> THEN {
+                http_request.query
+                    |> List/filter_field_equal(
+                        field: name
+                        value: TEXT { q }
+                    )
+                    |> List/join_field(
+                        field: value
+                        separator: Text/empty()
+                    )
+            }
+        }
+
+    stations: LIST {
+        [id: TEXT { NSR:StopPlace:548 }, name: TEXT { Førde rutebilstasjon }, latitude: 61.452, longitude: 5.857, kind: TEXT { bus_station }, modes: TEXT { bus,coach }]
+        [id: TEXT { NSR:StopPlace:337 }, name: TEXT { Oslo S }, latitude: 59.9109, longitude: 10.7523, kind: TEXT { rail_station }, modes: TEXT { rail,metro,tram,bus }]
+        [id: TEXT { NSR:StopPlace:58366 }, name: TEXT { Bergen stasjon }, latitude: 60.3905, longitude: 5.3331, kind: TEXT { rail_station }, modes: TEXT { rail,bus }]
+        [id: TEXT { NSR:StopPlace:417 }, name: TEXT { Trondheim S }, latitude: 63.4365, longitude: 10.3981, kind: TEXT { rail_station }, modes: TEXT { rail,bus }]
+        [id: TEXT { NSR:StopPlace:390 }, name: TEXT { Bodø stasjon }, latitude: 67.2868, longitude: 14.3908, kind: TEXT { rail_station }, modes: TEXT { rail,bus,ferry }]
+    }
+
+    station_matches:
+        List/query_prefix(
+            stations
+            field: name
+            prefix: search_query
+            limit: 20
+            normalization: TrimLowercase
+        )
+
+    departures: LIST {
+        [
+            id: TEXT { dep_100_1 }
+            serviceJourneyId: TEXT { SKY:ServiceJourney:100-1 }
+            lineId: TEXT { SKY:Line:100 }
+            lineCode: TEXT { 100 }
+            destination: TEXT { Nordfjordeid }
+            aimedDepartureAt: TEXT { 2026-07-10T10:15:00Z }
+            expectedDepartureAt: TEXT { 2026-07-10T10:17:00Z }
+            status: TEXT { delayed }
+            delaySeconds: 120
+            platform: TEXT { 1 }
+            realtime: True
+        ]
+    }
+
+    nearby_vehicles: LIST {
+        [
+            id: TEXT { SKY:Vehicle:12345 }
+            transportMode: TEXT { bus }
+            passengerServiceState: TEXT { passenger }
+            lineCode: TEXT { 100 }
+            destination: TEXT { Nordfjordeid }
+            state: TEXT { live }
+            latitude: 61.453
+            longitude: 5.858
+            bearing: 42
+            delaySeconds: 120
+            lastSeenAt: TEXT { 2026-07-10T09:59:58Z }
+            version: TEXT { 2026-07-10T09:59:58Z }
+        ]
+    }
+]
+
+outputs: [
+    health: [
+        ok: True
+        data: [
+            status: TEXT { healthy }
+            mode: TEXT { normal }
+            dataMode: TEXT { deterministic }
+            checkedAt: TEXT { 2026-07-10T10:00:00Z }
+            version: TEXT { boon-deterministic-v1 }
+            fallbackAvailable: False
+            dependencies: [
+                boonServer: [status: TEXT { healthy }, checkedAt: TEXT { 2026-07-10T10:00:00Z }]
+                redb: [status: TEXT { healthy }, checkedAt: TEXT { 2026-07-10T10:00:00Z }]
+                entur: [status: TEXT { configured }, checkedAt: TEXT { 2026-07-10T10:00:00Z }]
+                mapTiles: [status: TEXT { configured }, checkedAt: TEXT { 2026-07-10T10:00:00Z }]
+            ]
+        ]
+        meta: [requestId: TEXT { req_health }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    readiness: [
+        ok: True
+        data: [
+            status: TEXT { healthy }
+            restored: True
+            migrations: TEXT { compatible }
+            indexes: TEXT { valid }
+            listener: TEXT { admitted }
+        ]
+        meta: [requestId: TEXT { req_readiness }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    map_config: [
+        ok: True
+        data: [
+            version: TEXT { raster-v1 }
+            defaultBasemap: TEXT { streets }
+            sourceCount: 2
+            capabilityPolicy: TEXT { allowlisted-opaque-raster }
+        ]
+        meta: [requestId: TEXT { req_map_config }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    station_catalog: [
+        ok: True
+        data: [
+            bounds: [minLongitude: 4.5, minLatitude: 58, maxLongitude: 8.5, maxLatitude: 63]
+            zoom: 7.5
+            dataSource: TEXT { deterministic }
+            items: store.stations
+            completeMatchedCount: 5
+        ]
+        meta: [requestId: TEXT { req_station_map }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    search_contract: [
+        ok: True
+        query: store.search_query |> Text/concat(with: Text/empty(), separator: Text/empty())
+        indexedResultCount: store.station_matches |> List/length()
+        limit: 20
+        meta: [requestId: TEXT { req_search }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    station_snapshot: [
+        ok: True
+        data: [
+            stationId: TEXT { NSR:StopPlace:548 }
+            stationName: TEXT { Førde rutebilstasjon }
+            state: TEXT { fresh }
+            version: TEXT { 2026-07-10T10:00:00Z }
+            departures: store.departures
+            nearbyVehicles: store.nearby_vehicles
+        ]
+        meta: [requestId: TEXT { req_station }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    departure_board: [
+        ok: True
+        data: [
+            stationId: TEXT { NSR:StopPlace:548 }
+            mode: TEXT { day }
+            date: TEXT { 2026-07-10 }
+            timeZone: TEXT { Europe/Oslo }
+            departures: store.departures
+            limit: 50
+            complete: True
+            totalCount: 1
+        ]
+        meta: [requestId: TEXT { req_station_departures_01 }, updatedAt: TEXT { 2026-07-10T10:00:00.000Z }]
+    ]
+
+    nearby_vehicle_snapshot: [
+        ok: True
+        data: [
+            stationId: TEXT { NSR:StopPlace:548 }
+            searchRadiusMeters: 5000
+            state: TEXT { fresh }
+            vehicles: store.nearby_vehicles
+        ]
+        meta: [requestId: TEXT { req_nearby_vehicles }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    vehicle_snapshot: [
+        ok: True
+        data: [
+            id: TEXT { SKY:Vehicle:12345 }
+            transportMode: TEXT { bus }
+            passengerServiceState: TEXT { passenger }
+            lineCode: TEXT { 100 }
+            destination: TEXT { Nordfjordeid }
+            state: TEXT { live }
+            latitude: 61.453
+            longitude: 5.858
+            bearing: 42
+            routeProgress: 0.42
+            version: TEXT { 2026-07-10T09:59:58Z }
+        ]
+        meta: [requestId: TEXT { req_vehicle }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    realtime_token: [
+        ok: True
+        data: [
+            token: TEXT { deterministic-fixture-token-00000001 }
+            expiresAt: TEXT { 2026-07-10T10:05:00Z }
+            webSocketUrl: TEXT { ws://127.0.0.1/live }
+            protocolVersion: 1
+        ]
+        meta: [requestId: TEXT { req_realtime_token }, updatedAt: TEXT { 2026-07-10T10:00:00Z }]
+    ]
+
+    -- Existing deterministic Admin roots stay available while public routing is
+    -- expanded independently.
+    admin_session: [authenticated: True, username: TEXT { Fixture operator }, access: TEXT { read-only }]
+    admin_status: FjordPulseContract/admin_status(request_count: store.request_count)
+    admin_infrastructure: FjordPulseContract/admin_infrastructure()
+    admin_database: FjordPulseContract/admin_database()
+
+    http_response: [
+        status: public_http_status(
+            path: store.request_path
+            method: store.request_method
+            query: store.search_query
+        ) + 0
+        body: public_http_body(
+            path: store.request_path
+            method: store.request_method
+            query: store.search_query
+        ) |> Text/trim()
+    ]
+]
+
+host_ports: [
+    http: [
+        request: store.http_request
+        response: http_response
+    ]
+]
+
+FUNCTION public_http_status(path, method, query) {
+    path |> WHEN {
+        TEXT { /api/realtime-token } => method |> WHEN { TEXT { POST } => 201, __ => 405 }
+        TEXT { /api/search } => method |> WHEN {
+            TEXT { GET } => query |> WHEN {
+                TEXT { førde } => 200
+                TEXT { ber } => 200
+                __ => 400
+            }
+            __ => 405
+        }
+        TEXT { /api/health } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/readiness } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/map/config } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/stations } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/stations/NSR:StopPlace:548 } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/stations/NSR:StopPlace:548/departures } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/stations/NSR:StopPlace:548/nearby-vehicles } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/vehicles/SKY:Vehicle:12345 } => method |> WHEN { TEXT { GET } => 200, __ => 405 }
+        TEXT { /api/stations/not-an-id } => method |> WHEN { TEXT { GET } => 400, __ => 405 }
+        TEXT { /api/stations/NSR:StopPlace:999 } => method |> WHEN { TEXT { GET } => 404, __ => 405 }
+        TEXT { /api/vehicles/not-an-id } => method |> WHEN { TEXT { GET } => 400, __ => 405 }
+        TEXT { /api/vehicles/SKY:Vehicle:999 } => method |> WHEN { TEXT { GET } => 404, __ => 405 }
+        __ => 404
+    }
+}
+
+FUNCTION public_http_body(path, method, query) {
+    path |> WHEN {
+        TEXT { /api/health } => method |> WHEN { TEXT { GET } => health_json(), __ => method_not_allowed_json() }
+        TEXT { /api/readiness } => method |> WHEN { TEXT { GET } => readiness_json(), __ => method_not_allowed_json() }
+        TEXT { /api/map/config } => method |> WHEN { TEXT { GET } => map_config_json(), __ => method_not_allowed_json() }
+        TEXT { /api/stations } => method |> WHEN { TEXT { GET } => station_map_json(), __ => method_not_allowed_json() }
+        TEXT { /api/search } => method |> WHEN {
+            TEXT { GET } => query |> WHEN {
+                TEXT { førde } => search_forde_json()
+                TEXT { ber } => search_bergen_json()
+                __ => invalid_query_json()
+            }
+            __ => method_not_allowed_json()
+        }
+        TEXT { /api/stations/NSR:StopPlace:548 } => method |> WHEN { TEXT { GET } => station_json(), __ => method_not_allowed_json() }
+        TEXT { /api/stations/NSR:StopPlace:548/departures } => method |> WHEN { TEXT { GET } => station_departures_json(), __ => method_not_allowed_json() }
+        TEXT { /api/stations/NSR:StopPlace:548/nearby-vehicles } => method |> WHEN { TEXT { GET } => nearby_vehicles_json(), __ => method_not_allowed_json() }
+        TEXT { /api/vehicles/SKY:Vehicle:12345 } => method |> WHEN { TEXT { GET } => vehicle_json(), __ => method_not_allowed_json() }
+        TEXT { /api/realtime-token } => method |> WHEN { TEXT { POST } => realtime_token_json(), __ => method_not_allowed_json() }
+        TEXT { /api/stations/not-an-id } => invalid_station_json()
+        TEXT { /api/stations/NSR:StopPlace:999 } => unknown_station_json()
+        TEXT { /api/vehicles/not-an-id } => invalid_vehicle_json()
+        TEXT { /api/vehicles/SKY:Vehicle:999 } => unknown_vehicle_json()
+        __ => not_found_json()
+    }
+}
+
+FUNCTION health_json() {
+    "{\"ok\":true,\"data\":{\"status\":\"healthy\",\"mode\":\"normal\",\"dataMode\":\"deterministic\",\"checkedAt\":\"2026-07-10T10:00:00Z\",\"version\":\"boon-deterministic-v1\",\"fallbackAvailable\":false,\"dependencies\":{\"boonServer\":{\"status\":\"healthy\",\"checkedAt\":\"2026-07-10T10:00:00Z\"},\"redb\":{\"status\":\"healthy\",\"checkedAt\":\"2026-07-10T10:00:00Z\"},\"entur\":{\"status\":\"configured\",\"checkedAt\":\"2026-07-10T10:00:00Z\"},\"mapTiles\":{\"status\":\"configured\",\"checkedAt\":\"2026-07-10T10:00:00Z\"}}},\"meta\":{\"requestId\":\"req_health\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION readiness_json() {
+    "{\"ok\":true,\"data\":{\"status\":\"healthy\",\"mode\":\"normal\",\"dataMode\":\"deterministic\",\"checkedAt\":\"2026-07-10T10:00:00Z\",\"version\":\"boon-deterministic-v1\",\"fallbackAvailable\":false,\"dependencies\":{\"artifact\":{\"status\":\"healthy\",\"checkedAt\":\"2026-07-10T10:00:00Z\"},\"redb\":{\"status\":\"healthy\",\"checkedAt\":\"2026-07-10T10:00:00Z\"},\"indexes\":{\"status\":\"healthy\",\"checkedAt\":\"2026-07-10T10:00:00Z\"},\"listener\":{\"status\":\"healthy\",\"checkedAt\":\"2026-07-10T10:00:00Z\"}}},\"meta\":{\"requestId\":\"req_readiness\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION map_config_json() {
+    "{\"ok\":true,\"data\":{\"version\":\"raster-v1\",\"defaultBasemap\":\"streets\",\"rasterSources\":[{\"id\":\"streets\",\"label\":\"Map\",\"urlTemplate\":\"capability://maptiler-streets/{z}/{x}/{y}\",\"attribution\":\"Map data and imagery providers declared by the operator\",\"minZoom\":0,\"maxZoom\":20,\"tileSize\":256,\"capability\":\"maptiler-streets\"},{\"id\":\"satellite\",\"label\":\"Satellite\",\"urlTemplate\":\"capability://maptiler-satellite/{z}/{x}/{y}\",\"attribution\":\"Map data and imagery providers declared by the operator\",\"minZoom\":0,\"maxZoom\":20,\"tileSize\":256,\"capability\":\"maptiler-satellite\"}]},\"meta\":{\"requestId\":\"req_map_config\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION station_map_json() {
+    "{\"ok\":true,\"data\":{\"bounds\":{\"minLongitude\":4.5,\"minLatitude\":58,\"maxLongitude\":8.5,\"maxLatitude\":63},\"zoom\":7.5,\"dataSource\":\"deterministic\",\"items\":[{\"kind\":\"cluster\",\"id\":\"cluster_forde\",\"latitude\":61.452,\"longitude\":5.857,\"count\":4,\"bounds\":{\"minLongitude\":5.7,\"minLatitude\":61.3,\"maxLongitude\":6.0,\"maxLatitude\":61.6}},{\"kind\":\"station\",\"id\":\"NSR:StopPlace:548\",\"name\":\"Førde rutebilstasjon\",\"latitude\":61.452,\"longitude\":5.857,\"transportModes\":[\"bus\"]}]},\"meta\":{\"requestId\":\"req_station_map\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION search_forde_json() {
+    "{\"ok\":true,\"data\":{\"query\":\"førde\",\"results\":[{\"type\":\"station\",\"id\":\"NSR:StopPlace:548\",\"label\":\"Førde rutebilstasjon\",\"secondaryText\":\"Førde, Sunnfjord\",\"stationId\":\"NSR:StopPlace:548\",\"lineCode\":null,\"latitude\":61.452,\"longitude\":5.857},{\"type\":\"line\",\"id\":\"SKY:Line:100\",\"label\":\"Line 100\",\"secondaryText\":\"Førde–Nordfjordeid\",\"stationId\":null,\"lineCode\":\"100\",\"latitude\":null,\"longitude\":null},{\"type\":\"vehicle\",\"id\":\"SKY:Vehicle:12345\",\"label\":\"Vehicle SKY:Vehicle:12345\",\"secondaryText\":\"Line 100 · Nordfjordeid\",\"stationId\":null,\"lineCode\":\"100\",\"latitude\":61.453,\"longitude\":5.858,\"transportMode\":\"bus\"}]},\"meta\":{\"requestId\":\"req_search\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION search_bergen_json() {
+    "{\"ok\":true,\"data\":{\"query\":\"ber\",\"results\":[{\"type\":\"station\",\"id\":\"NSR:StopPlace:58366\",\"label\":\"Bergen stasjon\",\"secondaryText\":\"Bergen\",\"stationId\":\"NSR:StopPlace:58366\",\"lineCode\":null,\"latitude\":60.3905,\"longitude\":5.3331}]},\"meta\":{\"requestId\":\"req_search\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION station_json() {
+    "{\"ok\":true,\"data\":{\"station\":{\"id\":\"NSR:StopPlace:548\",\"name\":\"Førde rutebilstasjon\",\"kind\":\"bus_station\",\"latitude\":61.452,\"longitude\":5.857,\"locality\":\"Førde\",\"municipality\":\"Sunnfjord\",\"transportModes\":[\"bus\",\"coach\"],\"importedAt\":\"2026-07-10T08:00:00Z\"},\"snapshot\":{\"stationId\":\"NSR:StopPlace:548\",\"state\":\"fresh\",\"version\":\"2026-07-10T10:00:00Z\",\"updatedAt\":\"2026-07-10T10:00:00Z\",\"lastSuccessfulAt\":\"2026-07-10T10:00:00Z\",\"warning\":null,\"departures\":[{\"id\":\"dep_100_1\",\"serviceJourneyId\":\"SKY:ServiceJourney:100-1\",\"lineId\":\"SKY:Line:100\",\"lineCode\":\"100\",\"destination\":\"Nordfjordeid\",\"aimedDepartureAt\":\"2026-07-10T10:15:00Z\",\"expectedDepartureAt\":\"2026-07-10T10:17:00Z\",\"status\":\"delayed\",\"delaySeconds\":120,\"platform\":\"1\",\"realtime\":true}],\"departureBoard\":{\"windowStart\":\"2026-07-10T10:00:00Z\",\"windowEnd\":\"2026-07-10T22:00:00Z\",\"limit\":20,\"hasMore\":false},\"nearbyVehicles\":[{\"id\":\"SKY:Vehicle:12345\",\"transportMode\":\"bus\",\"passengerServiceState\":\"non_passenger\",\"lineCode\":\"100\",\"destination\":\"Nordfjordeid\",\"state\":\"live\",\"latitude\":61.453,\"longitude\":5.858,\"bearing\":42,\"delaySeconds\":120,\"distanceMeters\":null,\"lastSeenAt\":\"2026-07-10T09:59:58Z\",\"version\":\"2026-07-10T09:59:58Z\"}],\"servingVehicles\":[{\"id\":\"SKY:Vehicle:67890\",\"transportMode\":\"bus\",\"passengerServiceState\":\"unknown\",\"lineCode\":\"100\",\"destination\":\"Nordfjordeid\",\"state\":\"live\",\"latitude\":61.636,\"longitude\":6.216,\"bearing\":32,\"delaySeconds\":120,\"distanceMeters\":null,\"lastSeenAt\":\"2026-07-10T09:59:57Z\",\"version\":\"2026-07-10T09:59:57Z\",\"callRole\":\"calls_here\",\"progress\":\"before_station\",\"stationCallAt\":\"2026-07-10T10:17:00Z\"}],\"servingVehicleCoverage\":{\"windowStart\":\"2026-07-10T04:00:00Z\",\"windowEnd\":\"2026-07-10T16:00:00Z\",\"candidateJourneyCount\":12,\"queriedJourneyCount\":12,\"truncated\":false}}},\"meta\":{\"requestId\":\"req_station\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION station_departures_json() {
+    "{\"ok\":true,\"data\":{\"stationId\":\"NSR:StopPlace:548\",\"state\":\"fresh\",\"version\":\"2026-07-10T10:00:00.000Z\",\"updatedAt\":\"2026-07-10T10:00:00.000Z\",\"lastSuccessfulAt\":\"2026-07-10T10:00:00.000Z\",\"warning\":null,\"mode\":\"day\",\"date\":\"2026-07-10\",\"timeZone\":\"Europe/Oslo\",\"windowStart\":\"2026-07-10T00:00:00+02:00\",\"windowEnd\":\"2026-07-11T00:00:00+02:00\",\"departures\":[{\"id\":\"dep_100_1\",\"serviceJourneyId\":\"SKY:ServiceJourney:100-1\",\"lineId\":\"SKY:Line:100\",\"lineCode\":\"100\",\"destination\":\"Nordfjordeid\",\"aimedDepartureAt\":\"2026-07-10T10:15:00Z\",\"expectedDepartureAt\":\"2026-07-10T10:17:00Z\",\"status\":\"delayed\",\"delaySeconds\":120,\"platform\":\"1\",\"realtime\":true}],\"page\":{\"limit\":50,\"hasMore\":false,\"nextCursor\":null},\"complete\":true,\"totalCount\":1},\"meta\":{\"requestId\":\"req_station_departures_01\",\"updatedAt\":\"2026-07-10T10:00:00.000Z\",\"nextCursor\":null}}"
+}
+
+FUNCTION nearby_vehicles_json() {
+    "{\"ok\":true,\"data\":{\"stationId\":\"NSR:StopPlace:548\",\"searchRadiusMeters\":5000,\"state\":\"fresh\",\"version\":\"2026-07-10T10:00:00Z\",\"updatedAt\":\"2026-07-10T10:00:00Z\",\"lastSuccessfulAt\":\"2026-07-10T10:00:00Z\",\"warning\":null,\"vehicles\":[{\"id\":\"SKY:Vehicle:12345\",\"transportMode\":\"bus\",\"passengerServiceState\":\"passenger\",\"lineCode\":\"100\",\"destination\":\"Nordfjordeid\",\"state\":\"live\",\"latitude\":61.453,\"longitude\":5.858,\"bearing\":42,\"delaySeconds\":120,\"distanceMeters\":null,\"lastSeenAt\":\"2026-07-10T09:59:58Z\",\"version\":\"2026-07-10T09:59:58Z\"}]},\"meta\":{\"requestId\":\"req_nearby_vehicles\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION vehicle_json() {
+    "{\"ok\":true,\"data\":{\"vehicle\":{\"id\":\"SKY:Vehicle:12345\",\"transportMode\":\"bus\",\"passengerServiceState\":\"passenger\",\"lineCode\":\"100\",\"routeName\":\"Førde–Nordfjordeid\",\"destination\":\"Nordfjordeid\",\"state\":\"live\",\"latitude\":61.453,\"longitude\":5.858,\"bearing\":42,\"delaySeconds\":120,\"distanceMeters\":null,\"lastSeenAt\":\"2026-07-10T09:59:58Z\",\"refreshedAt\":\"2026-07-10T10:00:00Z\",\"version\":\"2026-07-10T09:59:58Z\",\"nextStop\":{\"stopPlaceId\":\"NSR:StopPlace:549\",\"quayId\":\"NSR:Quay:549\",\"name\":\"Førde sentrum\",\"order\":1,\"latitude\":61.456,\"longitude\":5.861,\"aimedArrivalAt\":\"2026-07-10T10:05:00Z\",\"expectedArrivalAt\":\"2026-07-10T10:07:00Z\",\"aimedDepartureAt\":\"2026-07-10T10:06:00Z\",\"expectedDepartureAt\":\"2026-07-10T10:08:00Z\",\"realtime\":true,\"cancellation\":false},\"journeyReference\":{\"serviceJourneyId\":\"SKY:ServiceJourney:100-1\",\"operatingDate\":\"2026-07-10\",\"datedServiceJourneyId\":null,\"originRef\":\"NSR:StopPlace:36025\",\"originName\":\"Førde rutebilstasjon\",\"destinationRef\":\"NSR:StopPlace:35453\",\"destinationName\":\"Nordfjordeid\"},\"monitoredCall\":{\"stopPointRef\":\"NSR:Quay:549\",\"order\":1,\"vehicleAtStop\":false},\"progressBetweenStops\":{\"linkDistance\":1200,\"percentage\":0.4},\"journeyVersion\":\"2026-07-10T09:59:57Z\",\"routeProgress\":0.42},\"trail\":[{\"latitude\":61.452,\"longitude\":5.857,\"bearing\":40,\"observedAt\":\"2026-07-10T09:59:30Z\"}],\"journey\":{\"serviceJourneyId\":\"SKY:ServiceJourney:100-1\",\"operatingDate\":\"2026-07-10\",\"datedServiceJourneyId\":null,\"version\":\"2026-07-10T09:59:57Z\",\"state\":\"fresh\",\"route\":{\"type\":\"LineString\",\"coordinates\":[[5.857,61.452],[5.861,61.456],[5.991,61.906]],\"distanceMeters\":52000},\"calls\":[{\"stopPlaceId\":\"NSR:StopPlace:549\",\"quayId\":\"NSR:Quay:549\",\"name\":\"Førde sentrum\",\"order\":1,\"latitude\":61.456,\"longitude\":5.861,\"aimedArrivalAt\":\"2026-07-10T10:05:00Z\",\"expectedArrivalAt\":\"2026-07-10T10:07:00Z\",\"aimedDepartureAt\":\"2026-07-10T10:06:00Z\",\"expectedDepartureAt\":\"2026-07-10T10:08:00Z\",\"realtime\":true,\"cancellation\":false}],\"refreshedAt\":\"2026-07-10T09:59:57Z\",\"lastSuccessfulAt\":\"2026-07-10T09:59:57Z\",\"warning\":null},\"upcomingStops\":[{\"stopPlaceId\":\"NSR:StopPlace:549\",\"quayId\":\"NSR:Quay:549\",\"name\":\"Førde sentrum\",\"order\":1,\"latitude\":61.456,\"longitude\":5.861,\"aimedArrivalAt\":\"2026-07-10T10:05:00Z\",\"expectedArrivalAt\":\"2026-07-10T10:07:00Z\",\"aimedDepartureAt\":\"2026-07-10T10:06:00Z\",\"expectedDepartureAt\":\"2026-07-10T10:08:00Z\",\"realtime\":true,\"cancellation\":false}]},\"meta\":{\"requestId\":\"req_vehicle\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION realtime_token_json() {
+    "{\"ok\":true,\"data\":{\"token\":\"deterministic-fixture-token-00000001\",\"expiresAt\":\"2026-07-10T10:05:00Z\",\"webSocketUrl\":\"ws://127.0.0.1/live\",\"protocolVersion\":1},\"meta\":{\"requestId\":\"req_realtime_token\",\"updatedAt\":\"2026-07-10T10:00:00Z\"}}"
+}
+
+FUNCTION invalid_query_json() {
+    "{\"ok\":false,\"error\":{\"code\":\"invalid_query\",\"message\":\"Search query must be one bounded JSON-safe value.\",\"details\":{\"field\":\"q\"}},\"meta\":{\"requestId\":\"req_invalid_query\"}}"
+}
+
+FUNCTION invalid_station_json() {
+    "{\"ok\":false,\"error\":{\"code\":\"invalid_station\",\"message\":\"Station id is invalid.\",\"details\":{\"field\":\"stationId\"}},\"meta\":{\"requestId\":\"req_invalid_station\"}}"
+}
+
+FUNCTION unknown_station_json() {
+    "{\"ok\":false,\"error\":{\"code\":\"station_not_found\",\"message\":\"Station was not found.\",\"details\":{\"field\":\"stationId\"}},\"meta\":{\"requestId\":\"req_unknown_station\"}}"
+}
+
+FUNCTION invalid_vehicle_json() {
+    "{\"ok\":false,\"error\":{\"code\":\"invalid_vehicle\",\"message\":\"Vehicle id is invalid.\",\"details\":{\"field\":\"vehicleId\"}},\"meta\":{\"requestId\":\"req_invalid_vehicle\"}}"
+}
+
+FUNCTION unknown_vehicle_json() {
+    "{\"ok\":false,\"error\":{\"code\":\"vehicle_not_found\",\"message\":\"Vehicle was not found.\",\"details\":{\"field\":\"vehicleId\"}},\"meta\":{\"requestId\":\"req_unknown_vehicle\"}}"
+}
+
+FUNCTION method_not_allowed_json() {
+    "{\"ok\":false,\"error\":{\"code\":\"method_not_allowed\",\"message\":\"HTTP method is not allowed for this route.\",\"details\":{\"field\":\"method\"}},\"meta\":{\"requestId\":\"req_method_not_allowed\"}}"
+}
+
+FUNCTION not_found_json() {
+    "{\"ok\":false,\"error\":{\"code\":\"route_not_found\",\"message\":\"HTTP route was not found.\",\"details\":{\"field\":\"path\"}},\"meta\":{\"requestId\":\"req_route_not_found\"}}"
+}

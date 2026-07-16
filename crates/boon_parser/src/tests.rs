@@ -110,6 +110,38 @@ slow: Duration[seconds: 2] |> Timer/interval()
 }
 
 #[test]
+fn source_named_events_is_distinct_from_an_event_group_wrapper() {
+    let program = parse_source(
+        "nested-source-events-collision.bn",
+        r#"
+store: [
+    controls: [
+        admin: [
+            status: SOURCE
+            events: SOURCE
+        ]
+        button: [events: [press: SOURCE]]
+    ]
+]
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        program
+            .source_ports
+            .iter()
+            .map(|source| source.path.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "store.controls.admin.events",
+            "store.controls.admin.status",
+            "store.controls.button.press",
+        ])
+    );
+}
+
+#[test]
 fn formatter_keeps_todomvc_source_declarations_in_designed_compact_shape() {
     let source = include_str!("../../../examples/todomvc.bn");
     let formatted = format_source("examples/todomvc.bn", source).unwrap();
@@ -321,6 +353,84 @@ FUNCTION new_todo(todo) {
         }),
         "THEN should keep nested call output blocks such as Bool/not()"
     );
+}
+
+#[test]
+fn parses_nested_multiline_call_arguments_as_expression_graph() {
+    let program = parse_source(
+        "nested-multiline-call.bn",
+        r#"
+FUNCTION locale_text(language, norwegian, english) {
+    language |> WHEN {
+        Norwegian => norwegian
+        __ => english
+    }
+}
+
+value: Element/label(label: locale_text(
+    language: Norwegian
+    norwegian: TEXT { Hei }
+    english: TEXT { Hello }
+))
+"#,
+    )
+    .unwrap();
+
+    let locale_call = program
+        .ast
+        .expressions
+        .iter()
+        .find(|expression| {
+            matches!(
+                &expression.kind,
+                AstExprKind::Call { function, .. } if function == "locale_text"
+            )
+        })
+        .expect("nested locale_text call");
+    let AstExprKind::Call { args, .. } = &locale_call.kind else {
+        unreachable!();
+    };
+    assert_eq!(
+        args.iter()
+            .filter_map(|arg| arg.name.as_deref())
+            .collect::<Vec<_>>(),
+        ["language", "norwegian", "english"]
+    );
+    assert!(
+        !program
+            .ast
+            .expressions
+            .iter()
+            .any(|expression| matches!(expression.kind, AstExprKind::Unknown(_)))
+    );
+}
+
+#[test]
+fn parses_same_line_source_after_multiline_call_close() {
+    let program = parse_source(
+        "multiline-call-source.bn",
+        r#"
+source: SOURCE
+value: Element/button(
+    element: [event: [press: SOURCE]]
+    style: [width: 120, height: 36]
+    label: TEXT { Publish }
+) |> SOURCE { source }
+"#,
+    )
+    .unwrap();
+
+    assert!(program.ast.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            AstExprKind::Pipe { input, op, .. }
+                if op == "SOURCE"
+                    && matches!(
+                        program.ast.expressions[*input].kind,
+                        AstExprKind::Call { ref function, .. } if function == "Element/button"
+                    )
+        )
+    }));
 }
 
 #[test]

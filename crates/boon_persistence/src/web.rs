@@ -3870,6 +3870,10 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     use boon_plan::{EffectId, EffectInvocationId, MemoryKind, MemoryOwnerPath};
 
+    fn number(value: i64) -> StoredValue {
+        StoredValue::integer(value).unwrap()
+    }
+
     fn application() -> ApplicationIdentity {
         ApplicationIdentity::new("dev.boon.web", "golden", "browser")
     }
@@ -3897,7 +3901,7 @@ mod tests {
         let scalar = StoredScalar {
             touched: true,
             value: StoredValue::Record(BTreeMap::from([
-                ("a".to_owned(), StoredValue::Number(-7)),
+                ("a".to_owned(), number(-7)),
                 (
                     "b".to_owned(),
                     StoredValue::List(vec![
@@ -4119,7 +4123,7 @@ mod tests {
                 row_key: 3,
                 row_generation: 1,
                 field_id: field,
-                value: StoredValue::Number(9),
+                value: number(9),
             }],
             outbox_changes: vec![DurableOutboxChange::BeginDispatch {
                 item_id: OutboxItemId([0x41; 32]),
@@ -4323,7 +4327,7 @@ mod tests {
             invocation,
             effect,
             StoredValue::Text("key".to_owned()),
-            StoredValue::Number(1),
+            number(1),
             Some(DurableEffectRow {
                 list_memory_id: list_memory,
                 row_key: 0,

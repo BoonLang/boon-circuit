@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "error": {
+    "code": "invalid_station",
+    "message": "Station id is invalid.",
+    "details": { "field": "stationId" }
+  },
+  "meta": {
+    "requestId": "req_invalid_station"
+  }
+}

@@ -1,0 +1,251 @@
+FUNCTION locale_text(language, norwegian, english) {
+    language |> WHEN {
+        Norwegian => norwegian
+        English => english
+        __ => norwegian
+    }
+}
+
+FUNCTION language_code(language) {
+    language |> WHEN {
+        Norwegian => TEXT { NO }
+        English => TEXT { EN }
+        __ => TEXT { NO }
+    }
+}
+
+FUNCTION basemap_label(basemap, language) {
+    basemap |> WHEN {
+        Streets => locale_text(language: language, norwegian: TEXT { Kart }, english: TEXT { Map })
+        Satellite => locale_text(language: language, norwegian: TEXT { Satellitt }, english: TEXT { Satellite })
+        __ => locale_text(language: language, norwegian: TEXT { Kart }, english: TEXT { Map })
+    }
+}
+
+FUNCTION station_name(station) {
+    station |> WHEN {
+        Forde => TEXT { Førde rutebilstasjon }
+        FordeFerry => TEXT { Førde ferjekai }
+        OsloS => TEXT { Oslo S }
+        Bergen => TEXT { Bergen stasjon }
+        Trondheim => TEXT { Trondheim S }
+        Bodo => TEXT { Bodø stasjon }
+        __ => TEXT { Oslo S }
+    }
+}
+
+FUNCTION station_place(station) {
+    station |> WHEN {
+        Forde => TEXT { Førde · Sunnfjord }
+        FordeFerry => TEXT { Førde · 0.7 km }
+        OsloS => TEXT { Oslo · 0.3 km }
+        Bergen => TEXT { Bergen · 0.8 km }
+        Trondheim => TEXT { Trondheim · 0.6 km }
+        Bodo => TEXT { Bodø · 0.5 km }
+        __ => TEXT { Oslo · 0.3 km }
+    }
+}
+
+FUNCTION station_code(station) {
+    station |> WHEN {
+        Forde => TEXT { NSR:StopPlace:36025 }
+        FordeFerry => TEXT { NSR:StopPlace:58362 }
+        OsloS => TEXT { NSR:StopPlace:337 }
+        Bergen => TEXT { NSR:StopPlace:58366 }
+        Trondheim => TEXT { NSR:StopPlace:417 }
+        Bodo => TEXT { NSR:StopPlace:390 }
+        __ => TEXT { NSR:StopPlace:337 }
+    }
+}
+
+FUNCTION station_kind(station, language) {
+    station |> WHEN {
+        Forde => locale_text(language: language, norwegian: TEXT { Busstasjon }, english: TEXT { Bus station })
+        FordeFerry => locale_text(language: language, norwegian: TEXT { Ferjeterminal og bussholdeplass }, english: TEXT { Ferry terminal and bus stop })
+        Bodo => locale_text(language: language, norwegian: TEXT { Togstasjon og ferjeterminal }, english: TEXT { Train station and ferry terminal })
+        __ => locale_text(language: language, norwegian: TEXT { Togstasjon }, english: TEXT { Train station })
+    }
+}
+
+FUNCTION station_modes(station, language) {
+    station |> WHEN {
+        Forde => locale_text(language: language, norwegian: TEXT { Buss }, english: TEXT { Bus })
+        FordeFerry => locale_text(language: language, norwegian: TEXT { Buss · Båt }, english: TEXT { Bus · Water })
+        OsloS => locale_text(language: language, norwegian: TEXT { Tog · T-bane · Trikk · Buss }, english: TEXT { Rail · Metro · Tram · Bus })
+        Bergen => locale_text(language: language, norwegian: TEXT { Tog · Buss }, english: TEXT { Rail · Bus })
+        Trondheim => locale_text(language: language, norwegian: TEXT { Tog · Buss }, english: TEXT { Rail · Bus })
+        Bodo => locale_text(language: language, norwegian: TEXT { Tog · Buss · Båt }, english: TEXT { Rail · Bus · Water })
+        __ => locale_text(language: language, norwegian: TEXT { Tog · Buss }, english: TEXT { Rail · Bus })
+    }
+}
+
+FUNCTION first_departure_destination(station) {
+    station |> WHEN {
+        Forde => TEXT { Sandane }
+        FordeFerry => TEXT { Bergen }
+        OsloS => TEXT { Lillehammer }
+        Bergen => TEXT { Voss }
+        Trondheim => TEXT { Steinkjer }
+        Bodo => TEXT { Fauske }
+        __ => TEXT { Lillehammer }
+    }
+}
+
+FUNCTION second_departure_destination(station) {
+    station |> WHEN {
+        Forde => TEXT { Skei }
+        FordeFerry => TEXT { Askvoll }
+        OsloS => TEXT { Drammen }
+        Bergen => TEXT { Arna }
+        Trondheim => TEXT { Stjørdal }
+        Bodo => TEXT { Rognan }
+        __ => TEXT { Drammen }
+    }
+}
+
+FUNCTION station_latitude(station) {
+    station |> WHEN {
+        Forde => 61.4522
+        FordeFerry => 61.4480
+        OsloS => 59.9139
+        Bergen => 60.3913
+        Trondheim => 63.4305
+        Bodo => 67.2804
+        __ => 61.4522
+    }
+}
+
+FUNCTION station_longitude(station) {
+    station |> WHEN {
+        Forde => 5.8572
+        FordeFerry => 5.8440
+        OsloS => 10.7522
+        Bergen => 5.3221
+        Trondheim => 10.3951
+        Bodo => 14.4049
+        __ => 5.8572
+    }
+}
+
+FUNCTION map_latitude(route, station) {
+    route |> WHEN {
+        PublicMap => 64.45
+        PublicPlace => 61.4520
+        PublicLine => 61.55
+        __ => station_latitude(station: station)
+    }
+}
+
+FUNCTION map_longitude(route, station) {
+    route |> WHEN {
+        PublicMap => 11.20
+        PublicPlace => 5.8600
+        PublicLine => 6.10
+        __ => station_longitude(station: station)
+    }
+}
+
+FUNCTION search_highlight_label(highlight, language) {
+    highlight |> WHEN {
+        FordeStationResult => TEXT { Førde rutebilstasjon }
+        FordeFerryResult => TEXT { Førde ferjekai }
+        FordePlaceResult => TEXT { Førde sentrum }
+        Line100Result => locale_text(language: language, norwegian: TEXT { Linje 100 }, english: TEXT { Line 100 })
+        __ => TEXT { Førde rutebilstasjon }
+    }
+}
+
+FUNCTION search_position_label(highlight, language) {
+    highlight |> WHEN {
+        FordeStationResult => locale_text(language: language, norwegian: TEXT { Resultat 1 av 4 }, english: TEXT { Result 1 of 4 })
+        FordeFerryResult => locale_text(language: language, norwegian: TEXT { Resultat 2 av 4 }, english: TEXT { Result 2 of 4 })
+        FordePlaceResult => locale_text(language: language, norwegian: TEXT { Resultat 3 av 4 }, english: TEXT { Result 3 of 4 })
+        Line100Result => locale_text(language: language, norwegian: TEXT { Resultat 4 av 4 }, english: TEXT { Result 4 of 4 })
+        __ => locale_text(language: language, norwegian: TEXT { Resultat 1 av 4 }, english: TEXT { Result 1 of 4 })
+    }
+}
+
+FUNCTION resource_label(state, language) {
+    state |> WHEN {
+        Ready => locale_text(language: language, norwegian: TEXT { Klar }, english: TEXT { Ready })
+        Fresh => locale_text(language: language, norwegian: TEXT { Oppdatert }, english: TEXT { Fresh })
+        Loading => locale_text(language: language, norwegian: TEXT { Laster }, english: TEXT { Loading })
+        Retrying => locale_text(language: language, norwegian: TEXT { Prøver igjen }, english: TEXT { Retrying })
+        Empty => locale_text(language: language, norwegian: TEXT { Ingen data }, english: TEXT { Empty })
+        Stale => locale_text(language: language, norwegian: TEXT { Utdatert }, english: TEXT { Stale })
+        Error => locale_text(language: language, norwegian: TEXT { Feil }, english: TEXT { Error })
+        Live => locale_text(language: language, norwegian: TEXT { Sanntid }, english: TEXT { Live })
+        Lost => locale_text(language: language, norwegian: TEXT { Posisjon utilgjengelig }, english: TEXT { Position unavailable })
+        __ => locale_text(language: language, norwegian: TEXT { Ukjent }, english: TEXT { Unknown })
+    }
+}
+
+FUNCTION focus_label(focus, language) {
+    focus |> WHEN {
+        Following => locale_text(language: language, norwegian: TEXT { Følger kjøretøyet }, english: TEXT { Following vehicle })
+        Paused => locale_text(language: language, norwegian: TEXT { Fokusering satt på pause }, english: TEXT { Focus paused })
+        __ => locale_text(language: language, norwegian: TEXT { Ikke fokusert }, english: TEXT { Not focused })
+    }
+}
+
+FUNCTION vehicle_title(vehicle, passenger_state, language) {
+    passenger_state |> WHEN {
+        NonPassenger => locale_text(language: language, norwegian: TEXT { Ikke i passasjertrafikk }, english: TEXT { Not in passenger service })
+        __ => vehicle |> WHEN {
+            Bus31 => locale_text(language: language, norwegian: TEXT { Buss 31 }, english: TEXT { Bus 31 })
+            __ => locale_text(language: language, norwegian: TEXT { Tog R10 }, english: TEXT { Train R10 })
+        }
+    }
+}
+
+FUNCTION vehicle_id(vehicle) {
+    vehicle |> WHEN {
+        Bus31 => TEXT { VEH:31:2208 }
+        TrainR10 => TEXT { VEH:R10:1042 }
+        __ => TEXT { VEH:R10:1042 }
+    }
+}
+
+FUNCTION vehicle_route(vehicle, language) {
+    vehicle |> WHEN {
+        Bus31 => locale_text(language: language, norwegian: TEXT { Oslo bussterminal → Fornebu }, english: TEXT { Oslo bus terminal → Fornebu })
+        __ => locale_text(language: language, norwegian: TEXT { Drammen → Lillehammer }, english: TEXT { Drammen → Lillehammer })
+    }
+}
+
+FUNCTION sheet_label(sheet, language) {
+    sheet |> WHEN {
+        Peek => locale_text(language: language, norwegian: TEXT { Kompakt }, english: TEXT { Peek })
+        Half => locale_text(language: language, norwegian: TEXT { Halv }, english: TEXT { Half })
+        Full => locale_text(language: language, norwegian: TEXT { Full }, english: TEXT { Full })
+        __ => locale_text(language: language, norwegian: TEXT { Halv }, english: TEXT { Half })
+    }
+}
+
+FUNCTION admin_page_title(route, language) {
+    route |> WHEN {
+        AdminStatus => locale_text(language: language, norwegian: TEXT { Systemstatus }, english: TEXT { System status })
+        AdminInfrastructure => locale_text(language: language, norwegian: TEXT { Infrastruktur }, english: TEXT { Infrastructure })
+        AdminWatches => locale_text(language: language, norwegian: TEXT { Overvåkinger }, english: TEXT { Watches })
+        AdminEnturLog => locale_text(language: language, norwegian: TEXT { Logg over Entur-forespørsler }, english: TEXT { Entur request log })
+        AdminRealtime => locale_text(language: language, norwegian: TEXT { Sanntidsdiagnostikk }, english: TEXT { Realtime diagnostics })
+        AdminEvents => locale_text(language: language, norwegian: TEXT { Lagrede hendelser }, english: TEXT { Persisted events })
+        AdminDatabaseSchema => TEXT { Database }
+        AdminDatabaseMigrations => locale_text(language: language, norwegian: TEXT { Databasemigreringer }, english: TEXT { Database migrations })
+        __ => locale_text(language: language, norwegian: TEXT { Systemstatus }, english: TEXT { System status })
+    }
+}
+
+FUNCTION admin_page_subtitle(route, language) {
+    route |> WHEN {
+        AdminStatus => locale_text(language: language, norwegian: TEXT { Tjenestetilstand og siste deterministiske måling. }, english: TEXT { Service state and latest deterministic measurement. })
+        AdminInfrastructure => locale_text(language: language, norwegian: TEXT { Én Boon-server, generiske verter og varig redb-lagring. }, english: TEXT { One Boon Server, generic hosts, and durable redb storage. })
+        AdminWatches => locale_text(language: language, norwegian: TEXT { Aktive holdeplass-, kjøretøy- og fokusovervåkinger. }, english: TEXT { Active station, vehicle, and Focus watches. })
+        AdminEnturLog => locale_text(language: language, norwegian: TEXT { Bounded kildebudsjett; utgående HTTP er av i denne modusen. }, english: TEXT { Bounded source budget; outbound HTTP is off in this mode. })
+        AdminRealtime => locale_text(language: language, norwegian: TEXT { Økter, rom, versjoner og deterministisk publisering. }, english: TEXT { Sessions, rooms, versions, and deterministic publication. })
+        AdminEvents => locale_text(language: language, norwegian: TEXT { Varige semantiske hendelser i avgrenset oppbevaring. }, english: TEXT { Durable semantic events with bounded retention. })
+        AdminDatabaseSchema => locale_text(language: language, norwegian: TEXT { Boon-samlinger, indekser og redb-helse. Skrivebeskyttet. }, english: TEXT { Boon collections, indexes, and redb health. Read-only. })
+        AdminDatabaseMigrations => locale_text(language: language, norwegian: TEXT { Skjemaversjoner og migreringssamsvar. Skrivebeskyttet. }, english: TEXT { Schema versions and migration compatibility. Read-only. })
+        __ => Text/empty()
+    }
+}

@@ -1,0 +1,5 @@
+format = 1
+package_id = "cz.kavik.fjordpulse"
+current_schema = 1
+migrations = []
+

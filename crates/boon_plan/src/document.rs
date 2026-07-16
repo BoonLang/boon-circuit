@@ -303,14 +303,18 @@ pub enum DocumentBuiltin {
     LogError,
     LogInfo,
     NumberBitWidth,
+    NumberCeil,
+    NumberFloor,
     NumberInterpolate,
     NumberMax,
     NumberMin,
     NumberProjectOffset,
     NumberProjectTime,
     NumberProjectWidth,
+    NumberRound,
     NumberToAsciiText,
     NumberToText,
+    NumberTruncate,
     RouterGoTo,
     RouterRoute,
     Svg,
@@ -400,6 +404,7 @@ pub enum DocumentConstructor {
     ElementTextInput,
     ElementProgram,
     ElementEmbeddedMedia,
+    ElementMap,
     SceneNew,
     SceneElementStripe,
     SceneElementBlock,
@@ -412,6 +417,7 @@ pub enum DocumentConstructor {
     SceneElementParagraph,
     SceneElementLink,
     SceneElementEmbeddedMedia,
+    SceneElementMap,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -432,6 +438,12 @@ pub enum DocumentArgumentRole {
     Child,
     Children,
     EventBindings,
+    MapCamera,
+    MapBounds,
+    MapTileSource,
+    MapOverlays,
+    MapInteraction,
+    MapGeneration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -685,6 +697,17 @@ impl DocumentPlan {
                     expression.id.0, template.0
                 ));
             }
+            if let DocumentExprOp::Constructor {
+                constructor,
+                arguments,
+                ..
+            } = &expression.op
+            {
+                verify_map_viewport_constructor_contract(*constructor, arguments, &self.names)
+                    .map_err(|detail| {
+                        format!("document expression {} {detail}", expression.id.0)
+                    })?;
+            }
             if let DocumentExprOp::Materialize { materialization } = &expression.op
                 && !materialization_ids.contains(materialization)
             {
@@ -716,6 +739,85 @@ impl DocumentPlan {
         }
         Ok(())
     }
+}
+
+impl DocumentConstructor {
+    pub fn is_map_viewport(self) -> bool {
+        matches!(self, Self::ElementMap | Self::SceneElementMap)
+    }
+
+    pub fn map_viewport_argument_role(self, name: &str) -> Option<DocumentArgumentRole> {
+        if !self.is_map_viewport() {
+            return None;
+        }
+        match name {
+            "camera" => Some(DocumentArgumentRole::MapCamera),
+            "bounds" => Some(DocumentArgumentRole::MapBounds),
+            "tile_source" => Some(DocumentArgumentRole::MapTileSource),
+            "overlays" => Some(DocumentArgumentRole::MapOverlays),
+            "interaction" => Some(DocumentArgumentRole::MapInteraction),
+            "generation" => Some(DocumentArgumentRole::MapGeneration),
+            _ => None,
+        }
+    }
+}
+
+pub fn verify_map_viewport_constructor_contract(
+    constructor: DocumentConstructor,
+    arguments: &[DocumentConstructorArgument],
+    names: &[String],
+) -> Result<(), String> {
+    if !constructor.is_map_viewport() {
+        return Ok(());
+    }
+
+    let mut supplied = BTreeSet::new();
+    for argument in arguments {
+        let name = names
+            .get(argument.name.0)
+            .map(String::as_str)
+            .ok_or_else(|| format!("MapViewport argument name {} is missing", argument.name.0))?;
+        if !supplied.insert(name) {
+            return Err(format!(
+                "MapViewport argument `{name}` is supplied more than once"
+            ));
+        }
+        let valid_role = match name {
+            "camera" => argument.role == DocumentArgumentRole::MapCamera,
+            "bounds" => argument.role == DocumentArgumentRole::MapBounds,
+            "tile_source" => argument.role == DocumentArgumentRole::MapTileSource,
+            "overlays" => argument.role == DocumentArgumentRole::MapOverlays,
+            "interaction" => argument.role == DocumentArgumentRole::MapInteraction,
+            "generation" => argument.role == DocumentArgumentRole::MapGeneration,
+            "style" => matches!(
+                argument.role,
+                DocumentArgumentRole::StaticStyle | DocumentArgumentRole::DynamicStyle
+            ),
+            "element" | "events" => argument.role == DocumentArgumentRole::EventBindings,
+            "child" | "root" => argument.role == DocumentArgumentRole::Child,
+            "items" | "children" | "contents" => argument.role == DocumentArgumentRole::Children,
+            _ => {
+                return Err(format!(
+                    "MapViewport constructor has unknown argument `{name}`"
+                ));
+            }
+        };
+        if !valid_role {
+            return Err(format!(
+                "MapViewport argument `{name}` has incompatible role {:?}",
+                argument.role
+            ));
+        }
+    }
+
+    for required in ["camera", "bounds", "tile_source", "overlays", "interaction"] {
+        if !supplied.contains(required) {
+            return Err(format!(
+                "MapViewport constructor is missing required argument `{required}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl DocumentExprOp {
@@ -792,5 +894,72 @@ impl DocumentExprOp {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod map_viewport_contract_tests {
+    use super::*;
+
+    fn argument(name: usize, role: DocumentArgumentRole) -> DocumentConstructorArgument {
+        DocumentConstructorArgument {
+            name: DocumentNameId(name),
+            role,
+            value: DocumentExprId(0),
+        }
+    }
+
+    #[test]
+    fn map_viewport_contract_requires_typed_descriptor_fields() {
+        let names = [
+            "camera",
+            "bounds",
+            "tile_source",
+            "overlays",
+            "interaction",
+            "generation",
+            "children",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let arguments = vec![
+            argument(0, DocumentArgumentRole::MapCamera),
+            argument(1, DocumentArgumentRole::MapBounds),
+            argument(2, DocumentArgumentRole::MapTileSource),
+            argument(3, DocumentArgumentRole::MapOverlays),
+            argument(4, DocumentArgumentRole::MapInteraction),
+            argument(5, DocumentArgumentRole::MapGeneration),
+            argument(6, DocumentArgumentRole::Children),
+        ];
+        verify_map_viewport_constructor_contract(
+            DocumentConstructor::SceneElementMap,
+            &arguments,
+            &names,
+        )
+        .unwrap();
+
+        let mut missing = arguments.clone();
+        missing.remove(2);
+        assert_eq!(
+            verify_map_viewport_constructor_contract(
+                DocumentConstructor::ElementMap,
+                &missing,
+                &names,
+            )
+            .unwrap_err(),
+            "MapViewport constructor is missing required argument `tile_source`"
+        );
+
+        let mut wrong_role = arguments;
+        wrong_role[0].role = DocumentArgumentRole::Value;
+        assert!(
+            verify_map_viewport_constructor_contract(
+                DocumentConstructor::ElementMap,
+                &wrong_role,
+                &names,
+            )
+            .unwrap_err()
+            .contains("`camera` has incompatible role")
+        );
     }
 }

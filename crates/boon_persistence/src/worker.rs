@@ -1793,6 +1793,10 @@ mod tests {
     use boon_plan::{MemoryId, MemoryKind, MemoryOwnerPath};
     use std::sync::Condvar;
 
+    fn number(value: i64) -> StoredValue {
+        StoredValue::integer(value).unwrap()
+    }
+
     #[derive(Clone, Debug, Default)]
     struct DriverTrace {
         commits: Arc<Mutex<Vec<(u64, u64)>>>,
@@ -1924,7 +1928,7 @@ mod tests {
                 memory_id: memory(),
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Number(value),
+                    value: number(value),
                 },
             }],
         )
@@ -2304,7 +2308,7 @@ mod tests {
         assert_eq!(durable.through_turn_sequence, 1);
         assert_eq!(
             durable.scalars.get(&memory()).map(|value| &value.value),
-            Some(&StoredValue::Number(11))
+            Some(&number(11))
         );
 
         coordinator.commit_immediate(turn(2, 22)).unwrap();

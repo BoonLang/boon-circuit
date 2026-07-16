@@ -1,0 +1,65 @@
+store: [
+    request: SOURCE
+    http_succeeded: SOURCE
+    http_failed: SOURCE
+    random_ready: SOURCE
+    host_failed: SOURCE
+
+    final_byte_count:
+        0 |> HOLD final_byte_count {
+            LATEST {
+                random_ready.bytes |> THEN { random_ready.bytes |> Bytes/length }
+                http_failed.code |> THEN { -1 }
+                host_failed.code |> THEN { -2 }
+            }
+        }
+
+    outbound_headers: LIST {
+        [name: TEXT { accept }, value: BYTES {}]
+    }
+
+]
+
+effects: [
+    fetch: [
+        on: store.request
+        perform: Http/request(
+            endpoint: TEXT { catalog }
+            method: Get
+            path_segments: store.request.path_segments
+            query: store.request.query
+            headers: store.outbound_headers
+            body: store.request.body
+            connect_timeout_ms: 500
+            overall_timeout_ms: 2000
+            cancellation: Independent
+        )
+        results: [
+            HttpSucceeded: store.http_succeeded
+            HttpFailed: store.http_failed
+        ]
+    ]
+
+    nonce: [
+        on: store.http_succeeded
+        perform: Random/bytes(byte_count: 16)
+        results: [
+            RandomBytesReady: store.random_ready
+            HostServiceFailed: store.host_failed
+        ]
+    ]
+]
+
+outputs: [
+    response: [
+        status: 200
+        body: store.final_byte_count
+    ]
+]
+
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]

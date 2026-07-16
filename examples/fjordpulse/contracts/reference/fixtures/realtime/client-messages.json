@@ -1,0 +1,64 @@
+[
+  {
+    "protocolVersion": 1,
+    "id": "msg_watch_station",
+    "type": "watch_station",
+    "payload": {
+      "stationId": "NSR:StopPlace:548",
+      "knownVersion": "2026-07-10T09:59:00Z",
+      "lastEventId": "evt_previous_station"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_unwatch_station",
+    "type": "unwatch_station",
+    "payload": { "stationId": "NSR:StopPlace:548" }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_watch_vehicle",
+    "type": "watch_vehicle",
+    "payload": {
+      "vehicleId": "SKY:Vehicle:12345",
+      "knownVersion": "2026-07-10T09:59:00Z",
+      "lastEventId": "evt_previous_vehicle"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_unwatch_vehicle",
+    "type": "unwatch_vehicle",
+    "payload": { "vehicleId": "SKY:Vehicle:12345" }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_focus_vehicle",
+    "type": "focus_vehicle",
+    "payload": { "vehicleId": "SKY:Vehicle:12345" }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_unfocus_vehicle",
+    "type": "unfocus_vehicle",
+    "payload": { "vehicleId": "SKY:Vehicle:12345" }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_pause_focus",
+    "type": "pause_focus",
+    "payload": { "vehicleId": "SKY:Vehicle:12345" }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_resume_focus",
+    "type": "resume_focus",
+    "payload": { "vehicleId": "SKY:Vehicle:12345" }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_ping",
+    "type": "ping",
+    "payload": { "sentAt": "2026-07-10T10:00:00Z" }
+  }
+]

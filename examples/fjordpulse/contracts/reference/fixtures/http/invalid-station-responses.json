@@ -1,0 +1,191 @@
+[
+  {
+    "reason": "station-serving relationship includes a non-passenger vehicle",
+    "message": {
+      "ok": true,
+      "data": {
+        "station": {
+          "id": "NSR:StopPlace:548",
+          "name": "Førde rutebilstasjon",
+          "kind": "bus_station",
+          "latitude": 61.452,
+          "longitude": 5.857,
+          "locality": "Førde",
+          "transportModes": ["bus"],
+          "importedAt": "2026-07-10T08:00:00Z"
+        },
+        "snapshot": {
+          "stationId": "NSR:StopPlace:548",
+          "state": "fresh",
+          "version": "2026-07-10T10:00:00Z",
+          "updatedAt": "2026-07-10T10:00:00Z",
+          "departures": [],
+          "departureBoard": {
+            "windowStart": "2026-07-10T10:00:00Z",
+            "windowEnd": "2026-07-10T22:00:00Z",
+            "limit": 20,
+            "hasMore": false
+          },
+          "nearbyVehicles": [
+            {
+              "id": "SKY:Vehicle:3350447622",
+              "transportMode": "bus",
+              "passengerServiceState": "non_passenger",
+              "lineCode": "4",
+              "state": "live",
+              "latitude": 60.4,
+              "longitude": 5.3,
+              "lastSeenAt": "2026-07-10T10:00:00Z",
+              "version": "2026-07-10T10:00:00Z"
+            }
+          ],
+          "servingVehicles": [
+            {
+              "id": "SKY:Vehicle:3350447622",
+              "transportMode": "bus",
+              "passengerServiceState": "non_passenger",
+              "lineCode": "4",
+              "state": "live",
+              "latitude": 60.4,
+              "longitude": 5.3,
+              "lastSeenAt": "2026-07-10T10:00:00Z",
+              "version": "2026-07-10T10:00:00Z",
+              "callRole": "calls_here",
+              "progress": "before_station",
+              "stationCallAt": "2026-07-10T10:15:00Z"
+            }
+          ],
+          "servingVehicleCoverage": {
+            "windowStart": null,
+            "windowEnd": null,
+            "candidateJourneyCount": 1,
+            "queriedJourneyCount": 1,
+            "truncated": false
+          }
+        }
+      },
+      "meta": {
+        "requestId": "req_invalid_non_passenger_serving_vehicle",
+        "updatedAt": "2026-07-10T10:00:00Z"
+      }
+    }
+  },
+  {
+    "reason": "station-serving row retains removed legacy relation property",
+    "message": {
+      "ok": true,
+      "data": {
+        "station": {
+          "id": "NSR:StopPlace:548",
+          "name": "Førde rutebilstasjon",
+          "kind": "bus_station",
+          "latitude": 61.452,
+          "longitude": 5.857,
+          "locality": "Førde",
+          "transportModes": ["bus"],
+          "importedAt": "2026-07-10T08:00:00Z"
+        },
+        "snapshot": {
+          "stationId": "NSR:StopPlace:548",
+          "state": "fresh",
+          "version": "2026-07-10T10:00:00Z",
+          "updatedAt": "2026-07-10T10:00:00Z",
+          "departures": [],
+          "departureBoard": {
+            "windowStart": "2026-07-10T10:00:00Z",
+            "windowEnd": "2026-07-10T22:00:00Z",
+            "limit": 20,
+            "hasMore": false
+          },
+          "nearbyVehicles": [],
+          "servingVehicles": [
+            {
+              "id": "SKY:Vehicle:3350447622",
+              "transportMode": "bus",
+              "passengerServiceState": "passenger",
+              "lineCode": "4",
+              "state": "live",
+              "latitude": 60.4,
+              "longitude": 5.3,
+              "lastSeenAt": "2026-07-10T10:00:00Z",
+              "version": "2026-07-10T10:00:00Z",
+              "callRole": "calls_here",
+              "progress": "before_station",
+              "stationCallAt": "2026-07-10T10:15:00Z",
+              "relation": "approaching"
+            }
+          ],
+          "servingVehicleCoverage": {
+            "windowStart": null,
+            "windowEnd": null,
+            "candidateJourneyCount": 1,
+            "queriedJourneyCount": 1,
+            "truncated": false
+          }
+        }
+      },
+      "meta": {
+        "requestId": "req_invalid_legacy_station_vehicle_relation",
+        "updatedAt": "2026-07-10T10:00:00Z"
+      }
+    }
+  },
+  {
+    "reason": "station-serving row omits required progress",
+    "message": {
+      "ok": true,
+      "data": {
+        "station": {
+          "id": "NSR:StopPlace:548",
+          "name": "Førde rutebilstasjon",
+          "kind": "bus_station",
+          "latitude": 61.452,
+          "longitude": 5.857,
+          "locality": "Førde",
+          "transportModes": ["bus"],
+          "importedAt": "2026-07-10T08:00:00Z"
+        },
+        "snapshot": {
+          "stationId": "NSR:StopPlace:548",
+          "state": "fresh",
+          "version": "2026-07-10T10:00:00Z",
+          "updatedAt": "2026-07-10T10:00:00Z",
+          "departures": [],
+          "departureBoard": {
+            "windowStart": "2026-07-10T10:00:00Z",
+            "windowEnd": "2026-07-10T22:00:00Z",
+            "limit": 20,
+            "hasMore": false
+          },
+          "nearbyVehicles": [],
+          "servingVehicles": [
+            {
+              "id": "SKY:Vehicle:3350447622",
+              "transportMode": "bus",
+              "passengerServiceState": "passenger",
+              "lineCode": "4",
+              "state": "live",
+              "latitude": 60.4,
+              "longitude": 5.3,
+              "lastSeenAt": "2026-07-10T10:00:00Z",
+              "version": "2026-07-10T10:00:00Z",
+              "callRole": "calls_here",
+              "stationCallAt": "2026-07-10T10:15:00Z"
+            }
+          ],
+          "servingVehicleCoverage": {
+            "windowStart": null,
+            "windowEnd": null,
+            "candidateJourneyCount": 1,
+            "queriedJourneyCount": 1,
+            "truncated": false
+          }
+        }
+      },
+      "meta": {
+        "requestId": "req_invalid_missing_station_vehicle_progress",
+        "updatedAt": "2026-07-10T10:00:00Z"
+      }
+    }
+  }
+]

@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use boon_document::{DocumentFrame, DocumentNodeId, RenderScene};
@@ -6,10 +7,12 @@ use boon_native_app_window::{
     NativeHostError, NativeSurfaceHost, SurfaceAcquireError, SurfacePreferences,
 };
 use boon_native_gpu::{
-    FrameMetrics, RenderAssetSource, SurfaceRenderSceneRequest, VisibleLayoutRenderer,
+    FrameMetrics, MapTileEvent, RenderAssetSource, SurfaceRenderSceneRequest, VisibleLayoutRenderer,
 };
+use boon_web_host::{MapViewportHostController, MapViewportHostEvent};
 use sha2::{Digest, Sha256};
 
+use crate::map_host::NativeMapTileHost;
 use crate::observer::{
     FrameEvidenceKey, FramePresented, InputKind, NATIVE_SESSION_ID_ENV, ObserverEvent,
     ObserverRole, RoleMetadata,
@@ -146,6 +149,10 @@ pub struct PreviewPerfStats {
     pub missed_frame_count: u64,
     pub dropped_snapshot_count: u64,
     pub proof_enabled: bool,
+    pub map_tile_dispatched: u64,
+    pub map_tile_failed: u64,
+    pub map_tile_cancelled: u64,
+    pub map_tile_prewarm_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +238,10 @@ pub struct ProductFrame {
     present_target: Option<ProductPresentTarget>,
     last_presented_key: Option<FrameEvidenceKey>,
     last_presented_captured: bool,
+    map_interaction: MapViewportHostController,
+    map_tiles: NativeMapTileHost,
+    device_lost_reason: Arc<Mutex<Option<String>>>,
+    rendered_map_interaction_revision: u64,
 }
 
 struct ProductPresentTarget {
@@ -276,6 +287,7 @@ impl ProductFrame {
             })
             .await
             .map_err(|error| format!("request product WGPU device: {error}"))?;
+        let device_lost_reason = install_device_lost_callback(&device);
         let binding = host
             .configure(&adapter, &device, SurfacePreferences::default())
             .await?;
@@ -339,6 +351,10 @@ impl ProductFrame {
             present_target: None,
             last_presented_key: None,
             last_presented_captured: false,
+            map_interaction: MapViewportHostController::default(),
+            map_tiles: NativeMapTileHost::from_env()?,
+            device_lost_reason,
+            rendered_map_interaction_revision: 0,
         })
     }
 
@@ -384,7 +400,13 @@ impl ProductFrame {
     }
 
     pub fn stats(&self) -> PreviewPerfStats {
-        self.stats
+        let mut stats = self.stats;
+        let map = self.map_tiles.metrics();
+        stats.map_tile_dispatched = map.dispatched;
+        stats.map_tile_failed = map.failed;
+        stats.map_tile_cancelled = map.cancelled;
+        stats.map_tile_prewarm_bytes = map.prewarm_bytes;
+        stats
     }
 
     pub fn last_presented_key(&self) -> Option<&FrameEvidenceKey> {
@@ -393,6 +415,32 @@ impl ProductFrame {
 
     pub fn set_virtual_cursor(&mut self, cursor: Option<(f32, f32)>) {
         self.virtual_cursor = cursor;
+    }
+
+    pub fn handle_map_input(
+        &mut self,
+        scene: &RenderScene,
+        event: &HostEvent,
+    ) -> Result<(bool, bool, Vec<MapViewportHostEvent>), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let consumed = self.map_interaction.consumes_host_event(scene, event);
+        let visible_changed = self.map_interaction.handle_host_event(scene, event)?;
+        let events = self.map_interaction.drain_events().collect();
+        Ok((consumed, visible_changed, events))
+    }
+
+    pub async fn next_map_tile_wake(&mut self) -> Option<()> {
+        self.map_tiles.next_wake().await
+    }
+
+    pub fn service_map_tiles(
+        &mut self,
+    ) -> Result<(bool, Vec<MapTileEvent>), Box<dyn std::error::Error + Send + Sync>> {
+        let changed =
+            self.map_tiles
+                .service_before_frame(&mut self.renderer, &self.device, &self.queue)?;
+        let events = self.map_tiles.drain_events().collect();
+        Ok((changed, events))
     }
 
     pub fn replace_asset_sources(
@@ -529,6 +577,22 @@ impl ProductFrame {
         scene_identity: String,
         revisions: (u64, u64, u64),
     ) -> Result<Option<PresentedFrame>, Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .device_lost_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
+            .is_some()
+        {
+            self.recover_lost_device(host).await?;
+        }
+        let interaction_revision = self.map_interaction.revision();
+        let interaction_dirty = interaction_revision != self.rendered_map_interaction_revision;
+        let scene = self.map_interaction.scene_for_render(scene)?;
+        if !interaction_dirty {
+            self.map_tiles
+                .service_before_frame(&mut self.renderer, &self.device, &self.queue)?;
+        }
         let viewport = host.viewport();
         if viewport.is_zero_sized() {
             return Ok(None);
@@ -565,7 +629,7 @@ impl ProductFrame {
                 queue: &self.queue,
                 encoder: &mut encoder,
                 view: &target.view,
-                scene,
+                scene: &scene,
                 scene_identity: Some(&scene_identity),
                 format: self.format,
                 width: viewport.physical_size.width,
@@ -597,13 +661,24 @@ impl ProductFrame {
                 queue: &self.queue,
                 encoder: &mut encoder,
                 view: &surface_view,
-                scene,
+                scene: &scene,
                 scene_identity: Some(&scene_identity),
                 format: self.format,
                 width: viewport.physical_size.width,
                 height: viewport.physical_size.height,
             })?
         };
+        self.rendered_map_interaction_revision = interaction_revision;
+        if interaction_dirty {
+            if self
+                .map_tiles
+                .service_before_frame(&mut self.renderer, &self.device, &self.queue)?
+            {
+                self.map_tiles.wake_product_frame();
+            }
+        } else {
+            self.map_tiles.service_after_frame(&mut self.renderer);
+        }
         let render_us = duration_us(render_started.elapsed());
 
         let submit_started = Instant::now();
@@ -702,6 +777,58 @@ impl ProductFrame {
         }))
     }
 
+    async fn recover_lost_device(
+        &mut self,
+        host: &mut NativeSurfaceHost,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let adapter = host
+            .request_adapter(wgpu::PowerPreference::HighPerformance, false)
+            .await?;
+        let adapter_info = adapter.get_info();
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("boon-playground-product-recovered-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::default(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+            })
+            .await
+            .map_err(|error| format!("recover product WGPU device: {error}"))?;
+        let lost_reason = install_device_lost_callback(&device);
+        let binding = host
+            .configure(&adapter, &device, SurfacePreferences::default())
+            .await?;
+        if self.stats.proof_enabled && !binding.usage.contains(wgpu::TextureUsages::COPY_DST) {
+            return Err("recovered proof surface lacks COPY_DST support".into());
+        }
+        self.renderer
+            .rebuild_device_resources(&device, &queue, binding.format)?;
+        self.device = device;
+        self.queue = queue;
+        self.format = binding.format;
+        self.device_lost_reason = lost_reason;
+        self.present_target = None;
+        self.last_presented_key = None;
+        self.last_presented_captured = false;
+        self.metadata.surface_epoch = binding.epoch;
+        self.metadata.surface_format = format_name(binding.format);
+        self.metadata.present_mode = present_mode_name(binding.present_mode).to_owned();
+        self.metadata.adapter_name = adapter_info.name.clone();
+        self.metadata.adapter_backend = backend_name(adapter_info.backend).to_owned();
+        self.metadata.adapter_device_type = device_type_name(adapter_info.device_type).to_owned();
+        let adapter_name = adapter_info.name.to_ascii_lowercase();
+        self.metadata.software_adapter = matches!(adapter_info.device_type, wgpu::DeviceType::Cpu)
+            || ["llvmpipe", "softpipe", "software", "swiftshader"]
+                .iter()
+                .any(|needle| adapter_name.contains(needle));
+        self.map_tiles
+            .service_before_frame(&mut self.renderer, &self.device, &self.queue)?;
+        Ok(())
+    }
+
     fn ensure_present_target(&mut self, width: u32, height: u32) {
         let reusable = self.present_target.as_ref().is_some_and(|target| {
             target.width == width && target.height == height && target.format == self.format
@@ -732,6 +859,17 @@ impl ProductFrame {
             format: self.format,
         });
     }
+}
+
+fn install_device_lost_callback(device: &wgpu::Device) -> Arc<Mutex<Option<String>>> {
+    let lost_reason = Arc::new(Mutex::new(None));
+    let callback_reason = Arc::clone(&lost_reason);
+    device.set_device_lost_callback(move |reason, message| {
+        if let Ok(mut slot) = callback_reason.lock() {
+            *slot = Some(format!("{reason:?}: {message}"));
+        }
+    });
+    lost_reason
 }
 
 fn align_to(value: u32, alignment: u32) -> Result<u32, &'static str> {

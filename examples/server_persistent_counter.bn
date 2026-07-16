@@ -1,0 +1,24 @@
+store: [
+    request: SOURCE
+
+    request_count:
+        0 |> HOLD request_count {
+            LATEST {
+                request.method |> THEN { request_count + 1 }
+            }
+        }
+]
+
+outputs: [
+    response: [
+        status: 200
+        body: store.request_count
+    ]
+]
+
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]

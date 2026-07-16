@@ -1,0 +1,40 @@
+{
+  "ok": true,
+  "data": {
+    "bounds": {
+      "minLongitude": 4.5,
+      "minLatitude": 58,
+      "maxLongitude": 8.5,
+      "maxLatitude": 63
+    },
+    "zoom": 7.5,
+    "dataSource": "surrealdb",
+    "items": [
+      {
+        "kind": "cluster",
+        "id": "cluster_forde",
+        "latitude": 61.452,
+        "longitude": 5.857,
+        "count": 4,
+        "bounds": {
+          "minLongitude": 5.7,
+          "minLatitude": 61.3,
+          "maxLongitude": 6.0,
+          "maxLatitude": 61.6
+        }
+      },
+      {
+        "kind": "station",
+        "id": "NSR:StopPlace:548",
+        "name": "Førde rutebilstasjon",
+        "latitude": 61.452,
+        "longitude": 5.857,
+        "transportModes": ["bus"]
+      }
+    ]
+  },
+  "meta": {
+    "requestId": "req_station_map",
+    "updatedAt": "2026-07-10T10:00:00Z"
+  }
+}

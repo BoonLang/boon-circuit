@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "data": {
+    "stationId": "NSR:StopPlace:548",
+    "searchRadiusMeters": 5000,
+    "state": "fresh",
+    "version": "2026-07-10T10:00:00Z",
+    "updatedAt": "2026-07-10T10:00:00Z",
+    "lastSuccessfulAt": "2026-07-10T10:00:00Z",
+    "warning": null,
+    "vehicles": [
+      {
+        "id": "SKY:Vehicle:12345",
+        "transportMode": "bus",
+        "passengerServiceState": "passenger",
+        "lineCode": "100",
+        "destination": "Nordfjordeid",
+        "state": "live",
+        "latitude": 61.453,
+        "longitude": 5.858,
+        "bearing": 42,
+        "delaySeconds": 120,
+        "distanceMeters": null,
+        "lastSeenAt": "2026-07-10T09:59:58Z",
+        "version": "2026-07-10T09:59:58Z"
+      }
+    ]
+  },
+  "meta": {
+    "requestId": "req_nearby_vehicles",
+    "updatedAt": "2026-07-10T10:00:00Z"
+  }
+}

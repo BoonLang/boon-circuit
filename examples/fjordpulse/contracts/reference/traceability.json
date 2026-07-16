@@ -1,0 +1,273 @@
+{
+  "schemaVersion": 1,
+  "contractVersion": "1.0.0",
+  "sourceStoryInventory": {
+    "manifest": "../docs/user-stories/00_manifest.json",
+    "traceabilityMatrix": "../docs/user-stories/traceability_matrix.csv",
+    "storyCount": 108,
+    "firstStory": "FP-001",
+    "lastStory": "FP-108"
+  },
+  "canonicalFiles": [
+    "http/openapi.yaml",
+    "realtime/envelope.schema.json",
+    "realtime/client-message.schema.json",
+    "realtime/server-message.schema.json"
+  ],
+  "httpOperations": [
+    {
+      "operationId": "getHealth",
+      "method": "GET",
+      "path": "/api/health",
+      "stories": ["FP-007", "FP-008", "FP-040", "FP-048", "FP-049", "FP-057", "FP-065", "FP-069", "FP-087", "FP-088", "FP-102"]
+    },
+    {
+      "operationId": "getReadiness",
+      "method": "GET",
+      "path": "/api/readiness",
+      "stories": ["FP-049", "FP-057", "FP-069", "FP-087", "FP-090"]
+    },
+    {
+      "operationId": "getMapConfig",
+      "method": "GET",
+      "path": "/api/map/config",
+      "stories": ["FP-001", "FP-002", "FP-005", "FP-008"]
+    },
+    {
+      "operationId": "getStationMap",
+      "method": "GET",
+      "path": "/api/stations",
+      "stories": ["FP-002", "FP-003", "FP-004", "FP-005", "FP-060", "FP-079"]
+    },
+    {
+      "operationId": "search",
+      "method": "GET",
+      "path": "/api/search",
+      "stories": ["FP-009", "FP-010", "FP-011", "FP-012", "FP-013", "FP-014", "FP-041", "FP-060", "FP-079", "FP-081"]
+    },
+    {
+      "operationId": "getStation",
+      "method": "GET",
+      "path": "/api/stations/{stationId}",
+      "stories": ["FP-013", "FP-015", "FP-017", "FP-020", "FP-021", "FP-022", "FP-025", "FP-048", "FP-055", "FP-079"]
+    },
+    {
+      "operationId": "getStationDepartures",
+      "method": "GET",
+      "path": "/api/stations/{stationId}/departures",
+      "stories": ["FP-015", "FP-018", "FP-019", "FP-020", "FP-021", "FP-022", "FP-025", "FP-048", "FP-050", "FP-055", "FP-079"]
+    },
+    {
+      "operationId": "getStationNearbyVehicles",
+      "method": "GET",
+      "path": "/api/stations/{stationId}/nearby-vehicles",
+      "stories": ["FP-015", "FP-023", "FP-024", "FP-025", "FP-048", "FP-051", "FP-055", "FP-079"]
+    },
+    {
+      "operationId": "getVehicle",
+      "method": "GET",
+      "path": "/api/vehicles/{vehicleId}",
+      "stories": ["FP-026", "FP-027", "FP-028", "FP-035", "FP-038", "FP-039", "FP-048", "FP-052", "FP-055", "FP-061", "FP-062", "FP-079"]
+    },
+    {
+      "operationId": "createRealtimeToken",
+      "method": "POST",
+      "path": "/api/realtime-token",
+      "stories": ["FP-040", "FP-042", "FP-047", "FP-078", "FP-080", "FP-081", "FP-084"]
+    },
+    {
+      "operationId": "getAdminDemoCredentials",
+      "method": "GET",
+      "path": "/api/admin/demo-credentials",
+      "stories": ["FP-064", "FP-078", "FP-081", "FP-082"]
+    },
+    {
+      "operationId": "getAdminSession",
+      "method": "GET",
+      "path": "/api/admin/session",
+      "stories": ["FP-064", "FP-078", "FP-082"]
+    },
+    {
+      "operationId": "createAdminSession",
+      "method": "POST",
+      "path": "/api/admin/session",
+      "stories": ["FP-064", "FP-081", "FP-082"]
+    },
+    {
+      "operationId": "deleteAdminSession",
+      "method": "DELETE",
+      "path": "/api/admin/session",
+      "stories": ["FP-064", "FP-082"]
+    },
+    {
+      "operationId": "getAdminStatus",
+      "method": "GET",
+      "path": "/api/admin/status",
+      "stories": ["FP-049", "FP-053", "FP-057", "FP-058", "FP-059", "FP-063", "FP-065", "FP-068", "FP-069", "FP-082", "FP-091"]
+    },
+    {
+      "operationId": "getAdminWatches",
+      "method": "GET",
+      "path": "/api/admin/watches",
+      "stories": ["FP-016", "FP-029", "FP-034", "FP-036", "FP-037", "FP-043", "FP-044", "FP-045", "FP-053", "FP-066", "FP-068", "FP-096"]
+    },
+    {
+      "operationId": "getAdminEnturLog",
+      "method": "GET",
+      "path": "/api/admin/entur-log",
+      "stories": ["FP-041", "FP-049", "FP-050", "FP-051", "FP-053", "FP-054", "FP-067", "FP-070", "FP-082"]
+    },
+    {
+      "operationId": "getAdminRealtime",
+      "method": "GET",
+      "path": "/api/admin/realtime",
+      "stories": ["FP-040", "FP-043", "FP-044", "FP-045", "FP-046", "FP-047", "FP-048", "FP-063", "FP-068", "FP-069", "FP-088"]
+    },
+    {
+      "operationId": "getAdminEvents",
+      "method": "GET",
+      "path": "/api/admin/events",
+      "stories": ["FP-046", "FP-063", "FP-065", "FP-068"]
+    },
+    {
+      "operationId": "getAdminMigrations",
+      "method": "GET",
+      "path": "/api/admin/migrations",
+      "stories": ["FP-058", "FP-059", "FP-065", "FP-082"]
+    },
+    {
+      "operationId": "getAdminDatabaseSchema",
+      "method": "GET",
+      "path": "/api/admin/database/schema",
+      "stories": ["FP-057", "FP-059", "FP-065", "FP-078", "FP-082", "FP-089"]
+    },
+    {
+      "operationId": "getAdminDatabaseMigrations",
+      "method": "GET",
+      "path": "/api/admin/database/migrations",
+      "stories": ["FP-057", "FP-058", "FP-065", "FP-078", "FP-082", "FP-089", "FP-091"]
+    },
+    {
+      "operationId": "getDevScenario",
+      "method": "GET",
+      "path": "/api/dev/scenario",
+      "stories": ["FP-055", "FP-056", "FP-071", "FP-094", "FP-095", "FP-096", "FP-097", "FP-098", "FP-099"]
+    },
+    {
+      "operationId": "setDevScenario",
+      "method": "POST",
+      "path": "/api/dev/scenario",
+      "stories": ["FP-055", "FP-056", "FP-071", "FP-094", "FP-095", "FP-096", "FP-097", "FP-098", "FP-099"]
+    },
+    {
+      "operationId": "getDevScenarios",
+      "method": "GET",
+      "path": "/api/dev/scenarios",
+      "stories": ["FP-055", "FP-056", "FP-071", "FP-094", "FP-095", "FP-096", "FP-097", "FP-098", "FP-099"]
+    }
+  ],
+  "clientMessages": [
+    { "type": "watch_station", "stories": ["FP-013", "FP-016", "FP-025", "FP-042", "FP-043", "FP-080", "FP-096"] },
+    { "type": "unwatch_station", "stories": ["FP-016", "FP-042", "FP-043", "FP-080", "FP-096"] },
+    { "type": "watch_vehicle", "stories": ["FP-023", "FP-026", "FP-035", "FP-036", "FP-042", "FP-044", "FP-080", "FP-096"] },
+    { "type": "unwatch_vehicle", "stories": ["FP-034", "FP-037", "FP-042", "FP-044", "FP-080", "FP-096"] },
+    { "type": "focus_vehicle", "stories": ["FP-029", "FP-030", "FP-042", "FP-045", "FP-052", "FP-080", "FP-096"] },
+    { "type": "unfocus_vehicle", "stories": ["FP-034", "FP-038", "FP-042", "FP-045", "FP-080", "FP-096"] },
+    { "type": "pause_focus", "stories": ["FP-032", "FP-042", "FP-045", "FP-080", "FP-096"] },
+    { "type": "resume_focus", "stories": ["FP-033", "FP-042", "FP-045", "FP-080", "FP-096"] },
+    { "type": "ping", "stories": ["FP-040", "FP-042", "FP-047", "FP-080", "FP-095"] }
+  ],
+  "serverMessages": [
+    { "type": "watch_station_ack", "stories": ["FP-016", "FP-042", "FP-043", "FP-096"] },
+    { "type": "unwatch_station_ack", "stories": ["FP-016", "FP-042", "FP-043", "FP-096"] },
+    { "type": "watch_vehicle_ack", "stories": ["FP-042", "FP-044", "FP-096"] },
+    { "type": "unwatch_vehicle_ack", "stories": ["FP-037", "FP-042", "FP-044", "FP-096"] },
+    { "type": "focus_started", "stories": ["FP-029", "FP-042", "FP-045", "FP-096"] },
+    { "type": "focus_stopped", "stories": ["FP-034", "FP-038", "FP-042", "FP-045", "FP-096"] },
+    { "type": "focus_paused", "stories": ["FP-032", "FP-042", "FP-045", "FP-096"] },
+    { "type": "focus_resumed", "stories": ["FP-033", "FP-042", "FP-045", "FP-096"] },
+    { "type": "station_snapshot", "stories": ["FP-015", "FP-017", "FP-018", "FP-019", "FP-020", "FP-021", "FP-025", "FP-043", "FP-047"] },
+    { "type": "station_snapshot_changed", "stories": ["FP-018", "FP-019", "FP-020", "FP-023", "FP-024", "FP-025", "FP-043", "FP-046", "FP-050", "FP-051", "FP-063"] },
+    { "type": "station_departures_changed", "stories": ["FP-018", "FP-019", "FP-020", "FP-025", "FP-046", "FP-050"] },
+    { "type": "nearby_vehicles_changed", "stories": ["FP-023", "FP-024", "FP-025", "FP-046", "FP-051"] },
+    { "type": "vehicle_snapshot", "stories": ["FP-027", "FP-028", "FP-035", "FP-038", "FP-044", "FP-047", "FP-061", "FP-062"] },
+    { "type": "vehicle_moved", "stories": ["FP-028", "FP-030", "FP-046", "FP-052", "FP-061", "FP-062", "FP-063"] },
+    { "type": "vehicle_stale", "stories": ["FP-035", "FP-046", "FP-052", "FP-055", "FP-063"] },
+    { "type": "vehicle_lost", "stories": ["FP-038", "FP-039", "FP-046", "FP-052", "FP-055", "FP-063"] },
+    { "type": "source_backoff", "stories": ["FP-008", "FP-020", "FP-046", "FP-054", "FP-055"] },
+    { "type": "rate_limited", "stories": ["FP-046", "FP-053", "FP-054", "FP-081"] },
+    { "type": "telemetry_tick", "stories": ["FP-007", "FP-040", "FP-046", "FP-065", "FP-068"] },
+    { "type": "realtime_degraded", "stories": ["FP-007", "FP-008", "FP-040", "FP-047", "FP-048", "FP-069", "FP-097"] },
+    { "type": "resync_required", "stories": ["FP-025", "FP-030", "FP-047", "FP-048", "FP-061"] },
+    { "type": "pong", "stories": ["FP-040", "FP-042", "FP-047", "FP-095"] },
+    { "type": "error", "stories": ["FP-021", "FP-039", "FP-042", "FP-045", "FP-080", "FP-081", "FP-095"] }
+  ],
+  "nonWireStories": [
+    { "story": "FP-001", "reason": "Public shell rendering has no additional wire shape." },
+    { "story": "FP-006", "reason": "Selected-marker highlighting is frontend state." },
+    { "story": "FP-031", "reason": "Focus-pill presentation consumes already-traced focus messages." },
+    { "story": "FP-072", "reason": "Mobile default layout is a visual acceptance surface." },
+    { "story": "FP-073", "reason": "Mobile half-sheet layout is a visual acceptance surface." },
+    { "story": "FP-074", "reason": "Mobile full-sheet layout is a visual acceptance surface." },
+    { "story": "FP-075", "reason": "Mobile Focus layout consumes already-traced vehicle and focus messages." },
+    { "story": "FP-076", "reason": "Mobile lost layout consumes the already-traced vehicle_lost message." },
+    { "story": "FP-077", "reason": "Design-system component reuse is not a wire contract." },
+    { "story": "FP-083", "reason": "Privacy and no-account behavior are policy and UI requirements." },
+    { "story": "FP-085", "reason": "Sharptech and Coolify deployment is an operator black-box surface, not an HTTP or realtime wire shape." },
+    { "story": "FP-086", "reason": "Actual DNS, HTTPS, and WSS rollout is outside the local goal." },
+    { "story": "FP-092", "reason": "Scheduled maintenance is an operational orchestration behavior." },
+    { "story": "FP-093", "reason": "Static analysis is a repository quality gate." },
+    { "story": "FP-100", "reason": "Accessibility is a UI and black-box quality surface." },
+    { "story": "FP-101", "reason": "Performance is a runtime quality budget." },
+    { "story": "FP-103", "reason": "Architecture documentation is a handoff artifact." },
+    { "story": "FP-104", "reason": "Local-development documentation is a handoff artifact." },
+    { "story": "FP-105", "reason": "Deployment documentation is a handoff artifact." },
+    { "story": "FP-106", "reason": "Entur usage documentation is a handoff artifact." },
+    { "story": "FP-107", "reason": "UI state documentation is a handoff artifact." },
+    { "story": "FP-108", "reason": "Production readiness is the aggregate completion audit." }
+  ],
+  "crossCuttingRequirements": [
+    {
+      "id": "FP-CONTRACT-001",
+      "requirement": "The browser never calls Entur or SurrealDB directly.",
+      "sources": ["AGENTS.md rules 1-2", "FP-041", "FP-078"]
+    },
+    {
+      "id": "FP-CONTRACT-002",
+      "requirement": "Database-originated notifications use the sole DEFINE EVENT to LIVE SELECT publication path and are not broadcast directly after writes.",
+      "sources": ["AGENTS.md rules 10-11", "GOAL.md phase 8", "FP-046", "FP-063"]
+    },
+    {
+      "id": "FP-CONTRACT-003",
+      "requirement": "Snapshots are authoritative; notifications carry versions and clients ignore duplicate or older versions.",
+      "sources": ["AGENTS.md rules 13-14", "GOAL.md phase 8", "FP-047", "FP-061"]
+    },
+    {
+      "id": "FP-CONTRACT-004",
+      "requirement": "A failed live-query bridge exposes degraded health and uses HTTP snapshot polling without a second publication path.",
+      "sources": ["AGENTS.md rule 12", "FP-048", "FP-069", "FP-097"]
+    },
+    {
+      "id": "FP-CONTRACT-005",
+      "requirement": "All boundary timestamps are UTC RFC3339 and transport display conversion occurs only in the UI using Europe/Oslo.",
+      "sources": ["AGENTS.md rule 15", "docs/03_api_contract.md"]
+    },
+    {
+      "id": "FP-CONTRACT-006",
+      "requirement": "Development scenarios are unavailable in production and production never fakes or interpolates vehicle movement.",
+      "sources": ["AGENTS.md rules 3-4", "FP-056", "FP-078"]
+    }
+  ],
+  "developmentScenarios": [
+    "normal",
+    "station_empty",
+    "station_stale",
+    "station_error",
+    "vehicle_live",
+    "vehicle_stale",
+    "vehicle_lost",
+    "fallback",
+    "entur_backoff",
+    "realtime_reconnect"
+  ]
+}

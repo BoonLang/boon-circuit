@@ -1,5 +1,9 @@
 use super::*;
 
+fn number(value: i64) -> Value {
+    Value::integer(value).unwrap()
+}
+
 fn runtime_for_path(path: &str) -> LiveRuntime {
     let units = source_units_for_path(Path::new(path)).unwrap();
     LiveRuntime::from_project(path, &units).unwrap()
@@ -25,6 +29,31 @@ fn apply_mount(patches: &[DocumentPatch]) -> boon_document::DocumentState {
 }
 
 #[test]
+fn generic_map_viewport_mounts_a_valid_typed_descriptor() {
+    let runtime = LiveRuntime::from_source(
+        "examples/map_viewport_descriptor.bn",
+        include_str!("../../../examples/map_viewport_descriptor.bn"),
+    )
+    .unwrap();
+    let mount = runtime.mount();
+    assert_eq!(mount.document_patch_status, DocumentPatchStatus::Complete);
+    let frame = runtime.document_frame().unwrap();
+    let map = frame
+        .nodes
+        .values()
+        .find(|node| node.kind == boon_document_model::DocumentNodeKind::MapViewport)
+        .expect("typed MapViewport node");
+    let descriptor = map.map_viewport.as_ref().expect("map descriptor");
+    descriptor.validate().unwrap();
+    assert_eq!(
+        descriptor.generation,
+        boon_document_model::MapViewportGeneration(4)
+    );
+    assert!(descriptor.overlays.is_empty());
+    assert_eq!(descriptor.visible_xyz_tile_requests(1).unwrap().len(), 16);
+}
+
+#[test]
 fn scenario_parser_exposes_typed_source_events() {
     let scenario = parse_scenario(Path::new("../../examples/counter.scn")).unwrap();
     let event = scenario
@@ -47,7 +76,7 @@ fn unscoped_scenario_source_ignores_visual_target_text() {
     assert_eq!(turns.len(), 6);
     assert_eq!(
         runtime.root_value_current("store.count").unwrap(),
-        Value::Number(0)
+        number(0)
     );
 }
 
@@ -281,20 +310,20 @@ fn unsettled_runtime_turn_rolls_back_authority_document_and_sequence() {
     assert!(!prepared.durable_changes.is_empty());
     assert_eq!(
         runtime.root_value_current("store.count").unwrap(),
-        Value::Number(1)
+        number(1)
     );
 
     runtime.rollback_unsettled_turn().unwrap();
     assert_eq!(
         runtime.root_value_current("store.count").unwrap(),
-        Value::Number(0)
+        number(0)
     );
     assert_eq!(runtime.document_frame(), Some(&original_frame));
 
     runtime.dispatch(event).unwrap();
     assert_eq!(
         runtime.root_value_current("store.count").unwrap(),
-        Value::Number(1)
+        number(1)
     );
 }
 
@@ -909,10 +938,15 @@ fn cells_formula_dependency_recomputes_visible_fanout() {
         .unwrap();
     let value = runtime.session.project_current(&[b0_value]).unwrap()[&b0_value].clone();
 
-    assert!(turn.metrics.recomputed_targets.contains(&b0_value));
+    assert!(
+        turn.metrics.recomputed_targets.contains(&b0_value),
+        "metrics: {:#?}; deltas: {:#?}",
+        turn.metrics,
+        turn.deltas
+    );
     assert_eq!(
         value,
-        Value::Number(51),
+        number(51),
         "metrics: {:#?}; deltas: {:#?}",
         turn.metrics,
         turn.deltas
@@ -1238,7 +1272,7 @@ fn durable_restore_settles_before_initial_document_materialization() {
 
     assert_eq!(
         restored.root_value_current("store.count").unwrap(),
-        Value::Number(1)
+        number(1)
     );
     assert!(
         restored

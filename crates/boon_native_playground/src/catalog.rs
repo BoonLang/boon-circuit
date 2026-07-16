@@ -1,8 +1,10 @@
+use crate::program_bundle::{ProgramSource, compile_program_bundle};
 use crate::protocol::{
     ApplicationIdentity, AssetBlob, CatalogItem, MigrationBundle, MigrationStage,
     MigrationTestDriver, SourceUnit, TestStep,
 };
-use boon_runtime::{ExampleManifestEntry, RuntimeResult};
+use boon_plan::ProgramRole;
+use boon_runtime::{ExampleManifestEntry, PairedProgramLifecycle, ProgramBundle, RuntimeResult};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::{fs, path::PathBuf};
@@ -16,6 +18,20 @@ pub struct LoadedExample {
     pub test_steps: Vec<TestStep>,
     pub assets: Vec<AssetBlob>,
     pub migration: Option<MigrationBundle>,
+    program_bundle: Option<ProgramBundle>,
+}
+
+impl LoadedExample {
+    pub(crate) fn program_bundle(&self) -> Option<&ProgramBundle> {
+        self.program_bundle.as_ref()
+    }
+
+    pub(crate) fn start_paired_programs(&self) -> RuntimeResult<Option<PairedProgramLifecycle>> {
+        self.program_bundle
+            .as_ref()
+            .map(ProgramBundle::start_paired)
+            .transpose()
+    }
 }
 
 pub struct Catalog {
@@ -101,6 +117,12 @@ impl Catalog {
                 })
                 .collect(),
         };
+        let base_application = built_in_application_identity(entry);
+        let program_bundle = load_program_bundle(entry, &base_application, &units)?;
+        let application = program_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.artifact(ProgramRole::Document))
+            .map_or(base_application, |artifact| artifact.application().clone());
         let test_steps = match migration.as_ref().map(|migration| migration.test_driver) {
             Some(MigrationTestDriver::Migration) => Vec::new(),
             Some(MigrationTestDriver::Example) | None => ordinary_test_steps(&entry.scenario)?,
@@ -117,13 +139,108 @@ impl Catalog {
         Ok(LoadedExample {
             id: entry.id.clone(),
             label: entry.label.clone(),
-            application: built_in_application_identity(entry),
+            application,
             units,
             test_steps,
             assets,
             migration,
+            program_bundle,
         })
     }
+}
+
+fn load_program_bundle(
+    entry: &ExampleManifestEntry,
+    base_application: &ApplicationIdentity,
+    primary_units: &[SourceUnit],
+) -> RuntimeResult<Option<ProgramBundle>> {
+    if entry.programs.is_empty() {
+        return Ok(None);
+    }
+    let paired = entry.programs.len() > 1;
+    let sources = entry
+        .programs
+        .iter()
+        .map(|program| {
+            let units = boon_compiler::compiler_source_units_for_manifest_source(
+                &program.source,
+                &program.source_files,
+            )?
+            .into_iter()
+            .map(|unit| {
+                Ok(SourceUnit {
+                    path: workspace_relative_source_path(&unit.path)?,
+                    source: unit.source,
+                })
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?;
+            let state_namespace = program.state_namespace.clone().unwrap_or_else(|| {
+                if paired {
+                    format!(
+                        "{}:{}",
+                        base_application.state_namespace,
+                        program.role.as_str()
+                    )
+                } else {
+                    base_application.state_namespace.clone()
+                }
+            });
+            Ok(ProgramSource {
+                role: program.role,
+                entry_path: program.source.clone(),
+                units,
+                application: ApplicationIdentity::new(
+                    base_application.package_id.clone(),
+                    state_namespace,
+                    base_application.deployment_domain.clone(),
+                ),
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    let primary_units = primary_units
+        .iter()
+        .map(|unit| {
+            Ok(SourceUnit {
+                path: workspace_relative_source_path(&unit.path)?,
+                source: unit.source.clone(),
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    if let Some(document) = sources
+        .iter()
+        .find(|source| source.role == ProgramRole::Document)
+        && document.units != primary_units
+    {
+        return Err(format!(
+            "example `{}` primary source differs from its declared document program",
+            entry.id
+        )
+        .into());
+    }
+    compile_program_bundle(sources).map(Some)
+}
+
+fn workspace_relative_source_path(path: &str) -> RuntimeResult<String> {
+    let path = Path::new(path);
+    let relative = if path.is_absolute() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("native playground manifest directory has no workspace parent")?;
+        path.strip_prefix(workspace).map_err(|_| {
+            format!(
+                "program source path `{}` is outside workspace `{}`",
+                path.display(),
+                workspace.display()
+            )
+        })?
+    } else {
+        path
+    };
+    relative
+        .to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("program source path `{}` is not UTF-8", path.display()).into())
 }
 
 fn load_migration_bundle(
@@ -309,6 +426,7 @@ mod tests {
         let id = catalog.initial_id(Some("counter")).expect("counter id");
         let example = catalog.open(id).expect("counter sources");
         assert_eq!(example.id, "counter");
+        assert!(example.program_bundle().is_none());
         assert!(!example.units.is_empty());
         assert!(example.units.iter().all(|unit| !unit.path.is_empty()));
         assert!(example.units.iter().all(|unit| !unit.source.is_empty()));
@@ -450,6 +568,119 @@ mod tests {
                 "missing built-in catalog entry {id:?}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_program_declarations_build_the_unrelated_runtime_owned_pair() {
+        const SHARED: &str =
+            "crates/boon_native_playground/testdata/paired_fixture/Shared/PairContract.bn";
+        const CLIENT: &str = "crates/boon_native_playground/testdata/paired_fixture/Client/RUN.bn";
+        const SERVER: &str = "crates/boon_native_playground/testdata/paired_fixture/Server/RUN.bn";
+
+        let catalog = Catalog::load().expect("catalog");
+        let mut entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.programs.len() == 2)
+            .expect("paired catalog declaration")
+            .clone();
+        entry.id = "paired-fixture".to_owned();
+        entry.source = CLIENT.to_owned();
+        entry.source_files = vec![SHARED.to_owned(), CLIENT.to_owned()];
+        let document_declaration = entry
+            .programs
+            .iter_mut()
+            .find(|program| program.role == ProgramRole::Document)
+            .expect("document declaration");
+        document_declaration.source = CLIENT.to_owned();
+        document_declaration.source_files = vec![SHARED.to_owned(), CLIENT.to_owned()];
+        document_declaration.state_namespace = Some("fixture-client".to_owned());
+        let server_declaration = entry
+            .programs
+            .iter_mut()
+            .find(|program| program.role == ProgramRole::Server)
+            .expect("server declaration");
+        server_declaration.source = SERVER.to_owned();
+        server_declaration.source_files = vec![SHARED.to_owned(), SERVER.to_owned()];
+        server_declaration.state_namespace = Some("fixture-server".to_owned());
+
+        let primary_units = boon_runtime::source_units_for_entry(&entry)
+            .expect("fixture document source units")
+            .into_iter()
+            .map(|unit| SourceUnit {
+                path: unit.path,
+                source: unit.source,
+            })
+            .collect::<Vec<_>>();
+        let application = ApplicationIdentity::new("dev.boon.paired-fixture", "base", "test");
+        let bundle = load_program_bundle(&entry, &application, &primary_units)
+            .expect("load fixture program declarations")
+            .expect("paired fixture bundle");
+        assert_eq!(bundle.artifacts().len(), 2);
+
+        let document = bundle
+            .artifact(ProgramRole::Document)
+            .expect("fixture document artifact");
+        let server = bundle
+            .artifact(ProgramRole::Server)
+            .expect("fixture server artifact");
+        assert_eq!(document.role(), ProgramRole::Document);
+        assert_eq!(server.role(), ProgramRole::Server);
+        assert_eq!(
+            document.capability_profile(),
+            boon_runtime::ProgramCapabilityProfile::PublicDocument
+        );
+        assert_eq!(
+            server.capability_profile(),
+            boon_runtime::ProgramCapabilityProfile::TrustedServer
+        );
+        assert_eq!(document.application().state_namespace, "fixture-client");
+        assert_eq!(server.application().state_namespace, "fixture-server");
+        assert_ne!(document.application(), server.application());
+        assert!(!document.source_digest().is_empty());
+        assert!(!server.source_digest().is_empty());
+        let document_application = document.application().clone();
+
+        let mut loaded = catalog.open("counter").expect("catalog fixture host");
+        loaded.application = document_application.clone();
+        loaded.program_bundle = Some(bundle);
+        let mut lifecycle = loaded
+            .start_paired_programs()
+            .expect("start fixture programs")
+            .expect("fixture pair");
+        assert_eq!(lifecycle.session_count(), 2);
+        assert_eq!(
+            lifecycle
+                .artifact(ProgramRole::Document)
+                .expect("document session")
+                .application(),
+            &document_application
+        );
+        assert_eq!(
+            lifecycle
+                .root_value_current(ProgramRole::Server, "store.server_count")
+                .expect("initial server count"),
+            boon_runtime::Value::integer(0).unwrap()
+        );
+        lifecycle
+            .dispatch(
+                ProgramRole::Server,
+                "store.request_received",
+                None,
+                boon_runtime::SourcePayload::default(),
+            )
+            .expect("server source turn");
+        assert_eq!(
+            lifecycle
+                .root_value_current(ProgramRole::Server, "store.server_count")
+                .expect("updated server count"),
+            boon_runtime::Value::integer(1).unwrap()
+        );
+        let response = lifecycle
+            .output_value_current(ProgramRole::Server, "api_response")
+            .expect("server output");
+        assert!(matches!(response, boon_runtime::Value::Record(fields)
+            if fields.get("count") == Some(&boon_runtime::Value::integer(1).unwrap())));
     }
 
     #[test]

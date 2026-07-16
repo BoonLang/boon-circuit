@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "data": {
+    "status": "unhealthy",
+    "mode": "fallback_polling",
+    "dataMode": "real",
+    "checkedAt": "2026-07-10T10:00:00Z",
+    "version": "1.0.0-dev",
+    "fallbackAvailable": false,
+    "dependencies": {
+      "http": { "status": "healthy", "checkedAt": "2026-07-10T10:00:00Z" },
+      "realtime": { "status": "unavailable", "checkedAt": "2026-07-10T10:00:00Z" },
+      "surrealdb": {
+        "status": "unavailable",
+        "checkedAt": "2026-07-10T10:00:00Z",
+        "message": "Authoritative state is unavailable."
+      },
+      "entur": { "status": "unknown", "checkedAt": "2026-07-10T10:00:00Z" },
+      "mapTiles": { "status": "misconfigured", "checkedAt": "2026-07-10T10:00:00Z" },
+      "liveQueryBridge": { "status": "unavailable", "checkedAt": "2026-07-10T10:00:00Z" }
+    }
+  },
+  "meta": {
+    "requestId": "req_unhealthy",
+    "updatedAt": "2026-07-10T10:00:00Z"
+  }
+}

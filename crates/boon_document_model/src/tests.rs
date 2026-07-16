@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn program_capability_profiles_have_stable_names_and_public_default() {
+    #[derive(serde::Deserialize)]
+    struct ProfileConfig {
+        profile: ProgramCapabilityProfile,
+    }
+
+    assert_eq!(
+        ProgramCapabilityProfile::default(),
+        ProgramCapabilityProfile::PublicDocument
+    );
+    assert_eq!(
+        ProgramCapabilityProfile::PublicDocument.name(),
+        "public_document"
+    );
+    assert_eq!(
+        ProgramCapabilityProfile::TrustedServer.name(),
+        "trusted_server"
+    );
+    assert_eq!(
+        toml::from_str::<ProfileConfig>("profile = \"trusted_server\"")
+            .unwrap()
+            .profile,
+        ProgramCapabilityProfile::TrustedServer
+    );
+}
+
+#[test]
 fn typed_ui_style_changes_lower_to_compatible_style_patches() {
     let node = DocumentNodeId("node".to_owned());
     let typed_changes = vec![

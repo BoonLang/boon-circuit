@@ -7,12 +7,15 @@ use std::path::{Component, Path};
 
 mod binary;
 mod document;
+mod host;
 
+pub use boon_data::{FiniteReal, FiniteRealError};
 pub use document::*;
+pub use host::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 3;
+pub const PLAN_MAJOR_VERSION: u32 = 4;
 pub const PLAN_MINOR_VERSION: u32 = 0;
-pub const PERSISTENCE_FORMAT_VERSION: u32 = 1;
+pub const PERSISTENCE_FORMAT_VERSION: u32 = 2;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
 pub const INLINE_BYTE_CONSTANT_LIMIT: usize = 1024;
 
@@ -24,7 +27,7 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct PlanVersion {
     pub major: u32,
     pub minor: u32,
@@ -45,6 +48,28 @@ pub enum TargetProfile {
     SoftwareDefault,
     SoftwareBounded,
     FpgaTodomvc,
+}
+
+/// Declares how a host drives a compiled program.
+///
+/// This is deliberately orthogonal to [`TargetProfile`]: the role describes
+/// the program boundary, while the target profile describes execution and
+/// resource constraints.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramRole {
+    #[default]
+    Document,
+    Server,
+}
+
+impl ProgramRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Document => "document",
+            Self::Server => "server",
+        }
+    }
 }
 
 impl TargetProfile {
@@ -124,6 +149,8 @@ plan_digest_ids!(
     EffectId,
     EffectInvocationId,
     OutputRootId,
+    QueryCollectionId,
+    QueryIndexId,
     MemoryId,
     MemoryLeafId,
     MigrationInputId,
@@ -318,6 +345,14 @@ pub struct EffectContract {
     pub replay: EffectReplay,
     pub barrier: EffectBarrier,
     pub result_policy: EffectResultPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<EffectSchemaPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectSchemaPlan {
+    pub intent_type: DataTypePlan,
+    pub result_type: DataTypePlan,
 }
 
 impl EffectContract {
@@ -334,6 +369,7 @@ impl EffectContract {
             replay,
             barrier,
             result_policy,
+            schema: None,
         };
         contract.validate()?;
         Ok(contract)
@@ -357,6 +393,25 @@ impl EffectContract {
         {
             return Err(PlanError::new(
                 "idempotent effect key type must be canonical and closed",
+            ));
+        }
+        if let Some(schema) = &self.schema
+            && [&schema.intent_type, &schema.result_type]
+                .into_iter()
+                .any(|data_type| !data_type.is_canonical() || data_type_contains_unknown(data_type))
+        {
+            return Err(PlanError::new(
+                "effect schemas must use canonical closed data types",
+            ));
+        }
+        if self.result_policy == EffectResultPolicy::CorrelatedSource
+            && !matches!(
+                self.schema.as_ref().map(|schema| &schema.result_type),
+                Some(DataTypePlan::Variant { .. })
+            )
+        {
+            return Err(PlanError::new(
+                "correlated effects require a closed typed variant result schema",
             ));
         }
         match (&self.replay, self.barrier, self.result_policy) {
@@ -434,7 +489,12 @@ pub fn builtin_effect_contract(host_operation: &str) -> Result<Option<EffectCont
             }
             boon_effect_schema::ResultPolicySpec::Discarded => EffectResultPolicy::Discarded,
         },
+        schema: spec.schema.as_ref().map(|schema| EffectSchemaPlan {
+            intent_type: effect_schema_type_to_plan(&schema.intent).canonicalized(),
+            result_type: effect_schema_type_to_plan(&schema.result).canonicalized(),
+        }),
     };
+    contract.validate()?;
     Ok(Some(contract))
 }
 
@@ -444,21 +504,21 @@ pub fn builtin_effect_outbox_schema(
     let Some(spec) = boon_effect_schema::host_effect_spec(host_operation) else {
         return Ok(None);
     };
-    let Some(schema) = spec.durable_schema else {
-        return Ok(None);
-    };
-    let intent_type = effect_schema_type_to_plan(&schema.intent);
-    let result_type = effect_schema_type_to_plan(&schema.result);
     let contract = builtin_effect_contract(host_operation)?.ok_or_else(|| {
         PlanError::new(format!(
             "effect outbox schema `{host_operation}` has no built-in contract"
         ))
     })?;
     let EffectReplay::Idempotent { key_type } = contract.replay else {
+        return Ok(None);
+    };
+    let Some(schema) = spec.schema else {
         return Err(PlanError::new(format!(
-            "effect outbox schema `{host_operation}` is not idempotent"
+            "idempotent effect `{host_operation}` has no typed schema"
         )));
     };
+    let intent_type = effect_schema_type_to_plan(&schema.intent);
+    let result_type = effect_schema_type_to_plan(&schema.result);
     EffectOutboxSchema::new(contract.effect_id, intent_type, key_type, result_type).map(Some)
 }
 
@@ -469,6 +529,9 @@ fn effect_schema_type_to_plan(value_type: &boon_effect_schema::ValueType) -> Dat
         boon_effect_schema::ValueType::Text => DataTypePlan::Text,
         boon_effect_schema::ValueType::Bytes { fixed_len } => DataTypePlan::Bytes {
             fixed_len: *fixed_len,
+        },
+        boon_effect_schema::ValueType::List { item } => DataTypePlan::List {
+            item: Box::new(effect_schema_type_to_plan(item)),
         },
         boon_effect_schema::ValueType::Record { fields, open } => DataTypePlan::Record {
             fields: fields
@@ -810,7 +873,7 @@ pub enum MigrationExpressionPlan {
         value: String,
     },
     Number {
-        value: i64,
+        value: FiniteReal,
     },
     Byte {
         value: u8,
@@ -2017,16 +2080,7 @@ impl SourcePayloadSchema {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourcePayloadDescriptor {
     pub field: SourcePayloadField,
-    pub value_type: SourcePayloadValueType,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourcePayloadValueType {
-    Bytes,
-    Bool,
-    Number,
-    Text,
+    pub data_type: DataTypePlan,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -2090,10 +2144,18 @@ impl OutputRootPlan {
 pub struct MachinePlan {
     pub version: PlanVersion,
     pub target_profile: TargetProfile,
+    #[serde(default)]
+    pub program_role: ProgramRole,
     pub application: ApplicationPlan,
     pub persistence: PersistencePlan,
     pub effects: Vec<EffectContract>,
     pub outputs: Vec<OutputRootPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_ports: Vec<HostPortPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_collections: Vec<QueryCollectionPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub query_indexes: Vec<QueryIndexPlan>,
     pub demand: DemandPlan,
     pub document: Option<DocumentPlan>,
     pub constants: Vec<PlanConstant>,
@@ -2105,6 +2167,303 @@ pub struct MachinePlan {
     pub delta_plan: DeltaPlan,
     pub capability_summary: CapabilitySummary,
     pub debug_map: DebugMap,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryTextNormalization {
+    #[default]
+    Exact,
+    TrimLowercase,
+    Tokens,
+}
+
+impl QueryTextNormalization {
+    pub fn normalize(self, value: &str) -> String {
+        match self {
+            Self::Exact => value.to_owned(),
+            Self::TrimLowercase => value
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase(),
+            Self::Tokens => boon_query::normalize_text(value),
+        }
+    }
+}
+
+impl From<QueryTextNormalization> for boon_query::TextNormalization {
+    fn from(value: QueryTextNormalization) -> Self {
+        match value {
+            QueryTextNormalization::Exact => Self::Exact,
+            QueryTextNormalization::TrimLowercase => Self::TrimLowercase,
+            QueryTextNormalization::Tokens => Self::Tokens,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryKeyType {
+    Bool,
+    Number,
+    Text,
+    Tag,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryIndexOrder {
+    #[default]
+    Ascending,
+    Descending,
+}
+
+impl From<QueryIndexOrder> for boon_query::IndexOrder {
+    fn from(value: QueryIndexOrder) -> Self {
+        match value {
+            QueryIndexOrder::Ascending => Self::Ascending,
+            QueryIndexOrder::Descending => Self::Descending,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryIndexFieldPlan {
+    pub field: FieldId,
+    pub path: Vec<String>,
+    pub semantic_path: String,
+    pub key_type: QueryKeyType,
+    pub normalization: QueryTextNormalization,
+    pub multi_value: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryCollectionPlan {
+    pub id: QueryCollectionId,
+    pub source_list: ListId,
+    pub semantic_path: String,
+    pub row_schema_hash: [u8; 32],
+    pub schema_version: u64,
+    pub retention: QueryRetentionPlan,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueryRetentionPlan {
+    #[default]
+    KeepAll,
+    MaxRows {
+        max_rows: u64,
+    },
+}
+
+impl QueryCollectionPlan {
+    pub fn new(
+        source_list: ListId,
+        semantic_path: impl Into<String>,
+        row_schema_hash: [u8; 32],
+        schema_version: u64,
+        retention: QueryRetentionPlan,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        if semantic_path.is_empty()
+            || semantic_path.trim() != semantic_path
+            || schema_version == 0
+            || matches!(retention, QueryRetentionPlan::MaxRows { max_rows: 0 })
+        {
+            return Err(PlanError::new(
+                "query collection identity, schema version, and retention must be canonical",
+            ));
+        }
+        let engine = boon_query::CollectionPlan::new_with_schema_hash(
+            canonical_query_name(&semantic_path),
+            vec!["$row".to_owned()],
+            row_schema_hash,
+        )
+        .map_err(|error| PlanError::new(error.to_string()))?;
+        Ok(Self {
+            id: QueryCollectionId(engine.id.0),
+            source_list,
+            semantic_path,
+            row_schema_hash,
+            schema_version,
+            retention,
+        })
+    }
+
+    pub fn engine_plan(&self) -> Result<boon_query::CollectionPlan, PlanError> {
+        let engine = boon_query::CollectionPlan::new_with_schema_hash(
+            canonical_query_name(&self.semantic_path),
+            vec!["$row".to_owned()],
+            self.row_schema_hash,
+        )
+        .map_err(|error| PlanError::new(error.to_string()))?;
+        if QueryCollectionId(engine.id.0) != self.id {
+            return Err(PlanError::new("query collection identity is not canonical"));
+        }
+        Ok(engine)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryIndexPlan {
+    pub id: QueryIndexId,
+    pub collection: QueryCollectionId,
+    pub source_list: ListId,
+    pub source_semantic_path: String,
+    pub row_schema_hash: [u8; 32],
+    pub fields: Vec<QueryIndexFieldPlan>,
+    pub unique: bool,
+    pub order: QueryIndexOrder,
+}
+
+impl QueryIndexPlan {
+    pub fn new(
+        source_list: ListId,
+        source_semantic_path: impl Into<String>,
+        row_schema_hash: [u8; 32],
+        fields: Vec<QueryIndexFieldPlan>,
+        unique: bool,
+        order: QueryIndexOrder,
+    ) -> Result<Self, PlanError> {
+        let source_semantic_path = source_semantic_path.into();
+        if source_semantic_path.is_empty()
+            || source_semantic_path.trim() != source_semantic_path
+            || fields.is_empty()
+            || fields.len() > boon_query::MAX_INDEX_KEY_PARTS
+            || fields.iter().any(|field| {
+                field.path.is_empty()
+                    || field.semantic_path.is_empty()
+                    || field.semantic_path.trim() != field.semantic_path
+            })
+        {
+            return Err(PlanError::new(
+                "query index projection must be non-empty, bounded, and canonical",
+            ));
+        }
+        if fields
+            .iter()
+            .filter(|field| {
+                field.multi_value || field.normalization == QueryTextNormalization::Tokens
+            })
+            .count()
+            > 1
+        {
+            return Err(PlanError::new(
+                "query index may contain at most one expanding field",
+            ));
+        }
+        let mut projected_paths = BTreeSet::new();
+        if fields.iter().any(|field| {
+            !projected_paths.insert(field.path.clone())
+                || field
+                    .path
+                    .iter()
+                    .any(|part| part.is_empty() || part.trim() != part)
+                || (field.key_type != QueryKeyType::Text
+                    && field.normalization != QueryTextNormalization::Exact)
+        }) {
+            return Err(PlanError::new(
+                "query index fields must have unique canonical paths and type-compatible normalization",
+            ));
+        }
+        let collection = boon_query::CollectionPlan::new_with_schema_hash(
+            canonical_query_name(&source_semantic_path),
+            vec!["$row".to_owned()],
+            row_schema_hash,
+        )
+        .map_err(|error| PlanError::new(error.to_string()))?;
+        let engine_index = boon_query::IndexPlan::new_with_order(
+            collection.id,
+            canonical_query_name(&format!(
+                "{}.{}",
+                source_semantic_path,
+                fields
+                    .iter()
+                    .map(|field| field.path.join("."))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            )),
+            fields
+                .iter()
+                .map(|field| boon_query::IndexFieldPlan {
+                    path: field.path.clone(),
+                    text_normalization: field.normalization.into(),
+                    multi_value: field.multi_value,
+                })
+                .collect(),
+            unique,
+            order.into(),
+        )
+        .map_err(|error| PlanError::new(error.to_string()))?;
+        let id = QueryIndexId(engine_index.id.0);
+        Ok(Self {
+            id,
+            collection: QueryCollectionId(collection.id.0),
+            source_list,
+            source_semantic_path,
+            row_schema_hash,
+            fields,
+            unique,
+            order,
+        })
+    }
+
+    pub fn engine_plans(
+        &self,
+    ) -> Result<(boon_query::CollectionPlan, boon_query::IndexPlan), PlanError> {
+        let collection = boon_query::CollectionPlan::new_with_schema_hash(
+            canonical_query_name(&self.source_semantic_path),
+            vec!["$row".to_owned()],
+            self.row_schema_hash,
+        )
+        .map_err(|error| PlanError::new(error.to_string()))?;
+        let index = boon_query::IndexPlan::new_with_order(
+            collection.id,
+            canonical_query_name(&format!(
+                "{}.{}",
+                self.source_semantic_path,
+                self.fields
+                    .iter()
+                    .map(|field| field.path.join("."))
+                    .collect::<Vec<_>>()
+                    .join("+")
+            )),
+            self.fields
+                .iter()
+                .map(|field| boon_query::IndexFieldPlan {
+                    path: field.path.clone(),
+                    text_normalization: field.normalization.into(),
+                    multi_value: field.multi_value,
+                })
+                .collect(),
+            self.unique,
+            self.order.into(),
+        )
+        .map_err(|error| PlanError::new(error.to_string()))?;
+        Ok((collection, index))
+    }
+}
+
+fn canonical_query_name(value: &str) -> String {
+    let mut output = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if output.is_empty() {
+        output.push_str("query");
+    }
+    output.truncate(256);
+    output
 }
 
 impl MachinePlan {
@@ -2160,7 +2519,7 @@ pub enum PlanConstantValue {
         value: String,
     },
     Number {
-        value: i64,
+        value: FiniteReal,
     },
     Byte {
         value: u8,
@@ -2176,6 +2535,9 @@ pub enum PlanConstantValue {
     },
     Enum {
         value: String,
+    },
+    Data {
+        value: boon_data::Value,
     },
 }
 
@@ -2259,6 +2621,7 @@ pub enum InitialValueKind {
     Bool,
     Bytes,
     Enum,
+    Data,
     RootInitialField,
     RowInitialField,
     Unknown,
@@ -2276,6 +2639,7 @@ pub enum PlanValueType {
         fixed_len: Option<u64>,
     },
     Enum,
+    Data,
     RootInitialField,
     RowInitialField,
     Unknown,
@@ -2426,6 +2790,22 @@ pub enum PlanListProjection {
         field: String,
         value: ValueRef,
     },
+    TextPrefix {
+        index: QueryIndexId,
+        source_list: ListId,
+        prefix: ValueRef,
+        limit: usize,
+    },
+    IndexedQuery {
+        index: QueryIndexId,
+        source_list: ListId,
+        selection: PlanQuerySelection,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        residual: Vec<PlanQueryResidual>,
+        limit: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<ValueRef>,
+    },
     Chunk {
         source_list: ListId,
         size: usize,
@@ -2441,6 +2821,91 @@ pub enum PlanListProjection {
     Unknown {
         summary: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanQuerySelection {
+    Exact {
+        key: ValueRef,
+    },
+    TextPrefix {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leading: Option<ValueRef>,
+        prefix: ValueRef,
+    },
+    Range {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lower: Option<ValueRef>,
+        lower_inclusive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upper: Option<ValueRef>,
+        upper_inclusive: bool,
+    },
+    Union {
+        keys: ValueRef,
+    },
+    Intersection {
+        keys: ValueRef,
+    },
+}
+
+impl PlanQuerySelection {
+    pub fn value_refs(&self) -> Vec<&ValueRef> {
+        match self {
+            Self::Exact { key } => vec![key],
+            Self::TextPrefix { leading, prefix } => {
+                leading.iter().chain(std::iter::once(prefix)).collect()
+            }
+            Self::Range { lower, upper, .. } => lower.iter().chain(upper.iter()).collect(),
+            Self::Union { keys } | Self::Intersection { keys } => vec![keys],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanQueryResidual {
+    FieldEqual {
+        path: Vec<String>,
+        value: ValueRef,
+    },
+    TextContains {
+        path: Vec<String>,
+        needle: ValueRef,
+    },
+    NumberRange {
+        path: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<ValueRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<ValueRef>,
+    },
+    Wgs84Radius {
+        latitude_path: Vec<String>,
+        longitude_path: Vec<String>,
+        center_latitude: ValueRef,
+        center_longitude: ValueRef,
+        radius_meters: ValueRef,
+    },
+}
+
+impl PlanQueryResidual {
+    pub fn value_refs(&self) -> Vec<&ValueRef> {
+        match self {
+            Self::FieldEqual { value, .. } => vec![value],
+            Self::TextContains { needle, .. } => vec![needle],
+            Self::NumberRange {
+                minimum, maximum, ..
+            } => minimum.iter().chain(maximum.iter()).collect(),
+            Self::Wgs84Radius {
+                center_latitude,
+                center_longitude,
+                radius_meters,
+                ..
+            } => vec![center_latitude, center_longitude, radius_meters],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2475,7 +2940,7 @@ pub enum PlanDerivedExpression {
     NumberCompareConst {
         left: ValueRef,
         op: String,
-        right: i64,
+        right: FiniteReal,
     },
     ValueCompare {
         left: ValueRef,
@@ -2719,7 +3184,7 @@ pub struct PlanRowSelectArm {
 pub enum PlanRowSelectPattern {
     Bool { value: bool },
     Text { value: String },
-    Number { value: i64 },
+    Number { value: FiniteReal },
     NaN,
     Wildcard,
 }
@@ -2751,6 +3216,7 @@ pub enum PlanExpressionKind {
     BytesLength,
     BytesIsEmpty,
     BytesGet,
+    ListGet,
     BytesSet,
     BytesSlice,
     BytesTake,
@@ -2959,6 +3425,12 @@ impl fmt::Display for PlanError {
 
 impl Error for PlanError {}
 
+impl From<FiniteRealError> for PlanError {
+    fn from(error: FiniteRealError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 impl serde::ser::Error for PlanError {
     fn custom<T>(message: T) -> Self
     where
@@ -3165,6 +3637,38 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         detail: output_root_failure
             .unwrap_or_else(|| format!("{} typed host output root(s)", plan.outputs.len())),
     });
+    let role_valid = match plan.program_role {
+        ProgramRole::Document => true,
+        ProgramRole::Server => {
+            plan.document.is_none()
+                && !plan.outputs.is_empty()
+                && plan
+                    .outputs
+                    .iter()
+                    .all(|output| matches!(output.contract, OutputContractKind::HostValue { .. }))
+        }
+    };
+    checks.push(PlanCheck {
+        id: "program-role-matches-output-boundary".to_owned(),
+        pass: role_valid,
+        detail: format!(
+            "{} role, {} host output root(s), document plan {}",
+            plan.program_role.as_str(),
+            plan.outputs.len(),
+            if plan.document.is_some() {
+                "present"
+            } else {
+                "absent"
+            }
+        ),
+    });
+    let host_port_failure = host_ports_failure(plan);
+    checks.push(PlanCheck {
+        id: "host-ports-typed-and-resolved".to_owned(),
+        pass: host_port_failure.is_none(),
+        detail: host_port_failure
+            .unwrap_or_else(|| format!("{} typed host port(s)", plan.host_ports.len())),
+    });
     let document_failure = plan
         .document
         .as_ref()
@@ -3250,6 +3754,22 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         id: "list-projection-refs-resolve".to_owned(),
         pass: list_projection_refs_resolve(plan),
         detail: "list projections carry typed source list, value, and output refs".to_owned(),
+    });
+    checks.push(PlanCheck {
+        id: "query-collections-canonical-and-resolved".to_owned(),
+        pass: query_collections_resolve(plan)?,
+        detail: format!(
+            "{} compiler-owned query collection(s)",
+            plan.query_collections.len()
+        ),
+    });
+    checks.push(PlanCheck {
+        id: "query-indexes-canonical-and-resolved".to_owned(),
+        pass: query_indexes_resolve(plan)?,
+        detail: format!(
+            "{} compiler-owned query index(es)",
+            plan.query_indexes.len()
+        ),
     });
     let malformed_file_read_bytes_op_count = malformed_file_read_bytes_op_count(plan);
     checks.push(PlanCheck {
@@ -3560,11 +4080,11 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
         else {
             continue;
         };
-        let consequential = matches!(
+        let effectful = matches!(
             expression_kind,
             PlanExpressionKind::FileWriteBytes | PlanExpressionKind::HostEffect
         );
-        if consequential != effect.is_some() {
+        if effectful != effect.is_some() {
             return Some(format!(
                 "effectful update op {} has inconsistent invocation metadata",
                 op.id.0
@@ -3589,22 +4109,39 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                 invocation.invocation_id
             ));
         };
-        let Some(outbox) = plan
-            .persistence
-            .effect_outbox
-            .iter()
-            .find(|schema| schema.effect_id == invocation.effect_id)
-        else {
+        let Some(effect_schema) = contract.schema.as_ref() else {
             return Some(format!(
-                "effect invocation {} has no outbox schema",
+                "effect invocation {} has no typed effect schema",
                 invocation.invocation_id
             ));
         };
-        if !outbox.invocation_ids.contains(&invocation.invocation_id) {
-            return Some(format!(
-                "effect invocation {} is absent from its durable outbox schema",
-                invocation.invocation_id
-            ));
+        let outbox = plan
+            .persistence
+            .effect_outbox
+            .iter()
+            .find(|schema| schema.effect_id == invocation.effect_id);
+        match (&contract.replay, outbox) {
+            (EffectReplay::Idempotent { .. }, Some(outbox))
+                if outbox.invocation_ids.contains(&invocation.invocation_id) => {}
+            (EffectReplay::Idempotent { .. }, _) => {
+                return Some(format!(
+                    "effect invocation {} is absent from its durable outbox schema",
+                    invocation.invocation_id
+                ));
+            }
+            (EffectReplay::ReadOnly, None) => {}
+            (EffectReplay::ReadOnly, Some(_)) => {
+                return Some(format!(
+                    "read-only effect invocation {} must not use a durable outbox",
+                    invocation.invocation_id
+                ));
+            }
+            (EffectReplay::NonReplayable, _) => {
+                return Some(format!(
+                    "non-replayable effect invocation {} cannot be executed safely",
+                    invocation.invocation_id
+                ));
+            }
         }
         let intent_inputs = invocation
             .intent_fields
@@ -3612,8 +4149,16 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
             .map(|field| field.input.clone())
             .collect::<Vec<_>>();
         if intent_inputs != *ordered_inputs
-            || !effect_intent_fields_match_schema(&invocation.intent_fields, &outbox.intent_type)
-            || !effect_result_route_matches(plan, op, &invocation.result, &outbox.result_type)
+            || !effect_intent_fields_match_schema(
+                &invocation.intent_fields,
+                &effect_schema.intent_type,
+            )
+            || !effect_result_route_matches(
+                plan,
+                op,
+                &invocation.result,
+                &effect_schema.result_type,
+            )
             || invocation.result.policy() != contract.result_policy
             || invocation.barrier != contract.barrier
             || invocation.idempotency_key != EffectIdempotencyKeyPlan::InvocationTurnIntentSha256
@@ -3630,7 +4175,24 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
         .iter()
         .flat_map(|schema| schema.invocation_ids.iter().copied())
         .collect::<BTreeSet<_>>();
-    if bound_invocation_ids != invocation_ids {
+    let durable_invocation_ids = plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                effect: Some(invocation),
+                ..
+            } => plan
+                .effects
+                .iter()
+                .find(|contract| contract.effect_id == invocation.effect_id)
+                .is_some_and(|contract| matches!(contract.replay, EffectReplay::Idempotent { .. }))
+                .then_some(invocation.invocation_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if bound_invocation_ids != durable_invocation_ids {
         return Some(
             "durable outbox invocation identities differ from executable effect invocations"
                 .to_owned(),
@@ -3700,20 +4262,17 @@ fn source_payload_matches_variant(source: &SourceRoute, variant: &DataVariantPla
         .fields
         .iter()
         .map(|field| {
-            Some((
+            (
                 source_payload_field_from_schema_name(&field.name),
-                source_payload_type_from_data_type(&field.data_type)?,
-            ))
+                field.data_type.clone(),
+            )
         })
-        .collect::<Option<BTreeMap<_, _>>>();
-    let Some(expected) = expected else {
-        return false;
-    };
+        .collect::<BTreeMap<_, _>>();
     let actual = source
         .payload_schema
         .typed_fields
         .iter()
-        .map(|field| (field.field.clone(), field.value_type))
+        .map(|field| (field.field.clone(), field.data_type.clone()))
         .collect::<BTreeMap<_, _>>();
     actual == expected
         && source
@@ -3752,16 +4311,6 @@ fn source_payload_field_from_schema_name(name: &str) -> SourcePayloadField {
         "key" => SourcePayloadField::Key,
         "text" => SourcePayloadField::Text,
         _ => SourcePayloadField::Named(name.to_owned()),
-    }
-}
-
-fn source_payload_type_from_data_type(data_type: &DataTypePlan) -> Option<SourcePayloadValueType> {
-    match data_type {
-        DataTypePlan::Bytes { .. } => Some(SourcePayloadValueType::Bytes),
-        DataTypePlan::Bool => Some(SourcePayloadValueType::Bool),
-        DataTypePlan::Number | DataTypePlan::Byte => Some(SourcePayloadValueType::Number),
-        DataTypePlan::Text => Some(SourcePayloadValueType::Text),
-        _ => None,
     }
 }
 
@@ -4357,6 +4906,28 @@ pub fn cpu_plan_executor_unsupported_op_count(
     scalar_slots: &[ScalarStorageSlot],
     constants: &[PlanConstant],
 ) -> usize {
+    cpu_plan_executor_unsupported_ops_for_parts(regions, list_slots, scalar_slots, constants).len()
+}
+
+/// Returns the exact operations that the CPU executor cannot currently run.
+///
+/// This is the diagnostic counterpart to the capability-summary count and is
+/// intentionally derived from the same support predicate.
+pub fn cpu_plan_executor_unsupported_ops(plan: &MachinePlan) -> Vec<&PlanOp> {
+    cpu_plan_executor_unsupported_ops_for_parts(
+        &plan.regions,
+        &plan.storage_layout.list_slots,
+        &plan.storage_layout.scalar_slots,
+        &plan.constants,
+    )
+}
+
+fn cpu_plan_executor_unsupported_ops_for_parts<'a>(
+    regions: &'a [OperationRegion],
+    list_slots: &[ListStorageSlot],
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+) -> Vec<&'a PlanOp> {
     let supported_list_projection_outputs = regions
         .iter()
         .flat_map(|region| &region.ops)
@@ -4447,7 +5018,7 @@ pub fn cpu_plan_executor_unsupported_op_count(
                 &supported_list_retain_outputs,
             )
         })
-        .count()
+        .collect()
 }
 
 pub fn cpu_plan_executor_supports_whole_plan_op(
@@ -4481,7 +5052,14 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     && update_constant_id.is_none()
                     && source_guard.is_none()
                     && update_branch_source_ids(op).len() == 1
-                    && !ordered_inputs.is_empty();
+                    && effect.as_ref().is_some_and(|effect| {
+                        effect.intent_fields.len() == ordered_inputs.len()
+                            && effect
+                                .intent_fields
+                                .iter()
+                                .zip(ordered_inputs)
+                                .all(|(field, input)| &field.input == input)
+                    });
             }
             if op.indexed {
                 return cpu_plan_executor_supports_indexed_update_op(
@@ -4542,35 +5120,38 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         )
                 }
                 PlanExpressionKind::BytesLength => {
-                    source_payload_field.is_none()
-                        && update_constant_id.is_none()
+                    update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
                         && update_branch_source_ids(op).len() == 1
-                        && bytes_length_input_is_supported(scalar_slots, op)
-                        && source_payload_input_ids(op).is_empty()
+                        && bytes_input_is_supported(scalar_slots, op, source_payload_field.as_ref())
                 }
                 PlanExpressionKind::BytesIsEmpty => {
-                    source_payload_field.is_none()
-                        && update_constant_id.is_none()
+                    update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Bool)
                         && update_branch_source_ids(op).len() == 1
-                        && bytes_length_input_is_supported(scalar_slots, op)
-                        && source_payload_input_ids(op).is_empty()
+                        && bytes_input_is_supported(scalar_slots, op, source_payload_field.as_ref())
                 }
                 PlanExpressionKind::BytesGet => {
                     source_payload_field.is_none()
                         && update_constant_id
                             .and_then(|constant_id| plan_constant_by_id(constants, constant_id))
                             .is_some_and(|constant| {
-                                matches!(
-                                    constant.value,
-                                    PlanConstantValue::Number { value } if value >= 0
-                                )
+                                plan_constant_is_non_negative_integer(&constant.value)
                             })
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Byte)
                         && update_branch_source_ids(op).len() == 1
                         && bytes_length_input_is_supported(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
+                }
+                PlanExpressionKind::ListGet => {
+                    source_payload_field.is_none()
+                        && update_constant_id
+                            .and_then(|constant_id| plan_constant_by_id(constants, constant_id))
+                            .is_some_and(|constant| {
+                                plan_constant_is_non_negative_integer(&constant.value)
+                            })
+                        && update_branch_source_ids(op).len() == 1
+                        && list_get_inputs_are_supported(scalar_slots, constants, op)
                 }
                 PlanExpressionKind::BytesSet => {
                     source_payload_field.is_none()
@@ -4938,6 +5519,35 @@ fn cpu_plan_executor_supports_list_projection_op(
                 && op.inputs.contains(value)
                 && matches!(value, ValueRef::State(_))
         }
+        PlanListProjection::TextPrefix {
+            source_list,
+            prefix,
+            limit,
+            ..
+        } => {
+            *limit > 0
+                && op.inputs.contains(&ValueRef::List(*source_list))
+                && op.inputs.contains(prefix)
+                && matches!(prefix, ValueRef::State(_) | ValueRef::Field(_))
+        }
+        PlanListProjection::IndexedQuery {
+            source_list,
+            selection,
+            residual,
+            limit,
+            cursor,
+            ..
+        } => {
+            *limit > 0
+                && *limit <= boon_query::MAX_QUERY_LIMIT
+                && op.inputs.contains(&ValueRef::List(*source_list))
+                && selection
+                    .value_refs()
+                    .into_iter()
+                    .chain(residual.iter().flat_map(PlanQueryResidual::value_refs))
+                    .chain(cursor.iter())
+                    .all(|value| op.inputs.contains(value))
+        }
         PlanListProjection::Chunk {
             source_list, size, ..
         } => *size > 0 && op.inputs.contains(&ValueRef::List(*source_list)),
@@ -5168,12 +5778,17 @@ fn cpu_plan_executor_supports_indexed_update_op(
             source_payload_field.is_none()
                 && update_constant_id
                     .and_then(|constant_id| plan_constant_by_id(constants, constant_id))
-                    .is_some_and(|constant| {
-                        matches!(constant.value, PlanConstantValue::Number { value } if value >= 0)
-                    })
+                    .is_some_and(|constant| plan_constant_is_non_negative_integer(&constant.value))
                 && output_state_type_is(scalar_slots, op, &PlanValueType::Byte)
                 && bytes_length_input_is_supported(scalar_slots, op)
                 && source_payload_input_ids(op).is_empty()
+        }
+        PlanExpressionKind::ListGet => {
+            source_payload_field.is_none()
+                && update_constant_id
+                    .and_then(|constant_id| plan_constant_by_id(constants, constant_id))
+                    .is_some_and(|constant| plan_constant_is_non_negative_integer(&constant.value))
+                && list_get_inputs_are_supported(scalar_slots, constants, op)
         }
         PlanExpressionKind::BytesSet => {
             source_payload_field.is_none()
@@ -5222,7 +5837,12 @@ fn cpu_plan_executor_supports_indexed_update_op(
             source_payload_field.is_none()
                 && update_constant_id.is_none()
                 && output_state_is_bytes(scalar_slots, op)
-                && indexed_text_to_bytes_inputs_are_supported(scalar_slots, list_slots, constants, op)
+                && indexed_text_to_bytes_inputs_are_supported(
+                    scalar_slots,
+                    list_slots,
+                    constants,
+                    op,
+                )
                 && source_payload_input_ids(op).is_empty()
         }
         PlanExpressionKind::BytesFromHex | PlanExpressionKind::BytesFromBase64 => {
@@ -5380,9 +6000,9 @@ fn root_number_infix_inputs_supported(
         ValueRef::State(state) => {
             plan_value_type_for_state_slots(scalar_slots, *state) == Some(&PlanValueType::Number)
         }
-        ValueRef::Constant(id) => constants.iter().any(|constant| {
-            constant.id == *id && matches!(constant.value, PlanConstantValue::Number { .. })
-        }),
+        ValueRef::Constant(id) => constants
+            .iter()
+            .any(|constant| constant.id == *id && plan_constant_is_number(&constant.value)),
         _ => false,
     };
     let operator_supported = match operator {
@@ -5521,6 +6141,52 @@ fn bytes_length_input_is_supported(scalar_slots: &[ScalarStorageSlot], op: &Plan
         plan_value_type_for_state_slots(scalar_slots, *state_id),
         Some(PlanValueType::Bytes { .. })
     )
+}
+
+fn bytes_input_is_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    op: &PlanOp,
+    source_payload_field: Option<&SourcePayloadField>,
+) -> bool {
+    match source_payload_field {
+        Some(field) => {
+            matches!(field, SourcePayloadField::Bytes)
+                && source_payload_input_matches_single_source(op, field)
+                && state_input_ids(op).is_empty()
+                && matches!(
+                    update_branch_ordered_inputs(op),
+                    [ValueRef::SourcePayload { .. }]
+                )
+        }
+        None => {
+            source_payload_input_ids(op).is_empty()
+                && bytes_length_input_is_supported(scalar_slots, op)
+        }
+    }
+}
+
+fn list_get_inputs_are_supported(
+    scalar_slots: &[ScalarStorageSlot],
+    constants: &[PlanConstant],
+    op: &PlanOp,
+) -> bool {
+    let [ValueRef::SourcePayload { .. }, ValueRef::Constant(index)] =
+        update_branch_ordered_inputs(op)
+    else {
+        return false;
+    };
+    source_payload_input_ids(op).len() == 1
+        && state_input_ids(op).is_empty()
+        && output_state_type(scalar_slots, op).is_some_and(|value_type| {
+            !matches!(
+                value_type,
+                PlanValueType::RootInitialField
+                    | PlanValueType::RowInitialField
+                    | PlanValueType::Unknown
+            )
+        })
+        && plan_constant_by_id(constants, *index)
+            .is_some_and(|constant| plan_constant_is_non_negative_integer(&constant.value))
 }
 
 fn bytes_equal_inputs_are_supported(scalar_slots: &[ScalarStorageSlot], op: &PlanOp) -> bool {
@@ -5714,9 +6380,10 @@ fn bytes_set_inputs_are_supported(
                 let PlanConstantValue::Number { value } = constant.value else {
                     return false;
                 };
-                if value < 0 {
+                let Ok(value) = value.to_i64_exact() else {
                     return false;
-                }
+                };
+                if value < 0 { return false; }
                 match plan_value_type_for_state_slots(scalar_slots, *input) {
                     Some(PlanValueType::Bytes {
                         fixed_len: Some(len),
@@ -5739,7 +6406,7 @@ fn plan_number_constant_u64(
     let PlanConstantValue::Number { value } = constant.value else {
         return None;
     };
-    u64::try_from(value).ok()
+    u64::try_from(value.to_i64_exact().ok()?).ok()
 }
 
 fn plan_number_constant_i64(
@@ -5750,7 +6417,7 @@ fn plan_number_constant_i64(
     let PlanConstantValue::Number { value } = constant.value else {
         return None;
     };
-    Some(value)
+    value.to_i64_exact().ok()
 }
 
 fn plan_text_constant_value(
@@ -6480,11 +7147,11 @@ fn source_payload_refs_are_declared_and_typed(
             .typed_fields
             .iter()
             .find(|descriptor| descriptor.field == field)
-            .map(|descriptor| descriptor.value_type)
+            .map(|descriptor| &descriptor.data_type)
         else {
             return false;
         };
-        if !source_payload_value_type_matches_plan_type(payload_type, output_type) {
+        if !source_payload_data_type_matches_plan_type(payload_type, output_type) {
             return false;
         }
     }
@@ -6495,7 +7162,7 @@ fn source_payload_refs_are_declared_as(
     plan: &MachinePlan,
     op: &PlanOp,
     expected_field: &SourcePayloadField,
-    expected_type: SourcePayloadValueType,
+    expected_type: &DataTypePlan,
 ) -> bool {
     let payload_inputs = source_payload_input_ids(op);
     if payload_inputs.is_empty() {
@@ -6514,7 +7181,7 @@ fn source_payload_refs_are_declared_as(
                         .iter()
                         .find(|descriptor| descriptor.field == field)
                 })
-                .is_some_and(|descriptor| descriptor.value_type == expected_type)
+                .is_some_and(|descriptor| &descriptor.data_type == expected_type)
     })
 }
 
@@ -6539,12 +7206,7 @@ fn text_to_number_op_is_well_formed(
         (Some(expected), ValueRef::SourcePayload { field: actual, .. }) => {
             expected == actual
                 && source_payload_input_matches_single_source(op, expected)
-                && source_payload_refs_are_declared_as(
-                    plan,
-                    op,
-                    expected,
-                    SourcePayloadValueType::Text,
-                )
+                && source_payload_refs_are_declared_as(plan, op, expected, &DataTypePlan::Text)
                 && state_input_ids(op).is_empty()
         }
         (None, ValueRef::State(state_id)) => {
@@ -6593,14 +7255,14 @@ fn source_payload_ref_mismatch_detail(
             .typed_fields
             .iter()
             .find(|descriptor| descriptor.field == field)
-            .map(|descriptor| descriptor.value_type)
+            .map(|descriptor| &descriptor.data_type)
         else {
             return format!(
                 "source route {} has no typed schema entry for {:?}",
                 source_id.0, field
             );
         };
-        if !source_payload_value_type_matches_plan_type(payload_type, output_type) {
+        if !source_payload_data_type_matches_plan_type(payload_type, output_type) {
             return format!(
                 "source route {} field {:?} payload_type={:?} does not match output_type={:?}",
                 source_id.0, field, payload_type, output_type
@@ -6610,15 +7272,21 @@ fn source_payload_ref_mismatch_detail(
     "unknown source-payload mismatch".to_owned()
 }
 
-fn source_payload_value_type_matches_plan_type(
-    payload_type: SourcePayloadValueType,
+fn source_payload_data_type_matches_plan_type(
+    payload_type: &DataTypePlan,
     plan_type: &PlanValueType,
 ) -> bool {
     match payload_type {
-        SourcePayloadValueType::Bytes => matches!(plan_type, PlanValueType::Bytes { .. }),
-        SourcePayloadValueType::Bool => plan_type == &PlanValueType::Bool,
-        SourcePayloadValueType::Number => plan_type == &PlanValueType::Number,
-        SourcePayloadValueType::Text => plan_type == &PlanValueType::Text,
+        DataTypePlan::Bytes { .. } => matches!(plan_type, PlanValueType::Bytes { .. }),
+        DataTypePlan::Bool => plan_type == &PlanValueType::Bool,
+        DataTypePlan::Number | DataTypePlan::Byte => plan_type == &PlanValueType::Number,
+        DataTypePlan::Text => plan_type == &PlanValueType::Text,
+        DataTypePlan::Null
+        | DataTypePlan::Variant { .. }
+        | DataTypePlan::Record { .. }
+        | DataTypePlan::List { .. }
+        | DataTypePlan::Error { .. }
+        | DataTypePlan::Unknown => false,
     }
 }
 
@@ -6638,7 +7306,12 @@ fn source_payload_output_type_is_supported(
         SourcePayloadField::Address | SourcePayloadField::Key | SourcePayloadField::Text => {
             output_type == &PlanValueType::Text
         }
-        SourcePayloadField::Named(_) => output_type == &PlanValueType::Text,
+        SourcePayloadField::Named(_) => !matches!(
+            output_type,
+            PlanValueType::RootInitialField
+                | PlanValueType::RowInitialField
+                | PlanValueType::Unknown
+        ),
     }
 }
 
@@ -6997,7 +7670,7 @@ fn root_number_operand_supported(
                     == Some(&PlanValueType::Number)
         }
         ValueRef::Constant(id) => plan_constant_by_id(constants, *id)
-            .is_some_and(|constant| matches!(constant.value, PlanConstantValue::Number { .. })),
+            .is_some_and(|constant| plan_constant_is_number(&constant.value)),
         ValueRef::Field(_) | ValueRef::SourcePayload { .. } => op.inputs.contains(value),
         ValueRef::Source(_) | ValueRef::List(_) => false,
     }
@@ -7035,8 +7708,9 @@ fn root_update_value_ref_supported(
                     _ => output_type == &PlanValueType::Text,
                 }
         }
-        ValueRef::Constant(constant_id) => plan_constant_by_id(constants, *constant_id)
-            .is_some_and(|constant| constant_value_matches_plan_type(&constant.value, output_type)),
+        ValueRef::Constant(_) => {
+            match_const_output_ref_supported(constants, output_type, value_ref)
+        }
         ValueRef::Field(_) => op.inputs.contains(value_ref),
         ValueRef::Source(_) | ValueRef::List(_) => false,
     }
@@ -7052,7 +7726,7 @@ fn match_const_input_ref_supported(
             op.inputs.contains(value_ref)
                 && matches!(
                     plan_value_type_for_state_slots(scalar_slots, *state_id),
-                    Some(PlanValueType::Text | PlanValueType::Enum)
+                    Some(PlanValueType::Bool | PlanValueType::Text | PlanValueType::Enum)
                 )
         }
         ValueRef::SourcePayload { field, .. } => {
@@ -7205,7 +7879,8 @@ fn byte_constants_match_hashes(constants: &[PlanConstant]) -> bool {
         | PlanConstantValue::Number { .. }
         | PlanConstantValue::Byte { .. }
         | PlanConstantValue::Bool { .. }
-        | PlanConstantValue::Enum { .. } => true,
+        | PlanConstantValue::Enum { .. }
+        | PlanConstantValue::Data { .. } => true,
     })
 }
 
@@ -7353,12 +8028,7 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                                     op.id.0, field, state_id.0, output_type
                                 ));
                             }
-                            SourcePayloadField::Named(_) if output_type != &PlanValueType::Text => {
-                                return Some(format!(
-                                    "source-payload update op {} named field {:?} outputs non-TEXT state {} type {:?}",
-                                    op.id.0, field, state_id.0, output_type
-                                ));
-                            }
+                            SourcePayloadField::Named(_) => {}
                             _ => {}
                         }
                     }
@@ -7395,10 +8065,7 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                             op.id.0, constant_id.0
                         ));
                     };
-                    if !matches!(
-                        constant.value,
-                        PlanConstantValue::Number { value } if value >= 0
-                    ) {
+                    if !plan_constant_is_non_negative_integer(&constant.value) {
                         return Some(format!(
                             "bytes-get update op {} index constant {} is not a non-negative number: {:?}",
                             op.id.0, constant_id.0, constant.value
@@ -7417,6 +8084,63 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                                 op.id.0, state_id.0, value_type
                             ));
                         }
+                    }
+                }
+                PlanExpressionKind::ListGet => {
+                    if source_payload_field.is_some() {
+                        return Some(format!(
+                            "list-get update op {} unexpectedly has scalar source payload field {:?}",
+                            op.id.0, source_payload_field
+                        ));
+                    }
+                    let [
+                        ValueRef::SourcePayload { source_id, field },
+                        ValueRef::Constant(index_id),
+                    ] = update_branch_ordered_inputs(op)
+                    else {
+                        return Some(format!(
+                            "list-get update op {} requires source-payload list and index inputs",
+                            op.id.0
+                        ));
+                    };
+                    if update_constant_id != &Some(*index_id)
+                        || !plan_constant_by_id(&plan.constants, *index_id).is_some_and(
+                            |constant| plan_constant_is_non_negative_integer(&constant.value),
+                        )
+                    {
+                        return Some(format!(
+                            "list-get update op {} has an invalid index constant",
+                            op.id.0
+                        ));
+                    }
+                    let item_type = plan
+                        .source_routes
+                        .iter()
+                        .find(|route| route.source_id == *source_id)
+                        .and_then(|route| {
+                            route
+                                .payload_schema
+                                .typed_fields
+                                .iter()
+                                .find(|descriptor| descriptor.field == *field)
+                        })
+                        .and_then(|descriptor| match &descriptor.data_type {
+                            DataTypePlan::List { item } => Some(item.as_ref()),
+                            _ => None,
+                        });
+                    let output_type = op.output.as_ref().and_then(|output| match output {
+                        ValueRef::State(state_id) => plan_value_type_for_state(plan, *state_id),
+                        _ => None,
+                    });
+                    if !matches!(
+                        (item_type, output_type),
+                        (Some(item), Some(output))
+                            if source_payload_data_type_matches_plan_type(item, output)
+                    ) {
+                        return Some(format!(
+                            "list-get update op {} source list item type does not match its output",
+                            op.id.0
+                        ));
                     }
                 }
                 PlanExpressionKind::BytesIsEmpty => {
@@ -7538,17 +8262,18 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                     else {
                         return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
-                    if !matches!(
-                        index_constant.value,
-                        PlanConstantValue::Number { value } if value >= 0
-                    ) {
+                    if !plan_constant_is_non_negative_integer(&index_constant.value) {
                         return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let PlanConstantValue::Number { value } = &index_constant.value
                         && let PlanValueType::Bytes {
                             fixed_len: Some(len),
                         } = input_type
-                        && !u64::try_from(*value).is_ok_and(|index| index < *len)
+                        && value
+                            .to_i64_exact()
+                            .ok()
+                            .and_then(|value| u64::try_from(value).ok())
+                            .is_none_or(|index| index >= *len)
                     {
                         return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
@@ -8255,6 +8980,40 @@ fn list_projection_refs_resolve(plan: &MachinePlan) -> bool {
                         && op.inputs.contains(&ValueRef::List(*source_list))
                         && op.inputs.contains(value)
                 }
+                PlanListProjection::TextPrefix {
+                    index,
+                    source_list,
+                    prefix,
+                    limit,
+                } => {
+                    *limit > 0
+                        && plan.query_indexes.iter().any(|candidate| {
+                            candidate.id == *index && candidate.source_list == *source_list
+                        })
+                        && op.inputs.contains(&ValueRef::List(*source_list))
+                        && op.inputs.contains(prefix)
+                }
+                PlanListProjection::IndexedQuery {
+                    index,
+                    source_list,
+                    selection,
+                    residual,
+                    limit,
+                    cursor,
+                } => {
+                    *limit > 0
+                        && *limit <= boon_query::MAX_QUERY_LIMIT
+                        && plan.query_indexes.iter().any(|candidate| {
+                            candidate.id == *index && candidate.source_list == *source_list
+                        })
+                        && op.inputs.contains(&ValueRef::List(*source_list))
+                        && selection
+                            .value_refs()
+                            .into_iter()
+                            .chain(residual.iter().flat_map(PlanQueryResidual::value_refs))
+                            .chain(cursor.iter())
+                            .all(|value| op.inputs.contains(value))
+                }
                 PlanListProjection::Chunk {
                     source_list,
                     size,
@@ -8280,6 +9039,68 @@ fn list_projection_refs_resolve(plan: &MachinePlan) -> bool {
                 PlanListProjection::Unknown { summary } => !summary.trim().is_empty(),
             }
         })
+}
+
+fn query_indexes_resolve(plan: &MachinePlan) -> Result<bool, PlanError> {
+    let mut ids = BTreeSet::new();
+    for index in &plan.query_indexes {
+        if !ids.insert(index.id)
+            || index.source_semantic_path.is_empty()
+            || !plan.query_collections.iter().any(|collection| {
+                collection.id == index.collection
+                    && collection.source_list == index.source_list
+                    && collection.semantic_path == index.source_semantic_path
+                    && collection.row_schema_hash == index.row_schema_hash
+            })
+            || !plan.storage_layout.list_slots.iter().any(|slot| {
+                slot.list_id == index.source_list
+                    && index
+                        .fields
+                        .iter()
+                        .all(|field| slot.row_field_ids.contains(&field.field))
+            })
+        {
+            return Ok(false);
+        }
+        let canonical = QueryIndexPlan::new(
+            index.source_list,
+            index.source_semantic_path.clone(),
+            index.row_schema_hash,
+            index.fields.clone(),
+            index.unique,
+            index.order,
+        )?;
+        if canonical.id != index.id || canonical.collection != index.collection {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn query_collections_resolve(plan: &MachinePlan) -> Result<bool, PlanError> {
+    let mut ids = BTreeSet::new();
+    for collection in &plan.query_collections {
+        if !ids.insert(collection.id)
+            || !plan
+                .storage_layout
+                .list_slots
+                .iter()
+                .any(|slot| slot.list_id == collection.source_list)
+        {
+            return Ok(false);
+        }
+        let canonical = QueryCollectionPlan::new(
+            collection.source_list,
+            collection.semantic_path.clone(),
+            collection.row_schema_hash,
+            collection.schema_version,
+            collection.retention.clone(),
+        )?;
+        if canonical != *collection || collection.engine_plan().is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(plan.query_indexes.is_empty() || !plan.query_collections.is_empty())
 }
 
 fn list_initial_row_fields_resolve(plan: &MachinePlan) -> bool {
@@ -9205,7 +10026,16 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
 
 fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
     match expression {
-        PlanRowExpression::Field { .. } | PlanRowExpression::Constant { .. } => true,
+        PlanRowExpression::Field { .. }
+        | PlanRowExpression::Constant { .. }
+        | PlanRowExpression::ListRef { .. }
+        | PlanRowExpression::ListMapItem { .. } => true,
+        PlanRowExpression::Object { fields } => fields
+            .iter()
+            .all(|field| root_row_expression_cpu_evaluable(&field.value)),
+        PlanRowExpression::ListLiteral { items } => {
+            items.iter().all(root_row_expression_cpu_evaluable)
+        }
         PlanRowExpression::TextTrim { input }
         | PlanRowExpression::TextToNumber { input }
         | PlanRowExpression::ObjectField { object: input, .. } => {
@@ -9215,6 +10045,9 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
         PlanRowExpression::TextConcat { parts } => {
             parts.iter().all(root_row_expression_cpu_evaluable)
         }
+        PlanRowExpression::NumberInfix { left, right, .. } => {
+            root_row_expression_cpu_evaluable(left) && root_row_expression_cpu_evaluable(right)
+        }
         PlanRowExpression::ListFindValue {
             value, fallback, ..
         } => {
@@ -9223,11 +10056,34 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
                     .as_deref()
                     .is_none_or(root_row_expression_cpu_evaluable)
         }
+        PlanRowExpression::ListMap { input, value, .. } => {
+            root_row_expression_cpu_evaluable(input) && root_row_expression_cpu_evaluable(value)
+        }
         PlanRowExpression::BuiltinCall {
             function,
             input,
             args,
-        } => function == "Router/route" && input.is_none() && args.is_empty(),
+        } => {
+            matches!(
+                function.as_str(),
+                "Text/empty"
+                    | "Error/new"
+                    | "Error/text"
+                    | "Router/route"
+                    | "List/count"
+                    | "List/length"
+                    | "List/retain"
+                    | "List/filter_field_equal"
+                    | "List/filter_field_not_equal"
+                    | "List/filter_text_contains"
+                    | "List/join_field"
+            ) && input
+                .as_deref()
+                .is_none_or(root_row_expression_cpu_evaluable)
+                && args
+                    .iter()
+                    .all(|arg| root_row_expression_cpu_evaluable(&arg.value))
+        }
         PlanRowExpression::Select { input, arms } => {
             root_row_expression_cpu_evaluable(input)
                 && arms
@@ -9294,6 +10150,7 @@ fn constant_value_matches_plan_type(value: &PlanConstantValue, value_type: &Plan
         (PlanConstantValue::Byte { .. }, PlanValueType::Byte) => true,
         (PlanConstantValue::Bool { .. }, PlanValueType::Bool) => true,
         (PlanConstantValue::Enum { .. }, PlanValueType::Enum) => true,
+        (PlanConstantValue::Data { .. }, PlanValueType::Data) => true,
         (
             PlanConstantValue::Bytes { byte_len, .. },
             PlanValueType::Bytes {
@@ -9309,6 +10166,18 @@ fn constant_value_matches_plan_type(value: &PlanConstantValue, value_type: &Plan
         ) => true,
         _ => false,
     }
+}
+
+fn plan_constant_is_number(value: &PlanConstantValue) -> bool {
+    matches!(value, PlanConstantValue::Number { .. })
+}
+
+fn plan_constant_is_non_negative_integer(value: &PlanConstantValue) -> bool {
+    matches!(
+        value,
+        PlanConstantValue::Number { value }
+            if value.to_i64_exact().is_ok_and(|value| value >= 0)
+    )
 }
 
 pub fn non_executable_constant_payload_count(constants: &[PlanConstant]) -> usize {

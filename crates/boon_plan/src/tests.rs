@@ -13,10 +13,14 @@ fn empty_plan() -> MachinePlan {
     MachinePlan {
         version: PlanVersion::default(),
         target_profile: TargetProfile::SoftwareDefault,
+        program_role: ProgramRole::Document,
         application,
         persistence,
         effects: Vec::new(),
         outputs: Vec::new(),
+        host_ports: Vec::new(),
+        query_collections: Vec::new(),
+        query_indexes: Vec::new(),
         demand: DemandPlan {
             root_derived_outputs: RootOutputDemand::Selected(Vec::new()),
         },

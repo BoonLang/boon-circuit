@@ -1,0 +1,467 @@
+[
+  {
+    "protocolVersion": 1,
+    "id": "msg_watch_station",
+    "type": "watch_station_ack",
+    "scope": "station:NSR:StopPlace:548",
+    "entityId": "NSR:StopPlace:548",
+    "createdAt": "2026-07-10T10:00:00Z",
+    "payload": {
+      "entityId": "NSR:StopPlace:548",
+      "scope": "station:NSR:StopPlace:548",
+      "clientCount": 1,
+      "watchExpiresAt": "2026-07-10T10:05:00Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_unwatch_station",
+    "type": "unwatch_station_ack",
+    "scope": "station:NSR:StopPlace:548",
+    "entityId": "NSR:StopPlace:548",
+    "createdAt": "2026-07-10T10:00:01Z",
+    "payload": {
+      "entityId": "NSR:StopPlace:548",
+      "scope": "station:NSR:StopPlace:548",
+      "remainingClientCount": 0
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_watch_vehicle",
+    "type": "watch_vehicle_ack",
+    "scope": "vehicle:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "createdAt": "2026-07-10T10:00:02Z",
+    "payload": {
+      "entityId": "SKY:Vehicle:12345",
+      "scope": "vehicle:SKY:Vehicle:12345",
+      "clientCount": 1,
+      "watchExpiresAt": "2026-07-10T10:05:02Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_unwatch_vehicle",
+    "type": "unwatch_vehicle_ack",
+    "scope": "vehicle:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "createdAt": "2026-07-10T10:00:03Z",
+    "payload": {
+      "entityId": "SKY:Vehicle:12345",
+      "scope": "vehicle:SKY:Vehicle:12345",
+      "remainingClientCount": 0
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_focus_vehicle",
+    "type": "focus_started",
+    "scope": "focus:client-1:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "createdAt": "2026-07-10T10:00:04Z",
+    "payload": {
+      "vehicleId": "SKY:Vehicle:12345",
+      "scope": "focus:client-1:SKY:Vehicle:12345",
+      "state": "following",
+      "watchExpiresAt": "2026-07-10T10:05:04Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_unfocus_vehicle",
+    "type": "focus_stopped",
+    "scope": "focus:client-1:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "createdAt": "2026-07-10T10:00:05Z",
+    "payload": {
+      "vehicleId": "SKY:Vehicle:12345",
+      "scope": "focus:client-1:SKY:Vehicle:12345",
+      "state": "stopped",
+      "watchExpiresAt": null
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_pause_focus",
+    "type": "focus_paused",
+    "scope": "focus:client-1:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "createdAt": "2026-07-10T10:00:06Z",
+    "payload": {
+      "vehicleId": "SKY:Vehicle:12345",
+      "scope": "focus:client-1:SKY:Vehicle:12345",
+      "state": "paused",
+      "watchExpiresAt": "2026-07-10T10:05:06Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_resume_focus",
+    "type": "focus_resumed",
+    "scope": "focus:client-1:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "createdAt": "2026-07-10T10:00:07Z",
+    "payload": {
+      "vehicleId": "SKY:Vehicle:12345",
+      "scope": "focus:client-1:SKY:Vehicle:12345",
+      "state": "following",
+      "watchExpiresAt": "2026-07-10T10:05:07Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "station_snapshot",
+    "scope": "station:NSR:StopPlace:548",
+    "entityId": "NSR:StopPlace:548",
+    "version": "2026-07-10T10:00:08Z",
+    "createdAt": "2026-07-10T10:00:08Z",
+    "payload": {
+      "stationId": "NSR:StopPlace:548",
+      "state": "fresh",
+      "version": "2026-07-10T10:00:08Z",
+      "updatedAt": "2026-07-10T10:00:08Z",
+      "lastSuccessfulAt": "2026-07-10T10:00:08Z",
+      "warning": null,
+      "departures": [],
+      "departureBoard": {
+        "windowStart": "2026-07-10T10:00:00Z",
+        "windowEnd": "2026-07-10T22:00:00Z",
+        "limit": 20,
+        "hasMore": false
+      },
+      "nearbyVehicles": [
+        {
+          "id": "SKY:Vehicle:3350447622",
+          "transportMode": "bus",
+          "passengerServiceState": "non_passenger",
+          "lineCode": "4",
+          "destination": "skyss.no",
+          "state": "live",
+          "latitude": 60.4,
+          "longitude": 5.3,
+          "bearing": 90,
+          "delaySeconds": 1080,
+          "distanceMeters": null,
+          "lastSeenAt": "2026-07-10T10:00:08Z",
+          "version": "2026-07-10T10:00:08Z"
+        }
+      ],
+      "servingVehicles": [
+        {
+          "id": "SKY:Vehicle:67890",
+          "transportMode": "bus",
+          "passengerServiceState": "unknown",
+          "lineCode": "100",
+          "destination": "Nordfjordeid",
+          "state": "live",
+          "latitude": 61.636,
+          "longitude": 6.216,
+          "bearing": 32,
+          "delaySeconds": 120,
+          "distanceMeters": null,
+          "lastSeenAt": "2026-07-10T10:00:08Z",
+          "version": "2026-07-10T10:00:08Z",
+          "callRole": "calls_here",
+          "progress": "before_station",
+          "stationCallAt": "2026-07-10T10:17:00Z"
+        }
+      ],
+      "servingVehicleCoverage": {
+        "windowStart": null,
+        "windowEnd": null,
+        "candidateJourneyCount": 0,
+        "queriedJourneyCount": 0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "station_snapshot_changed",
+    "scope": "station:NSR:StopPlace:548",
+    "entityId": "NSR:StopPlace:548",
+    "eventId": "evt_station_snapshot",
+    "version": "2026-07-10T10:00:09Z",
+    "createdAt": "2026-07-10T10:00:09Z",
+    "payload": {
+      "stationId": "NSR:StopPlace:548",
+      "state": "empty",
+      "version": "2026-07-10T10:00:09Z",
+      "updatedAt": "2026-07-10T10:00:09Z",
+      "lastSuccessfulAt": "2026-07-10T10:00:09Z",
+      "warning": null,
+      "departures": [],
+      "departureBoard": {
+        "windowStart": "2026-07-10T10:00:00Z",
+        "windowEnd": "2026-07-10T22:00:00Z",
+        "limit": 20,
+        "hasMore": false
+      },
+      "nearbyVehicles": [],
+      "servingVehicles": [],
+      "servingVehicleCoverage": {
+        "windowStart": null,
+        "windowEnd": null,
+        "candidateJourneyCount": 0,
+        "queriedJourneyCount": 0,
+        "truncated": false
+      }
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "station_departures_changed",
+    "scope": "station:NSR:StopPlace:548",
+    "entityId": "NSR:StopPlace:548",
+    "eventId": "evt_station_departures",
+    "version": "2026-07-10T10:00:10Z",
+    "createdAt": "2026-07-10T10:00:10Z",
+    "payload": {
+      "stationId": "NSR:StopPlace:548",
+      "state": "fresh",
+      "version": "2026-07-10T10:00:10Z",
+      "updatedAt": "2026-07-10T10:00:10Z",
+      "departures": []
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "nearby_vehicles_changed",
+    "scope": "station:NSR:StopPlace:548",
+    "entityId": "NSR:StopPlace:548",
+    "eventId": "evt_nearby_vehicles",
+    "version": "2026-07-10T10:00:11Z",
+    "createdAt": "2026-07-10T10:00:11Z",
+    "payload": {
+      "stationId": "NSR:StopPlace:548",
+      "state": "empty",
+      "version": "2026-07-10T10:00:11Z",
+      "updatedAt": "2026-07-10T10:00:11Z",
+      "vehicles": []
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "vehicle_snapshot",
+    "scope": "vehicle:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "version": "2026-07-10T10:00:12Z",
+    "createdAt": "2026-07-10T10:00:12Z",
+    "payload": {
+      "vehicle": {
+        "id": "SKY:Vehicle:12345",
+        "transportMode": "bus",
+        "passengerServiceState": "passenger",
+        "lineCode": "100",
+        "routeName": "Førde–Nordfjordeid",
+        "destination": "Nordfjordeid",
+        "state": "live",
+        "latitude": 61.452,
+        "longitude": 5.857,
+        "bearing": 42,
+        "delaySeconds": 120,
+        "distanceMeters": null,
+        "lastSeenAt": "2026-07-10T10:00:12Z",
+        "refreshedAt": "2026-07-10T10:00:12Z",
+        "version": "2026-07-10T10:00:12Z",
+        "nextStop": null,
+        "journeyReference": null,
+        "monitoredCall": null,
+        "progressBetweenStops": null,
+        "journeyVersion": null,
+        "routeProgress": null
+      },
+      "trail": [],
+      "journey": null,
+      "upcomingStops": []
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "vehicle_moved",
+    "scope": "vehicle:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "eventId": "evt_vehicle_moved",
+    "version": "2026-07-10T10:00:13Z",
+    "createdAt": "2026-07-10T10:00:13Z",
+    "payload": {
+      "vehicle": {
+        "id": "SKY:Vehicle:12345",
+        "transportMode": "bus",
+        "passengerServiceState": "passenger",
+        "lineCode": "100",
+        "routeName": "Førde–Nordfjordeid",
+        "destination": "Nordfjordeid",
+        "state": "live",
+        "latitude": 61.453,
+        "longitude": 5.858,
+        "bearing": 43,
+        "delaySeconds": 120,
+        "distanceMeters": null,
+        "lastSeenAt": "2026-07-10T10:00:13Z",
+        "refreshedAt": "2026-07-10T10:00:13Z",
+        "version": "2026-07-10T10:00:13Z",
+        "nextStop": null,
+        "journeyReference": null,
+        "monitoredCall": null,
+        "progressBetweenStops": null,
+        "journeyVersion": null,
+        "routeProgress": null
+      },
+      "observation": {
+        "latitude": 61.453,
+        "longitude": 5.858,
+        "bearing": 43,
+        "observedAt": "2026-07-10T10:00:13Z"
+      }
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "vehicle_stale",
+    "scope": "vehicle:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "eventId": "evt_vehicle_stale",
+    "version": "2026-07-10T10:00:14Z",
+    "createdAt": "2026-07-10T10:00:14Z",
+    "payload": {
+      "vehicle": {
+        "id": "SKY:Vehicle:12345",
+        "transportMode": "bus",
+        "passengerServiceState": "passenger",
+        "lineCode": "100",
+        "routeName": "Førde–Nordfjordeid",
+        "destination": "Nordfjordeid",
+        "state": "stale",
+        "latitude": 61.453,
+        "longitude": 5.858,
+        "bearing": 43,
+        "delaySeconds": 120,
+        "distanceMeters": null,
+        "lastSeenAt": "2026-07-10T09:58:14Z",
+        "refreshedAt": "2026-07-10T10:00:14Z",
+        "version": "2026-07-10T10:00:14Z",
+        "nextStop": null,
+        "journeyReference": null,
+        "monitoredCall": null,
+        "progressBetweenStops": null,
+        "journeyVersion": null,
+        "routeProgress": null
+      },
+      "observation": null
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "vehicle_lost",
+    "scope": "vehicle:SKY:Vehicle:12345",
+    "entityId": "SKY:Vehicle:12345",
+    "eventId": "evt_vehicle_lost",
+    "version": "2026-07-10T10:00:15Z",
+    "createdAt": "2026-07-10T10:00:15Z",
+    "payload": {
+      "vehicle": {
+        "id": "SKY:Vehicle:12345",
+        "transportMode": "bus",
+        "passengerServiceState": "passenger",
+        "lineCode": "100",
+        "routeName": "Førde–Nordfjordeid",
+        "destination": "Nordfjordeid",
+        "state": "lost",
+        "latitude": 61.453,
+        "longitude": 5.858,
+        "bearing": 43,
+        "delaySeconds": 120,
+        "distanceMeters": null,
+        "lastSeenAt": "2026-07-10T09:55:15Z",
+        "refreshedAt": "2026-07-10T10:00:15Z",
+        "version": "2026-07-10T10:00:15Z",
+        "nextStop": null,
+        "journeyReference": null,
+        "monitoredCall": null,
+        "progressBetweenStops": null,
+        "journeyVersion": null,
+        "routeProgress": null
+      },
+      "observation": null
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "source_backoff",
+    "scope": "station:NSR:StopPlace:548",
+    "createdAt": "2026-07-10T10:00:16Z",
+    "payload": {
+      "service": "journey_planner",
+      "reason": "Entur returned HTTP 429.",
+      "retryAt": "2026-07-10T10:01:16Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "rate_limited",
+    "createdAt": "2026-07-10T10:00:17Z",
+    "payload": {
+      "limit": 30,
+      "remaining": 0,
+      "retryAt": "2026-07-10T10:01:17Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "telemetry_tick",
+    "createdAt": "2026-07-10T10:00:18Z",
+    "payload": {
+      "backend": "ok",
+      "realtime": "connected",
+      "entur": "idle",
+      "liveQueryBridge": "connected",
+      "refreshMode": "realtime",
+      "lastUpdateAt": "2026-07-10T10:00:18Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "realtime_degraded",
+    "createdAt": "2026-07-10T10:00:19Z",
+    "payload": {
+      "reason": "The database live-query bridge is reconnecting.",
+      "fallbackPolling": true,
+      "bridgeStatus": "reconnecting"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "type": "resync_required",
+    "createdAt": "2026-07-10T10:00:20Z",
+    "payload": {
+      "reason": "bridge_recovered",
+      "scopes": [
+        "station:NSR:StopPlace:548",
+        "vehicle:SKY:Vehicle:12345"
+      ]
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_ping",
+    "type": "pong",
+    "createdAt": "2026-07-10T10:00:21Z",
+    "payload": {
+      "serverTime": "2026-07-10T10:00:21Z",
+      "echoedSentAt": "2026-07-10T10:00:00Z"
+    }
+  },
+  {
+    "protocolVersion": 1,
+    "id": "msg_bad",
+    "type": "error",
+    "createdAt": "2026-07-10T10:00:22Z",
+    "error": {
+      "code": "invalid_message",
+      "message": "Message payload is invalid.",
+      "details": { "field": "payload.stationId" }
+    }
+  }
+]

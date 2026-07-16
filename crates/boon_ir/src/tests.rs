@@ -4,9 +4,51 @@ use super::*;
 include!("tests/bytes.rs");
 include!("tests/cells.rs");
 include!("tests/output_roots.rs");
+include!("tests/host_ports.rs");
+include!("tests/indexed_queries.rs");
 include!("tests/migrations.rs");
 include!("tests/sources_and_events.rs");
 include!("tests/todomvc.rs");
+
+#[test]
+fn outbound_http_effect_lowers_recursive_schema_without_executable_string_routes() {
+    let parsed = boon_parser::parse_source(
+        "outbound-http-effect.bn",
+        include_str!("../../../examples/outbound_http_effect.bn"),
+    )
+    .unwrap();
+    let typed = lower(&parsed).unwrap();
+    let [effect] = typed.host_effects.as_slice() else {
+        panic!("expected one typed outbound effect");
+    };
+    assert_eq!(effect.operation, "Http/request");
+    assert!(matches!(
+        effect
+            .intent_fields
+            .iter()
+            .find(|field| field.name == "headers")
+            .map(|field| &field.data_type),
+        Some(SemanticDataType::List { item })
+            if matches!(item.as_ref(), SemanticDataType::Record { open: false, .. })
+    ));
+    assert_eq!(
+        effect
+            .result_routes
+            .iter()
+            .map(|route| route.variant.as_str())
+            .collect::<Vec<_>>(),
+        ["HttpFailed", "HttpSucceeded"]
+    );
+    let request = typed
+        .sources
+        .iter()
+        .find(|source| source.path == "store.request")
+        .unwrap();
+    assert!(request.payload_schema.typed_fields.iter().any(|field| {
+        field.field == SourcePayloadField::Named("path_segments".to_owned())
+            && matches!(field.data_type, SemanticDataType::List { .. })
+    }));
+}
 
 #[test]
 fn typed_passkey_effects_lower_as_metadata_with_typed_result_sources() {
@@ -98,6 +140,6 @@ effects: [
         .unwrap();
     assert!(failure.payload_schema.typed_fields.iter().any(|field| {
         field.field == SourcePayloadField::Named("retryable".to_owned())
-            && field.value_type == SourcePayloadValueType::Bool
+            && field.data_type == SemanticDataType::Bool
     }));
 }

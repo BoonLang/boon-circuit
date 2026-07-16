@@ -905,6 +905,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let lines = parser_lines(&tokens);
     let item_lines = merge_multiline_bytes_lines(&lines, &text_body_line_ranges);
     let item_lines = merge_multiline_drain_lines(&item_lines, &text_body_line_ranges);
+    let item_lines = merge_multiline_call_expression_lines(&item_lines, &text_body_line_ranges);
     let items = parser_items(&item_lines, &text_body_line_ranges);
     let mut expressions = Vec::new();
     let statements = ast_statement_tree(&items, &mut expressions, source);
@@ -1166,6 +1167,102 @@ fn merge_multiline_drain_lines(
     text_body_line_ranges: &[(usize, usize)],
 ) -> Vec<ParserLine> {
     merge_multiline_braced_lines(lines, text_body_line_ranges, unclosed_drain_body_open)
+}
+
+fn merge_multiline_call_expression_lines(
+    lines: &[ParserLine],
+    text_body_line_ranges: &[(usize, usize)],
+) -> Vec<ParserLine> {
+    let mut merged = Vec::new();
+    let mut index = 0usize;
+    while let Some(line) = lines.get(index) {
+        if line_is_in_ranges(line.line, text_body_line_ranges) {
+            merged.push(line.clone());
+            index += 1;
+            continue;
+        }
+        let Some(open) = line.symbols.iter().position(|symbol| symbol == "(") else {
+            merged.push(line.clone());
+            index += 1;
+            continue;
+        };
+        if matching_close(&line.symbols, open).is_some() {
+            merged.push(line.clone());
+            index += 1;
+            continue;
+        }
+
+        let nested_call = unmatched_parenthesis_count(&line.symbols) > 1;
+        let mut end_index = index;
+        let mut candidate = line.symbols.clone();
+        let mut outer_close = None;
+        while outer_close.is_none() {
+            end_index += 1;
+            let Some(next) = lines.get(end_index) else {
+                break;
+            };
+            if line_is_in_ranges(next.line, text_body_line_ranges) {
+                break;
+            }
+            candidate.extend(next.symbols.iter().cloned());
+            outer_close = matching_close(&candidate, open);
+        }
+        let Some(outer_close) = outer_close else {
+            merged.push(line.clone());
+            index += 1;
+            continue;
+        };
+        let has_trailing_expression = candidate
+            .get(outer_close + 1..)
+            .is_some_and(|tokens| !tokens.is_empty());
+        if !nested_call && !has_trailing_expression {
+            merged.push(line.clone());
+            index += 1;
+            continue;
+        }
+
+        let mut expression_line = line.clone();
+        for next in &lines[index + 1..=end_index] {
+            if multiline_expression_needs_separator(&expression_line.symbols, &next.symbols) {
+                let separator = expression_line
+                    .symbol_spans
+                    .last()
+                    .map(|(_, end)| (*end, *end))
+                    .unwrap_or((expression_line.end, expression_line.end));
+                expression_line.symbols.push(",".to_owned());
+                expression_line.symbol_spans.push(separator);
+            }
+            expression_line.end = next.end;
+            expression_line.symbols.extend(next.symbols.iter().cloned());
+            expression_line
+                .symbol_spans
+                .extend(next.symbol_spans.iter().copied());
+        }
+        merged.push(expression_line);
+        index = end_index + 1;
+    }
+    merged
+}
+
+fn unmatched_parenthesis_count(symbols: &[String]) -> usize {
+    symbols
+        .iter()
+        .fold(0usize, |depth, symbol| match symbol.as_str() {
+            "(" => depth + 1,
+            ")" => depth.saturating_sub(1),
+            _ => depth,
+        })
+}
+
+fn multiline_expression_needs_separator(current: &[String], next: &[String]) -> bool {
+    let Some(previous) = current.last().map(String::as_str) else {
+        return false;
+    };
+    let Some(next) = next.first().map(String::as_str) else {
+        return false;
+    };
+    !matches!(previous, "(" | "[" | "{" | ":" | "," | "|>" | "=>")
+        && !matches!(next, ")" | "]" | "}" | "," | "|>" | "=>")
 }
 
 fn merge_multiline_braced_lines(
@@ -3513,7 +3610,7 @@ fn derive_structure_from_statements(
                     tables,
                 );
                 if !collected_from_expr && let Some(field) = field.as_deref() {
-                    let source_scope = source_scope_without_events(scope);
+                    let source_scope = source_scope_without_event_groups(scope);
                     let path = match event.as_deref() {
                         Some(event) => join_path(&source_scope, [field, event]),
                         None => join_path(&source_scope, [field]),
@@ -4212,7 +4309,7 @@ fn collect_source_ports_from_expr(
     };
     match &expr.kind {
         AstExprKind::Source => {
-            let source_scope = source_scope_without_events(scope);
+            let source_scope = source_scope_without_event_groups(scope);
             if let Some(path) = scope_path(&source_scope) {
                 tables.source_ports.push(ParsedSourcePort {
                     path,
@@ -4770,11 +4867,13 @@ fn scope_path(scope: &[String]) -> Option<String> {
     })
 }
 
-fn source_scope_without_events(scope: &[String]) -> Vec<String> {
+fn source_scope_without_event_groups(scope: &[String]) -> Vec<String> {
+    let source_leaf = scope.len().saturating_sub(1);
     scope
         .iter()
-        .filter(|segment| segment.as_str() != "events")
-        .cloned()
+        .enumerate()
+        .filter(|(index, segment)| segment.as_str() != "events" || *index == source_leaf)
+        .map(|(_, segment)| segment.clone())
         .collect()
 }
 

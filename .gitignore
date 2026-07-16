@@ -1,3 +1,5 @@
 target/
+!examples/fjordpulse/contracts/target/
+!examples/fjordpulse/contracts/target/**
 /playground/custom_examples/
 /playground/state/

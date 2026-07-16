@@ -2435,6 +2435,10 @@ mod tests {
     use boon_plan::{EffectId, MemoryKind, MemoryLeafId, MemoryOwnerPath};
     use redb::TableHandle;
 
+    fn number(value: i64) -> StoredValue {
+        StoredValue::integer(value).unwrap()
+    }
+
     fn application() -> ApplicationIdentity {
         ApplicationIdentity::new("dev.boon.redb", "test", "local")
     }
@@ -2492,10 +2496,7 @@ mod tests {
                 .unwrap(),
             effect,
             StoredValue::Text("request-1".to_owned()),
-            StoredValue::Record(BTreeMap::from([(
-                "amount".to_owned(),
-                StoredValue::Number(12),
-            )])),
+            StoredValue::Record(BTreeMap::from([("amount".to_owned(), number(12))])),
             None,
             turn_sequence,
         )
@@ -2944,7 +2945,7 @@ mod tests {
                     memory_id: count,
                     value: StoredScalar {
                         touched: true,
-                        value: StoredValue::Number(9),
+                        value: number(9),
                     },
                 },
                 DurableChange::InsertRow {
@@ -2977,7 +2978,7 @@ mod tests {
                 memory_id: count,
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Number(10),
+                    value: number(10),
                 },
             }],
             outbox_changes: Vec::new(),
@@ -3010,7 +3011,7 @@ mod tests {
             old,
             StoredScalar {
                 touched: true,
-                value: StoredValue::Number(7),
+                value: number(7),
             },
         );
         let edge = MigrationEdgeId::from_schema_transition(
@@ -3036,7 +3037,7 @@ mod tests {
                     memory_id: new,
                     value: StoredScalar {
                         touched: true,
-                        value: StoredValue::Number(7),
+                        value: number(7),
                     },
                 }],
                 completed_migration_edges: vec![edge],
@@ -3069,7 +3070,7 @@ mod tests {
         assert_eq!(restored.schema_version, 2);
         assert_eq!(restored.schema_hash, [6; 32]);
         assert!(!restored.scalars.contains_key(&old));
-        assert_eq!(restored.scalars[&new].value, StoredValue::Number(7));
+        assert_eq!(restored.scalars[&new].value, number(7));
         assert!(restored.completed_migration_edges.contains(&edge));
         assert_eq!(
             restored.content_artifact_manifest.bindings[&artifact_owner].artifact_id,

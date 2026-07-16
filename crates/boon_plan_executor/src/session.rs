@@ -1,20 +1,30 @@
 use boon_plan::{
-    EffectInvocationId, FieldId, InitialValueKind, ListId, ListInitializerKind, ListStorageSlot,
-    MachinePlan, PlanConstantId, PlanConstantValue, PlanDerivedExpression, PlanDerivedKind,
-    PlanExpressionKind, PlanListOperationKind, PlanListProjection, PlanListRemovePredicate, PlanOp,
-    PlanOpId, PlanOpKind, PlanRowCallArg, PlanRowExpression, PlanRowSelectPattern, PlanSourceGuard,
-    RootOutputDemand, ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute,
-    StateId, ValueRef,
+    EffectInvocationId, FieldId, FiniteReal, InitialValueKind, ListId, ListInitializerKind,
+    ListStorageSlot, MachinePlan, PlanConstantId, PlanConstantValue, PlanDerivedExpression,
+    PlanDerivedKind, PlanExpressionKind, PlanListOperationKind, PlanListProjection,
+    PlanListRemovePredicate, PlanOp, PlanOpId, PlanOpKind, PlanQueryResidual, PlanQuerySelection,
+    PlanRowCallArg, PlanRowExpression, PlanRowSelectPattern, PlanSourceGuard, QueryCollectionId,
+    QueryCollectionPlan, QueryIndexId, QueryIndexPlan, QueryKeyType, RootOutputDemand,
+    ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute, StateId, ValueRef,
+};
+use boon_query::{
+    Collection as QueryCollection, CursorToken as QueryCursorToken, IndexId as EngineIndexId,
+    IndexKey as EngineIndexKey, KeyPart as EngineKeyPart, QueryPlan as EngineQueryPlan,
+    QuerySelection as EngineQuerySelection, ResidualPredicate as EngineResidualPredicate,
+    RowId as EngineRowId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_SESSION_LAUNCH_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Value {
     Null,
     Bool(bool),
-    Number(i64),
+    Number(FiniteReal),
     Text(String),
     Bytes(Vec<u8>),
     List(Vec<Value>),
@@ -30,6 +40,14 @@ pub enum Value {
     Error {
         code: String,
     },
+}
+
+impl Value {
+    pub fn integer(value: i64) -> Result<Self, Error> {
+        FiniteReal::from_i64_exact(value)
+            .map(Self::Number)
+            .map_err(|error| Error::Evaluation(error.to_string()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -128,6 +146,16 @@ pub struct TurnMetrics {
     pub index_lookup_count: usize,
     pub index_candidate_count: usize,
     pub list_find_scan_count: usize,
+    pub query_index_range_count: usize,
+    pub query_index_key_count: usize,
+    pub query_rows_examined_count: usize,
+    pub query_candidate_count: usize,
+    pub query_residual_evaluation_count: usize,
+    pub query_result_count: usize,
+    pub query_full_scan_count: usize,
+    pub query_elapsed_nanos: u64,
+    pub query_cursor_count: usize,
+    pub query_selected_indexes: Vec<QueryIndexId>,
     pub work_unit_count: u64,
     pub recomputed_targets: Vec<ValueTarget>,
 }
@@ -140,7 +168,41 @@ pub struct Turn {
     pub authority_deltas: Vec<AuthorityDelta>,
     pub durable_changes: Vec<boon_persistence::DurableChange>,
     pub outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
+    pub transient_effects: Vec<TransientEffectInvocation>,
     pub metrics: TurnMetrics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TransientEffectCallId {
+    launch_epoch: u64,
+    sequence: u64,
+}
+
+impl TransientEffectCallId {
+    pub fn launch_epoch(self) -> u64 {
+        self.launch_epoch
+    }
+
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
+impl fmt::Display for TransientEffectCallId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.launch_epoch, self.sequence)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransientEffectInvocation {
+    pub call_id: TransientEffectCallId,
+    pub invocation_id: EffectInvocationId,
+    pub effect_id: boon_plan::EffectId,
+    pub trigger_source_sequence: u64,
+    pub authority_turn_sequence: u64,
+    pub target: Option<RowId>,
+    pub intent: Value,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -301,11 +363,17 @@ struct ListState {
     next_key: u64,
 }
 
+#[derive(Clone, Debug)]
+struct QueryCollectionState {
+    engine: QueryCollection,
+    runtime_rows: BTreeMap<EngineRowId, RowId>,
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ScalarKey {
     Null,
     Bool(bool),
-    Number(i64),
+    Number(FiniteReal),
     Text(String),
     Bytes(Vec<u8>),
 }
@@ -344,6 +412,7 @@ enum Consumer {
 enum DynamicDependency {
     RowField(RowId, FieldId),
     Query(IndexKey),
+    IndexedQuery(QueryIndexId),
     List(ListId),
 }
 
@@ -351,6 +420,7 @@ enum DynamicDependency {
 struct DynamicDependencies {
     by_row_field: BTreeMap<(RowId, FieldId), BTreeSet<Consumer>>,
     by_query: BTreeMap<IndexKey, BTreeSet<Consumer>>,
+    by_indexed_query: BTreeMap<QueryIndexId, BTreeSet<Consumer>>,
     by_list: BTreeMap<ListId, BTreeSet<Consumer>>,
     by_consumer: BTreeMap<Consumer, BTreeSet<DynamicDependency>>,
 }
@@ -367,6 +437,9 @@ impl DynamicDependencies {
                 }
                 DynamicDependency::Query(key) => {
                     remove_consumer(&mut self.by_query, &key, consumer)
+                }
+                DynamicDependency::IndexedQuery(index) => {
+                    remove_consumer(&mut self.by_indexed_query, &index, consumer)
                 }
                 DynamicDependency::List(list) => {
                     remove_consumer(&mut self.by_list, &list, consumer)
@@ -389,6 +462,12 @@ impl DynamicDependencies {
             }
             DynamicDependency::Query(key) => {
                 self.by_query.entry(key).or_default().insert(consumer);
+            }
+            DynamicDependency::IndexedQuery(index) => {
+                self.by_indexed_query
+                    .entry(index)
+                    .or_default()
+                    .insert(consumer);
             }
             DynamicDependency::List(list) => {
                 self.by_list.entry(list).or_default().insert(consumer);
@@ -434,6 +513,9 @@ struct Metadata {
     list_labels: BTreeMap<ListId, String>,
     list_fields_by_name: BTreeMap<(ListId, String), Vec<FieldId>>,
     list_fields_by_exact_name: BTreeMap<String, Vec<(ListId, FieldId)>>,
+    row_field_names: BTreeMap<(ListId, FieldId), String>,
+    query_collections: BTreeMap<QueryCollectionId, QueryCollectionPlan>,
+    query_indexes: BTreeMap<QueryIndexId, QueryIndexPlan>,
     root_field_by_exact_name: BTreeMap<String, Vec<FieldId>>,
     root_field_by_name: BTreeMap<String, Vec<FieldId>>,
     root_state_by_exact_name: BTreeMap<String, Vec<StateId>>,
@@ -461,6 +543,7 @@ impl Metadata {
         let mut row_field_owner = BTreeMap::new();
         let mut list_fields_by_name = BTreeMap::<(ListId, String), Vec<FieldId>>::new();
         let mut list_fields_by_exact_name = BTreeMap::<String, Vec<(ListId, FieldId)>>::new();
+        let mut row_field_names = BTreeMap::<(ListId, FieldId), String>::new();
         for slot in &plan.storage_layout.list_slots {
             let persistence = plan
                 .persistence
@@ -477,6 +560,9 @@ impl Metadata {
                     )));
                 }
                 if let Some(label) = field_labels.get(field) {
+                    row_field_names
+                        .entry((slot.list_id, *field))
+                        .or_insert_with(|| local_name(label).to_owned());
                     list_fields_by_name
                         .entry((slot.list_id, label.clone()))
                         .or_default()
@@ -492,6 +578,10 @@ impl Metadata {
                         .iter()
                         .find(|leaf| leaf.runtime_field_id == Some(*field))
                 }) {
+                    row_field_names.insert(
+                        (slot.list_id, *field),
+                        local_name(&leaf.semantic_path).to_owned(),
+                    );
                     list_fields_by_name
                         .entry((slot.list_id, leaf.semantic_path.clone()))
                         .or_default()
@@ -562,6 +652,36 @@ impl Metadata {
                 return Err(Error::InvalidPlan(format!(
                     "scope {} owns lists {} and {}",
                     scope.0, previous.0, slot.list_id.0
+                )));
+            }
+        }
+        let mut query_collections = BTreeMap::new();
+        for collection in &plan.query_collections {
+            if collection.engine_plan().is_err()
+                || query_collections
+                    .insert(collection.id, collection.clone())
+                    .is_some()
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "query collection {:?} has duplicate or non-canonical identity",
+                    collection.id
+                )));
+            }
+        }
+        let mut query_indexes = BTreeMap::new();
+        for index in &plan.query_indexes {
+            if index
+                .fields
+                .iter()
+                .any(|field| row_field_owner.get(&field.field) != Some(&index.source_list))
+                || query_collections
+                    .get(&index.collection)
+                    .is_none_or(|collection| collection.source_list != index.source_list)
+                || query_indexes.insert(index.id, index.clone()).is_some()
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "query index {} has duplicate identity or an unowned field",
+                    index.id
                 )));
             }
         }
@@ -756,6 +876,9 @@ impl Metadata {
             list_labels,
             list_fields_by_name,
             list_fields_by_exact_name,
+            row_field_names,
+            query_collections,
+            query_indexes,
             root_field_by_exact_name,
             root_field_by_name,
             root_state_by_exact_name,
@@ -957,6 +1080,69 @@ impl Metadata {
     }
 }
 
+fn empty_query_collections(
+    metadata: &Metadata,
+) -> Result<BTreeMap<ListId, QueryCollectionState>, Error> {
+    let mut grouped =
+        BTreeMap::<ListId, (boon_query::CollectionPlan, Vec<boon_query::IndexPlan>)>::new();
+    for collection in metadata.query_collections.values() {
+        let engine = collection
+            .engine_plan()
+            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+        if grouped
+            .insert(collection.source_list, (engine, Vec::new()))
+            .is_some()
+        {
+            return Err(Error::InvalidPlan(format!(
+                "list {} owns multiple query collections",
+                collection.source_list.0
+            )));
+        }
+    }
+    for index in metadata.query_indexes.values() {
+        let (collection, engine_index) = index
+            .engine_plans()
+            .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+        match grouped.entry(index.source_list) {
+            std::collections::btree_map::Entry::Vacant(_) => {
+                return Err(Error::InvalidPlan(format!(
+                    "query index {} has no declared collection",
+                    index.id
+                )));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != collection {
+                    return Err(Error::InvalidPlan(format!(
+                        "list {} query indexes disagree on collection identity",
+                        index.source_list.0
+                    )));
+                }
+                entry.get_mut().1.push(engine_index);
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(list, (collection, indexes))| {
+            if indexes.is_empty() {
+                return Err(Error::InvalidPlan(format!(
+                    "query collection for list {} has no indexes",
+                    list.0
+                )));
+            }
+            let engine = QueryCollection::new(collection, indexes)
+                .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+            Ok((
+                list,
+                QueryCollectionState {
+                    engine,
+                    runtime_rows: BTreeMap::new(),
+                },
+            ))
+        })
+        .collect()
+}
+
 fn debug_name_variants(label: &str) -> Vec<String> {
     let parts = label.split('.').collect::<Vec<_>>();
     (0..parts.len())
@@ -1012,8 +1198,9 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
         PlanConstantValue::Text { value } | PlanConstantValue::Enum { value } => {
             Ok(Value::Text(value.clone()))
         }
+        PlanConstantValue::Data { value } => Ok(runtime_value_from_data(value)),
         PlanConstantValue::Number { value } => Ok(Value::Number(*value)),
-        PlanConstantValue::Byte { value } => Ok(Value::Number(i64::from(*value))),
+        PlanConstantValue::Byte { value } => Value::integer(i64::from(*value)),
         PlanConstantValue::Bool { value } => Ok(Value::Bool(*value)),
         PlanConstantValue::Bytes {
             byte_len,
@@ -1032,6 +1219,239 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
             Ok(Value::Bytes(bytes))
         }
     }
+}
+
+fn runtime_value_from_data(value: &boon_data::Value) -> Value {
+    match value {
+        boon_data::Value::Null => Value::Null,
+        boon_data::Value::Bool(value) => Value::Bool(*value),
+        boon_data::Value::Number(value) => Value::Number(*value),
+        boon_data::Value::Text(value) => Value::Text(value.clone()),
+        boon_data::Value::Bytes(value) => Value::Bytes(value.clone()),
+        boon_data::Value::List(values) => {
+            Value::List(values.iter().map(runtime_value_from_data).collect())
+        }
+        boon_data::Value::Record(fields) => Value::Record(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), runtime_value_from_data(value)))
+                .collect(),
+        ),
+        boon_data::Value::Variant { tag, fields } => {
+            if fields.is_empty() {
+                Value::Text(tag.clone())
+            } else {
+                Value::Record(
+                    std::iter::once(("tag".to_owned(), Value::Text(tag.clone())))
+                        .chain(
+                            fields.iter().map(|(name, value)| {
+                                (name.clone(), runtime_value_from_data(value))
+                            }),
+                        )
+                        .collect(),
+                )
+            }
+        }
+        boon_data::Value::Error { code, fields } => {
+            if fields.is_empty() {
+                Value::Error { code: code.clone() }
+            } else {
+                Value::Record(
+                    std::iter::once(("error".to_owned(), Value::Text(code.clone())))
+                        .chain(
+                            fields.iter().map(|(name, value)| {
+                                (name.clone(), runtime_value_from_data(value))
+                            }),
+                        )
+                        .collect(),
+                )
+            }
+        }
+    }
+}
+
+fn runtime_value_to_query_data(value: &Value) -> Result<boon_data::Value, Error> {
+    Ok(match value {
+        Value::Null => boon_data::Value::Null,
+        Value::Bool(value) => boon_data::Value::Bool(*value),
+        Value::Number(value) => boon_data::Value::Number(*value),
+        Value::Text(value) => boon_data::Value::Text(value.clone()),
+        Value::Bytes(value) => boon_data::Value::Bytes(value.clone()),
+        Value::List(values) => boon_data::Value::List(
+            values
+                .iter()
+                .map(runtime_value_to_query_data)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Value::Record(fields) => boon_data::Value::Record(
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), runtime_value_to_query_data(value)?)))
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+        ),
+        Value::Error { code } => boon_data::Value::Error {
+            code: code.clone(),
+            fields: BTreeMap::new(),
+        },
+        Value::MappedRow { .. } | Value::Row { .. } => {
+            return Err(Error::Evaluation(
+                "query authority cannot contain runtime row handles".to_owned(),
+            ));
+        }
+    })
+}
+
+fn engine_row_id(row: RowId) -> EngineRowId {
+    EngineRowId(format!(
+        "{:016x}:{:016x}:{:016x}",
+        row.list.0, row.key, row.generation
+    ))
+}
+
+fn runtime_query_key(
+    value: &Value,
+    index: &QueryIndexPlan,
+    expected_arity: usize,
+) -> Result<EngineIndexKey, Error> {
+    EngineIndexKey::new(runtime_query_parts(value, index, Some(expected_arity))?)
+        .map_err(|error| Error::Evaluation(error.to_string()))
+}
+
+fn runtime_query_parts(
+    value: &Value,
+    index: &QueryIndexPlan,
+    expected_arity: Option<usize>,
+) -> Result<Vec<EngineKeyPart>, Error> {
+    let values = match value {
+        Value::List(values) => values.iter().collect::<Vec<_>>(),
+        Value::Record(values) => index
+            .fields
+            .iter()
+            .take(expected_arity.unwrap_or(index.fields.len()))
+            .map(|field| {
+                let name = field.path.last().ok_or_else(|| {
+                    Error::InvalidPlan(format!("query index {} has an empty field path", index.id))
+                })?;
+                values.get(name).ok_or_else(|| {
+                    Error::Evaluation(format!("compound query key is missing field `{name}`"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        value => vec![value],
+    };
+    let expected_arity = expected_arity.unwrap_or(values.len());
+    if values.len() != expected_arity || values.len() > index.fields.len() {
+        return Err(Error::Evaluation(format!(
+            "query index {} requires a {expected_arity}-part key, received {} parts",
+            index.id,
+            values.len()
+        )));
+    }
+    values
+        .into_iter()
+        .zip(&index.fields)
+        .map(|(value, field)| match (field.key_type, value) {
+            (QueryKeyType::Bool, Value::Bool(value)) => Ok(EngineKeyPart::Bool(*value)),
+            (QueryKeyType::Number, Value::Number(value)) => Ok(EngineKeyPart::Number(*value)),
+            (QueryKeyType::Text, Value::Text(value)) => Ok(EngineKeyPart::Text(value.clone())),
+            (QueryKeyType::Tag, Value::Text(value)) => Ok(EngineKeyPart::Tag(value.clone())),
+            _ => Err(Error::Evaluation(format!(
+                "query key for `{}` has the wrong scalar type",
+                field.semantic_path
+            ))),
+        })
+        .collect()
+}
+
+fn query_cursor_from_runtime(value: Value) -> Result<Option<QueryCursorToken>, Error> {
+    match value {
+        Value::Bytes(bytes) if bytes.is_empty() => Ok(None),
+        Value::Bytes(bytes) => QueryCursorToken::from_bytes(bytes)
+            .map(Some)
+            .map_err(|error| Error::Evaluation(error.to_string())),
+        Value::Null => Ok(None),
+        _ => Err(Error::Evaluation(
+            "indexed query cursor must be Bytes or Null".to_owned(),
+        )),
+    }
+}
+
+fn query_number(value: Value, label: &str) -> Result<FiniteReal, Error> {
+    let Value::Number(value) = value else {
+        return Err(Error::Evaluation(format!(
+            "indexed query {label} must be Number"
+        )));
+    };
+    Ok(value)
+}
+
+fn coerce_query_tag(
+    value: &mut boon_data::Value,
+    path: &[String],
+    multi_value: bool,
+) -> Result<(), Error> {
+    let (last, parents) = path
+        .split_last()
+        .ok_or_else(|| Error::InvalidPlan("tag query field has an empty path".to_owned()))?;
+    let mut current = value;
+    for component in parents {
+        current = match current {
+            boon_data::Value::Record(fields)
+            | boon_data::Value::Variant { fields, .. }
+            | boon_data::Value::Error { fields, .. } => fields.get_mut(component),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            Error::Evaluation(format!(
+                "tag query path `{}` is absent from the row",
+                path.join(".")
+            ))
+        })?;
+    }
+    let target = match current {
+        boon_data::Value::Record(fields)
+        | boon_data::Value::Variant { fields, .. }
+        | boon_data::Value::Error { fields, .. } => fields.get_mut(last),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        Error::Evaluation(format!(
+            "tag query path `{}` is absent from the row",
+            path.join(".")
+        ))
+    })?;
+    if multi_value {
+        let boon_data::Value::List(values) = target else {
+            return Err(Error::Evaluation(format!(
+                "multi-value tag query path `{}` is not a list",
+                path.join(".")
+            )));
+        };
+        for value in values {
+            let boon_data::Value::Text(tag) = value else {
+                return Err(Error::Evaluation(format!(
+                    "tag query path `{}` contains a non-tag value",
+                    path.join(".")
+                )));
+            };
+            *value = boon_data::Value::Variant {
+                tag: std::mem::take(tag),
+                fields: BTreeMap::new(),
+            };
+        }
+    } else {
+        let boon_data::Value::Text(tag) = target else {
+            return Err(Error::Evaluation(format!(
+                "tag query path `{}` is not a fieldless tag",
+                path.join(".")
+            )));
+        };
+        *target = boon_data::Value::Variant {
+            tag: std::mem::take(tag),
+            fields: BTreeMap::new(),
+        };
+    }
+    Ok(())
 }
 
 fn stable_list_fields(
@@ -1182,6 +1602,109 @@ fn stored_value_for_data_type(
     stored_value(value)
 }
 
+fn validate_value_for_data_type(
+    value: &Value,
+    data_type: &boon_plan::DataTypePlan,
+    path: &str,
+) -> Result<(), Error> {
+    use boon_plan::DataTypePlan;
+
+    match (value, data_type) {
+        (Value::Null, DataTypePlan::Null)
+        | (Value::Bool(_), DataTypePlan::Bool)
+        | (Value::Number(_), DataTypePlan::Number)
+        | (Value::Text(_), DataTypePlan::Text) => Ok(()),
+        (Value::Number(value), DataTypePlan::Byte)
+            if value
+                .to_i64_exact()
+                .ok()
+                .is_some_and(|value| (0..=u8::MAX as i64).contains(&value)) =>
+        {
+            Ok(())
+        }
+        (Value::Bytes(value), DataTypePlan::Bytes { fixed_len })
+            if fixed_len
+                .is_none_or(|expected| u64::try_from(value.len()).ok() == Some(expected)) =>
+        {
+            Ok(())
+        }
+        (Value::List(values), DataTypePlan::List { item }) => {
+            for (index, value) in values.iter().enumerate() {
+                validate_value_for_data_type(value, item, &format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        (Value::Record(values), DataTypePlan::Record { fields, open }) => {
+            validate_record_for_data_type(values, fields, *open, path)
+        }
+        (Value::Text(tag), DataTypePlan::Variant { variants }) => {
+            let variant = variants
+                .iter()
+                .find(|variant| variant.tag == *tag)
+                .ok_or_else(|| {
+                    Error::Evaluation(format!("{path} has undeclared variant `{tag}`"))
+                })?;
+            if variant.fields.is_empty() {
+                Ok(())
+            } else {
+                Err(Error::Evaluation(format!(
+                    "{path} variant `{tag}` requires named fields"
+                )))
+            }
+        }
+        (Value::Record(values), DataTypePlan::Variant { variants }) => {
+            let Some(Value::Text(tag)) = values.get("$tag") else {
+                return Err(Error::Evaluation(format!(
+                    "{path} structured variant has no text `$tag`"
+                )));
+            };
+            let variant = variants
+                .iter()
+                .find(|variant| variant.tag == *tag)
+                .ok_or_else(|| {
+                    Error::Evaluation(format!("{path} has undeclared variant `{tag}`"))
+                })?;
+            let fields = values
+                .iter()
+                .filter(|(name, _)| name.as_str() != "$tag")
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            validate_record_for_data_type(&fields, &variant.fields, variant.open, path)
+        }
+        (Value::Error { .. }, DataTypePlan::Error { fields, .. }) if fields.is_empty() => Ok(()),
+        (_, DataTypePlan::Unknown) => Err(Error::InvalidPlan(format!(
+            "{path} has an unknown data type"
+        ))),
+        _ => Err(Error::Evaluation(format!(
+            "{path} does not match its declared data type"
+        ))),
+    }
+}
+
+fn validate_record_for_data_type(
+    values: &BTreeMap<String, Value>,
+    fields: &[boon_plan::DataTypeFieldPlan],
+    open: bool,
+    path: &str,
+) -> Result<(), Error> {
+    for field in fields {
+        let value = values.get(&field.name).ok_or_else(|| {
+            Error::Evaluation(format!("{path} is missing field `{}`", field.name))
+        })?;
+        validate_value_for_data_type(value, &field.data_type, &format!("{path}.{}", field.name))?;
+    }
+    if !open
+        && let Some(name) = values
+            .keys()
+            .find(|name| !fields.iter().any(|field| field.name == **name))
+    {
+        return Err(Error::Evaluation(format!(
+            "{path} contains undeclared field `{name}`"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Value, Error> {
     match value {
         boon_persistence::StoredValue::Null => Ok(Value::Null),
@@ -1260,6 +1783,9 @@ struct Work {
     deltas: Vec<Delta>,
     authority_deltas: Vec<AuthorityDelta>,
     outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
+    transient_effects: Vec<TransientEffectInvocation>,
+    committed_transient_effects: Vec<TransientEffectCallId>,
+    completed_transient_effects: Vec<(TransientEffectCallId, PendingTransientEffect)>,
     metrics: TurnMetrics,
     dirty_states: HashSet<StateId>,
     dirty_consumers: HashSet<Consumer>,
@@ -1291,6 +1817,9 @@ impl Work {
         self.deltas.clear();
         self.authority_deltas.clear();
         self.outbox_changes.clear();
+        self.transient_effects.clear();
+        self.committed_transient_effects.clear();
+        self.completed_transient_effects.clear();
         self.metrics = TurnMetrics::default();
         self.dirty_states.clear();
         self.dirty_consumers.clear();
@@ -1333,6 +1862,8 @@ impl Work {
         self.authority_undo.clear();
         self.undo_root_states.clear();
         self.undo_row_fields.clear();
+        self.committed_transient_effects.clear();
+        self.completed_transient_effects.clear();
         self.pending_settle = false;
     }
 
@@ -1346,7 +1877,16 @@ impl Work {
             .recomputed_targets
             .extend(self.recomputed_targets.iter().copied());
         self.metrics.recomputed_targets.sort_unstable();
+        self.metrics.query_selected_indexes.sort_unstable();
+        self.metrics.query_selected_indexes.dedup();
     }
+}
+
+#[derive(Clone, Debug)]
+struct PendingTransientEffect {
+    invocation_id: EffectInvocationId,
+    effect_id: boon_plan::EffectId,
+    target: Option<RowId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1370,9 +1910,13 @@ pub struct Session {
     root_fields: BTreeMap<FieldId, DerivedCell>,
     lists: BTreeMap<ListId, ListState>,
     indexes: BTreeMap<IndexKey, BTreeSet<RowId>>,
+    query_collections: BTreeMap<ListId, QueryCollectionState>,
     dynamic_dependencies: DynamicDependencies,
     last_sequence: Option<u64>,
     turn_sequence: u64,
+    launch_epoch: u64,
+    next_transient_effect_sequence: u64,
+    pending_transient_effects: BTreeMap<TransientEffectCallId, PendingTransientEffect>,
     next_binding_id: u64,
     touched_root_states: BTreeSet<StateId>,
     touched_lists: BTreeSet<ListId>,
@@ -1383,6 +1927,14 @@ pub struct Session {
 pub struct SessionBuilder {
     session: Session,
     authority: Option<AuthoritySnapshot>,
+}
+
+fn next_session_launch_epoch() -> Result<u64, Error> {
+    NEXT_SESSION_LAUNCH_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| Error::Evaluation("session launch epoch exhausted".to_owned()))
 }
 
 impl SessionBuilder {
@@ -1398,6 +1950,7 @@ impl SessionBuilder {
             )));
         }
         let metadata = Arc::new(Metadata::new(&plan)?);
+        let query_collections = empty_query_collections(&metadata)?;
         let turn_work = Work::with_limit(options.max_work_units_per_transaction);
         Ok(Self {
             session: Session {
@@ -1408,9 +1961,13 @@ impl SessionBuilder {
                 root_fields: BTreeMap::new(),
                 lists: BTreeMap::new(),
                 indexes: BTreeMap::new(),
+                query_collections,
                 dynamic_dependencies: DynamicDependencies::default(),
                 last_sequence: None,
                 turn_sequence: 0,
+                launch_epoch: next_session_launch_epoch()?,
+                next_transient_effect_sequence: 1,
+                pending_transient_effects: BTreeMap::new(),
                 next_binding_id: 1,
                 touched_root_states: BTreeSet::new(),
                 touched_lists: BTreeSet::new(),
@@ -2255,6 +2812,17 @@ impl Session {
         list: ListId,
         item_type: &boon_plan::DataTypePlan,
     ) -> Result<Value, Error> {
+        let mut work = self.fresh_work();
+        self.materialize_typed_list(list, item_type, None, &mut work)
+    }
+
+    fn materialize_typed_list(
+        &mut self,
+        list: ListId,
+        item_type: &boon_plan::DataTypePlan,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<Value, Error> {
         let boon_plan::DataTypePlan::Record {
             fields,
             open: false,
@@ -2267,14 +2835,13 @@ impl Session {
         };
         let rows = self.list_row_ids(list);
         let mut values = Vec::with_capacity(rows.len());
-        let mut work = self.fresh_work();
         work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
         for row in rows {
             let mut record = BTreeMap::new();
             for output_field in fields {
                 let field = self.metadata.list_storage_field(list, &output_field.name)?;
                 let value = if self.metadata.row_computations.contains_key(&field) {
-                    self.ensure_row_field(row, field, None, &mut work)?
+                    self.ensure_row_field(row, field, event, work)?
                 } else {
                     self.row_value(row, field)?
                 };
@@ -2337,10 +2904,10 @@ impl Session {
                 self.row_value(row, field)?
             };
             values.push(Value::Record(BTreeMap::from([
-                ("key".to_owned(), Value::Number(row.key as i64)),
+                ("key".to_owned(), Value::integer(row.key as i64)?),
                 (
                     "generation".to_owned(),
-                    Value::Number(row.generation as i64),
+                    Value::integer(row.generation as i64)?,
                 ),
                 ("value".to_owned(), value),
             ])));
@@ -2662,6 +3229,7 @@ impl Session {
 
     fn rebuild_runtime_state(&mut self, work: &mut Work) -> Result<(), Error> {
         self.indexes.clear();
+        self.query_collections = empty_query_collections(&self.metadata)?;
         self.dynamic_dependencies = DynamicDependencies::default();
         self.next_binding_id = 1;
         let rows = self
@@ -3009,6 +3577,7 @@ impl Session {
                     outcome,
                     turn_sequence: sequence,
                 });
+            self.commit_transient_effects(&mut work)?;
             self.turn_sequence = sequence;
             work.finish_metrics();
             let turn = Turn {
@@ -3018,12 +3587,123 @@ impl Session {
                 authority_deltas: std::mem::take(&mut work.authority_deltas),
                 durable_changes,
                 outbox_changes: std::mem::take(&mut work.outbox_changes),
+                transient_effects: std::mem::take(&mut work.transient_effects),
                 metrics: std::mem::take(&mut work.metrics),
             };
             work.pending_settle = true;
             Ok(turn)
         })();
         self.finish_internal_turn_work(work, result)
+    }
+
+    pub fn complete_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    ) -> Result<Turn, Error> {
+        if call_id.launch_epoch != self.launch_epoch {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} belongs to a different session launch"
+            )));
+        }
+        let pending = self
+            .pending_transient_effects
+            .get(&call_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidEvent(format!(
+                    "transient effect call {call_id} is unknown, cancelled, or already completed"
+                ))
+            })?;
+        let (op, effect) = self.effect_invocation(pending.invocation_id)?;
+        if effect.effect_id != pending.effect_id {
+            return Err(Error::InvalidPlan(format!(
+                "transient effect call {call_id} no longer matches invocation {}",
+                pending.invocation_id
+            )));
+        }
+        let contract = self
+            .plan
+            .effects
+            .iter()
+            .find(|contract| contract.effect_id == effect.effect_id)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "transient effect call {call_id} has no effect contract"
+                ))
+            })?;
+        if !matches!(contract.replay, boon_plan::EffectReplay::ReadOnly)
+            || contract.barrier != boon_plan::EffectBarrier::None
+        {
+            return Err(Error::InvalidPlan(format!(
+                "transient effect call {call_id} is not read-only and barrier-free"
+            )));
+        }
+        let result_type = &contract
+            .schema
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "transient effect call {call_id} has no typed result schema"
+                ))
+            })?
+            .result_type;
+        validate_value_for_data_type(&outcome, result_type, "effect outcome")?;
+        let stored_outcome = stored_value_for_data_type(&outcome, result_type)?;
+        let sequence = self.next_internal_turn_sequence()?;
+        let mut work = self.take_internal_turn_work();
+        let result = (|| {
+            self.apply_effect_outcome(
+                &op,
+                &effect.result,
+                pending.target,
+                stored_outcome,
+                sequence,
+                &mut work,
+            )?;
+            let durable_changes = self.durable_changes(&work.authority_deltas)?;
+            let removed = self
+                .pending_transient_effects
+                .remove(&call_id)
+                .ok_or_else(|| {
+                    Error::InvalidEvent(format!(
+                        "transient effect call {call_id} was completed concurrently"
+                    ))
+                })?;
+            work.completed_transient_effects.push((call_id, removed));
+            self.commit_transient_effects(&mut work)?;
+            self.turn_sequence = sequence;
+            work.finish_metrics();
+            let turn = Turn {
+                sequence,
+                source_sequence: None,
+                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: std::mem::take(&mut work.authority_deltas),
+                durable_changes,
+                outbox_changes: Vec::new(),
+                transient_effects: std::mem::take(&mut work.transient_effects),
+                metrics: std::mem::take(&mut work.metrics),
+            };
+            work.pending_settle = true;
+            Ok(turn)
+        })();
+        self.finish_internal_turn_work(work, result)
+    }
+
+    pub fn cancel_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+    ) -> Result<bool, Error> {
+        if call_id.launch_epoch != self.launch_epoch {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} belongs to a different session launch"
+            )));
+        }
+        Ok(self.pending_transient_effects.remove(&call_id).is_some())
+    }
+
+    pub fn pending_transient_effect_count(&self) -> usize {
+        self.pending_transient_effects.len()
     }
 
     fn next_internal_turn_sequence(&self) -> Result<u64, Error> {
@@ -3048,6 +3728,7 @@ impl Session {
             authority_deltas: Vec::new(),
             durable_changes: Vec::new(),
             outbox_changes: std::mem::take(&mut work.outbox_changes),
+            transient_effects: Vec::new(),
             metrics: std::mem::take(&mut work.metrics),
         };
         work.pending_settle = true;
@@ -3107,7 +3788,7 @@ impl Session {
             })
             .ok_or_else(|| {
                 Error::InvalidPlan(format!(
-                    "outbox invocation {invocation_id} is absent from the active plan"
+                    "effect invocation {invocation_id} is absent from the active plan"
                 ))
             })
     }
@@ -3352,6 +4033,12 @@ impl Session {
 
     fn rollback_turn(&mut self, work: &mut Work) -> Result<(), Error> {
         work.allow_rollback();
+        for call_id in work.committed_transient_effects.drain(..) {
+            self.pending_transient_effects.remove(&call_id);
+        }
+        for (call_id, pending) in work.completed_transient_effects.drain(..) {
+            self.pending_transient_effects.insert(call_id, pending);
+        }
         for undo in work.authority_undo.drain(..).rev() {
             match undo {
                 AuthorityUndo::RootState {
@@ -3461,6 +4148,7 @@ impl Session {
         work.deltas.clear();
         work.authority_deltas.clear();
         work.outbox_changes.clear();
+        work.transient_effects.clear();
         work.emit = false;
         self.rebuild_runtime_state(work)?;
         self.ensure_published_current(None, work)?;
@@ -3482,6 +4170,7 @@ impl Session {
             .turn_sequence
             .checked_add(1)
             .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
+        self.commit_transient_effects(work)?;
         work.finish_metrics();
         Ok(Turn {
             sequence: self.turn_sequence,
@@ -3490,8 +4179,31 @@ impl Session {
             authority_deltas: std::mem::take(&mut work.authority_deltas),
             durable_changes,
             outbox_changes: std::mem::take(&mut work.outbox_changes),
+            transient_effects: std::mem::take(&mut work.transient_effects),
             metrics: std::mem::take(&mut work.metrics),
         })
+    }
+
+    fn commit_transient_effects(&mut self, work: &mut Work) -> Result<(), Error> {
+        for invocation in &work.transient_effects {
+            let pending = PendingTransientEffect {
+                invocation_id: invocation.invocation_id,
+                effect_id: invocation.effect_id,
+                target: invocation.target,
+            };
+            if self
+                .pending_transient_effects
+                .insert(invocation.call_id, pending)
+                .is_some()
+            {
+                return Err(Error::Evaluation(format!(
+                    "transient effect call {} was emitted more than once",
+                    invocation.call_id
+                )));
+            }
+            work.committed_transient_effects.push(invocation.call_id);
+        }
+        Ok(())
     }
 
     fn route_event_with_work(
@@ -3849,15 +4561,86 @@ impl Session {
                 ),
             });
         }
+        let contract = self
+            .plan
+            .effects
+            .iter()
+            .find(|contract| contract.effect_id == effect.effect_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "effect invocation {} has no effect contract",
+                    effect.invocation_id
+                ))
+            })?;
+        let schema = contract.schema.as_ref().ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "effect invocation {} has no typed schema",
+                effect.invocation_id
+            ))
+        })?;
+        let intent_values = effect
+            .intent_fields
+            .iter()
+            .map(|field| {
+                let value = match (&field.input, &field.data_type) {
+                    (ValueRef::List(list), boon_plan::DataTypePlan::List { item }) => {
+                        self.materialize_typed_list(*list, item, Some(event), work)?
+                    }
+                    _ => self.eval_update_ref(&field.input, row, event, work)?,
+                };
+                Ok((field.name.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        let transient_intent = Value::Record(intent_values.clone());
+        validate_value_for_data_type(&transient_intent, &schema.intent_type, "effect intent")?;
+        let sequence = self
+            .turn_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
+        if matches!(contract.replay, boon_plan::EffectReplay::ReadOnly) {
+            let call_id = TransientEffectCallId {
+                launch_epoch: self.launch_epoch,
+                sequence: self.next_transient_effect_sequence,
+            };
+            self.next_transient_effect_sequence = self
+                .next_transient_effect_sequence
+                .checked_add(1)
+                .ok_or_else(|| {
+                    Error::Evaluation("transient effect sequence exhausted".to_owned())
+                })?;
+            work.consume(1)?;
+            work.transient_effects.push(TransientEffectInvocation {
+                call_id,
+                invocation_id: effect.invocation_id,
+                effect_id: effect.effect_id,
+                trigger_source_sequence: event.sequence,
+                authority_turn_sequence: sequence,
+                target: row,
+                intent: transient_intent,
+            });
+            return Ok(());
+        }
+        if !matches!(contract.replay, boon_plan::EffectReplay::Idempotent { .. }) {
+            return Err(Error::InvalidPlan(format!(
+                "effect invocation {} has no executable replay policy",
+                effect.invocation_id
+            )));
+        }
         let intent = boon_persistence::StoredValue::Record(
             effect
                 .intent_fields
                 .iter()
                 .map(|field| {
-                    let value = self.eval_update_ref(&field.input, row, event, work)?;
+                    let value = intent_values.get(&field.name).ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "effect invocation {} lost intent field `{}`",
+                            effect.invocation_id, field.name
+                        ))
+                    })?;
                     Ok((
                         field.name.clone(),
-                        stored_value_for_data_type(&value, &field.data_type)?,
+                        stored_value_for_data_type(value, &field.data_type)?,
                     ))
                 })
                 .collect::<Result<BTreeMap<_, _>, Error>>()?,
@@ -3871,10 +4654,6 @@ impl Session {
                 })
             })
             .transpose()?;
-        let sequence = self
-            .turn_sequence
-            .checked_add(1)
-            .ok_or_else(|| Error::Evaluation("authority turn sequence overflow".to_owned()))?;
         let idempotency_key = match effect.idempotency_key {
             boon_plan::EffectIdempotencyKeyPlan::InvocationTurnIntentSha256 => {
                 boon_persistence::canonical_intent_key(&boon_persistence::StoredValue::Record(
@@ -4373,6 +5152,7 @@ impl Session {
             .fields
             .insert(field, value.clone());
         self.insert_index_value(row, field, &value);
+        self.sync_query_row(row)?;
         work.changed_rows.insert(row);
         if work.emit && !work.suppress_row_deltas.contains(&row) {
             work.deltas.push(Delta::SetValue {
@@ -4394,6 +5174,7 @@ impl Session {
         for (field, value) in fields {
             self.insert_index_value(row, field, &value);
         }
+        self.sync_query_row(row)?;
         Ok(())
     }
 
@@ -4429,6 +5210,73 @@ impl Session {
         }
     }
 
+    fn sync_query_row(&mut self, row: RowId) -> Result<(), Error> {
+        if !self.query_collections.contains_key(&row.list) {
+            return Ok(());
+        }
+        let runtime_fields = self
+            .lists
+            .get(&row.list)
+            .and_then(|list| list.rows.get(&row))
+            .map(|row| row.fields.clone())
+            .ok_or_else(|| Error::Evaluation("cannot query-index a missing row".to_owned()))?;
+        let mut fields = BTreeMap::from([(
+            "$row".to_owned(),
+            boon_data::Value::Text(engine_row_id(row).0),
+        )]);
+        for (field, value) in runtime_fields {
+            let name = self
+                .metadata
+                .row_field_names
+                .get(&(row.list, field))
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "query-indexed row field {} in list {} has no semantic name",
+                        field.0, row.list.0
+                    ))
+                })?;
+            fields.insert(name.clone(), runtime_value_to_query_data(&value)?);
+        }
+        let indexes = self
+            .metadata
+            .query_indexes
+            .values()
+            .filter(|index| index.source_list == row.list)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut value = boon_data::Value::Record(fields);
+        for index in indexes {
+            for field in index.fields {
+                if field.key_type == QueryKeyType::Tag {
+                    coerce_query_tag(&mut value, &field.path, field.multi_value)?;
+                }
+            }
+        }
+        let state = self
+            .query_collections
+            .get_mut(&row.list)
+            .expect("query collection existence checked");
+        let indexed_row = state
+            .engine
+            .upsert(value)
+            .map_err(|error| Error::Evaluation(error.to_string()))?;
+        state.runtime_rows.insert(indexed_row, row);
+        Ok(())
+    }
+
+    fn remove_query_row(&mut self, row: RowId) -> Result<(), Error> {
+        let Some(state) = self.query_collections.get_mut(&row.list) else {
+            return Ok(());
+        };
+        let id = engine_row_id(row);
+        state
+            .engine
+            .remove(&id)
+            .map_err(|error| Error::Evaluation(error.to_string()))?;
+        state.runtime_rows.remove(&id);
+        Ok(())
+    }
+
     fn lookup_index(
         &mut self,
         list: ListId,
@@ -4460,6 +5308,319 @@ impl Session {
             .unwrap_or_default();
         work.metrics.index_candidate_count += rows.len();
         Ok(rows)
+    }
+
+    fn lookup_text_prefix_index(
+        &mut self,
+        index_id: QueryIndexId,
+        prefix: &Value,
+        limit: usize,
+        consumer: Option<Consumer>,
+        work: &mut Work,
+    ) -> Result<Vec<RowId>, Error> {
+        let Value::Text(prefix) = prefix else {
+            return Err(Error::Evaluation(format!(
+                "query index {index_id} prefix is not Text"
+            )));
+        };
+        let result = self.run_indexed_query(
+            index_id,
+            EngineQuerySelection::TextPrefix {
+                leading: Vec::new(),
+                prefix: prefix.clone(),
+            },
+            Vec::new(),
+            limit,
+            None,
+            consumer,
+            work,
+        )?;
+        Ok(result.0)
+    }
+
+    fn evaluate_query_value(
+        &mut self,
+        value: &ValueRef,
+        output: FieldId,
+        event: Option<&SourceEvent>,
+        consumer: Option<Consumer>,
+        work: &mut Work,
+    ) -> Result<Value, Error> {
+        let value = self.eval_value_ref(value, None, event, Some(output), consumer, work)?;
+        self.materialize_eval(value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_query_selection(
+        &mut self,
+        selection: &PlanQuerySelection,
+        index: &QueryIndexPlan,
+        output: FieldId,
+        event: Option<&SourceEvent>,
+        consumer: Option<Consumer>,
+        work: &mut Work,
+    ) -> Result<EngineQuerySelection, Error> {
+        Ok(match selection {
+            PlanQuerySelection::Exact { key } => EngineQuerySelection::Exact {
+                key: runtime_query_key(
+                    &self.evaluate_query_value(key, output, event, consumer, work)?,
+                    index,
+                    index.fields.len(),
+                )?,
+            },
+            PlanQuerySelection::TextPrefix { leading, prefix } => {
+                let leading = leading
+                    .as_ref()
+                    .map(|leading| {
+                        let value =
+                            self.evaluate_query_value(leading, output, event, consumer, work)?;
+                        runtime_query_parts(&value, index, None)
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let prefix = self.evaluate_query_value(prefix, output, event, consumer, work)?;
+                let Value::Text(prefix) = prefix else {
+                    return Err(Error::Evaluation(
+                        "indexed prefix query requires a Text prefix".to_owned(),
+                    ));
+                };
+                EngineQuerySelection::TextPrefix { leading, prefix }
+            }
+            PlanQuerySelection::Range {
+                lower,
+                lower_inclusive,
+                upper,
+                upper_inclusive,
+            } => EngineQuerySelection::Range {
+                lower: lower
+                    .as_ref()
+                    .map(|lower| {
+                        let value =
+                            self.evaluate_query_value(lower, output, event, consumer, work)?;
+                        runtime_query_key(&value, index, index.fields.len())
+                    })
+                    .transpose()?,
+                lower_inclusive: *lower_inclusive,
+                upper: upper
+                    .as_ref()
+                    .map(|upper| {
+                        let value =
+                            self.evaluate_query_value(upper, output, event, consumer, work)?;
+                        runtime_query_key(&value, index, index.fields.len())
+                    })
+                    .transpose()?,
+                upper_inclusive: *upper_inclusive,
+            },
+            PlanQuerySelection::Union { keys } | PlanQuerySelection::Intersection { keys } => {
+                let values = self.evaluate_query_value(keys, output, event, consumer, work)?;
+                let values = match values {
+                    Value::List(values) => values,
+                    Value::Record(values) => values.into_values().collect(),
+                    _ => {
+                        return Err(Error::Evaluation(
+                            "indexed union/intersection query requires a list or record of keys"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                let selections = values
+                    .iter()
+                    .map(|value| {
+                        Ok(EngineQuerySelection::Exact {
+                            key: runtime_query_key(value, index, index.fields.len())?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                if matches!(selection, PlanQuerySelection::Union { .. }) {
+                    EngineQuerySelection::Union { selections }
+                } else {
+                    EngineQuerySelection::Intersection { selections }
+                }
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_query_residuals(
+        &mut self,
+        residuals: &[PlanQueryResidual],
+        output: FieldId,
+        event: Option<&SourceEvent>,
+        consumer: Option<Consumer>,
+        work: &mut Work,
+    ) -> Result<Vec<EngineResidualPredicate>, Error> {
+        residuals
+            .iter()
+            .map(|residual| {
+                Ok(match residual {
+                    PlanQueryResidual::FieldEqual { path, value } => {
+                        let value =
+                            self.evaluate_query_value(value, output, event, consumer, work)?;
+                        EngineResidualPredicate::FieldEqual {
+                            path: path.clone(),
+                            value: runtime_value_to_query_data(&value)?,
+                        }
+                    }
+                    PlanQueryResidual::TextContains { path, needle } => {
+                        let needle =
+                            self.evaluate_query_value(needle, output, event, consumer, work)?;
+                        let Value::Text(needle) = needle else {
+                            return Err(Error::Evaluation(
+                                "TextContains residual requires a Text needle".to_owned(),
+                            ));
+                        };
+                        EngineResidualPredicate::TextContains {
+                            path: path.clone(),
+                            needle,
+                        }
+                    }
+                    PlanQueryResidual::NumberRange {
+                        path,
+                        minimum,
+                        maximum,
+                    } => EngineResidualPredicate::NumberRange {
+                        path: path.clone(),
+                        minimum: minimum
+                            .as_ref()
+                            .map(|minimum| {
+                                let value = self
+                                    .evaluate_query_value(minimum, output, event, consumer, work)?;
+                                query_number(value, "minimum")
+                            })
+                            .transpose()?,
+                        maximum: maximum
+                            .as_ref()
+                            .map(|maximum| {
+                                let value = self
+                                    .evaluate_query_value(maximum, output, event, consumer, work)?;
+                                query_number(value, "maximum")
+                            })
+                            .transpose()?,
+                    },
+                    PlanQueryResidual::Wgs84Radius {
+                        latitude_path,
+                        longitude_path,
+                        center_latitude,
+                        center_longitude,
+                        radius_meters,
+                    } => {
+                        let center_latitude = query_number(
+                            self.evaluate_query_value(
+                                center_latitude,
+                                output,
+                                event,
+                                consumer,
+                                work,
+                            )?,
+                            "center_latitude",
+                        )?;
+                        let center_longitude = query_number(
+                            self.evaluate_query_value(
+                                center_longitude,
+                                output,
+                                event,
+                                consumer,
+                                work,
+                            )?,
+                            "center_longitude",
+                        )?;
+                        let radius_meters = query_number(
+                            self.evaluate_query_value(
+                                radius_meters,
+                                output,
+                                event,
+                                consumer,
+                                work,
+                            )?,
+                            "radius_meters",
+                        )?;
+                        EngineResidualPredicate::Wgs84Radius {
+                            latitude_path: latitude_path.clone(),
+                            longitude_path: longitude_path.clone(),
+                            center_latitude,
+                            center_longitude,
+                            radius_meters,
+                        }
+                    }
+                })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_indexed_query(
+        &mut self,
+        index_id: QueryIndexId,
+        selection: EngineQuerySelection,
+        residual: Vec<EngineResidualPredicate>,
+        limit: usize,
+        cursor: Option<QueryCursorToken>,
+        consumer: Option<Consumer>,
+        work: &mut Work,
+    ) -> Result<(Vec<RowId>, Option<Vec<u8>>), Error> {
+        let index = self
+            .metadata
+            .query_indexes
+            .get(&index_id)
+            .ok_or_else(|| Error::InvalidPlan(format!("unknown query index {index_id}")))?;
+        if let Some(consumer) = consumer {
+            self.dynamic_dependencies
+                .insert(consumer, DynamicDependency::IndexedQuery(index_id));
+        }
+        let state = self
+            .query_collections
+            .get(&index.source_list)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!("query index {index_id} has no runtime collection"))
+            })?;
+        let result = state
+            .engine
+            .query(&EngineQueryPlan {
+                index: EngineIndexId(index_id.0),
+                selection,
+                residual,
+                limit,
+                cursor,
+            })
+            .map_err(|error| Error::Evaluation(error.to_string()))?;
+        let rows = result
+            .rows
+            .iter()
+            .map(|row| {
+                state.runtime_rows.get(&row.id).copied().ok_or_else(|| {
+                    Error::Evaluation(format!(
+                        "query index {index_id} returned an unknown runtime row `{}`",
+                        row.id.0
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        work.consume(
+            result
+                .metrics
+                .keys_visited
+                .saturating_add(result.metrics.rows_examined)
+                .saturating_add(result.metrics.residual_evaluations)
+                .try_into()
+                .unwrap_or(u64::MAX),
+        )?;
+        work.metrics.query_index_range_count += result.metrics.ranges;
+        work.metrics.query_index_key_count += result.metrics.keys_visited;
+        work.metrics.query_rows_examined_count += result.metrics.rows_examined;
+        work.metrics.query_candidate_count += result.metrics.candidates_selected;
+        work.metrics.query_residual_evaluation_count += result.metrics.residual_evaluations;
+        work.metrics.query_result_count += result.metrics.returned;
+        work.metrics.query_full_scan_count += result.metrics.full_scans;
+        work.metrics.query_elapsed_nanos = work
+            .metrics
+            .query_elapsed_nanos
+            .saturating_add(result.metrics.elapsed_nanos);
+        work.metrics.query_cursor_count += usize::from(result.next_cursor.is_some());
+        work.metrics.query_selected_indexes.push(index_id);
+        Ok((
+            rows,
+            result.next_cursor.map(|cursor| cursor.as_bytes().to_vec()),
+        ))
     }
 
     fn list_row_ids(&self, list: ListId) -> Vec<RowId> {
@@ -4613,6 +5774,21 @@ impl Session {
                 }
             }
         }
+        let query_indexes = self
+            .metadata
+            .query_indexes
+            .values()
+            // Residual predicates may read any authoritative row field. Index
+            // identity remains the dependency key, so any row mutation in the
+            // owning collection invalidates subscribed queries without a scan.
+            .filter(|index| index.source_list == row.list)
+            .map(|index| index.id)
+            .collect::<Vec<_>>();
+        for index in query_indexes {
+            if let Some(query_consumers) = self.dynamic_dependencies.by_indexed_query.get(&index) {
+                consumers.extend(query_consumers);
+            }
+        }
         let static_dependents = self
             .metadata
             .dependencies
@@ -4637,6 +5813,18 @@ impl Session {
             .unwrap_or_default();
         for (key, query_consumers) in &self.dynamic_dependencies.by_query {
             if key.list == list {
+                consumers.extend(query_consumers);
+            }
+        }
+        let query_index_ids = self
+            .metadata
+            .query_indexes
+            .values()
+            .filter(|index| index.source_list == list)
+            .map(|index| index.id)
+            .collect::<BTreeSet<_>>();
+        for (index, query_consumers) in &self.dynamic_dependencies.by_indexed_query {
+            if query_index_ids.contains(index) {
                 consumers.extend(query_consumers);
             }
         }
@@ -4705,7 +5893,9 @@ impl Session {
                         DynamicDependency::RowField(row, field) => {
                             Some(Consumer::Row(*row, *field))
                         }
-                        DynamicDependency::Query(_) | DynamicDependency::List(_) => None,
+                        DynamicDependency::Query(_)
+                        | DynamicDependency::IndexedQuery(_)
+                        | DynamicDependency::List(_) => None,
                     }),
             );
         }
@@ -4809,8 +5999,8 @@ impl Session {
             }
             PlanDerivedExpression::NumberCompareConst { left, op, right } => {
                 let left = self.eval_value_ref(left, row, event, output, consumer, work)?;
-                let left = eval_to_number(&left)?;
-                Ok(EvalValue::Value(Value::Bool(compare_numbers(
+                let left = eval_to_numeric(&left)?;
+                Ok(EvalValue::Value(Value::Bool(numeric_compare(
                     left, op, *right,
                 )?)))
             }
@@ -5032,15 +6222,15 @@ impl Session {
             PlanRowExpression::TextLength { input } => {
                 let value =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                Ok(EvalValue::Value(Value::Number(
+                Ok(EvalValue::Value(Value::integer(
                     eval_to_text(&value)?.chars().count() as i64,
-                )))
+                )?))
             }
             PlanRowExpression::TextToNumber { input } => {
                 let value =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
                 let text = eval_to_text(&value)?;
-                Ok(EvalValue::Value(match text.trim().parse::<i64>() {
+                Ok(EvalValue::Value(match text.trim().parse::<FiniteReal>() {
                     Ok(value) => Value::Number(value),
                     Err(_) => Value::Text("NaN".to_owned()),
                 }))
@@ -5056,8 +6246,8 @@ impl Session {
                     self.eval_row_expression(start, row, event, output, consumer, bindings, work)?;
                 let length =
                     self.eval_row_expression(length, row, event, output, consumer, bindings, work)?;
-                let start = nonnegative_usize(eval_to_number(&start)?, "text substring start")?;
-                let length = nonnegative_usize(eval_to_number(&length)?, "text substring length")?;
+                let start = nonnegative_usize(eval_to_integer(&start)?, "text substring start")?;
+                let length = nonnegative_usize(eval_to_integer(&length)?, "text substring length")?;
                 let text = eval_to_text(&input)?;
                 let value = text.chars().skip(start).take(length).collect::<String>();
                 Ok(EvalValue::Value(Value::Text(value)))
@@ -5133,7 +6323,7 @@ impl Session {
             PlanRowExpression::BytesLength { input } => {
                 let bytes = self
                     .eval_expression_bytes(input, row, event, output, consumer, bindings, work)?;
-                Ok(EvalValue::Value(Value::Number(bytes.len() as i64)))
+                Ok(EvalValue::Value(Value::integer(bytes.len() as i64)?))
             }
             PlanRowExpression::BytesGet { input, index } => {
                 let bytes = self
@@ -5144,7 +6334,7 @@ impl Session {
                 let value = bytes.get(index).copied().ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
                 })?;
-                Ok(EvalValue::Value(Value::Number(i64::from(value))))
+                Ok(EvalValue::Value(Value::integer(i64::from(value))?))
             }
             PlanRowExpression::BytesSlice {
                 input,
@@ -5233,13 +6423,13 @@ impl Session {
                 let endian =
                     self.eval_row_expression(endian, row, event, output, consumer, bindings, work)?;
                 let signed = matches!(expression, PlanRowExpression::BytesReadSigned { .. });
-                Ok(EvalValue::Value(Value::Number(read_integer(
+                Ok(EvalValue::Value(Value::integer(read_integer(
                     &bytes,
                     offset,
                     count,
                     &eval_to_text(&endian)?,
                     signed,
-                )?)))
+                )?)?))
             }
             PlanRowExpression::BytesSet {
                 input,
@@ -5305,9 +6495,10 @@ impl Session {
                     .eval_expression_bytes(input, row, event, output, consumer, bindings, work)?;
                 let needle = self
                     .eval_expression_bytes(needle, row, event, output, consumer, bindings, work)?;
-                let value = find_bytes(&input, &needle)
-                    .map(|index| Value::Number(index as i64))
-                    .unwrap_or_else(|| Value::Text("NaN".to_owned()));
+                let value = match find_bytes(&input, &needle) {
+                    Some(index) => Value::integer(index as i64)?,
+                    None => Value::Text("NaN".to_owned()),
+                };
                 Ok(EvalValue::Value(value))
             }
             PlanRowExpression::BytesStartsWith { input, prefix } => {
@@ -5428,8 +6619,8 @@ impl Session {
                         .unwrap_or(u64::MAX);
                     work.consume(length)?;
                     (from..=to)
-                        .map(|value| EvalValue::Value(Value::Number(value)))
-                        .collect()
+                        .map(|value| Value::integer(value).map(EvalValue::Value))
+                        .collect::<Result<Vec<_>, _>>()?
                 } else {
                     Vec::new()
                 };
@@ -5489,15 +6680,16 @@ impl Session {
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
                 let items = eval_to_list(input)?;
                 work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
-                let mut total = 0i64;
+                let mut total = 0.0f64;
                 for item in items {
                     if let Ok(value) = eval_to_number(&item) {
-                        total = total
-                            .checked_add(value)
-                            .ok_or_else(|| Error::Evaluation("List/sum overflow".to_owned()))?;
+                        total += value.get();
                     }
                 }
-                Ok(EvalValue::Value(Value::Number(total)))
+                Ok(EvalValue::Value(Value::Number(
+                    FiniteReal::new(total)
+                        .map_err(|_| Error::Evaluation("List/sum overflow".to_owned()))?,
+                )))
             }
             PlanRowExpression::Object { fields } => {
                 let mut record = BTreeMap::new();
@@ -5584,7 +6776,7 @@ impl Session {
     ) -> Result<i64, Error> {
         let value =
             self.eval_row_expression(expression, row, event, output, consumer, bindings, work)?;
-        eval_to_number(&value)
+        eval_to_integer(&value)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5736,6 +6928,38 @@ impl Session {
                 };
                 Ok(EvalValue::Value(Value::Text(code)))
             }
+            "Number/ceil" | "Number/floor" | "Number/round" | "Number/truncate" => {
+                let value = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else if let Some(value) = self
+                    .eval_named_arg(args, "value", row, event, output, consumer, bindings, work)?
+                {
+                    value
+                } else if let Some(argument) = args.first() {
+                    self.eval_row_expression(
+                        &argument.value,
+                        row,
+                        event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )?
+                } else {
+                    return Err(Error::Evaluation(format!("{function} requires a value")));
+                };
+                let value = eval_to_number(&value)?.get();
+                let rounded = match function {
+                    "Number/ceil" => value.ceil(),
+                    "Number/floor" => value.floor(),
+                    "Number/round" => value.round(),
+                    "Number/truncate" => value.trunc(),
+                    _ => unreachable!(),
+                };
+                Ok(EvalValue::Value(Value::Number(finite_number_result(
+                    rounded, function,
+                )?)))
+            }
             "Number/min" | "Number/max" => {
                 let left = if let Some(input) = input {
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
@@ -5786,16 +7010,14 @@ impl Session {
                 let fallback = self.required_number_arg(
                     args, "fallback", row, event, output, consumer, bindings, work,
                 )?;
-                let value = if denominator == 0 {
+                let value = if denominator.get() == 0.0 {
                     fallback
                 } else {
-                    end.checked_sub(start)
-                        .and_then(|span| span.checked_mul(numerator))
-                        .and_then(|offset| offset.checked_div(denominator))
-                        .and_then(|offset| start.checked_add(offset))
-                        .ok_or_else(|| {
-                            Error::Evaluation("Number/interpolate arithmetic overflow".to_owned())
-                        })?
+                    finite_number_result(
+                        start.get()
+                            + ((end.get() - start.get()) * numerator.get() / denominator.get()),
+                        "Number/interpolate",
+                    )?
                 };
                 Ok(EvalValue::Value(Value::Number(value)))
             }
@@ -5838,21 +7060,14 @@ impl Session {
                 )?;
                 let _zoom = self
                     .eval_named_arg(args, "zoom", row, event, output, consumer, bindings, work)?;
-                let span = end.checked_sub(start).ok_or_else(|| {
-                    Error::Evaluation("Number/project_offset span overflow".to_owned())
-                })?;
-                let value = if span <= 0 || width <= 0 {
+                let span = end.get() - start.get();
+                let value = if span <= 0.0 || width.get() <= 0.0 {
                     fallback
                 } else {
-                    time.checked_sub(start)
-                        .and_then(|offset| offset.checked_mul(width))
-                        .and_then(|offset| offset.checked_div(span))
-                        .ok_or_else(|| {
-                            Error::Evaluation(
-                                "Number/project_offset arithmetic overflow".to_owned(),
-                            )
-                        })?
-                        .clamp(0, width)
+                    finite_number_result(
+                        ((time.get() - start.get()) * width.get() / span).clamp(0.0, width.get()),
+                        "Number/project_offset",
+                    )?
                 };
                 Ok(EvalValue::Value(Value::Number(value)))
             }
@@ -5900,17 +7115,14 @@ impl Session {
                 let fallback = self.required_number_arg(
                     args, "fallback", row, event, output, consumer, bindings, work,
                 )?;
-                let value = if width <= 0 {
+                let value = if width.get() <= 0.0 {
                     fallback
                 } else {
-                    end.checked_sub(start)
-                        .and_then(|span| x.checked_mul(span))
-                        .and_then(|offset| offset.checked_div(width))
-                        .and_then(|offset| offset.checked_add(start))
-                        .ok_or_else(|| {
-                            Error::Evaluation("Number/project_time arithmetic overflow".to_owned())
-                        })?
-                        .clamp(start.min(end), start.max(end))
+                    finite_number_result(
+                        (x.get() * (end.get() - start.get()) / width.get() + start.get())
+                            .clamp(start.min(end).get(), start.max(end).get()),
+                        "Number/project_time",
+                    )?
                 };
                 Ok(EvalValue::Value(Value::Number(value)))
             }
@@ -5963,23 +7175,18 @@ impl Session {
                 )?;
                 let _zoom = self
                     .eval_named_arg(args, "zoom", row, event, output, consumer, bindings, work)?;
-                let viewport_span = viewport_end.checked_sub(viewport_start).ok_or_else(|| {
-                    Error::Evaluation("Number/project_width viewport overflow".to_owned())
-                })?;
-                let segment_span = segment_end.checked_sub(segment_start).ok_or_else(|| {
-                    Error::Evaluation("Number/project_width segment overflow".to_owned())
-                })?;
-                let value = if viewport_span <= 0 || segment_span <= 0 || canvas_width <= 0 {
-                    fallback
-                } else {
-                    segment_span
-                        .checked_mul(canvas_width)
-                        .and_then(|width| width.checked_div(viewport_span))
-                        .ok_or_else(|| {
-                            Error::Evaluation("Number/project_width arithmetic overflow".to_owned())
-                        })?
-                        .clamp(0, canvas_width)
-                };
+                let viewport_span = viewport_end.get() - viewport_start.get();
+                let segment_span = segment_end.get() - segment_start.get();
+                let value =
+                    if viewport_span <= 0.0 || segment_span <= 0.0 || canvas_width.get() <= 0.0 {
+                        fallback
+                    } else {
+                        finite_number_result(
+                            (segment_span * canvas_width.get() / viewport_span)
+                                .clamp(0.0, canvas_width.get()),
+                            "Number/project_width",
+                        )?
+                    };
                 Ok(EvalValue::Value(Value::Number(value)))
             }
             "List/count" | "List/length" => {
@@ -5988,9 +7195,9 @@ impl Session {
                 })?;
                 let value =
                     self.eval_row_expression(input, row, event, output, consumer, bindings, work)?;
-                Ok(EvalValue::Value(Value::Number(
-                    eval_to_list(value)?.len() as i64
-                )))
+                Ok(EvalValue::Value(Value::integer(
+                    eval_to_list(value)?.len() as i64,
+                )?))
             }
             "List/any" => {
                 let input = input.ok_or_else(|| {
@@ -6290,7 +7497,7 @@ impl Session {
         consumer: Option<Consumer>,
         bindings: &mut BTreeMap<String, EvalValue>,
         work: &mut Work,
-    ) -> Result<i64, Error> {
+    ) -> Result<FiniteReal, Error> {
         self.eval_named_arg(args, name, row, event, output, consumer, bindings, work)?
             .ok_or_else(|| Error::Evaluation(format!("numeric builtin requires `{name}`")))
             .and_then(|value| eval_to_number(&value))
@@ -6330,6 +7537,30 @@ impl Session {
                     return Ok(None);
                 };
                 value
+            }
+            PlanExpressionKind::ListGet => {
+                let [input, index] = ordered_inputs.as_slice() else {
+                    return Err(Error::InvalidPlan(format!(
+                        "ListGet update {} requires list and index inputs",
+                        op.id.0
+                    )));
+                };
+                let Value::List(values) = self.eval_update_ref(input, row, event, work)? else {
+                    return Err(Error::Evaluation(format!(
+                        "ListGet update {} input is not a list",
+                        op.id.0
+                    )));
+                };
+                let index = nonnegative_usize(
+                    value_to_integer(&self.eval_update_ref(index, row, event, work)?)?,
+                    "list index",
+                )?;
+                values.get(index).cloned().ok_or_else(|| {
+                    Error::Evaluation(format!(
+                        "ListGet update {} index {index} is out of range",
+                        op.id.0
+                    ))
+                })?
             }
             PlanExpressionKind::Const => {
                 let constant = update_constant_id.ok_or_else(|| {
@@ -6423,30 +7654,30 @@ impl Session {
                 let end =
                     value_to_number(&self.eval_update_ref(viewport_end, row, event, work)?)?;
                 let fallback = value_to_number(&self.eval_update_ref(fallback, row, event, work)?)?;
-                if width <= 0 {
+                if width.get() <= 0.0 {
                     Value::Number(fallback)
                 } else {
-                    let span = end
-                        .checked_sub(start)
-                        .ok_or_else(|| Error::Evaluation("ProjectTime span overflow".to_owned()))?;
-                    let projected = x
-                        .checked_mul(span)
-                        .and_then(|value| value.checked_div(width))
-                        .and_then(|value| value.checked_add(start))
-                        .ok_or_else(|| {
-                            Error::Evaluation("ProjectTime arithmetic overflow".to_owned())
-                        })?;
-                    Value::Number(projected.clamp(start.min(end), start.max(end)))
+                    Value::Number(finite_number_result(
+                        (x.get() * (end.get() - start.get()) / width.get() + start.get())
+                            .clamp(start.min(end).get(), start.max(end).get()),
+                        "ProjectTime",
+                    )?)
                 }
             }
             PlanExpressionKind::BytesLength => {
-                let input = self.single_update_input(op)?;
-                Value::Number(
+                let input = ordered_inputs
+                    .first()
+                    .cloned()
+                    .map_or_else(|| self.single_update_input(op), Ok)?;
+                Value::integer(
                     value_to_bytes(&self.eval_update_ref(&input, row, event, work)?)?.len() as i64,
-                )
+                )?
             }
             PlanExpressionKind::BytesIsEmpty => {
-                let input = self.single_update_input(op)?;
+                let input = ordered_inputs
+                    .first()
+                    .cloned()
+                    .map_or_else(|| self.single_update_input(op), Ok)?;
                 Value::Bool(
                     value_to_bytes(&self.eval_update_ref(&input, row, event, work)?)?.is_empty(),
                 )
@@ -6457,15 +7688,15 @@ impl Session {
                 let index = update_constant_id
                     .map(|constant| self.constant(constant))
                     .transpose()?
-                    .map(|value| value_to_number(&value))
+                    .map(|value| value_to_integer(&value))
                     .transpose()?
                     .ok_or_else(|| {
                         Error::InvalidPlan(format!("BytesGet update {} has no index", op.id.0))
                     })?;
                 let index = nonnegative_usize(index, "byte index")?;
-                Value::Number(i64::from(*bytes.get(index).ok_or_else(|| {
+                Value::integer(i64::from(*bytes.get(index).ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
-                })?))
+                })?))?
             }
             PlanExpressionKind::BytesSet => {
                 let [input, index, value] = ordered_inputs.as_slice() else {
@@ -6476,10 +7707,10 @@ impl Session {
                 };
                 let mut bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
                 let index = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(index, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(index, row, event, work)?)?,
                     "byte index",
                 )?;
-                let value = value_to_number(&self.eval_update_ref(value, row, event, work)?)?;
+                let value = value_to_integer(&self.eval_update_ref(value, row, event, work)?)?;
                 let value = u8::try_from(value).map_err(|_| {
                     Error::Evaluation(format!("byte value {value} is outside 0..=255"))
                 })?;
@@ -6497,11 +7728,11 @@ impl Session {
                 };
                 let bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
                 let offset = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(offset, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(offset, row, event, work)?)?,
                     "byte offset",
                 )?;
                 let count = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(count, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(count, row, event, work)?)?,
                     "byte count",
                 )?;
                 Value::Bytes(checked_slice(&bytes, offset, count)?)
@@ -6515,7 +7746,7 @@ impl Session {
                 };
                 let bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
                 let count = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(count, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(count, row, event, work)?)?,
                     "byte count",
                 )?;
                 Value::Bytes(if *expression_kind == PlanExpressionKind::BytesTake {
@@ -6532,7 +7763,7 @@ impl Session {
                     )));
                 };
                 let count = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(count, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(count, row, event, work)?)?,
                     "byte count",
                 )?;
                 Value::Bytes(vec![0; count])
@@ -6612,9 +7843,10 @@ impl Session {
                 let left = value_to_bytes(&self.eval_update_ref(left, row, event, work)?)?;
                 let right = value_to_bytes(&self.eval_update_ref(right, row, event, work)?)?;
                 match expression_kind {
-                    PlanExpressionKind::BytesFind => find_bytes(&left, &right)
-                        .map(|index| Value::Number(index as i64))
-                        .unwrap_or_else(|| Value::Text("NaN".to_owned())),
+                    PlanExpressionKind::BytesFind => match find_bytes(&left, &right) {
+                        Some(index) => Value::integer(index as i64)?,
+                        None => Value::Text("NaN".to_owned()),
+                    },
                     PlanExpressionKind::BytesStartsWith => Value::Bool(left.starts_with(&right)),
                     PlanExpressionKind::BytesEndsWith => Value::Bool(left.ends_with(&right)),
                     _ => unreachable!(),
@@ -6629,21 +7861,21 @@ impl Session {
                 };
                 let bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
                 let offset = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(offset, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(offset, row, event, work)?)?,
                     "byte offset",
                 )?;
                 let count = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(count, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(count, row, event, work)?)?,
                     "byte count",
                 )?;
                 let endian = value_to_text(&self.eval_update_ref(endian, row, event, work)?)?;
-                Value::Number(read_integer(
+                Value::integer(read_integer(
                     &bytes,
                     offset,
                     count,
                     &endian,
                     *expression_kind == PlanExpressionKind::BytesReadSigned,
-                )?)
+                )?)?
             }
             PlanExpressionKind::BytesWriteUnsigned | PlanExpressionKind::BytesWriteSigned => {
                 let [input, offset, count, endian, value] = ordered_inputs.as_slice() else {
@@ -6654,15 +7886,15 @@ impl Session {
                 };
                 let mut bytes = value_to_bytes(&self.eval_update_ref(input, row, event, work)?)?;
                 let offset = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(offset, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(offset, row, event, work)?)?,
                     "byte offset",
                 )?;
                 let count = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(count, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(count, row, event, work)?)?,
                     "byte count",
                 )?;
                 let endian = value_to_text(&self.eval_update_ref(endian, row, event, work)?)?;
-                let value = value_to_number(&self.eval_update_ref(value, row, event, work)?)?;
+                let value = value_to_integer(&self.eval_update_ref(value, row, event, work)?)?;
                 write_integer(&mut bytes, offset, count, &endian, value)?;
                 Value::Bytes(bytes)
             }
@@ -6929,7 +8161,7 @@ impl Session {
                     input.as_str()
                 };
                 let arm_count = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(arm_count, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(arm_count, row, event, work)?)?,
                     "encoded match arm count",
                 )?;
                 let mut selected = None;
@@ -6975,7 +8207,7 @@ impl Session {
                     "False"
                 };
                 let arm_count = nonnegative_usize(
-                    value_to_number(&self.eval_update_ref(arm_count, row, event, work)?)?,
+                    value_to_integer(&self.eval_update_ref(arm_count, row, event, work)?)?,
                     "encoded infix match arm count",
                 )?;
                 let mut selected = None;
@@ -7359,6 +8591,7 @@ impl Session {
             touched_list: was_structurally_touched,
             touched_fields,
         });
+        self.remove_query_row(row)?;
         let removed = self
             .lists
             .get_mut(&row.list)
@@ -7510,7 +8743,7 @@ impl Session {
                 total += 1;
             }
         }
-        Ok(Value::Number(total))
+        Value::integer(total)
     }
 
     fn evaluate_projection(
@@ -7541,6 +8774,77 @@ impl Session {
                     }
                     None => Ok(Value::Null),
                 }
+            }
+            PlanListProjection::TextPrefix {
+                index,
+                source_list,
+                prefix,
+                limit,
+            } => {
+                let declared =
+                    self.metadata.query_indexes.get(index).ok_or_else(|| {
+                        Error::InvalidPlan(format!("unknown query index {index}"))
+                    })?;
+                if declared.source_list != *source_list {
+                    return Err(Error::InvalidPlan(format!(
+                        "query index {index} does not belong to list {}",
+                        source_list.0
+                    )));
+                }
+                let prefix =
+                    self.eval_value_ref(prefix, None, event, Some(output), consumer, work)?;
+                let prefix = self.materialize_eval(prefix)?;
+                let rows =
+                    self.lookup_text_prefix_index(*index, &prefix, *limit, consumer, work)?;
+                Ok(Value::List(
+                    rows.into_iter().map(row_identity_value).collect(),
+                ))
+            }
+            PlanListProjection::IndexedQuery {
+                index,
+                source_list,
+                selection,
+                residual,
+                limit,
+                cursor,
+            } => {
+                let declared = self
+                    .metadata
+                    .query_indexes
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| Error::InvalidPlan(format!("unknown query index {index}")))?;
+                if declared.source_list != *source_list {
+                    return Err(Error::InvalidPlan(format!(
+                        "query index {index} does not belong to list {}",
+                        source_list.0
+                    )));
+                }
+                let selection = self.evaluate_query_selection(
+                    selection, &declared, output, event, consumer, work,
+                )?;
+                let residual =
+                    self.evaluate_query_residuals(residual, output, event, consumer, work)?;
+                let cursor = cursor
+                    .as_ref()
+                    .map(|cursor| self.evaluate_query_value(cursor, output, event, consumer, work))
+                    .transpose()?
+                    .map(query_cursor_from_runtime)
+                    .transpose()?
+                    .flatten();
+                let (rows, next_cursor) = self.run_indexed_query(
+                    *index, selection, residual, *limit, cursor, consumer, work,
+                )?;
+                Ok(Value::Record(BTreeMap::from([
+                    (
+                        "rows".to_owned(),
+                        Value::List(rows.into_iter().map(row_identity_value).collect()),
+                    ),
+                    (
+                        "cursor".to_owned(),
+                        Value::Bytes(next_cursor.unwrap_or_default()),
+                    ),
+                ])))
             }
             PlanListProjection::Chunk {
                 source_list,
@@ -7718,14 +9022,20 @@ fn source_event_transform_op(op: &PlanOp) -> bool {
     )
 }
 
-fn value_to_number(value: &Value) -> Result<i64, Error> {
+fn value_to_number(value: &Value) -> Result<FiniteReal, Error> {
     match value {
         Value::Number(value) => Ok(*value),
         Value::Text(value) => value
-            .parse::<i64>()
-            .map_err(|_| Error::Evaluation(format!("text `{value}` is not an integer"))),
+            .parse::<FiniteReal>()
+            .map_err(|_| Error::Evaluation(format!("text `{value}` is not a number"))),
         other => Err(Error::Evaluation(format!("value {other:?} is not numeric"))),
     }
+}
+
+fn value_to_integer(value: &Value) -> Result<i64, Error> {
+    value_to_number(value)?
+        .to_i64_exact()
+        .map_err(|error| Error::Evaluation(error.to_string()))
 }
 
 fn value_to_bool(value: &Value) -> Result<bool, Error> {
@@ -7744,14 +9054,20 @@ fn value_to_bytes(value: &Value) -> Result<Vec<u8>, Error> {
     }
 }
 
-fn eval_to_number(value: &EvalValue) -> Result<i64, Error> {
+fn eval_to_number(value: &EvalValue) -> Result<FiniteReal, Error> {
     match value {
         EvalValue::Value(Value::Number(value)) => Ok(*value),
         EvalValue::Value(Value::Text(value)) => value
-            .parse::<i64>()
-            .map_err(|_| Error::Evaluation(format!("text `{value}` is not an integer"))),
+            .parse::<FiniteReal>()
+            .map_err(|_| Error::Evaluation(format!("text `{value}` is not a number"))),
         other => Err(Error::Evaluation(format!("value {other:?} is not numeric"))),
     }
+}
+
+fn eval_to_integer(value: &EvalValue) -> Result<i64, Error> {
+    eval_to_number(value)?
+        .to_i64_exact()
+        .map_err(|error| Error::Evaluation(error.to_string()))
 }
 
 fn eval_to_bool(value: &EvalValue) -> Result<bool, Error> {
@@ -7770,6 +9086,11 @@ fn eval_to_bytes(value: &EvalValue) -> Result<Vec<u8>, Error> {
     }
 }
 
+fn finite_number_result(value: f64, context: &str) -> Result<FiniteReal, Error> {
+    FiniteReal::new(value)
+        .map_err(|_| Error::Evaluation(format!("{context} produced a non-finite Number")))
+}
+
 fn eval_number_infix(op: &str, left: &EvalValue, right: &EvalValue) -> Result<Value, Error> {
     for value in [left, right] {
         if let EvalValue::Value(Value::Error { code }) = value {
@@ -7782,11 +9103,14 @@ fn eval_number_infix(op: &str, left: &EvalValue, right: &EvalValue) -> Result<Va
         return Ok(Value::Text("NaN".to_owned()));
     }
     if matches!(op, "==" | "!=") {
-        let equal = eval_to_text(left)? == eval_to_text(right)?;
+        let equal = match (eval_to_numeric(left), eval_to_numeric(right)) {
+            (Ok(left), Ok(right)) => numeric_compare(left, "==", right)?,
+            _ => eval_to_text(left)? == eval_to_text(right)?,
+        };
         return Ok(Value::Bool(if op == "==" { equal } else { !equal }));
     }
-    let left_number = eval_to_number(left);
-    let right_number = eval_to_number(right);
+    let left_number = eval_to_numeric(left);
+    let right_number = eval_to_numeric(right);
     if op == "+" && (left_number.is_err() || right_number.is_err()) {
         return Ok(Value::Text(format!(
             "{}{}",
@@ -7794,57 +9118,73 @@ fn eval_number_infix(op: &str, left: &EvalValue, right: &EvalValue) -> Result<Va
             eval_to_text(right)?
         )));
     }
-    let left = left_number?;
-    let right = right_number?;
-    match op {
-        "+" => left
-            .checked_add(right)
-            .map(Value::Number)
-            .ok_or_else(|| Error::Evaluation("integer addition overflow".to_owned())),
-        "-" => left
-            .checked_sub(right)
-            .map(Value::Number)
-            .ok_or_else(|| Error::Evaluation("integer subtraction overflow".to_owned())),
-        "*" => left
-            .checked_mul(right)
-            .map(Value::Number)
-            .ok_or_else(|| Error::Evaluation("integer multiplication overflow".to_owned())),
-        "/" if right == 0 => Ok(Value::Error {
-            code: "div_by_zero".to_owned(),
-        }),
-        "%" if right == 0 => Ok(Value::Error {
-            code: "mod_by_zero".to_owned(),
-        }),
-        "/" => Ok(Value::Number(left / right)),
-        "%" => Ok(Value::Number(left % right)),
-        ">" => Ok(Value::Bool(left > right)),
-        ">=" => Ok(Value::Bool(left >= right)),
-        "<" => Ok(Value::Bool(left < right)),
-        "<=" => Ok(Value::Bool(left <= right)),
-        _ => Err(Error::Evaluation(format!(
-            "unsupported numeric operator `{op}`"
-        ))),
-    }
+    numeric_infix(left_number?, op, right_number?)
 }
 
-fn compare_numbers(left: i64, op: &str, right: i64) -> Result<bool, Error> {
+fn eval_to_numeric(value: &EvalValue) -> Result<FiniteReal, Error> {
+    eval_to_number(value)
+}
+
+fn numeric_infix(left: FiniteReal, op: &str, right: FiniteReal) -> Result<Value, Error> {
+    if matches!(op, "/" | "%") && right.get() == 0.0 {
+        return Ok(Value::Error {
+            code: if op == "/" {
+                "div_by_zero"
+            } else {
+                "mod_by_zero"
+            }
+            .to_owned(),
+        });
+    }
+    if matches!(op, ">" | ">=" | "<" | "<=") {
+        return Ok(Value::Bool(numeric_compare(left, op, right)?));
+    }
+    let left = left.get();
+    let right = right.get();
+    let result = match op {
+        "+" => left + right,
+        "-" => left - right,
+        "*" => left * right,
+        "/" => left / right,
+        "%" => left % right,
+        _ => {
+            return Err(Error::Evaluation(format!(
+                "unsupported numeric operator `{op}`"
+            )));
+        }
+    };
+    finite_number_result(result, "numeric operation").map(Value::Number)
+}
+
+fn numeric_compare(left: FiniteReal, op: &str, right: FiniteReal) -> Result<bool, Error> {
+    let ordering = left.cmp(&right);
     match op {
-        "==" => Ok(left == right),
-        "!=" => Ok(left != right),
-        ">" => Ok(left > right),
-        ">=" => Ok(left >= right),
-        "<" => Ok(left < right),
-        "<=" => Ok(left <= right),
+        "==" => Ok(ordering.is_eq()),
+        "!=" => Ok(!ordering.is_eq()),
+        ">" => Ok(ordering.is_gt()),
+        ">=" => Ok(ordering.is_ge()),
+        "<" => Ok(ordering.is_lt()),
+        "<=" => Ok(ordering.is_le()),
         _ => Err(Error::Evaluation(format!("unsupported comparison `{op}`"))),
     }
 }
 
 fn compare_update_values(left: &Value, op: &str, right: &Value) -> Result<bool, Error> {
     match op {
-        "==" => Ok(left == right),
-        "!=" => Ok(left != right),
+        "==" | "!=" => {
+            let equal = match (
+                eval_to_numeric(&EvalValue::Value(left.clone())),
+                eval_to_numeric(&EvalValue::Value(right.clone())),
+            ) {
+                (Ok(left), Ok(right)) => numeric_compare(left, "==", right)?,
+                _ => left == right,
+            };
+            Ok(if op == "==" { equal } else { !equal })
+        }
         ">" | ">=" | "<" | "<=" => {
-            compare_numbers(value_to_number(left)?, op, value_to_number(right)?)
+            let left = eval_to_numeric(&EvalValue::Value(left.clone()))?;
+            let right = eval_to_numeric(&EvalValue::Value(right.clone()))?;
+            numeric_compare(left, op, right)
         }
         _ => Err(Error::Evaluation(format!("unsupported comparison `{op}`"))),
     }

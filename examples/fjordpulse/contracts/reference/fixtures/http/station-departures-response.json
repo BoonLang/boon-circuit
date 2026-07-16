@@ -1,0 +1,43 @@
+{
+  "ok": true,
+  "data": {
+    "stationId": "NSR:StopPlace:548",
+    "state": "fresh",
+    "version": "2026-07-10T10:00:00.000Z",
+    "updatedAt": "2026-07-10T10:00:00.000Z",
+    "lastSuccessfulAt": "2026-07-10T10:00:00.000Z",
+    "warning": null,
+    "mode": "day",
+    "date": "2026-07-10",
+    "timeZone": "Europe/Oslo",
+    "windowStart": "2026-07-10T00:00:00+02:00",
+    "windowEnd": "2026-07-11T00:00:00+02:00",
+    "departures": [
+      {
+        "id": "dep_100_1",
+        "serviceJourneyId": "SKY:ServiceJourney:100-1",
+        "lineId": "SKY:Line:100",
+        "lineCode": "100",
+        "destination": "Nordfjordeid",
+        "aimedDepartureAt": "2026-07-10T10:15:00Z",
+        "expectedDepartureAt": "2026-07-10T10:17:00Z",
+        "status": "delayed",
+        "delaySeconds": 120,
+        "platform": "1",
+        "realtime": true
+      }
+    ],
+    "page": {
+      "limit": 50,
+      "hasMore": false,
+      "nextCursor": null
+    },
+    "complete": true,
+    "totalCount": 1
+  },
+  "meta": {
+    "requestId": "req_station_departures_01",
+    "updatedAt": "2026-07-10T10:00:00.000Z",
+    "nextCursor": null
+  }
+}

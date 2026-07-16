@@ -2,7 +2,7 @@ use super::effects::{
     HostEffectDriver, HostEffectError, HostEffectReconciliation, HostEffectRequest,
     HostEffectWorker, HostEffectWorkerOperation, HostEffectWorkerOutcome,
 };
-use super::{DocumentPatch, LiveRuntime, RuntimeTurn};
+use super::{DocumentPatch, LiveRuntime, RuntimeTurn, TransientEffectCallId};
 use boon_persistence::{
     ActivationAck, ActivationBatch, AuthorityTurn, AuthorityTurnReservation, BarrierAck, CommitAck,
     CompactAck, ContentArtifact, ContentArtifactId, ContentArtifactLoadCompletion,
@@ -56,7 +56,7 @@ pub enum PersistentDispatchError {
     Runtime(String),
     PersistenceAdmissionFailed {
         turn: Box<RuntimeTurn>,
-        error: TurnEnqueueError,
+        error: Box<TurnEnqueueError>,
         rollback_error: Option<String>,
     },
     ImmediateCommitFailed {
@@ -336,6 +336,15 @@ pub struct PersistentStateArtifactActivation {
     pub preview: PersistentStateArtifactPreview,
 }
 
+type PreparedStateArtifact = (
+    LiveRuntime,
+    PersistentStateArtifactPreview,
+    BTreeSet<boon_plan::MigrationEdgeId>,
+    ContentArtifactManifest,
+    BTreeMap<ContentArtifactId, ContentArtifact>,
+    u64,
+);
+
 pub struct DurablyAcknowledgedTurn {
     pub turn: RuntimeTurn,
     pub acknowledgement: CommitAck,
@@ -467,6 +476,12 @@ impl PersistentRuntime {
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
+    pub fn root_value_current(&mut self, name: &str) -> Result<Value, PersistentDispatchError> {
+        self.runtime
+            .root_value_current(name)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
     pub fn output_value_current(&mut self, name: &str) -> Result<Value, PersistentDispatchError> {
         self.runtime
             .output_value_current(name)
@@ -499,10 +514,38 @@ impl PersistentRuntime {
             .persistence
             .try_reserve_turn()
             .map_err(PersistentDispatchError::Backpressure)?;
-        let mut turn = self
+        let turn = self
             .runtime
             .dispatch_unsettled(event)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
+        self.admit_buffered_turn(reservation, turn)
+    }
+
+    /// Completes one transient host effect as a normal persistent authority
+    /// turn. The completion can update durable state and emit chained effects;
+    /// neither is exposed unless the same admission/rollback contract as a
+    /// source turn succeeds.
+    pub fn complete_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
+        let reservation = self
+            .persistence
+            .try_reserve_turn()
+            .map_err(PersistentDispatchError::Backpressure)?;
+        let turn = self
+            .runtime
+            .complete_transient_effect_unsettled(call_id, outcome)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
+        self.admit_buffered_turn(reservation, turn)
+    }
+
+    fn admit_buffered_turn(
+        &mut self,
+        reservation: AuthorityTurnReservation,
+        mut turn: RuntimeTurn,
+    ) -> Result<RuntimeTurn, PersistentDispatchError> {
         let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         if next_effect_work.is_some()
             && self.pending_effect_durability.len() >= MAX_PENDING_EFFECT_DURABILITY
@@ -532,7 +575,7 @@ impl PersistentRuntime {
                 .map(|error| error.to_string());
             return Err(PersistentDispatchError::PersistenceAdmissionFailed {
                 turn: Box::new(turn),
-                error,
+                error: Box::new(error),
                 rollback_error,
             });
         }
@@ -592,7 +635,7 @@ impl PersistentRuntime {
                 .map(|error| error.to_string());
             return Err(PersistentDispatchError::PersistenceAdmissionFailed {
                 turn: Box::new(turn),
-                error,
+                error: Box::new(error),
                 rollback_error,
             });
         }
@@ -619,10 +662,45 @@ impl PersistentRuntime {
         &mut self,
         event: SourceEvent,
     ) -> Result<DurablyAcknowledgedTurn, PersistentDispatchError> {
-        let mut turn = self
+        let turn = self
             .runtime
             .dispatch_unsettled(event)
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
+        self.commit_unsettled_immediate(turn)
+    }
+
+    /// Completes a transient effect and waits until that exact completion turn
+    /// is durable. Request hosts use this before exposing a response derived
+    /// from an asynchronous effect result.
+    pub fn complete_transient_effect_durably(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    ) -> Result<DurablyAcknowledgedTurn, PersistentDispatchError> {
+        let turn = self
+            .runtime
+            .complete_transient_effect_unsettled(call_id, outcome)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
+        self.commit_unsettled_immediate(turn)
+    }
+
+    pub fn cancel_transient_effect(
+        &mut self,
+        call_id: TransientEffectCallId,
+    ) -> Result<bool, PersistentDispatchError> {
+        self.runtime
+            .cancel_transient_effect(call_id)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
+    pub fn pending_transient_effect_count(&self) -> usize {
+        self.runtime.pending_transient_effect_count()
+    }
+
+    fn commit_unsettled_immediate(
+        &mut self,
+        mut turn: RuntimeTurn,
+    ) -> Result<DurablyAcknowledgedTurn, PersistentDispatchError> {
         let next_effect_work = self.stage_effect_work_for_unsettled_turn(&turn)?;
         let persistence_started = Instant::now();
         let authority = AuthorityTurn::new(turn.sequence, turn.durable_changes.clone())
@@ -884,17 +962,7 @@ impl PersistentRuntime {
         &self,
         artifact: &[u8],
         options: SessionOptions,
-    ) -> Result<
-        (
-            LiveRuntime,
-            PersistentStateArtifactPreview,
-            BTreeSet<boon_plan::MigrationEdgeId>,
-            ContentArtifactManifest,
-            BTreeMap<ContentArtifactId, ContentArtifact>,
-            u64,
-        ),
-        PersistentActivationError,
-    > {
+    ) -> Result<PreparedStateArtifact, PersistentActivationError> {
         self.persistence
             .barrier()
             .map_err(PersistentActivationError::Persistence)?;
@@ -1671,6 +1739,10 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
 
+    fn number(value: i64) -> Value {
+        Value::integer(value).unwrap()
+    }
+
     struct FailingActivationDriver {
         inner: InMemoryDriver,
         fail_activation: Arc<AtomicBool>,
@@ -1941,7 +2013,7 @@ mod tests {
         );
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
-            Value::Number(1)
+            number(1)
         );
         runtime.shutdown().unwrap();
     }
@@ -2674,7 +2746,7 @@ mod tests {
                 .unwrap()
                 .states
                 .values()
-                .any(|value| value == &boon_plan_executor::Value::Number(1))
+                .any(|value| value == &number(1))
         );
         runtime.shutdown().unwrap();
     }
@@ -2761,7 +2833,7 @@ mod tests {
         assert!(after.completed_migration_edges.is_empty());
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
-            boon_plan_executor::Value::Number(0)
+            number(0)
         );
 
         let increment = runtime
@@ -2869,7 +2941,7 @@ mod tests {
         assert_eq!(runtime.generation(), 1);
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
-            Value::Number(2)
+            number(2)
         );
 
         let preview = runtime
@@ -2879,7 +2951,7 @@ mod tests {
         assert!(preview.migration.is_none());
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
-            Value::Number(2),
+            number(2),
             "preview must not mutate active authority"
         );
 
@@ -2890,7 +2962,7 @@ mod tests {
         assert!(activation.acknowledgement.epoch > 0);
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
-            Value::Number(1)
+            number(1)
         );
         runtime
             .clear_authority_path("store.count", SessionOptions::default())
@@ -2898,7 +2970,7 @@ mod tests {
         assert_eq!(runtime.generation(), 3);
         assert_eq!(
             runtime.runtime.root_value_current("store.count").unwrap(),
-            Value::Number(0)
+            number(0)
         );
         assert!(
             runtime
@@ -2997,7 +3069,7 @@ mod tests {
                 .runtime
                 .root_value_current("store.count")
                 .unwrap(),
-            Value::Number(1)
+            number(1)
         );
         assert_eq!(
             destination.load_content_artifact(content.id).unwrap(),
@@ -3100,7 +3172,7 @@ store: [
         assert_eq!(startup.restore_image.scalars.len(), 1);
         assert_eq!(
             restored.runtime.root_value_current("store.count").unwrap(),
-            Value::Number(1)
+            number(1)
         );
         restored.shutdown().unwrap();
     }

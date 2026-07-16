@@ -1,5 +1,5 @@
 use boon_document::{
-    DocumentNodeId, Rect, StyleMap, StyleRichTextSpan, StyleValue,
+    DocumentNodeId, MapTileCacheKey, Rect, StyleMap, StyleRichTextSpan, StyleValue,
     render_scene::{
         RenderAssetRef, RenderBlobRef, RenderFontStyle, RenderFontWeight, RenderRichTextSpan,
         RenderScene as DocumentRenderScene, RenderTextAlign, RenderTextColumnMeasurer,
@@ -7,6 +7,7 @@ use boon_document::{
         RenderVisualPrimitiveKind,
     },
 };
+mod map;
 #[cfg(test)]
 use boon_document::{DocumentNodeKind, LayoutFrame, StyleEditorTypeHint};
 use boon_host::SurfaceId;
@@ -16,6 +17,7 @@ use glyphon::{
     Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
     cosmic_text::{FeatureTag, FontFeatures, fontdb},
 };
+pub use map::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -262,6 +264,24 @@ pub struct FrameMetrics {
     pub asset_upload_count: u32,
     pub asset_upload_bytes: u64,
     pub asset_failure_diagnostics: Vec<String>,
+    #[serde(default)]
+    pub map_tiles: MapTileCacheMetrics,
+    #[serde(default)]
+    pub map_tile_gpu_cache_hits: u32,
+    #[serde(default)]
+    pub map_tile_gpu_cache_misses: u32,
+    #[serde(default)]
+    pub map_tile_gpu_cache_evictions: u32,
+    #[serde(default)]
+    pub map_tile_gpu_cache_entry_count: u32,
+    #[serde(default)]
+    pub map_tile_gpu_cache_byte_count: u64,
+    #[serde(default)]
+    pub map_tile_gpu_cache_byte_cap: u64,
+    #[serde(default)]
+    pub map_tile_upload_count: u32,
+    #[serde(default)]
+    pub map_tile_upload_bytes: u64,
     pub retained_chunk_count: u32,
     pub retained_chunk_hit_count: u32,
     pub retained_chunk_miss_count: u32,
@@ -336,6 +356,7 @@ struct InternalRenderSceneCacheKey {
     scene_identity: String,
     width: u32,
     height: u32,
+    map_revision: u64,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -692,6 +713,29 @@ impl AppOwnedProofRenderer {
     ) -> Result<(), RenderError> {
         self.renderer.replace_asset_sources(sources)
     }
+
+    pub fn take_map_tile_requests(&mut self, limit: usize) -> Vec<MapTileFetchRequest> {
+        self.renderer.take_map_tile_requests(limit)
+    }
+
+    pub fn submit_map_tile(
+        &mut self,
+        tile: DecodedMapTile,
+    ) -> Result<MapTileSubmission, MapTileCacheError> {
+        self.renderer.submit_map_tile(tile)
+    }
+
+    pub fn map_tile_metrics(&self) -> MapTileCacheMetrics {
+        self.renderer.map_tile_metrics()
+    }
+
+    pub fn prepare_map_tile_uploads(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<MapTileGpuPrepareMetrics, RenderError> {
+        self.renderer.prepare_map_tile_uploads(device, queue)
+    }
 }
 
 pub struct SurfaceRenderSceneRequest<'a> {
@@ -732,6 +776,7 @@ impl AssetTextureKey {
 enum QuadTexture {
     Solid,
     Asset(AssetTextureKey),
+    MapTile(MapTileCacheKey),
 }
 
 #[derive(Clone, Debug)]
@@ -1107,6 +1152,9 @@ struct TextureState {
     sources: BTreeMap<String, RenderAssetSource>,
     assets: BTreeMap<AssetTextureKey, GpuTextureAsset>,
     cached_asset_bytes: u64,
+    map_tiles: BTreeMap<MapTileCacheKey, GpuMapTile>,
+    cached_map_tile_bytes: u64,
+    map_access_tick: u64,
 }
 
 struct GpuTextureAsset {
@@ -1114,6 +1162,11 @@ struct GpuTextureAsset {
     _view: wgpu::TextureView,
     bind_group: TextureBindGroup,
     byte_count: u64,
+}
+
+struct GpuMapTile {
+    asset: GpuTextureAsset,
+    last_used: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1131,6 +1184,14 @@ struct AssetFrameMetrics {
     upload_count: u32,
     upload_bytes: u64,
     failure_diagnostics: Vec<String>,
+    map_cache_hits: u32,
+    map_cache_misses: u32,
+    map_cache_evictions: u32,
+    map_cache_entry_count: u32,
+    map_cache_byte_count: u64,
+    map_cache_byte_cap: u64,
+    map_upload_count: u32,
+    map_upload_bytes: u64,
 }
 
 impl Default for AssetFrameMetrics {
@@ -1149,16 +1210,27 @@ impl Default for AssetFrameMetrics {
             upload_count: 0,
             upload_bytes: 0,
             failure_diagnostics: Vec::new(),
+            map_cache_hits: 0,
+            map_cache_misses: 0,
+            map_cache_evictions: 0,
+            map_cache_entry_count: 0,
+            map_cache_byte_count: 0,
+            map_cache_byte_cap: DEFAULT_MAP_TILE_GPU_BYTE_CAP,
+            map_upload_count: 0,
+            map_upload_bytes: 0,
         }
     }
 }
 
 impl AssetFrameMetrics {
-    fn finish(mut self, state: &TextureState) -> Self {
+    fn finish(mut self, state: &TextureState, map_gpu_byte_cap: u64) -> Self {
         self.cache_entry_count = state.assets.len() as u32;
         self.cache_byte_count = state.assets.values().map(|asset| asset.byte_count).sum();
         self.cache_byte_cap = MAX_CACHED_ASSET_TEXTURE_BYTES;
         self.cache_byte_cap_hit = self.cache_byte_count >= MAX_CACHED_ASSET_TEXTURE_BYTES;
+        self.map_cache_entry_count = state.map_tiles.len() as u32;
+        self.map_cache_byte_count = state.cached_map_tile_bytes;
+        self.map_cache_byte_cap = map_gpu_byte_cap;
         self
     }
 
@@ -1204,6 +1276,9 @@ impl TextureState {
             sources: BTreeMap::new(),
             assets: BTreeMap::new(),
             cached_asset_bytes: 0,
+            map_tiles: BTreeMap::new(),
+            cached_map_tile_bytes: 0,
+            map_access_tick: 0,
         }
     }
 
@@ -1238,11 +1313,16 @@ impl TextureState {
         Ok(())
     }
 
+    fn map_tile_keys(&self) -> BTreeSet<MapTileCacheKey> {
+        self.map_tiles.keys().cloned().collect()
+    }
+
     fn prepare_assets(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         batches: &[QuadBatch],
+        map_cache: &MapTileCache,
     ) -> Result<AssetFrameMetrics, RenderError> {
         let mut metrics = AssetFrameMetrics::default();
         for batch in batches {
@@ -1310,37 +1390,204 @@ impl TextureState {
             metrics.upload_count = metrics.upload_count.saturating_add(1);
             metrics.upload_bytes = metrics.upload_bytes.saturating_add(byte_count);
         }
-        Ok(metrics.finish(self))
+        self.prepare_map_tiles(device, queue, batches, map_cache, &mut metrics)?;
+        Ok(metrics.finish(self, map_cache.config().gpu_byte_cap))
+    }
+
+    fn prepare_map_tiles(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batches: &[QuadBatch],
+        map_cache: &MapTileCache,
+        metrics: &mut AssetFrameMetrics,
+    ) -> Result<(), RenderError> {
+        let required = batches
+            .iter()
+            .filter_map(|batch| match &batch.texture {
+                QuadTexture::MapTile(key) => Some(key.clone()),
+                QuadTexture::Solid | QuadTexture::Asset(_) => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let prepared = self.prepare_map_tile_keys(device, queue, required, map_cache)?;
+        metrics.map_cache_hits = prepared.cache_hits;
+        metrics.map_cache_misses = prepared.cache_misses;
+        metrics.map_cache_evictions = prepared.cache_evictions;
+        metrics.map_cache_entry_count = prepared.cache_entry_count;
+        metrics.map_cache_byte_count = prepared.cache_byte_count;
+        metrics.map_cache_byte_cap = prepared.cache_byte_cap;
+        metrics.map_upload_count = prepared.upload_count;
+        metrics.map_upload_bytes = prepared.upload_bytes;
+        Ok(())
+    }
+
+    fn prepare_map_tile_keys(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        required: BTreeSet<MapTileCacheKey>,
+        map_cache: &MapTileCache,
+    ) -> Result<MapTileGpuPrepareMetrics, RenderError> {
+        let mut metrics = MapTileGpuPrepareMetrics {
+            cache_byte_cap: map_cache.config().gpu_byte_cap,
+            ..MapTileGpuPrepareMetrics::default()
+        };
+        let mut required_bytes = 0u64;
+        let to_upload = required
+            .iter()
+            .filter(|key| !self.map_tiles.contains_key(*key))
+            .take(map_cache.config().max_gpu_uploads_per_prepare)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut incoming_bytes = 0u64;
+        for key in &required {
+            let Some((width, height, _)) = map_cache.decoded_tile(key) else {
+                return Err(RenderError {
+                    message: format!(
+                        "retained map tile z{}/x{}/y{} has no decoded CPU pixels",
+                        key.z, key.x, key.y
+                    ),
+                });
+            };
+            let bytes = u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(4);
+            required_bytes = required_bytes.saturating_add(bytes);
+            if to_upload.contains(key) {
+                incoming_bytes = incoming_bytes.saturating_add(bytes);
+            }
+        }
+        let byte_cap = map_cache.config().gpu_byte_cap;
+        if required_bytes > byte_cap {
+            return Err(RenderError {
+                message: format!(
+                    "visible map tiles require {required_bytes} GPU bytes but cap is {byte_cap}"
+                ),
+            });
+        }
+        while self.cached_map_tile_bytes.saturating_add(incoming_bytes) > byte_cap {
+            let candidate = self
+                .map_tiles
+                .iter()
+                .filter(|(key, _)| !required.contains(*key))
+                .min_by(|left, right| {
+                    left.1
+                        .last_used
+                        .cmp(&right.1.last_used)
+                        .then_with(|| left.0.cmp(right.0))
+                })
+                .map(|(key, _)| key.clone());
+            let Some(candidate) = candidate else {
+                return Err(RenderError {
+                    message: "map GPU cache has no evictable tile within its byte cap".to_owned(),
+                });
+            };
+            if let Some(removed) = self.map_tiles.remove(&candidate) {
+                self.cached_map_tile_bytes = self
+                    .cached_map_tile_bytes
+                    .saturating_sub(removed.asset.byte_count);
+                metrics.cache_evictions = metrics.cache_evictions.saturating_add(1);
+            }
+        }
+        for key in required {
+            self.map_access_tick = self.map_access_tick.saturating_add(1);
+            if let Some(tile) = self.map_tiles.get_mut(&key) {
+                tile.last_used = self.map_access_tick;
+                metrics.cache_hits = metrics.cache_hits.saturating_add(1);
+                continue;
+            }
+            metrics.cache_misses = metrics.cache_misses.saturating_add(1);
+            if !to_upload.contains(&key) {
+                continue;
+            }
+            let (width, height, rgba) =
+                map_cache.decoded_tile(&key).ok_or_else(|| RenderError {
+                    message: "decoded map tile disappeared before GPU upload".to_owned(),
+                })?;
+            let (texture, view) = upload_rgba_texture(
+                device,
+                queue,
+                "boon-native-gpu-map-tile",
+                width,
+                height,
+                rgba,
+            );
+            let byte_count = u64::from(width)
+                .saturating_mul(u64::from(height))
+                .saturating_mul(4);
+            let bind_group = TextureBindGroup::from_bindings(
+                device,
+                generated::shader_bindings::native_gpu_rect::WgpuBindGroup0Entries::new(
+                    generated::shader_bindings::native_gpu_rect::WgpuBindGroup0EntriesParams {
+                        texture_sampler: &self.sampler,
+                        texture_image: &view,
+                    },
+                ),
+            );
+            self.map_tiles.insert(
+                key,
+                GpuMapTile {
+                    asset: GpuTextureAsset {
+                        _texture: texture,
+                        _view: view,
+                        bind_group,
+                        byte_count,
+                    },
+                    last_used: self.map_access_tick,
+                },
+            );
+            self.cached_map_tile_bytes = self.cached_map_tile_bytes.saturating_add(byte_count);
+            metrics.upload_count = metrics.upload_count.saturating_add(1);
+            metrics.upload_bytes = metrics.upload_bytes.saturating_add(byte_count);
+        }
+        metrics.cache_entry_count = self.map_tiles.len() as u32;
+        metrics.cache_byte_count = self.cached_map_tile_bytes;
+        Ok(metrics)
     }
 
     fn cached_asset_metrics<'a>(
         &self,
         textures: impl IntoIterator<Item = &'a QuadTexture>,
+        map_gpu_byte_cap: u64,
     ) -> AssetFrameMetrics {
         let mut metrics = AssetFrameMetrics::default();
         for texture in textures {
-            let QuadTexture::Asset(key) = texture else {
-                continue;
-            };
-            let asset_ref = self.asset_ref_for_key(key);
-            metrics.refs.insert(asset_ref.id.clone(), asset_ref);
-            if self.assets.contains_key(key) {
-                metrics.cache_hits = metrics.cache_hits.saturating_add(1);
-            } else {
-                metrics.cache_misses = metrics.cache_misses.saturating_add(1);
-                metrics.failure_diagnostics.push(format!(
-                    "asset texture {} was referenced by prepared quads but missing from cache",
-                    key.asset_ref().id
-                ));
+            match texture {
+                QuadTexture::Asset(key) => {
+                    let asset_ref = self.asset_ref_for_key(key);
+                    metrics.refs.insert(asset_ref.id.clone(), asset_ref);
+                    if self.assets.contains_key(key) {
+                        metrics.cache_hits = metrics.cache_hits.saturating_add(1);
+                    } else {
+                        metrics.cache_misses = metrics.cache_misses.saturating_add(1);
+                        metrics.failure_diagnostics.push(format!(
+                            "asset texture {} was referenced by prepared quads but missing from cache",
+                            key.asset_ref().id
+                        ));
+                    }
+                }
+                QuadTexture::MapTile(key) => {
+                    if self.map_tiles.contains_key(key) {
+                        metrics.map_cache_hits = metrics.map_cache_hits.saturating_add(1);
+                    } else {
+                        metrics.map_cache_misses = metrics.map_cache_misses.saturating_add(1);
+                        metrics.failure_diagnostics.push(format!(
+                            "map tile z{}/x{}/y{} was referenced by prepared quads but missing from GPU cache",
+                            key.z, key.x, key.y
+                        ));
+                    }
+                }
+                QuadTexture::Solid => {}
             }
         }
-        metrics.finish(self)
+        metrics.finish(self, map_gpu_byte_cap)
     }
 
     fn bind_group_for(&self, texture: &QuadTexture) -> Option<&TextureBindGroup> {
         match texture {
             QuadTexture::Solid => Some(&self.white_bind_group),
             QuadTexture::Asset(key) => self.assets.get(key).map(|asset| &asset.bind_group),
+            QuadTexture::MapTile(key) => self.map_tiles.get(key).map(|tile| &tile.asset.bind_group),
         }
     }
 
@@ -1540,6 +1787,7 @@ pub struct VisibleLayoutRenderer {
     prepared_quads: BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>,
     previous_chunk_ids: BTreeSet<String>,
     product_frame_graph: ProductFrameGraphState,
+    map_tiles: MapTileCache,
     diagnostics_enabled: bool,
 }
 
@@ -1594,8 +1842,37 @@ impl VisibleLayoutRenderer {
             prepared_quads: BTreeMap::new(),
             previous_chunk_ids: BTreeSet::new(),
             product_frame_graph: ProductFrameGraphState::default(),
+            map_tiles: MapTileCache::default(),
             diagnostics_enabled: true,
         }
+    }
+
+    pub fn new_with_map_tile_config(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        config: MapTileCacheConfig,
+    ) -> Result<Self, MapTileCacheError> {
+        let mut renderer = Self::new(device, queue, format);
+        renderer.map_tiles = MapTileCache::new(config)?;
+        Ok(renderer)
+    }
+
+    pub fn rebuild_device_resources(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+    ) -> Result<(), RenderError> {
+        let map_tiles = std::mem::take(&mut self.map_tiles);
+        let sources = self.textures.sources.values().cloned().collect::<Vec<_>>();
+        let diagnostics_enabled = self.diagnostics_enabled;
+        let frame_seq = self.frame_seq;
+        *self = Self::new(device, queue, format);
+        self.map_tiles = map_tiles;
+        self.diagnostics_enabled = diagnostics_enabled;
+        self.frame_seq = frame_seq;
+        self.replace_asset_sources(sources)
     }
 
     pub fn set_diagnostics_enabled(&mut self, enabled: bool) {
@@ -1609,10 +1886,72 @@ impl VisibleLayoutRenderer {
         self.textures.replace_sources(sources)
     }
 
+    pub fn take_map_tile_requests(&mut self, limit: usize) -> Vec<MapTileFetchRequest> {
+        self.map_tiles.take_requests(limit)
+    }
+
+    pub fn submit_map_tile(
+        &mut self,
+        tile: DecodedMapTile,
+    ) -> Result<MapTileSubmission, MapTileCacheError> {
+        self.map_tiles.submit_decoded(tile)
+    }
+
+    pub fn submit_map_tile_failure(
+        &mut self,
+        viewport: &DocumentNodeId,
+        identity: &boon_document::MapTileRequestIdentity,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> MapTileSubmission {
+        self.map_tiles
+            .submit_failure(viewport, identity, message, retryable)
+    }
+
+    pub fn retry_map_tile(&mut self, viewport: &DocumentNodeId, tile: &MapTileCacheKey) -> bool {
+        self.map_tiles.retry(viewport, tile)
+    }
+
+    pub fn drain_map_tile_events(&mut self) -> Vec<MapTileEvent> {
+        self.map_tiles.drain_events()
+    }
+
+    pub fn map_tile_metrics(&self) -> MapTileCacheMetrics {
+        self.map_tiles.metrics()
+    }
+
+    pub fn map_tile_cpu_snapshot(&self) -> MapTileCpuSnapshot {
+        self.map_tiles.snapshot()
+    }
+
+    pub fn prepare_map_tile_uploads(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<MapTileGpuPrepareMetrics, RenderError> {
+        let required = self.map_tiles.required_render_texture_keys();
+        let metrics =
+            self.textures
+                .prepare_map_tile_keys(device, queue, required, &self.map_tiles)?;
+        if metrics.upload_count > 0 || metrics.cache_evictions > 0 {
+            self.internal_scene_cache.clear();
+            self.prepared_quads.clear();
+        }
+        Ok(metrics)
+    }
+
+    pub fn restore_map_tile_cpu_snapshot(
+        &mut self,
+        snapshot: MapTileCpuSnapshot,
+    ) -> Result<(), MapTileCacheError> {
+        self.map_tiles.restore(snapshot)
+    }
+
     pub fn encode_scene(
         &mut self,
         request: SurfaceRenderSceneRequest<'_>,
     ) -> Result<FrameMetrics, RenderError> {
+        self.map_tiles.sync_scene(&request.scene.map_viewports);
         self.frame_seq += 1;
         encode_render_scene_to_surface_with_pipeline(
             request,
@@ -1626,6 +1965,7 @@ impl VisibleLayoutRenderer {
             &mut self.prepared_quads,
             &mut self.previous_chunk_ids,
             &mut self.product_frame_graph,
+            &mut self.map_tiles,
             self.frame_seq,
             self.diagnostics_enabled,
         )
@@ -1644,6 +1984,7 @@ fn internal_render_scene_cache_key(
     scene_identity: Option<&str>,
     width: u32,
     height: u32,
+    map_revision: u64,
 ) -> InternalRenderSceneCacheKey {
     InternalRenderSceneCacheKey {
         scene_identity: scene_identity
@@ -1651,6 +1992,7 @@ fn internal_render_scene_cache_key(
             .unwrap_or_else(|| document_render_scene_fallback_identity(scene)),
         width,
         height,
+        map_revision,
     }
 }
 
@@ -1695,15 +2037,22 @@ fn encode_render_scene_to_surface_with_pipeline(
     prepared_quads: &mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>,
     previous_chunk_ids: &mut BTreeSet<String>,
     product_frame_graph: &mut ProductFrameGraphState,
+    map_tiles: &mut MapTileCache,
     frame_seq: u64,
     diagnostics_enabled: bool,
 ) -> Result<FrameMetrics, RenderError> {
     let (width, height) = surface_render_extent(request.width, request.height);
     let convert_started = Instant::now();
-    let cache_key =
-        internal_render_scene_cache_key(request.scene, request.scene_identity, width, height);
+    let cache_key = internal_render_scene_cache_key(
+        request.scene,
+        request.scene_identity,
+        width,
+        height,
+        map_tiles.revision(),
+    );
     let cache_hit = internal_scene_cache.contains_key(&cache_key);
     if !cache_hit {
+        let available_map_tiles = textures.map_tile_keys();
         evict_internal_scene_cache_if_needed(internal_scene_cache);
         internal_scene_cache.insert(
             cache_key.clone(),
@@ -1712,8 +2061,12 @@ fn encode_render_scene_to_surface_with_pipeline(
                 width,
                 height,
                 document_quad_cache,
-                request.scene_identity.is_some(),
-                false,
+                DocumentSceneConversionOptions {
+                    use_retained_quad_cache: request.scene_identity.is_some(),
+                    retain_metric_items: false,
+                },
+                map_tiles,
+                &available_map_tiles,
             ),
         );
     }
@@ -1739,12 +2092,18 @@ fn encode_render_scene_to_surface_with_pipeline(
         pipeline,
         text,
         textures,
+        map_tiles,
         quad_buffers,
         quad_upload_ring,
         prepared_quads,
         previous_chunk_ids,
         product_frame_graph,
-        render_scene_supplied_cache_key(request.scene_identity, width, height),
+        render_scene_supplied_cache_key(
+            request.scene_identity,
+            width,
+            height,
+            map_tiles.revision(),
+        ),
         frame_seq,
         diagnostics_enabled,
     )?;
@@ -2368,6 +2727,7 @@ fn encode_internal_scene_to_surface(
     pipeline: &wgpu::RenderPipeline,
     text: &mut GlyphonTextState,
     textures: &mut TextureState,
+    map_tiles: &MapTileCache,
     quad_buffers: &mut BTreeMap<QuadBatchCacheKey, CachedGpuQuadBatch>,
     quad_upload_ring: &mut QuadUploadRing,
     prepared_quads: &mut BTreeMap<PreparedQuadCacheKey, PreparedQuadCache>,
@@ -2435,6 +2795,7 @@ fn encode_internal_scene_to_surface(
                         let asset_prepare_started = Instant::now();
                         let asset_metrics = textures.cached_asset_metrics(
                             entry.gpu_batches.iter().map(|batch| &batch.texture),
+                            map_tiles.config().gpu_byte_cap,
                         );
                         asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
                         asset_metrics
@@ -2458,6 +2819,7 @@ fn encode_internal_scene_to_surface(
                             request.device,
                             request.queue,
                             &quad_batches,
+                            map_tiles,
                         )?;
                         asset_prepare_ms += asset_prepare_started.elapsed().as_secs_f64() * 1000.0;
                         struct QuadUploadCandidate {
@@ -2861,6 +3223,15 @@ fn encode_internal_scene_to_surface(
         asset_upload_count: asset_metrics.upload_count,
         asset_upload_bytes: asset_metrics.upload_bytes,
         asset_failure_diagnostics: asset_metrics.failure_diagnostics,
+        map_tiles: map_tiles.metrics(),
+        map_tile_gpu_cache_hits: asset_metrics.map_cache_hits,
+        map_tile_gpu_cache_misses: asset_metrics.map_cache_misses,
+        map_tile_gpu_cache_evictions: asset_metrics.map_cache_evictions,
+        map_tile_gpu_cache_entry_count: asset_metrics.map_cache_entry_count,
+        map_tile_gpu_cache_byte_count: asset_metrics.map_cache_byte_count,
+        map_tile_gpu_cache_byte_cap: asset_metrics.map_cache_byte_cap,
+        map_tile_upload_count: asset_metrics.map_upload_count,
+        map_tile_upload_bytes: asset_metrics.map_upload_bytes,
         retained_chunk_count,
         retained_chunk_hit_count,
         retained_chunk_miss_count,
@@ -3090,6 +3461,14 @@ fn render_scene_cache_key(scene: &RenderScene) -> u64 {
                 key.width.hash(&mut hasher);
                 key.height.hash(&mut hasher);
             }
+            QuadTexture::MapTile(key) => {
+                "map-tile".hash(&mut hasher);
+                key.source.0.hash(&mut hasher);
+                key.z.hash(&mut hasher);
+                key.x.hash(&mut hasher);
+                key.y.hash(&mut hasher);
+                key.scale.as_f64().to_bits().hash(&mut hasher);
+            }
         }
         for vertex in batch.vertices.iter() {
             for coordinate in vertex.position {
@@ -3114,12 +3493,14 @@ fn render_scene_supplied_cache_key(
     scene_identity: Option<&str>,
     width: u32,
     height: u32,
+    map_revision: u64,
 ) -> Option<u64> {
     let scene_identity = scene_identity?;
     let mut hasher = DefaultHasher::new();
     scene_identity.hash(&mut hasher);
     width.hash(&mut hasher);
     height.hash(&mut hasher);
+    map_revision.hash(&mut hasher);
     Some(hasher.finish())
 }
 
@@ -3130,13 +3511,20 @@ fn hash_rect(hasher: &mut DefaultHasher, rect: Rect) {
     rect.height.to_bits().hash(hasher);
 }
 
+#[derive(Clone, Copy)]
+struct DocumentSceneConversionOptions {
+    use_retained_quad_cache: bool,
+    retain_metric_items: bool,
+}
+
 fn render_scene_from_document_scene_cached(
     scene: &DocumentRenderScene,
     width: u32,
     height: u32,
     document_quad_cache: &mut HashMap<DocumentQuadCacheKey, Vec<QuadBatch>>,
-    use_retained_quad_cache: bool,
-    retain_metric_items: bool,
+    options: DocumentSceneConversionOptions,
+    map_tiles: &mut MapTileCache,
+    available_map_tiles: &BTreeSet<MapTileCacheKey>,
 ) -> RenderScene {
     let viewport = Rect {
         x: scene.viewport.x,
@@ -3144,7 +3532,7 @@ fn render_scene_from_document_scene_cached(
         width: scene.viewport.width.min(width as f32).max(1.0),
         height: scene.viewport.height.min(height as f32).max(1.0),
     };
-    let items = if retain_metric_items {
+    let items = if options.retain_metric_items {
         {
             scene
                 .items
@@ -3166,8 +3554,16 @@ fn render_scene_from_document_scene_cached(
     } else {
         Default::default()
     };
-    let mut quad_batches = if scene.quad_batches.is_empty() {
-        if use_retained_quad_cache {
+    let mut quad_batches = if !scene.map_viewports.is_empty() {
+        quad_batches_from_document_scene_with_maps(
+            scene,
+            width,
+            height,
+            map_tiles,
+            available_map_tiles,
+        )
+    } else if scene.quad_batches.is_empty() {
+        if options.use_retained_quad_cache {
             cached_quad_batches_from_visual_primitives(
                 &scene.visual_primitives,
                 width,
@@ -3205,7 +3601,7 @@ fn render_scene_from_document_scene_cached(
         },
         quad_batches,
         overlay_batch_start,
-        text_runs: if retain_metric_items {
+        text_runs: if options.retain_metric_items {
             scene.text_runs.clone()
         } else {
             Default::default()
@@ -3219,7 +3615,188 @@ fn render_scene_from_document_scene(
     width: u32,
     height: u32,
 ) -> RenderScene {
-    render_scene_from_document_scene_cached(scene, width, height, &mut HashMap::new(), false, true)
+    render_scene_from_document_scene_cached(
+        scene,
+        width,
+        height,
+        &mut HashMap::new(),
+        DocumentSceneConversionOptions {
+            use_retained_quad_cache: false,
+            retain_metric_items: true,
+        },
+        &mut MapTileCache::default(),
+        &BTreeSet::new(),
+    )
+}
+
+fn quad_batches_from_document_scene_with_maps(
+    scene: &DocumentRenderScene,
+    width: u32,
+    height: u32,
+    map_tiles: &mut MapTileCache,
+    available_map_tiles: &BTreeSet<MapTileCacheKey>,
+) -> Vec<QuadBatch> {
+    let maps = scene
+        .map_viewports
+        .iter()
+        .map(|map| (map.node.clone(), map))
+        .collect::<BTreeMap<_, _>>();
+    let mut inserted = BTreeSet::new();
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < scene.visual_primitives.len() {
+        let node = scene.visual_primitives[start].node.clone();
+        let mut end = start + 1;
+        while end < scene.visual_primitives.len() && scene.visual_primitives[end].node == node {
+            end += 1;
+        }
+        batches.extend(quad_batches_from_visual_primitives_iter(
+            scene.visual_primitives[start..end].iter(),
+            width as f32,
+            height as f32,
+        ));
+        if let Some(map) = maps.get(&node)
+            && inserted.insert(node.clone())
+        {
+            batches.extend(
+                map_tiles
+                    .render_parts_with_available(map, available_map_tiles)
+                    .into_iter()
+                    .flat_map(|part| quad_batches_from_map_tile_part(&part, width, height)),
+            );
+            batches.extend(quad_batches_from_visual_primitives_iter(
+                map.overlay_primitives.iter(),
+                width as f32,
+                height as f32,
+            ));
+        }
+        start = end;
+    }
+    for (node, map) in maps {
+        if !inserted.insert(node) {
+            continue;
+        }
+        batches.extend(
+            map_tiles
+                .render_parts_with_available(map, available_map_tiles)
+                .into_iter()
+                .flat_map(|part| quad_batches_from_map_tile_part(&part, width, height)),
+        );
+        batches.extend(quad_batches_from_visual_primitives_iter(
+            map.overlay_primitives.iter(),
+            width as f32,
+            height as f32,
+        ));
+    }
+    batches
+}
+
+#[derive(Clone, Copy)]
+struct MapClipVertex {
+    point: [f32; 2],
+    uv: [f32; 2],
+}
+
+#[derive(Clone, Copy)]
+enum MapClipEdge {
+    Left(f32),
+    Right(f32),
+    Top(f32),
+    Bottom(f32),
+}
+
+fn quad_batches_from_map_tile_part(
+    part: &MapTileRenderPart,
+    width: u32,
+    height: u32,
+) -> Vec<QuadBatch> {
+    let mut polygon = part
+        .points
+        .into_iter()
+        .zip(part.uvs)
+        .map(|(point, uv)| MapClipVertex { point, uv })
+        .collect::<Vec<_>>();
+    for edge in [
+        MapClipEdge::Left(part.clip.x),
+        MapClipEdge::Right(part.clip.x + part.clip.width),
+        MapClipEdge::Top(part.clip.y),
+        MapClipEdge::Bottom(part.clip.y + part.clip.height),
+    ] {
+        polygon = clip_map_polygon(&polygon, edge);
+        if polygon.len() < 3 {
+            return Vec::new();
+        }
+    }
+    let mut builder = QuadBuilder::default();
+    builder.set_retained_chunk_id(&part.retained_chunk_id);
+    for index in 1..polygon.len() - 1 {
+        let triangle = [polygon[0], polygon[index], polygon[index + 1]];
+        builder.push_triangle(
+            QuadTexture::MapTile(part.texture.clone()),
+            triangle.map(|vertex| vertex.point),
+            triangle.map(|vertex| vertex.uv),
+            width as f32,
+            height as f32,
+            [1.0; 4],
+        );
+    }
+    builder.batches
+}
+
+fn clip_map_polygon(input: &[MapClipVertex], edge: MapClipEdge) -> Vec<MapClipVertex> {
+    let mut output = Vec::new();
+    let Some(mut previous) = input.last().copied() else {
+        return output;
+    };
+    let mut previous_inside = map_clip_inside(previous, edge);
+    for current in input.iter().copied() {
+        let current_inside = map_clip_inside(current, edge);
+        if current_inside != previous_inside {
+            output.push(map_clip_intersection(previous, current, edge));
+        }
+        if current_inside {
+            output.push(current);
+        }
+        previous = current;
+        previous_inside = current_inside;
+    }
+    output
+}
+
+fn map_clip_inside(vertex: MapClipVertex, edge: MapClipEdge) -> bool {
+    match edge {
+        MapClipEdge::Left(x) => vertex.point[0] >= x,
+        MapClipEdge::Right(x) => vertex.point[0] <= x,
+        MapClipEdge::Top(y) => vertex.point[1] >= y,
+        MapClipEdge::Bottom(y) => vertex.point[1] <= y,
+    }
+}
+
+fn map_clip_intersection(
+    from: MapClipVertex,
+    to: MapClipVertex,
+    edge: MapClipEdge,
+) -> MapClipVertex {
+    let (axis, boundary) = match edge {
+        MapClipEdge::Left(x) | MapClipEdge::Right(x) => (0usize, x),
+        MapClipEdge::Top(y) | MapClipEdge::Bottom(y) => (1usize, y),
+    };
+    let denominator = to.point[axis] - from.point[axis];
+    let t = if denominator.abs() <= f32::EPSILON {
+        0.0
+    } else {
+        ((boundary - from.point[axis]) / denominator).clamp(0.0, 1.0)
+    };
+    MapClipVertex {
+        point: [
+            from.point[0] + (to.point[0] - from.point[0]) * t,
+            from.point[1] + (to.point[1] - from.point[1]) * t,
+        ],
+        uv: [
+            from.uv[0] + (to.uv[0] - from.uv[0]) * t,
+            from.uv[1] + (to.uv[1] - from.uv[1]) * t,
+        ],
+    }
 }
 
 fn document_item_retained_chunk_id(item: &boon_document::RenderSceneItem) -> String {
@@ -3384,6 +3961,54 @@ fn quad_batches_from_visual_primitives_iter<'a>(
                     width,
                     height,
                     linear_f32_from_rgba8(primitive.color),
+                );
+            }
+            RenderVisualPrimitiveKind::MapCircle => {
+                let center_x = primitive.bounds.x + primitive.bounds.width / 2.0;
+                let center_y = primitive.bounds.y + primitive.bounds.height / 2.0;
+                push_checkbox_circle_raster(
+                    &mut builder,
+                    center_x,
+                    center_y,
+                    primitive.radius.max(0.5),
+                    primitive.stroke_width.max(0.0),
+                    primitive.antialias.max(0.0),
+                    width,
+                    height,
+                    linear_f32_from_rgba8(primitive.secondary_color),
+                    linear_f32_from_rgba8(primitive.color),
+                );
+            }
+            RenderVisualPrimitiveKind::MapPolyline => {
+                for segment in primitive.control_points.windows(2) {
+                    let Some((start, end)) = clip_map_line_segment(
+                        segment[0],
+                        segment[1],
+                        primitive.clip.unwrap_or(primitive.bounds),
+                    ) else {
+                        continue;
+                    };
+                    push_line_segment_quad(
+                        &mut builder,
+                        (start[0], start[1]),
+                        (end[0], end[1]),
+                        primitive.stroke_width.max(1.0),
+                        width,
+                        height,
+                        linear_f32_from_rgba8(primitive.color),
+                    );
+                }
+            }
+            RenderVisualPrimitiveKind::MapPolygon => {
+                push_map_polygon(
+                    &mut builder,
+                    &primitive.control_points,
+                    primitive.clip.unwrap_or(primitive.bounds),
+                    primitive.stroke_width,
+                    width,
+                    height,
+                    linear_f32_from_rgba8(primitive.color),
+                    linear_f32_from_rgba8(primitive.secondary_color),
                 );
             }
             RenderVisualPrimitiveKind::ViewportBackground
@@ -5559,6 +6184,105 @@ fn push_line_segment_quad(
     let p3 = [start.0 - nx, start.1 - ny];
     push_solid_triangle(builder, [p0, p1, p2], width, height, color);
     push_solid_triangle(builder, [p0, p2, p3], width, height, color);
+}
+
+fn clip_map_line_segment(
+    start: [f32; 2],
+    end: [f32; 2],
+    clip: Rect,
+) -> Option<([f32; 2], [f32; 2])> {
+    let dx = end[0] - start[0];
+    let dy = end[1] - start[1];
+    let mut first = 0.0f32;
+    let mut last = 1.0f32;
+    for (p, q) in [
+        (-dx, start[0] - clip.x),
+        (dx, clip.x + clip.width - start[0]),
+        (-dy, start[1] - clip.y),
+        (dy, clip.y + clip.height - start[1]),
+    ] {
+        if p.abs() <= f32::EPSILON {
+            if q < 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let ratio = q / p;
+        if p < 0.0 {
+            first = first.max(ratio);
+        } else {
+            last = last.min(ratio);
+        }
+        if first > last {
+            return None;
+        }
+    }
+    Some((
+        [start[0] + dx * first, start[1] + dy * first],
+        [start[0] + dx * last, start[1] + dy * last],
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_map_polygon(
+    builder: &mut QuadBuilder,
+    points: &[[f32; 2]],
+    clip: Rect,
+    stroke_width: f32,
+    width: f32,
+    height: f32,
+    fill: [f32; 4],
+    stroke: [f32; 4],
+) {
+    let mut polygon = points
+        .iter()
+        .copied()
+        .map(|point| MapClipVertex {
+            point,
+            uv: [0.0, 0.0],
+        })
+        .collect::<Vec<_>>();
+    for edge in [
+        MapClipEdge::Left(clip.x),
+        MapClipEdge::Right(clip.x + clip.width),
+        MapClipEdge::Top(clip.y),
+        MapClipEdge::Bottom(clip.y + clip.height),
+    ] {
+        polygon = clip_map_polygon(&polygon, edge);
+        if polygon.len() < 3 {
+            return;
+        }
+    }
+    if fill[3] > 0.001 {
+        for index in 1..polygon.len() - 1 {
+            push_solid_triangle(
+                builder,
+                [
+                    polygon[0].point,
+                    polygon[index].point,
+                    polygon[index + 1].point,
+                ],
+                width,
+                height,
+                fill,
+            );
+        }
+    }
+    if stroke_width > 0.0 && stroke[3] > 0.001 {
+        for index in 0..polygon.len() {
+            let start = polygon[index].point;
+            let end = polygon[(index + 1) % polygon.len()].point;
+            push_line_segment_quad(
+                builder,
+                (start[0], start[1]),
+                (end[0], end[1]),
+                stroke_width,
+                width,
+                height,
+                stroke,
+            );
+        }
+    }
 }
 
 fn push_styled_rect(

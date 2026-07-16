@@ -64,5 +64,6 @@ fn test_graph_pass(upload_bytes: u64, dirty_chunk_count: u32) -> RendererRenderG
 // Native GPU tests are grouped by renderer area while staying in this module for private helper access.
 include!("tests/document_primitives.rs");
 include!("tests/render_graph.rs");
+include!("tests/map_viewport.rs");
 include!("tests/retained_quads.rs");
 include!("tests/text_and_fonts.rs");

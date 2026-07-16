@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fjordpulse.kavik.cz/contracts/realtime/envelope.schema.json",
+  "title": "FjordPulse realtime envelope",
+  "description": "Common fields for protocol v1 browser commands and server messages. Server notifications that originate in realtime_event additionally use PersistentEventEnvelope.",
+  "$ref": "#/$defs/Envelope",
+  "$defs": {
+    "ProtocolVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "MessageId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "Scope": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 256,
+      "pattern": "^(station|vehicle):\\S+$|^focus:[^\\s:]+:\\S+$|^admin:status$"
+    },
+    "EntityId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "EventId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "EntityVersion": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Monotonic-per-entity UTC RFC3339 version used to reject duplicate and older updates."
+    },
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Error": {
+      "type": "object",
+      "required": ["code", "message", "details"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "Envelope": {
+      "type": "object",
+      "required": ["protocolVersion", "type"],
+      "properties": {
+        "protocolVersion": {
+          "$ref": "#/$defs/ProtocolVersion"
+        },
+        "id": {
+          "$ref": "#/$defs/MessageId"
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "entityId": {
+          "$ref": "#/$defs/EntityId"
+        },
+        "eventId": {
+          "$ref": "#/$defs/EventId"
+        },
+        "version": {
+          "$ref": "#/$defs/EntityVersion"
+        },
+        "createdAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "payload": true,
+        "error": {
+          "$ref": "#/$defs/Error"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClientEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Envelope"
+        },
+        {
+          "type": "object",
+          "required": ["protocolVersion", "id", "type", "payload"],
+          "properties": {
+            "scope": false,
+            "entityId": false,
+            "eventId": false,
+            "version": false,
+            "createdAt": false,
+            "error": false
+          }
+        }
+      ]
+    },
+    "ServerEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Envelope"
+        },
+        {
+          "type": "object",
+          "required": ["protocolVersion", "type", "createdAt"]
+        }
+      ]
+    },
+    "AckEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/ServerEnvelope"
+        },
+        {
+          "type": "object",
+          "required": ["id", "payload"],
+          "properties": {
+            "eventId": false,
+            "version": false,
+            "error": false
+          }
+        }
+      ]
+    },
+    "PersistentEventEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/ServerEnvelope"
+        },
+        {
+          "type": "object",
+          "required": ["scope", "entityId", "eventId", "version", "payload"],
+          "properties": {
+            "id": false,
+            "error": false
+          }
+        }
+      ]
+    },
+    "ErrorEnvelope": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/ServerEnvelope"
+        },
+        {
+          "type": "object",
+          "required": ["error"],
+          "properties": {
+            "eventId": false,
+            "version": false,
+            "payload": false
+          }
+        }
+      ]
+    }
+  },
+  "examples": [
+    {
+      "protocolVersion": 1,
+      "id": "msg_001",
+      "type": "watch_station",
+      "payload": {
+        "stationId": "NSR:StopPlace:548"
+      }
+    },
+    {
+      "protocolVersion": 1,
+      "type": "vehicle_moved",
+      "scope": "vehicle:SKY:Vehicle:12345",
+      "entityId": "SKY:Vehicle:12345",
+      "eventId": "evt_01J00000000000000000000000",
+      "version": "2026-07-10T10:00:00.123456Z",
+      "createdAt": "2026-07-10T10:00:00.123456Z",
+      "payload": {}
+    }
+  ]
+}

@@ -732,6 +732,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             Compiled(Option<crate::compile::CompileOutcome>),
             ProgramCompiled(Option<crate::compile::ProgramCompileOutcome>),
             Proof(Option<Box<ProofResult>>),
+            MapTile(Option<()>),
             Scheduled(Option<()>),
         }
         let wake = {
@@ -746,6 +747,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 }
             }
             .fuse();
+            let map_tile = product.next_map_tile_wake().fuse();
             let scheduled = deadline_scheduler.ticks.next().fuse();
             pin_mut!(
                 native,
@@ -753,6 +755,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 result,
                 program_result,
                 proof_result,
+                map_tile,
                 scheduled
             );
             select! {
@@ -761,6 +764,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 value = result => Wake::Compiled(value),
                 value = program_result => Wake::ProgramCompiled(value),
                 value = proof_result => Wake::Proof(value.map(Box::new)),
+                value = map_tile => Wake::MapTile(value),
                 value = scheduled => Wake::Scheduled(value),
             }
         };
@@ -790,6 +794,12 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                     let target_source_path = target
                         .as_ref()
                         .and_then(|target| target.source_path.clone());
+                    let (map_consumed, map_visible_changed, _map_events) =
+                        if matches!(envelope.event, HostEvent::Resize(_)) {
+                            (false, false, Vec::new())
+                        } else {
+                            product.handle_map_input(view.scene(), &envelope.event)?
+                        };
                     let mut event_dispatch_us = 0;
                     let mut executor_us = 0;
                     let mut runtime_document_us = 0;
@@ -806,6 +816,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         if let Some(model) = runtime.as_mut() {
                             converge_document_demands(model, &mut view, &mut columns)?;
                         }
+                        let _map_resize =
+                            product.handle_map_input(view.scene(), &envelope.event)?;
                         document_update_us = duration_us(started.elapsed());
                         if let Some(state) = responsive_evidence.as_mut() {
                             state.resize_started = true;
@@ -819,6 +831,8 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             ));
                         }
                         true
+                    } else if map_consumed {
+                        map_visible_changed
                     } else if let Some(model) = runtime.as_mut() {
                         let parent_generation_before = model.parent_runtime_generation();
                         let started = Instant::now();
@@ -2039,6 +2053,26 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         &mut queued_evidence_proofs,
                         &mut evidence_proof_in_flight,
                         [],
+                    )?;
+                }
+            }
+            Wake::MapTile(wake) => {
+                wake.ok_or("native map tile worker stopped")?;
+                let (map_visible_changed, _map_tile_events) = product.service_map_tiles()?;
+                if map_visible_changed && runtime.is_some() {
+                    if let Some(presented) = product.present(&mut host, &view).await? {
+                        emit_presented(&observer, &presented);
+                        latest_presented_key = Some(presented.key.clone());
+                    }
+                    send_stats(
+                        &output,
+                        &product,
+                        runtime.as_ref(),
+                        source_revision,
+                        FrameMode::Burst,
+                        compiler.replaced_count(),
+                        &mut last_stats_sent,
+                        false,
                     )?;
                 }
             }

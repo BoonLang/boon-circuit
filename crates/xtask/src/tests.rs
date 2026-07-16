@@ -50,6 +50,57 @@ fn command_parser_exposes_manifest_gates_and_fixed_tools() {
 }
 
 #[test]
+fn command_parser_accepts_strict_fjordpulse_traceability_invocations() {
+    let manifest = load_manifest(&workspace_root()).unwrap().0;
+    let reference = PathBuf::from("/tmp/FjordPulse");
+    assert_eq!(
+        parse_command(
+            &strings(&[
+                "fjordpulse-traceability",
+                "import",
+                "--reference",
+                "/tmp/FjordPulse",
+            ]),
+            &manifest,
+        )
+        .unwrap(),
+        ParsedCommand::FjordpulseTraceability {
+            action: TraceabilityAction::Import,
+            reference: reference.clone(),
+        }
+    );
+    assert_eq!(
+        parse_command(
+            &strings(&[
+                "fjordpulse-traceability",
+                "verify",
+                "--reference",
+                "/tmp/FjordPulse",
+            ]),
+            &manifest,
+        )
+        .unwrap(),
+        ParsedCommand::FjordpulseTraceability {
+            action: TraceabilityAction::Verify,
+            reference,
+        }
+    );
+    assert!(parse_command(&strings(&["fjordpulse-traceability", "import"]), &manifest,).is_err());
+    assert!(
+        parse_command(
+            &strings(&[
+                "fjordpulse-traceability",
+                "check",
+                "--reference",
+                "/tmp/FjordPulse",
+            ]),
+            &manifest,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn command_parser_accepts_only_v2_options() {
     let manifest = load_manifest(&workspace_root()).unwrap().0;
     assert_eq!(

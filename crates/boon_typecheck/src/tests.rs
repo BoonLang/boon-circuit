@@ -3,6 +3,64 @@ use super::*;
 // Typecheck tests are grouped by language surface while staying in this module for private helper access.
 include!("tests/flow_and_state.rs");
 include!("tests/functions_and_arguments.rs");
+include!("tests/fjordpulse.rs");
+include!("tests/host_ports.rs");
+include!("tests/indexed_queries.rs");
+
+#[test]
+fn outbound_http_effect_injects_recursive_intent_and_result_source_types() {
+    let parsed = boon_parser::parse_source(
+        "outbound-http-effect.bn",
+        include_str!("../../../examples/outbound_http_effect.bn"),
+    )
+    .unwrap();
+    let report = check(&parsed);
+    assert!(!report.has_errors(), "{:#?}", report.diagnostics);
+    let [effect] = report.host_effect_table.declarations.as_slice() else {
+        panic!("expected one typed outbound effect");
+    };
+    assert_eq!(effect.operation, "Http/request");
+    let path_segments = effect
+        .intent_fields
+        .iter()
+        .find(|field| field.name == "path_segments")
+        .unwrap();
+    assert_eq!(path_segments.value_type, Type::List(Box::new(Type::Text)));
+    let headers = effect
+        .intent_fields
+        .iter()
+        .find(|field| field.name == "headers")
+        .unwrap();
+    assert!(matches!(
+        &headers.value_type,
+        Type::List(item)
+            if matches!(item.as_ref(), Type::Object(shape)
+                if !shape.open
+                    && shape.fields.get("name") == Some(&Type::Text)
+                    && matches!(shape.fields.get("value"), Some(Type::Bytes(BytesType::Dynamic))))
+    ));
+    let request = report
+        .source_payload_shape_table
+        .iter()
+        .find(|source| source.source_path == "store.request")
+        .unwrap();
+    assert_eq!(request.fields.len(), 9);
+    assert!(
+        request
+            .fields
+            .iter()
+            .any(|field| { field.name == "query" && matches!(field.ty, Type::List(_)) })
+    );
+    for source in ["store.succeeded", "store.failed"] {
+        assert!(
+            report
+                .source_payload_shape_table
+                .iter()
+                .find(|entry| entry.source_path == source)
+                .is_some_and(|entry| !entry.fields.is_empty())
+        );
+    }
+}
 
 fn passkey_effect_fixture() -> ParsedProgram {
     boon_parser::parse_source(
@@ -52,6 +110,60 @@ effects: [
 "#,
     )
     .unwrap()
+}
+
+#[test]
+fn source_named_events_owns_its_payload_independently_from_siblings() {
+    let parsed = boon_parser::parse_source(
+        "nested-source-events-collision.bn",
+        r#"
+store: [
+    controls: [
+        admin: [
+            status: SOURCE
+            events: SOURCE
+        ]
+    ]
+
+    page:
+        Public |> HOLD page {
+            LATEST {
+                controls.admin.status.event.press |> THEN { Status }
+                controls.admin.events.event.press |> THEN { Events }
+            }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+
+    assert!(
+        !report.has_errors(),
+        "unexpected diagnostics: {:?}",
+        report.diagnostics
+    );
+    for source_path in ["store.controls.admin.status", "store.controls.admin.events"] {
+        let shape = report
+            .source_payload_shape_table
+            .iter()
+            .find(|shape| shape.source_path == source_path)
+            .unwrap_or_else(|| panic!("missing payload shape for {source_path}"));
+        assert_eq!(
+            shape
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["press"]
+        );
+    }
+    assert!(
+        !report
+            .source_payload_shape_table
+            .iter()
+            .any(|shape| shape.source_path == "store.controls.admin")
+    );
 }
 
 #[test]

@@ -15,12 +15,12 @@ fn source_payload_schema_row_lookup_field_uses_generic_name() {
 #[test]
 fn press_payload_fields_are_bool_typed() {
     assert_eq!(
-        source_payload_value_type(&SourcePayloadField::Named("press".to_owned())),
-        SourcePayloadValueType::Bool
+        source_payload_data_type(&SourcePayloadField::Named("press".to_owned())),
+        SemanticDataType::Bool
     );
     assert_eq!(
-        source_payload_value_type(&SourcePayloadField::Named("pointer_x".to_owned())),
-        SourcePayloadValueType::Text
+        source_payload_data_type(&SourcePayloadField::Named("pointer_x".to_owned())),
+        SemanticDataType::Text
     );
 }
 
@@ -231,6 +231,88 @@ fn event_press_pulse_is_not_payload_guard_field() {
 }
 
 #[test]
+fn source_named_events_keeps_distinct_payload_and_view_bindings() {
+    let source = r#"
+store: [
+    controls: [
+        admin: [
+            status: SOURCE
+            events: SOURCE
+        ]
+    ]
+
+    page:
+        Public |> HOLD page {
+            LATEST {
+                controls.admin.status.event.press |> THEN { Status }
+                controls.admin.events.event.press |> THEN { Events }
+            }
+        }
+]
+
+scene: Scene/new(
+    root: Scene/Element/stripe(
+        element: []
+        direction: Row
+        gap: 4
+        style: [width: Fill, height: Fill]
+        items: LIST {
+            Scene/Element/button(
+                element: [event: [press: SOURCE]]
+                style: [width: 80, height: 40]
+                label: TEXT { Status }
+            ) |> SOURCE { store.controls.admin.status }
+            Scene/Element/button(
+                element: [event: [press: SOURCE]]
+                style: [width: 80, height: 40]
+                label: TEXT { Events }
+            ) |> SOURCE { store.controls.admin.events }
+        }
+    )
+)
+"#;
+    let parsed = boon_parser::parse_source("nested-source-events-collision.bn", source).unwrap();
+    let ir = lower(&parsed).expect("source names must not collide with event payload markers");
+
+    assert_eq!(
+        ir.sources
+            .iter()
+            .map(|source| source.path.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "store.controls.admin.events",
+            "store.controls.admin.status",
+        ])
+    );
+    for source_path in [
+        "store.controls.admin.status",
+        "store.controls.admin.events",
+    ] {
+        let source = ir
+            .sources
+            .iter()
+            .find(|source| source.path == source_path)
+            .unwrap_or_else(|| panic!("missing source {source_path}"));
+        assert!(
+            source
+                .payload_schema
+                .fields
+                .contains(&SourcePayloadField::Named("press".to_owned())),
+            "missing press payload for {source_path}: {:?}",
+            source.payload_schema
+        );
+        assert!(ir
+            .update_branches
+            .iter()
+            .any(|branch| branch.source == source_path && branch.target == "store.page"));
+        assert!(ir
+            .view_bindings
+            .iter()
+            .any(|binding| binding.path == source_path && binding.source_id == Some(source.id)));
+    }
+}
+
+#[test]
 fn inline_match_over_event_derived_value_lowers_to_static_update() {
     let source = r#"
 store: [
@@ -425,8 +507,66 @@ store: [
     );
     assert_eq!(
         rows[1].fields[1].value,
-        InitialValue::Number { value: 9 }
+        InitialValue::Number {
+            value: "9".to_owned()
+        }
     );
+}
+
+#[test]
+fn pure_record_functions_initialize_recursive_list_rows() {
+    let parsed = boon_parser::parse_source(
+        "function-list-initializer.bn",
+        r#"
+store: [
+    places: LIST {
+        place(id: TEXT { alpha }, name: TEXT { Alpha }, x: 1.5, y: 2.5)
+        place(id: TEXT { beta }, name: TEXT { Beta }, x: 3.5, y: 4.5)
+    }
+]
+
+FUNCTION point(x, y) {
+    [x: x, y: y]
+}
+
+FUNCTION place(id, name, x, y) {
+    [
+        id: id
+        name: name
+        point: point(x: x, y: y)
+    ]
+}
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).unwrap();
+    let places = ir.lists.iter().find(|list| list.name == "places").unwrap();
+    let ListInitializer::RecordLiteral { rows } = &places.initializer else {
+        panic!("function-built records must be authoritative rows");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0]
+            .fields
+            .iter()
+            .find(|field| field.name == "name")
+            .unwrap()
+            .value,
+        InitialValue::Text {
+            value: "Alpha".to_owned(),
+        }
+    );
+    assert!(matches!(
+        &rows[0]
+            .fields
+            .iter()
+            .find(|field| field.name == "point")
+            .unwrap()
+            .value,
+        InitialValue::Data {
+            value: boon_data::Value::Record(fields),
+        } if fields.len() == 2
+    ));
 }
 
 #[test]

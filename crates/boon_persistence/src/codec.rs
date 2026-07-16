@@ -13,9 +13,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 4;
-const APPLICATION_TRANSFER_FORMAT: u32 = 2;
-const CHECKPOINT_BATCH_FORMAT: u32 = 3;
+const RESTORE_IMAGE_FORMAT: u32 = 5;
+const APPLICATION_TRANSFER_FORMAT: u32 = 3;
+const CHECKPOINT_BATCH_FORMAT: u32 = 4;
 const OUTBOX_RECORD_FORMAT: u32 = 2;
 const BLOB_RECORD_FORMAT: u32 = 1;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
@@ -144,7 +144,7 @@ pub fn decode_restore_image(
     let format = decoder.u32().map_err(decode_error)?;
     if !matches!(
         (format, root_len),
-        (1, 9) | (3, 10) | (RESTORE_IMAGE_FORMAT, 11)
+        (1, 9) | (3, 10) | (4, 11) | (RESTORE_IMAGE_FORMAT, 11)
     ) {
         return Err(CodecError::new(format!(
             "unsupported restore image format {format} with {root_len} fields"
@@ -260,7 +260,7 @@ pub fn decode_application_transfer(
         "application transfer",
     )?;
     let format = decoder.u32().map_err(decode_error)?;
-    if format != APPLICATION_TRANSFER_FORMAT || root_len != 3 {
+    if !matches!(format, 2 | APPLICATION_TRANSFER_FORMAT) || root_len != 3 {
         return Err(CodecError::new(format!(
             "unsupported application transfer format {format} with {root_len} fields"
         )));
@@ -370,7 +370,10 @@ pub fn decode_checkpoint_batch(
     let mut decoder = Decoder::new(bytes);
     let root_len = definite_len(decoder.array().map_err(decode_error)?, "checkpoint batch")?;
     let format = decoder.u32().map_err(decode_error)?;
-    if !matches!((format, root_len), (2, 10) | (CHECKPOINT_BATCH_FORMAT, 11)) {
+    if !matches!(
+        (format, root_len),
+        (2, 10) | (3, 11) | (CHECKPOINT_BATCH_FORMAT, 11)
+    ) {
         return Err(CodecError::new(format!(
             "unsupported checkpoint batch format {format} with {root_len} fields"
         )));
@@ -1359,8 +1362,8 @@ fn encode_component_value(
         StoredValue::Number(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(2))
-                .and_then(|encoder| encoder.i64(*value))
+                .and_then(|encoder| encoder.u8(10))
+                .and_then(|encoder| encoder.f64(value.get()))
                 .map_err(encode_error)?;
         }
         StoredValue::Text(value) => {
@@ -1441,7 +1444,14 @@ fn decode_component_value(
     match (tag, len) {
         (0, 1) => Ok(StoredValue::Null),
         (1, 2) => Ok(StoredValue::Bool(decoder.bool().map_err(decode_error)?)),
-        (2, 2) => Ok(StoredValue::Number(decoder.i64().map_err(decode_error)?)),
+        (2, 2) => Ok(StoredValue::Number(
+            boon_data::FiniteReal::from_i64_exact(decoder.i64().map_err(decode_error)?)
+                .map_err(|error| CodecError::new(error.to_string()))?,
+        )),
+        (10, 2) => Ok(StoredValue::Number(
+            boon_data::FiniteReal::new(decoder.f64().map_err(decode_error)?)
+                .map_err(|error| CodecError::new(error.to_string()))?,
+        )),
         (3, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
         (4, 2) => {
             let bytes = decoder.bytes().map_err(decode_error)?;
@@ -1551,8 +1561,8 @@ fn encode_value(
         StoredValue::Number(value) => {
             encoder
                 .array(2)
-                .and_then(|encoder| encoder.u8(2))
-                .and_then(|encoder| encoder.i64(*value))
+                .and_then(|encoder| encoder.u8(10))
+                .and_then(|encoder| encoder.f64(value.get()))
                 .map_err(encode_error)?;
         }
         StoredValue::Text(value) => {
@@ -1619,7 +1629,14 @@ fn decode_value(
     match (tag, len) {
         (0, 1) => Ok(StoredValue::Null),
         (1, 2) => Ok(StoredValue::Bool(decoder.bool().map_err(decode_error)?)),
-        (2, 2) => Ok(StoredValue::Number(decoder.i64().map_err(decode_error)?)),
+        (2, 2) => Ok(StoredValue::Number(
+            boon_data::FiniteReal::from_i64_exact(decoder.i64().map_err(decode_error)?)
+                .map_err(|error| CodecError::new(error.to_string()))?,
+        )),
+        (10, 2) => Ok(StoredValue::Number(
+            boon_data::FiniteReal::new(decoder.f64().map_err(decode_error)?)
+                .map_err(|error| CodecError::new(error.to_string()))?,
+        )),
         (3, 2) => Ok(StoredValue::Text(decode_text(decoder, limits)?)),
         (4, 2) => {
             let bytes = decoder.bytes().map_err(decode_error)?;
@@ -1753,7 +1770,12 @@ fn decode_error<E: fmt::Display>(error: E) -> CodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_data::FiniteReal;
     use boon_plan::{MemoryKind, MemoryOwnerPath};
+
+    fn number(value: i64) -> StoredValue {
+        StoredValue::integer(value).unwrap()
+    }
 
     fn memory(name: &str) -> MemoryId {
         MemoryId::from_identity(
@@ -1773,10 +1795,30 @@ mod tests {
             EffectInvocationId::from_semantic_route(effect, "test.send", "store.result").unwrap(),
             effect,
             StoredValue::Text("stable-key".to_owned()),
-            StoredValue::Number(42),
+            number(42),
             None,
             turn_sequence,
         )
+    }
+
+    #[test]
+    fn old_integer_number_decodes_and_reencodes_as_canonical_float_number() {
+        let mut old_bytes = Vec::new();
+        Encoder::new(&mut old_bytes)
+            .array(2)
+            .and_then(|encoder| encoder.u8(2))
+            .and_then(|encoder| encoder.i64(42))
+            .unwrap();
+        let decoded =
+            decode_value(&mut Decoder::new(&old_bytes), DecodeLimits::default(), 0).unwrap();
+        assert_eq!(decoded, number(42));
+
+        let mut canonical = Vec::new();
+        encode_value(&mut Encoder::new(&mut canonical), &decoded, 0).unwrap();
+        let mut decoder = Decoder::new(&canonical);
+        assert_eq!(decoder.array().unwrap(), Some(2));
+        assert_eq!(decoder.u8().unwrap(), 10);
+        assert_eq!(decoder.f64().unwrap(), 42.0);
     }
 
     #[test]
@@ -1793,8 +1835,12 @@ mod tests {
             StoredScalar {
                 touched: true,
                 value: StoredValue::Record(BTreeMap::from([
-                    ("a".to_owned(), StoredValue::Number(3)),
+                    ("a".to_owned(), number(3)),
                     ("b".to_owned(), StoredValue::Text("text".to_owned())),
+                    (
+                        "c".to_owned(),
+                        StoredValue::Number(FiniteReal::new(59.91).unwrap()),
+                    ),
                 ])),
             },
         );
@@ -1932,7 +1978,7 @@ mod tests {
                 memory_id: memory("value"),
                 value: StoredScalar {
                     touched: true,
-                    value: StoredValue::Number(1),
+                    value: number(1),
                 },
             }],
             outbox_changes: vec![DurableOutboxChange::Enqueue { item }],

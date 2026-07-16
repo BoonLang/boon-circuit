@@ -1,15 +1,18 @@
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
-    DocumentPatch, EmbeddedProgramDescriptor, EmbeddedProgramSourceUnit, MaterializedRange,
-    ProgramArtifactRetention, ProgramCapabilityProfile, SourceBinding, SourceBindingId, StyleMap,
-    StylePatch, StyleValue, TextInputFocusRequest, TextInputId, TextValue,
+    DocumentPatch, EmbeddedProgramDescriptor, EmbeddedProgramSourceUnit, MapCamera, MapCoordinate,
+    MapHitIdentity, MapInteractionPolicy, MapOverlayDescriptor, MapOverlayGeometry, MapOverlayId,
+    MapOverlayPaint, MapTileSourceId, MapTileSourceRef, MapViewportBounds, MapViewportDescriptor,
+    MapViewportGeneration, MaterializedRange, ProgramArtifactRetention, ProgramCapabilityProfile,
+    SourceBinding, SourceBindingId, StyleMap, StylePatch, StyleValue, TextInputFocusRequest,
+    TextInputId, TextValue,
 };
 use boon_plan::{
     DocumentArgumentRole, DocumentBuiltin, DocumentConstantId, DocumentConstantValue,
     DocumentConstructor, DocumentExprId, DocumentExprOp, DocumentFunctionId,
     DocumentMaterialization, DocumentMaterializationId, DocumentMaterializationSource,
     DocumentNameId, DocumentPattern, DocumentRead, DocumentScalarOp, DocumentTemplateId, FieldId,
-    ListId, MachinePlan, ScopeId, SourceId,
+    FiniteReal, ListId, MachinePlan, ScopeId, SourceId,
 };
 use boon_plan_executor::{Delta, RowId, Session, Value, ValueTarget};
 use std::collections::{BTreeMap, BTreeSet};
@@ -820,6 +823,14 @@ impl DocumentRuntime {
         node.parent = retained.parent.clone();
         if let Some(row) = retained.row {
             insert_row_identity(&mut node, row);
+        }
+        if retained.kind == DocumentNodeKind::MapViewport {
+            node.map_viewport = Some(Box::new(evaluate_map_viewport_descriptor(
+                retained
+                    .arguments
+                    .iter()
+                    .map(|argument| (argument.role, argument.value.clone())),
+            )?));
         }
         for argument in &retained.arguments {
             apply_argument(
@@ -1754,7 +1765,7 @@ impl<'a> Evaluator<'a> {
         match value {
             Value::Null => EvalValue::Null,
             Value::Bool(value) => EvalValue::Bool(value),
-            Value::Number(value) => EvalValue::Number(value as f64),
+            Value::Number(value) => EvalValue::Number(value.get()),
             Value::Text(value) => EvalValue::Text(value),
             Value::Bytes(value) => EvalValue::Bytes(value),
             Value::List(values) => {
@@ -2271,6 +2282,13 @@ impl<'a> Evaluator<'a> {
         if let Some(row) = row {
             insert_row_identity(&mut node, row);
         }
+        if node.kind == DocumentNodeKind::MapViewport {
+            node.map_viewport = Some(Box::new(evaluate_map_viewport_descriptor(
+                evaluated
+                    .iter()
+                    .map(|argument| (argument.role, argument.value.clone())),
+            )?));
+        }
         let mut retained_arguments = Vec::new();
         for argument in evaluated {
             self.apply_argument(
@@ -2544,7 +2562,14 @@ fn apply_argument(
         }
         DocumentArgumentRole::EventBindings => attach_sources(node, &runtime.routes, &value, row),
         DocumentArgumentRole::Value => apply_value_argument(node, name, value),
-        DocumentArgumentRole::Child | DocumentArgumentRole::Children => {}
+        DocumentArgumentRole::Child
+        | DocumentArgumentRole::Children
+        | DocumentArgumentRole::MapCamera
+        | DocumentArgumentRole::MapBounds
+        | DocumentArgumentRole::MapTileSource
+        | DocumentArgumentRole::MapOverlays
+        | DocumentArgumentRole::MapInteraction
+        | DocumentArgumentRole::MapGeneration => {}
     }
     Ok(())
 }
@@ -2558,6 +2583,12 @@ fn retained_argument_role(role: DocumentArgumentRole) -> bool {
             | DocumentArgumentRole::DynamicText
             | DocumentArgumentRole::EventBindings
             | DocumentArgumentRole::Value
+            | DocumentArgumentRole::MapCamera
+            | DocumentArgumentRole::MapBounds
+            | DocumentArgumentRole::MapTileSource
+            | DocumentArgumentRole::MapOverlays
+            | DocumentArgumentRole::MapInteraction
+            | DocumentArgumentRole::MapGeneration
     )
 }
 
@@ -2678,15 +2709,7 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
     match value {
         EvalValue::Null => Some(Value::Null),
         EvalValue::Bool(value) => Some(Value::Bool(*value)),
-        EvalValue::Number(value)
-            if value.is_finite()
-                && value.fract() == 0.0
-                && *value >= i64::MIN as f64
-                && *value <= i64::MAX as f64 =>
-        {
-            Some(Value::Number(*value as i64))
-        }
-        EvalValue::Number(_) => None,
+        EvalValue::Number(value) => FiniteReal::new(*value).ok().map(Value::Number),
         EvalValue::Text(value) | EvalValue::Enum(value) => Some(Value::Text(value.clone())),
         EvalValue::Bytes(value) => Some(Value::Bytes(value.clone())),
         EvalValue::Record(fields) => fields
@@ -2964,6 +2987,8 @@ fn eval_builtin(
             let value = first.number().unwrap_or(0.0).abs() as u64;
             EvalValue::Number((u64::BITS - value.leading_zeros()) as f64)
         }
+        DocumentBuiltin::NumberCeil => EvalValue::Number(first.number().unwrap_or(0.0).ceil()),
+        DocumentBuiltin::NumberFloor => EvalValue::Number(first.number().unwrap_or(0.0).floor()),
         DocumentBuiltin::NumberInterpolate => first,
         DocumentBuiltin::NumberMax => EvalValue::Number(
             std::iter::once(first.number().unwrap_or(0.0))
@@ -2979,6 +3004,8 @@ fn eval_builtin(
         | DocumentBuiltin::NumberProjectTime
         | DocumentBuiltin::NumberProjectWidth
         | DocumentBuiltin::NumberToText => EvalValue::Text(first.text()),
+        DocumentBuiltin::NumberRound => EvalValue::Number(first.number().unwrap_or(0.0).round()),
+        DocumentBuiltin::NumberTruncate => EvalValue::Number(first.number().unwrap_or(0.0).trunc()),
         DocumentBuiltin::TextAllCharsIn => {
             let allowed = values.next().unwrap_or(EvalValue::Null).text();
             EvalValue::Bool(
@@ -3091,6 +3118,9 @@ fn constructor_kind(constructor: DocumentConstructor, direction: Option<&str>) -
         }
         DocumentConstructor::ElementEmbeddedMedia
         | DocumentConstructor::SceneElementEmbeddedMedia => DocumentNodeKind::EmbeddedMedia,
+        DocumentConstructor::ElementMap | DocumentConstructor::SceneElementMap => {
+            DocumentNodeKind::MapViewport
+        }
         DocumentConstructor::ElementContainer
         | DocumentConstructor::SceneElementBlock
         | DocumentConstructor::DocumentNew
@@ -3273,6 +3303,396 @@ fn embedded_program_source_units(value: &EvalValue) -> Vec<EmbeddedProgramSource
             }
         })
         .collect()
+}
+
+fn evaluate_map_viewport_descriptor(
+    arguments: impl IntoIterator<Item = (DocumentArgumentRole, EvalValue)>,
+) -> Result<MapViewportDescriptor, DocumentError> {
+    let mut camera = None;
+    let mut bounds = None;
+    let mut tile_source = None;
+    let mut overlays = None;
+    let mut interaction = None;
+    let mut generation = None;
+    for (role, value) in arguments {
+        match role {
+            DocumentArgumentRole::MapCamera => {
+                set_map_descriptor_part(&mut camera, map_camera(&value)?, "camera")?
+            }
+            DocumentArgumentRole::MapBounds => {
+                set_map_descriptor_part(&mut bounds, map_bounds(&value)?, "bounds")?
+            }
+            DocumentArgumentRole::MapTileSource => {
+                set_map_descriptor_part(&mut tile_source, map_tile_source(&value)?, "tile_source")?
+            }
+            DocumentArgumentRole::MapOverlays => {
+                set_map_descriptor_part(&mut overlays, map_overlays(&value)?, "overlays")?
+            }
+            DocumentArgumentRole::MapInteraction => {
+                set_map_descriptor_part(&mut interaction, map_interaction(&value)?, "interaction")?
+            }
+            DocumentArgumentRole::MapGeneration => set_map_descriptor_part(
+                &mut generation,
+                MapViewportGeneration(map_u64(&value, "generation")?),
+                "generation",
+            )?,
+            _ => {}
+        }
+    }
+    let descriptor = MapViewportDescriptor {
+        generation: generation.unwrap_or_default(),
+        camera: required_map_descriptor_part(camera, "camera")?,
+        bounds: required_map_descriptor_part(bounds, "bounds")?,
+        tile_source: required_map_descriptor_part(tile_source, "tile_source")?,
+        overlays: required_map_descriptor_part(overlays, "overlays")?,
+        interaction: required_map_descriptor_part(interaction, "interaction")?,
+    };
+    descriptor
+        .validate()
+        .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
+    Ok(descriptor)
+}
+
+fn set_map_descriptor_part<T>(
+    target: &mut Option<T>,
+    value: T,
+    path: &str,
+) -> Result<(), DocumentError> {
+    if target.replace(value).is_some() {
+        return Err(map_evaluation_error(
+            path,
+            "constructor argument is supplied more than once",
+        ));
+    }
+    Ok(())
+}
+
+fn required_map_descriptor_part<T>(value: Option<T>, path: &str) -> Result<T, DocumentError> {
+    value.ok_or_else(|| map_evaluation_error(path, "constructor argument is missing"))
+}
+
+fn map_camera(value: &EvalValue) -> Result<MapCamera, DocumentError> {
+    let fields = map_record(value, "camera")?;
+    Ok(MapCamera {
+        longitude: map_required_number(fields, "camera", "longitude")?,
+        latitude: map_required_number(fields, "camera", "latitude")?,
+        zoom: map_required_number(fields, "camera", "zoom")?,
+        bearing: map_required_number(fields, "camera", "bearing")?,
+    })
+}
+
+fn map_bounds(value: &EvalValue) -> Result<MapViewportBounds, DocumentError> {
+    let fields = map_record(value, "bounds")?;
+    Ok(MapViewportBounds {
+        width: map_required_number(fields, "bounds", "width")?,
+        height: map_required_number(fields, "bounds", "height")?,
+        scale: map_required_number(fields, "bounds", "scale")?,
+    })
+}
+
+fn map_tile_source(value: &EvalValue) -> Result<MapTileSourceRef, DocumentError> {
+    let fields = map_record(value, "tile_source")?;
+    let allowed_origins = map_list(
+        map_required_field(fields, "tile_source", "allowed_origins")?,
+        "tile_source.allowed_origins",
+    )?
+    .iter()
+    .enumerate()
+    .map(|(index, origin)| map_text(origin, &format!("tile_source.allowed_origins[{index}]")))
+    .collect::<Result<Vec<_>, _>>()?;
+    Ok(MapTileSourceRef {
+        id: MapTileSourceId(map_required_text(fields, "tile_source", "id")?),
+        url_template_capability: map_required_text(
+            fields,
+            "tile_source",
+            "url_template_capability",
+        )?,
+        min_zoom: map_u8(
+            map_required_field(fields, "tile_source", "min_zoom")?,
+            "tile_source.min_zoom",
+        )?,
+        max_zoom: map_u8(
+            map_required_field(fields, "tile_source", "max_zoom")?,
+            "tile_source.max_zoom",
+        )?,
+        tile_size: map_u16(
+            map_required_field(fields, "tile_source", "tile_size")?,
+            "tile_source.tile_size",
+        )?,
+        attribution: map_required_text(fields, "tile_source", "attribution")?,
+        allowed_origins,
+    })
+}
+
+fn map_interaction(value: &EvalValue) -> Result<MapInteractionPolicy, DocumentError> {
+    let fields = map_record(value, "interaction")?;
+    Ok(MapInteractionPolicy {
+        pan: map_required_bool(fields, "interaction", "pan")?,
+        wheel_zoom: map_required_bool(fields, "interaction", "wheel_zoom")?,
+        pinch_zoom: map_required_bool(fields, "interaction", "pinch_zoom")?,
+        keyboard_zoom: map_required_bool(fields, "interaction", "keyboard_zoom")?,
+    })
+}
+
+fn map_overlays(value: &EvalValue) -> Result<Vec<MapOverlayDescriptor>, DocumentError> {
+    map_list(value, "overlays")?
+        .iter()
+        .enumerate()
+        .map(|(index, overlay)| map_overlay(overlay, index))
+        .collect()
+}
+
+fn map_overlay(value: &EvalValue, index: usize) -> Result<MapOverlayDescriptor, DocumentError> {
+    let path = format!("overlays[{index}]");
+    let EvalValue::Tagged(kind, fields) = value else {
+        return Err(map_evaluation_error(
+            &path,
+            "must be a Point, Cluster, Polyline, Polygon, or Label tagged record",
+        ));
+    };
+    let paint = fields
+        .get("paint")
+        .map(|paint| map_overlay_paint(paint, &format!("{path}.paint")))
+        .transpose()?
+        .unwrap_or_default();
+    let geometry = match kind.as_str() {
+        "Point" => MapOverlayGeometry::Point {
+            position: map_required_coordinate(fields, &path, "position")?,
+            radius: map_required_number(fields, &path, "radius")?,
+            symbol_ref: fields
+                .get("symbol_ref")
+                .map(|value| map_text(value, &format!("{path}.symbol_ref")))
+                .transpose()?,
+        },
+        "Cluster" => MapOverlayGeometry::Cluster {
+            position: map_required_coordinate(fields, &path, "position")?,
+            count: map_u64(
+                map_required_field(fields, &path, "count")?,
+                &format!("{path}.count"),
+            )?,
+            radius: map_required_number(fields, &path, "radius")?,
+        },
+        "Polyline" => MapOverlayGeometry::Polyline {
+            points: map_coordinate_list(
+                map_required_field(fields, &path, "points")?,
+                &format!("{path}.points"),
+            )?,
+        },
+        "Polygon" => {
+            let rings_path = format!("{path}.rings");
+            let rings = map_list(map_required_field(fields, &path, "rings")?, &rings_path)?
+                .iter()
+                .enumerate()
+                .map(|(ring_index, ring)| {
+                    map_coordinate_list(ring, &format!("{rings_path}[{ring_index}]"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            MapOverlayGeometry::Polygon { rings }
+        }
+        "Label" => MapOverlayGeometry::Label {
+            position: map_required_coordinate(fields, &path, "position")?,
+            text: map_required_text(fields, &path, "text")?,
+            collision_priority: map_i32(
+                map_required_field(fields, &path, "collision_priority")?,
+                &format!("{path}.collision_priority"),
+            )?,
+            font_size: map_required_number(fields, &path, "font_size")?,
+        },
+        other => {
+            return Err(map_evaluation_error(
+                &path,
+                format!("has unsupported overlay kind `{other}`"),
+            ));
+        }
+    };
+    Ok(MapOverlayDescriptor {
+        id: MapOverlayId(map_required_text(fields, &path, "id")?),
+        hit_identity: MapHitIdentity(map_required_text(fields, &path, "hit_identity")?),
+        z_order: map_i32(
+            map_required_field(fields, &path, "z_order")?,
+            &format!("{path}.z_order"),
+        )?,
+        selected: map_required_bool(fields, &path, "selected")?,
+        focused: fields
+            .get("focused")
+            .map(|value| map_bool(value, &format!("{path}.focused")))
+            .transpose()?
+            .unwrap_or(false),
+        paint,
+        geometry,
+    })
+}
+
+fn map_overlay_paint(value: &EvalValue, path: &str) -> Result<MapOverlayPaint, DocumentError> {
+    let fields = map_record(value, path)?;
+    Ok(MapOverlayPaint {
+        fill: fields
+            .get("fill")
+            .map(|value| map_text(value, &format!("{path}.fill")))
+            .transpose()?,
+        stroke: fields
+            .get("stroke")
+            .map(|value| map_text(value, &format!("{path}.stroke")))
+            .transpose()?,
+        stroke_width: fields
+            .get("stroke_width")
+            .map(|value| map_number(value, &format!("{path}.stroke_width")))
+            .transpose()?
+            .unwrap_or(1.0),
+        opacity: fields
+            .get("opacity")
+            .map(|value| map_number(value, &format!("{path}.opacity")))
+            .transpose()?
+            .unwrap_or(1.0),
+    })
+}
+
+fn map_required_coordinate(
+    fields: &BTreeMap<String, EvalValue>,
+    path: &str,
+    name: &str,
+) -> Result<MapCoordinate, DocumentError> {
+    map_coordinate(
+        map_required_field(fields, path, name)?,
+        &format!("{path}.{name}"),
+    )
+}
+
+fn map_coordinate(value: &EvalValue, path: &str) -> Result<MapCoordinate, DocumentError> {
+    let fields = map_record(value, path)?;
+    Ok(MapCoordinate {
+        longitude: map_required_number(fields, path, "longitude")?,
+        latitude: map_required_number(fields, path, "latitude")?,
+    })
+}
+
+fn map_coordinate_list(value: &EvalValue, path: &str) -> Result<Vec<MapCoordinate>, DocumentError> {
+    map_list(value, path)?
+        .iter()
+        .enumerate()
+        .map(|(index, coordinate)| map_coordinate(coordinate, &format!("{path}[{index}]")))
+        .collect()
+}
+
+fn map_record<'a>(
+    value: &'a EvalValue,
+    path: &str,
+) -> Result<&'a BTreeMap<String, EvalValue>, DocumentError> {
+    record_fields(value).ok_or_else(|| map_evaluation_error(path, "must be a record"))
+}
+
+fn map_list<'a>(value: &'a EvalValue, path: &str) -> Result<&'a [EvalValue], DocumentError> {
+    match value {
+        EvalValue::List(values) => Ok(values),
+        _ => Err(map_evaluation_error(path, "must be a list")),
+    }
+}
+
+fn map_required_field<'a>(
+    fields: &'a BTreeMap<String, EvalValue>,
+    path: &str,
+    name: &str,
+) -> Result<&'a EvalValue, DocumentError> {
+    fields
+        .get(name)
+        .ok_or_else(|| map_evaluation_error(format!("{path}.{name}"), "field is missing"))
+}
+
+fn map_required_number(
+    fields: &BTreeMap<String, EvalValue>,
+    path: &str,
+    name: &str,
+) -> Result<f64, DocumentError> {
+    map_number(
+        map_required_field(fields, path, name)?,
+        &format!("{path}.{name}"),
+    )
+}
+
+fn map_required_text(
+    fields: &BTreeMap<String, EvalValue>,
+    path: &str,
+    name: &str,
+) -> Result<String, DocumentError> {
+    map_text(
+        map_required_field(fields, path, name)?,
+        &format!("{path}.{name}"),
+    )
+}
+
+fn map_required_bool(
+    fields: &BTreeMap<String, EvalValue>,
+    path: &str,
+    name: &str,
+) -> Result<bool, DocumentError> {
+    map_bool(
+        map_required_field(fields, path, name)?,
+        &format!("{path}.{name}"),
+    )
+}
+
+fn map_number(value: &EvalValue, path: &str) -> Result<f64, DocumentError> {
+    match value {
+        EvalValue::Number(value) => Ok(*value),
+        _ => Err(map_evaluation_error(path, "must be a number")),
+    }
+}
+
+fn map_text(value: &EvalValue, path: &str) -> Result<String, DocumentError> {
+    match value {
+        EvalValue::Text(value) | EvalValue::Enum(value) => Ok(value.clone()),
+        _ => Err(map_evaluation_error(path, "must be text")),
+    }
+}
+
+fn map_bool(value: &EvalValue, path: &str) -> Result<bool, DocumentError> {
+    match value {
+        EvalValue::Bool(value) => Ok(*value),
+        _ => Err(map_evaluation_error(path, "must be a boolean")),
+    }
+}
+
+fn map_u8(value: &EvalValue, path: &str) -> Result<u8, DocumentError> {
+    map_integral_number(value, path, 0.0, f64::from(u8::MAX)).map(|value| value as u8)
+}
+
+fn map_u16(value: &EvalValue, path: &str) -> Result<u16, DocumentError> {
+    map_integral_number(value, path, 0.0, f64::from(u16::MAX)).map(|value| value as u16)
+}
+
+fn map_u64(value: &EvalValue, path: &str) -> Result<u64, DocumentError> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    map_integral_number(value, path, 0.0, MAX_SAFE_INTEGER).map(|value| value as u64)
+}
+
+fn map_i32(value: &EvalValue, path: &str) -> Result<i32, DocumentError> {
+    map_integral_number(value, path, f64::from(i32::MIN), f64::from(i32::MAX))
+        .map(|value| value as i32)
+}
+
+fn map_integral_number(
+    value: &EvalValue,
+    path: &str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<f64, DocumentError> {
+    let value = map_number(value, path)?;
+    if value.is_finite() && value.fract() == 0.0 && value >= minimum && value <= maximum {
+        Ok(value)
+    } else {
+        Err(map_evaluation_error(
+            path,
+            format!("must be an integer within {minimum}..={maximum}"),
+        ))
+    }
+}
+
+fn map_evaluation_error(path: impl AsRef<str>, message: impl AsRef<str>) -> DocumentError {
+    DocumentError::Evaluation(format!(
+        "MapViewport {}: {}",
+        path.as_ref(),
+        message.as_ref()
+    ))
 }
 
 fn lower_style_record(record: &BTreeMap<String, EvalValue>, style: &mut StyleMap) {
@@ -3886,6 +4306,7 @@ fn diff_node(previous: &DocumentNode, next: &DocumentNode) -> Vec<DocumentPatch>
         || previous.parent != next.parent
         || previous.children != next.children
         || previous.materialized != next.materialized
+        || previous.map_viewport != next.map_viewport
     {
         return vec![DocumentPatch::UpsertNode(next.clone())];
     }
@@ -4012,6 +4433,7 @@ pub(crate) fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec
         if previous_node.kind != next_node.kind
             || previous_node.parent != next_node.parent
             || previous_node.materialized != next_node.materialized
+            || previous_node.map_viewport != next_node.map_viewport
         {
             patches.push(DocumentPatch::UpsertNode(next_node.clone()));
             continue;
@@ -4110,6 +4532,233 @@ fn diff_style(previous: &StyleMap, next: &StyleMap) -> StylePatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn map_descriptor(generation: u64, longitude: f64) -> MapViewportDescriptor {
+        MapViewportDescriptor {
+            generation: MapViewportGeneration(generation),
+            camera: MapCamera {
+                longitude,
+                latitude: 0.0,
+                zoom: 2.0,
+                bearing: 0.0,
+            },
+            bounds: MapViewportBounds {
+                width: 512.0,
+                height: 320.0,
+                scale: 1.0,
+            },
+            tile_source: MapTileSourceRef {
+                id: MapTileSourceId("runtime-fixture".to_owned()),
+                url_template_capability: "fixture_xyz".to_owned(),
+                min_zoom: 0,
+                max_zoom: 6,
+                tile_size: 256,
+                attribution: "Runtime fixture".to_owned(),
+                allowed_origins: vec!["boon-local://runtime-map".to_owned()],
+            },
+            interaction: MapInteractionPolicy::default(),
+            overlays: Vec::new(),
+        }
+    }
+
+    fn eval_record<const N: usize>(fields: [(&str, EvalValue); N]) -> EvalValue {
+        EvalValue::Record(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
+        )
+    }
+
+    fn eval_position(longitude: f64, latitude: f64) -> EvalValue {
+        eval_record([
+            ("longitude", EvalValue::Number(longitude)),
+            ("latitude", EvalValue::Number(latitude)),
+        ])
+    }
+
+    fn eval_overlay(
+        kind: &str,
+        id: &str,
+        geometry: impl IntoIterator<Item = (&'static str, EvalValue)>,
+    ) -> EvalValue {
+        let mut fields = BTreeMap::from([
+            ("id".to_owned(), EvalValue::Text(id.to_owned())),
+            (
+                "hit_identity".to_owned(),
+                EvalValue::Text(format!("hit-{id}")),
+            ),
+            ("z_order".to_owned(), EvalValue::Number(3.0)),
+            ("selected".to_owned(), EvalValue::Bool(false)),
+        ]);
+        fields.extend(
+            geometry
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value)),
+        );
+        EvalValue::Tagged(kind.to_owned(), fields)
+    }
+
+    #[test]
+    fn descriptor_evaluation_decodes_every_generic_overlay_kind() {
+        let overlays = EvalValue::List(vec![
+            eval_overlay(
+                "Point",
+                "point",
+                [
+                    ("position", eval_position(-1.0, 1.0)),
+                    ("radius", EvalValue::Number(7.0)),
+                    ("symbol_ref", EvalValue::Text("circle".to_owned())),
+                    (
+                        "paint",
+                        eval_record([
+                            ("fill", EvalValue::Text("#267a66".to_owned())),
+                            ("opacity", EvalValue::Number(0.8)),
+                        ]),
+                    ),
+                ],
+            ),
+            eval_overlay(
+                "Cluster",
+                "cluster",
+                [
+                    ("position", eval_position(1.0, 1.0)),
+                    ("count", EvalValue::Number(12.0)),
+                    ("radius", EvalValue::Number(15.0)),
+                ],
+            ),
+            eval_overlay(
+                "Polyline",
+                "line",
+                [(
+                    "points",
+                    EvalValue::List(vec![eval_position(-2.0, -1.0), eval_position(2.0, 1.0)]),
+                )],
+            ),
+            eval_overlay(
+                "Polygon",
+                "polygon",
+                [(
+                    "rings",
+                    EvalValue::List(vec![EvalValue::List(vec![
+                        eval_position(-3.0, -2.0),
+                        eval_position(3.0, -2.0),
+                        eval_position(0.0, 3.0),
+                    ])]),
+                )],
+            ),
+            eval_overlay(
+                "Label",
+                "label",
+                [
+                    ("position", eval_position(0.0, 0.0)),
+                    ("text", EvalValue::Text("Origin".to_owned())),
+                    ("collision_priority", EvalValue::Number(100.0)),
+                    ("font_size", EvalValue::Number(14.0)),
+                ],
+            ),
+        ]);
+        let descriptor = evaluate_map_viewport_descriptor(vec![
+            (DocumentArgumentRole::MapGeneration, EvalValue::Number(9.0)),
+            (
+                DocumentArgumentRole::MapCamera,
+                eval_record([
+                    ("longitude", EvalValue::Number(0.0)),
+                    ("latitude", EvalValue::Number(0.0)),
+                    ("zoom", EvalValue::Number(2.5)),
+                    ("bearing", EvalValue::Number(15.0)),
+                ]),
+            ),
+            (
+                DocumentArgumentRole::MapBounds,
+                eval_record([
+                    ("width", EvalValue::Number(720.0)),
+                    ("height", EvalValue::Number(480.0)),
+                    ("scale", EvalValue::Number(1.25)),
+                ]),
+            ),
+            (
+                DocumentArgumentRole::MapTileSource,
+                eval_record([
+                    ("id", EvalValue::Text("fixture".to_owned())),
+                    (
+                        "url_template_capability",
+                        EvalValue::Text("fixture_xyz".to_owned()),
+                    ),
+                    ("min_zoom", EvalValue::Number(0.0)),
+                    ("max_zoom", EvalValue::Number(6.0)),
+                    ("tile_size", EvalValue::Number(256.0)),
+                    ("attribution", EvalValue::Text("Fixture tiles".to_owned())),
+                    (
+                        "allowed_origins",
+                        EvalValue::List(vec![EvalValue::Text("boon-local://fixture".to_owned())]),
+                    ),
+                ]),
+            ),
+            (DocumentArgumentRole::MapOverlays, overlays),
+            (
+                DocumentArgumentRole::MapInteraction,
+                eval_record([
+                    ("pan", EvalValue::Bool(true)),
+                    ("wheel_zoom", EvalValue::Bool(true)),
+                    ("pinch_zoom", EvalValue::Bool(true)),
+                    ("keyboard_zoom", EvalValue::Bool(true)),
+                ]),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(descriptor.generation, MapViewportGeneration(9));
+        assert!(matches!(
+            descriptor.overlays[0].geometry,
+            MapOverlayGeometry::Point { .. }
+        ));
+        assert!(matches!(
+            descriptor.overlays[1].geometry,
+            MapOverlayGeometry::Cluster { .. }
+        ));
+        assert!(matches!(
+            descriptor.overlays[2].geometry,
+            MapOverlayGeometry::Polyline { .. }
+        ));
+        assert!(matches!(
+            descriptor.overlays[3].geometry,
+            MapOverlayGeometry::Polygon { .. }
+        ));
+        assert!(matches!(
+            descriptor.overlays[4].geometry,
+            MapOverlayGeometry::Label { .. }
+        ));
+    }
+
+    #[test]
+    fn frame_diff_patches_map_descriptor_with_the_same_node_identity() {
+        let mut previous = DocumentFrame::empty("root");
+        let mut map = DocumentNode::new("map", DocumentNodeKind::MapViewport);
+        map.parent = Some(previous.root.clone());
+        map.map_viewport = Some(Box::new(map_descriptor(3, 0.0)));
+        previous
+            .nodes
+            .get_mut(&previous.root)
+            .unwrap()
+            .children
+            .push(map.id.clone());
+        previous.nodes.insert(map.id.clone(), map);
+        let mut next = previous.clone();
+        next.nodes
+            .get_mut(&FrameNodeId("map".to_owned()))
+            .unwrap()
+            .map_viewport = Some(Box::new(map_descriptor(4, 1.0)));
+
+        assert!(matches!(
+            diff_frames(&previous, &next).as_slice(),
+            [DocumentPatch::UpsertNode(node)]
+                if node.id.0 == "map"
+                    && node.map_viewport.as_ref().is_some_and(|descriptor|
+                        descriptor.generation == MapViewportGeneration(4)
+                            && descriptor.camera.longitude == 1.0)
+        ));
+    }
 
     #[test]
     fn frame_diff_emits_embedded_program_descriptor_changes() {

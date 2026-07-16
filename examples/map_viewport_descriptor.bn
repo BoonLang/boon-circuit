@@ -1,0 +1,34 @@
+document: Document/new(
+    root: Element/map(
+        element: []
+        style: [width: Fill, height: Fill]
+        generation: 4
+        camera: [longitude: 0, latitude: 0, zoom: 2.5, bearing: 15]
+        bounds: [width: 720, height: 480, scale: 1.25]
+        tile_source: [
+            id: TEXT { local-fixture }
+            url_template_capability: TEXT { fixture_xyz }
+            min_zoom: 0
+            max_zoom: 6
+            tile_size: 256
+            attribution: TEXT { Local fixture tiles }
+            allowed_origins: LIST {
+                TEXT { boon-local://map-fixture }
+            }
+        ]
+        interaction: [
+            pan: True
+            wheel_zoom: True
+            pinch_zoom: True
+            keyboard_zoom: True
+        ]
+        overlays: LIST {}
+        children: LIST {
+            Element/label(
+                element: []
+                style: [height: 24]
+                label: TEXT { Local map controls }
+            )
+        }
+    )
+)

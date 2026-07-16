@@ -1,0 +1,104 @@
+[
+  {
+    "reason": "non-passenger vehicle snapshot includes a journey",
+    "message": {
+      "ok": true,
+      "data": {
+        "vehicle": {
+          "id": "SKY:Vehicle:3350447622",
+          "transportMode": "bus",
+          "passengerServiceState": "non_passenger",
+          "lineCode": "4",
+          "routeName": "Flaktveit - Hesjaholtet",
+          "destination": "skyss.no",
+          "state": "live",
+          "latitude": 60.4,
+          "longitude": 5.3,
+          "bearing": 90,
+          "delaySeconds": 1080,
+          "distanceMeters": null,
+          "lastSeenAt": "2026-07-10T10:00:00Z",
+          "refreshedAt": "2026-07-10T10:00:00Z",
+          "version": "2026-07-10T10:00:00Z",
+          "nextStop": null,
+          "journeyReference": null,
+          "monitoredCall": null,
+          "progressBetweenStops": null,
+          "journeyVersion": null,
+          "routeProgress": null
+        },
+        "trail": [],
+        "journey": {
+          "serviceJourneyId": "SKY:ServiceJourney:4-1",
+          "operatingDate": "2026-07-10",
+          "datedServiceJourneyId": null,
+          "version": "2026-07-10T10:00:00Z",
+          "state": "fresh",
+          "route": null,
+          "calls": [],
+          "refreshedAt": "2026-07-10T10:00:00Z",
+          "lastSuccessfulAt": "2026-07-10T10:00:00Z",
+          "warning": null
+        },
+        "upcomingStops": []
+      },
+      "meta": {
+        "requestId": "req_invalid_non_passenger_journey",
+        "updatedAt": "2026-07-10T10:00:00Z"
+      }
+    }
+  },
+  {
+    "reason": "non-passenger vehicle snapshot includes upcoming stops",
+    "message": {
+      "ok": true,
+      "data": {
+        "vehicle": {
+          "id": "SKY:Vehicle:3350447622",
+          "transportMode": "bus",
+          "passengerServiceState": "non_passenger",
+          "lineCode": "4",
+          "routeName": "Flaktveit - Hesjaholtet",
+          "destination": "skyss.no",
+          "state": "live",
+          "latitude": 60.4,
+          "longitude": 5.3,
+          "bearing": 90,
+          "delaySeconds": 1080,
+          "distanceMeters": null,
+          "lastSeenAt": "2026-07-10T10:00:00Z",
+          "refreshedAt": "2026-07-10T10:00:00Z",
+          "version": "2026-07-10T10:00:00Z",
+          "nextStop": null,
+          "journeyReference": null,
+          "monitoredCall": null,
+          "progressBetweenStops": null,
+          "journeyVersion": null,
+          "routeProgress": null
+        },
+        "trail": [],
+        "journey": null,
+        "upcomingStops": [
+          {
+            "stopPlaceId": "NSR:StopPlace:548",
+            "quayId": "NSR:Quay:548",
+            "name": "Førde rutebilstasjon",
+            "order": 1,
+            "latitude": 61.452,
+            "longitude": 5.857,
+            "aimedArrivalAt": "2026-07-10T10:05:00Z",
+            "expectedArrivalAt": "2026-07-10T10:05:00Z",
+            "aimedDepartureAt": "2026-07-10T10:06:00Z",
+            "expectedDepartureAt": "2026-07-10T10:06:00Z",
+            "realtime": true,
+            "cancellation": false
+          }
+        ]
+      },
+      "meta": {
+        "requestId": "req_invalid_non_passenger_stops",
+        "updatedAt": "2026-07-10T10:00:00Z"
+      }
+    }
+  }
+]

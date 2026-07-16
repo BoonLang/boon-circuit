@@ -1,0 +1,86 @@
+[package]
+name = "boon_web_host"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+boon_document.workspace = true
+boon_host.workspace = true
+boon_native_gpu.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+wgpu.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+idb = { version = "0.6.5", default-features = false, features = ["builder"] }
+js-sys = "0.3.98"
+wasm-bindgen = "0.2.121"
+wasm-bindgen-futures = "0.4.71"
+web-sys = { version = "0.3.98", features = [
+    "AbortController",
+    "AbortSignal",
+    "AddEventListenerOptions",
+    "BeforeUnloadEvent",
+    "BinaryType",
+    "Blob",
+    "BlobPropertyBag",
+    "Clipboard",
+    "ClipboardEvent",
+    "CloseEvent",
+    "CompositionEvent",
+    "CssStyleDeclaration",
+    "DataTransfer",
+    "Document",
+    "DomRect",
+    "Element",
+    "ErrorEvent",
+    "Event",
+    "EventTarget",
+    "FocusEvent",
+    "Headers",
+    "History",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "ImageBitmap",
+    "ImageData",
+    "InputEvent",
+    "KeyboardEvent",
+    "Location",
+    "MediaQueryList",
+    "MessageEvent",
+    "MouseEvent",
+    "Navigator",
+    "Node",
+    "OffscreenCanvas",
+    "OffscreenCanvasRenderingContext2d",
+    "Performance",
+    "PointerEvent",
+    "PopStateEvent",
+    "PageTransitionEvent",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "Request",
+    "RequestCredentials",
+    "RequestInit",
+    "RequestMode",
+    "RequestRedirect",
+    "Response",
+    "Storage",
+    "Url",
+    "VisibilityState",
+    "WebSocket",
+    "WheelEvent",
+    "Window",
+] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

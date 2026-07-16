@@ -10,11 +10,19 @@ use boon_document_model::{
     DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor, ProgramArtifactRetention,
     ScrollRootId, SourceBindingId,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use boon_persistence::{
+    BarrierAck, CommitAck, PersistenceControlError, PersistenceDriver, PersistenceWorkerConfig,
+    PersistenceWorkerStatus, ShutdownAck,
+};
 use boon_persistence::{
     ContentArtifact, ContentArtifactId, ContentArtifactOwnerId, ContentArtifactRetention,
     validate_content_artifact,
 };
-use boon_plan::{DocumentConstructor, MachinePlan, OutputContractKind, TargetProfile};
+use boon_plan::{
+    DocumentConstructor, EffectBarrier, EffectReplay, MachinePlan, OutputContractKind, ProgramRole,
+    TargetProfile,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,6 +31,8 @@ use std::ops::Range;
 use std::sync::Arc;
 
 const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+const MAX_TRUSTED_PACKAGE_SOURCE_UNITS: usize = 256;
+const MAX_TRUSTED_PACKAGE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const PROGRAM_ARTIFACT_FORMAT: u32 = 1;
 const PROGRAM_ARTIFACT_MEDIA_TYPE: &str = "application/vnd.boon.machine-plan+cbor;version=1";
 
@@ -34,6 +44,8 @@ pub struct ProgramLimits {
     pub max_scalar_slots: usize,
     pub max_list_slots: usize,
     pub max_source_routes: usize,
+    pub max_output_roots: usize,
+    pub max_effect_contracts: usize,
     pub max_document_expressions: usize,
     pub max_document_templates: usize,
     pub max_document_materializations: usize,
@@ -50,11 +62,28 @@ fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
             max_scalar_slots: 512,
             max_list_slots: 64,
             max_source_routes: 128,
+            max_output_roots: usize::MAX,
+            max_effect_contracts: 32,
             max_document_expressions: 10_000,
             max_document_templates: 2_000,
             max_document_materializations: 128,
             max_declared_list_capacity: 4_096,
             max_runtime_work_units_per_transaction: 20_000,
+        },
+        ProgramCapabilityProfile::TrustedServer => ProgramLimits {
+            max_source_units: 32,
+            max_source_bytes: 512 * 1024,
+            max_operations: 100_000,
+            max_scalar_slots: 4_096,
+            max_list_slots: 512,
+            max_source_routes: 2_048,
+            max_output_roots: 256,
+            max_effect_contracts: 256,
+            max_document_expressions: 0,
+            max_document_templates: 0,
+            max_document_materializations: 0,
+            max_declared_list_capacity: 65_536,
+            max_runtime_work_units_per_transaction: 200_000,
         },
     }
 }
@@ -150,6 +179,14 @@ pub struct ProgramArtifact {
     content: Arc<ContentArtifact>,
 }
 
+impl PartialEq for ProgramArtifact {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.revision == other.revision
+    }
+}
+
+impl Eq for ProgramArtifact {}
+
 impl ProgramArtifact {
     pub fn id(&self) -> ContentArtifactId {
         self.id
@@ -183,6 +220,14 @@ impl ProgramArtifact {
         &self.plan
     }
 
+    pub fn role(&self) -> ProgramRole {
+        self.plan.program_role
+    }
+
+    pub fn application(&self) -> &ApplicationIdentity {
+        &self.plan.application.identity
+    }
+
     pub fn compiler_id(&self) -> &'static str {
         COMPILER_ID
     }
@@ -192,9 +237,7 @@ impl ProgramArtifact {
     }
 
     pub fn capability_profile_id(&self) -> &'static str {
-        match self.capability_profile {
-            ProgramCapabilityProfile::PublicDocument => "public_document",
-        }
+        self.capability_profile.name()
     }
 
     pub fn to_content_artifact(&self) -> ContentArtifact {
@@ -358,6 +401,28 @@ pub fn compile_program_artifact(
     request: &ProgramCompileRequest,
 ) -> Result<ProgramArtifact, ProgramDiagnostic> {
     validate_request(request)?;
+    compile_validated_program_artifact(request)
+}
+
+/// Compiles source already trusted by a package build.
+///
+/// This preserves the smaller runtime-authored source limits while allowing a
+/// bounded production package to contain a larger multi-module application.
+/// Plan capability and execution limits remain identical to runtime builds.
+pub fn compile_trusted_package_program_artifact(
+    request: &ProgramCompileRequest,
+) -> Result<ProgramArtifact, ProgramDiagnostic> {
+    validate_request_with_source_limits(
+        request,
+        MAX_TRUSTED_PACKAGE_SOURCE_UNITS,
+        MAX_TRUSTED_PACKAGE_SOURCE_BYTES,
+    )?;
+    compile_validated_program_artifact(request)
+}
+
+fn compile_validated_program_artifact(
+    request: &ProgramCompileRequest,
+) -> Result<ProgramArtifact, ProgramDiagnostic> {
     let source_digest = crate::sha256_bytes(request.units[0].source.as_bytes());
     let units = request
         .units
@@ -416,12 +481,14 @@ pub fn compile_program_artifact(
 }
 
 pub struct ProgramSession {
+    id: ProgramSessionId,
     artifact: ProgramArtifact,
     runtime: LiveRuntime,
+    next_source_sequence: u64,
 }
 
 impl ProgramSession {
-    fn start(artifact: ProgramArtifact) -> Result<Self, ProgramDiagnostic> {
+    pub fn start(artifact: ProgramArtifact) -> Result<Self, ProgramDiagnostic> {
         let limits = program_limits(artifact.capability_profile());
         let runtime = LiveRuntime::from_shared_machine_plan(
             Arc::clone(artifact.plan()),
@@ -437,7 +504,17 @@ impl ProgramSession {
                 error.to_string(),
             )
         })?;
-        Ok(Self { artifact, runtime })
+        let id = deterministic_program_session_id(&artifact);
+        Ok(Self {
+            id,
+            artifact,
+            runtime,
+            next_source_sequence: 1,
+        })
+    }
+
+    pub fn id(&self) -> &ProgramSessionId {
+        &self.id
     }
 
     pub fn artifact(&self) -> &ProgramArtifact {
@@ -452,10 +529,448 @@ impl ProgramSession {
         &mut self.runtime
     }
 
-    pub fn frame(&self) -> &DocumentFrame {
+    pub fn frame(&self) -> Option<&DocumentFrame> {
+        self.runtime.document_frame()
+    }
+
+    pub fn next_source_sequence(&self) -> u64 {
+        self.next_source_sequence
+    }
+
+    pub fn dispatch(
+        &mut self,
+        source_path: &str,
+        target: Option<RowId>,
+        payload: SourcePayload,
+    ) -> crate::RuntimeResult<ProgramSessionDispatch> {
+        let source_sequence = self.next_source_sequence;
+        let next_source_sequence = source_sequence
+            .checked_add(1)
+            .ok_or("program source sequence overflow")?;
+        let event = self
+            .runtime
+            .source_event(source_sequence, source_path, target, payload)?;
+        let runtime_turn = self.runtime.dispatch(event)?;
+        self.next_source_sequence = next_source_sequence;
+        Ok(ProgramSessionDispatch {
+            source_sequence,
+            source_path: source_path.to_owned(),
+            runtime_turn,
+        })
+    }
+
+    pub fn root_value_current(&mut self, name: &str) -> crate::RuntimeResult<crate::Value> {
+        self.runtime.root_value_current(name)
+    }
+
+    pub fn output_value_current(&mut self, name: &str) -> crate::RuntimeResult<crate::Value> {
+        self.runtime.output_value_current(name)
+    }
+
+    pub fn complete_transient_effect(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        outcome: crate::Value,
+    ) -> crate::RuntimeResult<crate::RuntimeTurn> {
+        self.runtime.complete_transient_effect(call_id, outcome)
+    }
+
+    pub fn cancel_transient_effect(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+    ) -> crate::RuntimeResult<bool> {
+        self.runtime.cancel_transient_effect(call_id)
+    }
+
+    pub fn pending_transient_effect_count(&self) -> usize {
+        self.runtime.pending_transient_effect_count()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ProgramSessionDispatch {
+    pub source_sequence: u64,
+    pub source_path: String,
+    pub runtime_turn: crate::RuntimeTurn,
+}
+
+/// One trusted program session whose authoritative state is owned by the
+/// native persistence coordinator.
+///
+/// Source sequencing stays host-local and is deliberately absent from the
+/// durable image. Authority turns use the runtime's independent contiguous
+/// turn sequence.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct PersistentProgramSession {
+    id: ProgramSessionId,
+    artifact: ProgramArtifact,
+    runtime: crate::PersistentRuntime,
+    next_source_sequence: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PersistentProgramSession {
+    pub fn start<D>(
+        artifact: ProgramArtifact,
+        driver: D,
+        config: PersistenceWorkerConfig,
+    ) -> Result<(Self, crate::PersistentRuntimeStartup), ProgramDiagnostic>
+    where
+        D: PersistenceDriver + Send + 'static,
+    {
+        let limits = program_limits(artifact.capability_profile());
+        let (runtime, startup) = crate::PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(artifact.plan()),
+            SessionOptions {
+                max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
+                ..SessionOptions::default()
+            },
+            driver,
+            config,
+        )
+        .map_err(|error| {
+            ProgramDiagnostic::new(
+                artifact.revision(),
+                ProgramDiagnosticPhase::Start,
+                error.to_string(),
+            )
+        })?;
+        let id = deterministic_program_session_id(&artifact);
+        Ok((
+            Self {
+                id,
+                artifact,
+                runtime,
+                next_source_sequence: 1,
+            },
+            startup,
+        ))
+    }
+
+    pub fn id(&self) -> &ProgramSessionId {
+        &self.id
+    }
+
+    pub fn artifact(&self) -> &ProgramArtifact {
+        &self.artifact
+    }
+
+    pub fn runtime(&self) -> &crate::PersistentRuntime {
+        &self.runtime
+    }
+
+    pub fn next_source_sequence(&self) -> u64 {
+        self.next_source_sequence
+    }
+
+    pub fn dispatch(
+        &mut self,
+        source_path: &str,
+        target: Option<RowId>,
+        payload: SourcePayload,
+    ) -> Result<ProgramSessionDispatch, crate::PersistentDispatchError> {
+        let (source_sequence, next_source_sequence, event) =
+            self.prepare_dispatch(source_path, target, payload)?;
+        let runtime_turn = self.runtime.dispatch(event)?;
+        self.next_source_sequence = next_source_sequence;
+        Ok(ProgramSessionDispatch {
+            source_sequence,
+            source_path: source_path.to_owned(),
+            runtime_turn,
+        })
+    }
+
+    pub fn dispatch_durably(
+        &mut self,
+        source_path: &str,
+        target: Option<RowId>,
+        payload: SourcePayload,
+    ) -> Result<(ProgramSessionDispatch, CommitAck), crate::PersistentDispatchError> {
+        let (source_sequence, next_source_sequence, event) =
+            self.prepare_dispatch(source_path, target, payload)?;
+        let acknowledged = self.runtime.dispatch_durably(event)?;
+        self.next_source_sequence = next_source_sequence;
+        Ok((
+            ProgramSessionDispatch {
+                source_sequence,
+                source_path: source_path.to_owned(),
+                runtime_turn: acknowledged.turn,
+            },
+            acknowledged.acknowledgement,
+        ))
+    }
+
+    fn prepare_dispatch(
+        &self,
+        source_path: &str,
+        target: Option<RowId>,
+        payload: SourcePayload,
+    ) -> Result<(u64, u64, crate::SourceEvent), crate::PersistentDispatchError> {
+        let source_sequence = self.next_source_sequence;
+        let next_source_sequence = source_sequence.checked_add(1).ok_or_else(|| {
+            crate::PersistentDispatchError::Runtime("program source sequence overflow".to_owned())
+        })?;
+        let event = self
+            .runtime
+            .runtime()
+            .source_event(source_sequence, source_path, target, payload)
+            .map_err(|error| crate::PersistentDispatchError::Runtime(error.to_string()))?;
+        Ok((source_sequence, next_source_sequence, event))
+    }
+
+    pub fn root_value_current(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::Value, crate::PersistentDispatchError> {
+        self.runtime.root_value_current(name)
+    }
+
+    pub fn output_value_current(
+        &mut self,
+        name: &str,
+    ) -> Result<crate::Value, crate::PersistentDispatchError> {
+        self.runtime.output_value_current(name)
+    }
+
+    pub fn complete_transient_effect(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        outcome: crate::Value,
+    ) -> Result<crate::RuntimeTurn, crate::PersistentDispatchError> {
+        self.runtime.complete_transient_effect(call_id, outcome)
+    }
+
+    pub fn complete_transient_effect_durably(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        outcome: crate::Value,
+    ) -> Result<crate::DurablyAcknowledgedTurn, crate::PersistentDispatchError> {
         self.runtime
-            .primary_retained_output_frame()
-            .expect("validated program artifact keeps one retained visual output")
+            .complete_transient_effect_durably(call_id, outcome)
+    }
+
+    pub fn cancel_transient_effect(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+    ) -> Result<bool, crate::PersistentDispatchError> {
+        self.runtime.cancel_transient_effect(call_id)
+    }
+
+    pub fn pending_transient_effect_count(&self) -> usize {
+        self.runtime.pending_transient_effect_count()
+    }
+
+    pub fn persistence_status(&self) -> PersistenceWorkerStatus {
+        self.runtime.status()
+    }
+
+    pub fn barrier(&self) -> Result<BarrierAck, PersistenceControlError> {
+        self.runtime.barrier()
+    }
+
+    pub fn shutdown(&self) -> Result<ShutdownAck, PersistenceControlError> {
+        self.runtime.shutdown()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramBundle {
+    artifacts: Vec<ProgramArtifact>,
+}
+
+impl ProgramBundle {
+    pub fn new(mut artifacts: Vec<ProgramArtifact>) -> crate::RuntimeResult<Self> {
+        if artifacts.is_empty() {
+            return Err("program bundle declares no artifacts".into());
+        }
+        let package_id = artifacts[0].application().package_id.clone();
+        let deployment_domain = artifacts[0].application().deployment_domain.clone();
+        let mut roles = BTreeSet::new();
+        let mut namespaces = BTreeSet::new();
+        for artifact in &artifacts {
+            if !roles.insert(artifact.role().as_str()) {
+                return Err(
+                    format!("program bundle repeats role `{}`", artifact.role().as_str()).into(),
+                );
+            }
+            let application = artifact.application();
+            if application.package_id != package_id
+                || application.deployment_domain != deployment_domain
+            {
+                return Err(format!(
+                    "{} program is outside bundle application `{package_id}` in deployment `{deployment_domain}`",
+                    artifact.role().as_str()
+                )
+                .into());
+            }
+            if !namespaces.insert(application.state_namespace.clone()) {
+                return Err(format!(
+                    "program bundle repeats state namespace `{}`",
+                    application.state_namespace
+                )
+                .into());
+            }
+        }
+        artifacts.sort_by_key(|artifact| program_role_rank(artifact.role()));
+        Ok(Self { artifacts })
+    }
+
+    pub fn artifacts(&self) -> &[ProgramArtifact] {
+        &self.artifacts
+    }
+
+    pub fn artifact(&self, role: ProgramRole) -> Option<&ProgramArtifact> {
+        self.artifacts
+            .iter()
+            .find(|artifact| artifact.role() == role)
+    }
+
+    pub fn start_paired(&self) -> crate::RuntimeResult<PairedProgramLifecycle> {
+        PairedProgramLifecycle::start(self)
+    }
+}
+
+fn program_role_rank(role: ProgramRole) -> u8 {
+    match role {
+        ProgramRole::Document => 0,
+        ProgramRole::Server => 1,
+    }
+}
+
+fn deterministic_program_session_id(artifact: &ProgramArtifact) -> ProgramSessionId {
+    let application = artifact.application();
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.program-session.v1");
+    for component in [
+        application.package_id.as_str(),
+        application.state_namespace.as_str(),
+        application.deployment_domain.as_str(),
+        artifact.role().as_str(),
+    ] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    ProgramSessionId(format!("program-session:{:x}", hasher.finalize()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PairedProgramTurn {
+    pub lifecycle_sequence: u64,
+    pub session: ProgramSessionId,
+    pub role: ProgramRole,
+    pub source_sequence: u64,
+    pub runtime_sequence: u64,
+    pub source_path: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PairedDispatchOutcome {
+    pub turn: PairedProgramTurn,
+    pub runtime_turn: crate::RuntimeTurn,
+}
+
+pub struct PairedProgramLifecycle {
+    sessions: Vec<ProgramSession>,
+    next_lifecycle_sequence: u64,
+    turn_log: Vec<PairedProgramTurn>,
+}
+
+impl PairedProgramLifecycle {
+    fn start(bundle: &ProgramBundle) -> crate::RuntimeResult<Self> {
+        if bundle.artifacts.len() != 2
+            || bundle.artifact(ProgramRole::Document).is_none()
+            || bundle.artifact(ProgramRole::Server).is_none()
+        {
+            return Err(
+                "paired lifecycle requires exactly one document and one server artifact".into(),
+            );
+        }
+        let sessions = bundle
+            .artifacts
+            .iter()
+            .cloned()
+            .map(ProgramSession::start)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            sessions,
+            next_lifecycle_sequence: 1,
+            turn_log: Vec::new(),
+        })
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn artifact(&self, role: ProgramRole) -> Option<&ProgramArtifact> {
+        self.session(role).map(ProgramSession::artifact)
+    }
+
+    pub fn session_id(&self, role: ProgramRole) -> Option<&ProgramSessionId> {
+        self.session(role).map(ProgramSession::id)
+    }
+
+    pub fn turn_log(&self) -> &[PairedProgramTurn] {
+        &self.turn_log
+    }
+
+    pub fn dispatch(
+        &mut self,
+        role: ProgramRole,
+        source_path: &str,
+        target: Option<RowId>,
+        payload: SourcePayload,
+    ) -> crate::RuntimeResult<PairedDispatchOutcome> {
+        let lifecycle_sequence = self.next_lifecycle_sequence;
+        let next_lifecycle_sequence = lifecycle_sequence
+            .checked_add(1)
+            .ok_or("paired lifecycle sequence overflow")?;
+        let session = self.session_mut(role)?;
+        let session_id = session.id().clone();
+        let dispatched = session.dispatch(source_path, target, payload)?;
+        let turn = PairedProgramTurn {
+            lifecycle_sequence,
+            session: session_id,
+            role,
+            source_sequence: dispatched.source_sequence,
+            runtime_sequence: dispatched.runtime_turn.sequence,
+            source_path: dispatched.source_path,
+        };
+        self.next_lifecycle_sequence = next_lifecycle_sequence;
+        self.turn_log.push(turn.clone());
+        Ok(PairedDispatchOutcome {
+            turn,
+            runtime_turn: dispatched.runtime_turn,
+        })
+    }
+
+    pub fn root_value_current(
+        &mut self,
+        role: ProgramRole,
+        name: &str,
+    ) -> crate::RuntimeResult<crate::Value> {
+        self.session_mut(role)?.root_value_current(name)
+    }
+
+    pub fn output_value_current(
+        &mut self,
+        role: ProgramRole,
+        name: &str,
+    ) -> crate::RuntimeResult<crate::Value> {
+        self.session_mut(role)?.output_value_current(name)
+    }
+
+    fn session(&self, role: ProgramRole) -> Option<&ProgramSession> {
+        self.sessions
+            .iter()
+            .find(|session| session.artifact().role() == role)
+    }
+
+    fn session_mut(&mut self, role: ProgramRole) -> crate::RuntimeResult<&mut ProgramSession> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.artifact().role() == role)
+            .ok_or_else(|| format!("paired lifecycle has no {} session", role.as_str()).into())
     }
 }
 
@@ -566,6 +1081,14 @@ impl ProgramController {
 
 fn validate_request(request: &ProgramCompileRequest) -> Result<(), ProgramDiagnostic> {
     let limits = program_limits(request.capability_profile);
+    validate_request_with_source_limits(request, limits.max_source_units, limits.max_source_bytes)
+}
+
+fn validate_request_with_source_limits(
+    request: &ProgramCompileRequest,
+    max_source_units: usize,
+    max_source_bytes: usize,
+) -> Result<(), ProgramDiagnostic> {
     if request.revision == 0 {
         return Err(ProgramDiagnostic::new(
             request.revision,
@@ -573,14 +1096,14 @@ fn validate_request(request: &ProgramCompileRequest) -> Result<(), ProgramDiagno
             "revision zero is reserved for an uninitialized program",
         ));
     }
-    if request.units.is_empty() || request.units.len() > limits.max_source_units {
+    if request.units.is_empty() || request.units.len() > max_source_units {
         return Err(ProgramDiagnostic::new(
             request.revision,
             ProgramDiagnosticPhase::Request,
             format!(
                 "source unit count {} is outside 1..={}",
                 request.units.len(),
-                limits.max_source_units
+                max_source_units
             ),
         ));
     }
@@ -589,13 +1112,13 @@ fn validate_request(request: &ProgramCompileRequest) -> Result<(), ProgramDiagno
         .iter()
         .map(|unit| unit.path.len().saturating_add(unit.source.len()))
         .sum::<usize>();
-    if source_bytes > limits.max_source_bytes {
+    if source_bytes > max_source_bytes {
         return Err(ProgramDiagnostic::new(
             request.revision,
             ProgramDiagnosticPhase::Request,
             format!(
                 "source bundle uses {source_bytes} bytes, limit is {}",
-                limits.max_source_bytes
+                max_source_bytes
             ),
         ));
     }
@@ -654,13 +1177,7 @@ fn validate_plan(
 ) -> Result<(), ProgramDiagnostic> {
     let limits = program_limits(profile);
     let capabilities = &plan.capability_summary;
-    let document = plan.document_plan().ok_or_else(|| {
-        ProgramDiagnostic::new(
-            revision,
-            ProgramDiagnosticPhase::Capability,
-            "program has no retained document or scene output",
-        )
-    })?;
+    let document = plan.document_plan();
     let retained_outputs = plan
         .outputs
         .iter()
@@ -672,34 +1189,105 @@ fn validate_plan(
         })
         .count();
     let mut failures = Vec::new();
-    if !capabilities.executable
-        || !capabilities.typed_lowering_executable
+    let expected_role = match profile {
+        ProgramCapabilityProfile::PublicDocument => ProgramRole::Document,
+        ProgramCapabilityProfile::TrustedServer => ProgramRole::Server,
+    };
+    if plan.program_role != expected_role {
+        failures.push(format!(
+            "profile `{}` requires ProgramRole::{}, compiled plan declares ProgramRole::{}",
+            profile.name(),
+            title_case_role(expected_role),
+            title_case_role(plan.program_role)
+        ));
+    }
+    if plan.target_profile != TargetProfile::SoftwareBounded {
+        failures.push(format!(
+            "profile `{}` requires target profile `software_bounded`, found `{}`",
+            profile.name(),
+            plan.target_profile.as_str()
+        ));
+    }
+    if !plan.application.identity.is_valid() {
+        failures.push("plan application identity is invalid".to_owned());
+    }
+    if !capabilities.typed_lowering_executable
+        || !capabilities.executable
         || !capabilities.cpu_plan_executor_complete
     {
-        failures.push("plan is not fully executable by the typed CPU executor".to_owned());
-    }
-    if retained_outputs != 1 {
+        let unsupported = boon_plan::cpu_plan_executor_unsupported_ops(plan)
+            .into_iter()
+            .take(16)
+            .map(|op| format!("{}:{:?}", op.id.0, op.kind))
+            .collect::<Vec<_>>()
+            .join(", ");
         failures.push(format!(
-            "program must expose exactly one retained visual output, found {retained_outputs}"
-        ));
-    }
-    if !plan.effects.is_empty() {
-        failures.push(format!(
-            "profile `{}` forbids {} host effect contract(s)",
+            "plan is not executable for profile `{}` (unresolved refs {}, unknown ops {}, unsupported CPU ops {} [{}])",
             profile.name(),
-            plan.effects.len()
+            capabilities.unresolved_executable_ref_count,
+            capabilities.unknown_plan_op_count,
+            capabilities.cpu_plan_executor_unsupported_op_count,
+            unsupported,
         ));
     }
-    if document.templates.iter().any(|template| {
-        matches!(
-            template.constructor,
-            DocumentConstructor::ElementProgram | DocumentConstructor::SceneElementProgram
-        )
-    }) {
-        failures.push(format!(
-            "profile `{}` forbids nested program hosts",
-            profile.name()
-        ));
+    match profile {
+        ProgramCapabilityProfile::PublicDocument => {
+            if document.is_none() {
+                failures.push("program has no retained document or scene output".to_owned());
+            }
+            if retained_outputs != 1 {
+                failures.push(format!(
+                    "program must expose exactly one retained visual output, found {retained_outputs}"
+                ));
+            }
+            let denied_effects = plan
+                .effects
+                .iter()
+                .filter(|effect| {
+                    !matches!(effect.replay, EffectReplay::ReadOnly)
+                        || effect.barrier != EffectBarrier::None
+                        || effect.schema.is_none()
+                })
+                .count();
+            if denied_effects > 0 {
+                failures.push(format!(
+                    "profile `{}` forbids {denied_effects} host effect contract(s) that are not typed read-only operations without persistence barriers",
+                    profile.name(),
+                ));
+            }
+            if document.is_some_and(|document| {
+                document.templates.iter().any(|template| {
+                    matches!(
+                        template.constructor,
+                        DocumentConstructor::ElementProgram
+                            | DocumentConstructor::SceneElementProgram
+                    )
+                })
+            }) {
+                failures.push(format!(
+                    "profile `{}` forbids nested program hosts",
+                    profile.name()
+                ));
+            }
+        }
+        ProgramCapabilityProfile::TrustedServer => {
+            if document.is_some() || retained_outputs != 0 {
+                failures.push(
+                    "trusted server program must not contain a retained visual output".to_owned(),
+                );
+            }
+            if plan.outputs.is_empty()
+                || plan
+                    .outputs
+                    .iter()
+                    .any(|output| !matches!(output.contract, OutputContractKind::HostValue { .. }))
+            {
+                failures.push(
+                    "trusted server program requires one or more typed host-value outputs"
+                        .to_owned(),
+                );
+            }
+        }
     }
     check_limit(
         &mut failures,
@@ -725,22 +1313,36 @@ fn validate_plan(
         plan.source_routes.len(),
         limits.max_source_routes,
     );
+    if profile == ProgramCapabilityProfile::TrustedServer {
+        check_limit(
+            &mut failures,
+            "output roots",
+            plan.outputs.len(),
+            limits.max_output_roots,
+        );
+    }
+    check_limit(
+        &mut failures,
+        "effect contracts",
+        plan.effects.len(),
+        limits.max_effect_contracts,
+    );
     check_limit(
         &mut failures,
         "document expressions",
-        document.expressions.len(),
+        document.map_or(0, |document| document.expressions.len()),
         limits.max_document_expressions,
     );
     check_limit(
         &mut failures,
         "document templates",
-        document.templates.len(),
+        document.map_or(0, |document| document.templates.len()),
         limits.max_document_templates,
     );
     check_limit(
         &mut failures,
         "document materializations",
-        document.materializations.len(),
+        document.map_or(0, |document| document.materializations.len()),
         limits.max_document_materializations,
     );
     if let Some(capacity) = plan
@@ -755,6 +1357,21 @@ fn validate_plan(
             limits.max_declared_list_capacity
         ));
     }
+    match boon_plan::verify_plan(plan) {
+        Ok(verification) => {
+            let failed = verification
+                .checks
+                .iter()
+                .filter(|check| !check.pass)
+                .map(|check| check.id.as_str())
+                .collect::<Vec<_>>();
+            if verification.status != "pass" || verification.error_count != 0 || !failed.is_empty()
+            {
+                failures.push(format!("plan verification failed: {}", failed.join(", ")));
+            }
+        }
+        Err(error) => failures.push(format!("plan verification failed: {error}")),
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -763,6 +1380,13 @@ fn validate_plan(
             ProgramDiagnosticPhase::Capability,
             failures.join("; "),
         ))
+    }
+}
+
+fn title_case_role(role: ProgramRole) -> &'static str {
+    match role {
+        ProgramRole::Document => "Document",
+        ProgramRole::Server => "Server",
     }
 }
 
@@ -1280,6 +1904,7 @@ impl ProgramDocumentHost {
             .get(&projection.session)?
             .controller
             .active()?;
+        let frame = session.frame()?;
         let mut used_materializations = self.parent_materializations.clone();
         for (other_host, other) in &self.projections {
             if other_host == host {
@@ -1292,7 +1917,7 @@ impl ProgramDocumentHost {
         Some(project_program(
             host,
             &projection.session,
-            session.frame(),
+            frame,
             &mut used_materializations,
         ))
     }
@@ -2041,6 +2666,96 @@ mod tests {
         }
     }
 
+    fn server_request(revision: u64, source: &str) -> ProgramCompileRequest {
+        ProgramCompileRequest {
+            revision,
+            entry_path: "Server.bn".to_owned(),
+            units: vec![RuntimeSourceUnit {
+                path: "Server.bn".to_owned(),
+                source: source.to_owned(),
+            }],
+            application: ApplicationIdentity::new(
+                "dev.boon.test-child",
+                "test-server",
+                "runtime-test",
+            ),
+            capability_profile: ProgramCapabilityProfile::TrustedServer,
+        }
+    }
+
+    fn server_source() -> &'static str {
+        r#"
+store: [
+    request_received: SOURCE
+    request_count:
+        0 |> HOLD request_count {
+            LATEST {
+                store.request_received |> THEN { request_count + 1 }
+            }
+        }
+]
+
+outputs: [
+    response: [status: TEXT { accepted }, count: store.request_count]
+]
+"#
+    }
+
+    #[test]
+    fn trusted_package_sources_have_a_separate_bounded_build_limit() {
+        let mut request = request(1, "document: Document/new(root: [])");
+        request.units[0].source.push_str(&" ".repeat(128 * 1024));
+        assert!(
+            validate_request(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("source bundle uses")
+        );
+        validate_request_with_source_limits(
+            &request,
+            MAX_TRUSTED_PACKAGE_SOURCE_UNITS,
+            MAX_TRUSTED_PACKAGE_SOURCE_BYTES,
+        )
+        .unwrap();
+    }
+
+    fn outbound_document_source() -> &'static str {
+        r#"
+store: [
+    request: SOURCE
+    succeeded: SOURCE
+    failed: SOURCE
+]
+
+effects: [
+    fetch_resource: [
+        on: store.request
+        perform: Http/request(
+            endpoint: store.request.endpoint
+            method: store.request.method
+            path_segments: store.request.path_segments
+            query: store.request.query
+            headers: store.request.headers
+            body: store.request.body
+            connect_timeout_ms: store.request.connect_timeout_ms
+            overall_timeout_ms: store.request.overall_timeout_ms
+            cancellation: store.request.cancellation
+        )
+        results: [
+            HttpSucceeded: store.succeeded
+            HttpFailed: store.failed
+        ]
+    ]
+]
+
+scene: Scene/Element/text(
+    element: []
+    style: [width: Fill]
+    text: TEXT { Outbound HTTP document }
+)
+"#
+    }
+
     fn parent_frame(revision: u64, source: &str) -> DocumentFrame {
         let mut frame = DocumentFrame::empty("parent");
         let mut program = DocumentNode::new("program", DocumentNodeKind::EmbeddedProgram);
@@ -2180,7 +2895,7 @@ document: Document/new(
             controller.complete(Ok(artifact)),
             ProgramCompletion::Activated { revision: 1 }
         );
-        let frame = controller.active().unwrap().frame();
+        let frame = controller.active().unwrap().frame().unwrap();
         assert!(
             frame
                 .nodes
@@ -2252,6 +2967,242 @@ document: Document/new(
         .unwrap_err();
         assert_eq!(diagnostic.phase, ProgramDiagnosticPhase::Artifact);
         assert!(diagnostic.message.contains("plan digest"));
+    }
+
+    #[test]
+    fn trusted_server_artifact_round_trips_and_runs_without_a_document_frame() {
+        let artifact = compile_program_artifact(&server_request(1, server_source())).unwrap();
+        assert_eq!(artifact.role(), ProgramRole::Server);
+        assert_eq!(
+            artifact.capability_profile(),
+            ProgramCapabilityProfile::TrustedServer
+        );
+        assert_eq!(artifact.application().state_namespace, "test-server");
+        assert!(artifact.plan().document.is_none());
+
+        let restored = ProgramArtifact::from_content_artifact(
+            7,
+            ProgramCapabilityProfile::TrustedServer,
+            artifact.to_content_artifact(),
+        )
+        .unwrap();
+        assert_eq!(restored.id(), artifact.id());
+        assert_eq!(restored.role(), ProgramRole::Server);
+
+        let mut session = ProgramSession::start(restored).unwrap();
+        assert!(session.frame().is_none());
+        assert_eq!(
+            session.root_value_current("store.request_count").unwrap(),
+            crate::Value::integer(0).unwrap()
+        );
+        let dispatched = session
+            .dispatch("store.request_received", None, SourcePayload::default())
+            .unwrap();
+        assert_eq!(dispatched.source_sequence, 1);
+        assert_eq!(session.next_source_sequence(), 2);
+        let response = session.output_value_current("response").unwrap();
+        assert!(matches!(response, crate::Value::Record(fields)
+            if fields.get("count") == Some(&crate::Value::integer(1).unwrap())));
+    }
+
+    #[test]
+    fn public_document_may_emit_typed_read_only_effect_without_an_outbox() {
+        let artifact = compile_program_artifact(&request(1, outbound_document_source())).unwrap();
+        let [effect] = artifact.plan().effects.as_slice() else {
+            panic!("document plan must own one outbound HTTP effect contract");
+        };
+        assert!(matches!(effect.replay, EffectReplay::ReadOnly));
+        assert_eq!(effect.barrier, EffectBarrier::None);
+        assert!(effect.schema.is_some());
+
+        let mut session = ProgramSession::start(artifact).unwrap();
+        let dispatched = session
+            .dispatch(
+                "store.request",
+                None,
+                SourcePayload {
+                    fields: BTreeMap::from([
+                        (
+                            "endpoint".to_owned(),
+                            crate::Value::Text("catalog".to_owned()),
+                        ),
+                        ("method".to_owned(), crate::Value::Text("Get".to_owned())),
+                        ("path_segments".to_owned(), crate::Value::List(Vec::new())),
+                        ("query".to_owned(), crate::Value::List(Vec::new())),
+                        ("headers".to_owned(), crate::Value::List(Vec::new())),
+                        ("body".to_owned(), crate::Value::Bytes(Vec::new())),
+                        (
+                            "connect_timeout_ms".to_owned(),
+                            crate::Value::integer(500).unwrap(),
+                        ),
+                        (
+                            "overall_timeout_ms".to_owned(),
+                            crate::Value::integer(2_000).unwrap(),
+                        ),
+                        (
+                            "cancellation".to_owned(),
+                            crate::Value::Text("Independent".to_owned()),
+                        ),
+                    ]),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        assert!(dispatched.runtime_turn.outbox_changes.is_empty());
+        assert_eq!(dispatched.runtime_turn.transient_effects.len(), 1);
+    }
+
+    #[test]
+    fn persistent_transient_completion_is_an_acknowledged_authority_turn() {
+        let artifact = compile_program_artifact(&server_request(
+            1,
+            include_str!("../../../examples/outbound_http_effect.bn"),
+        ))
+        .unwrap();
+        let (mut session, _) = PersistentProgramSession::start(
+            artifact,
+            boon_persistence::InMemoryDriver::default(),
+            PersistenceWorkerConfig::default(),
+        )
+        .unwrap();
+        let request = SourcePayload {
+            fields: BTreeMap::from([
+                (
+                    "endpoint".to_owned(),
+                    crate::Value::Text("catalog".to_owned()),
+                ),
+                ("method".to_owned(), crate::Value::Text("Get".to_owned())),
+                ("path_segments".to_owned(), crate::Value::List(Vec::new())),
+                ("query".to_owned(), crate::Value::List(Vec::new())),
+                ("headers".to_owned(), crate::Value::List(Vec::new())),
+                ("body".to_owned(), crate::Value::Bytes(Vec::new())),
+                (
+                    "connect_timeout_ms".to_owned(),
+                    crate::Value::integer(500).unwrap(),
+                ),
+                (
+                    "overall_timeout_ms".to_owned(),
+                    crate::Value::integer(2_000).unwrap(),
+                ),
+                (
+                    "cancellation".to_owned(),
+                    crate::Value::Text("Independent".to_owned()),
+                ),
+            ]),
+            ..SourcePayload::default()
+        };
+        let (dispatched, first_acknowledgement) = session
+            .dispatch_durably("store.request", None, request)
+            .unwrap();
+        let [invocation] = dispatched.runtime_turn.transient_effects.as_slice() else {
+            panic!("request turn must emit one transient effect");
+        };
+        let call_id = invocation.call_id;
+        assert_eq!(session.pending_transient_effect_count(), 1);
+        assert_eq!(
+            first_acknowledgement.through_turn_sequence,
+            dispatched.runtime_turn.sequence
+        );
+
+        let outcome = crate::Value::Record(BTreeMap::from([
+            (
+                "$tag".to_owned(),
+                crate::Value::Text("HttpSucceeded".to_owned()),
+            ),
+            (
+                "endpoint".to_owned(),
+                crate::Value::Text("catalog".to_owned()),
+            ),
+            ("status".to_owned(), crate::Value::integer(207).unwrap()),
+            ("headers".to_owned(), crate::Value::List(Vec::new())),
+            ("body".to_owned(), crate::Value::Bytes(Vec::new())),
+            (
+                "redirects_followed".to_owned(),
+                crate::Value::integer(0).unwrap(),
+            ),
+        ]));
+        let completed = session
+            .complete_transient_effect_durably(call_id, outcome)
+            .unwrap();
+        assert_eq!(
+            completed.acknowledgement.through_turn_sequence,
+            completed.turn.sequence
+        );
+        assert!(completed.turn.sequence > first_acknowledgement.through_turn_sequence);
+        assert_eq!(session.pending_transient_effect_count(), 0);
+        assert_eq!(
+            session.output_value_current("last_status").unwrap(),
+            crate::Value::integer(207).unwrap()
+        );
+        session.shutdown().unwrap();
+    }
+
+    #[test]
+    fn trusted_server_load_rejects_hash_tampering_and_a_rehashed_role_mismatch() {
+        let artifact = compile_program_artifact(&server_request(1, server_source())).unwrap();
+        let content = artifact.to_content_artifact();
+
+        let mut corrupt = content.clone();
+        corrupt.bytes[0] ^= 0xff;
+        let diagnostic = ProgramArtifact::from_content_artifact(
+            2,
+            ProgramCapabilityProfile::TrustedServer,
+            corrupt,
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.phase, ProgramDiagnosticPhase::Artifact);
+        assert!(diagnostic.message.contains("digest"));
+
+        let mut stored: StoredProgramArtifact =
+            ciborium::de::from_reader(content.bytes.as_slice()).unwrap();
+        stored.plan.program_role = ProgramRole::Document;
+        stored.plan_digest = boon_plan::plan_sha256(&stored.plan).unwrap();
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&stored, &mut bytes).unwrap();
+        let rehashed = ContentArtifact::new(PROGRAM_ARTIFACT_MEDIA_TYPE, bytes).unwrap();
+        let diagnostic = ProgramArtifact::from_content_artifact(
+            3,
+            ProgramCapabilityProfile::TrustedServer,
+            rehashed,
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.phase, ProgramDiagnosticPhase::Capability);
+        assert!(diagnostic.message.contains("requires ProgramRole::Server"));
+    }
+
+    #[test]
+    fn program_bundle_requires_distinct_namespaces_and_starts_deterministic_sessions() {
+        let document = compile_program_artifact(&request(1, &child_source("Paired"))).unwrap();
+        let server = compile_program_artifact(&server_request(1, server_source())).unwrap();
+        let bundle = ProgramBundle::new(vec![server.clone(), document.clone()]).unwrap();
+        assert_eq!(bundle.artifacts()[0].role(), ProgramRole::Document);
+        assert_eq!(bundle.artifacts()[1].role(), ProgramRole::Server);
+
+        let first = bundle.start_paired().unwrap();
+        let second = bundle.start_paired().unwrap();
+        assert_eq!(
+            first.session_id(ProgramRole::Document),
+            second.session_id(ProgramRole::Document)
+        );
+        assert_eq!(
+            first.session_id(ProgramRole::Server),
+            second.session_id(ProgramRole::Server)
+        );
+        assert_ne!(
+            first.session_id(ProgramRole::Document),
+            first.session_id(ProgramRole::Server)
+        );
+
+        let mut duplicate_namespace_request = server_request(2, server_source());
+        duplicate_namespace_request.application.state_namespace =
+            document.application().state_namespace.clone();
+        let duplicate_server = compile_program_artifact(&duplicate_namespace_request).unwrap();
+        let error = ProgramBundle::new(vec![document, duplicate_server]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("repeats state namespace `test-child`")
+        );
     }
 
     #[test]

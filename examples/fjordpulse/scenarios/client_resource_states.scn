@@ -1,0 +1,91 @@
+name = "fjordpulse_client_resource_states"
+source = "examples/fjordpulse/Client/RUN.bn"
+
+[[step]]
+id = "initial"
+expect_root_text = { "store.map_state" = "Ready", "store.search_state" = "Closed", "store.admin_resource_state" = "Fresh" }
+
+[[step]]
+id = "map-error-is-contained"
+expected_source_event = { source = "store.transport.map.error" }
+expect_root_text = { "store.map_state" = "Error", "store.route" = "PublicMap" }
+
+[[step]]
+id = "map-retry"
+expected_source_event = { source = "store.elements.map.retry", target_text = "Prøv kartet igjen" }
+expect_root_text = { "store.map_state" = "Retrying", "store.map_retry_count" = "1" }
+
+[[step]]
+id = "map-recovers"
+expected_source_event = { source = "store.transport.map.ready" }
+expect_root_text = { "store.map_state" = "Ready" }
+
+[[step]]
+id = "search-error"
+expected_source_event = { source = "store.elements.navigation.search", target_text = "Søk" }
+expect_root_text = { "store.search_state" = "Ready" }
+
+[[step]]
+id = "search-error-arrives"
+expected_source_event = { source = "store.transport.search.error" }
+expect_root_text = { "store.search_state" = "Error", "store.route" = "PublicMap" }
+
+[[step]]
+id = "search-retry"
+expected_source_event = { source = "store.elements.search_retry", target_text = "Prøv igjen" }
+expect_root_text = { "store.search_state" = "Retrying", "store.search_retry_count" = "1" }
+
+[[step]]
+id = "search-empty"
+expected_source_event = { source = "store.transport.search.empty" }
+expect_root_text = { "store.search_state" = "Empty" }
+
+[[step]]
+id = "select-station"
+expected_source_event = { source = "store.elements.station.forde", target_text = "Førde rutebilstasjon" }
+expect_root_text = { "store.route" = "PublicStation", "store.station_state" = "Loading", "store.departures_state" = "Loading", "store.station_vehicles_state" = "Loading" }
+
+[[step]]
+id = "station-error"
+expected_source_event = { source = "store.transport.station.error" }
+expect_root_text = { "store.station_state" = "Error", "store.departures_state" = "Loading", "store.station_vehicles_state" = "Loading" }
+
+[[step]]
+id = "station-retry"
+expected_source_event = { source = "store.elements.station.retry", target_text = "Prøv igjen" }
+expect_root_text = { "store.station_state" = "Retrying", "store.station_retry_count" = "1" }
+
+[[step]]
+id = "station-stale"
+expected_source_event = { source = "store.transport.station.stale" }
+expect_root_text = { "store.station_state" = "Stale" }
+
+[[step]]
+id = "departures-empty-independent"
+expected_source_event = { source = "store.transport.departures.empty" }
+expect_root_text = { "store.departures_state" = "Empty", "store.station_state" = "Stale", "store.station_vehicles_state" = "Loading" }
+
+[[step]]
+id = "vehicles-error-independent"
+expected_source_event = { source = "store.transport.station_vehicles.error" }
+expect_root_text = { "store.station_vehicles_state" = "Error", "store.departures_state" = "Empty" }
+
+[[step]]
+id = "admin-error"
+expected_source_event = { source = "store.elements.navigation.admin", target_text = "Admin" }
+expect_root_text = { "store.route" = "AdminStatus" }
+
+[[step]]
+id = "admin-error-arrives"
+expected_source_event = { source = "store.transport.admin.error" }
+expect_root_text = { "store.admin_resource_state" = "Error" }
+
+[[step]]
+id = "admin-retry"
+expected_source_event = { source = "store.elements.admin.retry", target_text = "Prøv igjen" }
+expect_root_text = { "store.admin_resource_state" = "Retrying", "store.admin_retry_count" = "1" }
+
+[[step]]
+id = "admin-stale"
+expected_source_event = { source = "store.transport.admin.stale" }
+expect_root_text = { "store.admin_resource_state" = "Stale" }

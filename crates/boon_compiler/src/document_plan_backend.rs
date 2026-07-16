@@ -1022,7 +1022,7 @@ impl<'a> DocumentCompiler<'a> {
                 ))
             })?;
             let value = self.compile_expr_with_children(arg.value, &[], context, None)?;
-            arguments.push(self.constructor_argument(name, value));
+            arguments.push(self.constructor_argument(constructor, name, value)?);
         }
         for child in children {
             let Some(name) = statement_field_name(child) else {
@@ -1038,8 +1038,10 @@ impl<'a> DocumentCompiler<'a> {
                 )));
             };
             let value = self.compile_statement_value(child, context, None)?;
-            arguments.push(self.constructor_argument(&name, value));
+            arguments.push(self.constructor_argument(constructor, &name, value)?);
         }
+        verify_map_viewport_constructor_contract(constructor, &arguments, &self.names)
+            .map_err(PlanError::new)?;
         let template = DocumentTemplateId(stable_compiler_identity(
             3,
             context.owner_function,
@@ -1077,36 +1079,17 @@ impl<'a> DocumentCompiler<'a> {
 
     fn constructor_argument(
         &mut self,
+        constructor: DocumentConstructor,
         name: &str,
         value: DocumentExprId,
-    ) -> DocumentConstructorArgument {
+    ) -> Result<DocumentConstructorArgument, PlanError> {
         let class = self.expressions[value.0].value_class;
-        let role = match name {
-            "style" => {
-                if class == DocumentValueClass::Static {
-                    DocumentArgumentRole::StaticStyle
-                } else {
-                    DocumentArgumentRole::DynamicStyle
-                }
-            }
-            "text" | "label" | "placeholder" => match class {
-                DocumentValueClass::Render => DocumentArgumentRole::Child,
-                DocumentValueClass::ChildList => DocumentArgumentRole::Children,
-                DocumentValueClass::Static => DocumentArgumentRole::StaticText,
-                DocumentValueClass::DynamicScalar | DocumentValueClass::DynamicStructure => {
-                    DocumentArgumentRole::DynamicText
-                }
-            },
-            "child" | "root" => DocumentArgumentRole::Child,
-            "items" | "children" | "contents" => DocumentArgumentRole::Children,
-            "element" | "events" => DocumentArgumentRole::EventBindings,
-            _ => DocumentArgumentRole::Value,
-        };
-        DocumentConstructorArgument {
+        let role = constructor_argument_role(constructor, name, class)?;
+        Ok(DocumentConstructorArgument {
             name: self.intern_name(name),
             role,
             value,
-        }
+        })
     }
 
     fn compile_materialization(
@@ -2441,6 +2424,7 @@ fn document_constructor(function: &str) -> Option<DocumentConstructor> {
         "Element/text_input" => DocumentConstructor::ElementTextInput,
         "Element/program" => DocumentConstructor::ElementProgram,
         "Element/embedded_media" => DocumentConstructor::ElementEmbeddedMedia,
+        "Element/map" => DocumentConstructor::ElementMap,
         "Scene/new" => DocumentConstructor::SceneNew,
         "Scene/Element/stripe" => DocumentConstructor::SceneElementStripe,
         "Scene/Element/block" => DocumentConstructor::SceneElementBlock,
@@ -2453,7 +2437,49 @@ fn document_constructor(function: &str) -> Option<DocumentConstructor> {
         "Scene/Element/paragraph" => DocumentConstructor::SceneElementParagraph,
         "Scene/Element/link" => DocumentConstructor::SceneElementLink,
         "Scene/Element/embedded_media" => DocumentConstructor::SceneElementEmbeddedMedia,
+        "Scene/Element/map" => DocumentConstructor::SceneElementMap,
         _ => return None,
+    })
+}
+
+fn constructor_argument_role(
+    constructor: DocumentConstructor,
+    name: &str,
+    class: DocumentValueClass,
+) -> Result<DocumentArgumentRole, PlanError> {
+    if let Some(role) = constructor.map_viewport_argument_role(name) {
+        return Ok(role);
+    }
+    if constructor.is_map_viewport()
+        && !matches!(
+            name,
+            "style" | "element" | "events" | "child" | "root" | "items" | "children" | "contents"
+        )
+    {
+        return Err(PlanError::new(format!(
+            "MapViewport constructor has unknown argument `{name}`"
+        )));
+    }
+    Ok(match name {
+        "style" => {
+            if class == DocumentValueClass::Static {
+                DocumentArgumentRole::StaticStyle
+            } else {
+                DocumentArgumentRole::DynamicStyle
+            }
+        }
+        "text" | "label" | "placeholder" => match class {
+            DocumentValueClass::Render => DocumentArgumentRole::Child,
+            DocumentValueClass::ChildList => DocumentArgumentRole::Children,
+            DocumentValueClass::Static => DocumentArgumentRole::StaticText,
+            DocumentValueClass::DynamicScalar | DocumentValueClass::DynamicStructure => {
+                DocumentArgumentRole::DynamicText
+            }
+        },
+        "child" | "root" => DocumentArgumentRole::Child,
+        "items" | "children" | "contents" => DocumentArgumentRole::Children,
+        "element" | "events" => DocumentArgumentRole::EventBindings,
+        _ => DocumentArgumentRole::Value,
     })
 }
 
@@ -2494,14 +2520,18 @@ fn document_builtin(function: &str) -> Option<DocumentBuiltin> {
         "List/sort_by" => DocumentBuiltin::ListSortBy,
         "List/sum" => DocumentBuiltin::ListSum,
         "Number/bit_width" => DocumentBuiltin::NumberBitWidth,
+        "Number/ceil" => DocumentBuiltin::NumberCeil,
+        "Number/floor" => DocumentBuiltin::NumberFloor,
         "Number/interpolate" => DocumentBuiltin::NumberInterpolate,
         "Number/max" => DocumentBuiltin::NumberMax,
         "Number/min" => DocumentBuiltin::NumberMin,
         "Number/project_offset" => DocumentBuiltin::NumberProjectOffset,
         "Number/project_time" => DocumentBuiltin::NumberProjectTime,
         "Number/project_width" => DocumentBuiltin::NumberProjectWidth,
+        "Number/round" => DocumentBuiltin::NumberRound,
         "Number/to_ascii_text" => DocumentBuiltin::NumberToAsciiText,
         "Number/to_text" => DocumentBuiltin::NumberToText,
+        "Number/truncate" => DocumentBuiltin::NumberTruncate,
         "Router/go_to" => DocumentBuiltin::RouterGoTo,
         "Router/route" => DocumentBuiltin::RouterRoute,
         "C/svg" => DocumentBuiltin::Svg,
@@ -2636,5 +2666,40 @@ fn value_class_rank(class: DocumentValueClass) -> u8 {
         DocumentValueClass::DynamicStructure => 2,
         DocumentValueClass::Render => 3,
         DocumentValueClass::ChildList => 4,
+    }
+}
+
+#[cfg(test)]
+mod map_viewport_constructor_contract_tests {
+    use super::*;
+
+    #[test]
+    fn map_fields_receive_dedicated_roles_and_unknown_fields_fail() {
+        assert_eq!(
+            constructor_argument_role(
+                DocumentConstructor::ElementMap,
+                "camera",
+                DocumentValueClass::DynamicScalar,
+            )
+            .unwrap(),
+            DocumentArgumentRole::MapCamera
+        );
+        assert_eq!(
+            constructor_argument_role(
+                DocumentConstructor::SceneElementMap,
+                "overlays",
+                DocumentValueClass::ChildList,
+            )
+            .unwrap(),
+            DocumentArgumentRole::MapOverlays
+        );
+        assert!(
+            constructor_argument_role(
+                DocumentConstructor::ElementMap,
+                "provider_secret",
+                DocumentValueClass::Static,
+            )
+            .is_err()
+        );
     }
 }

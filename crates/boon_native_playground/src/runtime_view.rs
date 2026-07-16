@@ -8225,6 +8225,9 @@ document: Document/new(
         view: &mut crate::view::RetainedView,
         columns: &mut boon_document::render_scene::ApproximateTextColumnMeasurer,
     ) {
+        // The workspace suite runs several independent persistence workers in
+        // parallel; release interaction latency is enforced by the native gate.
+        let timeout = Duration::from_secs(10);
         let started = Instant::now();
         for _ in 0..256 {
             model.resolve_program_artifact_requests().unwrap();
@@ -8276,8 +8279,9 @@ document: Document/new(
                 std::thread::sleep(sleep);
             }
             assert!(
-                started.elapsed() < Duration::from_secs(3),
-                "scenario runtime did not settle within three seconds; store_sessions={}, load_sessions={}, pending_requests={}, effects_busy={}",
+                started.elapsed() < timeout,
+                "scenario runtime did not settle within {} ms; store_sessions={}, load_sessions={}, pending_requests={}, effects_busy={}",
+                timeout.as_millis(),
                 model.program_artifact_store_lane.session_count(),
                 model.program_artifact_load_lane.session_count(),
                 model.pending_program_requests.len(),

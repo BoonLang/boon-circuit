@@ -1724,6 +1724,19 @@ impl Session {
         epoch: u64,
         completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
     ) -> Result<boon_persistence::RestoreImage, Error> {
+        self.restore_image(epoch, completed_migration_edges, false)
+    }
+
+    pub fn semantic_value_image(&self) -> Result<boon_persistence::RestoreImage, Error> {
+        self.restore_image(0, BTreeSet::new(), true)
+    }
+
+    fn restore_image(
+        &self,
+        epoch: u64,
+        completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
+        include_untouched_values: bool,
+    ) -> Result<boon_persistence::RestoreImage, Error> {
         let authority = self.authority_snapshot()?;
         let mut scalars = BTreeMap::new();
         for memory in self
@@ -1751,11 +1764,11 @@ impl Session {
                     memory.memory_id
                 ))
             })?;
-            if scalar.touched {
+            if include_untouched_values || scalar.touched {
                 scalars.insert(
                     memory.memory_id,
                     boon_persistence::StoredScalar {
-                        touched: true,
+                        touched: scalar.touched && !include_untouched_values,
                         value: stored_value(&scalar.value)?,
                     },
                 );
@@ -1782,57 +1795,21 @@ impl Session {
                     list_memory.memory_id
                 ))
             })?;
-            let field_ids = stable_list_fields(list_memory)?;
-            let rows = list
-                .rows
-                .iter()
-                .filter(|row| list.touched || !row.touched_fields.is_empty())
-                .map(|row| {
-                    let fields = row
-                        .fields
-                        .iter()
-                        .filter(|(field, _)| list.touched || row.touched_fields.contains(field))
-                        .map(|(field, value)| {
-                            let stable = field_ids.get(field).ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "list {} authority field {} has no stable leaf ID",
-                                    slot.list_id.0, field.0
-                                ))
-                            })?;
-                            Ok((*stable, stored_value(value)?))
-                        })
-                        .collect::<Result<BTreeMap<_, _>, Error>>()?;
-                    let touched_fields = row
-                        .touched_fields
-                        .iter()
-                        .map(|field| {
-                            field_ids.get(field).copied().ok_or_else(|| {
-                                Error::InvalidPlan(format!(
-                                    "list {} touched field {} has no stable leaf ID",
-                                    slot.list_id.0, field.0
-                                ))
-                            })
-                        })
-                        .collect::<Result<BTreeSet<_>, Error>>()?;
-                    Ok(boon_persistence::StoredRow {
-                        key: row.id.key,
-                        generation: row.id.generation,
-                        fields,
-                        touched_fields,
-                    })
-                })
-                .collect::<Result<Vec<_>, Error>>()?;
-            if !list.touched && rows.is_empty() {
+            let mut stored = stored_list(
+                list_memory,
+                list,
+                !include_untouched_values && !list.touched,
+            )?;
+            if include_untouched_values {
+                stored.touched = false;
+                stored.next_key = list.next_key;
+                for row in &mut stored.rows {
+                    row.touched_fields.clear();
+                }
+            } else if !stored.touched && stored.rows.is_empty() {
                 continue;
             }
-            lists.insert(
-                list_memory.memory_id,
-                boon_persistence::StoredList {
-                    touched: list.touched,
-                    next_key: if list.touched { list.next_key } else { 0 },
-                    rows,
-                },
-            );
+            lists.insert(list_memory.memory_id, stored);
         }
 
         Ok(boon_persistence::RestoreImage {
@@ -1840,7 +1817,11 @@ impl Session {
             schema_version: self.plan.persistence.schema_version,
             schema_hash: self.plan.persistence.schema_hash,
             epoch,
-            through_turn_sequence: authority.through_turn_sequence,
+            through_turn_sequence: if include_untouched_values {
+                0
+            } else {
+                authority.through_turn_sequence
+            },
             scalars,
             lists,
             completed_migration_edges,

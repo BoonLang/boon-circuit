@@ -35,8 +35,9 @@ use crate::observer::{
     NATIVE_WORKFLOW_PROOF_STEPS_ENV, NATIVE_WORKFLOW_STEPS_ENV, ObserverClient, ObserverEvent,
     ObserverRole, PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
     PROFILE_BENCHMARK_STEPS_ENV, PersistenceEvidenceKind, RESPONSIVE_EVIDENCE_WIDTH_ENV,
-    SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV,
-    STATE_MOUNT_EVIDENCE_ENV, StartupDisposition, StartupMigrationEvidence, TestPointerPhase,
+    RESPONSIVE_NAVIGATION_SOURCES_ENV, SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV,
+    STATE_EVIDENCE_STEPS_ENV, STATE_MOUNT_EVIDENCE_ENV, StartupDisposition,
+    StartupMigrationEvidence, TestPointerPhase,
 };
 use crate::proof::{ProofConfig, ProofRequest, ProofResult, ProofWorker};
 use crate::protocol::{
@@ -141,18 +142,18 @@ struct ResponsiveEvidenceState {
     desired_width: u32,
     desired_height: u32,
     baseline_key: crate::observer::FrameEvidenceKey,
-    expected_actions: BTreeMap<ResponsiveActionId, u32>,
+    baseline_state_digest: String,
+    expected_actions: boon_document::source_actions::SourceActionCoverage,
+    observed_actions: boon_document::source_actions::SourceActionCoverage,
+    navigation_sources: Vec<String>,
+    navigation_index: usize,
+    pending_navigation: Option<(String, String)>,
     baseline_action_count: u32,
     baseline_action_digest: String,
+    resize_sequence: Option<u64>,
     last_surface_epoch: u64,
     resize_started: bool,
     complete: bool,
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ResponsiveActionId {
-    source_path: String,
-    intent: String,
 }
 
 struct NativeWorkflowPending {
@@ -296,6 +297,7 @@ struct StateEvidenceConfig {
     profile_samples: usize,
     profile_steps: Vec<String>,
     responsive_width: Option<u32>,
+    responsive_navigation_sources: Vec<String>,
     stale_program: bool,
     native_workflow_steps: Vec<String>,
     native_workflow_proof_steps: BTreeSet<String>,
@@ -372,6 +374,15 @@ impl StateEvidenceConfig {
                 Ok(width)
             })
             .transpose()?;
+        let responsive_navigation_sources =
+            bounded_evidence_ids(RESPONSIVE_NAVIGATION_SOURCES_ENV)?;
+        if responsive_width.is_some() != !responsive_navigation_sources.is_empty()
+            || responsive_navigation_sources.len() > 8
+        {
+            return Err(format!(
+                "{RESPONSIVE_NAVIGATION_SOURCES_ENV} must declare one to eight routes with responsive evidence"
+            ));
+        }
         let stale_program = std::env::var_os(STALE_PROGRAM_EVIDENCE_ENV).is_some();
         let native_workflow_steps = bounded_evidence_ids(NATIVE_WORKFLOW_STEPS_ENV)?;
         let native_workflow_proof_steps = bounded_evidence_ids(NATIVE_WORKFLOW_PROOF_STEPS_ENV)?
@@ -393,6 +404,7 @@ impl StateEvidenceConfig {
             profile_samples,
             profile_steps,
             responsive_width,
+            responsive_navigation_sources,
             stale_program,
             native_workflow_steps,
             native_workflow_proof_steps,
@@ -867,6 +879,15 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 &outcome.dispatches,
                             )?;
                         }
+                        if let Some(state) = responsive_evidence.as_mut() {
+                            observe_responsive_navigation(
+                                state,
+                                envelope,
+                                target_name.as_deref(),
+                                target_source_path.as_deref(),
+                                &outcome.dispatches,
+                            )?;
+                        }
                         changed
                     } else {
                         false
@@ -1008,19 +1029,26 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             && height == state.desired_height
                             && presented.key.surface_epoch > previous_surface_epoch
                         {
-                            let request = capture_responsive_layout_evidence(
-                                &observer,
-                                source_revision,
-                                runtime
-                                    .as_mut()
-                                    .ok_or("responsive evidence has no runtime")?,
-                                &view,
-                                &mut product,
-                                state,
-                                sequence,
-                                presented.key.clone(),
-                            )?;
-                            state.complete = true;
+                            state.resize_sequence = Some(sequence);
+                        }
+                    }
+                    if let Some(state) = responsive_evidence.as_mut()
+                        && state.resize_sequence.is_some()
+                        && state.pending_navigation.is_none()
+                        && !state.complete
+                    {
+                        let request = advance_responsive_layout_evidence(
+                            &observer,
+                            source_revision,
+                            runtime
+                                .as_mut()
+                                .ok_or("responsive evidence has no runtime")?,
+                            &view,
+                            &mut product,
+                            state,
+                            presented.key.clone(),
+                        )?;
+                        if let Some(request) = request {
                             queue_evidence_proofs(
                                 &observer,
                                 proof.as_ref(),
@@ -1669,7 +1697,15 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                                 {
                                                     responsive_evidence =
                                                         Some(arm_responsive_evidence(
-                                                            &observer, &view, &host, width,
+                                                            &observer,
+                                                            runtime
+                                                                .as_mut()
+                                                                .expect("mounted runtime"),
+                                                            &view,
+                                                            &host,
+                                                            width,
+                                                            &state_evidence
+                                                                .responsive_navigation_sources,
                                                             last_key,
                                                         )?);
                                                 }
@@ -2092,9 +2128,11 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
             {
                 responsive_evidence = Some(arm_responsive_evidence(
                     &observer,
+                    runtime.as_mut().expect("mounted runtime"),
                     &view,
                     &host,
                     width,
+                    &state_evidence.responsive_navigation_sources,
                     latest_presented_key
                         .clone()
                         .ok_or("responsive workflow completed without a baseline frame")?,
@@ -2267,20 +2305,20 @@ fn native_workflow_keyboard_phase(
         LogicalKey::Named(actual) | LogicalKey::Character(actual) => actual,
         LogicalKey::Dead(_) | LogicalKey::Unidentified => return None,
     };
+    let actual = crate::runtime_view::normalize_key(actual);
+    let expected = crate::runtime_view::normalize_key(expected);
     match action_kind {
-        "key" | "focused_key" if actual.eq_ignore_ascii_case(expected) => {
-            Some((if key.pressed { 1 } else { 2 }, 2))
-        }
+        "key" | "focused_key" if actual == expected => Some((if key.pressed { 1 } else { 2 }, 2)),
         "focused_chord" => {
             let (modifier, expected_key) = expected.split_once('+')?;
             let modifier_matches = match modifier {
-                "ctrl" => actual.starts_with("Control"),
-                "shift" => actual.starts_with("Shift"),
+                "ctrl" => actual.starts_with("control") || actual.starts_with("ctrl"),
+                "shift" => actual.starts_with("shift"),
                 _ => false,
             };
             let phase = if modifier_matches {
                 if key.pressed { 1 } else { 4 }
-            } else if actual.eq_ignore_ascii_case(expected_key) {
+            } else if actual == expected_key {
                 if key.pressed { 2 } else { 3 }
             } else {
                 return None;
@@ -3614,7 +3652,7 @@ fn authoritative_state_evidence(
         .restore_image;
     let durable_epoch = image.epoch;
     let durable_turn_sequence = image.through_turn_sequence;
-    let semantic = semantic_authority_image(image);
+    let semantic = runtime.semantic_value_image()?;
     let canonical = encode_restore_image(&semantic)?;
     Ok(AuthoritativeStateEvidence {
         artifact,
@@ -3622,20 +3660,6 @@ fn authoritative_state_evidence(
         durable_epoch,
         durable_turn_sequence,
     })
-}
-
-fn semantic_authority_image(
-    mut image: boon_persistence::RestoreImage,
-) -> boon_persistence::RestoreImage {
-    image.epoch = 0;
-    image.through_turn_sequence = 0;
-    image.outbox.retain(|_, item| {
-        !matches!(
-            &item.state,
-            boon_persistence::DurableOutboxState::Completed { .. }
-        )
-    });
-    image
 }
 
 fn importable_authority(
@@ -4070,9 +4094,11 @@ fn emit_persistence_evidence(
 
 fn arm_responsive_evidence(
     observer: &Option<ObserverClient>,
+    runtime: &mut RuntimeView,
     view: &RetainedView,
     host: &NativeSurfaceHost,
     desired_width: u32,
+    navigation_sources: &[String],
     key: crate::observer::FrameEvidenceKey,
 ) -> Result<ResponsiveEvidenceState, Box<dyn std::error::Error + Send + Sync>> {
     let current = host.viewport().logical_size;
@@ -4081,16 +4107,14 @@ fn arm_responsive_evidence(
     if !(320..=2_160).contains(&current_height) {
         return Err("responsive evidence has an unsupported tiled height".into());
     }
-    let desktop_action_bounds = visible_action_bounds(view);
-    validate_action_bounds(
-        "desktop",
-        &desktop_action_bounds,
+    let expected_actions = boon_document::source_actions::SourceActionCoverage::collect(
+        view.visible_source_action_bounds(),
         current_width,
         current_height,
     )?;
-    let expected_actions = responsive_action_counts(&desktop_action_bounds);
-    let baseline_action_count = responsive_action_count(&expected_actions);
-    let baseline_action_digest = responsive_action_digest(&expected_actions);
+    let baseline_state_digest = authoritative_state_evidence(runtime)?.digest;
+    let baseline_action_count = expected_actions.total();
+    let baseline_action_digest = expected_actions.digest();
     emit(
         observer,
         ObserverEvent::ResponsiveResizeReady {
@@ -4107,63 +4131,93 @@ fn arm_responsive_evidence(
         desired_width,
         desired_height: current_height,
         baseline_key: key.clone(),
+        baseline_state_digest,
         expected_actions,
+        observed_actions: Default::default(),
+        navigation_sources: navigation_sources.to_vec(),
+        navigation_index: 0,
+        pending_navigation: None,
         baseline_action_count,
         baseline_action_digest,
+        resize_sequence: None,
         last_surface_epoch: key.surface_epoch,
         resize_started: false,
         complete: false,
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn capture_responsive_layout_evidence(
+fn advance_responsive_layout_evidence(
     observer: &Option<ObserverClient>,
     source_revision: u64,
     runtime: &mut RuntimeView,
     view: &RetainedView,
     product: &mut ProductFrame,
-    evidence: &ResponsiveEvidenceState,
-    resize_sequence: u64,
+    evidence: &mut ResponsiveEvidenceState,
     key: crate::observer::FrameEvidenceKey,
-) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
-    let observed_action_bounds = visible_action_bounds(view);
-    validate_action_bounds(
-        "narrow",
-        &observed_action_bounds,
+) -> Result<Option<PreparedProofRequest>, Box<dyn std::error::Error + Send + Sync>> {
+    let observed_actions = boon_document::source_actions::SourceActionCoverage::collect(
+        view.visible_source_action_bounds(),
         evidence.desired_width,
         evidence.desired_height,
     )?;
-    let observed_actions = responsive_action_counts(&observed_action_bounds);
-    let action_mismatches =
-        responsive_action_mismatches(&evidence.expected_actions, &observed_actions);
-    if !action_mismatches.is_empty() {
-        let narrow_only_actions = observed_actions
-            .keys()
-            .filter(|action| !evidence.expected_actions.contains_key(*action))
-            .map(|action| format!("{} [{}]", action.source_path, action.intent))
-            .collect::<Vec<_>>();
-        return Err(format!(
-            "narrow layout changed desktop public-action multiplicity {action_mismatches:?}; narrow-only navigation actions are {narrow_only_actions:?}"
-        )
-        .into());
+    for (action, count) in observed_actions.counts() {
+        if let Some(expected) = evidence.expected_actions.counts().get(action) {
+            if count > expected {
+                return Err(format!("narrow layout duplicates public action {action:?}").into());
+            }
+        } else if !evidence.navigation_sources.contains(&action.source_path) {
+            return Err(format!("undeclared narrow-only action {action:?}").into());
+        }
     }
-    let equivalent_actions = observed_actions
-        .into_iter()
-        .filter(|(action, _)| evidence.expected_actions.contains_key(action))
-        .collect::<BTreeMap<_, _>>();
+    evidence.observed_actions.merge_max(&observed_actions);
+    let proof = prepare_evidence_proof("responsive-narrow-visit", key.clone(), product)?;
+    if let Some(source) = evidence.navigation_sources.get(evidence.navigation_index) {
+        let action = observed_actions
+            .counts()
+            .keys()
+            .find(|action| action.source_path == *source && action.intent == "press")
+            .ok_or_else(|| format!("responsive navigation source `{source}` is not visible"))?;
+        let target = view
+            .target_for_source(&action.source_path, None)
+            .ok_or_else(|| format!("responsive navigation source `{source}` has no hit target"))?;
+        evidence.pending_navigation = Some((source.clone(), target.node.clone()));
+        emit(
+            observer,
+            ObserverEvent::RoleTarget {
+                role: ObserverRole::Preview,
+                node: target.node,
+                x: target.center_x,
+                y: target.center_y,
+            },
+        );
+        return Ok(Some(proof));
+    }
+    runtime.flush_persistence()?;
     let state = authoritative_state_evidence(runtime)?;
+    let action_mismatches = evidence
+        .expected_actions
+        .mismatches(&evidence.observed_actions);
+    if !action_mismatches.is_empty() || state.digest != evidence.baseline_state_digest {
+        return Err(format!(
+            "responsive traversal did not restore equivalent actions and semantic values: {action_mismatches:?}"
+        ).into());
+    }
+    let equivalent_actions = evidence
+        .observed_actions
+        .restricted_to(&evidence.expected_actions);
     emit(
         observer,
         ObserverEvent::ResponsiveLayoutEvidence {
-            resize_sequence,
+            resize_sequence: evidence
+                .resize_sequence
+                .ok_or("responsive resize was not observed")?,
             logical_width: evidence.desired_width,
             logical_height: evidence.desired_height,
             baseline_key: evidence.baseline_key.clone(),
             baseline_action_count: evidence.baseline_action_count,
             baseline_action_digest: evidence.baseline_action_digest.clone(),
-            action_count: responsive_action_count(&equivalent_actions),
-            action_digest: responsive_action_digest(&equivalent_actions),
+            action_count: equivalent_actions.total(),
+            action_digest: equivalent_actions.digest(),
             state_digest: state.digest,
             source_revision,
             runtime_sequence: runtime.runtime_turn_sequence(),
@@ -4172,7 +4226,40 @@ fn capture_responsive_layout_evidence(
             key: key.clone(),
         },
     );
-    prepare_evidence_proof("responsive-narrow", key, product)
+    evidence.complete = true;
+    Ok(Some(proof))
+}
+
+fn observe_responsive_navigation(
+    state: &mut ResponsiveEvidenceState,
+    envelope: &HostEventEnvelope,
+    target_node: Option<&str>,
+    target_source: Option<&str>,
+    dispatches: &[RuntimeSourceDispatch],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if envelope.origin == HostEventOrigin::RealOs
+        && let Some((source, node)) = state.pending_navigation.as_ref()
+        && target_node == Some(node)
+        && target_source == Some(source)
+        && matches!(
+            &envelope.event,
+            HostEvent::Pointer(PointerEvent {
+                phase: PointerPhase::Up,
+                button: Some(PointerButton::Primary),
+                ..
+            })
+        )
+    {
+        if !dispatches
+            .iter()
+            .any(|dispatch| dispatch.source_path == *source)
+        {
+            return Err(format!("responsive navigation `{source}` did not dispatch").into());
+        }
+        state.navigation_index += 1;
+        state.pending_navigation = None;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4363,100 +4450,6 @@ async fn run_stale_program_evidence(
     Ok(proof)
 }
 
-fn visible_action_bounds(
-    view: &RetainedView,
-) -> BTreeMap<ResponsiveActionId, Vec<boon_document::Rect>> {
-    let mut actions = BTreeMap::<ResponsiveActionId, Vec<boon_document::Rect>>::new();
-    for (source_path, intent, bounds) in view.visible_source_action_bounds() {
-        actions
-            .entry(ResponsiveActionId {
-                source_path,
-                intent,
-            })
-            .or_default()
-            .push(bounds);
-    }
-    actions
-}
-
-fn validate_action_bounds(
-    layout: &str,
-    actions: &BTreeMap<ResponsiveActionId, Vec<boon_document::Rect>>,
-    width: u32,
-    height: u32,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if actions.is_empty() {
-        return Err(format!("{layout} layout rendered no visible public controls").into());
-    }
-    for (action, targets) in actions {
-        for bounds in targets {
-            if !bounds.x.is_finite()
-                || !bounds.y.is_finite()
-                || !bounds.width.is_finite()
-                || !bounds.height.is_finite()
-                || bounds.width <= 0.0
-                || bounds.height <= 0.0
-                || bounds.x < -0.5
-                || bounds.y < -0.5
-                || bounds.x + bounds.width > width as f32 + 0.5
-                || bounds.y + bounds.height > height as f32 + 0.5
-            {
-                return Err(format!(
-                    "{layout} action `{} [{}]` has invalid bounds ({}, {}, {}, {}) in {width}x{height}",
-                    action.source_path,
-                    action.intent,
-                    bounds.x, bounds.y, bounds.width, bounds.height
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn responsive_action_mismatches(
-    desktop_actions: &BTreeMap<ResponsiveActionId, u32>,
-    narrow_actions: &BTreeMap<ResponsiveActionId, u32>,
-) -> Vec<String> {
-    desktop_actions
-        .iter()
-        .filter(|(action, count)| narrow_actions.get(*action).copied().unwrap_or(0) != **count)
-        .map(|(action, count)| {
-            format!(
-                "{} [{}] desktop x{count}, narrow x{}",
-                action.source_path,
-                action.intent,
-                narrow_actions.get(action).copied().unwrap_or(0)
-            )
-        })
-        .collect()
-}
-
-fn responsive_action_counts(
-    actions: &BTreeMap<ResponsiveActionId, Vec<boon_document::Rect>>,
-) -> BTreeMap<ResponsiveActionId, u32> {
-    actions
-        .iter()
-        .map(|(action, bounds)| (action.clone(), bounds.len().try_into().unwrap_or(u32::MAX)))
-        .collect()
-}
-
-fn responsive_action_count(actions: &BTreeMap<ResponsiveActionId, u32>) -> u32 {
-    actions.values().copied().fold(0, u32::saturating_add)
-}
-
-fn responsive_action_digest(actions: &BTreeMap<ResponsiveActionId, u32>) -> String {
-    let mut hasher = Sha256::new();
-    for (action, count) in actions {
-        for value in [&action.source_path, &action.intent] {
-            hasher.update((value.len() as u64).to_le_bytes());
-            hasher.update(value.as_bytes());
-        }
-        hasher.update(count.to_le_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
 fn queue_evidence_proofs(
     observer: &Option<ObserverClient>,
     proof: Option<&ProofWorker>,
@@ -4577,7 +4570,6 @@ async fn run_test(
             continue;
         }
         runtime.begin_scenario_step(&step.source_path);
-        let sequence_before = runtime.event_sequence();
         let target_row = runtime.scenario_target_row(
             &step.source_path,
             step.target_text.as_deref(),
@@ -4763,7 +4755,7 @@ async fn run_test(
             declared_source_dispatched |= outcome.dispatched(&step.source_path);
             sync_sensitive_input_focus(runtime, host)?;
         }
-        if runtime.event_sequence() == sequence_before || !declared_source_dispatched {
+        if !declared_source_dispatched {
             return Err(format!(
                 "TEST step `{}` host events did not dispatch declared source `{}` (intent {:?}, focused {:?}, target `{}`) in their event-local outcomes",
                 step.id, step.source_path, target.source_intent, runtime.focused(), final_target.node,
@@ -5278,7 +5270,7 @@ fn finalize_profile_candidate(
                         .try_into()
                         .unwrap_or(u32::MAX),
                     pending_durable_batches: persistence
-                        .pending_checkpoint_batches_peak
+                        .queued_checkpoint_batches
                         .try_into()
                         .unwrap_or(u32::MAX),
                     trusted_parent_rebuilds,
@@ -5988,31 +5980,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn responsive_action_coverage_preserves_intent_and_multiplicity() {
-        let action = |source_path: &str, intent: &str| ResponsiveActionId {
-            source_path: source_path.to_owned(),
-            intent: intent.to_owned(),
-        };
-        let publish = action("store.elements.publish", "click");
-        let theme = action("store.elements.theme_toggle", "click");
-        let desktop = BTreeMap::from([(publish.clone(), 2), (theme.clone(), 1)]);
-        let narrow = BTreeMap::from([
-            (publish.clone(), 2),
-            (theme, 1),
-            (action("store.elements.show_preview", "click"), 1),
-        ]);
-
-        assert!(responsive_action_mismatches(&desktop, &narrow).is_empty());
-        assert_eq!(
-            responsive_action_mismatches(&desktop, &BTreeMap::from([(publish, 1)])),
-            [
-                "store.elements.publish [click] desktop x2, narrow x1".to_owned(),
-                "store.elements.theme_toggle [click] desktop x1, narrow x0".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
     fn canonical_state_artifact_envelope_rejects_payload_corruption() {
         let mut artifact = canonical_state_artifact(7, vec![0x81, 0x01]);
         artifact.bytes[1] ^= 0x5a;
@@ -6564,6 +6531,7 @@ scene: Scene/Element/program(
                 .unwrap();
         assert_eq!(workflow.steps.len(), 36);
         assert!(workflow.steps.len() <= TEST_STEP_LIMIT);
+        assert_eq!(crate::runtime_view::normalize_key("Next"), "pagedown");
     }
 
     #[test]

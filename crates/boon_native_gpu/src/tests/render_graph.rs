@@ -18,86 +18,24 @@ fn renderer_graph_plan_hash_ignores_workload_metrics() {
 #[test]
 fn product_frame_graph_executor_emits_typed_pass_and_resource_metrics() {
     let schedule = ProductFrameSchedule::product_surface(1);
+    let planned = schedule.graph.passes.clone();
     let mut graph = ProductFrameGraphExecutor::new(schedule);
-    let (scene_key, _scene_key_ms) = graph
-        .run_product_pass(
-            ProductFrameGraphPassId::SceneKey,
-            ProductFrameGraphResourceId::RenderScene,
-            ProductFrameGraphResourceId::SceneCacheKey,
-            || {
-                Ok((
-                    17_u64,
-                    RendererRenderGraphPassStats {
-                        queue_write_count: 0,
-                        ..RendererRenderGraphPassStats::default()
-                    },
-                ))
-            },
-        )
-        .expect("scene-key graph pass should run");
-    assert_eq!(scene_key, 17);
-    graph
-        .run_product_pass(
-            ProductFrameGraphPassId::QuadPrepareUpload,
-            ProductFrameGraphResourceId::RenderSceneItems,
-            ProductFrameGraphResourceId::RetainedGpuBuffers,
-            || {
-                Ok((
-                    (),
-                    RendererRenderGraphPassStats {
-                        upload_bytes: 128,
-                        dirty_chunk_count: 1,
-                        queue_write_count: 1,
-                        ..RendererRenderGraphPassStats::default()
-                    },
-                ))
-            },
-        )
-        .expect("quad prepare graph pass should run");
-    graph
-        .run_product_pass(
-            ProductFrameGraphPassId::UiDraw,
-            ProductFrameGraphResourceId::RetainedGpuBuffers,
-            ProductFrameGraphResourceId::ColorTarget,
-            || {
-                Ok((
-                    (),
-                    RendererRenderGraphPassStats {
-                        draw_call_count: 1,
-                        ..RendererRenderGraphPassStats::default()
-                    },
-                ))
-            },
-        )
-        .expect("ui draw graph pass should run");
-    let ((), _metrics_ms) = graph
-        .run_metrics_pass(
-            ProductFrameGraphPassId::RetainedMetrics,
-            ProductFrameGraphResourceId::RenderScene,
-            ProductFrameGraphResourceId::FrameMetrics,
-            || Ok(((), RendererRenderGraphPassStats::default())),
-        )
-        .expect("retained-metrics graph pass should run");
-    graph
-        .run_product_pass(
-            ProductFrameGraphPassId::TextDraw,
-            ProductFrameGraphResourceId::TextRuns,
-            ProductFrameGraphResourceId::ColorTarget,
-            || {
-                Ok((
-                    (),
-                    RendererRenderGraphPassStats {
-                        draw_call_count: 1,
-                        ..RendererRenderGraphPassStats::default()
-                    },
-                ))
-            },
-        )
-        .expect("text draw graph pass should run");
+    for pass in planned {
+        graph
+            .run_pass(
+                pass.pass_id,
+                pass.input,
+                pass.output,
+                pass.product_visible,
+                pass.proof_or_readback,
+                || Ok(((), RendererRenderGraphPassStats::default())),
+            )
+            .expect("declared graph pass should run in schedule order");
+    }
 
     let execution = graph.finish().expect("full graph schedule should finish");
     let passes = execution.executed_passes;
-    assert_eq!(passes.len(), 5);
+    assert_eq!(passes.len(), 6);
     assert_eq!(passes[0].pass_id, "renderer-scene-key");
     assert_eq!(passes[0].pass_kind, "scene_identity");
     assert_eq!(passes[0].read_resources, vec!["RenderScene"]);
@@ -108,6 +46,8 @@ fn product_frame_graph_executor_emits_typed_pass_and_resource_metrics() {
     assert_eq!(passes[3].pass_kind, "retained_metrics");
     assert!(!passes[3].product_visible);
     assert!(!passes[3].proof_or_readback);
+    assert_eq!(passes[5].pass_id, "renderer-overlay-draw");
+    assert_eq!(passes[5].pass_kind, "post_text_overlay_draw_pass");
 
     let resources = renderer_render_graph_resources_for_passes(&passes);
     assert!(resources.iter().any(|resource| {
@@ -288,7 +228,7 @@ fn product_frame_graph_scheduler_classifies_resource_decisions() {
 fn product_frame_schedule_declares_resources_before_execution() {
     let schedule = ProductFrameSchedule::product_surface(3);
     assert_eq!(schedule.scheduler_kind, PRODUCT_FRAME_GRAPH_SCHEDULER_KIND);
-    assert_eq!(schedule.len(), 5);
+    assert_eq!(schedule.len(), 6);
     assert_eq!(schedule.plan_hash().len(), 64);
     let resources = schedule.planned_resources();
     let resource_ids = resources

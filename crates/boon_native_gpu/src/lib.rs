@@ -312,6 +312,7 @@ struct RenderScene {
     viewport: Rect,
     items: Vec<RenderSceneItem>,
     quad_batches: Vec<QuadBatch>,
+    overlay_batch_start: usize,
     rect_metrics: RectVertexMetrics,
     text_runs: Vec<RenderTextRun>,
 }
@@ -1655,10 +1656,11 @@ fn internal_render_scene_cache_key(
 
 fn document_render_scene_fallback_identity(scene: &DocumentRenderScene) -> String {
     format!(
-        "document-render-scene-ptr:{:p}:items:{}:primitives:{}:batches:{}:text:{}:visible:{}:rects:{}",
+        "document-render-scene-ptr:{:p}:items:{}:primitives:{}:overlays:{}:batches:{}:text:{}:visible:{}:rects:{}",
         scene,
         scene.items.len(),
         scene.visual_primitives.len(),
+        scene.overlay_visual_primitives.len(),
         scene.quad_batches.len(),
         scene.text_runs.len(),
         scene.metrics.visible_source_item_count,
@@ -1674,6 +1676,10 @@ fn evict_internal_scene_cache_if_needed(
     {
         cache.remove(&oldest_key);
     }
+}
+
+fn surface_render_extent(width: u32, height: u32) -> (u32, u32) {
+    (width.max(1), height.max(1))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1692,8 +1698,7 @@ fn encode_render_scene_to_surface_with_pipeline(
     frame_seq: u64,
     diagnostics_enabled: bool,
 ) -> Result<FrameMetrics, RenderError> {
-    let width = request.width.clamp(1, 1920);
-    let height = request.height.clamp(1, 1080);
+    let (width, height) = surface_render_extent(request.width, request.height);
     let convert_started = Instant::now();
     let cache_key =
         internal_render_scene_cache_key(request.scene, request.scene_identity, width, height);
@@ -1801,6 +1806,7 @@ enum ProductFrameGraphPassId {
     UiDraw,
     RetainedMetrics,
     TextDraw,
+    OverlayDraw,
 }
 
 impl ProductFrameGraphPassId {
@@ -1811,6 +1817,7 @@ impl ProductFrameGraphPassId {
             Self::UiDraw => "renderer-ui-draw",
             Self::RetainedMetrics => "renderer-retained-metrics",
             Self::TextDraw => "renderer-text-draw",
+            Self::OverlayDraw => "renderer-overlay-draw",
         }
     }
 
@@ -1821,6 +1828,7 @@ impl ProductFrameGraphPassId {
             Self::UiDraw => "ui_draw_pass",
             Self::RetainedMetrics => "retained_metrics",
             Self::TextDraw => "text_draw_pass",
+            Self::OverlayDraw => "post_text_overlay_draw_pass",
         }
     }
 }
@@ -1923,6 +1931,11 @@ impl ProductFrameGraph {
                     } else {
                         ProductFrameGraphResourceId::TextRuns
                     },
+                    ProductFrameGraphResourceId::ColorTarget,
+                ),
+                ProductFrameGraphPass::product(
+                    ProductFrameGraphPassId::OverlayDraw,
+                    ProductFrameGraphResourceId::RetainedGpuBuffers,
                     ProductFrameGraphResourceId::ColorTarget,
                 ),
             ],
@@ -2293,6 +2306,59 @@ fn product_frame_graph_schedule_metrics(
     }
 }
 
+fn encode_gpu_quad_draw_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    view: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    textures: &TextureState,
+    gpu_batches: &[GpuQuadBatch],
+    label: &'static str,
+    clear: bool,
+) -> Result<u32, RenderError> {
+    if gpu_batches.is_empty() && !clear {
+        return Ok(0);
+    }
+    let draw_ranges = coalesced_gpu_quad_draw_ranges(gpu_batches);
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: if clear {
+                    wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.04,
+                        g: 0.05,
+                        b: 0.06,
+                        a: 1.0,
+                    })
+                } else {
+                    wgpu::LoadOp::Load
+                },
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    for range in &draw_ranges {
+        let batch = &gpu_batches[range.first_batch_index];
+        let bind_group = textures
+            .bind_group_for(&range.texture)
+            .ok_or_else(|| RenderError {
+                message: "native GPU asset texture was not prepared before draw".to_owned(),
+            })?;
+        bind_group.set(&mut pass);
+        pass.set_vertex_buffer(0, batch.vertex_buffer.slice(range.byte_range.clone()));
+        pass.draw(0..range.vertex_count, 0..1);
+    }
+    Ok(draw_ranges.len() as u32)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_internal_scene_to_surface(
     request: SceneEncodeRequest<'_>,
@@ -2546,54 +2612,29 @@ fn encode_internal_scene_to_surface(
                 ))
             },
         )?;
-    let draw_ranges = coalesced_gpu_quad_draw_ranges(&gpu_batches);
-    let draw_range_count = draw_ranges.len() as u32;
-    let ((), draw_pass_ms) = render_graph.run_product_pass(
+    let overlay_batch_start = scene.quad_batches[..scene.overlay_batch_start]
+        .iter()
+        .filter(|batch| !batch.vertices.is_empty())
+        .count()
+        .min(gpu_batches.len());
+    let (draw_range_count, draw_pass_ms) = render_graph.run_product_pass(
         ProductFrameGraphPassId::UiDraw,
         ProductFrameGraphResourceId::RetainedGpuBuffers,
         ProductFrameGraphResourceId::ColorTarget,
         || {
-            let mut pass = request
-                .encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("boon-native-gpu-visible-pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: request.view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.04,
-                                g: 0.05,
-                                b: 0.06,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-            pass.set_pipeline(pipeline);
-            for range in &draw_ranges {
-                let batch = &gpu_batches[range.first_batch_index];
-                let bind_group =
-                    textures
-                        .bind_group_for(&range.texture)
-                        .ok_or_else(|| RenderError {
-                            message: "native GPU asset texture was not prepared before draw"
-                                .to_owned(),
-                        })?;
-                bind_group.set(&mut pass);
-                pass.set_vertex_buffer(0, batch.vertex_buffer.slice(range.byte_range.clone()));
-                pass.draw(0..range.vertex_count, 0..1);
-            }
+            let draw_call_count = encode_gpu_quad_draw_pass(
+                request.encoder,
+                request.view,
+                pipeline,
+                textures,
+                &gpu_batches[..overlay_batch_start],
+                "boon-native-gpu-visible-pass",
+                true,
+            )?;
             Ok((
-                (),
+                draw_call_count,
                 RendererRenderGraphPassStats {
-                    draw_call_count: draw_range_count,
+                    draw_call_count,
                     ..RendererRenderGraphPassStats::default()
                 },
             ))
@@ -2676,6 +2717,29 @@ fn encode_internal_scene_to_surface(
                 ))
             },
         )?;
+    let (overlay_draw_call_count, overlay_draw_ms) = render_graph.run_product_pass(
+        ProductFrameGraphPassId::OverlayDraw,
+        ProductFrameGraphResourceId::RetainedGpuBuffers,
+        ProductFrameGraphResourceId::ColorTarget,
+        || {
+            let draw_call_count = encode_gpu_quad_draw_pass(
+                request.encoder,
+                request.view,
+                pipeline,
+                textures,
+                &gpu_batches[overlay_batch_start..],
+                "boon-native-gpu-overlay-pass",
+                false,
+            )?;
+            Ok((
+                draw_call_count,
+                RendererRenderGraphPassStats {
+                    draw_call_count,
+                    ..RendererRenderGraphPassStats::default()
+                },
+            ))
+        },
+    )?;
     let render_execution = render_graph.finish()?;
     let product_frame_graph = diagnostics_enabled.then(|| {
         let renderer_render_graph_passes = render_execution.executed_passes;
@@ -2742,7 +2806,7 @@ fn encode_internal_scene_to_surface(
         document_scene_convert_ms: 0.0,
         document_scene_cache_hit: false,
         document_scene_cache_entry_count: 0,
-        draw_calls: draw_range_count + u32::from(rendered_text_runs > 0),
+        draw_calls: draw_range_count + u32::from(rendered_text_runs > 0) + overlay_draw_call_count,
         upload_bytes,
         allocated_gpu_bytes,
         dirty_upload_range_count: dirty_upload_ranges.len() as u32,
@@ -2760,7 +2824,7 @@ fn encode_internal_scene_to_surface(
         asset_prepare_ms,
         quad_batch_key_ms,
         quad_upload_ms,
-        draw_pass_ms,
+        draw_pass_ms: draw_pass_ms + overlay_draw_ms,
         retained_metrics_ms,
         text_render_ms,
         visible_display_item_count: rect_metrics.visible_display_item_count,
@@ -3014,6 +3078,7 @@ fn render_scene_cache_key(scene: &RenderScene) -> u64 {
         item.style_identity.pseudo_state_id.hash(&mut hasher);
         item.estimated_vertex_count.hash(&mut hasher);
     }
+    scene.overlay_batch_start.hash(&mut hasher);
     scene.quad_batches.len().hash(&mut hasher);
     for batch in &scene.quad_batches {
         batch.retained_chunk_id.hash(&mut hasher);
@@ -3101,7 +3166,7 @@ fn render_scene_from_document_scene_cached(
     } else {
         Default::default()
     };
-    let quad_batches = if scene.quad_batches.is_empty() {
+    let mut quad_batches = if scene.quad_batches.is_empty() {
         if use_retained_quad_cache {
             cached_quad_batches_from_visual_primitives(
                 &scene.visual_primitives,
@@ -3124,6 +3189,12 @@ fn render_scene_from_document_scene_cached(
             .map(|(index, batch)| quad_batch_from_document_batch(batch, index))
             .collect()
     };
+    let overlay_batch_start = quad_batches.len();
+    quad_batches.extend(quad_batches_from_visual_primitives_iter(
+        scene.overlay_visual_primitives.iter(),
+        width as f32,
+        height as f32,
+    ));
     RenderScene {
         viewport,
         items,
@@ -3133,6 +3204,7 @@ fn render_scene_from_document_scene_cached(
             cap_hit: scene.metrics.cap_hit,
         },
         quad_batches,
+        overlay_batch_start,
         text_runs: if retain_metric_items {
             scene.text_runs.clone()
         } else {
@@ -3924,8 +3996,7 @@ fn render_app_owned_scene_pixels_with_renderer(
             request.artifact_dir.display()
         ),
     })?;
-    let width = request.width.clamp(1, 1920);
-    let height = request.height.clamp(1, 1080);
+    let (width, height) = surface_render_extent(request.width, request.height);
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let texture = request.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("boon-native-gpu-app-owned-scene-texture"),
@@ -3942,7 +4013,9 @@ fn render_app_owned_scene_pixels_with_renderer(
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let unpadded_bytes_per_row = width * 4;
+    let unpadded_bytes_per_row = width.checked_mul(4).ok_or_else(|| RenderError {
+        message: "app-owned readback row size overflow".to_owned(),
+    })?;
     let padded_bytes_per_row = align_to(unpadded_bytes_per_row, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let readback_size = padded_bytes_per_row as u64 * height as u64;
     let readback = request.device.create_buffer(&wgpu::BufferDescriptor {

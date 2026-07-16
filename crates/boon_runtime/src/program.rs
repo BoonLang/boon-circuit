@@ -817,7 +817,14 @@ impl ProgramHostRequest {
 pub struct ProgramHostUpdate {
     pub patches: Vec<DocumentPatch>,
     pub requests: Vec<ProgramHostRequest>,
+    pub rejections: Vec<ProgramRejection>,
     pub bootstrap: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramRejection {
+    pub session: ProgramSessionId,
+    pub diagnostic: ProgramDiagnostic,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -875,6 +882,25 @@ struct HostedProgram {
     latest_request_artifact_id: Option<ContentArtifactId>,
     latest_request_artifact_ownership: Option<ProgramArtifactOwnership>,
     bootstrapping: bool,
+}
+
+fn reject_program_request(
+    program: &mut HostedProgram,
+    session: &ProgramSessionId,
+    diagnostic: ProgramDiagnostic,
+    rejections: &mut Vec<ProgramRejection>,
+) {
+    if program.request_diagnostic.as_ref() != Some(&diagnostic) {
+        rejections.push(ProgramRejection {
+            session: session.clone(),
+            diagnostic: diagnostic.clone(),
+        });
+    }
+    program.request_diagnostic = Some(diagnostic);
+    program.latest_request_id = None;
+    program.latest_request_artifact_id = None;
+    program.latest_request_artifact_ownership = None;
+    program.bootstrapping = false;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -990,10 +1016,10 @@ impl ProgramDocumentHost {
             self.frame.nodes.insert(id, node);
         }
 
-        let requests = if program_definition_changed {
+        let (requests, rejections) = if program_definition_changed {
             self.schedule_requests()
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let mut patches = parent_patches;
         if !changed_projection_hosts.is_empty() {
@@ -1003,6 +1029,7 @@ impl ProgramDocumentHost {
         ProgramHostUpdate {
             patches,
             requests,
+            rejections,
             bootstrap: false,
         }
     }
@@ -1014,11 +1041,12 @@ impl ProgramDocumentHost {
         self.parent_scroll_roots.clone_from(&parent.scroll_roots);
         self.parent_materializations = frame_materializations(parent);
         self.install_projections(parent);
-        let requests = self.schedule_requests();
+        let (requests, rejections) = self.schedule_requests();
         self.rebuild_composed_frame(parent);
         ProgramHostUpdate {
             patches: crate::document::diff_frames(&previous, &self.frame),
             requests,
+            rejections,
             bootstrap: false,
         }
     }
@@ -1047,7 +1075,7 @@ impl ProgramDocumentHost {
         self.projections = projections;
     }
 
-    fn schedule_requests(&mut self) -> Vec<ProgramHostRequest> {
+    fn schedule_requests(&mut self) -> (Vec<ProgramHostRequest>, Vec<ProgramRejection>) {
         let mut descriptors =
             BTreeMap::<ProgramSessionId, Vec<(DocumentNodeId, EmbeddedProgramDescriptor)>>::new();
         for (host, projection) in &self.projections {
@@ -1060,6 +1088,7 @@ impl ProgramDocumentHost {
             .retain(|session, _| descriptors.contains_key(session));
 
         let mut requests = Vec::new();
+        let mut rejections = Vec::new();
         for (session, descriptors) in descriptors {
             let (host, descriptor) = descriptors
                 .first()
@@ -1082,14 +1111,19 @@ impl ProgramDocumentHost {
                 .skip(1)
                 .find(|(_, other)| !same_program_definition(&descriptor, other))
             {
-                program.request_diagnostic = Some(ProgramDiagnostic::new(
-                    descriptor.revision.max(conflicting.revision),
-                    ProgramDiagnosticPhase::Request,
-                    format!(
-                        "logical session `{}` has conflicting descriptors at `{}` and `{}`",
-                        session.0, host.0, conflicting_host.0
+                reject_program_request(
+                    program,
+                    &session,
+                    ProgramDiagnostic::new(
+                        descriptor.revision.max(conflicting.revision),
+                        ProgramDiagnosticPhase::Request,
+                        format!(
+                            "logical session `{}` has conflicting descriptors at `{}` and `{}`",
+                            session.0, host.0, conflicting_host.0
+                        ),
                     ),
-                ));
+                    &mut rejections,
+                );
                 continue;
             }
             if same_current_program_definition(&program.descriptor, &descriptor)
@@ -1115,14 +1149,14 @@ impl ProgramDocumentHost {
                 }
                 Ok(_) => descriptor.clone(),
                 Err(diagnostic) => {
-                    program.request_diagnostic = Some(diagnostic);
+                    reject_program_request(program, &session, diagnostic, &mut rejections);
                     continue;
                 }
             };
             let artifact_id = match descriptor_artifact_id(&request_descriptor) {
                 Ok(artifact_id) => artifact_id,
                 Err(diagnostic) => {
-                    program.request_diagnostic = Some(diagnostic);
+                    reject_program_request(program, &session, diagnostic, &mut rejections);
                     continue;
                 }
             };
@@ -1171,10 +1205,12 @@ impl ProgramDocumentHost {
                         artifact_ownership,
                     });
                 }
-                Err(diagnostic) => program.request_diagnostic = Some(diagnostic),
+                Err(diagnostic) => {
+                    reject_program_request(program, &session, diagnostic, &mut rejections);
+                }
             }
         }
-        requests
+        (requests, rejections)
     }
 
     fn rebuild_composed_frame(&mut self, parent: &DocumentFrame) {
@@ -1348,16 +1384,17 @@ impl ProgramDocumentHost {
             })
             .collect::<BTreeSet<_>>();
         let patches = self.refresh_projections(Some(&hosts));
-        let requests = if bootstrap {
+        let (requests, rejections) = if bootstrap {
             self.schedule_requests()
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         (
             completion,
             ProgramHostUpdate {
                 patches,
                 requests,
+                rejections,
                 bootstrap,
             },
         )
@@ -2033,6 +2070,13 @@ mod tests {
         )
     }
 
+    fn frame_has_text(frame: &DocumentFrame, expected: &str) -> bool {
+        frame
+            .nodes
+            .values()
+            .any(|node| node.text.as_ref().is_some_and(|text| text.text == expected))
+    }
+
     #[test]
     fn replaceable_artifact_owner_is_stable_per_parent_session() {
         let parent = ApplicationIdentity::new("dev.boon.parent", "owner-test", "local");
@@ -2250,11 +2294,7 @@ document: Document/new(
             completion,
             ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
         );
-        assert!(host.frame().nodes.values().any(|node| {
-            node.text
-                .as_ref()
-                .is_some_and(|text| text.text == "Stored child")
-        }));
+        assert!(frame_has_text(host.frame(), "Stored child"));
     }
 
     #[test]
@@ -2316,11 +2356,7 @@ FUNCTION render() {
             completion,
             ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
         );
-        assert!(host.frame().nodes.values().any(|node| {
-            node.text
-                .as_ref()
-                .is_some_and(|text| text.text == "Typed profile")
-        }));
+        assert!(frame_has_text(host.frame(), "Typed profile"));
     }
 
     #[test]
@@ -2530,12 +2566,7 @@ scene: Scene/Element/program(
             ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 1 })
         );
         assert!(!update.patches.is_empty());
-        assert!(host.frame().nodes.values().any(|node| {
-            node.text.as_ref()
-                == Some(&TextValue {
-                    text: "first".to_owned(),
-                })
-        }));
+        assert!(frame_has_text(host.frame(), "first"));
 
         let invalid_parent = parent_frame(2, "scene: Missing/constructor(");
         let invalid = host.reconcile(&invalid_parent);
@@ -2551,12 +2582,16 @@ scene: Scene/Element/program(
             ProgramHostCompletion::Program(ProgramCompletion::Rejected { .. })
         ));
         assert_eq!(host.diagnostics().len(), 1);
-        assert!(host.frame().nodes.values().any(|node| {
-            node.text.as_ref()
-                == Some(&TextValue {
-                    text: "first".to_owned(),
-                })
-        }));
+        assert!(frame_has_text(host.frame(), "first"));
+        let empty = host.reconcile(&parent_frame(3, ""));
+        assert!(empty.requests.is_empty());
+        assert_eq!(empty.rejections.len(), 1);
+        assert!(
+            empty.rejections[0]
+                .diagnostic
+                .message
+                .contains("requires source")
+        );
     }
 
     #[test]
@@ -2629,12 +2664,7 @@ scene: Scene/Element/program(
             latest,
             ProgramHostCompletion::Program(ProgramCompletion::Activated { revision: 3 })
         );
-        assert!(host.frame().nodes.values().any(|node| {
-            node.text.as_ref()
-                == Some(&TextValue {
-                    text: "third".to_owned(),
-                })
-        }));
+        assert!(frame_has_text(host.frame(), "third"));
     }
 
     #[test]
@@ -2888,11 +2918,7 @@ scene: Scene/Element/program(
                 .revision(),
             2
         );
-        assert!(host.frame().nodes.values().any(|node| {
-            node.text
-                .as_ref()
-                .is_some_and(|text| text.text == "exact current")
-        }));
+        assert!(frame_has_text(host.frame(), "exact current"));
     }
 
     #[test]

@@ -389,6 +389,8 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         )
     };
 
+    let untouched = Session::new(make_plan(0), SessionOptions::default()).unwrap();
+    let semantic_default = untouched.semantic_value_image().unwrap();
     let mut original = Session::new(make_plan(0), SessionOptions::default()).unwrap();
     let turn = original.apply(event(1, 0, None)).unwrap();
     assert!(turn.deltas.is_empty());
@@ -408,6 +410,7 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         .unwrap();
     assert_eq!(durable.epoch, 7);
     assert_eq!(durable.scalars.len(), 1);
+    assert_eq!(original.semantic_value_image().unwrap(), semantic_default);
 
     let restored = SessionBuilder::new(make_plan(10), SessionOptions::default())
         .unwrap()

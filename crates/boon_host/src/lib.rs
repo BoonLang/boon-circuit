@@ -28,6 +28,67 @@ pub struct PhysicalSize {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TiledWindowRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+pub fn tiled_divider_drag_points(
+    preview: TiledWindowRect,
+    other: TiledWindowRect,
+    desired_width: u32,
+    desired_height: u32,
+) -> Result<((i32, i32), (i32, i32)), String> {
+    let desired_width = i32::try_from(desired_width).map_err(|_| "width is out of range")?;
+    let desired_height = i32::try_from(desired_height).map_err(|_| "height is out of range")?;
+    let overlap = |a: i32, al: i32, b: i32, bl: i32| {
+        let (start, end) = (a.max(b), a.saturating_add(al).min(b.saturating_add(bl)));
+        (end > start).then_some(start.saturating_add((end - start) / 2))
+    };
+    let (preview_right, other_right) = (
+        preview.x.saturating_add(preview.width),
+        other.x.saturating_add(other.width),
+    );
+    if desired_height == preview.height
+        && (preview_right - other.x).abs() <= 48
+        && let Some(y) = overlap(preview.y, preview.height, other.y, other.height)
+    {
+        let from = ((preview_right + other.x) / 2, y);
+        return Ok((from, (from.0 + desired_width - preview.width, y)));
+    }
+    if desired_height == preview.height
+        && (other_right - preview.x).abs() <= 48
+        && let Some(y) = overlap(preview.y, preview.height, other.y, other.height)
+    {
+        let from = ((other_right + preview.x) / 2, y);
+        return Ok((from, (from.0 + preview.width - desired_width, y)));
+    }
+    let (preview_bottom, other_bottom) = (
+        preview.y.saturating_add(preview.height),
+        other.y.saturating_add(other.height),
+    );
+    if desired_width == preview.width
+        && (preview_bottom - other.y).abs() <= 48
+        && let Some(x) = overlap(preview.x, preview.width, other.x, other.width)
+    {
+        let from = (x, (preview_bottom + other.y) / 2);
+        return Ok((from, (x, from.1 + desired_height - preview.height)));
+    }
+    if desired_width == preview.width
+        && (other_bottom - preview.y).abs() <= 48
+        && let Some(x) = overlap(preview.x, preview.width, other.x, other.width)
+    {
+        let from = (x, (other_bottom + preview.y) / 2);
+        return Ok((from, (x, from.1 + preview.height - desired_height)));
+    }
+    Err(format!(
+        "size {desired_width}x{desired_height} is unreachable through tiled divider {preview:?}/{other:?}"
+    ))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Viewport {
     pub surface: u64,

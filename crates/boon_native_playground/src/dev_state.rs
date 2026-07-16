@@ -460,7 +460,7 @@ impl DevState {
         }
         let extend = self.shift;
         let command = match key {
-            LogicalKey::Named(name) => match name.to_ascii_lowercase().as_str() {
+            LogicalKey::Named(name) => match crate::runtime_view::normalize_key(name).as_str() {
                 "backspace" => Some(Command::DeleteBackward),
                 "delete" => Some(Command::DeleteForward),
                 "enter" => Some(Command::Newline),
@@ -513,7 +513,7 @@ impl DevState {
         }
         let extend = self.shift;
         match key {
-            LogicalKey::Named(name) => match normalize_key(name).as_str() {
+            LogicalKey::Named(name) => match crate::runtime_view::normalize_key(name).as_str() {
                 "enter" => result(DevAction::CommitRename, DevChange::None),
                 "escape" => result(DevAction::CancelRename, DevChange::None),
                 "backspace" => {
@@ -599,16 +599,6 @@ fn key_text(key: &LogicalKey) -> Option<String> {
         LogicalKey::Character(value) => Some(value.to_ascii_lowercase()),
         LogicalKey::Named(value) if value.len() == 1 => Some(value.to_ascii_lowercase()),
         _ => None,
-    }
-}
-
-fn normalize_key(value: &str) -> String {
-    match value.to_ascii_lowercase().as_str() {
-        "arrowleft" | "leftarrow" => "left".to_owned(),
-        "arrowright" | "rightarrow" => "right".to_owned(),
-        "back_space" => "backspace".to_owned(),
-        "return" | "kp_enter" => "enter".to_owned(),
-        value => value.to_owned(),
     }
 }
 

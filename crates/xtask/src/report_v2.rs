@@ -360,6 +360,7 @@ pub enum CheckpointEvidenceRequirement {
     ResponsiveLayout {
         baseline_checkpoint: BoundedId,
         logical_width: u32,
+        navigation_sources: Vec<BoundedId>,
     },
     StaleCompileRejection,
     PersistenceOperation {
@@ -951,6 +952,18 @@ impl ProfileProofRequirements {
                     return Err(format!(
                         "responsive checkpoint {} has unsupported logical width {}",
                         checkpoint.id, logical_width
+                    ));
+                }
+                CheckpointEvidenceRequirement::ResponsiveLayout {
+                    navigation_sources, ..
+                } if navigation_sources.is_empty()
+                    || navigation_sources.len() > 8
+                    || navigation_sources.iter().collect::<BTreeSet<_>>().len()
+                        != navigation_sources.len() =>
+                {
+                    return Err(format!(
+                        "responsive checkpoint {} requires one to eight unique navigation sources",
+                        checkpoint.id
                     ));
                 }
                 _ => {}
@@ -1915,6 +1928,9 @@ pub enum StateCheckpointEvidence {
         logical_height: u32,
         action_count: u32,
         action_digest: Sha256Digest,
+        navigation_step_count: u32,
+        navigation_input_event_count: u32,
+        visited_frame_count: u32,
     },
     StaleCompileRejection {
         session: BoundedId,
@@ -1947,6 +1963,8 @@ pub enum NativeWorkflowActionKind {
     TypeText,
     DoubleClick,
     Key,
+    FocusedKey,
+    FocusedChord,
     Blur,
 }
 
@@ -2033,10 +2051,15 @@ impl StateCheckpointProof {
                 logical_width,
                 logical_height,
                 action_count,
+                navigation_step_count,
+                navigation_input_event_count,
+                visited_frame_count,
                 ..
             } if !(240..=1_920).contains(logical_width)
                 || !(320..=2_160).contains(logical_height)
-                || *action_count == 0 =>
+                || *action_count == 0
+                || *visited_frame_count != navigation_step_count.saturating_add(1)
+                || *navigation_input_event_count != navigation_step_count.saturating_mul(2) =>
             {
                 return Err(format!(
                     "responsive checkpoint {} has invalid layout evidence",
@@ -2392,13 +2415,19 @@ fn validate_checkpoint_requirement(
             CheckpointEvidenceRequirement::ResponsiveLayout {
                 baseline_checkpoint,
                 logical_width,
+                navigation_sources,
             },
             StateCheckpointEvidence::ResponsiveLayout {
                 baseline_checkpoint: observed,
                 logical_width: observed_width,
+                navigation_step_count,
                 ..
             },
-        ) => baseline_checkpoint == observed && logical_width == observed_width,
+        ) => {
+            baseline_checkpoint == observed
+                && logical_width == observed_width
+                && *navigation_step_count as usize == navigation_sources.len()
+        }
         (
             CheckpointEvidenceRequirement::StaleCompileRejection,
             StateCheckpointEvidence::StaleCompileRejection { .. },

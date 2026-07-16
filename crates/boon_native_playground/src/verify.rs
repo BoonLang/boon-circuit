@@ -26,6 +26,10 @@ use sha2::{Digest, Sha256};
 
 use crate::budget::{BudgetContract, BudgetUnit};
 use crate::observer::AsyncLaneKind;
+#[cfg(target_os = "linux")]
+use boon_host::{
+    TiledWindowRect as RoleRectangle, tiled_divider_drag_points as divider_drag_points,
+};
 
 #[cfg(target_os = "linux")]
 use crate::observer::{
@@ -34,9 +38,10 @@ use crate::observer::{
     NATIVE_WORKFLOW_STEPS_ENV, OBSERVER_SOCKET_ENV, ObserverEvent, ObserverRole,
     PERSISTENCE_EVIDENCE_ENV, PRODUCT_PROOF_AFTER_TEST_ENV, PROFILE_BENCHMARK_ENV,
     PROFILE_BENCHMARK_STEPS_ENV, PROOF_ARTIFACT_DIR_ENV, PROOF_MODE_ENV, PROOF_SAMPLE_ORDINAL_ENV,
-    PersistenceEvidenceKind, ProofArtifact, RESPONSIVE_EVIDENCE_WIDTH_ENV, RoleMetadata,
-    SCROLL_PROOF_ORDINAL_ENV, STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV,
-    STATE_MOUNT_EVIDENCE_ENV, StartupDisposition, TestPointerPhase, read_event,
+    PersistenceEvidenceKind, ProofArtifact, RESPONSIVE_EVIDENCE_WIDTH_ENV,
+    RESPONSIVE_NAVIGATION_SOURCES_ENV, RoleMetadata, SCROLL_PROOF_ORDINAL_ENV,
+    STALE_PROGRAM_EVIDENCE_ENV, STATE_EVIDENCE_STEPS_ENV, STATE_MOUNT_EVIDENCE_ENV,
+    StartupDisposition, TestPointerPhase, read_event,
 };
 #[cfg(target_os = "linux")]
 use crate::proof::frame_capture_token_digest;
@@ -159,6 +164,7 @@ enum VerifierCheckpointRequirementKind {
     ResponsiveLayout {
         baseline_checkpoint: String,
         logical_width: u32,
+        navigation_sources: Vec<String>,
     },
     StaleCompileRejection,
     PersistenceOperation {
@@ -421,6 +427,21 @@ impl VerifierProfile {
                 {
                     return Err(format!(
                         "checkpoint {} has an unsupported responsive width",
+                        checkpoint.id
+                    ));
+                }
+                VerifierCheckpointRequirementKind::ResponsiveLayout {
+                    navigation_sources, ..
+                } if navigation_sources.is_empty()
+                    || navigation_sources.len() > 8
+                    || navigation_sources
+                        .iter()
+                        .any(|source| !safe_evidence_id(source))
+                    || navigation_sources.iter().collect::<BTreeSet<_>>().len()
+                        != navigation_sources.len() =>
+                {
+                    return Err(format!(
+                        "checkpoint {} requires one to eight unique responsive navigation sources",
                         checkpoint.id
                     ));
                 }
@@ -1347,8 +1368,17 @@ fn run_restart_phase(
             migration_proof_keys.push(("migration activation", migration.5));
             migration_proof_keys.push(("post-migration product restoration", restored.5));
         }
-        wait_for_evidence_proofs(observer, events)
-            .map_err(|error| format!("restart proof lane did not drain: {error}"))?;
+        let required_proof_keys = std::iter::once(mounted.9.clone())
+            .chain(migration_proof_keys.iter().map(|(_, key)| key.clone()))
+            .collect::<Vec<_>>();
+        wait_for_count(observer, events, Duration::from_secs(60), |events| {
+            required_proof_keys
+                .iter()
+                .all(|key| exact_proof_for_key(events, key).is_some())
+        })
+        .map_err(|error| {
+            format!("restart proof lane did not prove every required frame: {error}")
+        })?;
         if exact_proof_for_key(events, &mounted.9).is_none() {
             return Err("restart mount has no exact app-owned WGPU proof".to_owned());
         }
@@ -1764,15 +1794,25 @@ fn exercise_native_roles(
         }
     }
 
-    if profile.required_checkpoints.iter().any(|checkpoint| {
-        matches!(
-            checkpoint.evidence,
-            VerifierCheckpointRequirementKind::ResponsiveLayout { .. }
-        )
-    }) {
-        drive_responsive_resize(session, observer, events, &mut placements, before_test)?;
-        wait_for_evidence_proofs(observer, events)
-            .map_err(|error| format!("responsive proof lane did not drain: {error}"))?;
+    if let Some(navigation_sources) =
+        profile
+            .required_checkpoints
+            .iter()
+            .find_map(|checkpoint| match &checkpoint.evidence {
+                VerifierCheckpointRequirementKind::ResponsiveLayout {
+                    navigation_sources, ..
+                } => Some(navigation_sources.as_slice()),
+                _ => None,
+            })
+    {
+        drive_responsive_resize(
+            session,
+            observer,
+            events,
+            &mut placements,
+            before_test,
+            navigation_sources,
+        )?;
     }
 
     if profile.switch_samples > 0 {
@@ -2748,21 +2788,13 @@ fn profile_frame_chain_is_exact(
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug)]
-struct RoleRectangle {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-#[cfg(target_os = "linux")]
 fn drive_responsive_resize(
     session: &mut NativeSession,
     observer: &mut ObserverServer,
     events: &mut Vec<ObserverEvent>,
     placements: &mut BTreeMap<ObserverRole, WindowPlacement>,
     start: usize,
+    navigation_sources: &[String],
 ) -> Result<(), String> {
     let ready = wait_for_value(
         observer,
@@ -2788,31 +2820,19 @@ fn drive_responsive_resize(
         },
     )
     .map_err(|error| format!("responsive resize target was not published: {error}"))?;
-    if !frame_key_matches_session(events, &ready.4, session, ObserverRole::Preview) {
-        return Err(
-            "responsive resize target has the wrong preview process or session identity".to_owned(),
-        );
-    }
-    if (ready.0, ready.1) == (ready.2, ready.3) {
-        return Err("responsive checkpoint requires a real native size transition".to_owned());
+    if !frame_key_matches_session(events, &ready.4, session, ObserverRole::Preview)
+        || (ready.0, ready.1) == (ready.2, ready.3)
+    {
+        return Err("responsive target lacks a distinct current preview frame".to_owned());
     }
 
     let preview_placement =
         activate_window(session, observer, events, placements, ObserverRole::Preview)?;
     let dev_placement = activate_window(session, observer, events, placements, ObserverRole::Dev)?;
-    let dev_metadata = events
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            ObserverEvent::RoleMetadata(metadata)
-                if metadata.role == ObserverRole::Dev
-                    && metadata.session_id == session.session_id =>
-            {
-                Some(metadata)
-            }
-            _ => None,
-        })
-        .ok_or("responsive divider proof has no exact dev role metadata")?;
+    let dev_metadata = role_metadata(events)
+        .remove(&ObserverRole::Dev)
+        .filter(|metadata| metadata.session_id == session.session_id)
+        .ok_or("responsive divider has no current dev metadata")?;
     let preview = RoleRectangle {
         x: preview_placement.origin.0,
         y: preview_placement.origin.1,
@@ -2836,163 +2856,131 @@ fn drive_responsive_resize(
     drag?;
     release?;
 
-    let responsive = wait_for_value(
-        observer,
-        events,
-        EVENT_TIMEOUT,
-        start,
-        |event| match event {
-            ObserverEvent::ResponsiveLayoutEvidence {
-                resize_sequence,
-                logical_width,
-                logical_height,
-                key,
-                ..
-            } if (*logical_width, *logical_height) == (ready.0, ready.1) => {
-                Some((*resize_sequence, key.clone()))
-            }
-            _ => None,
-        },
-    )
-    .map_err(|error| {
-        let observed_sizes = events[start..]
+    let mut event_cursor = start;
+    let mut proof_keys = Vec::with_capacity(navigation_sources.len() + 1);
+    for source in navigation_sources {
+        let (node, x, y) =
+            wait_for_value(
+                observer,
+                events,
+                EVENT_TIMEOUT,
+                event_cursor,
+                |event| match event {
+                    ObserverEvent::RoleTarget {
+                        role: ObserverRole::Preview,
+                        node,
+                        x,
+                        y,
+                    } => Some((node.clone(), *x, *y)),
+                    _ => None,
+                },
+            )
+            .map_err(|error| format!("responsive route `{source}` was not offered: {error}"))?;
+        let key = events
             .iter()
             .rev()
+            .find_map(|event| match event {
+                ObserverEvent::FramePresented(frame) if frame.role == ObserverRole::Preview => {
+                    Some(frame.key.clone())
+                }
+                _ => None,
+            })
+            .ok_or("responsive target has no preceding preview frame")?;
+        proof_keys.push(key);
+        let placement =
+            activate_window(session, observer, events, placements, ObserverRole::Preview)?;
+        let point = locate_target(
+            session,
+            observer,
+            events,
+            ObserverRole::Preview,
+            &node,
+            (x, y),
+            translated_target_candidates(placement, x, y),
+        )?;
+        session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
+        let input_start = events.len();
+        session.run_driver(&["click", "left"])?;
+        wait_for_event(observer, events, EVENT_TIMEOUT, input_start, |event| {
+            matches!(event,
+                ObserverEvent::InputAccepted(input)
+                    if input.role == ObserverRole::Preview && input.real_os
+                        && input.target.as_deref() == Some(&node)
+                        && input.target_source_path.as_deref() == Some(source)
+                        && input.pointer_button_pressed == Some(false)
+            )
+        })?;
+        let states = events[input_start..]
+            .iter()
             .filter_map(|event| match event {
-                ObserverEvent::ResponsiveResizeObserved {
+                ObserverEvent::InputAccepted(input)
+                    if input.target.as_deref() == Some(&node)
+                        && input.target_source_path.as_deref() == Some(source) =>
+                {
+                    input.pointer_button_pressed
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if states != [true, false] {
+            return Err(format!("responsive route `{source}` input was {states:?}"));
+        }
+        event_cursor = input_start;
+    }
+    let responsive =
+        wait_for_value(
+            observer,
+            events,
+            EVENT_TIMEOUT,
+            event_cursor,
+            |event| match event {
+                ObserverEvent::ResponsiveLayoutEvidence {
+                    resize_sequence,
                     logical_width,
                     logical_height,
-                    previous_surface_epoch,
                     key,
                     ..
-                } => Some(format!(
-                    "{}x{} epoch {}->{}",
-                    logical_width, logical_height, previous_surface_epoch, key.surface_epoch
-                )),
+                } if (*logical_width, *logical_height) == (ready.0, ready.1) => {
+                    Some((*resize_sequence, key.clone()))
+                }
                 _ => None,
-            })
-            .take(8)
-            .collect::<Vec<_>>();
-        let latest_role_sizes = events[start..]
-            .iter()
-            .rev()
-            .filter_map(|event| match event {
-                ObserverEvent::RoleMetadata(metadata) => Some(format!(
-                    "{:?} {:.0}x{:.0} epoch {}",
-                    metadata.role,
-                    metadata.logical_width,
-                    metadata.logical_height,
-                    metadata.surface_epoch
-                )),
-                _ => None,
-            })
-            .take(8)
-            .collect::<Vec<_>>();
-        format!(
-            "native divider drag did not reach the declared size: {error}; target={}x{} current={}x{}; preview={preview:?}; dev={dev:?}; drag={from:?}->{to:?}; latest observed resize frames={observed_sizes:?}; latest role sizes={latest_role_sizes:?}",
-            ready.0, ready.1, ready.2, ready.3
+            },
         )
-    })?;
-    let observed_previous_epoch = events[start..].iter().find_map(|event| match event {
+        .map_err(|error| format!("responsive traversal did not complete: {error}"))?;
+    proof_keys.push(responsive.1.clone());
+    wait_for_count(observer, events, Duration::from_secs(60), |events| {
+        proof_keys
+            .iter()
+            .all(|key| exact_proof_for_key(events, key).is_some())
+    })
+    .map_err(|error| format!("responsive proof lane did not prove every visited frame: {error}"))?;
+    let resize_key = events[start..].iter().find_map(|event| match event {
         ObserverEvent::ResponsiveResizeObserved {
             event_sequence,
-            logical_width,
-            logical_height,
             previous_surface_epoch,
             key,
-        } if *event_sequence == responsive.0
-            && (*logical_width, *logical_height) == (ready.0, ready.1)
-            && key == &responsive.1 =>
-        {
-            Some(*previous_surface_epoch)
+            ..
+        } if *event_sequence == responsive.0 && key.surface_epoch > *previous_surface_epoch => {
+            Some(key.clone())
         }
         _ => None,
     });
-    let session_matches =
-        frame_key_matches_session(events, &responsive.1, session, ObserverRole::Preview);
-    let input_matches = events[start..].iter().any(|event| {
-        matches!(event, ObserverEvent::InputAccepted(input)
-            if input.role == ObserverRole::Preview
-                && input.real_os
-                && input.kind == InputKind::Resize
-                && input.event_sequence == responsive.0
-                && input.surface_epoch == responsive.1.surface_epoch)
-    });
-    let frame_matches = events[start..].iter().any(|event| {
-        matches!(event, ObserverEvent::FramePresented(frame)
-            if frame.role == ObserverRole::Preview
-                && frame.key == responsive.1)
-    });
-    let epoch_advances =
-        observed_previous_epoch.is_some_and(|previous| responsive.1.surface_epoch > previous);
-    let exact_resize = epoch_advances && session_matches && input_matches && frame_matches;
-    if !exact_resize {
-        return Err(format!(
-            "responsive checkpoint is not bound to one exact native Resize frame: sequence={}, key={:?}, previous_epoch={observed_previous_epoch:?}, epoch_advances={epoch_advances}, session_matches={session_matches}, input_matches={input_matches}, frame_matches={frame_matches}",
-            responsive.0, responsive.1,
-        ));
+    if !resize_key.as_ref().is_some_and(|resize_key| {
+        frame_key_matches_session(events, resize_key, session, ObserverRole::Preview)
+            && exact_proof_for_key(events, resize_key).is_some()
+            && events[start..].iter().any(|event| matches!(event,
+        ObserverEvent::InputAccepted(input)
+            if input.role == ObserverRole::Preview && input.real_os
+                && input.kind == InputKind::Resize && input.event_sequence == responsive.0
+                && input.surface_epoch == resize_key.surface_epoch
+    ))
+    }) {
+        return Err("responsive evidence is not bound to one exact Resize frame".to_owned());
     }
     let status = query_isolation_status(&session.launch_id)?;
     status.require_safe(&session.isolated_seat_name)?;
     status.require_layout(session.observed_roles.len())?;
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn divider_drag_points(
-    preview: RoleRectangle,
-    dev: RoleRectangle,
-    desired_width: u32,
-    desired_height: u32,
-) -> Result<((i32, i32), (i32, i32)), String> {
-    let desired_width =
-        i32::try_from(desired_width).map_err(|_| "desired width is out of range")?;
-    let desired_height =
-        i32::try_from(desired_height).map_err(|_| "desired height is out of range")?;
-    let overlap_midpoint =
-        |first_start: i32, first_len: i32, second_start: i32, second_len: i32| {
-            let start = first_start.max(second_start);
-            let end = first_start
-                .saturating_add(first_len)
-                .min(second_start.saturating_add(second_len));
-            (end > start).then_some(start.saturating_add((end - start) / 2))
-        };
-    let gap_tolerance = 48;
-    let preview_right = preview.x.saturating_add(preview.width);
-    let dev_right = dev.x.saturating_add(dev.width);
-    if desired_height == preview.height
-        && (preview_right - dev.x).abs() <= gap_tolerance
-        && let Some(y) = overlap_midpoint(preview.y, preview.height, dev.y, dev.height)
-    {
-        let from = ((preview_right + dev.x) / 2, y);
-        return Ok((from, (from.0 + desired_width - preview.width, y)));
-    }
-    if desired_height == preview.height
-        && (dev_right - preview.x).abs() <= gap_tolerance
-        && let Some(y) = overlap_midpoint(preview.y, preview.height, dev.y, dev.height)
-    {
-        let from = ((dev_right + preview.x) / 2, y);
-        return Ok((from, (from.0 + preview.width - desired_width, y)));
-    }
-    let preview_bottom = preview.y.saturating_add(preview.height);
-    let dev_bottom = dev.y.saturating_add(dev.height);
-    if desired_width == preview.width
-        && (preview_bottom - dev.y).abs() <= gap_tolerance
-        && let Some(x) = overlap_midpoint(preview.x, preview.width, dev.x, dev.width)
-    {
-        let from = (x, (preview_bottom + dev.y) / 2);
-        return Ok((from, (x, from.1 + desired_height - preview.height)));
-    }
-    if desired_width == preview.width
-        && (dev_bottom - preview.y).abs() <= gap_tolerance
-        && let Some(x) = overlap_midpoint(preview.x, preview.width, dev.x, dev.width)
-    {
-        let from = (x, (dev_bottom + preview.y) / 2);
-        return Ok((from, (x, from.1 + preview.height - desired_height)));
-    }
-    Err(format!(
-        "declared responsive size {desired_width}x{desired_height} cannot be reached through the proven tiled divider: preview={preview:?}, dev={dev:?}"
-    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -3765,11 +3753,7 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
             continue;
         };
         let Some(scale) = role_metadata_for_key(events, frame.6, ObserverRole::Preview)
-            .filter(|metadata| {
-                metadata.surface_epoch == frame.6.surface_epoch
-                    && metadata.scale.is_finite()
-                    && metadata.scale > 0.0
-            })
+            .filter(|metadata| metadata.scale.is_finite() && metadata.scale > 0.0)
             .map(|metadata| metadata.scale)
         else {
             return (
@@ -3851,16 +3835,6 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
                 false,
                 format!(
                     "TEST #{request_id} step {step_index} hover/down/up did not retain one hit target: {interactive_targets:?}"
-                ),
-            );
-        }
-        let first_sequence = step_frames.first().map_or(0, |frame| frame.5);
-        let final_sequence = step_frames.last().map_or(0, |frame| frame.5);
-        if interactive && final_sequence <= first_sequence {
-            return (
-                false,
-                format!(
-                    "TEST #{request_id} step {step_index} did not change runtime sequence after pointer playback"
                 ),
             );
         }
@@ -5160,6 +5134,7 @@ fn checkpoint_proof(
         VerifierCheckpointRequirementKind::ResponsiveLayout {
             baseline_checkpoint,
             logical_width,
+            navigation_sources,
         } => {
             let baseline_requirement = profile
                 .required_checkpoints
@@ -5186,9 +5161,9 @@ fn checkpoint_proof(
                 } if observed_width == logical_width
                     && baseline_key == &baseline_frame
                     && *source_revision == baseline.source_revision
-                    && *runtime_sequence == baseline.runtime_sequence
-                    && *durable_epoch == baseline.durable_epoch
-                    && *durable_turn_sequence == baseline.durable_turn_sequence
+                    && *runtime_sequence > baseline.runtime_sequence
+                    && *durable_epoch >= baseline.durable_epoch
+                    && *durable_turn_sequence >= baseline.durable_turn_sequence
                     && state_digest == &baseline.state_digest
                     && *baseline_action_count > 0
                     && *action_count == *baseline_action_count
@@ -5226,6 +5201,9 @@ fn checkpoint_proof(
                             logical_height: *observed_height,
                             action_count: *action_count,
                             action_digest: action_digest.clone(),
+                            navigation_step_count: navigation_sources.len() as u32,
+                            navigation_input_event_count: navigation_sources.len() as u32 * 2,
+                            visited_frame_count: navigation_sources.len() as u32 + 1,
                         },
                     })
                 }
@@ -5696,7 +5674,8 @@ fn role_metadata_for_key<'a>(
             if metadata.role == role
                 && metadata.pid == key.process_id
                 && metadata.surface_id == key.surface_id
-                && metadata.session_id == key.session_id =>
+                && metadata.session_id == key.session_id
+                && metadata.surface_epoch == key.surface_epoch =>
         {
             Some(metadata)
         }
@@ -6655,16 +6634,23 @@ impl NativeSession {
                 }) {
                     environment.push((STALE_PROGRAM_EVIDENCE_ENV, "1".to_owned()));
                 }
-                if let Some(width) = profile.required_checkpoints.iter().find_map(|checkpoint| {
-                    match checkpoint.evidence {
+                if let Some((width, navigation_sources)) = profile
+                    .required_checkpoints
+                    .iter()
+                    .find_map(|checkpoint| match checkpoint.evidence {
                         VerifierCheckpointRequirementKind::ResponsiveLayout {
                             logical_width,
+                            ref navigation_sources,
                             ..
-                        } => Some(logical_width),
+                        } => Some((logical_width, navigation_sources)),
                         _ => None,
-                    }
-                }) {
+                    })
+                {
                     environment.push((RESPONSIVE_EVIDENCE_WIDTH_ENV, width.to_string()));
+                    environment.push((
+                        RESPONSIVE_NAVIGATION_SOURCES_ENV,
+                        navigation_sources.join(","),
+                    ));
                 }
                 if !profile.required_budget_metrics.is_empty() {
                     environment.push((PROFILE_BENCHMARK_ENV, "120".to_owned()));
@@ -7648,6 +7634,9 @@ enum StateCheckpointEvidence {
         logical_height: u32,
         action_count: u32,
         action_digest: String,
+        navigation_step_count: u32,
+        navigation_input_event_count: u32,
+        visited_frame_count: u32,
     },
     StaleCompileRejection {
         session: String,

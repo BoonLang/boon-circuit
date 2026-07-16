@@ -356,6 +356,7 @@ fn renderer_uploads_only_changed_retained_chunk_after_document_scene_interaction
                     primitive("left", 12.0, [30, 90, 150, 255]),
                     primitive("right", 68.0, right_color),
                 ],
+                overlay_visual_primitives: Vec::new(),
                 quad_batches: Vec::new(),
                 text_runs: Vec::new(),
                 metrics: boon_document::RenderSceneMetrics {
@@ -535,6 +536,7 @@ fn renderer_reuses_prepared_quad_cache_across_alternating_scene_identities() {
                     style_identity,
                     dependency_set: vec![format!("primitive:{node}:fill")],
                 }],
+                overlay_visual_primitives: Vec::new(),
                 quad_batches: Vec::new(),
                 text_runs: Vec::new(),
                 metrics: boon_document::RenderSceneMetrics {

@@ -144,7 +144,7 @@ impl RetainedView {
                 } else {
                     bounds
                 };
-                scene.visual_primitives.push(RenderVisualPrimitive {
+                scene.overlay_visual_primitives.push(RenderVisualPrimitive {
                     node: DocumentNodeId("operator.cursor".to_owned()),
                     retained_chunk_id: format!("{cursor_id:x}{layer}{part}"),
                     source_kind: DocumentNodeKind::Root,
@@ -163,8 +163,6 @@ impl RetainedView {
                 });
             }
         }
-        scene.metrics.visual_primitive_count =
-            scene.visual_primitives.len().try_into().unwrap_or(u32::MAX);
         scene
     }
 

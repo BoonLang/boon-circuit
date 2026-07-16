@@ -189,6 +189,7 @@ FUNCTION mobile_workspace() {
         gap: 10
         style: [
             width: Fill
+            height: 820
             visible_max_width: 859
             padding: 10
             paint: False

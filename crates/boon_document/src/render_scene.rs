@@ -121,6 +121,8 @@ pub struct RenderScene {
     pub viewport: Rect,
     pub items: Vec<RenderSceneItem>,
     pub visual_primitives: Vec<RenderVisualPrimitive>,
+    #[serde(default)]
+    pub overlay_visual_primitives: Vec<RenderVisualPrimitive>,
     pub quad_batches: Vec<RenderQuadBatch>,
     pub text_runs: Vec<RenderTextRun>,
     pub metrics: RenderSceneMetrics,
@@ -887,6 +889,7 @@ pub fn lower_layout_frame_to_render_scene(
         },
         items,
         visual_primitives,
+        overlay_visual_primitives: Vec::new(),
         quad_batches: Vec::new(),
         text_runs,
     }

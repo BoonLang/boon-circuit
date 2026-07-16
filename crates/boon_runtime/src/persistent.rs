@@ -686,6 +686,12 @@ impl PersistentRuntime {
         self.persistence.status()
     }
 
+    pub fn semantic_value_image(&self) -> Result<RestoreImage, String> {
+        self.runtime
+            .semantic_value_image()
+            .map_err(|error| error.to_string())
+    }
+
     pub fn last_rebuild_derived_us(&self) -> u64 {
         self.last_rebuild_derived_us
     }

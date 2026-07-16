@@ -348,6 +348,8 @@ fn persons_profile_rejects_unproven_semantic_scenario_and_missing_checkpoint() {
     let manifest = load_manifest(&workspace_root()).unwrap().0;
     let entry = manifest_gate(&manifest, "persons-pro");
     let expected = expected_identity();
+    let encoded = serde_json::to_value(passing_timed_report("persons-pro")).unwrap();
+    serde_json::from_value::<crate::report_v2::GateReport>(encoded).unwrap();
 
     let mut missing_semantics = passing_timed_report("persons-pro");
     let scenario = missing_semantics
@@ -737,10 +739,11 @@ fn complete_profile_evidence(entry: &ManifestGate) -> VerificationProfileEvidenc
                             "store.elements.test"
                         })
                         .unwrap(),
-                        action_kind: if assertion_only {
-                            NativeWorkflowActionKind::AssertionOnly
-                        } else {
-                            NativeWorkflowActionKind::Click
+                        action_kind: match index {
+                            0 => NativeWorkflowActionKind::AssertionOnly,
+                            1 => NativeWorkflowActionKind::FocusedChord,
+                            2 => NativeWorkflowActionKind::FocusedKey,
+                            _ => NativeWorkflowActionKind::Click,
                         },
                         action_digest: digest_index(200 + index),
                         input_first_sequence: if assertion_only {
@@ -833,12 +836,16 @@ fn complete_profile_evidence(entry: &ManifestGate) -> VerificationProfileEvidenc
                         CheckpointEvidenceRequirement::ResponsiveLayout {
                             baseline_checkpoint,
                             logical_width,
+                            navigation_sources,
                         } => StateCheckpointEvidence::ResponsiveLayout {
                             baseline_checkpoint,
                             logical_width,
                             logical_height: 844,
                             action_count: 1,
                             action_digest: digest('7'),
+                            navigation_step_count: navigation_sources.len() as u32,
+                            navigation_input_event_count: navigation_sources.len() as u32 * 2,
+                            visited_frame_count: navigation_sources.len() as u32 + 1,
                         },
                         CheckpointEvidenceRequirement::StaleCompileRejection => {
                             StateCheckpointEvidence::StaleCompileRejection {

@@ -13,6 +13,7 @@ pending_program_artifact_store_max = 1
 pending_program_artifact_load_max = 1
 pending_persistence_artifact_store_max = 1
 pending_persistence_artifact_load_max = 1
+# Backlog only; the worker reports its single in-flight redb transaction separately.
 pending_durable_batch_max = 1
 proof_replacement_max = 0
 proof_result_drop_max = 0

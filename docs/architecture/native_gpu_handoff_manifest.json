@@ -345,7 +345,12 @@
               "id": "responsive-layout-parity",
               "kind": "responsive-layout",
               "baseline_checkpoint": "native-auto-preview",
-              "logical_width": 390
+              "logical_width": 390,
+              "navigation_sources": [
+                "store.elements.show_preview",
+                "store.elements.show_publish",
+                "store.elements.show_code"
+              ]
             },
             {
               "id": "stale-compile-rejected",

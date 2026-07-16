@@ -71,6 +71,7 @@ fn renderer_paints_external_document_border_primitives() {
                 dependency_set: vec!["primitive:border-bottom".to_owned()],
             },
         ],
+        overlay_visual_primitives: Vec::new(),
         quad_batches: Vec::new(),
         text_runs: Vec::new(),
         metrics: boon_document::RenderSceneMetrics {
@@ -195,6 +196,7 @@ fn renderer_paints_external_document_material_layer_primitives() {
                 dependency_set: vec!["primitive:material-highlight-top".to_owned()],
             },
         ],
+        overlay_visual_primitives: Vec::new(),
         quad_batches: Vec::new(),
         text_runs: Vec::new(),
         metrics: boon_document::RenderSceneMetrics {
@@ -297,6 +299,7 @@ fn renderer_paints_external_document_shadow_primitives() {
                 dependency_set: vec!["primitive:fill".to_owned()],
             },
         ],
+        overlay_visual_primitives: Vec::new(),
         quad_batches: Vec::new(),
         text_runs: Vec::new(),
         metrics: boon_document::RenderSceneMetrics {
@@ -399,6 +402,7 @@ fn renderer_paints_external_document_checkbox_raster_primitives() {
                 dependency_set: vec!["primitive:checkbox-checkmark".to_owned()],
             },
         ],
+        overlay_visual_primitives: Vec::new(),
         quad_batches: Vec::new(),
         text_runs: Vec::new(),
         metrics: boon_document::RenderSceneMetrics {
@@ -427,4 +431,3 @@ fn renderer_paints_external_document_checkbox_raster_primitives() {
         );
     }
 }
-

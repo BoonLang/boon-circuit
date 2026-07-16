@@ -470,6 +470,10 @@ impl LiveRuntime {
             .durable_restore_image(epoch, completed_migration_edges)?)
     }
 
+    pub fn semantic_value_image(&self) -> RuntimeResult<RestoreImage> {
+        Ok(self.session.semantic_value_image()?)
+    }
+
     pub fn root_value_current(&mut self, name: &str) -> RuntimeResult<Value> {
         Ok(self.session.root_value_current(name)?)
     }

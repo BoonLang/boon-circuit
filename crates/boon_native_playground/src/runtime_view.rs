@@ -18,9 +18,9 @@ use boon_runtime::{
     HostEffectWorker, LiveRuntime, PersistentDispatchError, PersistentRuntime,
     PersistentRuntimeStartup, PersistentRuntimeStartupDisposition, ProgramArtifact,
     ProgramArtifactOwnership, ProgramCompletion, ProgramDiagnostic, ProgramDocumentHost,
-    ProgramHostCompletion, ProgramHostDiagnostic, ProgramHostRequest, ProgramRequestId,
-    ProgramSessionId, RowId, RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload,
-    Value,
+    ProgramHostCompletion, ProgramHostDiagnostic, ProgramHostRequest, ProgramRejection,
+    ProgramRequestId, ProgramSessionId, RowId, RuntimePhaseTimings, RuntimeTurn, SessionOptions,
+    SourcePayload, Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -795,6 +795,10 @@ impl RuntimeView {
 
     pub fn runtime_turn_sequence(&self) -> u64 {
         self.runtime_turn_sequence
+    }
+
+    pub fn semantic_value_image(&self) -> ViewResult<boon_persistence::RestoreImage> {
+        self.runtime.semantic_value_image()
     }
 
     pub fn assert_scenario_step(&mut self, step: &boon_runtime::ScenarioStep) -> ViewResult<()> {
@@ -2137,30 +2141,7 @@ impl RuntimeView {
                     .active_artifact(session)
                     .map(|artifact| ("compiled", compiled_program_payload(artifact, bootstrap))),
                 ProgramHostCompletion::Program(ProgramCompletion::Rejected { diagnostic }) => {
-                    let mut payload = SourcePayload {
-                        text: Some(diagnostic.message.clone()),
-                        ..SourcePayload::default()
-                    };
-                    payload.fields.insert(
-                        "revision".to_owned(),
-                        Value::Text(diagnostic.revision.to_string()),
-                    );
-                    payload.fields.insert(
-                        "source_path".to_owned(),
-                        Value::Text(diagnostic.source_path.clone()),
-                    );
-                    payload
-                        .fields
-                        .insert("line".to_owned(), Value::Text(diagnostic.line.to_string()));
-                    payload.fields.insert(
-                        "column".to_owned(),
-                        Value::Text(diagnostic.column.to_string()),
-                    );
-                    payload.fields.insert(
-                        "diagnostic".to_owned(),
-                        Value::Text(diagnostic.message.clone()),
-                    );
-                    Some(("rejected", payload))
+                    Some(("rejected", rejected_program_payload(diagnostic)))
                 }
                 ProgramHostCompletion::Program(ProgramCompletion::Stale { .. })
                 | ProgramHostCompletion::Superseded { .. }
@@ -2173,6 +2154,7 @@ impl RuntimeView {
         );
         let mut changed =
             self.queue_program_update(update.patches, update.requests) || program_state_changed;
+        changed |= self.dispatch_rejections(update.rejections)?;
         if let Some((intent, payload)) = lifecycle {
             for path in self.program_host.lifecycle_source_paths(session, intent) {
                 changed |= self.dispatch_source(&path, None, payload.clone())?;
@@ -3323,6 +3305,20 @@ impl RuntimeView {
         changed
     }
 
+    fn dispatch_rejections(&mut self, rejections: Vec<ProgramRejection>) -> ViewResult<bool> {
+        let mut changed = false;
+        for rejection in rejections {
+            let payload = rejected_program_payload(&rejection.diagnostic);
+            let paths = self
+                .program_host
+                .lifecycle_source_paths(&rejection.session, "rejected");
+            for path in paths {
+                changed |= self.dispatch_source(&path, None, payload.clone())?;
+            }
+        }
+        Ok(changed)
+    }
+
     fn finish_parent_runtime_turn(&mut self, turn: RuntimeTurn) -> ViewResult<bool> {
         let durable_sequence = turn.sequence;
         let durable_queued_at = Instant::now();
@@ -3355,7 +3351,8 @@ impl RuntimeView {
         let update = self
             .program_host
             .reconcile_with_parent_patches(parent, parent_patches);
-        let changed = self.queue_program_update(update.patches, update.requests);
+        let mut changed = self.queue_program_update(update.patches, update.requests);
+        changed |= self.dispatch_rejections(update.rejections)?;
         Ok(changed)
     }
 
@@ -3703,12 +3700,14 @@ fn logical_key_text(key: &boon_host::LogicalKey) -> String {
     }
 }
 
-fn normalize_key(value: &str) -> String {
+pub(crate) fn normalize_key(value: &str) -> String {
     match value.to_ascii_lowercase().as_str() {
         "arrowleft" | "leftarrow" => "left".to_owned(),
         "arrowright" | "rightarrow" => "right".to_owned(),
         "arrowup" | "uparrow" => "up".to_owned(),
         "arrowdown" | "downarrow" => "down".to_owned(),
+        "prior" | "page_up" | "page up" => "pageup".to_owned(),
+        "next" | "page_down" | "page down" => "pagedown".to_owned(),
         "back_space" => "backspace".to_owned(),
         "return" | "kp_enter" => "enter".to_owned(),
         value => value.to_owned(),
@@ -3888,6 +3887,23 @@ fn compiled_program_payload(artifact: &ProgramArtifact, bootstrap: bool) -> Sour
     payload
         .fields
         .insert("bootstrap".to_owned(), Value::Bool(bootstrap));
+    payload
+}
+
+fn rejected_program_payload(diagnostic: &ProgramDiagnostic) -> SourcePayload {
+    let mut payload = SourcePayload {
+        text: Some(diagnostic.message.clone()),
+        ..SourcePayload::default()
+    };
+    for (name, value) in [
+        ("revision", diagnostic.revision.to_string()),
+        ("source_path", diagnostic.source_path.clone()),
+        ("line", diagnostic.line.to_string()),
+        ("column", diagnostic.column.to_string()),
+        ("diagnostic", diagnostic.message.clone()),
+    ] {
+        payload.fields.insert(name.to_owned(), Value::Text(value));
+    }
     payload
 }
 

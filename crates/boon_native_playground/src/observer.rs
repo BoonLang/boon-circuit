@@ -20,6 +20,7 @@ pub const PROFILE_BENCHMARK_ENV: &str = "BOON_VERIFY_PROFILE_BENCHMARK";
 pub const PROFILE_BENCHMARK_STEPS_ENV: &str = "BOON_VERIFY_PROFILE_BENCHMARK_STEPS";
 pub const PRODUCT_PROOF_AFTER_TEST_ENV: &str = "BOON_VERIFY_PRODUCT_PROOF_AFTER_TEST";
 pub const RESPONSIVE_EVIDENCE_WIDTH_ENV: &str = "BOON_VERIFY_RESPONSIVE_EVIDENCE_WIDTH";
+pub const RESPONSIVE_NAVIGATION_SOURCES_ENV: &str = "BOON_VERIFY_RESPONSIVE_NAVIGATION_SOURCES";
 pub const SCROLL_PROOF_ORDINAL_ENV: &str = "BOON_VERIFY_SCROLL_PROOF_ORDINAL";
 pub const STALE_PROGRAM_EVIDENCE_ENV: &str = "BOON_VERIFY_STALE_PROGRAM_EVIDENCE";
 pub const NATIVE_WORKFLOW_STEPS_ENV: &str = "BOON_VERIFY_NATIVE_WORKFLOW_STEPS";
@@ -494,6 +495,7 @@ pub enum ObserverEvent {
         pending_program_artifact_loads: u32,
         pending_persistence_artifact_stores: u32,
         pending_persistence_artifact_loads: u32,
+        /// Durable checkpoint batches queued behind the transaction in flight.
         pending_durable_batches: u32,
         trusted_parent_rebuilds: u32,
         source_revision: u64,

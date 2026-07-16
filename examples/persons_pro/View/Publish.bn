@@ -49,7 +49,7 @@ FUNCTION root() {
         style: [
             ...PersonsTheme/panel(mode: PASSED.store.mode)
             width: Fill
-            height: 700
+            height: Fill
             padding: 14
         ]
         items: LIST {

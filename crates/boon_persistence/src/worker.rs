@@ -232,6 +232,10 @@ pub struct PendingTurnRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistenceWorkerStatus {
     pub pending: Option<PendingTurnRange>,
+    /// Whether one worker-owned checkpoint transaction is currently running.
+    pub checkpoint_batch_in_flight: bool,
+    /// Checkpoint batches waiting behind the transaction currently in flight.
+    pub queued_checkpoint_batches: usize,
     /// Checkpoint commits needed to make the currently accepted authority
     /// durable. Multiple logical turns may share one worker-owned checkpoint.
     pub pending_checkpoint_batches: usize,
@@ -487,6 +491,7 @@ impl SharedState {
         let admission = lock(&self.admission);
         let pending_checkpoint_batches =
             pending_checkpoint_batches(&admission, self.max_batch_turns);
+        let checkpoint_batch_in_flight = admission.active_checkpoint_turns > 0;
         let pending = admission.pending.front().map(|first| PendingTurnRange {
             first_turn_sequence: first.turn_sequence,
             last_turn_sequence: admission
@@ -498,6 +503,8 @@ impl SharedState {
         });
         PersistenceWorkerStatus {
             pending,
+            checkpoint_batch_in_flight,
+            queued_checkpoint_batches: queued_checkpoint_batches(&admission, self.max_batch_turns),
             pending_checkpoint_batches,
             pending_checkpoint_batches_peak: admission.pending_checkpoint_batches_peak,
             durable_epoch: self.durable_epoch.load(Ordering::Acquire),
@@ -526,6 +533,11 @@ impl SharedState {
 }
 
 fn pending_checkpoint_batches(admission: &AdmissionState, max_batch_turns: usize) -> usize {
+    usize::from(admission.active_checkpoint_turns > 0)
+        .saturating_add(queued_checkpoint_batches(admission, max_batch_turns))
+}
+
+fn queued_checkpoint_batches(admission: &AdmissionState, max_batch_turns: usize) -> usize {
     let active_checkpoint_turns = admission
         .active_checkpoint_turns
         .min(admission.pending.len());
@@ -533,8 +545,7 @@ fn pending_checkpoint_batches(admission: &AdmissionState, max_batch_turns: usize
         .pending
         .len()
         .saturating_sub(active_checkpoint_turns);
-    usize::from(active_checkpoint_turns > 0)
-        .saturating_add(queued_checkpoint_turns.div_ceil(max_batch_turns))
+    queued_checkpoint_turns.div_ceil(max_batch_turns)
 }
 
 fn update_pending_checkpoint_batches_peak(admission: &mut AdmissionState, max_batch_turns: usize) {
@@ -1168,13 +1179,13 @@ fn worker_main<D>(
                     &shared,
                 );
                 shared.begin_checkpoint_batch(pending.len());
+                let _ = flush_pending(&mut driver, &mut durable, &mut pending, &shared);
                 for artifact in async_artifacts {
                     assert!(
                         handle_async_artifact(&mut driver, &durable, artifact, &shared).is_ok(),
                         "batch collection must retain only asynchronous artifact messages"
                     );
                 }
-                let _ = flush_pending(&mut driver, &mut durable, &mut pending, &shared);
             }
             message => {
                 if let Err(control) = handle_async_artifact(&mut driver, &durable, message, &shared)
@@ -2017,12 +2028,17 @@ mod tests {
             Some((1, 3))
         );
         assert_eq!(status.pending_checkpoint_batches, 2);
+        assert!(status.checkpoint_batch_in_flight);
+        assert_eq!(status.queued_checkpoint_batches, 1);
         assert_eq!(status.pending_checkpoint_batches_peak, 2);
 
         gate.release();
         coordinator.barrier().unwrap();
-        assert_eq!(coordinator.status().pending_checkpoint_batches, 0);
-        assert_eq!(coordinator.status().pending_checkpoint_batches_peak, 2);
+        let status = coordinator.status();
+        assert_eq!(status.pending_checkpoint_batches, 0);
+        assert!(!status.checkpoint_batch_in_flight);
+        assert_eq!(status.queued_checkpoint_batches, 0);
+        assert_eq!(status.pending_checkpoint_batches_peak, 2);
         coordinator.shutdown().unwrap();
     }
 
@@ -2196,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_batch_is_counted_while_slow_artifact_work_runs() {
+    fn sealed_authority_is_durable_before_slow_artifact_work_runs() {
         let trace = DriverTrace::default();
         let artifact_gate = Arc::new(CommitGate::new());
         let driver = RecordingDriver {
@@ -2217,10 +2233,11 @@ mod tests {
         coordinator.try_enqueue_turn(turn(1, 11)).unwrap();
         coordinator.try_put_content_artifact(artifact).unwrap();
         artifact_gate.wait_until_entered();
+        assert_eq!(coordinator.status().durable_through_turn_sequence, 1);
         coordinator.try_enqueue_turn(turn(2, 22)).unwrap();
         let status = coordinator.status();
-        assert_eq!(status.pending_checkpoint_batches, 2);
-        assert_eq!(status.pending_checkpoint_batches_peak, 2);
+        assert_eq!(status.pending_checkpoint_batches, 1);
+        assert_eq!(status.pending_checkpoint_batches_peak, 1);
 
         artifact_gate.release();
         coordinator.barrier().unwrap();

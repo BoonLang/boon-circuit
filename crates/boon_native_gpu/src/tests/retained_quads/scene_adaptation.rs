@@ -1,4 +1,11 @@
 #[test]
+fn surface_render_extent_preserves_the_exact_target_size() {
+    assert_eq!(surface_render_extent(2_560, 1_440), (2_560, 1_440));
+    assert_eq!(surface_render_extent(1_020, 1_082), (1_020, 1_082));
+    assert_eq!(surface_render_extent(0, 0), (1, 1));
+}
+
+#[test]
 fn renderer_helpers_accept_prelowered_render_scene_without_layout_frame() {
     let item = RenderSceneItem {
         node: DocumentNodeId("primitive-node".to_owned()),
@@ -39,6 +46,7 @@ fn renderer_helpers_accept_prelowered_render_scene_without_layout_frame() {
         },
         items: vec![item],
         quad_batches: builder.batches,
+        overlay_batch_start: 1,
         rect_metrics: RectVertexMetrics {
             visible_display_item_count: 1,
             rendered_rect_count: 1,
@@ -63,7 +71,7 @@ fn renderer_helpers_accept_prelowered_render_scene_without_layout_frame() {
 #[test]
 fn renderer_adapts_external_document_render_scene_without_layout_frame() {
     let style_identity = test_style_identity();
-    let document_scene = DocumentRenderScene {
+    let mut document_scene = DocumentRenderScene {
         viewport: Rect {
             x: 0.0,
             y: 0.0,
@@ -109,6 +117,7 @@ fn renderer_adapts_external_document_render_scene_without_layout_frame() {
             style_identity,
             dependency_set: vec!["prelowered:fill".to_owned()],
         }],
+        overlay_visual_primitives: Vec::new(),
         quad_batches: Vec::new(),
         text_runs: Vec::new(),
         metrics: boon_document::RenderSceneMetrics {
@@ -119,6 +128,9 @@ fn renderer_adapts_external_document_render_scene_without_layout_frame() {
         },
     };
 
+    document_scene
+        .overlay_visual_primitives
+        .push(document_scene.visual_primitives[0].clone());
     let scene = render_scene_from_document_scene(&document_scene, 320, 200);
     let (batches, metrics) = rect_vertices_from_scene(&scene, 320.0, 200.0);
     let chunk_summary =
@@ -126,7 +138,8 @@ fn renderer_adapts_external_document_render_scene_without_layout_frame() {
     let chunks = chunk_summary.retained_chunks;
 
     assert_eq!(scene.items[0].source_kind, "Button");
-    assert_eq!(batches.len(), 1);
+    assert_eq!(scene.overlay_batch_start, 1);
+    assert_eq!(batches.len(), 2);
     assert_eq!(metrics.visible_display_item_count, 1);
     assert_eq!(metrics.rendered_rect_count, 1);
     assert_eq!(chunks.len(), 1);
@@ -214,6 +227,7 @@ fn app_owned_scene_readback_uses_prelowered_render_scene_identity() {
                 style_identity,
                 dependency_set: vec!["primitive:fill".to_owned()],
             }],
+            overlay_visual_primitives: Vec::new(),
             quad_batches: Vec::new(),
             text_runs: Vec::new(),
             metrics: boon_document::RenderSceneMetrics {

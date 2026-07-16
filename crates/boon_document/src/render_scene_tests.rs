@@ -100,6 +100,7 @@ fn render_scene_contract_is_renderer_neutral_and_serializable() {
         },
         items: vec![item],
         visual_primitives: Vec::new(),
+        overlay_visual_primitives: Vec::new(),
         quad_batches: vec![RenderQuadBatch {
             retained_chunk_id: Some("chunk:row-1".to_owned()),
             texture: RenderTextureRef::Solid,

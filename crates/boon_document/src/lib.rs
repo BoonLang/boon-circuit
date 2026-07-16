@@ -8,6 +8,7 @@ pub use boon_document_model::{
     UiSemanticChange,
 };
 pub mod render_scene;
+pub mod source_actions;
 use boon_host::Viewport;
 pub use boon_host::{
     SemanticAction, SemanticActions, SemanticId, SemanticInputEvent, SemanticNode, SemanticPatch,

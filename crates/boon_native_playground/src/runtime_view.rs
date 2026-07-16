@@ -2804,10 +2804,9 @@ impl RuntimeView {
         let Some(state) = self.text_inputs.get_mut(id) else {
             return false;
         };
-        let changed = state.buffer.set_caret(Position { line, column }, extend);
+        let _ = state.buffer.set_caret(Position { line, column }, extend);
         state.reset_blink();
         self.queue_text_input_style(id);
-        let _ = changed;
         true
     }
 
@@ -2831,7 +2830,7 @@ impl RuntimeView {
             .get(focused)
             .map(|state| state.buffer.text())
             .unwrap_or_default();
-        let runtime_changed = self.dispatch_node_intent(
+        self.dispatch_node_intent(
             focused,
             &["change", "text", "input", "source"],
             SourcePayload {
@@ -2840,7 +2839,6 @@ impl RuntimeView {
             },
         )?;
         self.queue_text_input_overlay(focused);
-        let _ = runtime_changed;
         Ok(true)
     }
 
@@ -2888,10 +2886,9 @@ impl RuntimeView {
             match normalized.as_str() {
                 "a" => {
                     let state = self.text_inputs.get_mut(&focused).expect("focused input");
-                    let changed = state.buffer.apply(Command::SelectAll);
+                    let _ = state.buffer.apply(Command::SelectAll);
                     state.reset_blink();
                     self.queue_text_input_style(&focused);
-                    let _ = changed;
                     return Ok(true);
                 }
                 "c" => {
@@ -2938,10 +2935,9 @@ impl RuntimeView {
                 return self.edit_focused_text(command);
             }
             let state = self.text_inputs.get_mut(&focused).expect("focused input");
-            let changed = state.buffer.apply(command);
+            let _ = state.buffer.apply(command);
             state.reset_blink();
             self.queue_text_input_style(&focused);
-            let _ = changed;
             return Ok(true);
         }
 
@@ -2949,7 +2945,7 @@ impl RuntimeView {
             if self.focused_is_multiline() {
                 return self.edit_focused_text(Command::Newline);
             }
-            let changed = self.dispatch_node_intent(
+            self.dispatch_node_intent(
                 &focused,
                 &["commit", "submit", "key_down", "source"],
                 SourcePayload {
@@ -2959,7 +2955,6 @@ impl RuntimeView {
             )?;
             self.sync_text_input_from_document(&focused, None);
             self.queue_text_input_overlay(&focused);
-            let _ = changed;
             return Ok(true);
         }
         if normalized == "tab" && self.focused_is_multiline() {
@@ -2970,7 +2965,7 @@ impl RuntimeView {
             });
         }
         if normalized == "escape" {
-            let changed = self.dispatch_node_intent(
+            self.dispatch_node_intent(
                 &focused,
                 &["cancel", "escape", "key_down", "source"],
                 SourcePayload {
@@ -2980,7 +2975,6 @@ impl RuntimeView {
             )?;
             self.sync_text_input_from_document(&focused, None);
             self.queue_text_input_overlay(&focused);
-            let _ = changed;
             return Ok(true);
         }
         Ok(false)
@@ -3411,12 +3405,18 @@ impl RuntimeView {
     }
 
     fn capture_scenario_turn(&mut self, source_path: &str, turn: &RuntimeTurn) {
-        if self.scenario_trigger_turn.is_none()
-            && self.scenario_trigger_source.as_deref() == Some(source_path)
-        {
-            self.scenario_trigger_turn = Some(turn.clone());
-            self.scenario_trigger_source = None;
+        if self.scenario_trigger_source.as_deref() != Some(source_path) {
+            if self.scenario_trigger_source.is_some() && !turn.document_patches.is_empty() {
+                self.scenario_trigger_turn = Some(turn.clone());
+            }
+            return;
         }
+        let mut declared = turn.clone();
+        if let Some(earlier) = self.scenario_trigger_turn.take() {
+            declared.document_patches.extend(earlier.document_patches);
+        }
+        self.scenario_trigger_turn = Some(declared);
+        self.scenario_trigger_source = None;
     }
 
     fn dispatch_host_lifecycle_started(&mut self) -> ViewResult<()> {

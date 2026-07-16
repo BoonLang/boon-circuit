@@ -6,6 +6,9 @@ use boon_document::{
 };
 use boon_host::Viewport;
 
+pub(crate) const OPERATOR_CURSOR_LIGHT: [u8; 4] = [255, 255, 255, 255];
+pub(crate) const OPERATOR_CURSOR_DARK: [u8; 4] = [24, 28, 36, 255];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HitTarget {
     pub node: String,
@@ -150,7 +153,7 @@ impl RetainedView {
                 height: 9.0,
             },
         ];
-        for (layer, color) in [[255, 255, 255, 255], [24, 28, 36, 255]]
+        for (layer, color) in [OPERATOR_CURSOR_LIGHT, OPERATOR_CURSOR_DARK]
             .into_iter()
             .enumerate()
         {

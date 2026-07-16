@@ -3799,6 +3799,57 @@ pub fn complete_presented_texture_readback(
     })
 }
 
+pub fn verify_bordered_marker_pixels(
+    artifact_path: &Path,
+    x: f32,
+    y: f32,
+    scale: f64,
+    foreground: [u8; 4],
+    border_color: [u8; 4],
+) -> Result<usize, RenderError> {
+    if !x.is_finite() || !y.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return Err(RenderError {
+            message: "pixel marker probe has invalid coordinates or scale".to_owned(),
+        });
+    }
+    let pixels = image::open(artifact_path)
+        .map_err(|error| RenderError {
+            message: format!("decode marker proof `{}`: {error}", artifact_path.display()),
+        })?
+        .into_rgba8();
+    let origin_x = (f64::from(x) * scale).round() as i64;
+    let origin_y = (f64::from(y) * scale).round() as i64;
+    let stroke = (3.0 * scale).ceil().max(2.0) as i64;
+    let border = (2.0 * scale).ceil().max(1.0) as i64;
+    let row_end = (origin_y + (12.0 * scale).ceil() as i64).min(i64::from(pixels.height()));
+    let mut matched_rows = 0usize;
+    for py in origin_y.max(0)..row_end {
+        let row_matches =
+            ((origin_x - 1).max(0)..(origin_x + stroke).min(i64::from(pixels.width()))).any(|px| {
+                pixel_near(pixels.get_pixel(px as u32, py as u32).0, foreground)
+                    && ((px - border).max(0)..px).any(|border_x| {
+                        pixel_near(pixels.get_pixel(border_x as u32, py as u32).0, border_color)
+                    })
+            });
+        matched_rows = matched_rows.saturating_add(usize::from(row_matches));
+    }
+    let required_rows = (6.0 * scale).ceil().max(4.0) as usize;
+    (matched_rows >= required_rows)
+        .then_some(matched_rows)
+        .ok_or_else(|| RenderError {
+            message: format!(
+                "marker at ({x:.1}, {y:.1}) matched {matched_rows}/{required_rows} required rows"
+            ),
+        })
+}
+
+fn pixel_near(actual: [u8; 4], expected: [u8; 4]) -> bool {
+    actual
+        .into_iter()
+        .zip(expected)
+        .all(|(actual, expected)| actual.abs_diff(expected) <= 12)
+}
+
 fn render_app_owned_scene_pixels_with_renderer(
     request: AppOwnedRenderSceneRequest<'_>,
     renderer: &mut VisibleLayoutRenderer,

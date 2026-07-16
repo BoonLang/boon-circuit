@@ -300,8 +300,8 @@ Persist only authoritative product memory:
 - current source draft and source revision;
 - last successful artifact identity;
 - immutable published revision metadata;
-- selected editor, preview surface, and preview-width mode as workspace UI
-  preferences;
+- selected editor, preview surface, preview-width mode, and visual theme as
+  semantic workspace preferences;
 - registered credential descriptors, never private key material;
 - bounded account and publish workflow state that cannot be reconstructed.
 
@@ -454,7 +454,7 @@ frame-bound workflow checkpoints for restart, asynchronous artifact load,
 responsive desktop/narrow layouts, migration activation, scrolling, and
 visible TEST cursor playback.
 
-Current implementation evidence (2026-07-16, through commit `be6ff21`):
+Current implementation evidence (2026-07-16, beginning with commit `be6ff21`):
 
 - Asynchronous program-artifact store/load work no longer acts as a persistence
   checkpoint boundary. A 150 ms slow-I/O regression proves that an interleaved
@@ -494,6 +494,30 @@ Current implementation evidence (2026-07-16, through commit `be6ff21`):
   production batching, startup ordering, responsive identity/clip, and
   migration-revision contracts. Their timing-based test concern was replaced
   by the deterministic gate described above.
+- An independent final product/native audit found that ordinary editor behavior
+  was implemented but under-proven. The manifest-backed workflow now contains
+  36 ordered isolated-input steps, including PageDown caret reveal, select all,
+  copy, End navigation, paste, select again, Delete, and subsequent valid
+  typing. Twenty-four state frames require exact app-owned readback proof.
+- TEST evidence now decodes exact production-target artifacts and requires the
+  cursor's bordered vertical marker at the logical event coordinate and matching
+  surface scale. Frame sequencing plus a merely nonblank PNG is insufficient.
+- Responsive evidence requires exact multiplicity for every desktop product
+  action identity. Narrow-only navigation remains allowed, but is excluded from
+  the equivalent-action digest instead of masking duplicate product controls.
+- The architecture gate derives built-in identities from the example manifest
+  and rejects example-specific control-flow branches in generic engine and
+  native-verifier production code.
+- Clear/start-over, export, import preview/activation, corruption rejection,
+  restart, and migration deliberately remain generic host persistence
+  operations exposed by the dev surface and exercised by typed verifier
+  checkpoints. They are not duplicated as Persons-specific Boon source routes.
+
+At final handoff, the exact current results are the source-identity-bound files
+named by `docs/architecture/native_gpu_handoff_manifest.json`, culminating in
+`target/reports/report-v2/verify-all.json`. Those report artifacts, rather than
+copied timing prose in this plan, are the canonical measurements for the final
+HEAD; no tracked edit may follow their generation.
 
 The older release Persons report remains useful only as a historical timing
 sample: editor-visible p95 8.257 ms, child-preview p95 10.648 ms and p99

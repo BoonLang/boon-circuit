@@ -42,7 +42,10 @@ use crate::observer::{
 use crate::proof::frame_capture_token_digest;
 #[cfg(target_os = "linux")]
 use crate::{
-    native_input::NativeInput, ui::DEV_EDITOR_INPUT_TARGET, workspace_control::WorkspaceGuard,
+    native_input::NativeInput,
+    ui::DEV_EDITOR_INPUT_TARGET,
+    view::{OPERATOR_CURSOR_DARK, OPERATOR_CURSOR_LIGHT},
+    workspace_control::WorkspaceGuard,
 };
 
 const FORMAT_VERSION: u16 = 2;
@@ -2108,7 +2111,14 @@ fn declared_native_workflow(
                 .unwrap_or_else(|| "assertion_only".to_owned());
             if !matches!(
                 action_kind.as_str(),
-                "assertion_only" | "click" | "type_text" | "double_click" | "key" | "blur"
+                "assertion_only"
+                    | "click"
+                    | "type_text"
+                    | "double_click"
+                    | "key"
+                    | "focused_key"
+                    | "focused_chord"
+                    | "blur"
             ) {
                 return Err(format!(
                     "native workflow step `{id}` has unsupported action `{action_kind}`"
@@ -2132,6 +2142,15 @@ fn declared_native_workflow(
                         "native workflow step `{id}` text is not bounded printable ASCII"
                     ));
                 }
+            }
+            if action_kind == "focused_chord"
+                && !step.key.as_deref().is_some_and(|chord| {
+                    chord.split_once('+').is_some_and(|(modifier, key)| {
+                        matches!(modifier, "ctrl" | "shift") && !key.is_empty()
+                    })
+                })
+            {
+                return Err(format!("native workflow step `{id}` has an invalid chord"));
             }
             Ok(NativeWorkflowAction {
                 id: id.clone(),
@@ -2253,64 +2272,66 @@ fn drive_native_workflow(
                     action.id
                 ));
             }
-            let point = locate_target(
-                session,
-                observer,
-                events,
-                ObserverRole::Preview,
-                &target.0,
-                (target.1, target.2),
-                translated_target_candidates(preview_placement, target.1, target.2),
-            )?;
-            let pointer_start = events.len();
-            session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
-            wait_for_native_workflow_pointer_phase(
-                session,
-                observer,
-                events,
-                pointer_start,
-                test_request_id,
-                index,
-                TestPointerPhase::Move,
-            )?;
-            wait_for_native_workflow_pointer_phase(
-                session,
-                observer,
-                events,
-                pointer_start,
-                test_request_id,
-                index,
-                TestPointerPhase::Hover,
-            )?;
-            let pointer_cycles = usize::from(action.action_kind == "double_click") + 1;
-            for _ in 0..pointer_cycles {
-                let down_start = events.len();
-                session.run_driver(&["button", "down", "left"])?;
-                let down = wait_for_native_workflow_pointer_phase(
+            if !matches!(action.action_kind.as_str(), "focused_key" | "focused_chord") {
+                let point = locate_target(
                     session,
                     observer,
                     events,
-                    down_start,
-                    test_request_id,
-                    index,
-                    TestPointerPhase::Down,
-                );
-                if down.is_ok() {
-                    thread::sleep(crate::native_input::POINTER_CLICK_HOLD);
-                }
-                let up_start = events.len();
-                let release = session.run_driver(&["button", "up", "left"]);
-                down?;
-                release?;
+                    ObserverRole::Preview,
+                    &target.0,
+                    (target.1, target.2),
+                    translated_target_candidates(preview_placement, target.1, target.2),
+                )?;
+                let pointer_start = events.len();
+                session.run_driver(&["move", &point.0.to_string(), &point.1.to_string()])?;
                 wait_for_native_workflow_pointer_phase(
                     session,
                     observer,
                     events,
-                    up_start,
+                    pointer_start,
                     test_request_id,
                     index,
-                    TestPointerPhase::Up,
+                    TestPointerPhase::Move,
                 )?;
+                wait_for_native_workflow_pointer_phase(
+                    session,
+                    observer,
+                    events,
+                    pointer_start,
+                    test_request_id,
+                    index,
+                    TestPointerPhase::Hover,
+                )?;
+                let pointer_cycles = usize::from(action.action_kind == "double_click") + 1;
+                for _ in 0..pointer_cycles {
+                    let down_start = events.len();
+                    session.run_driver(&["button", "down", "left"])?;
+                    let down = wait_for_native_workflow_pointer_phase(
+                        session,
+                        observer,
+                        events,
+                        down_start,
+                        test_request_id,
+                        index,
+                        TestPointerPhase::Down,
+                    );
+                    if down.is_ok() {
+                        thread::sleep(crate::native_input::POINTER_CLICK_HOLD);
+                    }
+                    let up_start = events.len();
+                    let release = session.run_driver(&["button", "up", "left"]);
+                    down?;
+                    release?;
+                    wait_for_native_workflow_pointer_phase(
+                        session,
+                        observer,
+                        events,
+                        up_start,
+                        test_request_id,
+                        index,
+                        TestPointerPhase::Up,
+                    )?;
+                }
             }
             match action.action_kind.as_str() {
                 "type_text" => {
@@ -2324,12 +2345,20 @@ fn drive_native_workflow(
                     ])?;
                 }
                 "double_click" => {}
-                "key" => {
+                "key" | "focused_key" => {
                     let key = action.key.as_deref().ok_or_else(|| {
                         format!("native workflow key step `{}` has no key", action.id)
                     })?;
                     session.run_driver(&["key", "down", key])?;
                     session.run_driver(&["key", "up", key])?;
+                }
+                "focused_chord" => {
+                    let (modifier, key) = action
+                        .key
+                        .as_deref()
+                        .and_then(|chord| chord.split_once('+'))
+                        .expect("validated native workflow chord");
+                    session.run_driver(&["chord", modifier, key])?;
                 }
                 "blur" => {
                     session.run_driver(&["key", "down", "tab"])?;
@@ -3722,6 +3751,45 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
             format!("TEST #{request_id} pointer frames lack strict presented-frame identity"),
         );
     }
+    let mut cursor_proof_count = 0usize;
+    for frame in frames
+        .iter()
+        .filter(|frame| frame.1 == TestPointerPhase::State)
+    {
+        let Some(proof) = exact_proof_for_key(events, frame.6) else {
+            continue;
+        };
+        let Some(scale) = role_metadata_for_key(events, frame.6, ObserverRole::Preview)
+            .filter(|metadata| {
+                metadata.surface_epoch == frame.6.surface_epoch
+                    && metadata.scale.is_finite()
+                    && metadata.scale > 0.0
+            })
+            .map(|metadata| metadata.scale)
+        else {
+            return (
+                false,
+                format!("TEST #{request_id} cursor proof has no exact preview scale"),
+            );
+        };
+        if let Err(error) = boon_native_gpu::verify_bordered_marker_pixels(
+            Path::new(&proof.artifact.path),
+            frame.2,
+            frame.3,
+            scale,
+            OPERATOR_CURSOR_DARK,
+            OPERATOR_CURSOR_LIGHT,
+        ) {
+            return (false, format!("TEST #{request_id} {error}"));
+        }
+        cursor_proof_count = cursor_proof_count.saturating_add(1);
+    }
+    if cursor_proof_count == 0 {
+        return (
+            false,
+            format!("TEST #{request_id} has no exact cursor-frame WGPU proof"),
+        );
+    }
     let unique_positions = frames
         .iter()
         .filter(|frame| frame.1 == TestPointerPhase::Move)
@@ -3794,8 +3862,8 @@ fn test_pointer_playback_summary(events: &[ObserverEvent]) -> (bool, String) {
     (
         true,
         format!(
-            "TEST #{request_id} presented {} cursor frames across {completed_steps} steps with move, hover, down, up, and resulting state",
-            frames.len()
+            "TEST #{request_id} presented {} cursor frames across {completed_steps} steps with {cursor_proof_count} coordinate-matched WGPU cursor proofs",
+            frames.len(),
         ),
     )
 }
@@ -5117,9 +5185,9 @@ fn checkpoint_proof(
                     && *durable_turn_sequence == baseline.durable_turn_sequence
                     && state_digest == &baseline.state_digest
                     && *baseline_action_count > 0
-                    && *action_count >= *baseline_action_count
+                    && *action_count == *baseline_action_count
+                    && action_digest == baseline_action_digest
                     && baseline_action_digest.len() == 64
-                    && action_digest.len() == 64
                     && baseline_key.same_producer_surface(key)
                     && key.frame_id > baseline_key.frame_id
                     && key.present_id > baseline_key.present_id
@@ -5612,19 +5680,31 @@ fn role_metadata(events: &[ObserverEvent]) -> BTreeMap<ObserverRole, RoleMetadat
 }
 
 #[cfg(target_os = "linux")]
+fn role_metadata_for_key<'a>(
+    events: &'a [ObserverEvent],
+    key: &FrameEvidenceKey,
+    role: ObserverRole,
+) -> Option<&'a RoleMetadata> {
+    events.iter().rev().find_map(|event| match event {
+        ObserverEvent::RoleMetadata(metadata)
+            if metadata.role == role
+                && metadata.pid == key.process_id
+                && metadata.surface_id == key.surface_id
+                && metadata.session_id == key.session_id =>
+        {
+            Some(metadata)
+        }
+        _ => None,
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn frame_key_matches_metadata(
     events: &[ObserverEvent],
     key: &FrameEvidenceKey,
     role: ObserverRole,
 ) -> bool {
-    key.is_complete()
-        && events.iter().any(|event| {
-            matches!(event, ObserverEvent::RoleMetadata(metadata)
-                if metadata.role == role
-                    && metadata.pid == key.process_id
-                    && metadata.surface_id == key.surface_id
-                    && metadata.session_id == key.session_id)
-        })
+    key.is_complete() && role_metadata_for_key(events, key, role).is_some()
 }
 
 #[cfg(target_os = "linux")]
@@ -7108,11 +7188,16 @@ fn key_code(name: &str) -> Result<u16, String> {
     match name {
         "ctrl" => Ok(29),
         "a" => Ok(30),
+        "c" => Ok(46),
+        "v" => Ok(47),
         "tab" => Ok(15),
         "enter" => Ok(28),
         "escape" => Ok(1),
         "left" => Ok(105),
         "right" => Ok(106),
+        "end" => Ok(107),
+        "pagedown" => Ok(109),
+        "delete" => Ok(111),
         "i" => Ok(23),
         "u" => Ok(22),
         "y" => Ok(21),
@@ -7828,6 +7913,48 @@ mod tests {
         assert_eq!(profile.scroll_samples, 148);
         assert_eq!(profile.selection_samples, 0);
         assert_eq!(profile.visible_mode, VisibleSampleMode::Hover);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cursor_pixel_proof_is_bound_to_its_reported_coordinate() {
+        let path = std::env::temp_dir().join(format!(
+            "boon-cursor-proof-{}-{}.png",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut pixels = image::RgbaImage::from_pixel(32, 32, image::Rgba(OPERATOR_CURSOR_LIGHT));
+        for y in 8..20 {
+            for x in 8..10 {
+                pixels.put_pixel(x, y, image::Rgba(OPERATOR_CURSOR_DARK));
+            }
+        }
+        pixels.save(&path).unwrap();
+        let artifact = ProofArtifact {
+            path: path.display().to_string(),
+            sha256: "a".repeat(64),
+            byte_len: 1,
+            capture_method: "app-owned-render-target-readback".to_owned(),
+            capture_token_digest: "b".repeat(64),
+            nonblank_samples: 1,
+            unique_rgba_values: 2,
+        };
+        let probe = |x, y| {
+            boon_native_gpu::verify_bordered_marker_pixels(
+                Path::new(&artifact.path),
+                x,
+                y,
+                1.0,
+                OPERATOR_CURSOR_DARK,
+                OPERATOR_CURSOR_LIGHT,
+            )
+        };
+        assert!(probe(8.0, 8.0).is_ok());
+        assert!(probe(20.0, 20.0).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[cfg(target_os = "linux")]

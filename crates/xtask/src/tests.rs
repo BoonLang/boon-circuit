@@ -114,8 +114,8 @@ fn handoff_manifest_defines_the_ordered_v2_gate_inventory() {
         .native_workflow
         .as_ref()
         .expect("Persons.pro native workflow");
-    assert_eq!(native_workflow.steps.len(), 29);
-    assert_eq!(native_workflow.proof_steps.len(), 18);
+    assert_eq!(native_workflow.steps.len(), 36);
+    assert_eq!(native_workflow.proof_steps.len(), 24);
     let checkpoint_ids = profile
         .proof_requirements
         .checkpoints

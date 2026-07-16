@@ -60,6 +60,11 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     );
     push_check(
         &mut checks,
+        "no-example-specific-engine-branches",
+        no_example_specific_engine_branches(workspace),
+    );
+    push_check(
+        &mut checks,
         "isolated-native-input-path",
         isolated_native_input_path(workspace),
     );
@@ -541,6 +546,81 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
             bounded_list(&machine_plan_definitions),
             bounded_list(&duplicate_runtime_types),
             bounded_list(&direct_executor_dependents)
+        ))
+    }
+}
+
+fn no_example_specific_engine_branches(workspace: &Path) -> Result<String, String> {
+    let manifest = parse_toml(&workspace.join("examples/manifest.toml"))?;
+    let examples = manifest
+        .get("example")
+        .and_then(toml::Value::as_array)
+        .ok_or("example manifest has no example array")?;
+    let mut names = examples
+        .iter()
+        .flat_map(|entry| [entry.get("id"), entry.get("label")])
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+
+    let prefixes = [
+        "crates/boon_parser/",
+        "crates/boon_compiler/",
+        "crates/boon_typecheck/",
+        "crates/boon_ir/",
+        "crates/boon_plan/",
+        "crates/boon_plan_executor/",
+        "crates/boon_runtime/",
+        "crates/boon_persistence/",
+        "crates/boon_document_model/",
+        "crates/boon_document/",
+        "crates/boon_native_gpu/",
+        "crates/boon_native_app_window/",
+        "crates/boon_host/",
+    ];
+    let mut offenders = Vec::new();
+    for relative in workspace_files(workspace)? {
+        let generic_source = prefixes.iter().any(|prefix| relative.starts_with(prefix))
+            || relative == "crates/boon_native_playground/src/verify.rs";
+        if !generic_source || !relative.ends_with(".rs") || is_test_path(&relative) {
+            continue;
+        }
+        let bytes = fs::read(workspace.join(&relative)).map_err(|error| error.to_string())?;
+        let production_lines = rust_file_line_counts(&relative, &bytes)?.production;
+        let source = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+        let compact = source
+            .lines()
+            .take(production_lines)
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for name in &names {
+            let quoted = format!("\"{name}\"");
+            let forbidden = [
+                format!("== {quoted}"),
+                format!("!= {quoted}"),
+                format!("{quoted} =>"),
+                format!(".contains({quoted})"),
+                format!(".starts_with({quoted})"),
+                format!(".ends_with({quoted})"),
+            ];
+            if forbidden.iter().any(|pattern| compact.contains(pattern)) {
+                offenders.push(format!("{relative}:{quoted}"));
+            }
+        }
+    }
+    if offenders.is_empty() {
+        Ok(
+            "generic engine and native verifier control flow contains no built-in example identity"
+                .to_owned(),
+        )
+    } else {
+        Err(format!(
+            "example-specific production branches: {}",
+            bounded_list(&offenders)
         ))
     }
 }

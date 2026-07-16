@@ -14,6 +14,49 @@ expect_root_nonempty = ["store.workspace_id", "store.workspace_grant_id"]
 expect_root_text = { "store.implementation_stage" = "LocalFirst", "store.workspace_grant_state" = "AnonymousGrant", "store.account_state" = "Anonymous", "store.credential_count" = "0", "store.publish_state" = "Draft", "store.active_view" = "Code", "store.draft_revision" = "1", "store.draft_compile_state" = "Ready", "store.last_valid_draft_revision" = "1" }
 
 [[step]]
+id = "editor-page-down-reveals-caret"
+user_action = { kind = "key", target = "profile source", key = "pagedown" }
+expected_source_event = { source = "store.elements.source_editor" }
+expect_root_nonempty = ["store.source_draft"]
+
+[[step]]
+id = "editor-selects-all"
+user_action = { kind = "focused_chord", target = "profile source", key = "ctrl+a" }
+expected_source_event = { source = "store.elements.source_editor" }
+expect_root_text = { "store.draft_revision" = "1" }
+
+[[step]]
+id = "editor-copies-selection"
+user_action = { kind = "focused_chord", target = "profile source", key = "ctrl+c" }
+expected_source_event = { source = "store.elements.source_editor" }
+expect_root_text = { "store.draft_revision" = "1" }
+
+[[step]]
+id = "editor-navigates-to-end"
+user_action = { kind = "focused_key", target = "profile source", key = "end" }
+expected_source_event = { source = "store.elements.source_editor" }
+expect_root_text = { "store.draft_revision" = "1" }
+
+[[step]]
+id = "editor-pastes-copy"
+user_action = { kind = "focused_chord", target = "profile source", key = "ctrl+v" }
+expected_source_event = { source = "store.elements.source_editor" }
+expect_root_nonempty = ["store.source_draft"]
+expect_root_text = { "store.draft_revision" = "2" }
+
+[[step]]
+id = "editor-selects-copy-for-deletion"
+user_action = { kind = "focused_chord", target = "profile source", key = "ctrl+a" }
+expected_source_event = { source = "store.elements.source_editor" }
+expect_root_text = { "store.draft_revision" = "2" }
+
+[[step]]
+id = "editor-deletes-selection"
+user_action = { kind = "focused_key", target = "profile source", key = "delete" }
+expected_source_event = { source = "store.elements.source_editor" }
+expect_root_text = { "store.source_draft" = "", "store.draft_revision" = "3", "store.draft_compile_state" = "Invalid" }
+
+[[step]]
 id = "valid-edit-preview"
 user_action = { kind = "type_text", target = "profile source", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })" }
 expected_source_event = { source = "store.elements.source_editor", text = "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Martin in Norway })" }

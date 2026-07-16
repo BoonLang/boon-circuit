@@ -216,9 +216,10 @@ impl NativeWorkflowState {
             .collect::<Result<Vec<_>, _>>()?;
         if steps.iter().any(|step| match step.action_kind.as_deref() {
             None => !step.source_path.is_empty() || step.expectations.is_empty(),
-            Some("click" | "type_text" | "double_click" | "key" | "blur") => {
-                step.source_path.is_empty() || step.expectations.is_empty()
-            }
+            Some(
+                "click" | "type_text" | "double_click" | "key" | "focused_key" | "focused_chord"
+                | "blur",
+            ) => step.source_path.is_empty() || step.expectations.is_empty(),
             Some(_) => true,
         }) {
             return Err(
@@ -2129,7 +2130,12 @@ fn observe_native_workflow_input(
         ) && pointer_source_path == Some(step.source_path.as_str());
         let starts_on_blur = action_kind == "blur"
             && matches!(envelope.event, HostEvent::Focus { focused: false, .. });
-        if !starts_on_target && !starts_on_blur {
+        let starts_focused = matches!(action_kind, "focused_key" | "focused_chord")
+            && matches!(
+                envelope.event,
+                HostEvent::Keyboard(KeyEvent { pressed: true, .. })
+            );
+        if !starts_on_target && !starts_on_blur && !starts_focused {
             return Ok(());
         }
         pending.started_at = Some(Instant::now());
@@ -2229,10 +2235,21 @@ fn observe_native_workflow_input(
                 .into());
             }
         }
-        ("key", HostEvent::Keyboard(key)) if !key.pressed => {
+        ("key" | "focused_key", HostEvent::Keyboard(key)) if !key.pressed => {
             pending.action_complete = step.key.as_deref().is_some_and(|expected| {
-                matches!(&key.logical_key, LogicalKey::Named(actual) if actual == expected)
+                matches!(&key.logical_key, LogicalKey::Named(actual) if actual.eq_ignore_ascii_case(expected))
             });
+        }
+        ("focused_chord", HostEvent::Keyboard(key)) if !key.pressed => {
+            pending.action_complete = step
+                .key
+                .as_deref()
+                .and_then(|chord| chord.split_once('+'))
+                .is_some_and(|(modifier, _)| match (&key.logical_key, modifier) {
+                    (LogicalKey::Named(actual), "ctrl") => actual.starts_with("Control"),
+                    (LogicalKey::Named(actual), "shift") => actual.starts_with("Shift"),
+                    _ => false,
+                });
         }
         ("blur", HostEvent::Focus { focused: false, .. }) => {
             pending.action_complete = true;
@@ -4096,18 +4113,23 @@ fn capture_responsive_layout_evidence(
         evidence.desired_height,
     )?;
     let observed_actions = responsive_action_counts(&observed_action_bounds);
-    let missing_actions = missing_responsive_actions(&evidence.expected_actions, &observed_actions);
-    if !missing_actions.is_empty() {
+    let action_mismatches =
+        responsive_action_mismatches(&evidence.expected_actions, &observed_actions);
+    if !action_mismatches.is_empty() {
         let narrow_only_actions = observed_actions
             .keys()
             .filter(|action| !evidence.expected_actions.contains_key(*action))
             .map(|action| format!("{} [{}]", action.source_path, action.intent))
             .collect::<Vec<_>>();
         return Err(format!(
-            "narrow layout is missing desktop public actions {missing_actions:?}; narrow-only navigation actions are {narrow_only_actions:?}"
+            "narrow layout changed desktop public-action multiplicity {action_mismatches:?}; narrow-only navigation actions are {narrow_only_actions:?}"
         )
         .into());
     }
+    let equivalent_actions = observed_actions
+        .into_iter()
+        .filter(|(action, _)| evidence.expected_actions.contains_key(action))
+        .collect::<BTreeMap<_, _>>();
     let state = authoritative_state_evidence(runtime)?;
     emit(
         observer,
@@ -4118,8 +4140,8 @@ fn capture_responsive_layout_evidence(
             baseline_key: evidence.baseline_key.clone(),
             baseline_action_count: evidence.baseline_action_count,
             baseline_action_digest: evidence.baseline_action_digest.clone(),
-            action_count: responsive_action_count(&observed_actions),
-            action_digest: responsive_action_digest(&observed_actions),
+            action_count: responsive_action_count(&equivalent_actions),
+            action_digest: responsive_action_digest(&equivalent_actions),
             state_digest: state.digest,
             source_revision,
             runtime_sequence: runtime.runtime_turn_sequence(),
@@ -4370,14 +4392,21 @@ fn validate_action_bounds(
     Ok(())
 }
 
-fn missing_responsive_actions(
+fn responsive_action_mismatches(
     desktop_actions: &BTreeMap<ResponsiveActionId, u32>,
     narrow_actions: &BTreeMap<ResponsiveActionId, u32>,
 ) -> Vec<String> {
     desktop_actions
         .iter()
-        .filter(|(action, count)| narrow_actions.get(*action).copied().unwrap_or(0) < **count)
-        .map(|(action, count)| format!("{} [{}] x{count}", action.source_path, action.intent))
+        .filter(|(action, count)| narrow_actions.get(*action).copied().unwrap_or(0) != **count)
+        .map(|(action, count)| {
+            format!(
+                "{} [{}] desktop x{count}, narrow x{}",
+                action.source_path,
+                action.intent,
+                narrow_actions.get(action).copied().unwrap_or(0)
+            )
+        })
         .collect()
 }
 
@@ -5941,12 +5970,12 @@ mod tests {
             (action("store.elements.show_preview", "click"), 1),
         ]);
 
-        assert!(missing_responsive_actions(&desktop, &narrow).is_empty());
+        assert!(responsive_action_mismatches(&desktop, &narrow).is_empty());
         assert_eq!(
-            missing_responsive_actions(&desktop, &BTreeMap::from([(publish, 1)])),
+            responsive_action_mismatches(&desktop, &BTreeMap::from([(publish, 1)])),
             [
-                "store.elements.publish [click] x2".to_owned(),
-                "store.elements.theme_toggle [click] x1".to_owned(),
+                "store.elements.publish [click] desktop x2, narrow x1".to_owned(),
+                "store.elements.theme_toggle [click] desktop x1, narrow x0".to_owned(),
             ]
         );
     }
@@ -6478,6 +6507,25 @@ scene: Scene/Element/program(
         assert!(!example.test_steps.is_empty());
         let completed = run_migration_test(migration, &example.application, 42, 3).unwrap();
         assert_eq!(completed, migration.scenario.steps.len());
+    }
+
+    #[test]
+    fn persons_editor_actions_form_one_supported_native_workflow() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let required = example
+            .test_steps
+            .iter()
+            .map(|step| step.id.clone())
+            .collect::<Vec<_>>();
+        let proof = required.iter().cloned().collect();
+        let workflow =
+            NativeWorkflowState::from_test_steps(1, &example.test_steps, &required, &proof)
+                .unwrap()
+                .unwrap();
+        assert_eq!(workflow.steps.len(), 36);
     }
 
     #[test]

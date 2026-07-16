@@ -35,3 +35,6 @@ evdev.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 cosmic-protocols.workspace = true
+
+[dev-dependencies]
+image.workspace = true

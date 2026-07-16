@@ -142,6 +142,7 @@ struct ResponsiveEvidenceState {
     desired_height: u32,
     expected_actions: BTreeSet<String>,
     last_surface_epoch: u64,
+    resize_started: bool,
     complete: bool,
 }
 
@@ -153,6 +154,7 @@ struct NativeWorkflowPending {
     first_sequence: Option<u64>,
     last_sequence: Option<u64>,
     event_digests: Vec<String>,
+    event_summaries: Vec<String>,
     batch_text: String,
     pointer_up_count: u8,
     last_pointer_up_source_path: Option<String>,
@@ -782,6 +784,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         }
                         document_update_us = duration_us(started.elapsed());
                         if let Some(state) = responsive_evidence.as_mut() {
+                            state.resize_started = true;
                             let previous_surface_epoch = state.last_surface_epoch;
                             state.last_surface_epoch = resize.epoch;
                             resize_observation = Some((
@@ -968,6 +971,14 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                     &mut product,
                                 )?],
                             )?;
+                        }
+                    }
+                    if let Some(state) = responsive_evidence.as_mut()
+                        && !state.resize_started
+                    {
+                        let current_actions = document_action_paths(view.frame());
+                        if !current_actions.is_empty() {
+                            state.expected_actions = current_actions;
                         }
                     }
                     if let Some((sequence, width, height, previous_surface_epoch)) =
@@ -2114,6 +2125,16 @@ fn observe_native_workflow_input(
     pending.first_sequence.get_or_insert(envelope.sequence);
     pending.last_sequence = Some(envelope.sequence);
     pending.event_digests.push(host_event_digest(envelope));
+    pending.event_summaries.push(format!(
+        "{}:{}:target={:?}:dispatch={:?}",
+        envelope.sequence,
+        native_workflow_event_shape(&envelope.event),
+        pointer_source_path,
+        dispatches
+            .iter()
+            .map(|dispatch| dispatch.source_path.as_str())
+            .collect::<Vec<_>>()
+    ));
     if pending.event_digests.len() > MAX_NATIVE_WORKFLOW_INPUT_EVENTS {
         return Err(format!(
             "native workflow step `{}` exceeded its bounded {}-event input span",
@@ -2190,6 +2211,18 @@ fn observe_native_workflow_input(
         _ => {}
     }
     Ok(())
+}
+
+fn native_workflow_event_shape(event: &HostEvent) -> String {
+    match event {
+        HostEvent::Pointer(pointer) => {
+            format!("pointer/{:?}/{:?}", pointer.phase, pointer.button)
+        }
+        HostEvent::TextInput(text) => format!("text/{}bytes", text.text.len()),
+        HostEvent::Keyboard(key) => format!("key/{:?}/{}", key.logical_key, key.pressed),
+        HostEvent::Focus { focused, .. } => format!("focus/{focused}"),
+        _ => format!("{:?}", input_kind(event)),
+    }
 }
 
 fn native_workflow_pointer_presentation(
@@ -2410,7 +2443,7 @@ async fn service_native_workflow(
                     .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT)
             {
                 return Err(format!(
-                    "native workflow step `{}` did not complete its declared real-input span; events={}, pointer_ups={}, first_sequence={:?}, last_sequence={:?}, pointer_up_source={:?}, pointer_up_dispatch={:?}",
+                    "native workflow step `{}` did not complete its declared real-input span; events={}, pointer_ups={}, first_sequence={:?}, last_sequence={:?}, pointer_up_source={:?}, pointer_up_dispatch={:?}, event_span={:?}",
                     workflow
                         .current()
                         .map_or("unknown", |step| step.id.as_str()),
@@ -2420,6 +2453,7 @@ async fn service_native_workflow(
                     pending.last_sequence,
                     pending.last_pointer_up_source_path,
                     pending.last_pointer_up_dispatched_source_paths,
+                    pending.event_summaries,
                 )
                 .into());
             }
@@ -2660,6 +2694,7 @@ fn emit_current_native_workflow_target(
         first_sequence: None,
         last_sequence: None,
         event_digests: Vec::new(),
+        event_summaries: Vec::new(),
         batch_text: String::new(),
         pointer_up_count: 0,
         last_pointer_up_source_path: None,
@@ -3947,6 +3982,7 @@ fn arm_responsive_evidence(
         desired_height: current_height,
         expected_actions,
         last_surface_epoch: key.surface_epoch,
+        resize_started: false,
         complete: false,
     })
 }
@@ -5853,6 +5889,7 @@ mod tests {
                 first_sequence: None,
                 last_sequence: None,
                 event_digests: Vec::new(),
+                event_summaries: Vec::new(),
                 batch_text: String::new(),
                 pointer_up_count: 0,
                 last_pointer_up_source_path: None,

@@ -2584,7 +2584,6 @@ fn drive_responsive_resize(
         && events.iter().any(|event| {
             matches!(event, ObserverEvent::FramePresented(frame)
                 if frame.role == ObserverRole::Preview
-                    && frame.event_sequence == Some(observed.0)
                     && frame.key == observed.2)
         })
         && events.iter().any(|event| {

@@ -2,8 +2,8 @@
 
 Date: 2026-07-15
 
-Status: local-first implementation complete; current-HEAD manifest-backed
-native handoff regeneration is in progress
+Status: local-first implementation complete; final acceptance is defined by
+the source-bound manifest reports named below
 
 Persons.pro is a Boon-hosted personal publishing workspace. A visitor receives
 an immediately usable anonymous workspace, edits a small Boon program, sees the
@@ -454,7 +454,8 @@ frame-bound workflow checkpoints for restart, asynchronous artifact load,
 responsive desktop/narrow layouts, migration activation, scrolling, and
 visible TEST cursor playback.
 
-Current implementation evidence (2026-07-16, beginning with commit `be6ff21`):
+Current implementation evidence (2026-07-16, commits `be6ff21` through
+`9de9fd5`):
 
 - Asynchronous program-artifact store/load work no longer acts as a persistence
   checkpoint boundary. A 150 ms slow-I/O regression proves that an interleaved
@@ -525,6 +526,12 @@ Current implementation evidence (2026-07-16, beginning with commit `be6ff21`):
   restart, and migration deliberately remain generic host persistence
   operations exposed by the dev surface and exercised by typed verifier
   checkpoints. They are not duplicated as Persons-specific Boon source routes.
+- Native scenario assertions retain semantic deltas from the exact declared
+  source turn while carrying document-change evidence across every source turn
+  in the same host input transaction. This keeps realistic text-change plus
+  commit playback honest without weakening direct runtime scenario assertions.
+- The physical TodoMVC list retains a bounded scrolling viewport while exposing
+  the five rows exercised by its declared no-scroll native workflow.
 
 At final handoff, the exact current results are the source-identity-bound files
 named by `docs/architecture/native_gpu_handoff_manifest.json`, culminating in

@@ -2389,10 +2389,14 @@ async fn service_native_workflow(
                     .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT)
             {
                 return Err(format!(
-                    "native workflow step `{}` did not complete its declared real-input span",
+                    "native workflow step `{}` did not complete its declared real-input span; events={}, pointer_ups={}, first_sequence={:?}, last_sequence={:?}",
                     workflow
                         .current()
-                        .map_or("unknown", |step| step.id.as_str())
+                        .map_or("unknown", |step| step.id.as_str()),
+                    pending.event_digests.len(),
+                    pending.pointer_up_count,
+                    pending.first_sequence,
+                    pending.last_sequence,
                 )
                 .into());
             }

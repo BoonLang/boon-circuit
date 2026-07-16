@@ -2044,6 +2044,7 @@ fn drive_native_workflow(
                     index,
                     TestPointerPhase::Down,
                 )?;
+                thread::sleep(crate::native_input::POINTER_CLICK_HOLD);
                 let up_start = events.len();
                 session.run_driver(&["button", "up", "left"])?;
                 wait_for_native_workflow_pointer_phase(

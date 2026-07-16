@@ -15,7 +15,7 @@ const COMMAND_BYTES: usize = 9;
 const AXIS_MAX: i32 = 65_535;
 const DEFAULT_POINTER_SPACE: (i32, i32) = (2_400, 1_200);
 const DEVICE_SETTLE: Duration = Duration::from_millis(500);
-const CLICK_HOLD: Duration = Duration::from_millis(32);
+pub const POINTER_CLICK_HOLD: Duration = Duration::from_millis(32);
 const TEXT_KEY_INTERVAL: Duration = Duration::from_millis(2);
 const UINPUT_NAME_MAX_BYTES: usize = 79;
 pub const ASCII_TEXT_BATCH_MAX_BYTES: usize = 256;
@@ -106,7 +106,7 @@ impl NativeInput {
 
     pub fn click(&mut self, code: u16) -> Result<(), String> {
         self.button(code, true)?;
-        thread::sleep(CLICK_HOLD);
+        thread::sleep(POINTER_CLICK_HOLD);
         self.button(code, false)
     }
 

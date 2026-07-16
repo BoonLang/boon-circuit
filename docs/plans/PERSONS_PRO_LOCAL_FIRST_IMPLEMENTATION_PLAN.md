@@ -2,8 +2,8 @@
 
 Date: 2026-07-15
 
-Status: local-first release verifier passed at the implementation checkpoint;
-current-HEAD native handoff awaits the installed compositor restart
+Status: local-first implementation complete; current-HEAD manifest-backed
+native handoff regeneration is in progress
 
 Persons.pro is a Boon-hosted personal publishing workspace. A visitor receives
 an immediately usable anonymous workspace, edits a small Boon program, sees the
@@ -484,8 +484,8 @@ Current implementation evidence (2026-07-16, beginning with commit `be6ff21`):
 - `cargo check --workspace --all-targets`, `cargo test --workspace
   --all-targets --quiet`, and `cargo build --release
   -p boon_native_playground` pass from the current implementation.
-- The architecture gate passes with 184,950 tracked Rust lines, 31,999 test
-  lines, 31,993 playground production lines, 5,197 xtask production lines, and
+- The architecture gate passes with 184,963 tracked Rust lines, 31,999 test
+  lines, 32,000 playground production lines, 5,197 xtask production lines, and
   20,544 runtime-plus-executor production lines, all within their caps.
 - No tracked Python source exists. Production engine/playground scans contain
   no Persons.pro branch; remaining Persons literals are source-controlled
@@ -507,6 +507,14 @@ Current implementation evidence (2026-07-16, beginning with commit `be6ff21`):
   foreground and border region of the cursor's six-part geometry at the logical
   event coordinate and matching surface scale. A nonblank image or plain dark
   stripe at that coordinate fails the deterministic pixel regression.
+- Every verifier product uses a clean launch-scoped redb root, including gates
+  that do not require restart reporting. Ordinary TEST playback uses a fresh
+  in-memory deterministic runtime and never clears or rewrites manual state;
+  persistence workflows continue to exercise the launch-scoped redb runtime.
+- State-mount proof is emitted once per preview process rather than once per
+  source switch. The final ordinary TEST state receives one exact deduplicated
+  readback, and cursor retained identities include position so GPU geometry
+  cannot remain stale while frame events report a newer location.
 - Responsive evidence requires exact multiplicity for every desktop product
   action identity. Narrow-only navigation remains allowed, but is excluded from
   the equivalent-action digest instead of masking duplicate product controls.
@@ -530,13 +538,10 @@ sample: editor-visible p95 8.257 ms, child-preview p95 10.648 ms and p99
 0.841 ms, and maximum interaction-frame blocking 9.803 ms. It predates the
 current clean commits and cannot satisfy final handoff evidence.
 
-The installed `/usr/bin/cosmic-comp` and rebuilt compositor have SHA-256
-`f1efface3d67ac6b011712a812b406f8775e4ab23835ea1bb54a098310422e38`,
-while the running compositor process still maps
-`5fd348ebd1e142e70b357aae2ec5577d3a6a56034a791886d5597c0c76a70782`.
-A user/session restart is therefore mandatory before regenerating every native
-handoff report from current HEAD. Until those reports and the manifest-backed
-aggregate pass, this local-first milestone remains incomplete.
+The installed and running `/usr/bin/cosmic-comp` now both have SHA-256
+`f1efface3d67ac6b011712a812b406f8775e4ab23835ea1bb54a098310422e38`.
+Final completion still requires every manifest report and the manifest-backed
+aggregate to pass from one clean current HEAD.
 
 ### Slice 5: Browser host
 

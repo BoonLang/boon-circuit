@@ -661,6 +661,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
     let (program_compiler, mut program_compiled) = ProgramCompileWorker::start();
     let mut runtime = None::<RuntimeView>;
     let mut runtime_key = None::<String>;
+    let mut state_mount_captured = false;
     let mut migration = None::<MigrationBundle>;
     let mut active_migration_stage = None::<String>;
     let mut previewed_migration_stage = None::<String>;
@@ -1414,18 +1415,21 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                         let key = compiled_preview.source_key.clone();
                         let revision = compiled_preview.revision;
                         let post_compile_started = Instant::now();
+                        let isolated_test = test && state_evidence.native_workflow_steps.is_empty();
                         let deterministic_runtime =
                             test || !state_evidence.scenario_steps.is_empty();
                         match activate_compatible(
                             &mut runtime,
                             compiled_preview.plan,
                             deterministic_runtime,
+                            isolated_test,
                         ) {
                             Ok(activation) => {
+                                let capture_mount = state_evidence.mount && !state_mount_captured;
                                 let mut startup_async_lanes = Vec::new();
                                 let presented = match activation {
                                     RuntimeActivation::Opened(mut next) => {
-                                        if state_evidence.enabled() {
+                                        if capture_mount {
                                             startup_async_lanes =
                                                 next.take_async_lane_observations();
                                             emit_runtime_async_lanes_before_present(
@@ -1470,7 +1474,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                         compile_us,
                                         duration_us(post_compile_started.elapsed()),
                                     );
-                                    if state_evidence.enabled() {
+                                    if capture_mount {
                                         let request = capture_state_mounted(
                                             &observer,
                                             runtime.as_mut().expect("mounted runtime"),
@@ -1495,6 +1499,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             runtime.as_mut().expect("mounted runtime"),
                                             &product,
                                         )?;
+                                        state_mount_captured = true;
                                     }
                                     if state_evidence.migration_exercise
                                         && !migration_evidence_completed
@@ -3403,8 +3408,10 @@ fn activate_compatible(
     runtime: &mut Option<RuntimeView>,
     plan: Arc<boon_plan::MachinePlan>,
     deterministic_scenario: bool,
+    isolated_scenario: bool,
 ) -> Result<RuntimeActivation, String> {
-    if let Some(runtime) = runtime.as_mut()
+    if !isolated_scenario
+        && let Some(runtime) = runtime.as_mut()
         && runtime.application_identity() == &plan.application.identity
     {
         if !runtime.plan_schema_matches(&plan) {
@@ -3415,10 +3422,10 @@ fn activate_compatible(
         runtime.activate_machine_plan(plan)?;
         return Ok(RuntimeActivation::Updated);
     }
-    if deterministic_scenario {
+    if isolated_scenario {
         RuntimeView::open_for_scenario(plan)
     } else {
-        RuntimeView::open(plan)
+        RuntimeView::open(plan, deterministic_scenario)
     }
     .map(|runtime| RuntimeActivation::Opened(Box::new(runtime)))
 }
@@ -4838,11 +4845,23 @@ async fn run_test(
             .await?,
         );
     }
+    let last_key = last_state_key.ok_or("TEST completed without a presented state frame")?;
+    if std::env::var_os(PRODUCT_PROOF_AFTER_TEST_ENV).is_some()
+        && !proof_requests
+            .iter()
+            .any(|proof| proof.request.key == last_key)
+    {
+        proof_requests.push(prepare_evidence_proof(
+            "test-state",
+            last_key.clone(),
+            product,
+        )?);
+    }
     Ok(TestRunOutcome {
         completed_steps: completed,
         semantic_assertions_proven: semantic_expectation_count > 0,
         proof_requests,
-        last_key: last_state_key.ok_or("TEST completed without a presented state frame")?,
+        last_key,
     })
 }
 
@@ -6495,7 +6514,7 @@ scene: Scene/Element/program(
         let before = runtime.as_ref().unwrap().persistence_schema_version();
         let target = compile_migration_stage(&example.application, &migration, "v2").unwrap();
 
-        let error = match activate_compatible(&mut runtime, target, false) {
+        let error = match activate_compatible(&mut runtime, target, false, false) {
             Err(error) => error,
             Ok(_) => panic!("schema-changing source reload activated implicitly"),
         };

@@ -9,7 +9,7 @@ use boon_host::{
 use boon_persistence::{
     ContentArtifact, ContentArtifactLoadEnqueueError, ContentArtifactLoadTicket,
     ContentArtifactRetention, ContentArtifactStoreEnqueueError, ContentArtifactStoreTicket,
-    DurableContentArtifactChange, MigrationPreview, OutboxInspectorState,
+    DurableContentArtifactChange, InMemoryDriver, MigrationPreview, OutboxInspectorState,
     PersistenceInspectorSnapshot, PersistenceWorkerConfig, PersistenceWorkerStatus, RedbDriver,
 };
 use boon_plan::{ApplicationIdentity, ApplicationPlan, MachinePlan, MemoryKind};
@@ -36,9 +36,6 @@ use crate::protocol::{
     StateArtifactPreviewSummary, StoredSummary,
 };
 use crate::view::HitTarget;
-#[cfg(test)]
-use boon_persistence::InMemoryDriver;
-
 type ViewResult<T> = Result<T, String>;
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -429,19 +426,38 @@ pub struct RuntimePlanChange {
 }
 
 impl RuntimeView {
-    pub fn open(plan: Arc<MachinePlan>) -> ViewResult<Self> {
-        Self::open_with_state_root_and_identity_mode(
-            plan,
-            configured_state_root(),
-            HostIdentityMode::Interactive,
-        )
+    pub fn open(plan: Arc<MachinePlan>, deterministic: bool) -> ViewResult<Self> {
+        let identity_mode = match deterministic {
+            true => HostIdentityMode::Deterministic,
+            false => HostIdentityMode::Interactive,
+        };
+        Self::open_with_state_root_and_identity_mode(plan, configured_state_root(), identity_mode)
     }
 
     pub fn open_for_scenario(plan: Arc<MachinePlan>) -> ViewResult<Self> {
-        Self::open_with_state_root_and_identity_mode(
+        let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
             plan,
-            configured_state_root(),
+            SessionOptions::default(),
+            InMemoryDriver::default(),
+            PersistenceWorkerConfig::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let host_identity_generation = 1;
+        let host_started = dispatch_host_lifecycle_started(
+            &mut runtime,
             HostIdentityMode::Deterministic,
+            host_identity_generation,
+            1,
+        )?;
+        let mount = runtime.runtime().mount();
+        let startup = RuntimeStartupEvidence::from(&startup);
+        Self::mount_persistent(
+            runtime,
+            mount,
+            host_started,
+            startup,
+            HostIdentityMode::Deterministic,
+            host_identity_generation,
         )
     }
 
@@ -507,30 +523,7 @@ impl RuntimeView {
 
     #[cfg(test)]
     pub(crate) fn open_in_memory(runtime: LiveRuntime) -> ViewResult<Self> {
-        let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
-            runtime.shared_machine_plan(),
-            SessionOptions::default(),
-            InMemoryDriver::default(),
-            PersistenceWorkerConfig::default(),
-        )
-        .map_err(|error| error.to_string())?;
-        let host_identity_generation = 1;
-        let host_started = dispatch_host_lifecycle_started(
-            &mut runtime,
-            HostIdentityMode::Deterministic,
-            host_identity_generation,
-            1,
-        )?;
-        let mount = runtime.runtime().mount();
-        let startup = RuntimeStartupEvidence::from(&startup);
-        Self::mount_persistent(
-            runtime,
-            mount,
-            host_started,
-            startup,
-            HostIdentityMode::Deterministic,
-            host_identity_generation,
-        )
+        Self::open_for_scenario(runtime.shared_machine_plan())
     }
 
     fn mount_persistent(

@@ -668,10 +668,7 @@ fn run_linux_harness(profile: &VerifierProfile, run_id: &str, artifact_dir: &Pat
         profile.example(),
         &observer_path,
         &artifact_dir.join("primary"),
-        profile
-            .state_root_policy
-            .as_ref()
-            .map(|_| state_root.as_path()),
+        &state_root,
         profile,
         NativeSessionPhase::Primary,
     ) {
@@ -1015,7 +1012,7 @@ fn run_restart_phase(
         profile.example(),
         observer_path,
         artifact_dir,
-        Some(state_root),
+        state_root,
         profile,
         NativeSessionPhase::Restart,
     )?;
@@ -6592,7 +6589,7 @@ impl NativeSession {
         example: &str,
         observer_socket: &Path,
         artifact_dir: &Path,
-        state_root: Option<&Path>,
+        state_root: &Path,
         profile: &VerifierProfile,
         phase: NativeSessionPhase,
     ) -> Result<Self, String> {
@@ -6627,19 +6624,17 @@ impl NativeSession {
             (PROOF_SAMPLE_ORDINAL_ENV, "128".to_owned()),
             (PRODUCT_PROOF_AFTER_TEST_ENV, "1".to_owned()),
             (NATIVE_SESSION_ID_ENV, session_id.clone()),
+            (STATE_MOUNT_EVIDENCE_ENV, "1".to_owned()),
+            (
+                "BOON_PLAYGROUND_STATE_ROOT",
+                state_root.to_string_lossy().into_owned(),
+            ),
             (crate::protocol::VERIFY_BOUNDED_WINDOWS_ENV, "1".to_owned()),
             (
                 "BOON_NATIVE_ROLE_LOG",
                 role_log.to_string_lossy().into_owned(),
             ),
         ];
-        if let Some(state_root) = state_root {
-            environment.push((
-                "BOON_PLAYGROUND_STATE_ROOT",
-                state_root.to_string_lossy().into_owned(),
-            ));
-            environment.push((STATE_MOUNT_EVIDENCE_ENV, "1".to_owned()));
-        }
         match phase {
             NativeSessionPhase::Primary => {
                 let checkpoint_steps = profile.scenario_checkpoint_steps();

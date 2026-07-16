@@ -16,7 +16,6 @@ pub(crate) const OPERATOR_CURSOR_PARTS: [[f32; 4]; 6] = [
     [8.0, 8.0, 2.0, 4.0],
     [5.0, 11.0, 3.0, 9.0],
 ];
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct HitTarget {
     pub node: String,
@@ -115,6 +114,7 @@ impl RetainedView {
 
     pub fn scene_with_cursor(&self, x: f32, y: f32) -> RenderScene {
         let mut scene = self.retained.scene().clone();
+        let cursor_id = (u64::from(x.to_bits()) << 32) | u64::from(y.to_bits());
         let identity = ComputedStyleIdentity {
             style_id: 0x4355_5253_4f52,
             layout_id: 0x4355_5253_4f52,
@@ -146,7 +146,7 @@ impl RetainedView {
                 };
                 scene.visual_primitives.push(RenderVisualPrimitive {
                     node: DocumentNodeId("operator.cursor".to_owned()),
-                    retained_chunk_id: format!("operator-cursor-{layer}-{part}"),
+                    retained_chunk_id: format!("{cursor_id:x}{layer}{part}"),
                     source_kind: DocumentNodeKind::Root,
                     primitive: RenderVisualPrimitiveKind::Fill,
                     bounds,

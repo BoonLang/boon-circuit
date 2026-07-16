@@ -1862,13 +1862,6 @@ FUNCTION file_row(file_name, file_range) {
 }
 
 FUNCTION search_box() {
-    PASSED.store.focused_control_label == TEXT { signal search } |> WHEN {
-        True => search_box_focused()
-        False => search_box_resting()
-    }
-}
-
-FUNCTION search_box_resting() {
     Scene/Element/text_input(
         element: [
             event: [
@@ -1888,49 +1881,32 @@ FUNCTION search_box_resting() {
                 Light => TEXT { #172033 }
             }
             background: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #0a1322 }
-                Light => TEXT { #f3f7fc }
+                Dark => PASSED.store.focused_control_label == TEXT { signal search } |> WHEN {
+                    True => TEXT { #11243b }
+                    False => TEXT { #0a1322 }
+                }
+                Light => PASSED.store.focused_control_label == TEXT { signal search } |> WHEN {
+                    True => TEXT { #e9f3ff }
+                    False => TEXT { #f3f7fc }
+                }
             }]
             border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #263753 }
-                Light => TEXT { #d7dde8 }
+                Dark => PASSED.store.focused_control_label == TEXT { signal search } |> WHEN {
+                    True => TEXT { #65b8ff }
+                    False => TEXT { #263753 }
+                }
+                Light => PASSED.store.focused_control_label == TEXT { signal search } |> WHEN {
+                    True => TEXT { #2474bb }
+                    False => TEXT { #d7dde8 }
+                }
             }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: PanelInset)
-        ]
-        label: Hidden[text: TEXT { signal search }]
-        text: PASSED.store.signal_search_text
-        placeholder: [text: TEXT { search signals }]
-    )
-}
-
-FUNCTION search_box_focused() {
-    Scene/Element/text_input(
-        element: [
-            event: [
-                click: PASSED.store.elements.signal_search_focus_probe
-                change: PASSED.store.elements.signal_search_input
-            ]
-        ]
-        style: [
-            width: Fill
-            height: 36
-            padding: [left: 10, right: 10]
-            text_inset: 4
-            rounded_corners: 9
-            font: NovyTheme/font(mode: PASSED.store.mode, of: Body)
-            color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #dbeafe }
-                Light => TEXT { #172033 }
-            }
-            background: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #11243b }
-                Light => TEXT { #e9f3ff }
-            }]
-            border: [color: PASSED.store.mode |> WHEN {
-                Dark => TEXT { #65b8ff }
-                Light => TEXT { #2474bb }
-            }]
-            material: NovyTheme/material(mode: PASSED.store.mode, of: FocusedControl)
+            material: NovyTheme/material(
+                mode: PASSED.store.mode
+                of: PASSED.store.focused_control_label == TEXT { signal search } |> WHEN {
+                    True => FocusedControl
+                    False => PanelInset
+                }
+            )
         ]
         label: Hidden[text: TEXT { signal search }]
         text: PASSED.store.signal_search_text
@@ -4354,7 +4330,7 @@ FUNCTION variables_virtual_list() {
         element: []
         direction: Column
         gap: 4
-        style: [width: Fill, height: 112, paint: False, scroll_y: True, scrollbars: True]
+        style: [width: Fill, height: 140, paint: False, scroll_y: True, scrollbars: True]
         items:
             PASSED.store.variable_rows |> List/map(row, new: variables_virtual_row(row: row))
     )

@@ -57,8 +57,8 @@ pub(crate) const TEST_STEP_LIMIT: usize = 64;
 const OUTBOUND_QUEUE_DEPTH: usize = 8;
 const STATS_INTERVAL: Duration = Duration::from_millis(100);
 const TEST_CURSOR_FRAME: Duration = Duration::from_millis(16);
-const TEST_CURSOR_PIXELS_PER_FRAME: f32 = 36.0;
-const TEST_CURSOR_MAX_MOVE_FRAMES: usize = 12;
+const TEST_CURSOR_PIXELS_PER_FRAME: f32 = 64.0;
+const TEST_CURSOR_MAX_MOVE_FRAMES: usize = 8;
 const TEST_SETTLE_PROGRAM_LIMIT: usize = 128;
 const TEST_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_EVIDENCE_PROOFS: usize = 8;
@@ -4557,7 +4557,7 @@ async fn run_test(
                 host,
                 view,
                 *cursor,
-                2,
+                1,
             )
             .await?;
             last_state_key = Some(key.clone());
@@ -4663,7 +4663,7 @@ async fn run_test(
             host,
             view,
             *cursor,
-            3,
+            1,
         )
         .await?;
 
@@ -4674,8 +4674,8 @@ async fn run_test(
         let mut declared_source_dispatched = false;
         for _ in 0..pointer_cycles {
             for (phase, playback_phase, dwell_frames) in [
-                (PointerPhase::Down, TestPointerPhase::Down, 2),
-                (PointerPhase::Up, TestPointerPhase::Up, 3),
+                (PointerPhase::Down, TestPointerPhase::Down, 1),
+                (PointerPhase::Up, TestPointerPhase::Up, 1),
             ] {
                 let event = HostEvent::Pointer(PointerEvent {
                     surface: surface.clone(),
@@ -4688,15 +4688,13 @@ async fn run_test(
                 let changed = outcome.changed;
                 declared_source_dispatched |= outcome.dispatched(&step.source_path);
                 sync_sensitive_input_focus(runtime, host)?;
+                if changed {
+                    apply_runtime_update(runtime, view, columns)?;
+                }
                 if phase == PointerPhase::Down
                     && runtime.focused() != Some(final_target.node.as_str())
                 {
-                    return Err(
-                        format!("TEST pointer down did not focus `{}`", final_target.node).into(),
-                    );
-                }
-                if changed {
-                    apply_runtime_update(runtime, view, columns)?;
+                    return Err(format!("TEST `{}` lost focus", step.id).into());
                 }
                 present_test_cursor_frame(
                     observer,
@@ -4767,8 +4765,8 @@ async fn run_test(
         }
         if runtime.event_sequence() == sequence_before || !declared_source_dispatched {
             return Err(format!(
-                "TEST host events did not dispatch declared source `{}` (intent {:?}) in their event-local outcomes",
-                step.source_path, target.source_intent,
+                "TEST step `{}` host events did not dispatch declared source `{}` (intent {:?}, focused {:?}, target `{}`) in their event-local outcomes",
+                step.id, step.source_path, target.source_intent, runtime.focused(), final_target.node,
             )
             .into());
         }
@@ -4789,7 +4787,7 @@ async fn run_test(
             host,
             view,
             *cursor,
-            4,
+            1,
         )
         .await?;
         last_state_key = Some(key.clone());

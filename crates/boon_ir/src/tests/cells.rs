@@ -214,20 +214,11 @@ fn novywave_project_lowers_source_wrapped_controls() {
             "list literal field `{field_name}` should keep a generic root-state initializer reference"
         );
     }
-    assert!(
-        ir.state_cells
-            .iter()
-            .any(|cell| cell.path == "store.active_file" && !cell.indexed),
-        "NovyWave active_file must remain a root state cell: {:#?}",
-        ir.state_cells
-            .iter()
-            .filter(|cell| cell.path.contains("active_file"))
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        !ir.derived_values.iter().any(|value| value.path == "store"),
-        "container path `store` must not be emitted as a derived value"
-    );
+    assert!(ir
+        .state_cells
+        .iter()
+        .any(|cell| cell.path == "store.active_file" && !cell.indexed));
+    assert!(!ir.derived_values.iter().any(|value| value.path == "store"));
     assert!(
         ir.update_branches.iter().any(|branch| {
             branch.source == "external_file_tree_row.file_row_elements.select_file"
@@ -269,6 +260,14 @@ fn novywave_project_lowers_source_wrapped_controls() {
             })
             .collect::<Vec<_>>()
     );
+    assert!(ir.update_branches.iter().any(|branch| {
+        branch.source == "file_tree_row.file_row_elements.select_file"
+            && branch.target == "store.selected_timeline_cursor_value"
+            && branch.expression
+                == UpdateExpression::ReadPath {
+                    path: "store.selected_timeline_cursor_default".to_owned(),
+                }
+    }));
     assert!(
         ir.update_branches.iter().any(|branch| {
             branch.source == "store.elements.panels_toggle_arrangement"

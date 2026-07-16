@@ -325,7 +325,7 @@ expect_root_text = { "selected_rows_profile" = "DataFirst", "selected_rows_count
 id = "selected-data-down"
 user_action = { kind = "click", target = "selected row control", target_text = "Down" }
 expected_source_event = { source = "store.elements.selected_data_down", target_text = "Down" }
-expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected" }
+expect_root_text = { "selected_rows_profile" = "DataLast", "selected_rows_count" = "2", "selected_rows_order_label" = "A[3:0], B[3:0]", "selected_signal_count_label" = "2 selected", "signal_search_text" = "" }
 
 [[step]]
 id = "search-data"

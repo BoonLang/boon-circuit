@@ -6046,10 +6046,6 @@ fn update_branches(
     candidate_sources: &mut CandidateSourceIndex<'_>,
     resolved_constants: &ResolvedConstantLookup<'_>,
 ) -> Vec<UpdateBranch> {
-    let state_paths = cells
-        .iter()
-        .map(|cell| cell.path.as_str())
-        .collect::<BTreeSet<_>>();
     cells
         .iter()
         .flat_map(|cell| {
@@ -6093,7 +6089,6 @@ fn update_branches(
                 fields,
                 field,
                 cell,
-                &state_paths,
                 &branches,
                 candidate_sources,
                 resolved_constants,
@@ -6115,7 +6110,6 @@ fn derived_dependency_update_branches(
     fields: &[FieldDef],
     field: &FieldDef,
     cell: &StateCell,
-    state_paths: &BTreeSet<&str>,
     existing_branches: &[UpdateBranch],
     candidate_sources: &mut CandidateSourceIndex<'_>,
     resolved_constants: &ResolvedConstantLookup<'_>,
@@ -6124,7 +6118,6 @@ fn derived_dependency_update_branches(
     for dependency in fields.iter().filter(|dependency| {
         dependency.parent_path == field.parent_path
             && dependency.path != field.path
-            && !state_paths.contains(dependency.path.as_str())
             && field.mentions_identifier_expr(&dependency.local_name)
     }) {
         for source in candidate_sources.candidate_sources(&dependency.path) {

@@ -978,9 +978,17 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                     if let Some(state) = responsive_evidence.as_mut()
                         && !state.resize_started
                     {
-                        let current_actions = document_action_paths(view.frame());
-                        if !current_actions.is_empty() {
-                            state.expected_actions = current_actions;
+                        let current_action_bounds = visible_action_bounds(&view);
+                        if !current_action_bounds.is_empty() {
+                            let size = host.viewport().logical_size;
+                            validate_action_bounds(
+                                "desktop",
+                                &current_action_bounds,
+                                size.width.round().max(0.0) as u32,
+                                size.height.round().max(0.0) as u32,
+                            )?;
+                            state.expected_actions =
+                                current_action_bounds.keys().cloned().collect();
                         }
                     }
                     if let Some((sequence, width, height, previous_surface_epoch)) =
@@ -1470,11 +1478,16 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             &mut evidence_proof_in_flight,
                                             [request],
                                         )?;
+                                        emit_runtime_async_lanes(
+                                            &observer,
+                                            runtime.as_mut().expect("mounted runtime"),
+                                            &product,
+                                        )?;
                                     }
                                     if state_evidence.migration_exercise
                                         && !migration_evidence_completed
                                     {
-                                        let request = run_schema_migration_evidence(
+                                        let requests = run_schema_migration_evidence(
                                             &observer,
                                             source_revision,
                                             runtime.as_mut().expect("mounted runtime"),
@@ -1492,7 +1505,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                             proof.as_ref(),
                                             &mut queued_evidence_proofs,
                                             &mut evidence_proof_in_flight,
-                                            [request],
+                                            requests,
                                         )?;
                                         migration_evidence_completed = true;
                                         runtime_key = None;
@@ -3828,7 +3841,8 @@ async fn run_schema_migration_evidence(
     host: &mut NativeSurfaceHost,
     columns: &mut boon_native_gpu::GlyphonRenderTextColumnMeasurer,
     migration: &MigrationBundle,
-) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<PreparedProofRequest>, Box<dyn std::error::Error + Send + Sync>> {
+    let product_before = authoritative_state_evidence(runtime)?;
     let target_stage = if migration.launch_stage != migration.initial_stage {
         migration.launch_stage.as_str()
     } else {
@@ -3932,13 +3946,34 @@ async fn run_schema_migration_evidence(
         &activated,
         presented.key.clone(),
     );
-    let proof = prepare_evidence_proof("persistence-migrated", presented.key, product)?;
+    let migration_proof = prepare_evidence_proof("persistence-migrated", presented.key, product)?;
     let restored = product
         .present(host, view)
         .await?
         .ok_or("schema migration evidence did not restore the product frame")?;
     emit_presented(observer, &restored);
-    Ok(proof)
+    let product_after = authoritative_state_evidence(runtime)?;
+    if product_after.digest != product_before.digest
+        || product_after.durable_epoch != product_before.durable_epoch
+        || product_after.durable_turn_sequence != product_before.durable_turn_sequence
+    {
+        return Err("schema migration evidence changed the mounted product authority".into());
+    }
+    emit_persistence_evidence(
+        observer,
+        PersistenceEvidenceKind::MigrationProductRestored,
+        source_revision,
+        runtime,
+        &product_before,
+        &product_after,
+        restored.key.clone(),
+    );
+    let restored_proof = prepare_evidence_proof(
+        "persistence-migration-product-restored",
+        restored.key,
+        product,
+    )?;
+    Ok(vec![migration_proof, restored_proof])
 }
 
 fn emit_persistence_evidence(
@@ -3972,16 +4007,20 @@ fn arm_responsive_evidence(
     desired_width: u32,
     key: crate::observer::FrameEvidenceKey,
 ) -> Result<ResponsiveEvidenceState, Box<dyn std::error::Error + Send + Sync>> {
-    let expected_actions = document_action_paths(view.frame());
-    if expected_actions.is_empty() {
-        return Err("responsive evidence found no public document actions".into());
-    }
     let current = host.viewport().logical_size;
     let current_width = current.width.round().max(0.0) as u32;
     let current_height = current.height.round().max(0.0) as u32;
     if !(320..=2_160).contains(&current_height) {
         return Err("responsive evidence has an unsupported tiled height".into());
     }
+    let desktop_action_bounds = visible_action_bounds(view);
+    validate_action_bounds(
+        "desktop",
+        &desktop_action_bounds,
+        current_width,
+        current_height,
+    )?;
+    let expected_actions = desktop_action_bounds.keys().cloned().collect();
     emit(
         observer,
         ObserverEvent::ResponsiveResizeReady {
@@ -4013,7 +4052,17 @@ fn capture_responsive_layout_evidence(
     resize_sequence: u64,
     key: crate::observer::FrameEvidenceKey,
 ) -> Result<PreparedProofRequest, Box<dyn std::error::Error + Send + Sync>> {
-    let observed_actions = document_action_paths(view.frame());
+    let observed_action_bounds = visible_action_bounds(view);
+    validate_action_bounds(
+        "narrow",
+        &observed_action_bounds,
+        evidence.desired_width,
+        evidence.desired_height,
+    )?;
+    let observed_actions = observed_action_bounds
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let missing_actions = missing_responsive_actions(&evidence.expected_actions, &observed_actions);
     if !missing_actions.is_empty() {
         let narrow_only_actions = observed_actions
@@ -4024,42 +4073,6 @@ fn capture_responsive_layout_evidence(
             "narrow layout is missing desktop public actions {missing_actions:?}; narrow-only navigation actions are {narrow_only_actions:?}"
         )
         .into());
-    }
-    let mut bounded_actions = BTreeSet::new();
-    for node in view
-        .frame()
-        .nodes
-        .values()
-        .filter(|node| !node.source_bindings.is_empty())
-    {
-        let Some(bounds) = view.node_bounds(&node.id.0) else {
-            continue;
-        };
-        if !bounds.x.is_finite()
-            || !bounds.y.is_finite()
-            || !bounds.width.is_finite()
-            || !bounds.height.is_finite()
-            || bounds.width <= 0.0
-            || bounds.height <= 0.0
-            || bounds.x < -0.5
-            || bounds.y < -0.5
-            || bounds.x + bounds.width > evidence.desired_width as f32 + 0.5
-            || bounds.y + bounds.height > evidence.desired_height as f32 + 0.5
-        {
-            return Err(format!(
-                "narrow action `{}` has invalid bounds ({}, {}, {}, {})",
-                node.id.0, bounds.x, bounds.y, bounds.width, bounds.height
-            )
-            .into());
-        }
-        bounded_actions.extend(
-            node.source_bindings
-                .iter()
-                .map(|binding| binding.source_path.clone()),
-        );
-    }
-    if bounded_actions.is_empty() {
-        return Err("narrow layout rendered no bound controls".into());
     }
     let state = authoritative_state_evidence(runtime)?;
     let mut action_hasher = Sha256::new();
@@ -4274,13 +4287,45 @@ async fn run_stale_program_evidence(
     Ok(proof)
 }
 
-fn document_action_paths(frame: &boon_document::DocumentFrame) -> BTreeSet<String> {
-    frame
-        .nodes
-        .values()
-        .flat_map(|node| node.source_bindings.iter())
-        .map(|binding| binding.source_path.clone())
-        .collect()
+fn visible_action_bounds(view: &RetainedView) -> BTreeMap<String, Vec<boon_document::Rect>> {
+    let mut actions = BTreeMap::<String, Vec<boon_document::Rect>>::new();
+    for (source_path, bounds) in view.visible_source_action_bounds() {
+        actions.entry(source_path).or_default().push(bounds);
+    }
+    actions
+}
+
+fn validate_action_bounds(
+    layout: &str,
+    actions: &BTreeMap<String, Vec<boon_document::Rect>>,
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if actions.is_empty() {
+        return Err(format!("{layout} layout rendered no visible public controls").into());
+    }
+    for (source_path, targets) in actions {
+        for bounds in targets {
+            if !bounds.x.is_finite()
+                || !bounds.y.is_finite()
+                || !bounds.width.is_finite()
+                || !bounds.height.is_finite()
+                || bounds.width <= 0.0
+                || bounds.height <= 0.0
+                || bounds.x < -0.5
+                || bounds.y < -0.5
+                || bounds.x + bounds.width > width as f32 + 0.5
+                || bounds.y + bounds.height > height as f32 + 0.5
+            {
+                return Err(format!(
+                    "{layout} action `{source_path}` has invalid bounds ({}, {}, {}, {}) in {width}x{height}",
+                    bounds.x, bounds.y, bounds.width, bounds.height
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn missing_responsive_actions(
@@ -5104,7 +5149,7 @@ fn finalize_profile_candidate(
                         .try_into()
                         .unwrap_or(u32::MAX),
                     pending_durable_batches: persistence
-                        .pending_checkpoint_batches
+                        .pending_checkpoint_batches_peak
                         .try_into()
                         .unwrap_or(u32::MAX),
                     trusted_parent_rebuilds,

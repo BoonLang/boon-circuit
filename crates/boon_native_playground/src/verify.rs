@@ -1109,6 +1109,75 @@ fn run_restart_phase(
                     .to_owned(),
             );
         }
+        let artifact_load =
+            wait_for_value(
+                observer,
+                events,
+                EVENT_TIMEOUT,
+                start,
+                |event| match event {
+                    ObserverEvent::AsyncLaneCompleted {
+                        lane: AsyncLaneKind::ProgramArtifactLoad,
+                        request_id,
+                        revision,
+                        queue_depth,
+                        queue_wait_us,
+                        worker_us,
+                        apply_us,
+                        end_to_end_us,
+                        outcome,
+                        key,
+                    } if key.process_id == mounted.9.process_id => Some((
+                        request_id.clone(),
+                        *revision,
+                        *queue_depth,
+                        *queue_wait_us,
+                        *worker_us,
+                        *apply_us,
+                        *end_to_end_us,
+                        *outcome,
+                        key.clone(),
+                    )),
+                    _ => None,
+                },
+            )?;
+        let artifact_load_is_valid = events.iter().any(|event| {
+            matches!(
+                event,
+                ObserverEvent::AsyncLaneCompleted {
+                    lane: AsyncLaneKind::ProgramArtifactLoad,
+                    outcome: AsyncLaneOutcome::Applied,
+                    key,
+                    ..
+                } if key == &mounted.9
+            ) && async_lane_event_is_valid(event, events)
+        });
+        if artifact_load.0.is_empty()
+            || artifact_load.1 == 0
+            || artifact_load.2 == 0
+            || artifact_load.6
+                < artifact_load
+                    .3
+                    .saturating_add(artifact_load.4)
+                    .saturating_add(artifact_load.5)
+            || artifact_load.7 != AsyncLaneOutcome::Applied
+            || artifact_load.8 != mounted.9
+            || !artifact_load_is_valid
+        {
+            return Err(format!(
+                "restart artifact restoration was not applied through the async load lane before the exact first frame: request={}, revision={}, queue_depth={}, queue_wait_us={}, worker_us={}, apply_us={}, end_to_end_us={}, outcome={:?}, frame_matches={}, event_valid={artifact_load_is_valid}",
+                artifact_load.0,
+                artifact_load.1,
+                artifact_load.2,
+                artifact_load.3,
+                artifact_load.4,
+                artifact_load.5,
+                artifact_load.6,
+                artifact_load.7,
+                artifact_load.8 == mounted.9,
+            ));
+        }
+        let mut migration_proof_keys = Vec::new();
         if profile.requires_migration_exercise() {
             let migration =
                 wait_for_value(
@@ -1163,11 +1232,70 @@ fn run_restart_phase(
                     ),
                 ));
             }
+            let restored =
+                wait_for_value(
+                    observer,
+                    events,
+                    EVENT_TIMEOUT,
+                    start,
+                    |event| match event {
+                        ObserverEvent::PersistenceEvidence {
+                            kind: PersistenceEvidenceKind::MigrationProductRestored,
+                            source_revision,
+                            durable_epoch,
+                            durable_turn_sequence,
+                            before_state_digest,
+                            after_state_digest,
+                            key,
+                            ..
+                        } => Some((
+                            *source_revision,
+                            *durable_epoch,
+                            *durable_turn_sequence,
+                            before_state_digest.clone(),
+                            after_state_digest.clone(),
+                            key.clone(),
+                        )),
+                        _ => None,
+                    },
+                )?;
+            if restored.0 != baseline.source_revision
+                || restored.1 < baseline.durable_epoch
+                || restored.2 < baseline.durable_turn_sequence
+                || restored.3 != baseline.state_digest
+                || restored.4 != baseline.state_digest
+                || !restored.5.is_complete()
+                || !frame_key_matches_session(events, &restored.5, &session, ObserverRole::Preview)
+                || restored.5.frame_id <= migration.5.frame_id
+                || restored.5.present_id <= migration.5.present_id
+            {
+                return Err(format!(
+                    "post-migration product restoration is incomplete: source_revision={} (expected {}), durable_epoch={} (expected >= {}), durable_turn={} (expected >= {}), before={}, after={}, expected={}, frame={:?}, migration_frame={:?}",
+                    restored.0,
+                    baseline.source_revision,
+                    restored.1,
+                    baseline.durable_epoch,
+                    restored.2,
+                    baseline.durable_turn_sequence,
+                    restored.3,
+                    restored.4,
+                    baseline.state_digest,
+                    restored.5,
+                    migration.5,
+                ));
+            }
+            migration_proof_keys.push(("migration activation", migration.5));
+            migration_proof_keys.push(("post-migration product restoration", restored.5));
         }
         wait_for_evidence_proofs(observer, events)
             .map_err(|error| format!("restart proof lane did not drain: {error}"))?;
         if exact_proof_for_key(events, &mounted.9).is_none() {
             return Err("restart mount has no exact app-owned WGPU proof".to_owned());
+        }
+        for (label, key) in migration_proof_keys {
+            if exact_proof_for_key(events, &key).is_none() {
+                return Err(format!("{label} has no exact app-owned WGPU proof"));
+            }
         }
         if !process_exists(session.desktop_id())
             || !process_exists(roles.preview)

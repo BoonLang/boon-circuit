@@ -290,6 +290,21 @@ impl RetainedView {
         self.target_for_scenario(source_path, None, target_text, None, None)
     }
 
+    pub fn visible_source_action_bounds(&self) -> Vec<(String, Rect)> {
+        self.retained
+            .hits()
+            .entries
+            .iter()
+            .filter(|entry| self.visible_hit_target(entry).is_some())
+            .flat_map(|entry| {
+                entry
+                    .source_routes
+                    .iter()
+                    .map(move |route| (route.source_path.clone(), entry.bounds))
+            })
+            .collect()
+    }
+
     pub fn target_for_scenario(
         &self,
         source_path: &str,

@@ -58,6 +58,7 @@ pub enum PersistenceEvidenceKind {
     ImportPreviewed = 4,
     ImportActivated = 5,
     MigrationActivated = 6,
+    MigrationProductRestored = 7,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +98,7 @@ impl PersistenceEvidenceKind {
             4 => Ok(Self::ImportPreviewed),
             5 => Ok(Self::ImportActivated),
             6 => Ok(Self::MigrationActivated),
+            7 => Ok(Self::MigrationProductRestored),
             _ => Err(ObserverError::InvalidEnum(
                 "persistence evidence kind",
                 value,
@@ -2045,7 +2047,7 @@ mod tests {
             key: key(41),
         });
         roundtrip(ObserverEvent::PersistenceEvidence {
-            kind: PersistenceEvidenceKind::ImportActivated,
+            kind: PersistenceEvidenceKind::MigrationProductRestored,
             source_revision: 4,
             runtime_sequence: 10,
             durable_epoch: 9,

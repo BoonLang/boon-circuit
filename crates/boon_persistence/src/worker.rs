@@ -235,6 +235,11 @@ pub struct PersistenceWorkerStatus {
     /// Checkpoint commits needed to make the currently accepted authority
     /// durable. Multiple logical turns may share one worker-owned checkpoint.
     pub pending_checkpoint_batches: usize,
+    /// Lifetime high-water mark for `pending_checkpoint_batches`.
+    ///
+    /// This is updated while holding the admission lock, so observers cannot
+    /// miss a transient backlog between status samples.
+    pub pending_checkpoint_batches_peak: usize,
     pub durable_epoch: u64,
     pub durable_through_turn_sequence: u64,
     /// Turns waiting in the channel. Worker-owned batch turns remain visible in
@@ -342,6 +347,7 @@ struct AdmissionState {
     next_turn_sequence: u64,
     pending: VecDeque<PendingMeta>,
     active_checkpoint_turns: usize,
+    pending_checkpoint_batches_peak: usize,
 }
 
 #[derive(Debug)]
@@ -381,6 +387,7 @@ impl SharedState {
                 next_turn_sequence: 1,
                 pending: VecDeque::new(),
                 active_checkpoint_turns: 0,
+                pending_checkpoint_batches_peak: 0,
             }),
             reservation_changed: Condvar::new(),
             queue_depth: AtomicUsize::new(0),
@@ -457,6 +464,7 @@ impl SharedState {
         let mut admission = lock(&self.admission);
         debug_assert_eq!(admission.active_checkpoint_turns, 0);
         admission.active_checkpoint_turns = turn_count;
+        update_pending_checkpoint_batches_peak(&mut admission, self.max_batch_turns);
     }
 
     fn clear_checkpoint_batch(&self) {
@@ -474,15 +482,8 @@ impl SharedState {
     fn status(&self) -> PersistenceWorkerStatus {
         let now = Instant::now();
         let admission = lock(&self.admission);
-        let active_checkpoint_turns = admission
-            .active_checkpoint_turns
-            .min(admission.pending.len());
-        let queued_checkpoint_turns = admission
-            .pending
-            .len()
-            .saturating_sub(active_checkpoint_turns);
-        let pending_checkpoint_batches = usize::from(active_checkpoint_turns > 0)
-            .saturating_add(queued_checkpoint_turns.div_ceil(self.max_batch_turns));
+        let pending_checkpoint_batches =
+            pending_checkpoint_batches(&admission, self.max_batch_turns);
         let pending = admission.pending.front().map(|first| PendingTurnRange {
             first_turn_sequence: first.turn_sequence,
             last_turn_sequence: admission
@@ -495,6 +496,7 @@ impl SharedState {
         PersistenceWorkerStatus {
             pending,
             pending_checkpoint_batches,
+            pending_checkpoint_batches_peak: admission.pending_checkpoint_batches_peak,
             durable_epoch: self.durable_epoch.load(Ordering::Acquire),
             durable_through_turn_sequence: self.durable_turn.load(Ordering::Acquire),
             queue_depth: self.queue_depth.load(Ordering::Acquire),
@@ -518,6 +520,24 @@ impl SharedState {
             last_error: lock(&self.last_error).clone(),
         }
     }
+}
+
+fn pending_checkpoint_batches(admission: &AdmissionState, max_batch_turns: usize) -> usize {
+    let active_checkpoint_turns = admission
+        .active_checkpoint_turns
+        .min(admission.pending.len());
+    let queued_checkpoint_turns = admission
+        .pending
+        .len()
+        .saturating_sub(active_checkpoint_turns);
+    usize::from(active_checkpoint_turns > 0)
+        .saturating_add(queued_checkpoint_turns.div_ceil(max_batch_turns))
+}
+
+fn update_pending_checkpoint_batches_peak(admission: &mut AdmissionState, max_batch_turns: usize) {
+    admission.pending_checkpoint_batches_peak = admission
+        .pending_checkpoint_batches_peak
+        .max(pending_checkpoint_batches(admission, max_batch_turns));
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -606,7 +626,13 @@ impl AuthorityTurnReservation {
                 .sender
                 .try_send(WorkerMessage::Turn(QueuedTurn { turn }))
             {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    update_pending_checkpoint_batches_peak(
+                        &mut admission,
+                        self.shared.max_batch_turns,
+                    );
+                    Ok(())
+                }
                 Err(TrySendError::Full(WorkerMessage::Turn(queued))) => {
                     self.shared.queue_depth.fetch_sub(1, Ordering::AcqRel);
                     admission.pending.pop_back();
@@ -1129,14 +1155,25 @@ fn worker_main<D>(
             WorkerMessage::Turn(turn) => {
                 shared.queue_depth.fetch_sub(1, Ordering::AcqRel);
                 pending.push(turn);
-                collect_batch(&receiver, &config, &mut pending, &mut deferred, &shared);
+                collect_batch(
+                    &mut driver,
+                    &durable,
+                    &receiver,
+                    &config,
+                    &mut pending,
+                    &mut deferred,
+                    &shared,
+                );
                 let _ = flush_pending(&mut driver, &mut durable, &mut pending, &shared);
             }
-            control => {
-                let should_stop =
-                    handle_control(&mut driver, &mut durable, &mut pending, control, &shared);
-                if should_stop {
-                    break;
+            message => {
+                if let Err(control) = handle_async_artifact(&mut driver, &durable, message, &shared)
+                {
+                    let should_stop =
+                        handle_control(&mut driver, &mut durable, &mut pending, control, &shared);
+                    if should_stop {
+                        break;
+                    }
                 }
             }
         }
@@ -1208,13 +1245,71 @@ impl DurableCursor {
     }
 }
 
-fn collect_batch(
+fn handle_async_artifact<D>(
+    driver: &mut D,
+    durable: &DurableCursor,
+    message: WorkerMessage,
+    shared: &SharedState,
+) -> Result<(), WorkerMessage>
+where
+    D: PersistenceDriver,
+{
+    match message {
+        WorkerMessage::PutContentArtifactAsync(ticket, artifact) => {
+            let result = match driver.execute(PersistenceCommand::PutContentArtifact(
+                PutContentArtifactRequest {
+                    application: durable.application.clone(),
+                    artifact: *artifact,
+                },
+            )) {
+                PersistenceResult::ContentArtifactStored(result) => result,
+                _ => Err(StoreError::Backend(
+                    "driver returned the wrong result for PutContentArtifact".to_owned(),
+                )),
+            };
+            record_result_error(shared, &result);
+            lock(&shared.content_artifact_completions)
+                .push_back(ContentArtifactStoreCompletion { ticket, result });
+            shared
+                .pending_content_artifact_stores
+                .fetch_sub(1, Ordering::AcqRel);
+            Ok(())
+        }
+        WorkerMessage::LoadContentArtifactAsync(ticket, id) => {
+            let result = match driver.execute(PersistenceCommand::LoadContentArtifact(
+                LoadContentArtifactRequest {
+                    application: durable.application.clone(),
+                    id,
+                },
+            )) {
+                PersistenceResult::ContentArtifactLoaded(result) => result,
+                _ => Err(StoreError::Backend(
+                    "driver returned the wrong result for LoadContentArtifact".to_owned(),
+                )),
+            };
+            record_result_error(shared, &result);
+            lock(&shared.content_artifact_load_completions)
+                .push_back(ContentArtifactLoadCompletion { ticket, id, result });
+            shared
+                .pending_content_artifact_loads
+                .fetch_sub(1, Ordering::AcqRel);
+            Ok(())
+        }
+        message => Err(message),
+    }
+}
+
+fn collect_batch<D>(
+    driver: &mut D,
+    durable: &DurableCursor,
     receiver: &Receiver<WorkerMessage>,
     config: &PersistenceWorkerConfig,
     pending: &mut Vec<QueuedTurn>,
     deferred: &mut Option<WorkerMessage>,
     shared: &SharedState,
-) {
+) where
+    D: PersistenceDriver,
+{
     if pending.len() >= config.max_batch_turns {
         return;
     }
@@ -1243,9 +1338,11 @@ fn collect_batch(
                 shared.queue_depth.fetch_sub(1, Ordering::AcqRel);
                 pending.push(turn);
             }
-            control => {
-                *deferred = Some(control);
-                return;
+            message => {
+                if let Err(control) = handle_async_artifact(driver, durable, message, shared) {
+                    *deferred = Some(control);
+                    return;
+                }
             }
         }
     }
@@ -1567,26 +1664,6 @@ where
             let _ = reply.send(ControlReply::PutContentArtifact(result));
             false
         }
-        WorkerMessage::PutContentArtifactAsync(ticket, artifact) => {
-            let result = match driver.execute(PersistenceCommand::PutContentArtifact(
-                PutContentArtifactRequest {
-                    application: durable.application.clone(),
-                    artifact: *artifact,
-                },
-            )) {
-                PersistenceResult::ContentArtifactStored(result) => result,
-                _ => Err(StoreError::Backend(
-                    "driver returned the wrong result for PutContentArtifact".to_owned(),
-                )),
-            };
-            record_result_error(shared, &result);
-            lock(&shared.content_artifact_completions)
-                .push_back(ContentArtifactStoreCompletion { ticket, result });
-            shared
-                .pending_content_artifact_stores
-                .fetch_sub(1, Ordering::AcqRel);
-            false
-        }
         WorkerMessage::LoadContentArtifact(id, reply) => {
             let result = match driver.execute(PersistenceCommand::LoadContentArtifact(
                 LoadContentArtifactRequest {
@@ -1603,25 +1680,9 @@ where
             let _ = reply.send(ControlReply::LoadContentArtifact(result));
             false
         }
-        WorkerMessage::LoadContentArtifactAsync(ticket, id) => {
-            let result = match driver.execute(PersistenceCommand::LoadContentArtifact(
-                LoadContentArtifactRequest {
-                    application: durable.application.clone(),
-                    id,
-                },
-            )) {
-                PersistenceResult::ContentArtifactLoaded(result) => result,
-                _ => Err(StoreError::Backend(
-                    "driver returned the wrong result for LoadContentArtifact".to_owned(),
-                )),
-            };
-            record_result_error(shared, &result);
-            lock(&shared.content_artifact_load_completions)
-                .push_back(ContentArtifactLoadCompletion { ticket, id, result });
-            shared
-                .pending_content_artifact_loads
-                .fetch_sub(1, Ordering::AcqRel);
-            false
+        WorkerMessage::PutContentArtifactAsync(_, _)
+        | WorkerMessage::LoadContentArtifactAsync(_, _) => {
+            unreachable!("async artifact work is dispatched without a checkpoint boundary")
         }
         WorkerMessage::Shutdown(reply) => {
             let result = match driver.execute(PersistenceCommand::Shutdown(ShutdownRequest)) {
@@ -1931,10 +1992,12 @@ mod tests {
             Some((1, 3))
         );
         assert_eq!(status.pending_checkpoint_batches, 2);
+        assert_eq!(status.pending_checkpoint_batches_peak, 2);
 
         gate.release();
         coordinator.barrier().unwrap();
         assert_eq!(coordinator.status().pending_checkpoint_batches, 0);
+        assert_eq!(coordinator.status().pending_checkpoint_batches_peak, 2);
         coordinator.shutdown().unwrap();
     }
 
@@ -2064,6 +2127,32 @@ mod tests {
             coordinator.load_content_artifact(artifact.id).unwrap(),
             Some(artifact)
         );
+        coordinator.shutdown().unwrap();
+    }
+
+    #[test]
+    fn asynchronous_artifact_work_does_not_split_an_authority_batch() {
+        let (coordinator, trace) = coordinator(8, Duration::from_millis(100), None);
+        let artifact = ContentArtifact::new(
+            "application/vnd.boon.worker-test",
+            b"interleaved background artifact".to_vec(),
+        )
+        .unwrap();
+
+        coordinator.try_enqueue_turn(turn(1, 11)).unwrap();
+        let ticket = coordinator
+            .try_put_content_artifact(artifact.clone())
+            .unwrap();
+        coordinator.try_enqueue_turn(turn(2, 22)).unwrap();
+        coordinator.barrier().unwrap();
+
+        assert_eq!(&*lock(&trace.commits), &[(1, 2)]);
+        let completion = coordinator
+            .take_content_artifact_store_completions()
+            .into_iter()
+            .find(|completion| completion.ticket == ticket)
+            .expect("interleaved artifact store must complete");
+        assert_eq!(completion.result.unwrap().id, artifact.id);
         coordinator.shutdown().unwrap();
     }
 

@@ -155,6 +155,8 @@ struct NativeWorkflowPending {
     event_digests: Vec<String>,
     batch_text: String,
     pointer_up_count: u8,
+    last_pointer_up_source_path: Option<String>,
+    last_pointer_up_dispatched_source_path: Option<String>,
     action_complete: bool,
 }
 
@@ -2118,6 +2120,18 @@ fn observe_native_workflow_input(
         .into());
     }
 
+    if matches!(
+        envelope.event,
+        HostEvent::Pointer(PointerEvent {
+            phase: PointerPhase::Up,
+            button: Some(PointerButton::Primary),
+            ..
+        })
+    ) {
+        pending.last_pointer_up_source_path = pointer_source_path.map(str::to_owned);
+        pending.last_pointer_up_dispatched_source_path = dispatched_source_path.map(str::to_owned);
+    }
+
     match (action_kind, &envelope.event) {
         (
             "click" | "double_click",
@@ -2389,7 +2403,7 @@ async fn service_native_workflow(
                     .is_some_and(|started| started.elapsed() >= TEST_SETTLE_TIMEOUT)
             {
                 return Err(format!(
-                    "native workflow step `{}` did not complete its declared real-input span; events={}, pointer_ups={}, first_sequence={:?}, last_sequence={:?}",
+                    "native workflow step `{}` did not complete its declared real-input span; events={}, pointer_ups={}, first_sequence={:?}, last_sequence={:?}, pointer_up_source={:?}, pointer_up_dispatch={:?}",
                     workflow
                         .current()
                         .map_or("unknown", |step| step.id.as_str()),
@@ -2397,6 +2411,8 @@ async fn service_native_workflow(
                     pending.pointer_up_count,
                     pending.first_sequence,
                     pending.last_sequence,
+                    pending.last_pointer_up_source_path,
+                    pending.last_pointer_up_dispatched_source_path,
                 )
                 .into());
             }
@@ -2639,6 +2655,8 @@ fn emit_current_native_workflow_target(
         event_digests: Vec::new(),
         batch_text: String::new(),
         pointer_up_count: 0,
+        last_pointer_up_source_path: None,
+        last_pointer_up_dispatched_source_path: None,
         action_complete: false,
     });
     emit(

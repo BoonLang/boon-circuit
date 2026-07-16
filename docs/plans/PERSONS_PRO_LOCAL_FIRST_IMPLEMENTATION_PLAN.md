@@ -471,46 +471,54 @@ when this checkpoint was recorded still mapped the prior deleted binary. A
 session restart is required before rerunning `verify-persons-pro`; stale reports
 must not be used to satisfy the stop conditions.
 
-Current implementation evidence (2026-07-16, commits `aaad56a`, `9354fd1`,
-`12176d6`, and `9b4ed71`):
+Current implementation evidence (2026-07-16, through commits `62d19d2` and
+`3aa1d0e`):
 
-- `cargo test -p boon_persistence --lib` passes all 52 tests.
-- `cargo test -p boon_native_playground -p xtask --quiet` passes 62 focused
-  playground tests and 19 tooling tests. Duplicate private playground behavior
-  oracles were deleted; public product behavior remains owned by versioned
-  scenarios and manifest-backed native gates.
-- `cargo check --workspace --all-targets` and `cargo test --workspace
-  --all-targets --quiet` pass after the cleanup.
-- Fresh `cargo xtask verify-architecture` and `cargo xtask verify-negative`
-  reports pass. The architecture report records 183,763 tracked Rust lines,
-  31,703 test lines, and 31,361 playground production lines without raising any
-  cap.
-- The last fresh `cargo xtask verify-persons-pro --report
-  target/reports/report-v2/persons-pro.json` reports `status=pass`, completes all
-  29 declared native workflow steps, restores the exact acknowledged authority
-  in a second native process, and records an applied `program-artifact-load`
-  worker-lane completion linked to a presented restart frame.
-- Release budget observations are: editor-visible p95 8.257 ms, child-preview
-  p95 10.648 ms and p99 11.152 ms, starter compile p95 2.852 ms and max
-  2.952 ms, passive scroll p95 0.841 ms, and maximum interaction-frame blocking
-  9.803 ms. Trusted-parent rebuilds, proof replacements, and proof-result drops
-  are zero.
-- Persistence acceptance now distinguishes logical pending turns from actual
-  worker-owned checkpoint batches. The profile observed one pending checkpoint
-  batch at most; the worker regression proves that an active commit plus queued
-  future work reports two batches rather than disguising queue depth.
+- Asynchronous program-artifact store/load work no longer acts as a persistence
+  checkpoint boundary. A worker regression proves `Turn(1)`, asynchronous
+  artifact work, and `Turn(2)` produce one contiguous authority checkpoint.
+- `pending_checkpoint_batches_peak` is updated under the admission lock and is
+  the value used by release profiling, so transient durable backlog cannot be
+  hidden between profile samples.
+- Responsive parity is derived from visible topmost retained hit targets.
+  Hidden document branches no longer count, and every counted desktop/narrow
+  control must have finite positive bounds wholly inside the native viewport.
+- Restart verification now requires an applied `program-artifact-load` event
+  from the restarted preview process linked to its exact first mounted frame.
+  Migration verification separately proves the isolated migrated frame and a
+  later app-owned WGPU frame where the original product authority and digest
+  are restored unchanged.
+- A compact compiled-plan test pins the exact Persons.pro semantic-memory
+  allowlist, its two authoritative lists and row fields, two durable effect
+  contracts, and the exclusion of diagnostics and derived workflow status.
+  Host-only scenario ownership is explicitly assigned to the manifest-backed
+  native verifier rather than deleted private `runtime_view.rs` harnesses.
+- `cargo test -p boon_persistence --lib` passes all 53 tests.
+- `cargo test -p boon_native_playground -p xtask --quiet` passes 63 focused
+  playground tests and 19 tooling tests.
+- `cargo check --workspace --all-targets`, `cargo test --workspace
+  --all-targets --quiet`, and `cargo build --release
+  -p boon_native_playground` pass from the current implementation.
+- The architecture gate passes with 184,150 tracked Rust lines, 31,839 test
+  lines, 31,551 playground production lines, 5,117 xtask production lines, and
+  20,544 runtime-plus-executor production lines, all within their caps.
+- No tracked Python source exists. Production engine/playground scans contain
+  no Persons.pro branch; remaining Persons literals are source-controlled
+  fixtures and tests.
 
-That Persons report was produced from the implementation worktree before the
-subsequent test-only cleanup commits, so its measurements are evidence for the
-product implementation but are intentionally stale for the final aggregate.
-The Persons gate and all other manifest-native gates must be regenerated from
-current HEAD after the compositor restart.
+The older release Persons report remains useful only as a historical timing
+sample: editor-visible p95 8.257 ms, child-preview p95 10.648 ms and p99
+11.152 ms, starter compile p95 2.852 ms and max 2.952 ms, passive scroll p95
+0.841 ms, and maximum interaction-frame blocking 9.803 ms. It predates the
+current clean commits and cannot satisfy final handoff evidence.
 
-The latest isolated-seat release-ownership fix is installed in `/usr/bin`, but
-the current COSMIC session still maps the preceding compositor image. A session
-restart remains required before the final manifest-backed handoff run. The
-passing Persons report is current code evidence, but it does not waive that
-final environment refresh or the remaining workspace-wide gates.
+The installed `/usr/bin/cosmic-comp` and rebuilt compositor have SHA-256
+`f1efface3d67ac6b011712a812b406f8775e4ab23835ea1bb54a098310422e38`,
+while the running compositor process still maps
+`5fd348ebd1e142e70b357aae2ec5577d3a6a56034a791886d5597c0c76a70782`.
+A user/session restart is therefore mandatory before regenerating every native
+handoff report from current HEAD. Until those reports and the manifest-backed
+aggregate pass, this local-first milestone remains incomplete.
 
 ### Slice 5: Browser host
 

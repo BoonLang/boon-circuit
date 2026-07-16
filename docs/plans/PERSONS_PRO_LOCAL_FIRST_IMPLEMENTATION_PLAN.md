@@ -455,7 +455,7 @@ responsive desktop/narrow layouts, migration activation, scrolling, and
 visible TEST cursor playback.
 
 Current implementation evidence (2026-07-16, commits `be6ff21` through
-`9de9fd5`):
+`c73d276`):
 
 - Asynchronous program-artifact store/load work no longer acts as a persistence
   checkpoint boundary. A 150 ms slow-I/O regression proves that an interleaved
@@ -485,8 +485,8 @@ Current implementation evidence (2026-07-16, commits `be6ff21` through
 - `cargo check --workspace --all-targets`, `cargo test --workspace
   --all-targets --quiet`, and `cargo build --release
   -p boon_native_playground` pass from the current implementation.
-- The architecture gate passes with 184,963 tracked Rust lines, 31,999 test
-  lines, 32,000 playground production lines, 5,197 xtask production lines, and
+- The architecture gate passes with 184,953 tracked Rust lines, 31,998 test
+  lines, 31,998 playground production lines, 5,197 xtask production lines, and
   20,544 runtime-plus-executor production lines, all within their caps.
 - No tracked Python source exists. Production engine/playground scans contain
   no Persons.pro branch; remaining Persons literals are source-controlled
@@ -530,6 +530,14 @@ Current implementation evidence (2026-07-16, commits `be6ff21` through
   source turn while carrying document-change evidence across every source turn
   in the same host input transaction. This keeps realistic text-change plus
   commit playback honest without weakening direct runtime scenario assertions.
+- Explicit `THEN` use of semantic state now expands its upstream source lineage
+  into executable update branches instead of dependency metadata alone. The
+  focused IR regression and NovyWave's complete 109-turn semantic scenario pass.
+- NovyWave uses one retained search-input identity for resting and focused
+  styles, exposes the five UART signals used by its no-scroll workflow, and
+  completes native TEST playback with one visible 60 Hz frame per pointer phase
+  plus bounded eight-frame cursor travel. Its app-owned native gate passes from
+  the implementation worktree before final source-bound report regeneration.
 - The physical TodoMVC list retains a bounded scrolling viewport while exposing
   the five rows exercised by its declared no-scroll native workflow.
 

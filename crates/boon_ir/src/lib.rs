@@ -20,13 +20,13 @@ pub struct TypedProgram {
     pub expression_count: usize,
     pub expressions: Vec<AstExpr>,
     pub expression_coverage: ExpressionCoverage,
+    #[serde(default)]
+    pub distributed_references: DistributedReferences,
     pub semantic_index: SemanticIndex,
     pub graph_node_count: usize,
     pub nodes: Vec<IrNode>,
     pub row_scopes: Vec<RowScope>,
     pub sources: Vec<SourcePort>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub host_effects: Vec<HostEffectDeclaration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<HostPortDeclaration>,
     pub state_cells: Vec<StateCell>,
@@ -47,6 +47,38 @@ pub struct TypedProgram {
     pub typecheck_report: boon_typecheck::TypeCheckReport,
     pub hidden_identity_verified: bool,
     pub static_schedule_verified: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedReferences {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub value_references: Vec<DistributedValueReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pure_calls: Vec<DistributedPureCall>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedValueReference {
+    pub expr_id: ExprId,
+    pub canonical_path: String,
+    pub producer_role: boon_typecheck::ProgramRole,
+    pub value_type: boon_typecheck::Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedPureCall {
+    pub expr_id: ExprId,
+    pub canonical_function: String,
+    pub producer_role: boon_typecheck::ProgramRole,
+    pub result_type: boon_typecheck::Type,
+    pub arguments: Vec<DistributedPureCallArgument>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedPureCallArgument {
+    pub name: String,
+    pub expr_id: ExprId,
+    pub argument_type: boon_typecheck::Type,
 }
 
 macro_rules! typed_usize_ids {
@@ -273,6 +305,8 @@ pub struct SemanticIndexReuse {
 pub struct ExpressionCoverage {
     pub computed_from: String,
     pub ast_expression_count: usize,
+    #[serde(default)]
+    pub distributed_reference_expression_count: usize,
     pub unknown_ast_expression_count: usize,
     pub ignored_unknown_ast_expression_count: usize,
     pub unknown_initial_value_count: usize,
@@ -290,6 +324,7 @@ impl ExpressionCoverage {
         Self {
             computed_from: "parser_ast_and_typed_ir".to_owned(),
             ast_expression_count: 0,
+            distributed_reference_expression_count: 0,
             unknown_ast_expression_count: 0,
             ignored_unknown_ast_expression_count: 0,
             unknown_initial_value_count: 0,
@@ -351,28 +386,9 @@ pub struct SourcePort {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectDeclaration {
-    pub name: String,
-    pub line: usize,
-    pub trigger_source: String,
-    pub operation: String,
-    pub intent_type: SemanticDataType,
-    pub intent_fields: Vec<HostEffectIntentField>,
-    pub result_type: SemanticDataType,
-    pub result_routes: Vec<HostEffectResultRoute>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectIntentField {
+pub struct HostEffectCallArgument {
     pub name: String,
     pub value_expr_id: ExprId,
-    pub data_type: SemanticDataType,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectResultRoute {
-    pub variant: String,
-    pub source_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -486,9 +502,6 @@ pub enum InitialValue {
     },
     Number {
         value: String,
-    },
-    Byte {
-        value: u8,
     },
     Bool {
         value: bool,
@@ -713,6 +726,9 @@ pub enum UpdateGuard {
         field: SourcePayloadField,
         values: Vec<String>,
     },
+    TriggerValueOneOf {
+        values: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -891,6 +907,11 @@ pub enum UpdateExpression {
         bytes_path: String,
         path: FileBytesPath,
     },
+    HostEffect {
+        operation: String,
+        call_expr_id: ExprId,
+        arguments: Vec<HostEffectCallArgument>,
+    },
     BytesFind {
         haystack: String,
         needle: String,
@@ -1019,15 +1040,30 @@ pub enum ViewBindingKind {
 }
 
 pub fn lower(program: &ParsedProgram) -> Result<TypedProgram, String> {
-    lower_with_typecheck(program, true)
+    lower_with_external_types(program, &boon_typecheck::ExternalTypeEnvironment::default())
 }
 
 pub fn lower_runtime(program: &ParsedProgram) -> Result<TypedProgram, String> {
-    lower_with_typecheck(program, false)
+    lower_runtime_with_external_types(program, &boon_typecheck::ExternalTypeEnvironment::default())
+}
+
+pub fn lower_with_external_types(
+    program: &ParsedProgram,
+    external_types: &boon_typecheck::ExternalTypeEnvironment,
+) -> Result<TypedProgram, String> {
+    lower_with_typecheck(program, external_types, true)
+}
+
+pub fn lower_runtime_with_external_types(
+    program: &ParsedProgram,
+    external_types: &boon_typecheck::ExternalTypeEnvironment,
+) -> Result<TypedProgram, String> {
+    lower_with_typecheck(program, external_types, false)
 }
 
 fn lower_with_typecheck(
     program: &ParsedProgram,
+    external_types: &boon_typecheck::ExternalTypeEnvironment,
     include_type_hints: bool,
 ) -> Result<TypedProgram, String> {
     let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
@@ -1041,9 +1077,9 @@ fn lower_with_typecheck(
         eprintln!("boon_ir lower typecheck:start");
     }
     let typecheck_report = if include_type_hints {
-        boon_typecheck::check_profiled(program)
+        boon_typecheck::check_profiled_with_external_types(program, external_types)
     } else {
-        boon_typecheck::check_runtime_profiled(program)
+        boon_typecheck::check_runtime_profiled_with_external_types(program, external_types)
     }
     .0;
     let typecheck_ms = lower_elapsed_ms(typecheck_started);
@@ -1080,6 +1116,8 @@ fn lower_with_typecheck(
             failures.len(),
         ));
     }
+    let distributed_references =
+        distributed_references(program, external_types, &typecheck_report)?;
     let nodes_started = Instant::now();
     let nodes = source_driven_nodes(program);
     let nodes_ms = lower_elapsed_ms(nodes_started);
@@ -1175,7 +1213,7 @@ fn lower_with_typecheck(
         return Err("List/map node must be indexed".to_owned());
     }
     let dependencies_started = Instant::now();
-    let mut candidate_sources = CandidateSourceIndex::new(&fields, &direct_sources);
+    let mut candidate_sources = CandidateSourceIndex::new(&fields, &direct_sources, &state_cells);
     let dependencies = dependency_edges(program, &state_cells, &mut candidate_sources);
     let dependencies_ms = lower_elapsed_ms(dependencies_started);
     trace_phase("dependency_edges", dependencies_ms);
@@ -1193,6 +1231,7 @@ fn lower_with_typecheck(
         &mut candidate_sources,
         &resolved_constants,
     );
+    verify_host_effect_calls_scheduled(program, &update_branches)?;
     let update_branches_ms = lower_elapsed_ms(update_branches_started);
     trace_phase("update_branches", update_branches_ms);
     let list_operations_started = Instant::now();
@@ -1223,7 +1262,14 @@ fn lower_with_typecheck(
     let derived_values_ms = lower_elapsed_ms(derived_values_started);
     trace_phase("derived_values", derived_values_ms);
     let view_bindings_started = Instant::now();
-    let view_bindings = view_bindings(program, &row_scopes, &sources, &typecheck_report);
+    let view_bindings = view_bindings(
+        program,
+        &row_scopes,
+        &sources,
+        &typecheck_report,
+        &list_operations,
+        &list_projections,
+    )?;
     let view_bindings_ms = lower_elapsed_ms(view_bindings_started);
     trace_phase("view_bindings", view_bindings_ms);
     let expression_coverage_started = Instant::now();
@@ -1235,6 +1281,7 @@ fn lower_with_typecheck(
         &derived_values,
         &update_branches,
         &list_operations,
+        &distributed_references,
     );
     let expression_coverage_ms = lower_elapsed_ms(expression_coverage_started);
     trace_phase("expression_coverage", expression_coverage_ms);
@@ -1268,12 +1315,12 @@ fn lower_with_typecheck(
         expression_count: program.expressions.len(),
         expressions: program.expressions.clone(),
         expression_coverage,
+        distributed_references,
         semantic_index,
         graph_node_count: nodes.len(),
         nodes,
         row_scopes,
         sources,
-        host_effects: host_effect_declarations(&typecheck_report),
         host_ports: host_port_declarations(&typecheck_report),
         output_values,
         dependencies,
@@ -1301,6 +1348,190 @@ fn lower_with_typecheck(
     let verify_hidden_ms = lower_elapsed_ms(verify_hidden_started);
     trace_phase("verify_hidden_identity", verify_hidden_ms);
     Ok(typed)
+}
+
+fn distributed_references(
+    program: &ParsedProgram,
+    external_types: &boon_typecheck::ExternalTypeEnvironment,
+    typecheck_report: &boon_typecheck::TypeCheckReport,
+) -> Result<DistributedReferences, String> {
+    let mut references = DistributedReferences::default();
+    for expr in &program.expressions {
+        match &expr.kind {
+            AstExprKind::Path(parts) => {
+                let Some(producer_role) = distributed_value_role(parts) else {
+                    continue;
+                };
+                let canonical_path = parts.join(".");
+                let declared = external_types.values.get(&canonical_path).ok_or_else(|| {
+                    format!(
+                        "typecheck accepted qualified external value `{canonical_path}` without an external type"
+                    )
+                })?;
+                let actual = distributed_expr_type(typecheck_report, expr.id)?;
+                ensure_distributed_flow_is_closed(
+                    actual,
+                    &format!("qualified external value `{canonical_path}`"),
+                )?;
+                ensure_distributed_flow_is_closed(
+                    declared,
+                    &format!("external value declaration `{canonical_path}`"),
+                )?;
+                references.value_references.push(DistributedValueReference {
+                    expr_id: ExprId(expr.id),
+                    canonical_path,
+                    producer_role,
+                    value_type: declared.ty.clone(),
+                });
+            }
+            AstExprKind::Call { function, args } => {
+                let Some(producer_role) = distributed_function_role(function) else {
+                    continue;
+                };
+                let signature = external_types.functions.get(function).ok_or_else(|| {
+                    format!(
+                        "typecheck accepted qualified external function `{function}` without an external signature"
+                    )
+                })?;
+                if !signature.pure {
+                    return Err(format!(
+                        "typecheck accepted impure external function `{function}`"
+                    ));
+                }
+                let result = distributed_expr_type(typecheck_report, expr.id)?;
+                ensure_distributed_flow_is_closed(
+                    result,
+                    &format!("qualified external call `{function}` result"),
+                )?;
+                ensure_distributed_flow_is_closed(
+                    &signature.result,
+                    &format!("external function declaration `{function}` result"),
+                )?;
+
+                let mut arguments = Vec::with_capacity(args.len());
+                for argument in args {
+                    let name = argument.name.as_ref().ok_or_else(|| {
+                        format!(
+                            "typecheck accepted unnamed argument in qualified external call `{function}`"
+                        )
+                    })?;
+                    let declared_argument = signature
+                        .args
+                        .iter()
+                        .find(|candidate| candidate.name == *name)
+                        .ok_or_else(|| {
+                            format!(
+                                "typecheck accepted unknown argument `{name}` in qualified external call `{function}`"
+                            )
+                        })?;
+                    ensure_distributed_type_is_closed(
+                        &declared_argument.ty,
+                        &format!("external function `{function}` argument `{name}`"),
+                    )?;
+                    let actual = distributed_expr_type(typecheck_report, argument.value)?;
+                    ensure_distributed_flow_is_closed(
+                        actual,
+                        &format!("qualified external call `{function}` argument `{name}`"),
+                    )?;
+                    arguments.push(DistributedPureCallArgument {
+                        name: name.clone(),
+                        expr_id: ExprId(argument.value),
+                        argument_type: declared_argument.ty.clone(),
+                    });
+                }
+                references.pure_calls.push(DistributedPureCall {
+                    expr_id: ExprId(expr.id),
+                    canonical_function: function.clone(),
+                    producer_role,
+                    result_type: signature.result.ty.clone(),
+                    arguments,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(references)
+}
+
+fn distributed_expr_type(
+    report: &boon_typecheck::TypeCheckReport,
+    expr_id: usize,
+) -> Result<&boon_typecheck::FlowType, String> {
+    report
+        .expr_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.expr_id == expr_id)
+        .map(|entry| &entry.flow_type)
+        .ok_or_else(|| format!("qualified external expression {expr_id} has no checked type"))
+}
+
+fn distributed_value_role(parts: &[String]) -> Option<boon_typecheck::ProgramRole> {
+    parts
+        .first()
+        .and_then(|namespace| distributed_role(namespace))
+}
+
+fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRole> {
+    function
+        .split_once('/')
+        .and_then(|(namespace, _)| distributed_role(namespace))
+}
+
+fn distributed_role(namespace: &str) -> Option<boon_typecheck::ProgramRole> {
+    match namespace {
+        "Client" => Some(boon_typecheck::ProgramRole::Client),
+        "Session" => Some(boon_typecheck::ProgramRole::Session),
+        "Server" => Some(boon_typecheck::ProgramRole::Server),
+        _ => None,
+    }
+}
+
+fn ensure_distributed_flow_is_closed(
+    flow_type: &boon_typecheck::FlowType,
+    context: &str,
+) -> Result<(), String> {
+    if flow_type.mode != boon_typecheck::FlowMode::Continuous {
+        return Err(format!("{context} is not continuous"));
+    }
+    ensure_distributed_type_is_closed(&flow_type.ty, context)
+}
+
+fn ensure_distributed_type_is_closed(
+    data_type: &boon_typecheck::Type,
+    context: &str,
+) -> Result<(), String> {
+    if distributed_type_is_closed(data_type) {
+        Ok(())
+    } else {
+        Err(format!("{context} does not have a closed value type"))
+    }
+}
+
+fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
+    match data_type {
+        boon_typecheck::Type::Text
+        | boon_typecheck::Type::Number
+        | boon_typecheck::Type::Bytes(_) => true,
+        boon_typecheck::Type::Object(shape) => {
+            !shape.open && shape.fields.values().all(distributed_type_is_closed)
+        }
+        boon_typecheck::Type::VariantSet(variants) => {
+            variants.iter().all(|variant| match variant {
+                boon_typecheck::Variant::Tag(_) => true,
+                boon_typecheck::Variant::Tagged { fields, .. } => {
+                    !fields.open && fields.fields.values().all(distributed_type_is_closed)
+                }
+            })
+        }
+        boon_typecheck::Type::Skip
+        | boon_typecheck::Type::RenderContract
+        | boon_typecheck::Type::List(_)
+        | boon_typecheck::Type::Function { .. }
+        | boon_typecheck::Type::UnresolvedShape { .. }
+        | boon_typecheck::Type::Var(_)
+        | boon_typecheck::Type::Unknown => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1631,7 +1862,6 @@ fn semantic_data_type_is_closed(data_type: &SemanticDataType) -> bool {
         SemanticDataType::Null
         | SemanticDataType::Bool
         | SemanticDataType::Number
-        | SemanticDataType::Byte
         | SemanticDataType::Text
         | SemanticDataType::Bytes { .. } => true,
     }
@@ -1996,7 +2226,7 @@ fn lower_elapsed_ms(start: Instant) -> f64 {
 pub fn document_view_bindings_with_typecheck(
     program: &ParsedProgram,
     typecheck_report: &boon_typecheck::TypeCheckReport,
-) -> Vec<ViewBinding> {
+) -> Result<Vec<ViewBinding>, String> {
     let row_scopes = row_scopes(program);
     let fields = typed_field_defs(program);
     let direct_sources = direct_source_refs_by_path(&fields, program);
@@ -2019,7 +2249,16 @@ pub fn document_view_bindings_with_typecheck(
             path: source.path.clone(),
         })
         .collect::<Vec<_>>();
-    view_bindings(program, &row_scopes, &sources, typecheck_report)
+    let list_operations = list_operations(program, typecheck_report);
+    let list_projections = list_projections(program);
+    view_bindings(
+        program,
+        &row_scopes,
+        &sources,
+        typecheck_report,
+        &list_operations,
+        &list_projections,
+    )
 }
 
 pub fn verify_hidden_identity(program: &TypedProgram) -> Result<(), String> {
@@ -2076,6 +2315,7 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
             ));
         }
     }
+    verify_distributed_reference_schedule(program)?;
 
     let source_paths = unique_strings(
         "source port",
@@ -2272,6 +2512,13 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
         .copied()
         .chain(store_list_names.iter().map(String::as_str))
         .chain(source_payload_paths.iter().map(String::as_str))
+        .chain(
+            program
+                .distributed_references
+                .value_references
+                .iter()
+                .map(|reference| reference.canonical_path.as_str()),
+        )
         .collect::<BTreeSet<_>>();
     let list_projection_symbols = list_projection_view_symbols(program);
     for binding in &program.view_bindings {
@@ -2295,6 +2542,14 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
             require_known_symbol("cause source", source, &known_symbols)?;
         }
     }
+    let effect_result_states = program
+        .update_branches
+        .iter()
+        .filter_map(|branch| {
+            matches!(&branch.expression, UpdateExpression::HostEffect { .. })
+                .then_some(branch.target.as_str())
+        })
+        .collect::<BTreeSet<_>>();
     for branch in &program.update_branches {
         if !state_paths.contains(branch.target.as_str()) {
             return Err(format!(
@@ -2302,9 +2557,20 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
                 branch.target
             ));
         }
-        if !source_paths.contains(branch.source.as_str()) {
+        if !source_paths.contains(branch.source.as_str())
+            && !state_paths.contains(branch.source.as_str())
+        {
             return Err(format!(
-                "update branch source `{}` is not a declared source port",
+                "update branch trigger `{}` is neither a declared source nor a state cell",
+                branch.source
+            ));
+        }
+        if matches!(&branch.expression, UpdateExpression::HostEffect { .. })
+            && state_paths.contains(branch.source.as_str())
+            && !effect_result_states.contains(branch.source.as_str())
+        {
+            return Err(format!(
+                "host effect update trigger `{}` is not a typed host-effect result state",
                 branch.source
             ));
         }
@@ -2329,6 +2595,174 @@ pub fn verify_static_schedule(program: &TypedProgram) -> Result<(), String> {
             ));
         }
         verify_scheduled_list_operation(&operation.kind, &source_paths, &known_symbols)?;
+    }
+    Ok(())
+}
+
+fn verify_distributed_reference_schedule(program: &TypedProgram) -> Result<(), String> {
+    let expected_count = program.distributed_references.value_references.len()
+        + program.distributed_references.pure_calls.len();
+    if program
+        .expression_coverage
+        .distributed_reference_expression_count
+        != expected_count
+    {
+        return Err(format!(
+            "distributed expression coverage reports {}, expected {expected_count}",
+            program
+                .expression_coverage
+                .distributed_reference_expression_count
+        ));
+    }
+
+    let scheduled_expr_ids = program
+        .nodes
+        .iter()
+        .filter_map(|node| node.expr_id)
+        .collect::<BTreeSet<_>>();
+    let mut reference_expr_ids = BTreeSet::new();
+    for reference in &program.distributed_references.value_references {
+        if !reference_expr_ids.insert(reference.expr_id) {
+            return Err(format!(
+                "distributed expression {} is represented more than once",
+                reference.expr_id
+            ));
+        }
+        require_scheduled_distributed_expr(reference.expr_id, &scheduled_expr_ids)?;
+        let expr = distributed_ast_expr(program, reference.expr_id)?;
+        let AstExprKind::Path(parts) = &expr.kind else {
+            return Err(format!(
+                "distributed value expression {} is not an AST path",
+                reference.expr_id
+            ));
+        };
+        if parts.join(".") != reference.canonical_path {
+            return Err(format!(
+                "distributed value expression {} does not match canonical path `{}`",
+                reference.expr_id, reference.canonical_path
+            ));
+        }
+        if distributed_value_role(parts) != Some(reference.producer_role) {
+            return Err(format!(
+                "distributed value `{}` does not match producer role {:?}",
+                reference.canonical_path, reference.producer_role
+            ));
+        }
+        verify_distributed_metadata_type(
+            program,
+            reference.expr_id,
+            &reference.value_type,
+            &format!("distributed value `{}`", reference.canonical_path),
+        )?;
+    }
+
+    for call in &program.distributed_references.pure_calls {
+        if !reference_expr_ids.insert(call.expr_id) {
+            return Err(format!(
+                "distributed expression {} is represented more than once",
+                call.expr_id
+            ));
+        }
+        require_scheduled_distributed_expr(call.expr_id, &scheduled_expr_ids)?;
+        let expr = distributed_ast_expr(program, call.expr_id)?;
+        let AstExprKind::Call { function, args } = &expr.kind else {
+            return Err(format!(
+                "distributed pure call expression {} is not a direct AST call",
+                call.expr_id
+            ));
+        };
+        if function != &call.canonical_function {
+            return Err(format!(
+                "distributed call expression {} does not match canonical function `{}`",
+                call.expr_id, call.canonical_function
+            ));
+        }
+        if distributed_function_role(function) != Some(call.producer_role) {
+            return Err(format!(
+                "distributed call `{}` does not match producer role {:?}",
+                call.canonical_function, call.producer_role
+            ));
+        }
+        verify_distributed_metadata_type(
+            program,
+            call.expr_id,
+            &call.result_type,
+            &format!("distributed call `{}` result", call.canonical_function),
+        )?;
+        if args.len() != call.arguments.len() {
+            return Err(format!(
+                "distributed call `{}` has {} typed arguments for {} AST arguments",
+                call.canonical_function,
+                call.arguments.len(),
+                args.len()
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for (ast_argument, argument) in args.iter().zip(&call.arguments) {
+            if ast_argument.name.as_deref() != Some(argument.name.as_str())
+                || ast_argument.value != argument.expr_id.as_usize()
+            {
+                return Err(format!(
+                    "distributed call `{}` argument metadata does not match its AST",
+                    call.canonical_function
+                ));
+            }
+            if !names.insert(argument.name.as_str()) {
+                return Err(format!(
+                    "distributed call `{}` repeats argument `{}`",
+                    call.canonical_function, argument.name
+                ));
+            }
+            require_scheduled_distributed_expr(argument.expr_id, &scheduled_expr_ids)?;
+            let context = format!(
+                "distributed call `{}` argument `{}`",
+                call.canonical_function, argument.name
+            );
+            ensure_distributed_type_is_closed(&argument.argument_type, &context)?;
+            let checked =
+                distributed_expr_type(&program.typecheck_report, argument.expr_id.as_usize())?;
+            ensure_distributed_flow_is_closed(checked, &context)?;
+        }
+    }
+    Ok(())
+}
+
+fn require_scheduled_distributed_expr(
+    expr_id: ExprId,
+    scheduled_expr_ids: &BTreeSet<ExprId>,
+) -> Result<(), String> {
+    if scheduled_expr_ids.contains(&expr_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "distributed expression {expr_id} is not in the static schedule"
+        ))
+    }
+}
+
+fn distributed_ast_expr(program: &TypedProgram, expr_id: ExprId) -> Result<&AstExpr, String> {
+    program
+        .expressions
+        .get(expr_id.as_usize())
+        .filter(|expr| expr.id == expr_id.as_usize())
+        .ok_or_else(|| format!("distributed expression {expr_id} is missing from the AST"))
+}
+
+fn verify_distributed_metadata_type(
+    program: &TypedProgram,
+    expr_id: ExprId,
+    metadata_type: &boon_typecheck::Type,
+    context: &str,
+) -> Result<(), String> {
+    ensure_distributed_type_is_closed(metadata_type, context)?;
+    let checked = distributed_expr_type(&program.typecheck_report, expr_id.as_usize())?;
+    if checked.mode != boon_typecheck::FlowMode::Continuous {
+        return Err(format!("{context} is not continuous"));
+    }
+    if &checked.ty != metadata_type {
+        return Err(format!(
+            "{context} metadata type does not match its checked expression type"
+        ));
     }
     Ok(())
 }
@@ -2390,6 +2824,16 @@ fn scope_id_for_path(row_scopes: &[RowScope], path: &str) -> Option<ScopeId> {
             .find(|scope| scope.row_scope == segment)
             .map(|scope| scope.id)
     })
+}
+
+fn view_scope_id_for_path(
+    row_scopes: &[RowScope],
+    path: &str,
+    context: &DocumentViewBindingContext,
+) -> Option<ScopeId> {
+    context
+        .row_scope_for_path(path)
+        .or_else(|| scope_id_for_path(row_scopes, path))
 }
 
 fn scope_id_for_list(row_scopes: &[RowScope], list: &str) -> Option<ScopeId> {
@@ -2461,41 +2905,6 @@ fn source_payload_data_type(field: &SourcePayloadField) -> SemanticDataType {
         }
         SourcePayloadField::Named(_) => SemanticDataType::Text,
     }
-}
-
-fn host_effect_declarations(
-    report: &boon_typecheck::TypeCheckReport,
-) -> Vec<HostEffectDeclaration> {
-    report
-        .host_effect_table
-        .declarations
-        .iter()
-        .map(|declaration| HostEffectDeclaration {
-            name: declaration.name.clone(),
-            line: declaration.line,
-            trigger_source: declaration.trigger_source.clone(),
-            operation: declaration.operation.clone(),
-            intent_type: semantic_data_type(&declaration.intent_type),
-            intent_fields: declaration
-                .intent_fields
-                .iter()
-                .map(|field| HostEffectIntentField {
-                    name: field.name.clone(),
-                    value_expr_id: ExprId(field.value_expr_id),
-                    data_type: semantic_data_type(&field.value_type),
-                })
-                .collect(),
-            result_type: semantic_data_type(&declaration.result_type),
-            result_routes: declaration
-                .result_routes
-                .iter()
-                .map(|route| HostEffectResultRoute {
-                    variant: route.variant.clone(),
-                    source_path: route.source_path.clone(),
-                })
-                .collect(),
-        })
-        .collect()
 }
 
 fn host_port_declarations(report: &boon_typecheck::TypeCheckReport) -> Vec<HostPortDeclaration> {
@@ -2641,13 +3050,21 @@ fn view_bindings(
     row_scopes: &[RowScope],
     sources: &[SourcePort],
     typecheck_report: &boon_typecheck::TypeCheckReport,
-) -> Vec<ViewBinding> {
+    list_operations: &[ListOperation],
+    list_projections: &[ListProjection],
+) -> Result<Vec<ViewBinding>, String> {
     let source_paths = sources
         .iter()
         .map(|source| (source.path.as_str(), source.id))
         .collect::<Vec<_>>();
     let mut bindings = Vec::new();
-    let render_slots = RenderSlotBindingLookup::new(typecheck_report);
+    let render_slots = RenderSlotBindingLookup::new(
+        typecheck_report,
+        program,
+        row_scopes,
+        list_operations,
+        list_projections,
+    );
     let mut visited_expr_contexts = BTreeSet::new();
     if let Some(document) = boon_parser::parsed_document(program) {
         let document_functions = DocumentViewFunctionRegistry::new(&program.ast.statements);
@@ -2663,7 +3080,7 @@ fn view_bindings(
             &mut Vec::new(),
             &mut visited_expr_contexts,
             &DocumentViewBindingContext::default(),
-        );
+        )?;
     }
     if let Some(scene) = render_root_statement(program, "scene") {
         let document_functions = DocumentViewFunctionRegistry::new(&program.ast.statements);
@@ -2679,10 +3096,10 @@ fn view_bindings(
             &mut Vec::new(),
             &mut visited_expr_contexts,
             &DocumentViewBindingContext::default(),
-        );
+        )?;
     }
     normalize_view_binding_ids(&mut bindings);
-    bindings
+    Ok(bindings)
 }
 
 fn normalize_view_binding_ids(bindings: &mut Vec<ViewBinding>) {
@@ -2725,12 +3142,27 @@ struct DocumentViewFunctionRegistry<'a> {
 struct RenderSlotBindingLookup<'a> {
     by_statement_id: BTreeMap<usize, &'a boon_typecheck::ListMapBinding>,
     by_expr_id: BTreeMap<usize, &'a boon_typecheck::ListMapBinding>,
+    row_scope_by_map_expr_id: BTreeMap<usize, DocumentViewRowScope>,
+}
+
+#[derive(Clone)]
+struct DocumentViewRowScope {
+    id: ScopeId,
+    canonical_name: String,
 }
 
 impl<'a> RenderSlotBindingLookup<'a> {
-    fn new(typecheck_report: &'a boon_typecheck::TypeCheckReport) -> Self {
+    fn new(
+        typecheck_report: &'a boon_typecheck::TypeCheckReport,
+        program: &ParsedProgram,
+        row_scopes: &[RowScope],
+        list_operations: &[ListOperation],
+        list_projections: &[ListProjection],
+    ) -> Self {
         let mut by_statement_id = BTreeMap::new();
         let mut by_expr_id = BTreeMap::new();
+        let mut row_scope_by_map_expr_id = BTreeMap::new();
+        let list_owners = render_list_owner_index(program, list_operations, list_projections);
         for slot in &typecheck_report.render_slot_table.slots {
             let Some(binding_id) = slot.optional_list_map_binding_id else {
                 continue;
@@ -2742,10 +3174,23 @@ impl<'a> RenderSlotBindingLookup<'a> {
             if let Some(expr_id) = slot.value_expr_id {
                 by_expr_id.insert(expr_id, binding);
             }
+            if let Some(source_path) = source_list_from_program_expr(program, binding.list_expr_id)
+                && let Some(list) = render_list_owner(&list_owners, &source_path)
+                && let Some(scope) = row_scopes.iter().find(|scope| scope.list == list)
+            {
+                row_scope_by_map_expr_id.insert(
+                    binding.map_expr_id,
+                    DocumentViewRowScope {
+                        id: scope.id,
+                        canonical_name: scope.row_scope.clone(),
+                    },
+                );
+            }
         }
         Self {
             by_statement_id,
             by_expr_id,
+            row_scope_by_map_expr_id,
         }
     }
 
@@ -2756,6 +3201,62 @@ impl<'a> RenderSlotBindingLookup<'a> {
     fn for_expr(&self, expr_id: usize) -> Option<&'a boon_typecheck::ListMapBinding> {
         self.by_expr_id.get(&expr_id).copied()
     }
+
+    fn row_scope_for(
+        &self,
+        binding: &boon_typecheck::ListMapBinding,
+    ) -> Option<&DocumentViewRowScope> {
+        self.row_scope_by_map_expr_id.get(&binding.map_expr_id)
+    }
+}
+
+fn render_list_owner_index(
+    program: &ParsedProgram,
+    list_operations: &[ListOperation],
+    list_projections: &[ListProjection],
+) -> BTreeMap<String, String> {
+    let mut owners = BTreeMap::new();
+    for list in &program.list_memories {
+        insert_render_list_owner(&mut owners, &list.name, &list.name);
+    }
+    for operation in list_operations {
+        if let ListOperationKind::Retain { target, .. } = &operation.kind {
+            insert_render_list_owner(&mut owners, target, &operation.list);
+        }
+    }
+    for projection in list_projections {
+        if matches!(
+            projection.kind,
+            ListProjectionKind::TextPrefix { .. } | ListProjectionKind::IndexedQuery { .. }
+        ) {
+            insert_render_list_owner(&mut owners, &projection.target, &projection.list);
+        }
+    }
+    owners
+}
+
+fn insert_render_list_owner(owners: &mut BTreeMap<String, String>, target: &str, list: &str) {
+    for target in render_list_path_variants(target) {
+        owners.insert(target, list.to_owned());
+    }
+}
+
+fn render_list_owner<'a>(owners: &'a BTreeMap<String, String>, path: &str) -> Option<&'a str> {
+    render_list_path_variants(path)
+        .into_iter()
+        .find_map(|path| owners.get(&path).map(String::as_str))
+}
+
+fn render_list_path_variants(path: &str) -> Vec<String> {
+    let normalized = normalized_view_data_path(path);
+    let local = normalized
+        .strip_prefix("store.")
+        .unwrap_or(&normalized)
+        .to_owned();
+    let mut variants = vec![normalized, local.clone(), format!("store.{local}")];
+    variants.sort();
+    variants.dedup();
+    variants
 }
 
 impl<'a> DocumentViewFunctionRegistry<'a> {
@@ -2796,16 +3297,12 @@ impl<'a> DocumentViewFunctionRegistry<'a> {
 #[derive(Clone, Default)]
 struct DocumentViewBindingContext {
     arg_exprs: BTreeMap<String, usize>,
-    source_base: Option<String>,
+    row_aliases: BTreeMap<String, DocumentViewRowScope>,
 }
 
 impl DocumentViewBindingContext {
     fn arg_expr(&self, name: &str) -> Option<usize> {
         self.arg_exprs.get(name).copied()
-    }
-
-    fn source_base(&self) -> Option<&str> {
-        self.source_base.as_deref()
     }
 
     fn with_function_call(
@@ -2815,7 +3312,7 @@ impl DocumentViewBindingContext {
         expressions: &[AstExpr],
     ) -> Self {
         if let Some(args) = document_call_args(call, expressions) {
-            return self.with_function_args(function, args);
+            return self.with_function_args(function, args, expressions);
         }
         self.clone()
     }
@@ -2824,13 +3321,13 @@ impl DocumentViewBindingContext {
         &self,
         function: &AstStatement,
         args: &[boon_parser::AstCallArg],
+        expressions: &[AstExpr],
     ) -> Self {
         let mut next = self.clone();
         let formals = match &function.kind {
             AstStatementKind::Function { args, .. } => args.as_slice(),
             _ => &[],
         };
-        let mut scope = BTreeMap::new();
         for (index, arg) in args.iter().enumerate() {
             let Some(name) = arg
                 .name
@@ -2839,9 +3336,8 @@ impl DocumentViewBindingContext {
             else {
                 continue;
             };
-            scope.insert(name.to_owned(), arg.value);
+            self.bind_argument_expr(&mut next, name, arg.value, expressions);
         }
-        next.arg_exprs.extend(scope);
         next
     }
 
@@ -2850,15 +3346,15 @@ impl DocumentViewBindingContext {
         function: &AstStatement,
         input_expr_id: usize,
         args: &[boon_parser::AstCallArg],
+        expressions: &[AstExpr],
     ) -> Self {
         let mut next = self.clone();
         let formals = match &function.kind {
             AstStatementKind::Function { args, .. } => args.as_slice(),
             _ => &[],
         };
-        let mut scope = BTreeMap::new();
         if let Some(first_formal) = formals.first() {
-            scope.insert(first_formal.clone(), input_expr_id);
+            self.bind_argument_expr(&mut next, first_formal, input_expr_id, expressions);
         }
         for (index, arg) in args.iter().enumerate() {
             let Some(name) = arg
@@ -2868,22 +3364,113 @@ impl DocumentViewBindingContext {
             else {
                 continue;
             };
-            scope.insert(name.to_owned(), arg.value);
+            self.bind_argument_expr(&mut next, name, arg.value, expressions);
         }
-        next.arg_exprs.extend(scope);
         next
     }
 
-    fn with_function_item_expr(&self, function: &AstStatement, item_expr_id: usize) -> Self {
+    fn with_function_item_expr(
+        &self,
+        function: &AstStatement,
+        item_expr_id: usize,
+        expressions: &[AstExpr],
+    ) -> Self {
         let mut next = self.clone();
-        let mut scope = BTreeMap::new();
         if let AstStatementKind::Function { args, .. } = &function.kind
             && let Some(first_formal) = args.first()
         {
-            scope.insert(first_formal.clone(), item_expr_id);
+            self.bind_argument_expr(&mut next, first_formal, item_expr_id, expressions);
         }
-        next.arg_exprs.extend(scope);
         next
+    }
+
+    fn with_render_row_scope(
+        &self,
+        binding: &boon_typecheck::ListMapBinding,
+        row_scope: Option<&DocumentViewRowScope>,
+    ) -> Self {
+        let mut next = self.clone();
+        if let Some(row_scope) = row_scope {
+            next.row_aliases
+                .insert(binding.item_binding_name.clone(), row_scope.clone());
+            next.row_aliases
+                .entry(row_scope.canonical_name.clone())
+                .or_insert_with(|| row_scope.clone());
+        }
+        next
+    }
+
+    fn bind_argument_expr(
+        &self,
+        next: &mut Self,
+        name: &str,
+        expr_id: usize,
+        expressions: &[AstExpr],
+    ) {
+        next.arg_exprs.insert(
+            name.to_owned(),
+            self.resolved_argument_expr(expr_id, expressions),
+        );
+        next.row_aliases.remove(name);
+        if let Some(row_scope) = self.row_scope_for_expr(expr_id, expressions) {
+            next.row_aliases.insert(name.to_owned(), row_scope);
+        }
+    }
+
+    fn row_scope_for_expr(
+        &self,
+        expr_id: usize,
+        expressions: &[AstExpr],
+    ) -> Option<DocumentViewRowScope> {
+        self.row_scope_for_expr_inner(expr_id, expressions, &mut BTreeSet::new())
+    }
+
+    fn row_scope_for_expr_inner(
+        &self,
+        expr_id: usize,
+        expressions: &[AstExpr],
+        seen: &mut BTreeSet<usize>,
+    ) -> Option<DocumentViewRowScope> {
+        if !seen.insert(expr_id) {
+            return None;
+        }
+        let expr = expressions.get(expr_id)?;
+        let name = match &expr.kind {
+            AstExprKind::Identifier(name) => name.as_str(),
+            AstExprKind::Path(parts) => parts.first()?.as_str(),
+            _ => return None,
+        };
+        self.row_aliases.get(name).cloned().or_else(|| {
+            self.arg_expr(name)
+                .and_then(|mapped| self.row_scope_for_expr_inner(mapped, expressions, seen))
+        })
+    }
+
+    fn row_scope_for_path(&self, path: &str) -> Option<ScopeId> {
+        let mut segments = path.split('.');
+        let first = segments.next()?;
+        let root = if first == "PASSED" {
+            segments.next()?
+        } else {
+            first
+        };
+        self.row_aliases.get(root).map(|row_scope| row_scope.id)
+    }
+
+    fn canonicalize_row_path(&self, path: &str) -> String {
+        let mut segments = path.split('.').map(str::to_owned).collect::<Vec<_>>();
+        let root = usize::from(segments.first().is_some_and(|segment| segment == "PASSED"));
+        if let Some(segment) = segments.get_mut(root)
+            && let Some(row_scope) = self.row_aliases.get(segment)
+        {
+            *segment = row_scope.canonical_name.clone();
+        }
+        segments.join(".")
+    }
+
+    fn resolved_argument_expr(&self, expr_id: usize, expressions: &[AstExpr]) -> usize {
+        document_resolved_expr_id(expr_id, expressions, self, &mut BTreeSet::new())
+            .unwrap_or(expr_id)
     }
 
     fn with_local_scope(&self) -> Self {
@@ -2891,13 +3478,8 @@ impl DocumentViewBindingContext {
     }
 
     fn insert_local_expr(&mut self, name: String, expr_id: usize) {
+        self.row_aliases.remove(&name);
         self.arg_exprs.insert(name, expr_id);
-    }
-
-    fn with_source_base(&self, path: String) -> Self {
-        let mut next = self.clone();
-        next.source_base = Some(path);
-        next
     }
 
     fn cache_key(&self) -> String {
@@ -2907,10 +3489,12 @@ impl DocumentViewBindingContext {
             .map(|(name, expr_id)| format!("{name}:{expr_id}"))
             .collect::<Vec<_>>()
             .join(",");
-        if let Some(source_base) = &self.source_base {
-            key.push_str("|source[");
-            key.push_str(source_base);
-            key.push(']');
+        for (name, row_scope) in &self.row_aliases {
+            key.push_str(&format!(
+                "|row:{name}:{}:{}",
+                row_scope.id.as_usize(),
+                row_scope.canonical_name
+            ));
         }
         key
     }
@@ -2929,44 +3513,13 @@ fn normalized_view_data_path(path: &str) -> String {
         .join(".")
 }
 
-fn source_path_for_source_pipe(expr: &AstExpr, source_text: &str) -> Option<String> {
-    let snippet = source_text.get(expr.start..expr.end)?;
-    let source = snippet.find("SOURCE")?;
-    let after_source = &snippet[source + "SOURCE".len()..];
-    let open = after_source.find('{')?;
-    let close = after_source.rfind('}')?;
-    if close <= open {
-        return None;
-    }
-    let compact_path = after_source[open + 1..close]
-        .split_whitespace()
-        .collect::<String>();
-    let path = compact_path.trim();
-    (!path.is_empty()).then(|| normalized_view_data_path(path))
-}
-
-fn source_path_for_source_pipe_expr(
-    expr: &AstExpr,
-    source_text: &str,
-    expressions: &[AstExpr],
-    context: &DocumentViewBindingContext,
-) -> Option<String> {
-    if let AstExprKind::Pipe { op, args, .. } = &expr.kind
-        && op == "SOURCE"
-        && let Some(arg) = args.first()
-        && let Some(path) = document_expr_value_by_id(arg.value, expressions, context)
-    {
-        return Some(normalized_view_data_path(&path));
-    }
-    source_path_for_source_pipe(expr, source_text)
-}
-
 fn view_data_path_for_expr_id(
     expr_id: usize,
     expressions: &[AstExpr],
     context: &DocumentViewBindingContext,
 ) -> Option<String> {
     view_data_path_for_expr_id_inner(expr_id, expressions, context, &mut BTreeSet::new())
+        .map(|path| context.canonicalize_row_path(&path))
 }
 
 fn view_data_path_for_expr_id_inner(
@@ -3078,7 +3631,7 @@ fn push_data_view_binding_for_expr(
         id: ViewBindingId(bindings.len()),
         node_kind: node_kind.to_owned(),
         attr: attr.to_owned(),
-        scope_id: scope_id_for_path(row_scopes, &path),
+        scope_id: view_scope_id_for_path(row_scopes, &path, context),
         source_id: None,
         kind: if attr == "target" {
             ViewBindingKind::Target
@@ -3094,7 +3647,7 @@ fn view_data_binding_is_schedulable(
     row_scopes: &[RowScope],
     context: &DocumentViewBindingContext,
 ) -> bool {
-    if scope_id_for_path(row_scopes, path).is_some() {
+    if view_scope_id_for_path(row_scopes, path, context).is_some() {
         return true;
     }
     let Some(first_segment) = path.split('.').next() else {
@@ -3132,43 +3685,14 @@ fn statement_children_can_contain_render(statement: &AstStatement) -> bool {
                 || name == "element"
                 || attr_can_contain_render(name)
         }
-        AstStatementKind::Function { .. }
-        | AstStatementKind::Source { .. }
+        AstStatementKind::Function { .. } => false,
+        AstStatementKind::Source { .. }
         | AstStatementKind::Hold { .. }
         | AstStatementKind::List { field: None, .. }
         | AstStatementKind::Block
         | AstStatementKind::Spread
         | AstStatementKind::Expression => true,
     }
-}
-
-fn source_pipe_continuation_base(
-    statement: &AstStatement,
-    source_text: &str,
-    expressions: &[AstExpr],
-    context: &DocumentViewBindingContext,
-) -> Option<String> {
-    let expr = expressions.get(statement.expr?)?;
-    let AstExprKind::Pipe { input, op, .. } = &expr.kind else {
-        return None;
-    };
-    if op != "SOURCE" || !matches!(expressions.get(*input)?.kind, AstExprKind::Delimiter) {
-        return None;
-    }
-    source_path_for_source_pipe_expr(expr, source_text, expressions, context)
-}
-
-fn expr_is_source_pipe_continuation(expr_id: usize, expressions: &[AstExpr]) -> bool {
-    expressions.get(expr_id).is_some_and(|expr| {
-        matches!(
-            &expr.kind,
-            AstExprKind::Pipe { input, op, .. }
-                if op == "SOURCE"
-                    && expressions
-                        .get(*input)
-                        .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
-        )
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3184,7 +3708,7 @@ fn collect_document_function_body_view_bindings(
     function_stack: &mut Vec<String>,
     visited_expr_contexts: &mut BTreeSet<(usize, String)>,
     context: &DocumentViewBindingContext,
-) {
+) -> Result<(), String> {
     if let Some(expr_id) = function_statement.expr {
         collect_document_expr_view_bindings(
             expr_id,
@@ -3199,7 +3723,7 @@ fn collect_document_function_body_view_bindings(
             context,
             visited_expr_contexts,
             &mut Vec::new(),
-        );
+        )?;
     }
     collect_document_view_bindings(
         &function_statement.children,
@@ -3213,7 +3737,7 @@ fn collect_document_function_body_view_bindings(
         function_stack,
         visited_expr_contexts,
         context,
-    );
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3229,46 +3753,9 @@ fn collect_document_view_bindings(
     function_stack: &mut Vec<String>,
     visited_expr_contexts: &mut BTreeSet<(usize, String)>,
     context: &DocumentViewBindingContext,
-) {
+) -> Result<(), String> {
     let mut sibling_context = context.with_local_scope();
-    let mut previous_render_expr_id = None;
-    let mut previous_render_statement = None;
     for statement in statements {
-        if let Some(source_base) =
-            source_pipe_continuation_base(statement, source_text, expressions, &sibling_context)
-        {
-            let source_context = sibling_context.with_source_base(source_base);
-            if let Some(previous_statement) = previous_render_statement {
-                collect_document_statement_source_bindings(
-                    previous_statement,
-                    source_text,
-                    expressions,
-                    functions,
-                    row_scopes,
-                    source_paths,
-                    render_slots,
-                    bindings,
-                    function_stack,
-                    visited_expr_contexts,
-                    &source_context,
-                );
-            } else if let Some(previous_expr_id) = previous_render_expr_id {
-                collect_document_expr_view_bindings(
-                    previous_expr_id,
-                    source_text,
-                    expressions,
-                    functions,
-                    row_scopes,
-                    source_paths,
-                    render_slots,
-                    bindings,
-                    function_stack,
-                    &source_context,
-                    visited_expr_contexts,
-                    &mut Vec::new(),
-                );
-            }
-        }
         if matches!(
             document_statement_field(statement).as_deref(),
             Some("items" | "children")
@@ -3279,11 +3766,20 @@ fn collect_document_view_bindings(
                 && !function_stack.iter().any(|active| active == function_name)
             {
                 function_stack.push(function_name.to_owned());
+                let row_context = sibling_context
+                    .with_render_row_scope(binding, render_slots.row_scope_for(binding));
                 let scoped_context = if !binding.template_args.is_empty() {
-                    sibling_context.with_function_args(function_statement, &binding.template_args)
+                    row_context.with_function_args(
+                        function_statement,
+                        &binding.template_args,
+                        expressions,
+                    )
                 } else {
-                    sibling_context
-                        .with_function_item_expr(function_statement, binding.item_expr_id)
+                    row_context.with_function_item_expr(
+                        function_statement,
+                        binding.item_expr_id,
+                        expressions,
+                    )
                 };
                 collect_document_function_body_view_bindings(
                     function_statement,
@@ -3297,7 +3793,7 @@ fn collect_document_view_bindings(
                     function_stack,
                     visited_expr_contexts,
                     &scoped_context,
-                );
+                )?;
                 function_stack.pop();
             }
             continue;
@@ -3313,7 +3809,7 @@ fn collect_document_view_bindings(
                 source_paths,
                 bindings,
                 &sibling_context,
-            );
+            )?;
         } else if let Some(function) = document_statement_call(statement, expressions)
             && let Some(function_statement) = functions.get(function)
             && !function_stack.iter().any(|active| active == function)
@@ -3333,7 +3829,7 @@ fn collect_document_view_bindings(
                 function_stack,
                 visited_expr_contexts,
                 &scoped_context,
-            );
+            )?;
             function_stack.pop();
         } else if document_statement_field(statement).as_deref() == Some("element")
             && let Some(kind) = document_child_value(statement, "kind", expressions)
@@ -3364,30 +3860,7 @@ fn collect_document_view_bindings(
                 &sibling_context,
                 visited_expr_contexts,
                 &mut Vec::new(),
-            );
-        }
-        if let Some(parent_expr_id) = statement.expr {
-            for child in &statement.children {
-                if let Some(source_base) =
-                    source_pipe_continuation_base(child, source_text, expressions, &sibling_context)
-                {
-                    let source_context = sibling_context.with_source_base(source_base);
-                    collect_document_expr_view_bindings(
-                        parent_expr_id,
-                        source_text,
-                        expressions,
-                        functions,
-                        row_scopes,
-                        source_paths,
-                        render_slots,
-                        bindings,
-                        function_stack,
-                        &source_context,
-                        visited_expr_contexts,
-                        &mut Vec::new(),
-                    );
-                }
-            }
+            )?;
         }
         if statement_children_can_contain_render(statement) {
             collect_document_view_bindings(
@@ -3402,67 +3875,15 @@ fn collect_document_view_bindings(
                 function_stack,
                 visited_expr_contexts,
                 &sibling_context,
-            );
+            )?;
         }
         if let AstStatementKind::Field { name } = &statement.kind
             && let Some(expr_id) = statement.expr
         {
             sibling_context.insert_local_expr(name.clone(), expr_id);
         }
-        if statement_expr_can_contain_render(statement)
-            && let Some(expr_id) = statement.expr
-            && !expr_is_source_pipe_continuation(expr_id, expressions)
-        {
-            previous_render_expr_id = Some(expr_id);
-            previous_render_statement = Some(statement);
-        }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn collect_document_statement_source_bindings(
-    statement: &AstStatement,
-    source_text: &str,
-    expressions: &[AstExpr],
-    functions: &DocumentViewFunctionRegistry<'_>,
-    row_scopes: &[RowScope],
-    source_paths: &[(&str, SourceId)],
-    render_slots: &RenderSlotBindingLookup<'_>,
-    bindings: &mut Vec<ViewBinding>,
-    function_stack: &mut Vec<String>,
-    visited_expr_contexts: &mut BTreeSet<(usize, String)>,
-    context: &DocumentViewBindingContext,
-) {
-    if let Some(function) = document_statement_call(statement, expressions)
-        && boon_typecheck::is_registered_element_constructor(function)
-    {
-        collect_canonical_element_view_bindings(
-            function,
-            statement,
-            expressions,
-            row_scopes,
-            source_paths,
-            bindings,
-            context,
-        );
-        return;
-    }
-    if let Some(expr_id) = statement.expr {
-        collect_document_expr_view_bindings(
-            expr_id,
-            source_text,
-            expressions,
-            functions,
-            row_scopes,
-            source_paths,
-            render_slots,
-            bindings,
-            function_stack,
-            context,
-            visited_expr_contexts,
-            &mut Vec::new(),
-        );
-    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3479,20 +3900,20 @@ fn collect_document_expr_view_bindings(
     context: &DocumentViewBindingContext,
     visited_expr_contexts: &mut BTreeSet<(usize, String)>,
     expr_stack: &mut Vec<usize>,
-) {
+) -> Result<(), String> {
     let Some(expr_id) =
         document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())
     else {
-        return;
+        return Ok(());
     };
     if expr_stack.contains(&expr_id) {
-        return;
+        return Ok(());
     }
     if !visited_expr_contexts.insert((expr_id, context.cache_key())) {
-        return;
+        return Ok(());
     }
     let Some(expr) = expressions.get(expr_id) else {
-        return;
+        return Ok(());
     };
     expr_stack.push(expr_id);
     match &expr.kind {
@@ -3500,6 +3921,7 @@ fn collect_document_expr_view_bindings(
             if boon_typecheck::is_registered_element_constructor(function) {
                 let node_kind = canonical_view_node_kind(function).to_owned();
                 collect_canonical_call_arg_view_bindings(
+                    function,
                     &node_kind,
                     expr_id,
                     expressions,
@@ -3507,7 +3929,7 @@ fn collect_document_expr_view_bindings(
                     source_paths,
                     bindings,
                     context,
-                );
+                )?;
                 for arg in args {
                     if !arg.name.as_deref().is_none_or(attr_can_contain_render) {
                         continue;
@@ -3525,13 +3947,14 @@ fn collect_document_expr_view_bindings(
                         context,
                         visited_expr_contexts,
                         expr_stack,
-                    );
+                    )?;
                 }
             } else if let Some(function_statement) = functions.get(function)
                 && !function_stack.iter().any(|active| active == function)
             {
                 function_stack.push(function.to_owned());
-                let scoped_context = context.with_function_args(function_statement, args);
+                let scoped_context =
+                    context.with_function_args(function_statement, args, expressions);
                 collect_document_function_body_view_bindings(
                     function_statement,
                     source_text,
@@ -3544,7 +3967,7 @@ fn collect_document_expr_view_bindings(
                     function_stack,
                     visited_expr_contexts,
                     &scoped_context,
-                );
+                )?;
                 function_stack.pop();
             } else {
                 for arg in args {
@@ -3561,21 +3984,16 @@ fn collect_document_expr_view_bindings(
                         context,
                         visited_expr_contexts,
                         expr_stack,
-                    );
+                    )?;
                 }
             }
         }
         AstExprKind::Pipe { input, op, args } => {
-            let scoped_context = if op == "SOURCE" {
-                source_path_for_source_pipe_expr(expr, source_text, expressions, context)
-                    .map(|path| context.with_source_base(path))
-                    .unwrap_or_else(|| context.clone())
-            } else {
-                context.clone()
-            };
+            let scoped_context = context.clone();
             if boon_typecheck::is_registered_element_constructor(op) {
                 let node_kind = canonical_view_node_kind(op).to_owned();
                 collect_canonical_call_arg_view_bindings(
+                    op,
                     &node_kind,
                     expr_id,
                     expressions,
@@ -3583,7 +4001,7 @@ fn collect_document_expr_view_bindings(
                     source_paths,
                     bindings,
                     &scoped_context,
-                );
+                )?;
                 collect_document_expr_view_bindings(
                     *input,
                     source_text,
@@ -3597,7 +4015,7 @@ fn collect_document_expr_view_bindings(
                     &scoped_context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
                 for arg in args {
                     if !arg.name.as_deref().is_none_or(attr_can_contain_render) {
                         continue;
@@ -3615,14 +4033,18 @@ fn collect_document_expr_view_bindings(
                         &scoped_context,
                         visited_expr_contexts,
                         expr_stack,
-                    );
+                    )?;
                 }
             } else if let Some(function_statement) = functions.get(op)
                 && !function_stack.iter().any(|active| active == op)
             {
                 function_stack.push(op.to_owned());
-                let function_context =
-                    scoped_context.with_pipe_function_call(function_statement, *input, args);
+                let function_context = scoped_context.with_pipe_function_call(
+                    function_statement,
+                    *input,
+                    args,
+                    expressions,
+                );
                 collect_document_function_body_view_bindings(
                     function_statement,
                     source_text,
@@ -3635,7 +4057,7 @@ fn collect_document_expr_view_bindings(
                     function_stack,
                     visited_expr_contexts,
                     &function_context,
-                );
+                )?;
                 function_stack.pop();
             } else {
                 collect_document_expr_view_bindings(
@@ -3651,7 +4073,7 @@ fn collect_document_expr_view_bindings(
                     &scoped_context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
                 if op == "List/map"
                     && let Some(binding) = render_slots.for_expr(expr_id)
                     && let Some(function_name) = binding.template_function.as_deref()
@@ -3659,12 +4081,20 @@ fn collect_document_expr_view_bindings(
                     && !function_stack.iter().any(|active| active == function_name)
                 {
                     function_stack.push(function_name.to_owned());
+                    let row_context = scoped_context
+                        .with_render_row_scope(binding, render_slots.row_scope_for(binding));
                     let function_context = if !binding.template_args.is_empty() {
-                        scoped_context
-                            .with_function_args(function_statement, &binding.template_args)
+                        row_context.with_function_args(
+                            function_statement,
+                            &binding.template_args,
+                            expressions,
+                        )
                     } else {
-                        scoped_context
-                            .with_function_item_expr(function_statement, binding.item_expr_id)
+                        row_context.with_function_item_expr(
+                            function_statement,
+                            binding.item_expr_id,
+                            expressions,
+                        )
                     };
                     collect_document_function_body_view_bindings(
                         function_statement,
@@ -3678,7 +4108,7 @@ fn collect_document_expr_view_bindings(
                         function_stack,
                         visited_expr_contexts,
                         &function_context,
-                    );
+                    )?;
                     function_stack.pop();
                 }
                 for arg in args {
@@ -3695,7 +4125,7 @@ fn collect_document_expr_view_bindings(
                         &scoped_context,
                         visited_expr_contexts,
                         expr_stack,
-                    );
+                    )?;
                 }
             }
         }
@@ -3715,7 +4145,7 @@ fn collect_document_expr_view_bindings(
                 context,
                 visited_expr_contexts,
                 expr_stack,
-            );
+            )?;
         }
         AstExprKind::Then { input, output } => {
             collect_document_expr_view_bindings(
@@ -3731,7 +4161,7 @@ fn collect_document_expr_view_bindings(
                 context,
                 visited_expr_contexts,
                 expr_stack,
-            );
+            )?;
             if let Some(output) = output {
                 collect_document_expr_view_bindings(
                     *output,
@@ -3746,7 +4176,7 @@ fn collect_document_expr_view_bindings(
                     context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
             }
         }
         AstExprKind::Infix { left, right, .. } => {
@@ -3764,7 +4194,7 @@ fn collect_document_expr_view_bindings(
                     context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
             }
         }
         AstExprKind::MatchArm { output, .. } => {
@@ -3782,7 +4212,7 @@ fn collect_document_expr_view_bindings(
                     context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
             }
         }
         AstExprKind::Object(fields)
@@ -3802,7 +4232,7 @@ fn collect_document_expr_view_bindings(
                     context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
             }
         }
         AstExprKind::ListLiteral { items, .. } => {
@@ -3820,7 +4250,7 @@ fn collect_document_expr_view_bindings(
                     context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
             }
         }
         AstExprKind::BytesLiteral { items, .. } => {
@@ -3838,7 +4268,7 @@ fn collect_document_expr_view_bindings(
                     context,
                     visited_expr_contexts,
                     expr_stack,
-                );
+                )?;
             }
         }
         AstExprKind::Identifier(_)
@@ -3857,6 +4287,7 @@ fn collect_document_expr_view_bindings(
         | AstExprKind::Unknown(_) => {}
     }
     expr_stack.pop();
+    Ok(())
 }
 
 fn collect_canonical_element_view_bindings(
@@ -3867,10 +4298,11 @@ fn collect_canonical_element_view_bindings(
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
     context: &DocumentViewBindingContext,
-) {
+) -> Result<(), String> {
     let node_kind = canonical_view_node_kind(function).to_owned();
     if let Some(expr_id) = element.expr {
         collect_canonical_call_arg_view_bindings(
+            function,
             &node_kind,
             expr_id,
             expressions,
@@ -3878,7 +4310,7 @@ fn collect_canonical_element_view_bindings(
             source_paths,
             bindings,
             context,
-        );
+        )?;
     }
     for child in &element.children {
         let Some(attr) = document_statement_field(child) else {
@@ -3886,6 +4318,8 @@ fn collect_canonical_element_view_bindings(
         };
         if attr == "element" {
             collect_canonical_element_source_bindings(
+                function,
+                element.line,
                 &node_kind,
                 child,
                 expressions,
@@ -3893,7 +4327,7 @@ fn collect_canonical_element_view_bindings(
                 source_paths,
                 bindings,
                 context,
-            );
+            )?;
             collect_canonical_element_data_bindings(
                 &node_kind,
                 child,
@@ -3937,7 +4371,7 @@ fn collect_canonical_element_view_bindings(
                     id: ViewBindingId(bindings.len()),
                     node_kind: node_kind.clone(),
                     attr: attr.clone(),
-                    scope_id: scope_id_for_path(row_scopes, &path),
+                    scope_id: view_scope_id_for_path(row_scopes, &path, context),
                     source_id: None,
                     kind: ViewBindingKind::Data,
                     path,
@@ -3945,9 +4379,12 @@ fn collect_canonical_element_view_bindings(
             }
         }
     }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_canonical_call_arg_view_bindings(
+    constructor: &str,
     node_kind: &str,
     expr_id: usize,
     expressions: &[AstExpr],
@@ -3955,13 +4392,13 @@ fn collect_canonical_call_arg_view_bindings(
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
     context: &DocumentViewBindingContext,
-) {
+) -> Result<(), String> {
     let Some(expr) = expressions.get(expr_id) else {
-        return;
+        return Ok(());
     };
     let args = match &expr.kind {
         AstExprKind::Call { args, .. } | AstExprKind::Pipe { args, .. } => args.as_slice(),
-        _ => return,
+        _ => return Ok(()),
     };
     for arg in args {
         let Some(attr) = arg.name.as_deref() else {
@@ -3981,6 +4418,8 @@ fn collect_canonical_call_arg_view_bindings(
         }
         if attr == "element" {
             collect_canonical_element_source_bindings_from_expr(
+                constructor,
+                expr.line,
                 node_kind,
                 arg.value,
                 expressions,
@@ -3988,7 +4427,7 @@ fn collect_canonical_call_arg_view_bindings(
                 source_paths,
                 bindings,
                 context,
-            );
+            )?;
             collect_canonical_element_data_bindings_from_expr(
                 node_kind,
                 arg.value,
@@ -4009,6 +4448,7 @@ fn collect_canonical_call_arg_view_bindings(
             context,
         );
     }
+    Ok(())
 }
 
 fn collect_style_expr_view_bindings(
@@ -4182,7 +4622,10 @@ fn canonical_view_node_kind(function: &str) -> &str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_canonical_element_source_bindings(
+    constructor: &str,
+    constructor_line: usize,
     node_kind: &str,
     element_field: &AstStatement,
     expressions: &[AstExpr],
@@ -4190,9 +4633,11 @@ fn collect_canonical_element_source_bindings(
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
     context: &DocumentViewBindingContext,
-) {
+) -> Result<(), String> {
     if let Some(fields) = record_fields_for_statement(element_field, expressions) {
         collect_canonical_element_source_bindings_from_fields(
+            constructor,
+            constructor_line,
             node_kind,
             fields,
             expressions,
@@ -4200,7 +4645,7 @@ fn collect_canonical_element_source_bindings(
             source_paths,
             bindings,
             context,
-        );
+        )?;
     }
     for event_field in &element_field.children {
         if let AstStatementKind::Source {
@@ -4228,14 +4673,29 @@ fn collect_canonical_element_source_bindings(
             continue;
         }
         if document_statement_field(event_field).as_deref() == Some("events") {
-            if let Some(group_path) = document_statement_value(event_field, expressions, context) {
-                push_canonical_view_event_group_bindings(
-                    node_kind,
-                    &group_path,
-                    row_scopes,
-                    source_paths,
-                    bindings,
-                );
+            let resolved_value = event_field
+                .expr
+                .and_then(|expr_id| document_expr_value_by_id(expr_id, expressions, context));
+            let concrete = event_field
+                .expr
+                .is_some_and(|expr_id| document_expr_is_concrete(expr_id, expressions, context));
+            if collect_canonical_element_events_bindings_from_statement(
+                node_kind,
+                event_field,
+                expressions,
+                row_scopes,
+                source_paths,
+                bindings,
+                context,
+            ) == 0
+                && concrete
+            {
+                return Err(unresolved_element_events_error(
+                    constructor,
+                    constructor_line,
+                    resolved_value.as_deref(),
+                    context,
+                ));
             }
             continue;
         }
@@ -4278,6 +4738,7 @@ fn collect_canonical_element_source_bindings(
             );
         }
     }
+    Ok(())
 }
 
 fn source_record_event_value(
@@ -4292,7 +4753,10 @@ fn source_record_event_value(
         .and_then(|field| document_source_expr_value_by_id(field.value, expressions, context))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_canonical_element_source_bindings_from_expr(
+    constructor: &str,
+    constructor_line: usize,
     node_kind: &str,
     expr_id: usize,
     expressions: &[AstExpr],
@@ -4300,9 +4764,14 @@ fn collect_canonical_element_source_bindings_from_expr(
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
     context: &DocumentViewBindingContext,
-) {
-    if let Some(fields) = record_fields_for_expr(expr_id, expressions) {
+) -> Result<(), String> {
+    let resolved_expr_id =
+        document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())
+            .unwrap_or(expr_id);
+    if let Some(fields) = record_fields_for_expr(resolved_expr_id, expressions) {
         collect_canonical_element_source_bindings_from_fields(
+            constructor,
+            constructor_line,
             node_kind,
             fields,
             expressions,
@@ -4310,11 +4779,15 @@ fn collect_canonical_element_source_bindings_from_expr(
             source_paths,
             bindings,
             context,
-        );
+        )?;
     }
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_canonical_element_source_bindings_from_fields(
+    constructor: &str,
+    constructor_line: usize,
     node_kind: &str,
     fields: &[AstRecordField],
     expressions: &[AstExpr],
@@ -4322,17 +4795,28 @@ fn collect_canonical_element_source_bindings_from_fields(
     source_paths: &[(&str, SourceId)],
     bindings: &mut Vec<ViewBinding>,
     context: &DocumentViewBindingContext,
-) {
+) -> Result<(), String> {
     for field in fields {
         if field.name == "events" {
-            if let Some(group_path) = document_expr_value_by_id(field.value, expressions, context) {
-                push_canonical_view_event_group_bindings(
-                    node_kind,
-                    &group_path,
-                    row_scopes,
-                    source_paths,
-                    bindings,
-                );
+            let resolved_value = document_expr_value_by_id(field.value, expressions, context);
+            let concrete = document_expr_is_concrete(field.value, expressions, context);
+            if collect_canonical_element_events_bindings_from_expr(
+                node_kind,
+                field.value,
+                expressions,
+                row_scopes,
+                source_paths,
+                bindings,
+                context,
+            ) == 0
+                && concrete
+            {
+                return Err(unresolved_element_events_error(
+                    constructor,
+                    constructor_line,
+                    resolved_value.as_deref(),
+                    context,
+                ));
             }
             continue;
         }
@@ -4355,6 +4839,181 @@ fn collect_canonical_element_source_bindings_from_fields(
             }
         }
     }
+    Ok(())
+}
+
+fn unresolved_element_events_error(
+    constructor: &str,
+    line: usize,
+    value: Option<&str>,
+    context: &DocumentViewBindingContext,
+) -> String {
+    format!(
+        "Element constructor `{constructor}` at line {line} supplies `element.events` value `{}`, but it resolves to no concrete SOURCE leaves (binding context `{}`)",
+        value.unwrap_or("<unresolved>"),
+        context.cache_key(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_canonical_element_events_bindings_from_statement(
+    node_kind: &str,
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) -> usize {
+    if let Some(expr_id) = statement.expr {
+        return collect_canonical_element_events_bindings_from_expr(
+            node_kind,
+            expr_id,
+            expressions,
+            row_scopes,
+            source_paths,
+            bindings,
+            context,
+        );
+    }
+
+    let bindings_before = bindings.len();
+    let mut resolving = BTreeSet::new();
+    for child in &statement.children {
+        let Some(attr) = document_statement_field(child) else {
+            continue;
+        };
+        let Some(expr_id) = child.expr else {
+            continue;
+        };
+        collect_canonical_element_event_value_bindings(
+            node_kind,
+            Some(&attr),
+            expr_id,
+            expressions,
+            row_scopes,
+            source_paths,
+            bindings,
+            context,
+            &mut resolving,
+        );
+    }
+    bindings.len() - bindings_before
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_canonical_element_events_bindings_from_expr(
+    node_kind: &str,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+) -> usize {
+    collect_canonical_element_event_value_bindings(
+        node_kind,
+        None,
+        expr_id,
+        expressions,
+        row_scopes,
+        source_paths,
+        bindings,
+        context,
+        &mut BTreeSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_canonical_element_event_value_bindings(
+    node_kind: &str,
+    event_attr: Option<&str>,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    row_scopes: &[RowScope],
+    source_paths: &[(&str, SourceId)],
+    bindings: &mut Vec<ViewBinding>,
+    context: &DocumentViewBindingContext,
+    resolving: &mut BTreeSet<usize>,
+) -> usize {
+    let Some(expr_id) =
+        document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())
+    else {
+        return 0;
+    };
+    if !resolving.insert(expr_id) {
+        return 0;
+    }
+
+    let bindings_before = bindings.len();
+    let Some(expr) = expressions.get(expr_id) else {
+        resolving.remove(&expr_id);
+        return 0;
+    };
+    match &expr.kind {
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => {
+            for field in fields {
+                collect_canonical_element_event_value_bindings(
+                    node_kind,
+                    Some(&field.name),
+                    field.value,
+                    expressions,
+                    row_scopes,
+                    source_paths,
+                    bindings,
+                    context,
+                    resolving,
+                );
+            }
+        }
+        _ => {
+            if let Some(value) = document_expr_value(expr, expressions, context) {
+                if let Some(attr) = event_attr {
+                    push_canonical_view_source_binding(
+                        node_kind,
+                        attr,
+                        &value,
+                        row_scopes,
+                        source_paths,
+                        bindings,
+                    );
+                    if bindings.len() == bindings_before {
+                        push_canonical_view_event_group_bindings(
+                            node_kind,
+                            &value,
+                            row_scopes,
+                            source_paths,
+                            bindings,
+                        );
+                    }
+                } else {
+                    push_canonical_view_event_group_bindings(
+                        node_kind,
+                        &value,
+                        row_scopes,
+                        source_paths,
+                        bindings,
+                    );
+                    if bindings.len() == bindings_before
+                        && let Some(attr) = value.rsplit('.').next()
+                    {
+                        push_canonical_view_source_binding(
+                            node_kind,
+                            attr,
+                            &value,
+                            row_scopes,
+                            source_paths,
+                            bindings,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    resolving.remove(&expr_id);
+    bindings.len() - bindings_before
 }
 
 fn collect_canonical_element_data_bindings(
@@ -4626,7 +5285,7 @@ fn collect_document_element_bindings(
                 id: ViewBindingId(bindings.len()),
                 node_kind: node_kind.to_owned(),
                 attr: attr.clone(),
-                scope_id: scope_id_for_path(row_scopes, &path),
+                scope_id: view_scope_id_for_path(row_scopes, &path, context),
                 source_id: None,
                 kind: if attr == "target" {
                     ViewBindingKind::Target
@@ -4711,16 +5370,94 @@ fn document_expr_value_by_id(
     document_expr_value(expressions.get(expr_id)?, expressions, context)
 }
 
+fn document_expr_is_concrete(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+) -> bool {
+    document_expr_is_concrete_inner(expr_id, expressions, context, &mut BTreeSet::new())
+}
+
+fn document_expr_is_concrete_inner(
+    expr_id: usize,
+    expressions: &[AstExpr],
+    context: &DocumentViewBindingContext,
+    seen: &mut BTreeSet<usize>,
+) -> bool {
+    if !seen.insert(expr_id) {
+        return false;
+    }
+    let Some(expr) = expressions.get(expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Identifier(name) => {
+            context.arg_expr(name).is_some_and(|mapped| {
+                document_expr_is_concrete_inner(mapped, expressions, context, seen)
+            }) || context.row_aliases.contains_key(name)
+        }
+        AstExprKind::Path(parts) if parts.len() == 1 => {
+            context.arg_expr(&parts[0]).is_some_and(|mapped| {
+                document_expr_is_concrete_inner(mapped, expressions, context, seen)
+            }) || context.row_aliases.contains_key(&parts[0])
+        }
+        AstExprKind::Object(fields)
+        | AstExprKind::Record(fields)
+        | AstExprKind::TaggedObject { fields, .. } => fields
+            .iter()
+            .all(|field| document_expr_is_concrete_inner(field.value, expressions, context, seen)),
+        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => items
+            .iter()
+            .all(|item| document_expr_is_concrete_inner(*item, expressions, context, seen)),
+        AstExprKind::Pipe { input, args, .. } => {
+            document_expr_is_concrete_inner(*input, expressions, context, seen)
+                && args.iter().all(|arg| {
+                    document_expr_is_concrete_inner(arg.value, expressions, context, seen)
+                })
+        }
+        AstExprKind::Call { args, .. } => args
+            .iter()
+            .all(|arg| document_expr_is_concrete_inner(arg.value, expressions, context, seen)),
+        AstExprKind::Infix { left, right, .. } => {
+            document_expr_is_concrete_inner(*left, expressions, context, seen)
+                && document_expr_is_concrete_inner(*right, expressions, context, seen)
+        }
+        AstExprKind::Then { input, output } => {
+            document_expr_is_concrete_inner(*input, expressions, context, seen)
+                && output.is_none_or(|output| {
+                    document_expr_is_concrete_inner(output, expressions, context, seen)
+                })
+        }
+        AstExprKind::MatchArm { output, .. } => output.is_none_or(|output| {
+            document_expr_is_concrete_inner(output, expressions, context, seen)
+        }),
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial }
+        | AstExprKind::Draining { input: initial } => {
+            document_expr_is_concrete_inner(*initial, expressions, context, seen)
+        }
+        AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::ByteLiteral { .. }
+        | AstExprKind::Number(_)
+        | AstExprKind::Bool(_)
+        | AstExprKind::Enum(_)
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_) => true,
+    }
+}
+
 fn document_source_expr_value_by_id(
     expr_id: usize,
     expressions: &[AstExpr],
     context: &DocumentViewBindingContext,
 ) -> Option<String> {
-    let expr_id = document_resolved_expr_id(expr_id, expressions, context, &mut BTreeSet::new())?;
-    match &expressions.get(expr_id)?.kind {
-        AstExprKind::Source => context.source_base().map(str::to_owned),
-        _ => document_expr_value(expressions.get(expr_id)?, expressions, context),
-    }
+    document_expr_value_by_id(expr_id, expressions, context)
 }
 
 fn document_source_statement_value(
@@ -4784,7 +5521,7 @@ fn document_expr_value(
                     .is_some_and(|expr| expr_is_same_identifier_path(expr, value))
             })
             .and_then(|expr_id| document_expr_value_by_id(expr_id, expressions, context))
-            .or_else(|| Some(value.clone())),
+            .or_else(|| Some(context.canonicalize_row_path(value))),
         AstExprKind::Bool(value) => Some(value.to_string()),
         AstExprKind::Path(parts) => document_path_value(parts, expressions, context),
         AstExprKind::Pipe { input, op, args } => {
@@ -4830,9 +5567,9 @@ fn document_path_value(
     {
         value.push('.');
         value.push_str(&parts[1..].join("."));
-        return Some(value);
+        return Some(context.canonicalize_row_path(&value));
     }
-    Some(parts.join("."))
+    Some(context.canonicalize_row_path(&parts.join(".")))
 }
 
 fn expr_is_same_identifier_path(expr: &AstExpr, name: &str) -> bool {
@@ -4876,11 +5613,26 @@ fn require_known_symbol(
 
 fn symbol_known(value: &str, known_symbols: &BTreeSet<&str>) -> bool {
     known_symbols.contains(value)
-        || known_symbols.iter().any(|known| {
-            known
-                .rsplit_once('.')
-                .is_some_and(|(_, local)| local == value)
-        })
+        || known_symbols
+            .iter()
+            .any(|known| symbol_is_rooted_in(value, known))
+}
+
+fn symbol_is_rooted_in(value: &str, known: &str) -> bool {
+    let mut candidate = known;
+    loop {
+        if value == candidate
+            || value
+                .strip_prefix(candidate)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+        {
+            return true;
+        }
+        let Some((_, suffix)) = candidate.split_once('.') else {
+            return false;
+        };
+        candidate = suffix;
+    }
 }
 
 fn view_projection_symbol_known(value: &str) -> bool {
@@ -5171,6 +5923,23 @@ fn verify_scheduled_update_expression(
             }
             Ok(())
         }
+        UpdateExpression::HostEffect {
+            operation,
+            arguments,
+            ..
+        } => {
+            if !boon_typecheck::is_typed_host_effect(operation) {
+                return Err(format!(
+                    "static schedule contains unknown typed host effect `{operation}`"
+                ));
+            }
+            if arguments.iter().any(|argument| argument.name.is_empty()) {
+                return Err(format!(
+                    "typed host effect `{operation}` contains an unnamed argument"
+                ));
+            }
+            Ok(())
+        }
         UpdateExpression::Unknown { summary } => Err(format!(
             "static schedule contains unsupported update expression for `{target}` from `{source}`: `{summary}`"
         )),
@@ -5362,22 +6131,15 @@ fn field_symbol_dependency_graph(
         .iter()
         .map(|field| excluded_paths.contains(field.path.as_str()))
         .collect::<Vec<_>>();
-    let mentioned_identifiers = fields
+    let fields_by_path = fields
         .iter()
-        .map(|field| {
-            let mut identifiers = BTreeSet::new();
-            for item in &field.ast_items {
-                for symbol in &item.symbols {
-                    identifiers.insert(symbol.as_str());
-                }
-            }
-            identifiers
-        })
-        .collect::<Vec<_>>();
-    let mut fields_by_parent = BTreeMap::<&str, Vec<usize>>::new();
+        .enumerate()
+        .map(|(index, field)| (field.path.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut fields_by_local_name = BTreeMap::<&str, Vec<usize>>::new();
     for (index, field) in fields.iter().enumerate() {
-        fields_by_parent
-            .entry(field.parent_path.as_str())
+        fields_by_local_name
+            .entry(field.local_name.as_str())
             .or_default()
             .push(index);
     }
@@ -5386,23 +6148,59 @@ fn field_symbol_dependency_graph(
         if excluded_field[field_index] {
             continue;
         }
-        let Some(siblings) = fields_by_parent.get(field.parent_path.as_str()) else {
-            continue;
-        };
-        for &dependency_index in siblings {
-            let dependency = &fields[dependency_index];
-            if dependency_index == field_index
-                || excluded_field[dependency_index]
-                || dependency.local_name == field.local_name
+        let mut dependencies = BTreeSet::new();
+        for expr in &field.ast_exprs {
+            let raw = match &expr.kind {
+                AstExprKind::Identifier(value) => value.clone(),
+                AstExprKind::Path(parts) => parts.join("."),
+                _ => continue,
+            };
+            if let Some(dependency_index) =
+                scoped_field_reference_candidates(&field.parent_path, &raw)
+                    .into_iter()
+                    .find_map(|candidate| longest_field_path_prefix(&fields_by_path, &candidate))
+                && dependency_index != field_index
+                && !excluded_field[dependency_index]
             {
-                continue;
+                dependencies.insert(dependency_index);
             }
-            if mentioned_identifiers[field_index].contains(dependency.local_name.as_str()) {
-                dependency_edges[field_index].push(dependency_index);
+            if !raw.contains('.')
+                && let Some(candidates) = fields_by_local_name.get(raw.as_str())
+            {
+                for &dependency_index in candidates {
+                    if dependency_index != field_index
+                        && !excluded_field[dependency_index]
+                        && expression_references_field(field, expr, &fields[dependency_index])
+                    {
+                        dependencies.insert(dependency_index);
+                    }
+                }
             }
         }
+        dependency_edges[field_index].extend(dependencies);
     }
     (excluded_field, dependency_edges)
+}
+
+fn scoped_field_reference_candidates(parent_path: &str, path: &str) -> Vec<String> {
+    let mut candidates = vec![path.to_owned()];
+    let mut scope = Some(parent_path);
+    while let Some(parent) = scope.filter(|parent| !parent.is_empty()) {
+        candidates.push(format!("{parent}.{path}"));
+        scope = parent.rsplit_once('.').map(|(ancestor, _)| ancestor);
+    }
+    candidates
+}
+
+fn longest_field_path_prefix(fields_by_path: &BTreeMap<&str, usize>, path: &str) -> Option<usize> {
+    let mut candidate = path;
+    loop {
+        if let Some(index) = fields_by_path.get(candidate) {
+            return Some(*index);
+        }
+        let (parent, _) = candidate.rsplit_once('.')?;
+        candidate = parent;
+    }
 }
 
 fn verify_combinational_field_cycles(
@@ -5630,7 +6428,6 @@ fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
         }
         InitialValue::Text { .. }
         | InitialValue::Number { .. }
-        | InitialValue::Byte { .. }
         | InitialValue::Bool { .. }
         | InitialValue::Bytes { .. }
         | InitialValue::Data { .. } => Ok(()),
@@ -5821,6 +6618,17 @@ fn reject_update_expression_identity(value: &UpdateExpression) -> Result<(), Str
             }
             Ok(())
         }
+        UpdateExpression::HostEffect {
+            operation,
+            arguments,
+            ..
+        } => {
+            reject_hidden_identity_identifier("host effect operation", operation)?;
+            for argument in arguments {
+                reject_hidden_identity_identifier("host effect argument", &argument.name)?;
+            }
+            Ok(())
+        }
         UpdateExpression::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown update expression", summary)
         }
@@ -5978,9 +6786,12 @@ fn expression_coverage(
     derived_values: &[DerivedValue],
     update_branches: &[UpdateBranch],
     list_operations: &[ListOperation],
+    distributed_references: &DistributedReferences,
 ) -> ExpressionCoverage {
     let mut coverage = ExpressionCoverage {
         ast_expression_count: program.expressions.len(),
+        distributed_reference_expression_count: distributed_references.value_references.len()
+            + distributed_references.pure_calls.len(),
         ..ExpressionCoverage::empty()
     };
     let scheduled_expr_ids = nodes
@@ -6341,6 +7152,31 @@ fn update_branches(
         .collect()
 }
 
+fn verify_host_effect_calls_scheduled(
+    program: &ParsedProgram,
+    update_branches: &[UpdateBranch],
+) -> Result<(), String> {
+    let scheduled = update_branches
+        .iter()
+        .filter_map(|branch| match &branch.expression {
+            UpdateExpression::HostEffect { call_expr_id, .. } => Some(call_expr_id.as_usize()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for expr in &program.expressions {
+        let AstExprKind::Call { function, .. } = &expr.kind else {
+            continue;
+        };
+        if boon_typecheck::is_typed_host_effect(function) && !scheduled.contains(&expr.id) {
+            return Err(format!(
+                "typed host effect `{function}` on line {} is not a dependency-triggered HOLD update",
+                expr.line
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn derived_dependency_update_branches(
     program: &ParsedProgram,
@@ -6352,12 +7188,17 @@ fn derived_dependency_update_branches(
     resolved_constants: &ResolvedConstantLookup<'_>,
 ) -> Vec<UpdateBranch> {
     let mut branches = Vec::new();
-    for dependency in fields.iter().filter(|dependency| {
-        dependency.parent_path == field.parent_path
-            && dependency.path != field.path
-            && field.mentions_identifier_expr(&dependency.local_name)
-    }) {
-        for source in candidate_sources.candidate_sources(&dependency.path) {
+    for dependency_path in candidate_sources.dependency_paths(&field.path) {
+        let Some(dependency) = fields
+            .iter()
+            .find(|dependency| dependency.path == dependency_path)
+        else {
+            continue;
+        };
+        if !field_dependency_is_event_cause(field, dependency) {
+            continue;
+        }
+        for source in candidate_sources.event_sources_for_dependency(&dependency.path) {
             if existing_branches
                 .iter()
                 .chain(branches.iter())
@@ -7142,14 +7983,20 @@ fn derived_values(
         })
         .enumerate()
         .map(|(id, field)| {
-            let direct_sources = direct_sources_for_field(direct_sources, field)
-                .cloned()
-                .collect::<Vec<_>>();
-            let event_sources = if field.has_then_expr()
-                || field
-                    .ast_exprs
-                    .iter()
-                    .any(|expr| matches!(expr.kind, AstExprKind::Latest))
+            let structural_group = field_is_structural_group(field);
+            let direct_sources = if structural_group {
+                Vec::new()
+            } else {
+                direct_sources_for_field(direct_sources, field)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let event_sources = if !structural_group
+                && (field.has_then_expr()
+                    || field
+                        .ast_exprs
+                        .iter()
+                        .any(|expr| matches!(expr.kind, AstExprKind::Latest)))
             {
                 candidate_sources.candidate_sources(&field.path)
             } else {
@@ -7167,6 +8014,8 @@ fn derived_values(
             let scope_id = scope_id_for_path(row_scopes, &field.path);
             let kind = if list_memory_view {
                 DerivedValueKind::ListView
+            } else if structural_group {
+                DerivedValueKind::Pure
             } else {
                 derived_value_kind(field, &transform_sources)
             };
@@ -7187,6 +8036,17 @@ fn derived_values(
             }
         })
         .collect()
+}
+
+fn field_is_structural_group(field: &FieldDef) -> bool {
+    field.statement.expr.is_none()
+        && !field.statement.children.is_empty()
+        && field.statement.children.iter().all(|child| {
+            matches!(
+                child.kind,
+                AstStatementKind::Field { .. } | AstStatementKind::Source { .. }
+            )
+        })
 }
 
 fn is_output_registry_value_path(path: &str) -> bool {
@@ -7429,7 +8289,10 @@ fn ast_initial_value(
         AstExprKind::Number(value) => InitialValue::Number {
             value: value.clone(),
         },
-        AstExprKind::ByteLiteral { value, .. } => InitialValue::Byte { value: *value },
+        AstExprKind::ByteLiteral { value, .. } => InitialValue::Bytes {
+            bytes: vec![*value],
+            fixed_len: Some(1),
+        },
         AstExprKind::BytesLiteral { size, items } => initial_bytes_value(size, items, expressions)
             .unwrap_or_else(|| InitialValue::Unknown {
                 summary: ast_expr_label(expr),
@@ -7972,7 +8835,10 @@ fn literal_initial_value(tokens: &[String]) -> InitialValue {
         };
     }
     if let Some(value) = byte_literal_value(tokens) {
-        return InitialValue::Byte { value };
+        return InitialValue::Bytes {
+            bytes: vec![value],
+            fixed_len: Some(1),
+        };
     }
     if let Some(value) = bytes_literal_value(tokens) {
         return value;
@@ -8364,13 +9230,6 @@ impl<'a> ResolvedConstantLookup<'a> {
         }
     }
 
-    fn byte(&self, expr_id: usize) -> Option<u8> {
-        match self.by_expr_id.get(&expr_id).copied()? {
-            boon_typecheck::ResolvedConstantValue::Byte { value } => Some(*value),
-            _ => None,
-        }
-    }
-
     fn symbol(&self, expr_id: usize) -> Option<&str> {
         match self.by_expr_id.get(&expr_id).copied()? {
             boon_typecheck::ResolvedConstantValue::Symbol { value } => Some(value.as_str()),
@@ -8452,14 +9311,17 @@ fn bytes_set_index_arg_in_exprs(
     bytes_get_index_arg_in_exprs(resolved_constants, args, piped)
 }
 
-fn bytes_set_value_arg_in_exprs(
-    resolved_constants: &ResolvedConstantLookup<'_>,
-    args: &[AstCallArg],
-    piped: bool,
-) -> Option<u8> {
+fn bytes_set_value_arg_in_exprs(exprs: &[AstExpr], args: &[AstCallArg], piped: bool) -> Option<u8> {
     let positional_index = if piped { 1 } else { 2 };
-    bytes_arg_expr_id(args, &["value"], positional_index)
-        .and_then(|arg| resolved_constants.byte(arg.value))
+    let arg = bytes_arg_expr_id(args, &["value"], positional_index)?;
+    let expr = exprs.iter().find(|expr| expr.id == arg.value)?;
+    let AstExprKind::BytesLiteral { size, items } = &expr.kind else {
+        return None;
+    };
+    let InitialValue::Bytes { bytes, fixed_len } = initial_bytes_value(size, items, exprs)? else {
+        return None;
+    };
+    (fixed_len == Some(1) && bytes.len() == 1).then(|| bytes[0])
 }
 
 fn bytes_u64_arg_in_exprs(
@@ -9372,6 +10234,27 @@ fn statement_containing_expr(statement: &AstStatement, expr_id: usize) -> Option
         .find_map(|child| statement_containing_expr(child, expr_id))
 }
 
+fn statement_containing_expr_graph<'a>(
+    statement: &'a AstStatement,
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> Option<&'a AstStatement> {
+    if statement.expr == Some(expr_id) {
+        return Some(statement);
+    }
+    if let Some(nested) = statement
+        .children
+        .iter()
+        .find_map(|child| statement_containing_expr_graph(child, expr_id, expressions))
+    {
+        return Some(nested);
+    }
+    statement
+        .expr
+        .is_some_and(|root| expr_contains_expr_id_in_exprs(expressions, root, expr_id))
+        .then_some(statement)
+}
+
 fn row_field_path_from_expr(
     field: &FieldDef,
     expr_id: usize,
@@ -9925,18 +10808,27 @@ fn update_guard_for_routed_branch(
         let AstExprKind::When { input } = expr.kind else {
             continue;
         };
-        let Some(payload_field) = ast_argument_value(field, input)
+        let input_path = ast_argument_value(field, input);
+        let values = non_skip_literal_match_patterns_after_when(branch, expr.line);
+        if values.is_empty() {
+            continue;
+        }
+        if input_path
+            .as_deref()
+            .is_some_and(|input| variants.iter().any(|variant| variant == input))
+        {
+            return Some(UpdateGuard::TriggerValueOneOf { values });
+        }
+        let Some(payload_field) = input_path
             .and_then(|input| source_payload_guard_field_from_path(&input, &variants))
             .or_else(|| source_payload_field_near_when(branch, expr.line, &variants))
         else {
             continue;
         };
-        let field = SourcePayloadField::from_name(&payload_field);
-        let values = non_skip_literal_match_patterns_after_when(branch, expr.line);
-        if values.is_empty() {
-            continue;
-        }
-        return Some(UpdateGuard::SourcePayloadOneOf { field, values });
+        return Some(UpdateGuard::SourcePayloadOneOf {
+            field: SourcePayloadField::from_name(&payload_field),
+            values,
+        });
     }
     None
 }
@@ -10254,6 +11146,9 @@ fn update_expression_for_routed_branch(
     if let Some(expression) =
         branch.then_bytes_write_signed_expression(field, target, fields, resolved_constants)
     {
+        return expression;
+    }
+    if let Some(expression) = branch.host_effect_expression(field) {
         return expression;
     }
     if let Some(expression) = branch.then_file_read_bytes_expression(field, target, fields) {
@@ -11139,16 +12034,21 @@ fn expr_matches_source(field: &FieldDef, expr_id: usize, source: &str) -> bool {
     let Some(input_path) = ast_argument_value(field, expr_id) else {
         return false;
     };
+    let input_parts = input_path
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let canonical_path = canonical_local_path(&input_path, &field.parent_path);
+    let canonical_parts = canonical_path
+        .split('.')
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     source_ref_variants(source).iter().any(|variant| {
-        let canonical = canonical_local_path(&input_path, &field.parent_path);
-        input_path == *variant
-            || input_path
-                .strip_prefix(variant)
-                .is_some_and(|suffix| suffix.starts_with('.'))
-            || canonical == *variant
-            || canonical
-                .strip_prefix(variant)
-                .is_some_and(|suffix| suffix.starts_with('.'))
+        let expected = dotted_path_parts(variant);
+        path_parts_match_source_ref(&input_parts, &expected)
+            || path_parts_match_source_ref(&canonical_parts, &expected)
     })
 }
 
@@ -11962,6 +12862,9 @@ fn canonical_scalar_update_path_for_source(
     fields: &[FieldDef],
     source: &str,
 ) -> String {
+    if let Some(member_path) = canonical_source_member_path(source, value) {
+        return member_path;
+    }
     let canonical = canonical_scalar_update_path_with_fields(field, target, value, fields);
     if fields.iter().any(|candidate| candidate.path == canonical) {
         return canonical;
@@ -11981,6 +12884,20 @@ fn canonical_scalar_update_path_for_source(
     } else {
         canonical
     }
+}
+
+fn canonical_source_member_path(source: &str, value: &str) -> Option<String> {
+    let source_alias = std::iter::successors(Some(source), |candidate| {
+        candidate.split_once('.').map(|(_, suffix)| suffix)
+    })
+    .find(|candidate| {
+        value == *candidate
+            || value
+                .strip_prefix(*candidate)
+                .is_some_and(|suffix| suffix.starts_with('.'))
+    })?;
+    let suffix = value.strip_prefix(source_alias)?;
+    Some(format!("{source}{suffix}"))
 }
 
 fn canonical_bytes_scalar_arg(
@@ -12105,15 +13022,17 @@ fn bool_not_path_from_expr(exprs: &[AstExpr], expr_id: usize) -> Option<String> 
 struct CandidateSourceIndex<'a> {
     fields: &'a [FieldDef],
     direct_sources: &'a BTreeMap<String, Vec<String>>,
+    effect_result_states: BTreeSet<String>,
     fields_by_path: BTreeMap<&'a str, usize>,
     dependencies_by_field: Vec<Vec<usize>>,
-    cache: BTreeMap<String, Vec<String>>,
+    cache: BTreeMap<(String, bool), Vec<String>>,
 }
 
 impl<'a> CandidateSourceIndex<'a> {
     fn new(
         fields: &'a [FieldDef],
         direct_sources: &'a BTreeMap<String, Vec<String>>,
+        state_cells: &[StateCell],
     ) -> CandidateSourceIndex<'a> {
         let empty_exclusions = BTreeSet::new();
         let (_, dependencies_by_field) = field_symbol_dependency_graph(fields, &empty_exclusions);
@@ -12122,9 +13041,27 @@ impl<'a> CandidateSourceIndex<'a> {
             .enumerate()
             .map(|(index, field)| (field.path.as_str(), index))
             .collect();
+        let effect_result_states = state_cells
+            .iter()
+            .filter_map(|state| {
+                fields
+                    .iter()
+                    .find(|field| field.path == state.path)
+                    .filter(|field| {
+                        field.ast_exprs.iter().any(|expr| match &expr.kind {
+                            AstExprKind::Call { function, .. } => {
+                                boon_typecheck::is_typed_host_effect(function)
+                            }
+                            _ => false,
+                        })
+                    })
+                    .map(|_| state.path.clone())
+            })
+            .collect();
         CandidateSourceIndex {
             fields,
             direct_sources,
+            effect_result_states,
             fields_by_path,
             dependencies_by_field,
             cache: BTreeMap::new(),
@@ -12132,27 +13069,50 @@ impl<'a> CandidateSourceIndex<'a> {
     }
 
     fn candidate_sources(&mut self, target: &str) -> Vec<String> {
-        if let Some(cached) = self.cache.get(target) {
+        let cache_key = (target.to_owned(), false);
+        if let Some(cached) = self.cache.get(&cache_key) {
             return cached.clone();
         }
         let Some(&field_index) = self.fields_by_path.get(target) else {
-            self.cache.insert(target.to_owned(), Vec::new());
+            self.cache.insert(cache_key, Vec::new());
             return Vec::new();
         };
         let mut visiting = Vec::new();
-        self.candidate_sources_for_index(field_index, &mut visiting)
+        self.candidate_sources_for_index(field_index, false, &mut visiting)
+    }
+
+    fn dependency_paths(&self, target: &str) -> Vec<String> {
+        let Some(&field_index) = self.fields_by_path.get(target) else {
+            return Vec::new();
+        };
+        self.dependencies_by_field[field_index]
+            .iter()
+            .map(|dependency| self.fields[*dependency].path.clone())
+            .collect()
+    }
+
+    fn event_sources_for_dependency(&mut self, dependency: &str) -> Vec<String> {
+        if self.effect_result_states.contains(dependency) {
+            return vec![dependency.to_owned()];
+        }
+        self.candidate_sources(dependency)
     }
 
     fn candidate_sources_for_index(
         &mut self,
         field_index: usize,
+        as_dependency: bool,
         visiting: &mut Vec<usize>,
     ) -> Vec<String> {
         let path = self.fields[field_index].path.clone();
+        if as_dependency && self.effect_result_states.contains(&path) {
+            return vec![path];
+        }
         if visiting.contains(&field_index) {
             return Vec::new();
         }
-        if let Some(cached) = self.cache.get(&path) {
+        let cache_key = (path.clone(), as_dependency);
+        if let Some(cached) = self.cache.get(&cache_key) {
             return cached.clone();
         }
         visiting.push(field_index);
@@ -12164,12 +13124,12 @@ impl<'a> CandidateSourceIndex<'a> {
             if !field_dependency_is_event_cause(field, &self.fields[dependency_index]) {
                 continue;
             }
-            for source in self.candidate_sources_for_index(dependency_index, visiting) {
+            for source in self.candidate_sources_for_index(dependency_index, true, visiting) {
                 push_unique(&mut candidates, source);
             }
         }
         visiting.pop();
-        self.cache.insert(path, candidates.clone());
+        self.cache.insert(cache_key, candidates.clone());
         candidates
     }
 }
@@ -12232,9 +13192,14 @@ fn field_dependency_is_event_cause(field: &FieldDef, dependency: &FieldDef) -> b
 
 fn expression_references_field(field: &FieldDef, expr: &AstExpr, dependency: &FieldDef) -> bool {
     let raw = match &expr.kind {
-        AstExprKind::Identifier(value) => value.as_str(),
+        AstExprKind::Identifier(value) => {
+            if field.expression_has_match_binding(expr.id, value) {
+                return false;
+            }
+            value.as_str()
+        }
         AstExprKind::Path(parts) => {
-            return expression_path_references_field(field, parts, dependency);
+            return expression_path_references_field(field, expr.id, parts, dependency);
         }
         _ => return false,
     };
@@ -12245,16 +13210,29 @@ fn expression_references_field(field: &FieldDef, expr: &AstExpr, dependency: &Fi
 
 fn expression_path_references_field(
     field: &FieldDef,
+    expr_id: usize,
     parts: &[String],
     dependency: &FieldDef,
 ) -> bool {
     if parts.is_empty() {
         return false;
     }
+    if field.expression_has_match_binding(expr_id, &parts[0]) {
+        return false;
+    }
     let raw = parts.join(".");
-    raw == dependency.path
+    path_is_or_is_within(&raw, &dependency.path)
         || (parts.len() == 1 && parts[0] == dependency.local_name)
-        || canonical_local_path(&raw, &field.parent_path) == dependency.path
+        || scoped_field_reference_candidates(&field.parent_path, &raw)
+            .iter()
+            .any(|candidate| path_is_or_is_within(candidate, &dependency.path))
+}
+
+fn path_is_or_is_within(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 #[derive(Clone, Debug)]
@@ -12351,13 +13329,10 @@ impl RoutedBranch {
         target: &str,
     ) -> Option<UpdateExpression> {
         self.ast_exprs.iter().find_map(|expr| {
-            let AstExprKind::Then {
-                output: Some(output),
-                ..
-            } = expr.kind
-            else {
+            let AstExprKind::Then { output, .. } = expr.kind else {
                 return None;
             };
+            let output = output.or_else(|| following_direct_then_call_expr_id(field, expr.line))?;
             let output = self
                 .ast_exprs
                 .iter()
@@ -12586,12 +13561,12 @@ impl RoutedBranch {
                 AstExprKind::Pipe { input, op, args } if op == "Bytes/set" => (
                     ast_argument_value_in_exprs(&field.ast_exprs, *input)?,
                     bytes_set_index_arg_in_exprs(resolved_constants, args, true)?,
-                    bytes_set_value_arg_in_exprs(resolved_constants, args, true)?,
+                    bytes_set_value_arg_in_exprs(&field.ast_exprs, args, true)?,
                 ),
                 AstExprKind::Call { function, args } if function == "Bytes/set" => (
                     bytes_set_input_arg_in_exprs(&field.ast_exprs, args)?,
                     bytes_set_index_arg_in_exprs(resolved_constants, args, false)?,
-                    bytes_set_value_arg_in_exprs(resolved_constants, args, false)?,
+                    bytes_set_value_arg_in_exprs(&field.ast_exprs, args, false)?,
                 ),
                 _ => return None,
             };
@@ -13060,6 +14035,54 @@ impl RoutedBranch {
                 byte_count,
                 endian,
                 value,
+            })
+        })
+    }
+
+    fn host_effect_expression(&self, field: &FieldDef) -> Option<UpdateExpression> {
+        self.ast_exprs.iter().find_map(|output| {
+            let AstExprKind::Call { function, args } = &output.kind else {
+                return None;
+            };
+            if !boon_typecheck::is_typed_host_effect(function) {
+                return None;
+            }
+            let arguments = if args.is_empty() {
+                statement_containing_expr_graph(&field.statement, output.id, &field.ast_exprs)
+                    .map(|statement| {
+                        statement
+                            .children
+                            .iter()
+                            .filter_map(|argument| {
+                                let name = match &argument.kind {
+                                    AstStatementKind::Field { name }
+                                    | AstStatementKind::List {
+                                        field: Some(name), ..
+                                    } => name,
+                                    _ => return None,
+                                };
+                                Some(HostEffectCallArgument {
+                                    name: name.clone(),
+                                    value_expr_id: ExprId(argument.expr?),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                args.iter()
+                    .map(|argument| {
+                        Some(HostEffectCallArgument {
+                            name: argument.name.clone()?,
+                            value_expr_id: ExprId(argument.value),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?
+            };
+            Some(UpdateExpression::HostEffect {
+                operation: function.clone(),
+                call_expr_id: ExprId(output.id),
+                arguments,
             })
         })
     }
@@ -13878,6 +14901,10 @@ fn source_payload_suffix_from_variant<'a>(path: &'a str, variant: &str) -> Optio
 }
 
 impl FieldDef {
+    fn expression_has_match_binding(&self, expr_id: usize, name: &str) -> bool {
+        statement_match_binding_for_expr(&self.statement, expr_id, name, &self.ast_exprs)
+    }
+
     fn has_token(&self, token: &str) -> bool {
         self.ast_items
             .iter()
@@ -14117,6 +15144,50 @@ impl FieldDef {
             .collect();
         Some(RoutedBranch { items, ast_exprs })
     }
+}
+
+fn statement_match_binding_for_expr(
+    statement: &AstStatement,
+    expr_id: usize,
+    name: &str,
+    expressions: &[AstExpr],
+) -> bool {
+    let binds_name = statement
+        .expr
+        .and_then(|statement_expr_id| expressions.iter().find(|expr| expr.id == statement_expr_id))
+        .and_then(|expr| match &expr.kind {
+            AstExprKind::MatchArm { pattern, .. } => match_arm_binding_name(pattern),
+            _ => None,
+        })
+        .is_some_and(|binding| binding == name);
+    if binds_name && statement_subtree_contains_expr(statement, expr_id, expressions) {
+        return true;
+    }
+    statement
+        .children
+        .iter()
+        .any(|child| statement_match_binding_for_expr(child, expr_id, name, expressions))
+}
+
+fn statement_subtree_contains_expr(
+    statement: &AstStatement,
+    expr_id: usize,
+    expressions: &[AstExpr],
+) -> bool {
+    statement.expr.is_some_and(|root| {
+        root == expr_id || expr_contains_expr_id_in_exprs(expressions, root, expr_id)
+    }) || statement
+        .children
+        .iter()
+        .any(|child| statement_subtree_contains_expr(child, expr_id, expressions))
+}
+
+fn match_arm_binding_name(pattern: &[String]) -> Option<&str> {
+    let [name] = pattern else {
+        return None;
+    };
+    (name != "_" && name != "__" && value_starts_lowercase_identifier(name))
+        .then_some(name.as_str())
 }
 
 fn direct_source_refs_by_path(

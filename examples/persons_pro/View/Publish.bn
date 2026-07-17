@@ -15,11 +15,11 @@ FUNCTION controls() {
             )
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.publish
                 label: TEXT { Publish }
                 tone: Primary
                 selected: False
             )
-                |> SOURCE { PASSED.store.elements.publish }
         }
     )
 }
@@ -27,12 +27,12 @@ FUNCTION controls() {
 FUNCTION compiler() {
     PASSED.store.has_publish_request |> WHEN {
         True => Scene/Element/program(
-            element: [event: PASSED.store.elements.publish_candidate_program]
+            element: [events: PASSED.store.elements.publish_candidate_program]
             style: [width: 0, height: 0, paint: False]
             source: PASSED.store.publish_candidate_source
             support_sources: Profile/support_sources()
             revision: PASSED.store.publish_request_sequence
-            capability_profile: PublicDocument
+            capability_profile: PublicClient
             artifact_retention: Archive
             session_key: TEXT { persons-public-candidate }
             mount: False

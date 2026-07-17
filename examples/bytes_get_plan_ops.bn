@@ -4,7 +4,7 @@ payload:
 store: [
     measure: SOURCE
     selected_byte:
-        16u00 |> HOLD selected_byte {
+        BYTES[1] { 16u00 } |> HOLD selected_byte {
             LATEST {
                 store.measure |> THEN { payload |> Bytes/get(index: 2) }
             }

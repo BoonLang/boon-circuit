@@ -9,7 +9,7 @@ use boon_document::{
 };
 mod map;
 #[cfg(test)]
-use boon_document::{DocumentNodeKind, LayoutFrame, StyleEditorTypeHint};
+use boon_document::{DocumentNodeKind, LayoutFrame};
 use boon_host::SurfaceId;
 use glyphon::{
     Attrs, Buffer, Cache, Color, ContentType, CustomGlyph, CustomGlyphId, Family, FontSystem,
@@ -353,7 +353,7 @@ struct RenderSceneItem {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct InternalRenderSceneCacheKey {
-    scene_identity: String,
+    scene_content_key: u64,
     width: u32,
     height: u32,
     map_revision: u64,
@@ -1981,33 +1981,16 @@ pub fn encode_render_scene_to_surface(
 
 fn internal_render_scene_cache_key(
     scene: &DocumentRenderScene,
-    scene_identity: Option<&str>,
     width: u32,
     height: u32,
     map_revision: u64,
 ) -> InternalRenderSceneCacheKey {
     InternalRenderSceneCacheKey {
-        scene_identity: scene_identity
-            .map(str::to_owned)
-            .unwrap_or_else(|| document_render_scene_fallback_identity(scene)),
+        scene_content_key: document_render_scene_content_key(scene),
         width,
         height,
         map_revision,
     }
-}
-
-fn document_render_scene_fallback_identity(scene: &DocumentRenderScene) -> String {
-    format!(
-        "document-render-scene-ptr:{:p}:items:{}:primitives:{}:overlays:{}:batches:{}:text:{}:visible:{}:rects:{}",
-        scene,
-        scene.items.len(),
-        scene.visual_primitives.len(),
-        scene.overlay_visual_primitives.len(),
-        scene.quad_batches.len(),
-        scene.text_runs.len(),
-        scene.metrics.visible_source_item_count,
-        scene.metrics.rendered_rect_count,
-    )
 }
 
 fn evict_internal_scene_cache_if_needed(
@@ -2043,13 +2026,8 @@ fn encode_render_scene_to_surface_with_pipeline(
 ) -> Result<FrameMetrics, RenderError> {
     let (width, height) = surface_render_extent(request.width, request.height);
     let convert_started = Instant::now();
-    let cache_key = internal_render_scene_cache_key(
-        request.scene,
-        request.scene_identity,
-        width,
-        height,
-        map_tiles.revision(),
-    );
+    let cache_key =
+        internal_render_scene_cache_key(request.scene, width, height, map_tiles.revision());
     let cache_hit = internal_scene_cache.contains_key(&cache_key);
     if !cache_hit {
         let available_map_tiles = textures.map_tile_keys();
@@ -2098,12 +2076,7 @@ fn encode_render_scene_to_surface_with_pipeline(
         prepared_quads,
         previous_chunk_ids,
         product_frame_graph,
-        render_scene_supplied_cache_key(
-            request.scene_identity,
-            width,
-            height,
-            map_tiles.revision(),
-        ),
+        Some(cache_key.scene_content_key),
         frame_seq,
         diagnostics_enabled,
     )?;
@@ -3489,19 +3462,129 @@ fn render_scene_cache_key(scene: &RenderScene) -> u64 {
     hasher.finish()
 }
 
-fn render_scene_supplied_cache_key(
-    scene_identity: Option<&str>,
-    width: u32,
-    height: u32,
-    map_revision: u64,
-) -> Option<u64> {
-    let scene_identity = scene_identity?;
+fn document_render_scene_content_key(scene: &DocumentRenderScene) -> u64 {
     let mut hasher = DefaultHasher::new();
-    scene_identity.hash(&mut hasher);
-    width.hash(&mut hasher);
-    height.hash(&mut hasher);
-    map_revision.hash(&mut hasher);
-    Some(hasher.finish())
+    hash_rect(&mut hasher, scene.viewport);
+    scene.visual_primitives.len().hash(&mut hasher);
+    for primitive in &scene.visual_primitives {
+        hash_document_primitive(&mut hasher, primitive);
+    }
+    scene.overlay_visual_primitives.len().hash(&mut hasher);
+    for primitive in &scene.overlay_visual_primitives {
+        hash_document_primitive(&mut hasher, primitive);
+    }
+    scene.map_viewports.len().hash(&mut hasher);
+    for map in &scene.map_viewports {
+        scene
+            .visual_primitives
+            .iter()
+            .position(|primitive| primitive.node == map.node)
+            .hash(&mut hasher);
+        hash_rect(&mut hasher, map.bounds);
+        hash_optional_rect(&mut hasher, map.clip);
+        map.visible_tiles.len().hash(&mut hasher);
+        for tile in &map.visible_tiles {
+            tile.request.tile.source.0.hash(&mut hasher);
+            tile.request.tile.z.hash(&mut hasher);
+            tile.request.tile.x.hash(&mut hasher);
+            tile.request.tile.y.hash(&mut hasher);
+            tile.request.tile.scale.as_f64().to_bits().hash(&mut hasher);
+            for point in tile.screen_quad.points {
+                point.x.to_bits().hash(&mut hasher);
+                point.y.to_bits().hash(&mut hasher);
+            }
+        }
+        map.overlay_primitives.len().hash(&mut hasher);
+        for primitive in &map.overlay_primitives {
+            hash_document_primitive(&mut hasher, primitive);
+        }
+        map.overlay_text_runs.len().hash(&mut hasher);
+        for run in &map.overlay_text_runs {
+            hash_document_text_run(&mut hasher, run);
+        }
+    }
+    scene.quad_batches.len().hash(&mut hasher);
+    for batch in &scene.quad_batches {
+        hash_document_texture(&mut hasher, &batch.texture);
+        batch
+            .positions
+            .iter()
+            .for_each(|value| value.to_bits().hash(&mut hasher));
+        batch.colors.hash(&mut hasher);
+        batch
+            .uvs
+            .iter()
+            .for_each(|value| value.to_bits().hash(&mut hasher));
+    }
+    scene.text_runs.len().hash(&mut hasher);
+    for run in &scene.text_runs {
+        hash_document_text_run(&mut hasher, run);
+    }
+    scene.metrics.visible_source_item_count.hash(&mut hasher);
+    scene.metrics.rendered_rect_count.hash(&mut hasher);
+    scene.metrics.cap_hit.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_document_primitive(hasher: &mut DefaultHasher, primitive: &RenderVisualPrimitive) {
+    std::mem::discriminant(&primitive.primitive).hash(hasher);
+    hash_rect(hasher, primitive.bounds);
+    hash_optional_rect(hasher, primitive.clip);
+    primitive.radius.to_bits().hash(hasher);
+    primitive.stroke_width.to_bits().hash(hasher);
+    primitive.color.hash(hasher);
+    primitive.secondary_color.hash(hasher);
+    primitive.antialias.to_bits().hash(hasher);
+    for point in &primitive.control_points {
+        point[0].to_bits().hash(hasher);
+        point[1].to_bits().hash(hasher);
+    }
+    hash_document_texture(hasher, &primitive.texture);
+}
+
+fn hash_document_text_run(hasher: &mut DefaultHasher, run: &RenderTextRun) {
+    run.font_id.hash(hasher);
+    run.paint_id.hash(hasher);
+    hash_rect(hasher, run.bounds);
+    hash_optional_rect(hasher, run.clip);
+    run.text.hash(hasher);
+    for span in &run.rich_spans {
+        span.text.hash(hasher);
+        span.color.hash(hasher);
+        span.font_style.hash(hasher);
+        span.font_weight.hash(hasher);
+    }
+    run.font_family.hash(hasher);
+    run.font_style.hash(hasher);
+    run.font_weight.hash(hasher);
+    run.font_features.hash(hasher);
+    run.text_inset.to_bits().hash(hasher);
+    run.text_clip_padding.to_bits().hash(hasher);
+    run.color.hash(hasher);
+    run.size.to_bits().hash(hasher);
+    run.line_height.to_bits().hash(hasher);
+    run.align.hash(hasher);
+    run.vertical_align.hash(hasher);
+    run.rotate_degrees.hash(hasher);
+    run.wrap.hash(hasher);
+}
+
+fn hash_document_texture(hasher: &mut DefaultHasher, texture: &RenderTextureRef) {
+    match texture {
+        RenderTextureRef::Solid => 0_u8.hash(hasher),
+        RenderTextureRef::Asset {
+            url,
+            asset_ref,
+            width,
+            height,
+        } => {
+            1_u8.hash(hasher);
+            url.hash(hasher);
+            asset_ref.hash(hasher);
+            width.hash(hasher);
+            height.hash(hasher);
+        }
+    }
 }
 
 fn hash_rect(hasher: &mut DefaultHasher, rect: Rect) {
@@ -3509,6 +3592,13 @@ fn hash_rect(hasher: &mut DefaultHasher, rect: Rect) {
     rect.y.to_bits().hash(hasher);
     rect.width.to_bits().hash(hasher);
     rect.height.to_bits().hash(hasher);
+}
+
+fn hash_optional_rect(hasher: &mut DefaultHasher, rect: Option<Rect>) {
+    rect.is_some().hash(hasher);
+    if let Some(rect) = rect {
+        hash_rect(hasher, rect);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3607,26 +3697,6 @@ fn render_scene_from_document_scene_cached(
             Default::default()
         },
     }
-}
-
-#[cfg(test)]
-fn render_scene_from_document_scene(
-    scene: &DocumentRenderScene,
-    width: u32,
-    height: u32,
-) -> RenderScene {
-    render_scene_from_document_scene_cached(
-        scene,
-        width,
-        height,
-        &mut HashMap::new(),
-        DocumentSceneConversionOptions {
-            use_retained_quad_cache: false,
-            retain_metric_items: true,
-        },
-        &mut MapTileCache::default(),
-        &BTreeSet::new(),
-    )
 }
 
 fn quad_batches_from_document_scene_with_maps(
@@ -5496,8 +5566,6 @@ fn editor_font_system() -> FontSystem {
 
 #[derive(Clone, Debug)]
 struct TextRun {
-    #[cfg(test)]
-    node: DocumentNodeId,
     font_id: u64,
     paint_id: u64,
     bounds: Rect,
@@ -5533,20 +5601,6 @@ enum TextVerticalAlign {
     Bottom,
 }
 
-#[cfg(test)]
-fn text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<TextRun> {
-    neutral_text_runs(frame, width, height)
-        .into_iter()
-        .map(TextRun::from)
-        .collect()
-}
-
-#[cfg(test)]
-fn neutral_text_runs(frame: &LayoutFrame, width: u32, height: u32) -> Vec<RenderTextRun> {
-    let mut columns = GlyphonRenderTextColumnMeasurer::new();
-    boon_document::render_scene::render_text_runs(frame, width, height, &mut columns)
-}
-
 pub struct GlyphonRenderTextColumnMeasurer {
     service: GlyphonTextService,
 }
@@ -5575,8 +5629,6 @@ impl RenderTextColumnMeasurer for GlyphonRenderTextColumnMeasurer {
 impl From<RenderTextRun> for TextRun {
     fn from(run: RenderTextRun) -> Self {
         Self {
-            #[cfg(test)]
-            node: run.node,
             font_id: run.font_id,
             paint_id: run.paint_id,
             bounds: run.bounds,
@@ -6656,17 +6708,6 @@ fn rect_intersection(a: Rect, b: Rect) -> Option<Rect> {
     })
 }
 
-#[cfg(test)]
-fn circle_segments_for_radius(radius: f32) -> u32 {
-    if radius <= 3.0 {
-        24
-    } else if radius <= 10.0 {
-        96
-    } else {
-        192
-    }
-}
-
 fn checkbox_circle_center(rect: Rect) -> (f32, f32) {
     (
         (rect.x + rect.width * 0.5).floor() + 0.5,
@@ -6677,18 +6718,6 @@ fn checkbox_circle_center(rect: Rect) -> (f32, f32) {
 fn checkbox_check_points(rect: Rect) -> ((f32, f32), (f32, f32), (f32, f32)) {
     let point = |x: f32, y: f32| (rect.x + rect.width * x, rect.y + rect.height * y);
     (point(0.33, 0.55), point(0.45, 0.67), point(0.70, 0.35))
-}
-
-#[cfg(test)]
-fn circle_coverage(radius: f32, aa: f32, distance: f32) -> f32 {
-    if aa <= 0.0 {
-        return if distance <= radius { 1.0 } else { 0.0 };
-    }
-    let edge0 = radius - aa;
-    let edge1 = radius + aa;
-    let t = ((distance - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    let smooth = t * t * (3.0 - 2.0 * t);
-    1.0 - smooth
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6842,16 +6871,6 @@ fn rgba8_from_f32(color: [f32; 4]) -> [u8; 4] {
 fn pack_rgba8_from_f32(color: [f32; 4]) -> u32 {
     let [r, g, b, a] = rgba8_from_f32(color);
     u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16) | (u32::from(a) << 24)
-}
-
-#[cfg(test)]
-fn rgba8_from_packed(color: u32) -> [u8; 4] {
-    [
-        (color & 255) as u8,
-        ((color >> 8) & 255) as u8,
-        ((color >> 16) & 255) as u8,
-        ((color >> 24) & 255) as u8,
-    ]
 }
 
 fn srgb_u8_to_linear_f32(channel: u8) -> f32 {

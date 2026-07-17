@@ -7,34 +7,33 @@ use boon_host::{
     DocumentNodeId as HostDocumentNodeId, HostEvent, PointerButton, PointerPhase, SourceBindingId,
 };
 use boon_persistence::{
-    ContentArtifact, ContentArtifactLoadEnqueueError, ContentArtifactLoadTicket,
-    ContentArtifactRetention, ContentArtifactStoreEnqueueError, ContentArtifactStoreTicket,
-    DurableContentArtifactChange, InMemoryDriver, MigrationPreview, OutboxInspectorState,
-    PersistenceInspectorSnapshot, PersistenceWorkerConfig, PersistenceWorkerStatus, RedbDriver,
+    InMemoryDriver, MigrationPreview, OutboxInspectorState, PersistenceInspectorSnapshot,
+    PersistenceWorkerConfig, PersistenceWorkerStatus, RedbDriver,
 };
 use boon_plan::{ApplicationIdentity, ApplicationPlan, FiniteReal, MachinePlan, MemoryKind};
+pub(crate) use boon_runtime::ProgramCompletionObservation;
 use boon_runtime::{
-    DocumentPatch, DocumentPatchStatus, DurabilityTicket, FileEffectDriver, HostEffectRouter,
-    HostEffectWorker, LiveRuntime, PersistentDispatchError, PersistentRuntime,
-    PersistentRuntimeStartup, PersistentRuntimeStartupDisposition, ProgramArtifact,
-    ProgramArtifactOwnership, ProgramCompletion, ProgramDiagnostic, ProgramDocumentHost,
-    ProgramHostCompletion, ProgramHostDiagnostic, ProgramHostRequest, ProgramRejection,
-    ProgramRequestId, ProgramSessionId, RowId, RuntimePhaseTimings, RuntimeTurn, SessionOptions,
-    SourcePayload, Value,
+    DocumentPatch, DocumentPatchStatus, FileEffectDriver, HostEffectRouter, HostEffectWorker,
+    LiveRuntime, ObservedProgramCompletion, PersistentRuntime, PersistentRuntimeStartup,
+    ProgramArtifact, ProgramArtifactDrive, ProgramArtifactLaneKind, ProgramArtifactLaneOutcome,
+    ProgramArtifactTurnKind, ProgramDiagnostic, ProgramDocumentHost, ProgramHostDiagnostic,
+    ProgramHostRequest, ProgramRejection, ProgramRequestId, ProgramSessionId, RowId,
+    RuntimePhaseTimings, RuntimeTurn, SessionOptions, SourcePayload, Value,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::protocol::{
-    AuthoritySelection, AuthoritySelectionKind, AuthoritySummary, DurableSummary,
+    AssetBlob, AuthoritySelection, AuthoritySelectionKind, AuthoritySummary, DurableSummary,
     MAX_PERSISTENCE_OUTBOX_SAMPLES, MAX_PERSISTENCE_STATUS_BYTES, OutboxSample, OutboxSampleState,
     OutboxSummary, PendingSummary, PersistenceCapabilities, PersistenceCapability,
     PersistenceOperationStatus, PersistenceSnapshot, PersistenceTimingSummary,
     StateArtifactPreviewSummary, StoredSummary,
 };
+use crate::transient_host::{NativeTransientHost, PackageAsset, TransientHostCompletion};
 use crate::view::HitTarget;
 type ViewResult<T> = Result<T, String>;
 
@@ -45,12 +44,8 @@ const STATE_DIRECTORY: &str = "playground/state";
 pub(crate) const STATE_ROOT_ENV: &str = "BOON_PLAYGROUND_STATE_ROOT";
 const EFFECT_DIRECTORY: &str = "playground/effects";
 const EFFECT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_TRANSIENT_COMPLETIONS_PER_POLL: usize = 8;
 const HOST_LIFECYCLE_STARTED_SOURCE: &str = "host.lifecycle.started";
-const MAX_PROGRAM_ARTIFACT_STORE_SESSIONS: usize = 8;
-const MAX_PROGRAM_ARTIFACT_STORE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_PROGRAM_ARTIFACT_LOAD_SESSIONS: usize = 8;
-const REPLACEABLE_ARTIFACT_QUIET_PERIOD: Duration = Duration::from_millis(34);
-const PROGRAM_ARTIFACT_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostIdentityMode {
@@ -120,14 +115,10 @@ struct InputModifiers {
 pub struct RuntimeView {
     runtime: PersistentRuntime,
     program_host: ProgramDocumentHost,
-    pending_program_requests: Vec<ProgramHostRequest>,
-    program_artifact_store_lane: ProgramArtifactStoreLane,
-    program_artifact_load_lane: ProgramArtifactLoadLane,
-    program_artifact_cache: BTreeMap<boon_persistence::ContentArtifactId, ContentArtifact>,
     application: ApplicationIdentity,
     persistence_schema_version: u64,
     persistence_schema_hash: [u8; 32],
-    startup: RuntimeStartupEvidence,
+    startup: PersistentRuntimeStartup,
     authority_plan_counts: AuthorityPlanCounts,
     authority_selections: std::collections::BTreeMap<String, AuthoritySelection>,
     persistence_status: PersistenceWorkerStatus,
@@ -153,6 +144,7 @@ pub struct RuntimeView {
     last_runtime_phase: RuntimePhaseTimings,
     scheduled_sources: Vec<ScheduledSource>,
     effect_worker: HostEffectWorker,
+    transient_host: NativeTransientHost,
     next_effect_poll: Option<Instant>,
     host_identity_mode: HostIdentityMode,
     host_identity_generation: u64,
@@ -216,208 +208,6 @@ struct PendingDurableLane {
     queue_depth: u32,
 }
 
-#[derive(Clone, Debug)]
-struct PendingProgramArtifactStore {
-    candidate_sequence: u64,
-    mount_epoch: u64,
-    session: ProgramSessionId,
-    request_id: ProgramRequestId,
-    artifact: ProgramArtifact,
-    ownership: ProgramArtifactOwnership,
-    activated_before_store: bool,
-    queued_at: Instant,
-    store_after: Instant,
-    queue_depth: u32,
-    queue_wait_us: u64,
-    worker_us: u64,
-}
-
-#[derive(Debug)]
-struct ProgramArtifactStoreFlight {
-    ticket: ContentArtifactStoreTicket,
-    mount_epoch: u64,
-    artifact_id: boon_persistence::ContentArtifactId,
-    waiters: BTreeMap<ProgramSessionId, PendingProgramArtifactStore>,
-    started_at: Instant,
-}
-
-#[derive(Debug)]
-struct PendingProgramArtifactActivation {
-    ticket: DurabilityTicket,
-    pending: PendingProgramArtifactStore,
-}
-
-#[derive(Debug, Default)]
-struct ProgramArtifactStoreLane {
-    mount_epoch: u64,
-    next_candidate_sequence: u64,
-    in_flight: Option<ProgramArtifactStoreFlight>,
-    pending_by_session: BTreeMap<ProgramSessionId, PendingProgramArtifactStore>,
-    ready_for_authority: BTreeMap<u64, PendingProgramArtifactStore>,
-    awaiting_durability: BTreeMap<u64, PendingProgramArtifactActivation>,
-    queued_bytes: usize,
-}
-
-impl ProgramArtifactStoreLane {
-    fn reset(&mut self) {
-        self.mount_epoch = self.mount_epoch.saturating_add(1);
-        self.next_candidate_sequence = 0;
-        self.in_flight = None;
-        self.pending_by_session.clear();
-        self.ready_for_authority.clear();
-        self.awaiting_durability.clear();
-        self.queued_bytes = 0;
-    }
-
-    fn has_pending(&self) -> bool {
-        self.in_flight.is_some()
-            || !self.pending_by_session.is_empty()
-            || !self.ready_for_authority.is_empty()
-            || !self.awaiting_durability.is_empty()
-    }
-
-    fn session_count(&self) -> usize {
-        let mut sessions = self
-            .pending_by_session
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if let Some(in_flight) = &self.in_flight {
-            sessions.extend(in_flight.waiters.keys().cloned());
-        }
-        sessions.extend(
-            self.ready_for_authority
-                .values()
-                .map(|pending| pending.session.clone()),
-        );
-        sessions.extend(
-            self.awaiting_durability
-                .values()
-                .map(|activation| activation.pending.session.clone()),
-        );
-        sessions.len()
-    }
-
-    fn next_sequence(&mut self) -> u64 {
-        self.next_candidate_sequence = self.next_candidate_sequence.saturating_add(1);
-        self.next_candidate_sequence
-    }
-
-    fn remove_waiter_bytes(&mut self, waiter: &PendingProgramArtifactStore) {
-        self.queued_bytes = self
-            .queued_bytes
-            .saturating_sub(waiter.artifact.content_bytes_len());
-    }
-}
-
-#[derive(Debug)]
-struct PendingProgramArtifactLoad {
-    candidate_sequence: u64,
-    mount_epoch: u64,
-    request: ProgramHostRequest,
-    queued_at: Instant,
-    queue_depth: u32,
-}
-
-#[derive(Debug)]
-struct ProgramArtifactLoadFlight {
-    ticket: ContentArtifactLoadTicket,
-    mount_epoch: u64,
-    artifact_id: boon_persistence::ContentArtifactId,
-    waiters: BTreeMap<ProgramSessionId, PendingProgramArtifactLoad>,
-    started_at: Instant,
-}
-
-#[derive(Debug, Default)]
-struct ProgramArtifactLoadLane {
-    mount_epoch: u64,
-    next_candidate_sequence: u64,
-    in_flight: Option<ProgramArtifactLoadFlight>,
-    pending_by_session: BTreeMap<ProgramSessionId, PendingProgramArtifactLoad>,
-}
-
-impl ProgramArtifactLoadLane {
-    fn reset(&mut self) {
-        self.mount_epoch = self.mount_epoch.saturating_add(1);
-        self.next_candidate_sequence = 0;
-        self.in_flight = None;
-        self.pending_by_session.clear();
-    }
-
-    fn has_pending(&self) -> bool {
-        self.in_flight.is_some() || !self.pending_by_session.is_empty()
-    }
-
-    fn session_count(&self) -> usize {
-        let mut sessions = self
-            .pending_by_session
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if let Some(in_flight) = &self.in_flight {
-            sessions.extend(in_flight.waiters.keys().cloned());
-        }
-        sessions.len()
-    }
-
-    fn next_sequence(&mut self) -> u64 {
-        self.next_candidate_sequence = self.next_candidate_sequence.saturating_add(1);
-        self.next_candidate_sequence
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeStartupDisposition {
-    Fresh,
-    Restored,
-    Migrated(MigrationPreview),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeStartupEvidence {
-    pub disposition: RuntimeStartupDisposition,
-    pub schema_version: u64,
-    pub schema_hash: [u8; 32],
-    pub durable_epoch: u64,
-    pub durable_turn_sequence: u64,
-}
-
-impl From<&PersistentRuntimeStartup> for RuntimeStartupEvidence {
-    fn from(startup: &PersistentRuntimeStartup) -> Self {
-        Self {
-            disposition: match &startup.disposition {
-                PersistentRuntimeStartupDisposition::Fresh => RuntimeStartupDisposition::Fresh,
-                PersistentRuntimeStartupDisposition::Restored => {
-                    RuntimeStartupDisposition::Restored
-                }
-                PersistentRuntimeStartupDisposition::Migrated(preview) => {
-                    RuntimeStartupDisposition::Migrated(preview.clone())
-                }
-            },
-            schema_version: startup.restore_image.schema_version,
-            schema_hash: startup.restore_image.schema_hash,
-            durable_epoch: startup.restore_image.epoch,
-            durable_turn_sequence: startup.restore_image.through_turn_sequence,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ProgramCompletionObservation {
-    Host(ProgramHostCompletion),
-    ArtifactStorePending {
-        session: ProgramSessionId,
-        request_id: ProgramRequestId,
-        artifact_id: boon_persistence::ContentArtifactId,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ObservedProgramCompletion {
-    pub changed: bool,
-    pub completion: ProgramCompletionObservation,
-}
-
 pub struct RuntimePlanChange {
     pub target_schema_version: u64,
     pub durable_epoch: u64,
@@ -426,15 +216,27 @@ pub struct RuntimePlanChange {
 }
 
 impl RuntimeView {
-    pub fn open(plan: Arc<MachinePlan>, deterministic: bool) -> ViewResult<Self> {
+    pub fn open_with_assets(
+        plan: Arc<MachinePlan>,
+        deterministic: bool,
+        assets: &[AssetBlob],
+    ) -> ViewResult<Self> {
         let identity_mode = match deterministic {
             true => HostIdentityMode::Deterministic,
             false => HostIdentityMode::Interactive,
         };
-        Self::open_with_state_root_and_identity_mode(plan, configured_state_root(), identity_mode)
+        Self::open_with_state_root_and_identity_mode(
+            plan,
+            configured_state_root(),
+            identity_mode,
+            assets,
+        )
     }
 
-    pub fn open_for_scenario(plan: Arc<MachinePlan>) -> ViewResult<Self> {
+    pub fn open_for_scenario_with_assets(
+        plan: Arc<MachinePlan>,
+        assets: &[AssetBlob],
+    ) -> ViewResult<Self> {
         let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
             plan,
             SessionOptions::default(),
@@ -450,7 +252,6 @@ impl RuntimeView {
             1,
         )?;
         let mount = runtime.runtime().mount();
-        let startup = RuntimeStartupEvidence::from(&startup);
         Self::mount_persistent(
             runtime,
             mount,
@@ -458,6 +259,8 @@ impl RuntimeView {
             startup,
             HostIdentityMode::Deterministic,
             host_identity_generation,
+            transient_content_root(&repository_root().join("target/boon-transient")),
+            assets,
         )
     }
 
@@ -469,6 +272,7 @@ impl RuntimeView {
             plan,
             state_root,
             HostIdentityMode::Deterministic,
+            &[],
         )
     }
 
@@ -476,8 +280,10 @@ impl RuntimeView {
         plan: Arc<MachinePlan>,
         state_root: impl AsRef<Path>,
         host_identity_mode: HostIdentityMode,
+        assets: &[AssetBlob],
     ) -> ViewResult<Self> {
         validate_preview_plan(&plan)?;
+        let content_root = transient_content_root(&state_root.as_ref().join("transient"));
         let database_path =
             state_database_path_in(state_root.as_ref(), &plan.application.identity)?;
         let parent = database_path
@@ -510,7 +316,6 @@ impl RuntimeView {
             1,
         )?;
         let mount = runtime.runtime().mount();
-        let startup = RuntimeStartupEvidence::from(&startup);
         Self::mount_persistent(
             runtime,
             mount,
@@ -518,21 +323,20 @@ impl RuntimeView {
             startup,
             host_identity_mode,
             host_identity_generation,
+            content_root,
+            assets,
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_in_memory(runtime: LiveRuntime) -> ViewResult<Self> {
-        Self::open_for_scenario(runtime.shared_machine_plan())
-    }
-
     fn mount_persistent(
-        runtime: PersistentRuntime,
+        mut runtime: PersistentRuntime,
         turn: RuntimeTurn,
         host_started: Option<RuntimeTurn>,
-        startup: RuntimeStartupEvidence,
+        startup: PersistentRuntimeStartup,
         host_identity_mode: HostIdentityMode,
         host_identity_generation: u64,
+        content_root: PathBuf,
+        assets: &[AssetBlob],
     ) -> ViewResult<Self> {
         let source_sequence = source_sequence_after_turn(
             source_sequence_after_turn(0, turn.source_sequence),
@@ -541,6 +345,17 @@ impl RuntimeView {
         let runtime_turn_sequence = host_started
             .as_ref()
             .map_or(turn.sequence, |turn| turn.sequence);
+        let mut transient_host = NativeTransientHost::new(
+            content_root,
+            assets.iter().map(|asset| PackageAsset {
+                url: &asset.url,
+                bytes: &asset.bytes,
+            }),
+        )?;
+        if let Some(host_started) = &host_started {
+            transient_host.route_turn(host_started)?;
+        }
+        transient_host.route_turn(&turn)?;
         if turn.document_patch_status != DocumentPatchStatus::Complete {
             return Err("MachinePlan did not produce complete typed document bindings".to_owned());
         }
@@ -559,6 +374,7 @@ impl RuntimeView {
             .clone();
         let (program_host, pending_program_requests) =
             ProgramDocumentHost::mount(application.clone(), &frame);
+        runtime.queue_program_requests(pending_program_requests);
         let frame = program_host.frame();
         let text_inputs = frame
             .nodes
@@ -590,14 +406,11 @@ impl RuntimeView {
         };
         let persistence_status = runtime.status();
         let effect_worker = native_effect_worker()?;
-        let next_effect_poll = runtime.has_effect_work().then_some(Instant::now());
+        let next_effect_poll =
+            (runtime.has_effect_work() || transient_host.has_work()).then_some(Instant::now());
         let mut view = Self {
             runtime,
             program_host,
-            pending_program_requests,
-            program_artifact_store_lane: ProgramArtifactStoreLane::default(),
-            program_artifact_load_lane: ProgramArtifactLoadLane::default(),
-            program_artifact_cache: BTreeMap::new(),
             application,
             persistence_schema_version,
             persistence_schema_hash,
@@ -630,6 +443,7 @@ impl RuntimeView {
                 .map_or_else(RuntimePhaseTimings::default, |turn| turn.phase_timings),
             scheduled_sources,
             effect_worker,
+            transient_host,
             next_effect_poll,
             host_identity_mode,
             host_identity_generation,
@@ -724,11 +538,8 @@ impl RuntimeView {
     }
 
     fn install_runtime_mount(&mut self, mount: RuntimeTurn) -> ViewResult<()> {
-        self.program_artifact_store_lane.reset();
-        self.program_artifact_load_lane.reset();
-        self.program_artifact_cache.clear();
-        let _ = self.runtime.take_content_artifact_store_completions();
-        let _ = self.runtime.take_content_artifact_load_completions();
+        self.transient_host.route_turn(&mount)?;
+        self.runtime.reset_program_artifacts();
         let runtime_turn_sequence = mount.sequence;
         if mount.document_patch_status != DocumentPatchStatus::Complete {
             return Err("MachinePlan did not produce complete typed document bindings".to_owned());
@@ -745,7 +556,8 @@ impl RuntimeView {
         let (program_host, pending_program_requests) =
             ProgramDocumentHost::mount(self.application.clone(), &frame);
         self.program_host = program_host;
-        self.pending_program_requests = pending_program_requests;
+        self.runtime
+            .queue_program_requests(pending_program_requests);
         self.resolve_program_artifact_requests_blocking()?;
         self.pending_patches.clear();
         let frame = self.program_host.frame().clone();
@@ -781,7 +593,7 @@ impl RuntimeView {
         self.persistence_schema_version
     }
 
-    pub(crate) fn startup_evidence(&self) -> &RuntimeStartupEvidence {
+    pub(crate) fn startup_evidence(&self) -> &PersistentRuntimeStartup {
         &self.startup
     }
 
@@ -830,7 +642,27 @@ impl RuntimeView {
             .runtime
             .poll_effect_worker(&mut self.effect_worker)
             .map_err(|error| error.to_string())?;
-        let changed = turn.map_or(Ok(false), |turn| self.finish_parent_runtime_turn(turn))?;
+        let mut changed = turn.map_or(Ok(false), |turn| self.finish_parent_runtime_turn(turn))?;
+        for _ in 0..MAX_TRANSIENT_COMPLETIONS_PER_POLL {
+            let Some(completion) = self.transient_host.try_completion()? else {
+                break;
+            };
+            let turn = match completion {
+                TransientHostCompletion::Single { call_id, outcome } => self
+                    .runtime
+                    .complete_transient_effect(call_id, outcome)
+                    .map_err(|error| error.to_string())?,
+                TransientHostCompletion::Stream(event) => self
+                    .runtime
+                    .deliver_transient_effect_result(
+                        event.call_id,
+                        event.result_sequence,
+                        event.outcome,
+                    )
+                    .map_err(|error| error.to_string())?,
+            };
+            changed |= self.finish_parent_runtime_turn(turn)?;
+        }
         self.schedule_effect_poll()?;
         Ok(changed)
     }
@@ -853,8 +685,7 @@ impl RuntimeView {
             && self.persistence_status.reserved_slots == 0
             && self.persistence_status.pending_content_artifact_stores == 0
             && self.persistence_status.pending_content_artifact_loads == 0
-            && !self.program_artifact_store_lane.has_pending()
-            && !self.program_artifact_load_lane.has_pending();
+            && !self.runtime.program_artifacts_pending();
         let inspector_is_stale = self.persistence_inspector.as_ref().is_none_or(|inspector| {
             inspector.epoch < self.persistence_status.durable_epoch
                 || inspector.through_turn_sequence
@@ -1162,316 +993,102 @@ impl RuntimeView {
         self.program_host.frame()
     }
 
-    fn resolve_program_artifact_requests_blocking(&mut self) -> ViewResult<bool> {
-        let started = Instant::now();
-        let mut changed = self.resolve_program_artifact_requests()?;
-        loop {
-            changed |= self.poll_program_artifact_loads()?;
-            let queued_artifact_request = self
-                .pending_program_requests
-                .iter()
-                .any(ProgramHostRequest::is_artifact_load);
-            if !queued_artifact_request && !self.program_artifact_load_lane.has_pending() {
-                return Ok(changed);
+    fn apply_program_artifact_drive(
+        &mut self,
+        drive: ProgramArtifactDrive,
+    ) -> ViewResult<(bool, Option<ProgramCompletionObservation>)> {
+        let mut changed = drive.changed;
+        for artifact_turn in drive.turns {
+            let source_sequence = artifact_turn.turn.source_sequence.ok_or_else(|| {
+                format!(
+                    "program artifact source dispatch `{}` produced no source sequence",
+                    artifact_turn.source_path
+                )
+            })?;
+            self.capture_scenario_turn(&artifact_turn.source_path, &artifact_turn.turn);
+            self.sequence = source_sequence_after_turn(self.sequence, Some(source_sequence));
+            self.last_runtime_phase = artifact_turn.turn.phase_timings;
+            if artifact_turn.kind == ProgramArtifactTurnKind::Parent {
+                self.transient_host.route_turn(&artifact_turn.turn)?;
+                let durable_sequence = artifact_turn.turn.sequence;
+                let queued_at = Instant::now();
+                self.runtime_turn_sequence = durable_sequence;
+                self.persistence_status = self.query_persistence_status();
+                self.pending_durable_lanes.insert(
+                    durable_sequence,
+                    PendingDurableLane {
+                        queued_at,
+                        enqueue_us: artifact_turn.turn.phase_timings.persistence_enqueue_us,
+                        queue_depth: self
+                            .persistence_status
+                            .queue_depth
+                            .max(1)
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                    },
+                );
+                self.record_durable_lane_completions(queued_at, 0);
+                self.next_persistence_poll = Some(queued_at + PERSISTENCE_ACK_POLL_INTERVAL);
+                self.schedule_effect_poll()?;
             }
-            if started.elapsed() >= PROGRAM_ARTIFACT_STARTUP_TIMEOUT {
-                let persistence = self.runtime.status();
-                return Err(format!(
-                    "program artifact startup currentness barrier exceeded {} ms; queued_requests={}, load_sessions={}, persistence_loads={}, worker_alive={}, last_error={:?}",
-                    PROGRAM_ARTIFACT_STARTUP_TIMEOUT.as_millis(),
-                    usize::from(queued_artifact_request),
-                    self.program_artifact_load_lane.session_count(),
-                    persistence.pending_content_artifact_loads,
-                    persistence.worker_alive,
-                    persistence.last_error,
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(1));
+            self.record_event_dispatch(&artifact_turn.source_path, source_sequence);
         }
+        changed |= self.queue_program_update(drive.patches, Vec::new());
+        self.async_lane_observations
+            .extend(drive.observations.into_iter().map(|observation| {
+                RuntimeAsyncLaneObservation {
+                    lane: match observation.lane {
+                        ProgramArtifactLaneKind::Store => {
+                            RuntimeAsyncLaneKind::ProgramArtifactStore
+                        }
+                        ProgramArtifactLaneKind::Load => RuntimeAsyncLaneKind::ProgramArtifactLoad,
+                    },
+                    request_id: observation.request_id,
+                    revision: observation.revision,
+                    queue_depth: observation.queue_depth,
+                    queue_wait_us: observation.queue_wait_us,
+                    worker_us: observation.worker_us,
+                    apply_us: observation.apply_us,
+                    end_to_end_us: observation.end_to_end_us,
+                    outcome: match observation.outcome {
+                        ProgramArtifactLaneOutcome::Applied => RuntimeAsyncLaneOutcome::Applied,
+                        ProgramArtifactLaneOutcome::StaleRejected => {
+                            RuntimeAsyncLaneOutcome::StaleRejected
+                        }
+                        ProgramArtifactLaneOutcome::Failed => RuntimeAsyncLaneOutcome::Failed,
+                    },
+                }
+            }));
+        if drive.poll_required {
+            self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
+        }
+        Ok((changed, drive.completion))
+    }
+
+    fn resolve_program_artifact_requests_blocking(&mut self) -> ViewResult<bool> {
+        let drive = self
+            .runtime
+            .resolve_program_artifact_requests_blocking(&mut self.program_host, &mut self.sequence)
+            .map_err(|error| error.to_string())?;
+        self.apply_program_artifact_drive(drive)
+            .map(|(changed, _)| changed)
     }
 
     pub fn resolve_program_artifact_requests(&mut self) -> ViewResult<bool> {
-        let mut compile_requests = Vec::new();
-        let mut changed = false;
-        loop {
-            let requests = std::mem::take(&mut self.pending_program_requests);
-            if requests.is_empty() {
-                break;
-            }
-            for request in requests {
-                let Some(artifact_id) = request.artifact_id else {
-                    compile_requests.push(request);
-                    continue;
-                };
-                if let Some(content) = self.program_artifact_cache.get(&artifact_id).cloned() {
-                    let result = ProgramArtifact::from_content_artifact(
-                        request.compile.revision,
-                        request.compile.capability_profile,
-                        content,
-                    );
-                    changed |= self
-                        .complete_program_observed(&request.session, &request.request_id, result)?
-                        .changed;
-                } else {
-                    changed |= self.enqueue_program_artifact_load(request)?;
-                }
-            }
-        }
-        self.pending_program_requests = compile_requests;
-        Ok(changed)
-    }
-
-    fn enqueue_program_artifact_load(&mut self, request: ProgramHostRequest) -> ViewResult<bool> {
-        let artifact_id = request
-            .artifact_id
-            .expect("artifact load request carries an artifact identity");
-        let session_exists = self
-            .program_artifact_load_lane
-            .pending_by_session
-            .contains_key(&request.session)
-            || self
-                .program_artifact_load_lane
-                .in_flight
-                .as_ref()
-                .is_some_and(|flight| flight.waiters.contains_key(&request.session));
-        if !session_exists
-            && self.program_artifact_load_lane.session_count() >= MAX_PROGRAM_ARTIFACT_LOAD_SESSIONS
-        {
-            return Ok(self
-                .complete_program_observed(
-                    &request.session,
-                    &request.request_id,
-                    Err(ProgramDiagnostic::artifact(
-                        request.compile.revision,
-                        format!(
-                            "program artifact load has {} pending sessions, limit is {MAX_PROGRAM_ARTIFACT_LOAD_SESSIONS}",
-                            self.program_artifact_load_lane.session_count()
-                        ),
-                    )),
-                )?
-                .changed);
-        }
-
-        let pending = PendingProgramArtifactLoad {
-            candidate_sequence: self.program_artifact_load_lane.next_sequence(),
-            mount_epoch: self.program_artifact_load_lane.mount_epoch,
-            queue_depth: self
-                .program_artifact_load_lane
-                .session_count()
-                .saturating_add(1)
-                .try_into()
-                .unwrap_or(u32::MAX),
-            queued_at: Instant::now(),
-            request,
-        };
-        let joins_in_flight = self
-            .program_artifact_load_lane
-            .in_flight
-            .as_ref()
-            .is_some_and(|flight| {
-                flight.mount_epoch == pending.mount_epoch && flight.artifact_id == artifact_id
-            });
-        if joins_in_flight {
-            self.program_artifact_load_lane
-                .pending_by_session
-                .remove(&pending.request.session);
-            self.program_artifact_load_lane
-                .in_flight
-                .as_mut()
-                .expect("joining artifact load has an active flight")
-                .waiters
-                .insert(pending.request.session.clone(), pending);
-        } else {
-            self.program_artifact_load_lane
-                .pending_by_session
-                .insert(pending.request.session.clone(), pending);
-        }
-        let changed = self.drive_program_artifact_load_lane()?;
-        self.next_persistence_poll = Some(Instant::now());
-        Ok(changed)
-    }
-
-    fn drive_program_artifact_load_lane(&mut self) -> ViewResult<bool> {
-        if self.program_artifact_load_lane.in_flight.is_some() {
-            return Ok(false);
-        }
-        let Some(session) = self
-            .program_artifact_load_lane
-            .pending_by_session
-            .iter()
-            .min_by_key(|(_, candidate)| candidate.candidate_sequence)
-            .map(|(session, _)| session.clone())
-        else {
-            return Ok(false);
-        };
-        let first = self
-            .program_artifact_load_lane
-            .pending_by_session
-            .remove(&session)
-            .expect("selected artifact load candidate exists");
-        let artifact_id = first
-            .request
-            .artifact_id
-            .expect("artifact load candidate carries an identity");
-        let matching_sessions = self
-            .program_artifact_load_lane
-            .pending_by_session
-            .iter()
-            .filter_map(|(session, candidate)| {
-                (candidate.request.artifact_id == Some(artifact_id)).then_some(session.clone())
-            })
-            .collect::<Vec<_>>();
-        let mut waiters = BTreeMap::from([(first.request.session.clone(), first)]);
-        for session in matching_sessions {
-            let candidate = self
-                .program_artifact_load_lane
-                .pending_by_session
-                .remove(&session)
-                .expect("matching artifact load candidate exists");
-            waiters.insert(session, candidate);
-        }
-        match self.runtime.try_load_content_artifact(artifact_id) {
-            Ok(ticket) => {
-                self.program_artifact_load_lane.in_flight = Some(ProgramArtifactLoadFlight {
-                    ticket,
-                    mount_epoch: self.program_artifact_load_lane.mount_epoch,
-                    artifact_id,
-                    waiters,
-                    started_at: Instant::now(),
-                });
-                Ok(false)
-            }
-            Err(ContentArtifactLoadEnqueueError::Backpressure(_)) => {
-                self.program_artifact_load_lane.pending_by_session.extend(
-                    waiters
-                        .into_values()
-                        .map(|candidate| (candidate.request.session.clone(), candidate)),
-                );
-                Ok(false)
-            }
-            Err(ContentArtifactLoadEnqueueError::Closed(_)) => {
-                let mut changed = false;
-                for (_, pending) in waiters {
-                    changed |= self
-                        .complete_program_observed(
-                            &pending.request.session,
-                            &pending.request.request_id,
-                            Err(ProgramDiagnostic::artifact(
-                                pending.request.compile.revision,
-                                "persistence coordinator closed before loading the program artifact",
-                            )),
-                        )?
-                        .changed;
-                }
-                Ok(changed)
-            }
-        }
-    }
-
-    fn poll_program_artifact_loads(&mut self) -> ViewResult<bool> {
-        let mut changed = false;
-        for completion in self.runtime.take_content_artifact_load_completions() {
-            if self
-                .program_artifact_load_lane
-                .in_flight
-                .as_ref()
-                .is_none_or(|flight| flight.ticket != completion.ticket)
-            {
-                continue;
-            }
-            let flight = self
-                .program_artifact_load_lane
-                .in_flight
-                .take()
-                .expect("matching artifact load flight exists");
-            if flight.mount_epoch != self.program_artifact_load_lane.mount_epoch
-                || completion.id != flight.artifact_id
-            {
-                for pending in flight.waiters.into_values() {
-                    self.async_lane_observations
-                        .push(RuntimeAsyncLaneObservation {
-                            lane: RuntimeAsyncLaneKind::ProgramArtifactLoad,
-                            request_id: pending.request.request_id.0,
-                            revision: pending.request.compile.revision,
-                            queue_depth: pending.queue_depth,
-                            queue_wait_us: duration_us(
-                                flight
-                                    .started_at
-                                    .saturating_duration_since(pending.queued_at),
-                            ),
-                            worker_us: duration_us(flight.started_at.elapsed()),
-                            apply_us: 0,
-                            end_to_end_us: duration_us(pending.queued_at.elapsed()),
-                            outcome: RuntimeAsyncLaneOutcome::StaleRejected,
-                        });
-                }
-                continue;
-            }
-            if let Ok(Some(content)) = &completion.result {
-                self.program_artifact_cache
-                    .insert(content.id, content.clone());
-            }
-            for (_, pending) in flight.waiters {
-                let apply_started = Instant::now();
-                let result = match &completion.result {
-                    Ok(Some(content)) => ProgramArtifact::from_content_artifact(
-                        pending.request.compile.revision,
-                        pending.request.compile.capability_profile,
-                        content.clone(),
-                    ),
-                    Ok(None) => Err(ProgramDiagnostic::artifact(
-                        pending.request.compile.revision,
-                        format!(
-                            "immutable program artifact {} is missing",
-                            flight.artifact_id
-                        ),
-                    )),
-                    Err(error) => Err(ProgramDiagnostic::artifact(
-                        pending.request.compile.revision,
-                        error.to_string(),
-                    )),
-                };
-                let failed = result.is_err();
-                let observed = self.complete_program_observed(
-                    &pending.request.session,
-                    &pending.request.request_id,
-                    result,
-                )?;
-                changed |= observed.changed;
-                self.async_lane_observations
-                    .push(RuntimeAsyncLaneObservation {
-                        lane: RuntimeAsyncLaneKind::ProgramArtifactLoad,
-                        request_id: pending.request.request_id.0,
-                        revision: pending.request.compile.revision,
-                        queue_depth: pending.queue_depth,
-                        queue_wait_us: duration_us(
-                            flight
-                                .started_at
-                                .saturating_duration_since(pending.queued_at),
-                        ),
-                        worker_us: duration_us(flight.started_at.elapsed()),
-                        apply_us: duration_us(apply_started.elapsed()),
-                        end_to_end_us: duration_us(pending.queued_at.elapsed()),
-                        outcome: runtime_lane_outcome(&observed.completion, failed),
-                    });
-            }
-        }
-        changed |= self.drive_program_artifact_load_lane()?;
-        if changed {
-            changed |= self.resolve_program_artifact_requests()?;
-        }
-        Ok(changed)
+        let drive = self
+            .runtime
+            .resolve_program_artifact_requests(&mut self.program_host, &mut self.sequence)
+            .map_err(|error| error.to_string())?;
+        self.apply_program_artifact_drive(drive)
+            .map(|(changed, _)| changed)
     }
 
     pub fn take_program_requests(&mut self) -> Vec<ProgramHostRequest> {
-        std::mem::take(&mut self.pending_program_requests)
+        self.runtime.take_program_requests()
     }
 
     pub(crate) fn program_artifact_lane_counts(&self) -> (usize, usize) {
-        (
-            self.program_artifact_store_lane.session_count(),
-            self.program_artifact_load_lane.session_count(),
-        )
+        self.runtime.program_artifact_lane_counts()
     }
 
     pub(crate) fn take_async_lane_observations(&mut self) -> Vec<RuntimeAsyncLaneObservation> {
@@ -1485,7 +1102,7 @@ impl RuntimeView {
         result: Result<ProgramArtifact, ProgramDiagnostic>,
     ) -> ViewResult<bool> {
         self.complete_program_observed(session, request_id, result)
-            .map(|outcome| outcome.changed)
+            .map(|observed| observed.changed)
     }
 
     pub(crate) fn complete_program_observed(
@@ -1494,676 +1111,32 @@ impl RuntimeView {
         request_id: &ProgramRequestId,
         result: Result<ProgramArtifact, ProgramDiagnostic>,
     ) -> ViewResult<ObservedProgramCompletion> {
-        let request_is_current = self.program_host.request_is_current(session, request_id);
-        let artifact_ownership = self
-            .program_host
-            .request_artifact_ownership(session, request_id);
-        let artifact_load = self
-            .program_host
-            .request_is_artifact_load(session, request_id);
-        if request_is_current && let Some(ownership) = artifact_ownership {
-            return match result {
-                Ok(artifact) => {
-                    let activate_before_store =
-                        ownership.retention == ContentArtifactRetention::Replaceable;
-                    let pending = self.pending_program_artifact_store(
-                        session,
-                        request_id,
-                        artifact.clone(),
-                        ownership,
-                        activate_before_store,
-                    );
-                    if !activate_before_store {
-                        return self.enqueue_program_artifact_store(pending);
-                    }
-
-                    let activated = self.finish_program_completion_observed(
-                        session,
-                        request_id,
-                        Ok(artifact),
-                        false,
-                        true,
-                    )?;
-                    if !matches!(
-                        activated.completion,
-                        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
-                            ProgramCompletion::Activated { .. }
-                        ))
-                    ) {
-                        return Ok(activated);
-                    }
-                    let queued = self.enqueue_program_artifact_store(pending)?;
-                    if matches!(
-                        queued.completion,
-                        ProgramCompletionObservation::ArtifactStorePending { .. }
-                    ) {
-                        Ok(ObservedProgramCompletion {
-                            changed: activated.changed || queued.changed,
-                            completion: activated.completion,
-                        })
-                    } else {
-                        Ok(ObservedProgramCompletion {
-                            changed: activated.changed || queued.changed,
-                            completion: queued.completion,
-                        })
-                    }
-                }
-                Err(diagnostic) => self.finish_program_completion_observed(
-                    session,
-                    request_id,
-                    Err(diagnostic),
-                    false,
-                    false,
-                ),
-            };
-        }
-        self.finish_program_completion_observed(session, request_id, result, artifact_load, false)
-    }
-
-    fn pending_program_artifact_store(
-        &mut self,
-        session: &ProgramSessionId,
-        request_id: &ProgramRequestId,
-        artifact: ProgramArtifact,
-        ownership: ProgramArtifactOwnership,
-        activated_before_store: bool,
-    ) -> PendingProgramArtifactStore {
-        let queued_at = Instant::now();
-        let store_after = if ownership.retention == ContentArtifactRetention::Replaceable {
-            queued_at + REPLACEABLE_ARTIFACT_QUIET_PERIOD
-        } else {
-            queued_at
-        };
-        PendingProgramArtifactStore {
-            candidate_sequence: self.program_artifact_store_lane.next_sequence(),
-            mount_epoch: self.program_artifact_store_lane.mount_epoch,
-            session: session.clone(),
-            request_id: request_id.clone(),
-            artifact,
-            ownership,
-            activated_before_store,
-            queued_at,
-            store_after,
-            queue_depth: self
-                .program_artifact_store_lane
-                .session_count()
-                .saturating_add(1)
-                .try_into()
-                .unwrap_or(u32::MAX),
-            queue_wait_us: 0,
-            worker_us: 0,
-        }
-    }
-
-    fn enqueue_program_artifact_store(
-        &mut self,
-        pending: PendingProgramArtifactStore,
-    ) -> ViewResult<ObservedProgramCompletion> {
-        let session_exists = self
-            .program_artifact_store_lane
-            .pending_by_session
-            .contains_key(&pending.session)
-            || self
-                .program_artifact_store_lane
-                .in_flight
-                .as_ref()
-                .is_some_and(|flight| flight.waiters.contains_key(&pending.session))
-            || self
-                .program_artifact_store_lane
-                .ready_for_authority
-                .values()
-                .any(|candidate| candidate.session == pending.session)
-            || self
-                .program_artifact_store_lane
-                .awaiting_durability
-                .values()
-                .any(|activation| activation.pending.session == pending.session);
-        if !session_exists
-            && self.program_artifact_store_lane.session_count()
-                >= MAX_PROGRAM_ARTIFACT_STORE_SESSIONS
-        {
-            return self.finish_program_completion_observed(
-                &pending.session,
-                &pending.request_id,
-                Err(ProgramDiagnostic::artifact(
-                    pending.artifact.revision(),
-                    format!(
-                        "program artifact store has {} pending sessions, limit is {MAX_PROGRAM_ARTIFACT_STORE_SESSIONS}",
-                        self.program_artifact_store_lane.session_count()
-                    ),
-                )),
-                false,
-                false,
-            );
-        }
-
-        let artifact_id = pending.artifact.id();
-        let joins_in_flight = self
-            .program_artifact_store_lane
-            .in_flight
-            .as_ref()
-            .is_some_and(|flight| {
-                flight.mount_epoch == pending.mount_epoch && flight.artifact_id == artifact_id
-            });
-        let replaced_pending_bytes = self
-            .program_artifact_store_lane
-            .pending_by_session
-            .get(&pending.session)
-            .map_or(0, |replaced| replaced.artifact.content_bytes_len());
-        let replaced_flight_bytes = joins_in_flight
-            .then(|| {
-                self.program_artifact_store_lane
-                    .in_flight
-                    .as_ref()?
-                    .waiters
-                    .get(&pending.session)
-                    .map(|replaced| replaced.artifact.content_bytes_len())
-            })
-            .flatten()
-            .unwrap_or(0);
-        let projected_bytes = self
-            .program_artifact_store_lane
-            .queued_bytes
-            .saturating_sub(replaced_pending_bytes)
-            .saturating_sub(replaced_flight_bytes)
-            .saturating_add(pending.artifact.content_bytes_len());
-        if projected_bytes > MAX_PROGRAM_ARTIFACT_STORE_BYTES {
-            return self.finish_program_completion_observed(
-                &pending.session,
-                &pending.request_id,
-                Err(ProgramDiagnostic::artifact(
-                    pending.artifact.revision(),
-                    format!(
-                        "program artifact store would retain {projected_bytes} queued bytes, limit is {MAX_PROGRAM_ARTIFACT_STORE_BYTES}"
-                    ),
-                )),
-                false,
-                false,
-            );
-        }
-
-        let completion = ProgramCompletionObservation::ArtifactStorePending {
-            session: pending.session.clone(),
-            request_id: pending.request_id.clone(),
-            artifact_id,
-        };
-
-        if joins_in_flight {
-            self.program_artifact_store_lane
-                .pending_by_session
-                .remove(&pending.session);
-            let in_flight = self
-                .program_artifact_store_lane
-                .in_flight
-                .as_mut()
-                .expect("joining candidate has an artifact flight");
-            in_flight.waiters.insert(pending.session.clone(), pending);
-            self.program_artifact_store_lane.queued_bytes = projected_bytes;
-        } else {
-            self.program_artifact_store_lane
-                .pending_by_session
-                .insert(pending.session.clone(), pending);
-            self.program_artifact_store_lane.queued_bytes = projected_bytes;
-        }
-
-        let changed = self.drive_program_artifact_store_lane()?;
-        self.next_persistence_poll = Some(Instant::now());
+        let drive = self
+            .runtime
+            .complete_program_observed(
+                &mut self.program_host,
+                &mut self.sequence,
+                session,
+                request_id,
+                result,
+            )
+            .map_err(|error| error.to_string())?;
+        let (changed, completion) = self.apply_program_artifact_drive(drive)?;
         Ok(ObservedProgramCompletion {
             changed,
-            completion,
+            completion: completion.ok_or_else(|| {
+                "program completion did not report its final disposition".to_owned()
+            })?,
         })
-    }
-
-    fn drive_program_artifact_store_lane(&mut self) -> ViewResult<bool> {
-        if self.program_artifact_store_lane.in_flight.is_some()
-            || !self
-                .program_artifact_store_lane
-                .ready_for_authority
-                .is_empty()
-            || !self
-                .program_artifact_store_lane
-                .awaiting_durability
-                .is_empty()
-        {
-            return Ok(false);
-        }
-        let now = Instant::now();
-        let Some(session) = self
-            .program_artifact_store_lane
-            .pending_by_session
-            .iter()
-            .filter(|(_, candidate)| candidate.store_after <= now)
-            .min_by_key(|(_, candidate)| candidate.candidate_sequence)
-            .map(|(session, _)| session.clone())
-        else {
-            return Ok(false);
-        };
-        let first = self
-            .program_artifact_store_lane
-            .pending_by_session
-            .remove(&session)
-            .expect("selected artifact candidate exists");
-        let artifact_id = first.artifact.id();
-        let matching_sessions = self
-            .program_artifact_store_lane
-            .pending_by_session
-            .iter()
-            .filter_map(|(session, candidate)| {
-                (candidate.artifact.id() == artifact_id).then_some(session.clone())
-            })
-            .collect::<Vec<_>>();
-        let mut waiters = BTreeMap::from([(first.session.clone(), first)]);
-        for session in matching_sessions {
-            let candidate = self
-                .program_artifact_store_lane
-                .pending_by_session
-                .remove(&session)
-                .expect("matching artifact candidate exists");
-            waiters.insert(session, candidate);
-        }
-        let content = waiters
-            .values()
-            .next()
-            .expect("artifact flight has at least one waiter")
-            .artifact
-            .to_content_artifact();
-        match self.runtime.try_put_content_artifact(content) {
-            Ok(ticket) => {
-                self.program_artifact_store_lane.in_flight = Some(ProgramArtifactStoreFlight {
-                    ticket,
-                    mount_epoch: self.program_artifact_store_lane.mount_epoch,
-                    artifact_id,
-                    waiters,
-                    started_at: Instant::now(),
-                });
-                Ok(false)
-            }
-            Err(ContentArtifactStoreEnqueueError::Backpressure(_)) => {
-                self.program_artifact_store_lane
-                    .pending_by_session
-                    .extend(waiters);
-                Ok(false)
-            }
-            Err(ContentArtifactStoreEnqueueError::Closed(_)) => {
-                let mut changed = false;
-                for (_, waiter) in waiters {
-                    self.program_artifact_store_lane
-                        .remove_waiter_bytes(&waiter);
-                    changed |= self
-                        .finish_program_completion_observed(
-                            &waiter.session,
-                            &waiter.request_id,
-                            Err(ProgramDiagnostic::artifact(
-                                waiter.artifact.revision(),
-                                "persistence coordinator closed before storing the program artifact",
-                            )),
-                            false,
-                            false,
-                        )?
-                        .changed;
-                }
-                Ok(changed)
-            }
-        }
     }
 
     pub fn poll_program_artifact_stores(&mut self) -> ViewResult<bool> {
-        let mut changed = self.poll_program_artifact_loads()?;
-        changed |= self.poll_program_artifact_durability()?;
-        changed |= self.drive_program_artifact_authority_lane()?;
-        for completion in self.runtime.take_content_artifact_store_completions() {
-            if self
-                .program_artifact_store_lane
-                .in_flight
-                .as_ref()
-                .is_none_or(|flight| flight.ticket != completion.ticket)
-            {
-                continue;
-            }
-            let flight = self
-                .program_artifact_store_lane
-                .in_flight
-                .take()
-                .expect("matching artifact flight exists");
-            let acknowledged = completion.result.and_then(|ack| {
-                (ack.id == flight.artifact_id).then_some(()).ok_or_else(|| {
-                    boon_persistence::StoreError::InvalidContentArtifact(
-                        "persistence acknowledged a different program artifact".to_owned(),
-                    )
-                })
-            });
-            let store_worker_us = duration_us(flight.started_at.elapsed());
-            if acknowledged.is_ok()
-                && flight.mount_epoch == self.program_artifact_store_lane.mount_epoch
-                && let Some(artifact) = flight.waiters.values().next()
-            {
-                self.program_artifact_cache
-                    .insert(flight.artifact_id, artifact.artifact.to_content_artifact());
-            }
-            for (_, mut waiter) in flight.waiters {
-                waiter.queue_wait_us = duration_us(
-                    flight
-                        .started_at
-                        .saturating_duration_since(waiter.queued_at),
-                );
-                waiter.worker_us = store_worker_us;
-                if flight.mount_epoch != self.program_artifact_store_lane.mount_epoch {
-                    self.program_artifact_store_lane
-                        .remove_waiter_bytes(&waiter);
-                    let revision = waiter.artifact.revision();
-                    self.async_lane_observations
-                        .push(RuntimeAsyncLaneObservation {
-                            lane: RuntimeAsyncLaneKind::ProgramArtifactStore,
-                            request_id: waiter.request_id.0,
-                            revision,
-                            queue_depth: waiter.queue_depth,
-                            queue_wait_us: waiter.queue_wait_us,
-                            worker_us: waiter.worker_us,
-                            apply_us: 0,
-                            end_to_end_us: duration_us(waiter.queued_at.elapsed()),
-                            outcome: RuntimeAsyncLaneOutcome::StaleRejected,
-                        });
-                    continue;
-                }
-                match &acknowledged {
-                    Ok(()) => {
-                        self.program_artifact_store_lane
-                            .ready_for_authority
-                            .insert(waiter.candidate_sequence, waiter);
-                    }
-                    Err(error) => {
-                        self.program_artifact_store_lane
-                            .remove_waiter_bytes(&waiter);
-                        let diagnostic = ProgramDiagnostic::artifact(
-                            waiter.artifact.revision(),
-                            error.to_string(),
-                        );
-                        changed |= self
-                            .finish_program_artifact_store_observed(waiter, Err(diagnostic), false)?
-                            .changed;
-                    }
-                }
-            }
-        }
-        changed |= self.drive_program_artifact_authority_lane()?;
-        changed |= self.poll_program_artifact_durability()?;
-        changed |= self.drive_program_artifact_store_lane()?;
-        if changed {
-            changed |= self.resolve_program_artifact_requests()?;
-        }
-        if self.program_artifact_store_lane.has_pending()
-            || self.program_artifact_load_lane.has_pending()
-        {
-            self.next_persistence_poll = Some(Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL);
-        }
-        Ok(changed)
-    }
-
-    fn drive_program_artifact_authority_lane(&mut self) -> ViewResult<bool> {
-        let mut changed = false;
-        loop {
-            let Some(candidate_sequence) = self
-                .program_artifact_store_lane
-                .ready_for_authority
-                .first_key_value()
-                .map(|(sequence, _)| *sequence)
-            else {
-                return Ok(changed);
-            };
-            let pending = self
-                .program_artifact_store_lane
-                .ready_for_authority
-                .remove(&candidate_sequence)
-                .expect("selected durable artifact candidate exists");
-            if !self
-                .program_host
-                .request_is_current(&pending.session, &pending.request_id)
-            {
-                self.program_artifact_store_lane
-                    .remove_waiter_bytes(&pending);
-                changed |= self
-                    .finish_program_artifact_store_observed(pending, Ok(()), false)?
-                    .changed;
-                continue;
-            }
-
-            let paths = self
-                .program_host
-                .lifecycle_source_paths(&pending.session, "compiled");
-            if paths.len() != 1 {
-                self.program_artifact_store_lane
-                    .remove_waiter_bytes(&pending);
-                changed |= self
-                    .finish_program_completion_observed(
-                        &pending.session,
-                        &pending.request_id,
-                        Err(ProgramDiagnostic::artifact(
-                            pending.artifact.revision(),
-                            format!(
-                                "retained embedded program requires exactly one compiled lifecycle route, found {}",
-                                paths.len()
-                            ),
-                        )),
-                        false,
-                        false,
-                    )?
-                    .changed;
-                continue;
-            }
-            let change = match pending.ownership.retention {
-                ContentArtifactRetention::Replaceable => {
-                    DurableContentArtifactChange::SetReplaceable {
-                        owner_id: pending.ownership.owner,
-                        artifact_id: pending.artifact.id(),
-                    }
-                }
-                ContentArtifactRetention::Immutable => {
-                    DurableContentArtifactChange::InsertImmutable {
-                        owner_id: pending.ownership.owner,
-                        artifact_id: pending.artifact.id(),
-                    }
-                }
-            };
-            let payload = compiled_program_payload(&pending.artifact, false);
-            match self.dispatch_parent_source_with_content_artifact_changes(
-                &paths[0],
-                payload,
-                vec![change],
-            ) {
-                Ok((turn_changed, ticket)) => {
-                    changed |= turn_changed;
-                    self.program_artifact_store_lane.awaiting_durability.insert(
-                        ticket.turn_sequence,
-                        PendingProgramArtifactActivation { ticket, pending },
-                    );
-                }
-                Err(
-                    PersistentDispatchError::Backpressure(_)
-                    | PersistentDispatchError::PersistenceAdmissionFailed { .. },
-                ) => {
-                    self.program_artifact_store_lane
-                        .ready_for_authority
-                        .insert(candidate_sequence, pending);
-                    return Ok(changed);
-                }
-                Err(error) => {
-                    self.program_artifact_store_lane
-                        .remove_waiter_bytes(&pending);
-                    changed |= self
-                        .finish_program_completion_observed(
-                            &pending.session,
-                            &pending.request_id,
-                            Err(ProgramDiagnostic::artifact(
-                                pending.artifact.revision(),
-                                error.to_string(),
-                            )),
-                            false,
-                            false,
-                        )?
-                        .changed;
-                }
-            }
-        }
-    }
-
-    fn poll_program_artifact_durability(&mut self) -> ViewResult<bool> {
-        let acknowledged = self
-            .program_artifact_store_lane
-            .awaiting_durability
-            .iter()
-            .filter_map(|(sequence, activation)| {
-                self.runtime
-                    .durability_ticket_is_acknowledged(activation.ticket)
-                    .then_some(*sequence)
-            })
-            .collect::<Vec<_>>();
-        let mut changed = false;
-        for sequence in acknowledged {
-            let activation = self
-                .program_artifact_store_lane
-                .awaiting_durability
-                .remove(&sequence)
-                .expect("acknowledged program artifact activation exists");
-            let pending = activation.pending;
-            self.program_artifact_store_lane
-                .remove_waiter_bytes(&pending);
-            changed |= self
-                .finish_program_artifact_store_observed(pending, Ok(()), true)?
-                .changed;
-        }
-        Ok(changed)
-    }
-
-    fn dispatch_parent_source_with_content_artifact_changes(
-        &mut self,
-        path: &str,
-        payload: SourcePayload,
-        changes: Vec<DurableContentArtifactChange>,
-    ) -> Result<(bool, DurabilityTicket), PersistentDispatchError> {
-        if self.program_host.owns_source_route(path) {
-            return Err(PersistentDispatchError::Runtime(
-                "program lifecycle route resolved inside the restricted child runtime".to_owned(),
-            ));
-        }
-        let next_sequence = self.sequence.saturating_add(1);
-        let event = self
+        let drive = self
             .runtime
-            .runtime()
-            .source_event(next_sequence, path, None, payload)
-            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))?;
-        let (turn, ticket) = self
-            .runtime
-            .dispatch_with_content_artifact_changes(event, changes)?;
-        self.capture_scenario_turn(path, &turn);
-        let source_sequence = turn.source_sequence.ok_or_else(|| {
-            PersistentDispatchError::Runtime(format!(
-                "durable source dispatch `{path}` produced no source sequence"
-            ))
-        })?;
-        let changed = self
-            .finish_parent_runtime_turn(turn)
-            .map_err(PersistentDispatchError::Runtime)?;
-        self.record_event_dispatch(path, source_sequence);
-        self.schedule_effect_poll()
-            .map_err(PersistentDispatchError::Runtime)?;
-        Ok((changed, ticket))
-    }
-
-    fn finish_program_artifact_store_observed(
-        &mut self,
-        pending: PendingProgramArtifactStore,
-        result: Result<(), ProgramDiagnostic>,
-        authority_committed: bool,
-    ) -> ViewResult<ObservedProgramCompletion> {
-        let request_id = pending.request_id.0.clone();
-        let revision = pending.artifact.revision();
-        let queue_depth = pending.queue_depth;
-        let queue_wait_us = pending.queue_wait_us;
-        let worker_us = pending.worker_us;
-        let queued_at = pending.queued_at;
-        let failed = result.is_err();
-        let apply_started = Instant::now();
-        let observed = if !pending.activated_before_store || result.is_err() {
-            self.finish_program_completion_observed(
-                &pending.session,
-                &pending.request_id,
-                result.map(|()| pending.artifact),
-                false,
-                authority_committed,
-            )?
-        } else if !authority_committed {
-            ObservedProgramCompletion {
-                changed: false,
-                completion: ProgramCompletionObservation::Host(ProgramHostCompletion::Superseded {
-                    session: pending.session,
-                    request_id: pending.request_id,
-                }),
-            }
-        } else {
-            ObservedProgramCompletion {
-                changed: false,
-                completion: ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
-                    ProgramCompletion::Activated { revision },
-                )),
-            }
-        };
-        self.async_lane_observations
-            .push(RuntimeAsyncLaneObservation {
-                lane: RuntimeAsyncLaneKind::ProgramArtifactStore,
-                request_id,
-                revision,
-                queue_depth,
-                queue_wait_us,
-                worker_us,
-                apply_us: duration_us(apply_started.elapsed()),
-                end_to_end_us: duration_us(queued_at.elapsed()),
-                outcome: runtime_lane_outcome(&observed.completion, failed),
-            });
-        Ok(observed)
-    }
-
-    fn finish_program_completion_observed(
-        &mut self,
-        session: &ProgramSessionId,
-        request_id: &ProgramRequestId,
-        result: Result<ProgramArtifact, ProgramDiagnostic>,
-        artifact_load: bool,
-        lifecycle_already_dispatched: bool,
-    ) -> ViewResult<ObservedProgramCompletion> {
-        let (completion, update) = self.program_host.complete(session, request_id, result);
-        let bootstrap = update.bootstrap;
-        let lifecycle = if artifact_load || lifecycle_already_dispatched {
-            None
-        } else {
-            match &completion {
-                ProgramHostCompletion::Program(ProgramCompletion::Activated { .. }) => self
-                    .program_host
-                    .active_artifact(session)
-                    .map(|artifact| ("compiled", compiled_program_payload(artifact, bootstrap))),
-                ProgramHostCompletion::Program(ProgramCompletion::Rejected { diagnostic }) => {
-                    Some(("rejected", rejected_program_payload(diagnostic)))
-                }
-                ProgramHostCompletion::Program(ProgramCompletion::Stale { .. })
-                | ProgramHostCompletion::Superseded { .. }
-                | ProgramHostCompletion::Removed { .. } => None,
-            }
-        };
-        let program_state_changed = matches!(
-            completion,
-            ProgramHostCompletion::Program(ProgramCompletion::Activated { .. })
-        );
-        let mut changed =
-            self.queue_program_update(update.patches, update.requests) || program_state_changed;
-        changed |= self.dispatch_rejections(update.rejections)?;
-        if let Some((intent, payload)) = lifecycle {
-            for path in self.program_host.lifecycle_source_paths(session, intent) {
-                changed |= self.dispatch_source(&path, None, payload.clone())?;
-            }
-        }
-        Ok(ObservedProgramCompletion {
-            changed,
-            completion: ProgramCompletionObservation::Host(completion),
-        })
+            .poll_program_artifacts(&mut self.program_host, &mut self.sequence)
+            .map_err(|error| error.to_string())?;
+        self.apply_program_artifact_drive(drive)
+            .map(|(changed, _)| changed)
     }
 
     pub fn program_diagnostics(&self) -> Vec<ProgramHostDiagnostic> {
@@ -3292,7 +2265,7 @@ impl RuntimeView {
                     | DocumentPatch::MoveChild { .. }
             )
         });
-        self.pending_program_requests.extend(requests);
+        self.runtime.queue_program_requests(requests);
         for patch in patches {
             let patch = self.with_view_state(patch);
             self.sync_text_input_patch(&patch);
@@ -3320,6 +2293,7 @@ impl RuntimeView {
     }
 
     fn finish_parent_runtime_turn(&mut self, turn: RuntimeTurn) -> ViewResult<bool> {
+        self.transient_host.route_turn(&turn)?;
         let durable_sequence = turn.sequence;
         let durable_queued_at = Instant::now();
         let persistence_enqueue_us = turn.phase_timings.persistence_enqueue_us;
@@ -3396,7 +2370,9 @@ impl RuntimeView {
     }
 
     fn schedule_effect_poll(&mut self) -> ViewResult<()> {
-        let has_work = self.effect_worker.is_busy() || self.runtime.has_effect_work();
+        let has_work = self.effect_worker.is_busy()
+            || self.runtime.has_effect_work()
+            || self.transient_host.has_work();
         self.next_effect_poll = has_work.then_some(Instant::now() + EFFECT_POLL_INTERVAL);
         Ok(())
     }
@@ -3670,6 +2646,14 @@ fn configured_state_root() -> PathBuf {
         .unwrap_or_else(|| repository_root().join(STATE_DIRECTORY))
 }
 
+fn transient_content_root(parent: &Path) -> PathBuf {
+    parent.join(format!(
+        "{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().hyphenated()
+    ))
+}
+
 pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
     use std::fmt::Write as _;
 
@@ -3858,44 +2842,6 @@ fn pointer_source_payload(pointer: &boon_host::PointerEvent, target: &HitTarget)
     payload
 }
 
-fn compiled_program_payload(artifact: &ProgramArtifact, bootstrap: bool) -> SourcePayload {
-    let mut payload = SourcePayload {
-        text: Some(artifact.source_digest().to_owned()),
-        ..SourcePayload::default()
-    };
-    payload.fields.insert(
-        "revision".to_owned(),
-        Value::Text(artifact.revision().to_string()),
-    );
-    payload.fields.insert(
-        "source_digest".to_owned(),
-        Value::Text(artifact.source_digest().to_owned()),
-    );
-    payload.fields.insert(
-        "compiler".to_owned(),
-        Value::Text(artifact.compiler_id().to_owned()),
-    );
-    payload.fields.insert(
-        "target".to_owned(),
-        Value::Text(artifact.target_profile_id().to_owned()),
-    );
-    payload.fields.insert(
-        "capability_profile".to_owned(),
-        Value::Text(artifact.capability_profile_id().to_owned()),
-    );
-    payload
-        .fields
-        .insert("artifact_id".to_owned(), Value::Text(artifact.id_text()));
-    payload.fields.insert(
-        "plan_digest".to_owned(),
-        Value::Text(artifact.plan_digest().to_owned()),
-    );
-    payload
-        .fields
-        .insert("bootstrap".to_owned(), Value::Bool(bootstrap));
-    payload
-}
-
 fn rejected_program_payload(diagnostic: &ProgramDiagnostic) -> SourcePayload {
     let mut payload = SourcePayload {
         text: Some(diagnostic.message.clone()),
@@ -3998,29 +2944,234 @@ fn duration_us(duration: Duration) -> u64 {
     duration.as_micros().try_into().unwrap_or(u64::MAX)
 }
 
-fn runtime_lane_outcome(
-    completion: &ProgramCompletionObservation,
-    failed: bool,
-) -> RuntimeAsyncLaneOutcome {
-    if failed {
-        return RuntimeAsyncLaneOutcome::Failed;
-    }
-    match completion {
-        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
-            ProgramCompletion::Stale { .. },
-        ))
-        | ProgramCompletionObservation::Host(ProgramHostCompletion::Superseded { .. })
-        | ProgramCompletionObservation::Host(ProgramHostCompletion::Removed { .. }) => {
-            RuntimeAsyncLaneOutcome::StaleRejected
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn novywave_package_asset_runs_through_file_and_wellen_effect_chain() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("novywave")
+            .unwrap();
+        let units = example
+            .units
+            .iter()
+            .map(|unit| boon_runtime::RuntimeSourceUnit {
+                path: unit.path.clone(),
+                source: unit.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/novywave/RUN.bn", &units).unwrap();
+        let mut view = RuntimeView::open_for_scenario_with_assets(
+            runtime.shared_machine_plan(),
+            &example.assets,
+        )
+        .unwrap();
+        let mut payload = SourcePayload::default();
+        payload.fields.insert("press".to_owned(), Value::Bool(true));
+        view.dispatch_source("store.elements.load_default_file", None, payload)
+            .unwrap();
+
+        let started = Instant::now();
+        while view.effect_poll_deadline().is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "real NovyWave host-effect chain did not settle"
+            );
+            view.poll_host_effects(Instant::now() + Duration::from_millis(2))
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
         }
-        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
-            ProgramCompletion::Rejected { .. },
-        )) => RuntimeAsyncLaneOutcome::Failed,
-        ProgramCompletionObservation::Host(ProgramHostCompletion::Program(
-            ProgramCompletion::Activated { .. },
-        ))
-        | ProgramCompletionObservation::ArtifactStorePending { .. } => {
-            RuntimeAsyncLaneOutcome::Applied
+
+        for (path, expected_tag) in [
+            ("store.real_file_stream_result", "Finished"),
+            ("store.real_waveform_open_result", "WaveformOpened"),
+            ("store.real_hierarchy_page_result", "HierarchyPage"),
+            ("store.real_signal_page_result", "SignalPage"),
+            ("store.real_cursor_values_result", "CursorValues"),
+        ] {
+            let value = view.runtime.root_value_current(path).unwrap();
+            assert!(
+                matches!(&value,
+                    Value::Record(fields)
+                        if fields.get("$tag") == Some(&Value::Text(expected_tag.to_owned()))),
+                "{path} did not reach {expected_tag}: {value:?}"
+            );
+        }
+
+        assert_eq!(
+            view.runtime
+                .root_value_current("store.format_label")
+                .unwrap(),
+            Value::Text("VCD".to_owned())
+        );
+        let hierarchy = view
+            .runtime
+            .root_value_current("store.bridge_hierarchy_page_label")
+            .unwrap();
+        let Value::Text(hierarchy) = hierarchy else {
+            panic!("visible hierarchy status is not text: {hierarchy:?}");
+        };
+        for expected in ["hierarchy rows", "signal pages", "cursor values"] {
+            assert!(
+                hierarchy.contains(expected),
+                "visible hierarchy status omitted `{expected}`: {hierarchy}"
+            );
+        }
+        let visible_text = view
+            .retained_frame()
+            .nodes
+            .values()
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+            .collect::<Vec<_>>();
+        assert!(
+            visible_text.iter().any(|text| *text == "VCD"),
+            "real waveform format did not reach retained UI text: {visible_text:?}"
+        );
+
+        for (file, expected_format) in [
+            ("wave_27.fst", "FST"),
+            ("simple_test.ghw", "GHW"),
+            ("simple.vcd", "VCD"),
+        ] {
+            let target = view
+                .runtime
+                .runtime()
+                .row_target_for_source_text("file_tree_row.file_row_elements.select_file", file, 0)
+                .unwrap()
+                .unwrap();
+            view.dispatch_source(
+                "file_tree_row.file_row_elements.select_file",
+                Some(target),
+                SourcePayload {
+                    fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+            let started = Instant::now();
+            while view.effect_poll_deadline().is_some() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "real NovyWave host-effect replacement did not settle for {file}"
+                );
+                view.poll_host_effects(Instant::now() + Duration::from_millis(2))
+                    .unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                view.runtime
+                    .root_value_current("store.format_label")
+                    .unwrap(),
+                Value::Text(expected_format.to_owned()),
+                "selected package asset did not replace the active Wellen artifact for {file}"
+            );
+        }
+    }
+
+    #[test]
+    fn persons_passkey_cancellation_settles_without_changing_anonymous_authority() {
+        let example = crate::catalog::Catalog::load()
+            .unwrap()
+            .open("persons_pro")
+            .unwrap();
+        let units = example
+            .units
+            .iter()
+            .map(|unit| boon_runtime::RuntimeSourceUnit {
+                path: unit.path.clone(),
+                source: unit.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let runtime = LiveRuntime::from_project("examples/persons_pro/RUN.bn", &units).unwrap();
+        let mut view = RuntimeView::open_for_scenario_with_assets(
+            runtime.shared_machine_plan(),
+            &example.assets,
+        )
+        .unwrap();
+        assert_eq!(
+            view.runtime
+                .root_value_current("store.credential_count")
+                .unwrap(),
+            Value::Number(FiniteReal::from_i64_exact(0).unwrap())
+        );
+        view.dispatch_source(
+            "store.elements.simulate_registration_cancel",
+            None,
+            SourcePayload {
+                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                ..SourcePayload::default()
+            },
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        while view.effect_poll_deadline().is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "Persons.pro passkey cancellation did not settle"
+            );
+            view.poll_host_effects(Instant::now() + Duration::from_millis(2))
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            view.runtime
+                .root_value_current("store.credential_count")
+                .unwrap(),
+            Value::Number(FiniteReal::from_i64_exact(0).unwrap()),
+            "cancelled registration must not append a credential"
+        );
+        for (path, expected) in [
+            ("store.passkey_workflow_state", "Cancelled"),
+            ("store.workspace_grant_state", "AnonymousGrant"),
+            ("store.account_state", "Anonymous"),
+        ] {
+            assert_eq!(
+                view.runtime.root_value_current(path).unwrap(),
+                Value::Text(expected.to_owned()),
+                "passkey cancellation changed `{path}` incorrectly"
+            );
+        }
+
+        view.dispatch_source(
+            "store.elements.register_passkey",
+            None,
+            SourcePayload {
+                fields: BTreeMap::from([("press".to_owned(), Value::Bool(true))]),
+                ..SourcePayload::default()
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        while view.effect_poll_deadline().is_some() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "Persons.pro passkey registration did not settle"
+            );
+            view.poll_host_effects(Instant::now() + Duration::from_millis(2))
+                .unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            view.runtime
+                .root_value_current("store.credential_count")
+                .unwrap(),
+            Value::Number(FiniteReal::from_i64_exact(1).unwrap()),
+            "one successful registration must append exactly one credential"
+        );
+        for (path, expected) in [
+            ("store.passkey_workflow_state", "Registered"),
+            ("store.workspace_grant_state", "PendingRevocation"),
+            ("store.account_state", "OnePasskey"),
+        ] {
+            assert_eq!(
+                view.runtime.root_value_current(path).unwrap(),
+                Value::Text(expected.to_owned()),
+                "passkey registration did not update `{path}`"
+            );
         }
     }
 }

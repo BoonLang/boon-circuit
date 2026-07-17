@@ -2,53 +2,53 @@ name = "fjordpulse_deterministic_client"
 source = "examples/fjordpulse/Client/RUN.bn"
 
 [[step]]
-id = "initial-oslo-map"
-expect_root_text = { "store.language" = "Norwegian", "store.basemap" = "Streets", "store.selected_station" = "OsloS", "store.station_tab" = "Departures", "store.mobile_sheet" = "Half", "store.map_zoom" = "11.5" }
+id = "initial-forde-map"
+expect_root_text = { "store.language" = "Norwegian", "store.basemap" = "Satellite", "store.selected_station" = "Forde", "store.station_tab" = "Departures", "store.mobile_sheet" = "Half", "store.map_zoom" = "5.3" }
 
 [[step]]
 id = "select-bergen"
 user_action = { kind = "click", target = "Bergen station", target_text = "Bergen stasjon" }
-expected_source_event = { source = "store.elements.station.bergen", target_text = "Bergen stasjon" }
+expected_source_event = { source = "store.elements.station.bergen.press", target_text = "Bergen stasjon" }
 expect_root_text = { "store.selected_station" = "Bergen" }
 
 [[step]]
 id = "open-vehicles"
 user_action = { kind = "click", target = "vehicle tab", target_text = "Kjøretøy" }
-expected_source_event = { source = "store.elements.tab.vehicles", target_text = "Kjøretøy" }
+expected_source_event = { source = "store.elements.tab.vehicles.press", target_text = "Kjøretøy" }
 expect_root_text = { "store.station_tab" = "Vehicles" }
 
 [[step]]
 id = "open-details"
 user_action = { kind = "click", target = "details tab", target_text = "Detaljer" }
-expected_source_event = { source = "store.elements.tab.details", target_text = "Detaljer" }
+expected_source_event = { source = "store.elements.tab.details.press", target_text = "Detaljer" }
 expect_root_text = { "store.station_tab" = "Details" }
 
 [[step]]
 id = "switch-language"
 user_action = { kind = "click", target = "language", target_text = "NO" }
-expected_source_event = { source = "store.elements.locale", target_text = "NO" }
+expected_source_event = { source = "store.elements.locale.press", target_text = "NO" }
 expect_root_text = { "store.language" = "English" }
 
 [[step]]
-id = "switch-satellite"
-user_action = { kind = "click", target = "basemap", target_text = "Kart" }
-expected_source_event = { source = "store.elements.basemap", target_text = "Kart" }
-expect_root_text = { "store.basemap" = "Satellite" }
+id = "switch-streets"
+user_action = { kind = "click", target = "basemap", target_text = "Satellite" }
+expected_source_event = { source = "store.elements.basemap.press", target_text = "Satellite" }
+expect_root_text = { "store.basemap" = "Streets" }
 
 [[step]]
 id = "search-station"
 user_action = { kind = "type_text", target = "Search for a stop or place", text = "Trondheim" }
-expected_source_event = { source = "store.elements.search", text = "Trondheim" }
+expected_source_event = { source = "store.elements.search.change", text = "Trondheim" }
 expect_root_text = { "store.search_query" = "Trondheim" }
 
 [[step]]
 id = "mobile-sheet-full"
 user_action = { kind = "click", target = "full sheet", target_text = "Full" }
-expected_source_event = { source = "store.elements.sheet.full", target_text = "Full" }
+expected_source_event = { source = "store.elements.sheet.full.press", target_text = "Full" }
 expect_root_text = { "store.mobile_sheet" = "Full" }
 
 [[step]]
 id = "follow-location"
 user_action = { kind = "click", target = "locate", target_text = "◎" }
-expected_source_event = { source = "store.elements.map.locate", target_text = "◎" }
-expect_root_text = { "store.following" = "True" }
+expected_source_event = { source = "store.elements.map.locate.press", target_text = "◎" }
+expect_root_text = { "store.map_locating" = "True" }

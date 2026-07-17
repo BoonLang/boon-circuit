@@ -53,17 +53,34 @@ FUNCTION desktop_header() {
         items: LIST {
             brand()
             header_spacer()
-            nav_button(label: TEXT { Home }, selected: PASSED.store.page == Home)
-                |> SOURCE { PASSED.store.elements.nav.home }
-            nav_button(label: TEXT { Work }, selected: PASSED.store.page == Work)
-                |> SOURCE { PASSED.store.elements.nav.work }
-            nav_button(label: TEXT { Blog }, selected: PASSED.store.page == Blog)
-                |> SOURCE { PASSED.store.elements.nav.blog }
-            nav_button(label: TEXT { Shelf }, selected: PASSED.store.page == Shelf)
-                |> SOURCE { PASSED.store.elements.nav.shelf }
-            nav_button(label: TEXT { About }, selected: PASSED.store.page == About)
-                |> SOURCE { PASSED.store.elements.nav.about }
-            theme_button() |> SOURCE { PASSED.store.elements.theme_toggle }
+            nav_button(
+                source: PASSED.store.elements.nav.home
+                label: TEXT { Home }
+                selected: PASSED.store.page == Home
+            )
+            nav_button(
+                source: PASSED.store.elements.nav.work
+                label: TEXT { Work }
+                selected: PASSED.store.page == Work
+            )
+            nav_button(
+                source: PASSED.store.elements.nav.blog
+                label: TEXT { Blog }
+                selected: PASSED.store.page == Blog
+            )
+            nav_button(
+                source: PASSED.store.elements.nav.shelf
+                label: TEXT { Shelf }
+                selected: PASSED.store.page == Shelf
+            )
+            nav_button(
+                source: PASSED.store.elements.nav.about
+                label: TEXT { About }
+                selected: PASSED.store.page == About
+            )
+            theme_button(
+                source: PASSED.store.elements.theme_toggle
+            )
         }
     )
 }
@@ -96,7 +113,9 @@ FUNCTION mobile_header() {
                 items: LIST {
                     brand()
                     header_spacer()
-                    theme_button() |> SOURCE { PASSED.store.elements.theme_toggle }
+                    theme_button(
+                        source: PASSED.store.elements.theme_toggle
+                    )
                 }
             )
             Scene/Element/stripe(
@@ -105,16 +124,31 @@ FUNCTION mobile_header() {
                 gap: 4
                 style: [width: Fill, wrap: True, wrap_min_width: 64, paint: False]
                 items: LIST {
-                    nav_button(label: TEXT { Home }, selected: PASSED.store.page == Home)
-                        |> SOURCE { PASSED.store.elements.nav.home }
-                    nav_button(label: TEXT { Work }, selected: PASSED.store.page == Work)
-                        |> SOURCE { PASSED.store.elements.nav.work }
-                    nav_button(label: TEXT { Blog }, selected: PASSED.store.page == Blog)
-                        |> SOURCE { PASSED.store.elements.nav.blog }
-                    nav_button(label: TEXT { Shelf }, selected: PASSED.store.page == Shelf)
-                        |> SOURCE { PASSED.store.elements.nav.shelf }
-                    nav_button(label: TEXT { About }, selected: PASSED.store.page == About)
-                        |> SOURCE { PASSED.store.elements.nav.about }
+                    nav_button(
+                        source: PASSED.store.elements.nav.home
+                        label: TEXT { Home }
+                        selected: PASSED.store.page == Home
+                    )
+                    nav_button(
+                        source: PASSED.store.elements.nav.work
+                        label: TEXT { Work }
+                        selected: PASSED.store.page == Work
+                    )
+                    nav_button(
+                        source: PASSED.store.elements.nav.blog
+                        label: TEXT { Blog }
+                        selected: PASSED.store.page == Blog
+                    )
+                    nav_button(
+                        source: PASSED.store.elements.nav.shelf
+                        label: TEXT { Shelf }
+                        selected: PASSED.store.page == Shelf
+                    )
+                    nav_button(
+                        source: PASSED.store.elements.nav.about
+                        label: TEXT { About }
+                        selected: PASSED.store.page == About
+                    )
                 }
             )
         }
@@ -142,12 +176,9 @@ FUNCTION header_spacer() {
     )
 }
 
-FUNCTION nav_button(label, selected) {
+FUNCTION nav_button(source, label, selected) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: [press: source]]
         style: [
             ...KavikTheme/control(
                 mode: PASSED.store.mode
@@ -173,12 +204,9 @@ FUNCTION nav_button(label, selected) {
     )
 }
 
-FUNCTION theme_button() {
+FUNCTION theme_button(source) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: [press: source]]
         style: [
             ...KavikTheme/control(mode: PASSED.store.mode, selected: False, hovered: element.hovered)
             width: 92

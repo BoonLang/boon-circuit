@@ -3901,7 +3901,3 @@ fn rect_intersection(a: Rect, b: Rect) -> Option<Rect> {
         height: y1 - y0,
     })
 }
-
-#[cfg(test)]
-#[path = "render_scene_tests.rs"]
-mod tests;

@@ -30,6 +30,7 @@ fn compile_artifact(path: &str, source: &str, namespace: &str) -> boon_runtime::
             namespace,
             "loopback",
         ),
+        role: boon_plan::ProgramRole::Server,
         capability_profile: ProgramCapabilityProfile::TrustedServer,
     })
     .expect("unrelated server fixture should compile as TrustedServer")
@@ -91,6 +92,52 @@ async fn unrelated_boon_program_serves_a_real_http_request() {
         .expect("loopback GET should complete");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.text().await.unwrap(), "GET:health");
+
+    server.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_response_body_preserves_application_owned_bytes() {
+    let program = compile_fixture(
+        "server-http-bytes.bn",
+        r#"
+store: [
+    request: SOURCE
+]
+outputs: [
+    response: [
+        status: 200
+        headers: LIST {
+            [name: TEXT { content-type }, value: TEXT { application/octet-stream }]
+        }
+        body: BYTES[4] { 16uff, 16u00, 16u80, 16u41 }
+    ]
+]
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]
+"#,
+        "binary-response-test",
+    );
+    let server = bind(loopback(), ServerConfig::default(), program)
+        .await
+        .expect("loopback server should bind");
+
+    let response = reqwest::get(format!("http://{}/bytes", server.local_addr()))
+        .await
+        .expect("loopback GET should complete");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        &[0xff, 0x00, 0x80, 0x41]
+    );
 
     server.shutdown().await.unwrap();
 }

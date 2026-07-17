@@ -1,14 +1,14 @@
 use app_window::coordinates::{Position, Size};
 use app_window::event::{
     ButtonState, ImeEvent, LogicalKey, PointerButton as NativePointerButton, WheelDelta,
-    WindowEvent, WindowEventCapabilities, WindowEventCapability, WindowEventError,
+    WindowEvent, WindowEventCapabilities, WindowEventCapability, WindowEventEnvelope,
+    WindowEventError,
 };
 use app_window::input::keyboard::key::KeyboardKey;
 use boon_host::{
-    AccessibilityInputAction, AccessibilityInputEvent, CallbackToHostNs, HostEvent,
-    HostEventEnvelope, HostEventOrigin, ImeInputEvent, ImeInputKind, KeyEvent,
-    LogicalKey as HostLogicalKey, LogicalSize, PhysicalSize, PointerButton, PointerEvent,
-    PointerPhase, SensitiveInputHandle, SurfaceResizeEvent, TextInputEvent, WheelEvent,
+    AccessibilityInputAction, AccessibilityInputEvent, CallbackToHostNs, HostEvent, ImeInputEvent,
+    ImeInputKind, KeyEvent, LogicalKey as HostLogicalKey, LogicalSize, PhysicalSize, PointerButton,
+    PointerEvent, PointerPhase, SensitiveInputHandle, TextInputEvent, WheelEvent,
 };
 
 use crate::error::NativeHostError;
@@ -49,6 +49,12 @@ pub(crate) enum AdaptedWindowEvent {
     Host(HostEvent),
     Resize(NativeViewport),
     Omitted,
+}
+
+pub(crate) struct PreparedWindowEvent {
+    pub(crate) sequence: u64,
+    pub(crate) callback_to_host_ns: CallbackToHostNs,
+    pub(crate) event: AdaptedWindowEvent,
 }
 
 pub(crate) struct EventAdapter {
@@ -293,6 +299,27 @@ impl EventAdapter {
         Ok(AdaptedWindowEvent::Host(event))
     }
 
+    pub(crate) fn prepare(
+        &mut self,
+        envelope: WindowEventEnvelope,
+    ) -> Result<Option<PreparedWindowEvent>, NativeHostError> {
+        let event = self.adapt(envelope.event)?;
+        if matches!(event, AdaptedWindowEvent::Omitted) {
+            return Ok(None);
+        }
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(NativeHostError::CounterOverflow("host event sequence"))?;
+        Ok(Some(PreparedWindowEvent {
+            sequence: self.sequence,
+            callback_to_host_ns: CallbackToHostNs::saturating_from_duration(
+                envelope.callback_at.elapsed(),
+            ),
+            event,
+        }))
+    }
+
     fn update_modifiers(&mut self, key: Option<KeyboardKey>, state: ButtonState) {
         let pressed = state == ButtonState::Pressed;
         match key {
@@ -376,43 +403,6 @@ impl EventAdapter {
             ImeEvent::Commit(_) => unreachable!("commit handled before sensitive IME routing"),
         };
         Ok(handle)
-    }
-
-    pub(crate) fn envelope(
-        &mut self,
-        event: HostEvent,
-        surface_epoch: u64,
-        callback_to_host_ns: CallbackToHostNs,
-    ) -> Result<HostEventEnvelope, NativeHostError> {
-        self.sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or(NativeHostError::CounterOverflow("host event sequence"))?;
-        Ok(HostEventEnvelope {
-            sequence: self.sequence,
-            origin: HostEventOrigin::RealOs,
-            callback_to_host_ns,
-            window: self.ids.window.clone(),
-            surface: self.ids.surface.clone(),
-            surface_epoch,
-            event,
-        })
-    }
-
-    pub(crate) fn resize_envelope(
-        &mut self,
-        viewport: NativeViewport,
-        surface_epoch: u64,
-        callback_to_host_ns: CallbackToHostNs,
-    ) -> Result<HostEventEnvelope, NativeHostError> {
-        let event = HostEvent::Resize(SurfaceResizeEvent {
-            surface: self.ids.surface.clone(),
-            logical_size: viewport.logical_size,
-            scale: viewport.scale,
-            physical_size: viewport.physical_size,
-            epoch: surface_epoch,
-        });
-        self.envelope(event, surface_epoch, callback_to_host_ns)
     }
 }
 
@@ -520,20 +510,19 @@ mod tests {
     fn pointer_button_keeps_position_and_sequence() {
         let mut adapter = adapter();
         let moved = adapter
-            .adapt(WindowEvent::PointerMoved {
-                position: Position::new(12.5, 24.0),
+            .prepare(WindowEventEnvelope {
+                event: WindowEvent::PointerMoved {
+                    position: Position::new(12.5, 24.0),
+                },
+                callback_at: app_window::event::WindowEventTimestamp::now(),
             })
+            .unwrap()
             .unwrap();
-        let AdaptedWindowEvent::Host(moved) = moved else {
+        assert_eq!(moved.sequence, 1);
+        let AdaptedWindowEvent::Host(moved) = moved.event else {
             panic!("expected host event");
         };
-        assert_eq!(
-            adapter
-                .envelope(moved, 3, CallbackToHostNs::ZERO)
-                .unwrap()
-                .sequence,
-            1
-        );
+        assert!(matches!(moved, HostEvent::Pointer(_)));
 
         let pressed = adapter
             .adapt(WindowEvent::PointerButton {

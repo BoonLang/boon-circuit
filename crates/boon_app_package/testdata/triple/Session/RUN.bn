@@ -1,0 +1,10 @@
+store: [
+    request: SOURCE
+]
+
+outputs: [
+    response: [
+        accepted: TRUE
+        body: Contract/session_response_text()
+    ]
+]

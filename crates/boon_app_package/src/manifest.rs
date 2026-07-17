@@ -74,7 +74,7 @@ impl std::str::FromStr for NamespaceProfile {
 pub struct AppManifest {
     pub format: u32,
     pub package: PackageIdentityManifest,
-    pub programs: ProgramPairManifest,
+    pub programs: ProgramTripleManifest,
     #[serde(default)]
     pub capability_profiles: BTreeMap<String, CapabilityProfileManifest>,
     pub browser: BrowserManifest,
@@ -105,8 +105,9 @@ pub struct PackageIdentityManifest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProgramPairManifest {
-    pub document: ProgramManifest,
+pub struct ProgramTripleManifest {
+    pub client: ProgramManifest,
+    pub session: ProgramManifest,
     pub server: ProgramManifest,
 }
 
@@ -265,18 +266,32 @@ impl AppManifest {
                 "package modes must be non-empty and contain no duplicates",
             ));
         }
-        self.validate_program("document", &self.programs.document, ProgramRole::Document)?;
+        self.validate_program("client", &self.programs.client, ProgramRole::Client)?;
+        self.validate_program("session", &self.programs.session, ProgramRole::Session)?;
         self.validate_program("server", &self.programs.server, ProgramRole::Server)?;
-        if self.programs.document.artifact == self.programs.server.artifact {
+        let artifact_paths = [
+            self.programs.client.artifact.as_str(),
+            self.programs.session.artifact.as_str(),
+            self.programs.server.artifact.as_str(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if artifact_paths.len() != 3 {
             return Err(PackageError::new(
-                "document and server artifact paths must differ",
+                "client, session, and server artifact paths must be distinct",
             ));
         }
         for profile in NamespaceProfile::all() {
-            if self.programs.document.namespace(profile) == self.programs.server.namespace(profile)
-            {
+            let namespaces = [
+                self.programs.client.namespace(profile),
+                self.programs.session.namespace(profile),
+                self.programs.server.namespace(profile),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+            if namespaces.len() != 3 {
                 return Err(PackageError::new(format!(
-                    "document and server state namespaces must differ for {}",
+                    "client, session, and server state namespaces must be distinct for {}",
                     profile.as_str()
                 )));
             }
@@ -317,7 +332,8 @@ impl AppManifest {
             )));
         }
         let expected_capability = match expected_role {
-            ProgramRole::Document => ProgramCapabilityProfile::PublicDocument,
+            ProgramRole::Client => ProgramCapabilityProfile::PublicClient,
+            ProgramRole::Session => ProgramCapabilityProfile::TrustedSession,
             ProgramRole::Server => ProgramCapabilityProfile::TrustedServer,
         };
         if program.capability_profile != expected_capability {
@@ -396,7 +412,8 @@ impl AppManifest {
             }
         }
         for (label, program) in [
-            ("document", &self.programs.document),
+            ("client", &self.programs.client),
+            ("session", &self.programs.session),
             ("server", &self.programs.server),
         ] {
             let profile = self

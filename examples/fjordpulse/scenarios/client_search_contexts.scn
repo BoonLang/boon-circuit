@@ -7,7 +7,7 @@ expect_root_text = { "store.route" = "PublicMap", "store.search_state" = "Closed
 
 [[step]]
 id = "open-search"
-expected_source_event = { source = "store.elements.navigation.search", target_text = "Søk" }
+expected_source_event = { source = "store.elements.navigation.search.press", target_text = "Søk" }
 expect_root_text = { "store.search_state" = "Ready" }
 
 [[step]]
@@ -17,7 +17,7 @@ expect_root_text = { "store.search_query" = "Forde", "store.search_highlight" = 
 
 [[step]]
 id = "submit"
-expected_source_event = { source = "store.elements.search_submit", target_text = "Søk" }
+expected_source_event = { source = "store.elements.search_submit.press", target_text = "Søk" }
 expect_root_text = { "store.search_state" = "Loading" }
 
 [[step]]
@@ -47,7 +47,7 @@ expect_root_text = { "store.route" = "PublicLine", "store.search_state" = "Close
 
 [[step]]
 id = "open-search-again"
-expected_source_event = { source = "store.elements.navigation.search", target_text = "Søk" }
+expected_source_event = { source = "store.elements.navigation.search.press", target_text = "Søk" }
 expect_root_text = { "store.search_state" = "Ready", "store.search_highlight" = "FordeStationResult" }
 
 [[step]]
@@ -57,15 +57,15 @@ expect_root_text = { "store.search_state" = "Closed", "store.route" = "PublicLin
 
 [[step]]
 id = "open-place-context"
-expected_source_event = { source = "store.elements.search_result.forde_place", target_text = "Førde sentrum" }
+expected_source_event = { source = "store.elements.search_result.forde_place.press", target_text = "Førde sentrum" }
 expect_root_text = { "store.route" = "PublicPlace", "store.map_zoom" = "11.5" }
 
 [[step]]
 id = "place-opens-nearest-station"
-expected_source_event = { source = "store.elements.station.forde", target_text = "Førde rutebilstasjon" }
+expected_source_event = { source = "store.elements.station.forde.press", target_text = "Førde rutebilstasjon" }
 expect_root_text = { "store.route" = "PublicStation", "store.selected_station" = "Forde", "store.station_state" = "Loading", "store.station_tab" = "Departures" }
 
 [[step]]
 id = "open-ferry-station"
-expected_source_event = { source = "store.elements.station.forde_ferry", target_text = "Førde ferjekai" }
+expected_source_event = { source = "store.elements.station.forde_ferry.press", target_text = "Førde ferjekai" }
 expect_root_text = { "store.route" = "PublicStation", "store.selected_station" = "FordeFerry", "store.station_state" = "Loading" }

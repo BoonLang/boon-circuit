@@ -1,10 +1,13 @@
+use boon_data::{NumberTextFormat, format_number_text};
 use boon_plan::{
-    EffectInvocationId, FieldId, FiniteReal, InitialValueKind, ListId, ListInitializerKind,
-    ListStorageSlot, MachinePlan, PlanConstantId, PlanConstantValue, PlanDerivedExpression,
-    PlanDerivedKind, PlanExpressionKind, PlanListOperationKind, PlanListProjection,
-    PlanListRemovePredicate, PlanOp, PlanOpId, PlanOpKind, PlanQueryResidual, PlanQuerySelection,
-    PlanRowCallArg, PlanRowExpression, PlanRowSelectPattern, PlanSourceGuard, QueryCollectionId,
-    QueryCollectionPlan, QueryIndexId, QueryIndexPlan, QueryKeyType, RootOutputDemand,
+    DataTypePlan, DistributedArgumentId, EffectInvocationId, EffectInvocationPlan,
+    EffectResultRoute, ExportId, FieldId, FiniteReal, ImportId, InitialValueKind, ListId,
+    ListInitializerKind, ListStorageSlot, MachinePlan, PlanConstantId, PlanConstantValue,
+    PlanDerivedExpression, PlanDerivedKind, PlanExpressionKind, PlanIntrinsic,
+    PlanListOperationKind, PlanListProjection, PlanListRemovePredicate, PlanOp, PlanOpId,
+    PlanOpKind, PlanQueryResidual, PlanQuerySelection, PlanRowCallArg, PlanRowExpression,
+    PlanRowSelectPattern, PlanSourceGuard, ProgramRole, QueryCollectionId, QueryCollectionPlan,
+    QueryIndexId, QueryIndexPlan, QueryKeyType, RemoteCallSiteId, RootOutputDemand,
     ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute, StateId, ValueRef,
 };
 use boon_query::{
@@ -19,6 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_SESSION_LAUNCH_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+pub const MAX_SESSION_INFO_ID_BYTES: usize = 1024;
+pub const TRANSIENT_EFFECT_FIRST_RESULT_SEQUENCE: u64 = 0;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Value {
@@ -90,6 +96,10 @@ pub struct RowSnapshot {
 pub enum Delta {
     SetValue {
         target: ValueTarget,
+        value: Value,
+    },
+    SetDistributedImport {
+        import_id: ImportId,
         value: Value,
     },
     InsertRow {
@@ -169,6 +179,8 @@ pub struct Turn {
     pub durable_changes: Vec<boon_persistence::DurableChange>,
     pub outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
     pub transient_effects: Vec<TransientEffectInvocation>,
+    pub cancelled_transient_effects: Vec<TransientEffectCallId>,
+    pub transient_effect_credit_grants: Vec<TransientEffectCreditGrant>,
     pub metrics: TurnMetrics,
 }
 
@@ -203,6 +215,13 @@ pub struct TransientEffectInvocation {
     pub authority_turn_sequence: u64,
     pub target: Option<RowId>,
     pub intent: Value,
+    pub delivery: boon_plan::EffectDeliveryCardinality,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransientEffectCreditGrant {
+    pub call_id: TransientEffectCallId,
+    pub credits: u32,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -267,6 +286,10 @@ impl Snapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionOptions {
     pub require_monotonic_sequences: bool,
+    /// Session identity exposed by `SessionInfo/status()`.
+    pub session_id: Option<String>,
+    /// Authenticated identity exposed by `SessionInfo/principal()`.
+    pub principal_id: Option<String>,
     /// Deterministic executor work allowed for one startup, source turn, or
     /// host-owned currentness transaction. Trusted applications leave this
     /// unbounded; capability hosts set it for restricted programs.
@@ -277,13 +300,33 @@ impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             require_monotonic_sequences: true,
+            session_id: None,
+            principal_id: None,
             max_work_units_per_transaction: None,
         }
     }
 }
 
+fn validate_session_options(options: &SessionOptions) -> Result<(), Error> {
+    for (name, value) in [
+        ("session_id", options.session_id.as_deref()),
+        ("principal_id", options.principal_id.as_deref()),
+    ] {
+        if let Some(value) = value
+            && value.len() > MAX_SESSION_INFO_ID_BYTES
+        {
+            return Err(Error::InvalidOptions(format!(
+                "{name} is {} UTF-8 bytes; limit is {MAX_SESSION_INFO_ID_BYTES}",
+                value.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
+    InvalidOptions(String),
     InvalidPlan(String),
     InvalidEvent(String),
     Unsupported { op: PlanOpId, detail: String },
@@ -296,6 +339,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidOptions(detail) => write!(formatter, "invalid SessionOptions: {detail}"),
             Self::InvalidPlan(detail) => write!(formatter, "invalid MachinePlan: {detail}"),
             Self::InvalidEvent(detail) => write!(formatter, "invalid source event: {detail}"),
             Self::Unsupported { op, detail } => {
@@ -414,6 +458,7 @@ enum DynamicDependency {
     Query(IndexKey),
     IndexedQuery(QueryIndexId),
     List(ListId),
+    DistributedImport(ImportId),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -422,6 +467,7 @@ struct DynamicDependencies {
     by_query: BTreeMap<IndexKey, BTreeSet<Consumer>>,
     by_indexed_query: BTreeMap<QueryIndexId, BTreeSet<Consumer>>,
     by_list: BTreeMap<ListId, BTreeSet<Consumer>>,
+    by_distributed_import: BTreeMap<ImportId, BTreeSet<Consumer>>,
     by_consumer: BTreeMap<Consumer, BTreeSet<DynamicDependency>>,
 }
 
@@ -443,6 +489,9 @@ impl DynamicDependencies {
                 }
                 DynamicDependency::List(list) => {
                     remove_consumer(&mut self.by_list, &list, consumer)
+                }
+                DynamicDependency::DistributedImport(import) => {
+                    remove_consumer(&mut self.by_distributed_import, &import, consumer)
                 }
             }
         }
@@ -471,6 +520,12 @@ impl DynamicDependencies {
             }
             DynamicDependency::List(list) => {
                 self.by_list.entry(list).or_default().insert(consumer);
+            }
+            DynamicDependency::DistributedImport(import) => {
+                self.by_distributed_import
+                    .entry(import)
+                    .or_default()
+                    .insert(consumer);
             }
         }
     }
@@ -504,6 +559,7 @@ struct Dependencies {
 #[derive(Clone, Debug)]
 struct Metadata {
     constants: BTreeMap<PlanConstantId, Value>,
+    distributed_import_types: BTreeMap<ImportId, DataTypePlan>,
     root_computations: BTreeMap<FieldId, Arc<PlanOp>>,
     row_computations: BTreeMap<FieldId, Arc<PlanOp>>,
     row_field_owner: BTreeMap<FieldId, ListId>,
@@ -521,12 +577,50 @@ struct Metadata {
     root_state_by_exact_name: BTreeMap<String, Vec<StateId>>,
     root_state_by_name: BTreeMap<String, Vec<StateId>>,
     routes: BTreeMap<SourceId, SourceRoute>,
-    internal_effect_result_sources: BTreeSet<SourceId>,
     updates_by_source: BTreeMap<SourceId, Vec<Arc<PlanOp>>>,
+    updates_by_state: BTreeMap<StateId, Vec<Arc<PlanOp>>>,
     mutations: Vec<Arc<PlanOp>>,
+    mutations_by_state: BTreeMap<StateId, Vec<Arc<PlanOp>>>,
     source_derived_by_source: BTreeMap<SourceId, BTreeSet<FieldId>>,
+    transient_effect_result_states: BTreeSet<StateId>,
+    transient_effect_result_fields: BTreeSet<FieldId>,
     published: BTreeSet<FieldId>,
     dependencies: Dependencies,
+}
+
+fn distributed_import_contracts(
+    plan: &MachinePlan,
+) -> Result<BTreeMap<ImportId, DataTypePlan>, Error> {
+    let Some(endpoint) = &plan.distributed_endpoint else {
+        return Ok(BTreeMap::new());
+    };
+    if endpoint.endpoint.role != plan.program_role {
+        return Err(Error::InvalidPlan(
+            "distributed endpoint role does not match the machine role".to_owned(),
+        ));
+    }
+    let contracts = endpoint
+        .endpoint
+        .value_imports
+        .iter()
+        .map(|import| (import.import_id, import.data_type.clone()))
+        .chain(
+            endpoint
+                .endpoint
+                .remote_call_sites
+                .iter()
+                .map(|call| (call.result_import_id, call.result_type.clone())),
+        )
+        .collect::<Vec<_>>();
+    let mut by_id = BTreeMap::new();
+    for (import_id, data_type) in contracts {
+        if by_id.insert(import_id, data_type).is_some() {
+            return Err(Error::InvalidPlan(format!(
+                "distributed import {import_id} is declared more than once"
+            )));
+        }
+    }
+    Ok(by_id)
 }
 
 impl Metadata {
@@ -536,6 +630,7 @@ impl Metadata {
             .iter()
             .map(|constant| Ok((constant.id, constant_value(&constant.value)?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        let distributed_import_types = distributed_import_contracts(plan)?;
         let field_labels = debug_labels(&plan.debug_map.fields, "field:")
             .into_iter()
             .map(|(id, label)| (FieldId(id), label))
@@ -721,6 +816,15 @@ impl Metadata {
         let mut row_computations = BTreeMap::new();
         let mut source_derived_by_source = BTreeMap::<SourceId, BTreeSet<FieldId>>::new();
         let mut updates_by_source = BTreeMap::<SourceId, Vec<Arc<PlanOp>>>::new();
+        let mut updates_by_state = BTreeMap::<StateId, Vec<Arc<PlanOp>>>::new();
+        let read_only_effects = plan
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect.replay, boon_plan::EffectReplay::ReadOnly))
+            .map(|effect| effect.effect_id)
+            .collect::<BTreeSet<_>>();
+        let mut transient_effect_result_states = BTreeSet::new();
+        let mut transient_effect_result_fields = BTreeSet::new();
         let mut mutations = Vec::new();
         for op in plan.regions.iter().flat_map(|region| &region.ops) {
             match &op.kind {
@@ -757,16 +861,42 @@ impl Metadata {
                     };
                     root_computations.insert(field, Arc::new(op.clone()));
                 }
-                PlanOpKind::UpdateBranch { .. } => {
+                PlanOpKind::UpdateBranch {
+                    trigger, effect, ..
+                } => {
+                    if let Some(EffectInvocationPlan {
+                        effect_id,
+                        result: EffectResultRoute::Target { target, .. },
+                        ..
+                    }) = effect
+                        && read_only_effects.contains(effect_id)
+                    {
+                        match target {
+                            ValueRef::State(state) => {
+                                transient_effect_result_states.insert(*state);
+                            }
+                            ValueRef::Field(field) => {
+                                transient_effect_result_fields.insert(*field);
+                            }
+                            _ => {}
+                        }
+                    }
                     let op = Arc::new(op.clone());
-                    for source in op.inputs.iter().filter_map(|input| match input {
-                        ValueRef::Source(source) => Some(*source),
-                        _ => None,
-                    }) {
-                        updates_by_source
-                            .entry(source)
+                    match trigger {
+                        ValueRef::Source(source) => updates_by_source
+                            .entry(*source)
                             .or_default()
-                            .push(Arc::clone(&op));
+                            .push(Arc::clone(&op)),
+                        ValueRef::State(state) => updates_by_state
+                            .entry(*state)
+                            .or_default()
+                            .push(Arc::clone(&op)),
+                        _ => {
+                            return Err(Error::InvalidPlan(format!(
+                                "update op {} has a non-event trigger",
+                                op.id.0
+                            )));
+                        }
                     }
                 }
                 PlanOpKind::ListOperation {
@@ -809,7 +939,36 @@ impl Metadata {
         for ops in updates_by_source.values_mut() {
             ops.sort_by_key(|op| op.id);
         }
+        for ops in updates_by_state.values_mut() {
+            ops.sort_by_key(|op| op.id);
+        }
+        transient_effect_result_fields.extend(
+            transient_effect_result_states
+                .iter()
+                .filter_map(|state| indexed_state_field.get(state).copied()),
+        );
         mutations.sort_by_key(|op| op.id);
+        let mut mutations_by_state = BTreeMap::<StateId, Vec<Arc<PlanOp>>>::new();
+        for mutation in &mutations {
+            let PlanOpKind::ListOperation {
+                append: Some(append),
+                ..
+            } = &mutation.kind
+            else {
+                continue;
+            };
+            let states = match &append.trigger {
+                ValueRef::State(state) => vec![*state],
+                ValueRef::Field(field) => root_state_dependencies(*field, &root_computations),
+                _ => Vec::new(),
+            };
+            for state in states {
+                mutations_by_state
+                    .entry(state)
+                    .or_default()
+                    .push(Arc::clone(mutation));
+            }
+        }
 
         let published: BTreeSet<FieldId> = match &plan.demand.root_derived_outputs {
             RootOutputDemand::All => root_computations.keys().copied().collect(),
@@ -846,27 +1005,9 @@ impl Metadata {
         if routes.len() != plan.source_routes.len() {
             return Err(Error::InvalidPlan("duplicate source id".to_owned()));
         }
-        let internal_effect_result_sources = plan
-            .regions
-            .iter()
-            .flat_map(|region| &region.ops)
-            .filter_map(|op| match &op.kind {
-                PlanOpKind::UpdateBranch {
-                    effect:
-                        Some(boon_plan::EffectInvocationPlan {
-                            result: boon_plan::EffectResultRoute::CorrelatedSources { variants },
-                            ..
-                        }),
-                    ..
-                } => Some(variants.as_slice()),
-                _ => None,
-            })
-            .flatten()
-            .map(|route| route.source_id)
-            .collect::<BTreeSet<_>>();
-
         let mut metadata = Self {
             constants,
+            distributed_import_types,
             root_computations,
             row_computations,
             row_field_owner,
@@ -884,10 +1025,13 @@ impl Metadata {
             root_state_by_exact_name,
             root_state_by_name,
             routes,
-            internal_effect_result_sources,
             updates_by_source,
+            updates_by_state,
             mutations,
+            mutations_by_state,
             source_derived_by_source,
+            transient_effect_result_states,
+            transient_effect_result_fields,
             published,
             dependencies: Dependencies::default(),
         };
@@ -1200,7 +1344,6 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
         }
         PlanConstantValue::Data { value } => Ok(runtime_value_from_data(value)),
         PlanConstantValue::Number { value } => Ok(Value::Number(*value)),
-        PlanConstantValue::Byte { value } => Value::integer(i64::from(*value)),
         PlanConstantValue::Bool { value } => Ok(Value::Bool(*value)),
         PlanConstantValue::Bytes {
             byte_len,
@@ -1242,7 +1385,7 @@ fn runtime_value_from_data(value: &boon_data::Value) -> Value {
                 Value::Text(tag.clone())
             } else {
                 Value::Record(
-                    std::iter::once(("tag".to_owned(), Value::Text(tag.clone())))
+                    std::iter::once(("$tag".to_owned(), Value::Text(tag.clone())))
                         .chain(
                             fields.iter().map(|(name, value)| {
                                 (name.clone(), runtime_value_from_data(value))
@@ -1614,14 +1757,6 @@ fn validate_value_for_data_type(
         | (Value::Bool(_), DataTypePlan::Bool)
         | (Value::Number(_), DataTypePlan::Number)
         | (Value::Text(_), DataTypePlan::Text) => Ok(()),
-        (Value::Number(value), DataTypePlan::Byte)
-            if value
-                .to_i64_exact()
-                .ok()
-                .is_some_and(|value| (0..=u8::MAX as i64).contains(&value)) =>
-        {
-            Ok(())
-        }
         (Value::Bytes(value), DataTypePlan::Bytes { fixed_len })
             if fixed_len
                 .is_none_or(|expected| u64::try_from(value.len()).ok() == Some(expected)) =>
@@ -1679,6 +1814,20 @@ fn validate_value_for_data_type(
             "{path} does not match its declared data type"
         ))),
     }
+}
+
+fn validate_distributed_boundary_value(
+    value: &Value,
+    data_type: &DataTypePlan,
+    path: &str,
+) -> Result<(), Error> {
+    // Cross-role reads preserve Boon's normal value type while allowing a
+    // generated transport/currentness error to flow through existing error
+    // propagation. Applications do not serialize or inspect transport frames.
+    if matches!(value, Value::Error { .. }) {
+        return Ok(());
+    }
+    validate_value_for_data_type(value, data_type, path)
 }
 
 fn validate_record_for_data_type(
@@ -1784,8 +1933,11 @@ struct Work {
     authority_deltas: Vec<AuthorityDelta>,
     outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
     transient_effects: Vec<TransientEffectInvocation>,
+    cancelled_transient_effects: Vec<TransientEffectCallId>,
+    transient_effect_credit_grants: Vec<TransientEffectCreditGrant>,
     committed_transient_effects: Vec<TransientEffectCallId>,
     completed_transient_effects: Vec<(TransientEffectCallId, PendingTransientEffect)>,
+    updated_transient_effects: Vec<(TransientEffectCallId, PendingTransientEffect)>,
     metrics: TurnMetrics,
     dirty_states: HashSet<StateId>,
     dirty_consumers: HashSet<Consumer>,
@@ -1818,8 +1970,11 @@ impl Work {
         self.authority_deltas.clear();
         self.outbox_changes.clear();
         self.transient_effects.clear();
+        self.cancelled_transient_effects.clear();
+        self.transient_effect_credit_grants.clear();
         self.committed_transient_effects.clear();
         self.completed_transient_effects.clear();
+        self.updated_transient_effects.clear();
         self.metrics = TurnMetrics::default();
         self.dirty_states.clear();
         self.dirty_consumers.clear();
@@ -1864,6 +2019,7 @@ impl Work {
         self.undo_row_fields.clear();
         self.committed_transient_effects.clear();
         self.completed_transient_effects.clear();
+        self.updated_transient_effects.clear();
         self.pending_settle = false;
     }
 
@@ -1887,6 +2043,9 @@ struct PendingTransientEffect {
     invocation_id: EffectInvocationId,
     effect_id: boon_plan::EffectId,
     target: Option<RowId>,
+    delivery: boon_plan::EffectDeliveryCardinality,
+    next_result_sequence: u64,
+    available_credits: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1906,6 +2065,9 @@ pub struct Session {
     plan: Arc<MachinePlan>,
     options: SessionOptions,
     metadata: Arc<Metadata>,
+    distributed_imports: BTreeMap<ImportId, Value>,
+    distributed_import_revisions: BTreeMap<ImportId, u64>,
+    active_distributed_arguments: BTreeMap<(ExportId, DistributedArgumentId), Value>,
     root_states: BTreeMap<StateId, Value>,
     root_fields: BTreeMap<FieldId, DerivedCell>,
     lists: BTreeMap<ListId, ListState>,
@@ -1943,6 +2105,7 @@ impl SessionBuilder {
     }
 
     pub fn new_shared(plan: Arc<MachinePlan>, options: SessionOptions) -> Result<Self, Error> {
+        validate_session_options(&options)?;
         if plan.version.major != boon_plan::PLAN_MAJOR_VERSION {
             return Err(Error::InvalidPlan(format!(
                 "plan major version {} is not supported",
@@ -1951,12 +2114,28 @@ impl SessionBuilder {
         }
         let metadata = Arc::new(Metadata::new(&plan)?);
         let query_collections = empty_query_collections(&metadata)?;
+        let distributed_imports = metadata
+            .distributed_import_types
+            .keys()
+            .copied()
+            .map(|import_id| {
+                (
+                    import_id,
+                    Value::Error {
+                        code: "remote_not_current".to_owned(),
+                    },
+                )
+            })
+            .collect();
         let turn_work = Work::with_limit(options.max_work_units_per_transaction);
         Ok(Self {
             session: Session {
                 plan,
                 options,
                 metadata,
+                distributed_imports,
+                distributed_import_revisions: BTreeMap::new(),
+                active_distributed_arguments: BTreeMap::new(),
                 root_states: BTreeMap::new(),
                 root_fields: BTreeMap::new(),
                 lists: BTreeMap::new(),
@@ -2019,6 +2198,268 @@ impl Session {
 
     pub fn shared_plan(&self) -> Arc<MachinePlan> {
         Arc::clone(&self.plan)
+    }
+
+    pub fn distributed_import_revision(&self, import_id: ImportId) -> Option<u64> {
+        self.distributed_import_revisions.get(&import_id).copied()
+    }
+
+    pub fn distributed_import_value_current(&self, import_id: ImportId) -> Result<Value, Error> {
+        self.distributed_imports
+            .get(&import_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidEvent(format!(
+                    "distributed import {import_id} is not declared by this endpoint"
+                ))
+            })
+    }
+
+    /// Installs a producer-owned value without fabricating a local SOURCE event.
+    /// Revisions are producer-local monotonic content revisions; equal deliveries
+    /// are idempotent and stale or conflicting deliveries fail closed.
+    pub fn update_distributed_import(
+        &mut self,
+        import_id: ImportId,
+        content_revision: u64,
+        value: Value,
+    ) -> Result<Option<Turn>, Error> {
+        let data_type = self
+            .metadata
+            .distributed_import_types
+            .get(&import_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidEvent(format!(
+                    "distributed import {import_id} is not declared by this endpoint"
+                ))
+            })?;
+        if content_revision == 0 {
+            return Err(Error::InvalidEvent(format!(
+                "distributed import {import_id} content revision must be positive"
+            )));
+        }
+        validate_distributed_boundary_value(&value, &data_type, "distributed import")?;
+
+        let previous_revision = self
+            .distributed_import_revisions
+            .get(&import_id)
+            .copied()
+            .unwrap_or(0);
+        let previous_value = self.distributed_imports.get(&import_id).cloned();
+        if content_revision < previous_revision {
+            return Err(Error::InvalidEvent(format!(
+                "distributed import {import_id} revision {content_revision} is stale; current revision is {previous_revision}"
+            )));
+        }
+        if content_revision == previous_revision {
+            if previous_value.as_ref() == Some(&value) {
+                return Ok(None);
+            }
+            return Err(Error::InvalidEvent(format!(
+                "distributed import {import_id} revision {content_revision} conflicts with its current value"
+            )));
+        }
+
+        let sequence = self.next_internal_turn_sequence()?;
+        let mut work = self.take_internal_turn_work();
+        self.distributed_imports.insert(import_id, value);
+        self.distributed_import_revisions
+            .insert(import_id, content_revision);
+        let result = (|| {
+            work.deltas.push(Delta::SetDistributedImport {
+                import_id,
+                value: self
+                    .distributed_imports
+                    .get(&import_id)
+                    .cloned()
+                    .expect("updated distributed import exists"),
+            });
+            self.invalidate_distributed_import(import_id, &mut work);
+            self.ensure_published_current(None, &mut work)?;
+            self.turn_sequence = sequence;
+            work.finish_metrics();
+            let turn = Turn {
+                sequence,
+                source_sequence: None,
+                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: Vec::new(),
+                durable_changes: Vec::new(),
+                outbox_changes: Vec::new(),
+                transient_effects: Vec::new(),
+                cancelled_transient_effects: Vec::new(),
+                transient_effect_credit_grants: Vec::new(),
+                metrics: std::mem::take(&mut work.metrics),
+            };
+            work.pending_settle = true;
+            Ok(turn)
+        })();
+        if result.is_err() {
+            match previous_value {
+                Some(value) => {
+                    self.distributed_imports.insert(import_id, value);
+                }
+                None => {
+                    self.distributed_imports.remove(&import_id);
+                }
+            }
+            if previous_revision == 0 {
+                self.distributed_import_revisions.remove(&import_id);
+            } else {
+                self.distributed_import_revisions
+                    .insert(import_id, previous_revision);
+            }
+        }
+        self.finish_internal_turn_work(work, result).map(Some)
+    }
+
+    pub fn distributed_export_value_current(
+        &mut self,
+        export_id: ExportId,
+    ) -> Result<Value, Error> {
+        let export = self
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .and_then(|endpoint| {
+                endpoint
+                    .endpoint
+                    .value_exports
+                    .iter()
+                    .find(|export| export.export_id == export_id)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidEvent(format!(
+                    "distributed value export {export_id} is not declared by this endpoint"
+                ))
+            })?;
+        let mut work = self.fresh_work();
+        let evaluated = self.eval_value_ref(&export.value, None, None, None, None, &mut work)?;
+        let value = self.materialize_eval(evaluated)?;
+        validate_distributed_boundary_value(&value, &export.data_type, "distributed value export")?;
+        Ok(value)
+    }
+
+    pub fn evaluate_distributed_function(
+        &mut self,
+        export_id: ExportId,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    ) -> Result<Value, Error> {
+        let function = self
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .and_then(|endpoint| {
+                endpoint
+                    .endpoint
+                    .pure_function_exports
+                    .iter()
+                    .find(|function| function.export_id == export_id)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidEvent(format!(
+                    "distributed pure function export {export_id} is not declared by this endpoint"
+                ))
+            })?;
+        if arguments.len() != function.parameters.len() {
+            return Err(Error::InvalidEvent(format!(
+                "distributed function {export_id} received {} argument(s), expected {}",
+                arguments.len(),
+                function.parameters.len()
+            )));
+        }
+        let mut active = BTreeMap::new();
+        for parameter in &function.parameters {
+            let value = arguments
+                .get(&parameter.argument_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidEvent(format!(
+                        "distributed function {export_id} is missing argument `{}`",
+                        parameter.name
+                    ))
+                })?;
+            validate_distributed_boundary_value(
+                &value,
+                &parameter.data_type,
+                &format!("distributed argument `{}`", parameter.name),
+            )?;
+            active.insert((export_id, parameter.argument_id), value);
+        }
+        if !self.active_distributed_arguments.is_empty() {
+            return Err(Error::Evaluation(
+                "distributed pure function evaluation is not reentrant".to_owned(),
+            ));
+        }
+        self.active_distributed_arguments = active;
+        let mut bindings = BTreeMap::new();
+        let mut work = self.fresh_work();
+        let result = self
+            .eval_row_expression(
+                &function.body,
+                None,
+                None,
+                None,
+                None,
+                &mut bindings,
+                &mut work,
+            )
+            .and_then(|value| self.materialize_eval(value));
+        self.active_distributed_arguments.clear();
+        let value = result?;
+        validate_distributed_boundary_value(
+            &value,
+            &function.result_type,
+            "distributed function result",
+        )?;
+        Ok(value)
+    }
+
+    pub fn distributed_call_arguments_current(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+    ) -> Result<BTreeMap<DistributedArgumentId, Value>, Error> {
+        let call = self
+            .plan
+            .distributed_endpoint
+            .as_ref()
+            .and_then(|endpoint| {
+                endpoint
+                    .endpoint
+                    .remote_call_sites
+                    .iter()
+                    .find(|call| call.call_site_id == call_site_id)
+            })
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidEvent(format!(
+                    "remote call site {call_site_id} is not declared by this endpoint"
+                ))
+            })?;
+        let mut values = BTreeMap::new();
+        let mut work = self.fresh_work();
+        for argument in &call.arguments {
+            let mut bindings = BTreeMap::new();
+            let evaluated = self.eval_row_expression(
+                &argument.value,
+                None,
+                None,
+                None,
+                None,
+                &mut bindings,
+                &mut work,
+            )?;
+            let value = self.materialize_eval(evaluated)?;
+            validate_distributed_boundary_value(
+                &value,
+                &argument.data_type,
+                &format!("remote call argument `{}`", argument.name),
+            )?;
+            values.insert(argument.argument_id, value);
+        }
+        Ok(values)
     }
 
     pub fn list_rows(&self, list: ListId) -> Vec<RowId> {
@@ -2393,6 +2834,17 @@ impl Session {
     ) -> Result<Vec<boon_persistence::DurableChange>, Error> {
         deltas
             .iter()
+            .filter(|delta| match delta {
+                AuthorityDelta::SetRoot { state, .. } => {
+                    !self.metadata.transient_effect_result_states.contains(state)
+                }
+                AuthorityDelta::SetRowField { field, .. } => {
+                    !self.metadata.transient_effect_result_fields.contains(field)
+                }
+                AuthorityDelta::ReplaceList { .. }
+                | AuthorityDelta::InsertRow { .. }
+                | AuthorityDelta::RemoveRow { .. } => true,
+            })
             .map(|delta| match delta {
                 AuthorityDelta::SetRoot { state, value } => {
                     let memory = self
@@ -3513,6 +3965,15 @@ impl Session {
         item: &boon_persistence::DurableOutboxItem,
         outcome: boon_persistence::StoredValue,
     ) -> Result<Turn, Error> {
+        self.complete_effect_with_demand(item, outcome, &[])
+    }
+
+    pub fn complete_effect_with_demand(
+        &mut self,
+        item: &boon_persistence::DurableOutboxItem,
+        outcome: boon_persistence::StoredValue,
+        demanded_targets: &[ValueTarget],
+    ) -> Result<Turn, Error> {
         let attempt = match item.state {
             boon_persistence::DurableOutboxState::Dispatching { attempt }
             | boon_persistence::DurableOutboxState::ReconciliationRequired { attempt } => attempt,
@@ -3567,6 +4028,7 @@ impl Session {
                 sequence,
                 &mut work,
             )?;
+            self.ensure_demanded_current(demanded_targets, None, &mut work)?;
             let durable_changes = self.durable_changes(&work.authority_deltas)?;
             work.outbox_changes
                 .push(boon_persistence::DurableOutboxChange::Complete {
@@ -3588,6 +4050,10 @@ impl Session {
                 durable_changes,
                 outbox_changes: std::mem::take(&mut work.outbox_changes),
                 transient_effects: std::mem::take(&mut work.transient_effects),
+                cancelled_transient_effects: std::mem::take(&mut work.cancelled_transient_effects),
+                transient_effect_credit_grants: std::mem::take(
+                    &mut work.transient_effect_credit_grants,
+                ),
                 metrics: std::mem::take(&mut work.metrics),
             };
             work.pending_settle = true;
@@ -3600,6 +4066,15 @@ impl Session {
         &mut self,
         call_id: TransientEffectCallId,
         outcome: Value,
+    ) -> Result<Turn, Error> {
+        self.complete_transient_effect_with_demand(call_id, outcome, &[])
+    }
+
+    pub fn complete_transient_effect_with_demand(
+        &mut self,
+        call_id: TransientEffectCallId,
+        outcome: Value,
+        demanded_targets: &[ValueTarget],
     ) -> Result<Turn, Error> {
         if call_id.launch_epoch != self.launch_epoch {
             return Err(Error::InvalidEvent(format!(
@@ -3632,6 +4107,14 @@ impl Session {
                     "transient effect call {call_id} has no effect contract"
                 ))
             })?;
+        if !matches!(
+            contract.delivery,
+            boon_plan::EffectDeliveryCardinality::Single
+        ) {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} is a stream; deliver it with an explicit result sequence"
+            )));
+        }
         if !matches!(contract.replay, boon_plan::EffectReplay::ReadOnly)
             || contract.barrier != boon_plan::EffectBarrier::None
         {
@@ -3661,6 +4144,7 @@ impl Session {
                 sequence,
                 &mut work,
             )?;
+            self.ensure_demanded_current(demanded_targets, None, &mut work)?;
             let durable_changes = self.durable_changes(&work.authority_deltas)?;
             let removed = self
                 .pending_transient_effects
@@ -3682,6 +4166,181 @@ impl Session {
                 durable_changes,
                 outbox_changes: Vec::new(),
                 transient_effects: std::mem::take(&mut work.transient_effects),
+                cancelled_transient_effects: std::mem::take(&mut work.cancelled_transient_effects),
+                transient_effect_credit_grants: std::mem::take(
+                    &mut work.transient_effect_credit_grants,
+                ),
+                metrics: std::mem::take(&mut work.metrics),
+            };
+            work.pending_settle = true;
+            Ok(turn)
+        })();
+        self.finish_internal_turn_work(work, result)
+    }
+
+    pub fn deliver_transient_effect_result(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+    ) -> Result<Turn, Error> {
+        self.deliver_transient_effect_result_with_demand(call_id, result_sequence, outcome, &[])
+    }
+
+    pub fn deliver_transient_effect_result_with_demand(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+        demanded_targets: &[ValueTarget],
+    ) -> Result<Turn, Error> {
+        if call_id.launch_epoch != self.launch_epoch {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} belongs to a different session launch"
+            )));
+        }
+        let pending = self
+            .pending_transient_effects
+            .get(&call_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidEvent(format!(
+                    "transient effect call {call_id} is unknown, cancelled, or already completed"
+                ))
+            })?;
+        let boon_plan::EffectDeliveryCardinality::Stream {
+            max_in_flight,
+            terminal_result_tags,
+            ..
+        } = &pending.delivery
+        else {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} is single-delivery"
+            )));
+        };
+        if result_sequence != pending.next_result_sequence {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} expected result sequence {}, got {result_sequence}",
+                pending.next_result_sequence
+            )));
+        }
+        if pending.available_credits == 0 {
+            return Err(Error::InvalidEvent(format!(
+                "transient effect call {call_id} has no delivery credit"
+            )));
+        }
+
+        let (op, effect) = self.effect_invocation(pending.invocation_id)?;
+        if effect.effect_id != pending.effect_id {
+            return Err(Error::InvalidPlan(format!(
+                "transient effect call {call_id} no longer matches invocation {}",
+                pending.invocation_id
+            )));
+        }
+        let contract = self
+            .plan
+            .effects
+            .iter()
+            .find(|contract| contract.effect_id == effect.effect_id)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "transient effect call {call_id} has no effect contract"
+                ))
+            })?;
+        if contract.delivery != pending.delivery {
+            return Err(Error::InvalidPlan(format!(
+                "transient effect call {call_id} delivery contract changed while active"
+            )));
+        }
+        let result_type = &contract
+            .schema
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "transient effect call {call_id} has no typed result schema"
+                ))
+            })?
+            .result_type;
+        validate_value_for_data_type(&outcome, result_type, "stream effect outcome")?;
+        let outcome_tag = effect_outcome_tag(&outcome).ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "transient effect call {call_id} stream outcome has no variant tag"
+            ))
+        })?;
+        let terminal = terminal_result_tags
+            .binary_search_by(|candidate| candidate.as_str().cmp(outcome_tag))
+            .is_ok();
+        let stored_outcome = stored_value_for_data_type(&outcome, result_type)?;
+        let max_in_flight = *max_in_flight;
+        let sequence = self.next_internal_turn_sequence()?;
+        let mut work = self.take_internal_turn_work();
+        let result = (|| {
+            self.apply_effect_outcome(
+                &op,
+                &effect.result,
+                pending.target,
+                stored_outcome,
+                sequence,
+                &mut work,
+            )?;
+            self.ensure_demanded_current(demanded_targets, None, &mut work)?;
+            let durable_changes = self.durable_changes(&work.authority_deltas)?;
+
+            if terminal {
+                let removed = self
+                    .pending_transient_effects
+                    .remove(&call_id)
+                    .ok_or_else(|| {
+                        Error::InvalidEvent(format!(
+                            "transient effect call {call_id} terminated concurrently"
+                        ))
+                    })?;
+                work.completed_transient_effects.push((call_id, removed));
+            } else {
+                work.updated_transient_effects
+                    .push((call_id, pending.clone()));
+                let active = self
+                    .pending_transient_effects
+                    .get_mut(&call_id)
+                    .ok_or_else(|| {
+                        Error::InvalidEvent(format!(
+                            "transient effect call {call_id} was cancelled concurrently"
+                        ))
+                    })?;
+                active.available_credits = active.available_credits.saturating_sub(1);
+                active.next_result_sequence =
+                    active.next_result_sequence.checked_add(1).ok_or_else(|| {
+                        Error::Evaluation(format!(
+                            "transient effect call {call_id} exhausted result sequences"
+                        ))
+                    })?;
+                active.available_credits = active
+                    .available_credits
+                    .checked_add(1)
+                    .unwrap_or(max_in_flight)
+                    .min(max_in_flight);
+                work.transient_effect_credit_grants
+                    .push(TransientEffectCreditGrant {
+                        call_id,
+                        credits: 1,
+                    });
+            }
+
+            self.commit_transient_effects(&mut work)?;
+            self.turn_sequence = sequence;
+            work.finish_metrics();
+            let turn = Turn {
+                sequence,
+                source_sequence: None,
+                deltas: coalesce_deltas(std::mem::take(&mut work.deltas)),
+                authority_deltas: std::mem::take(&mut work.authority_deltas),
+                durable_changes,
+                outbox_changes: Vec::new(),
+                transient_effects: std::mem::take(&mut work.transient_effects),
+                cancelled_transient_effects: std::mem::take(&mut work.cancelled_transient_effects),
+                transient_effect_credit_grants: std::mem::take(
+                    &mut work.transient_effect_credit_grants,
+                ),
                 metrics: std::mem::take(&mut work.metrics),
             };
             work.pending_settle = true;
@@ -3704,6 +4363,12 @@ impl Session {
 
     pub fn pending_transient_effect_count(&self) -> usize {
         self.pending_transient_effects.len()
+    }
+
+    pub fn pending_transient_effect_credits(&self, call_id: TransientEffectCallId) -> Option<u32> {
+        self.pending_transient_effects
+            .get(&call_id)
+            .map(|pending| pending.available_credits)
     }
 
     fn next_internal_turn_sequence(&self) -> Result<u64, Error> {
@@ -3729,6 +4394,8 @@ impl Session {
             durable_changes: Vec::new(),
             outbox_changes: std::mem::take(&mut work.outbox_changes),
             transient_effects: Vec::new(),
+            cancelled_transient_effects: Vec::new(),
+            transient_effect_credit_grants: Vec::new(),
             metrics: std::mem::take(&mut work.metrics),
         };
         work.pending_settle = true;
@@ -3854,77 +4521,7 @@ impl Session {
         match route {
             boon_plan::EffectResultRoute::Target { target, .. } => {
                 let value = runtime_value(outcome)?;
-                self.apply_effect_result(op, target, row, value, work)
-            }
-            boon_plan::EffectResultRoute::CorrelatedSources { variants } => {
-                let boon_persistence::StoredValue::Variant { tag, fields } = outcome else {
-                    return Err(Error::InvalidPlan(format!(
-                        "correlated effect invocation {} completed with a non-variant outcome",
-                        op.id.0
-                    )));
-                };
-                let mut matching = variants.iter().filter(|route| route.tag == tag);
-                let route = matching.next().ok_or_else(|| {
-                    Error::InvalidPlan(format!(
-                        "correlated effect invocation {} has no SOURCE route for `{tag}`",
-                        op.id.0
-                    ))
-                })?;
-                if matching.next().is_some() {
-                    return Err(Error::InvalidPlan(format!(
-                        "correlated effect invocation {} has multiple SOURCE routes for `{tag}`",
-                        op.id.0
-                    )));
-                }
-                let source = self
-                    .metadata
-                    .routes
-                    .get(&route.source_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::InvalidPlan(format!(
-                            "correlated effect result SOURCE {} is absent from the plan",
-                            route.source_id.0
-                        ))
-                    })?;
-                let expected_fields = source
-                    .payload_schema
-                    .typed_fields
-                    .iter()
-                    .map(|field| source_payload_schema_field_name(&field.field).to_owned())
-                    .collect::<BTreeSet<_>>();
-                if expected_fields != fields.keys().cloned().collect() {
-                    return Err(Error::InvalidPlan(format!(
-                        "correlated effect result `{tag}` fields differ from SOURCE {} payload schema",
-                        route.source_id.0
-                    )));
-                }
-                let mut payload = SourcePayload::default();
-                for (name, value) in fields {
-                    set_source_payload_value(
-                        &mut payload,
-                        &source_payload_field_from_effect_name(&name),
-                        runtime_value(value)?,
-                    )?;
-                }
-                let target = if source.scoped {
-                    Some(row.ok_or_else(|| {
-                        Error::InvalidPlan(format!(
-                            "scoped correlated effect result SOURCE {} has no durable row",
-                            route.source_id.0
-                        ))
-                    })?)
-                } else {
-                    None
-                };
-                let mut event = SourceEvent {
-                    sequence,
-                    source: route.source_id,
-                    target,
-                    payload,
-                };
-                self.validate_event_route(&event, true)?;
-                self.route_event_with_work(&mut event, &[], work)
+                self.apply_effect_result(op, target, row, value, sequence, work)
             }
         }
     }
@@ -3935,6 +4532,7 @@ impl Session {
         target: &ValueRef,
         row: Option<RowId>,
         value: Value,
+        sequence: u64,
         work: &mut Work,
     ) -> Result<(), Error> {
         let ValueRef::State(state) = target else {
@@ -3965,6 +4563,7 @@ impl Session {
                 value: value.clone(),
             });
             self.set_row_field(row, field, value, work)?;
+            self.route_effect_result_state(*state, Some(row), sequence, work)?;
         } else {
             if row.is_some() {
                 return Err(Error::InvalidPlan(format!(
@@ -3979,6 +4578,42 @@ impl Session {
                 value: value.clone(),
             });
             self.set_root_state(*state, value, work);
+            self.route_effect_result_state(*state, None, sequence, work)?;
+        }
+        Ok(())
+    }
+
+    fn route_effect_result_state(
+        &mut self,
+        state: StateId,
+        row: Option<RowId>,
+        sequence: u64,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let event = SourceEvent {
+            sequence,
+            source: SourceId(usize::MAX),
+            target: row,
+            payload: SourcePayload::default(),
+        };
+        let updates = self
+            .metadata
+            .updates_by_state
+            .get(&state)
+            .cloned()
+            .unwrap_or_default();
+        for op in updates {
+            self.execute_update(&op, row, &event, work)?;
+        }
+        let mutations = self
+            .metadata
+            .mutations_by_state
+            .get(&state)
+            .cloned()
+            .unwrap_or_default();
+        let targets = row.into_iter().collect::<Vec<_>>();
+        for op in mutations {
+            self.execute_mutation(&op, &event, &targets, MutationCause::State(state), work)?;
         }
         Ok(())
     }
@@ -4038,6 +4673,9 @@ impl Session {
         }
         for (call_id, pending) in work.completed_transient_effects.drain(..) {
             self.pending_transient_effects.insert(call_id, pending);
+        }
+        for (call_id, previous) in work.updated_transient_effects.drain(..) {
+            self.pending_transient_effects.insert(call_id, previous);
         }
         for undo in work.authority_undo.drain(..).rev() {
             match undo {
@@ -4180,16 +4818,69 @@ impl Session {
             durable_changes,
             outbox_changes: std::mem::take(&mut work.outbox_changes),
             transient_effects: std::mem::take(&mut work.transient_effects),
+            cancelled_transient_effects: std::mem::take(&mut work.cancelled_transient_effects),
+            transient_effect_credit_grants: std::mem::take(
+                &mut work.transient_effect_credit_grants,
+            ),
             metrics: std::mem::take(&mut work.metrics),
         })
     }
 
     fn commit_transient_effects(&mut self, work: &mut Work) -> Result<(), Error> {
+        let mut latest = BTreeMap::<(EffectInvocationId, Option<RowId>), usize>::new();
+        for (index, invocation) in work.transient_effects.iter().enumerate() {
+            latest.insert((invocation.invocation_id, invocation.target), index);
+        }
+        work.transient_effects = work
+            .transient_effects
+            .drain(..)
+            .enumerate()
+            .filter_map(|(index, invocation)| {
+                (latest.get(&(invocation.invocation_id, invocation.target)) == Some(&index))
+                    .then_some(invocation)
+            })
+            .collect();
+
         for invocation in &work.transient_effects {
+            let replaced = self
+                .pending_transient_effects
+                .iter()
+                .filter_map(|(call_id, pending)| {
+                    (pending.invocation_id == invocation.invocation_id
+                        && pending.target == invocation.target)
+                        .then_some(*call_id)
+                })
+                .collect::<Vec<_>>();
+            for call_id in replaced {
+                if let Some(previous) = self.pending_transient_effects.remove(&call_id) {
+                    work.completed_transient_effects.push((call_id, previous));
+                    work.cancelled_transient_effects.push(call_id);
+                }
+            }
+            let contract = self
+                .plan
+                .effects
+                .iter()
+                .find(|contract| contract.effect_id == invocation.effect_id)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "transient effect call {} has no effect contract",
+                        invocation.call_id
+                    ))
+                })?;
+            let available_credits = match contract.delivery {
+                boon_plan::EffectDeliveryCardinality::Single => 1,
+                boon_plan::EffectDeliveryCardinality::Stream {
+                    initial_credits, ..
+                } => initial_credits,
+            };
             let pending = PendingTransientEffect {
                 invocation_id: invocation.invocation_id,
                 effect_id: invocation.effect_id,
                 target: invocation.target,
+                delivery: contract.delivery.clone(),
+                next_result_sequence: TRANSIENT_EFFECT_FIRST_RESULT_SEQUENCE,
+                available_credits,
             };
             if self
                 .pending_transient_effects
@@ -4242,7 +4933,13 @@ impl Session {
         }
 
         for op in &metadata.mutations {
-            self.execute_mutation(op, event, &targets, work)?;
+            self.execute_mutation(
+                op,
+                event,
+                &targets,
+                MutationCause::Source(event.source),
+                work,
+            )?;
         }
 
         self.ensure_demanded_current(demanded_targets, Some(event), work)?;
@@ -4301,22 +4998,11 @@ impl Session {
     fn validate_event_route(
         &self,
         event: &SourceEvent,
-        internal_effect_completion: bool,
+        _internal_effect_completion: bool,
     ) -> Result<(), Error> {
         if !self.metadata.routes.contains_key(&event.source) {
             return Err(Error::InvalidEvent(format!(
                 "source {} is not in the plan",
-                event.source.0
-            )));
-        }
-        if !internal_effect_completion
-            && self
-                .metadata
-                .internal_effect_result_sources
-                .contains(&event.source)
-        {
-            return Err(Error::InvalidEvent(format!(
-                "source {} is reserved for correlated host-effect completion",
                 event.source.0
             )));
         }
@@ -4420,7 +5106,7 @@ impl Session {
                 op.id.0
             )));
         };
-        if !self.source_guard_matches(source_guard.as_ref(), event)? {
+        if !self.source_guard_matches(source_guard.as_ref(), row, event, work)? {
             return Ok(());
         }
         if matches!(
@@ -4485,9 +5171,6 @@ impl Session {
                 op.id.0
             )));
         };
-        if !self.source_guard_matches(source_guard.as_ref(), event)? {
-            return Ok(());
-        }
         if matches!(
             &op.kind,
             PlanOpKind::UpdateBranch {
@@ -4496,7 +5179,9 @@ impl Session {
             }
         ) {
             for row in rows {
-                self.stage_effect_invocation(op, Some(*row), event, work)?;
+                if self.source_guard_matches(source_guard.as_ref(), Some(*row), event, work)? {
+                    self.stage_effect_invocation(op, Some(*row), event, work)?;
+                }
             }
             return Ok(());
         }
@@ -4515,6 +5200,9 @@ impl Session {
             })?;
         let mut pending = Vec::with_capacity(rows.len());
         for row in rows {
+            if !self.source_guard_matches(source_guard.as_ref(), Some(*row), event, work)? {
+                continue;
+            }
             if let Some(value) = self.evaluate_update(op, Some(*row), event, work)? {
                 pending.push((*row, value));
             }
@@ -4579,6 +5267,16 @@ impl Session {
                 effect.invocation_id
             ))
         })?;
+        let result_row = if op.indexed {
+            Some(row.ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "indexed effect invocation {} has no durable row target",
+                    effect.invocation_id
+                ))
+            })?)
+        } else {
+            None
+        };
         let intent_values = effect
             .intent_fields
             .iter()
@@ -4616,8 +5314,9 @@ impl Session {
                 effect_id: effect.effect_id,
                 trigger_source_sequence: event.sequence,
                 authority_turn_sequence: sequence,
-                target: row,
+                target: result_row,
                 intent: transient_intent,
+                delivery: contract.delivery.clone(),
             });
             return Ok(());
         }
@@ -4645,7 +5344,7 @@ impl Session {
                 })
                 .collect::<Result<BTreeMap<_, _>, Error>>()?,
         );
-        let target_row = row
+        let target_row = result_row
             .map(|row| {
                 Ok(boon_persistence::DurableEffectRow {
                     list_memory_id: self.persistence_list(row.list)?.memory_id,
@@ -4703,9 +5402,11 @@ impl Session {
     }
 
     fn source_guard_matches(
-        &self,
+        &mut self,
         guard: Option<&PlanSourceGuard>,
+        row: Option<RowId>,
         event: &SourceEvent,
+        work: &mut Work,
     ) -> Result<bool, Error> {
         match guard {
             None => Ok(true),
@@ -4722,6 +5423,11 @@ impl Session {
                 };
                 let text = value_to_text(&value)?;
                 Ok(values.contains(&text))
+            }
+            Some(PlanSourceGuard::TriggerValueOneOf { input, values }) => {
+                let value = self.eval_update_ref(input, row, event, work)?;
+                let label = value_to_match_label(&value)?;
+                Ok(values.contains(&label))
             }
         }
     }
@@ -5855,6 +6561,18 @@ impl Session {
         }
     }
 
+    fn invalidate_distributed_import(&mut self, import_id: ImportId, work: &mut Work) {
+        let consumers = self
+            .dynamic_dependencies
+            .by_distributed_import
+            .get(&import_id)
+            .cloned()
+            .unwrap_or_default();
+        for consumer in consumers {
+            self.mark_consumer_dirty(consumer, work);
+        }
+    }
+
     fn register_row_dependency(
         &mut self,
         consumer: Option<Consumer>,
@@ -5895,7 +6613,8 @@ impl Session {
                         }
                         DynamicDependency::Query(_)
                         | DynamicDependency::IndexedQuery(_)
-                        | DynamicDependency::List(_) => None,
+                        | DynamicDependency::List(_)
+                        | DynamicDependency::DistributedImport(_) => None,
                     }),
             );
         }
@@ -5906,6 +6625,17 @@ impl Session {
         if let Some(consumer) = consumer {
             self.dynamic_dependencies
                 .insert(consumer, DynamicDependency::List(list));
+        }
+    }
+
+    fn register_distributed_import_dependency(
+        &mut self,
+        consumer: Option<Consumer>,
+        import_id: ImportId,
+    ) {
+        if let Some(consumer) = consumer {
+            self.dynamic_dependencies
+                .insert(consumer, DynamicDependency::DistributedImport(import_id));
         }
     }
 
@@ -6078,6 +6808,31 @@ impl Session {
                 .cloned()
                 .map(EvalValue::Value)
                 .ok_or_else(|| Error::InvalidPlan(format!("missing constant {}", constant.0))),
+            ValueRef::DistributedImport(import_id) => {
+                self.register_distributed_import_dependency(consumer, *import_id);
+                self.distributed_imports
+                    .get(import_id)
+                    .cloned()
+                    .map(EvalValue::Value)
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "value ref uses undeclared distributed import {import_id}"
+                        ))
+                    })
+            }
+            ValueRef::DistributedFunctionArgument {
+                export_id,
+                argument_id,
+            } => self
+                .active_distributed_arguments
+                .get(&(*export_id, *argument_id))
+                .cloned()
+                .map(EvalValue::Value)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "distributed function argument {argument_id} for export {export_id} was read outside its invocation"
+                    ))
+                }),
             ValueRef::List(list) => {
                 self.register_list_dependency(consumer, *list);
                 let rows = self.list_row_ids(*list);
@@ -6116,6 +6871,35 @@ impl Session {
                     .map(EvalValue::Value)
                     .ok_or_else(|| {
                         Error::Evaluation(format!("root state {} has no value", state.0))
+                    })
+            }
+            ValueRef::StateProjection {
+                state_id,
+                field_path,
+            } => {
+                let value = self.eval_value_ref(
+                    &ValueRef::State(*state_id),
+                    row,
+                    event,
+                    output,
+                    consumer,
+                    work,
+                )?;
+                let EvalValue::Value(value) = value else {
+                    return Err(Error::Evaluation(format!(
+                        "state {} projection does not reference a scalar value",
+                        state_id.0
+                    )));
+                };
+                project_value(&value, field_path)
+                    .cloned()
+                    .map(EvalValue::Value)
+                    .ok_or_else(|| {
+                        Error::Evaluation(format!(
+                            "state {} has no projection `{}`",
+                            state_id.0,
+                            field_path.join(".")
+                        ))
                     })
             }
             ValueRef::Field(field) => {
@@ -6186,6 +6970,9 @@ impl Session {
     ) -> Result<EvalValue, Error> {
         work.consume(1)?;
         match expression {
+            PlanRowExpression::Intrinsic { intrinsic } => {
+                Ok(EvalValue::Value(self.eval_intrinsic(*intrinsic)))
+            }
             PlanRowExpression::Field { input } => {
                 self.eval_value_ref(input, row, event, output, consumer, work)
             }
@@ -6334,7 +7121,7 @@ impl Session {
                 let value = bytes.get(index).copied().ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
                 })?;
-                Ok(EvalValue::Value(Value::integer(i64::from(value))?))
+                Ok(EvalValue::Value(Value::Bytes(vec![value])))
             }
             PlanRowExpression::BytesSlice {
                 input,
@@ -6445,14 +7232,17 @@ impl Session {
                     "byte index",
                 )?;
                 let value = self
-                    .eval_expression_number(value, row, event, output, consumer, bindings, work)?;
-                let value = u8::try_from(value).map_err(|_| {
-                    Error::Evaluation(format!("byte value {value} is outside 0..=255"))
-                })?;
+                    .eval_expression_bytes(value, row, event, output, consumer, bindings, work)?;
+                let [value] = value.as_slice() else {
+                    return Err(Error::Evaluation(format!(
+                        "Bytes/set value must be BYTES[1], found {} byte(s)",
+                        value.len()
+                    )));
+                };
                 let target = bytes.get_mut(index).ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
                 })?;
-                *target = value;
+                *target = *value;
                 Ok(EvalValue::Value(Value::Bytes(bytes)))
             }
             PlanRowExpression::BytesWriteUnsigned {
@@ -6709,6 +7499,27 @@ impl Session {
                 }
                 Ok(EvalValue::Record(record))
             }
+            PlanRowExpression::TaggedObject { tag, fields } => {
+                let mut record = BTreeMap::from([(
+                    "$tag".to_owned(),
+                    EvalValue::Value(Value::Text(tag.clone())),
+                )]);
+                for field in fields {
+                    record.insert(
+                        field.name.clone(),
+                        self.eval_row_expression(
+                            &field.value,
+                            row,
+                            event,
+                            output,
+                            consumer,
+                            bindings,
+                            work,
+                        )?,
+                    );
+                }
+                Ok(EvalValue::Record(record))
+            }
             PlanRowExpression::ObjectField { object, field } => {
                 let object =
                     self.eval_row_expression(object, row, event, output, consumer, bindings, work)?;
@@ -6760,6 +7571,36 @@ impl Session {
                     "select has no matching arm for {input_value:?}"
                 )))
             }
+        }
+    }
+
+    fn eval_intrinsic(&self, intrinsic: PlanIntrinsic) -> Value {
+        match intrinsic {
+            PlanIntrinsic::SessionInfoStatus => Value::Record(BTreeMap::from([
+                ("$tag".to_owned(), Value::Text("Active".to_owned())),
+                (
+                    "role".to_owned(),
+                    Value::Text(
+                        match self.plan.program_role {
+                            ProgramRole::Client => "Client",
+                            ProgramRole::Session => "Session",
+                            ProgramRole::Server => "Server",
+                        }
+                        .to_owned(),
+                    ),
+                ),
+                (
+                    "session_id".to_owned(),
+                    Value::Text(self.options.session_id.clone().unwrap_or_default()),
+                ),
+            ])),
+            PlanIntrinsic::SessionInfoPrincipal => match &self.options.principal_id {
+                Some(id) => Value::Record(BTreeMap::from([
+                    ("$tag".to_owned(), Value::Text("Authenticated".to_owned())),
+                    ("id".to_owned(), Value::Text(id.clone())),
+                ])),
+                None => Value::Text("Anonymous".to_owned()),
+            },
         }
     }
 
@@ -6900,6 +7741,96 @@ impl Session {
     ) -> Result<EvalValue, Error> {
         match function {
             "Text/empty" => Ok(EvalValue::Value(Value::Text(String::new()))),
+            "Number/to_text" => {
+                let value = if let Some(input) = input {
+                    self.eval_row_expression(input, row, event, output, consumer, bindings, work)?
+                } else if let Some(value) = self
+                    .eval_named_arg(args, "value", row, event, output, consumer, bindings, work)?
+                {
+                    value
+                } else if let Some(argument) = args.first() {
+                    self.eval_row_expression(
+                        &argument.value,
+                        row,
+                        event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )?
+                } else {
+                    return Err(Error::Evaluation(
+                        "Number/to_text requires a value".to_owned(),
+                    ));
+                };
+                let number = eval_to_number(&value)?;
+                let radix = self
+                    .eval_named_arg(args, "radix", row, event, output, consumer, bindings, work)?
+                    .map(|value| eval_to_integer(&value))
+                    .transpose()?
+                    .unwrap_or(10);
+                let radix = u32::try_from(radix).unwrap_or_default();
+                let min_width = self
+                    .eval_named_arg(
+                        args,
+                        "min_width",
+                        row,
+                        event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )?
+                    .map(|value| eval_to_integer(&value))
+                    .transpose()?
+                    .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                    .unwrap_or_default();
+                let signed_width = self
+                    .eval_named_arg(
+                        args,
+                        "signed_width",
+                        row,
+                        event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )?
+                    .map(|value| eval_to_integer(&value))
+                    .transpose()?
+                    .map(|value| u32::try_from(value).unwrap_or_default());
+                let group_size = self
+                    .eval_named_arg(
+                        args,
+                        "group_size",
+                        row,
+                        event,
+                        output,
+                        consumer,
+                        bindings,
+                        work,
+                    )?
+                    .map(|value| eval_to_integer(&value))
+                    .transpose()?
+                    .map(|value| usize::try_from(value).unwrap_or_default());
+                let prefix = self
+                    .eval_named_arg(args, "prefix", row, event, output, consumer, bindings, work)?
+                    .map(|value| eval_to_bool(&value))
+                    .transpose()?
+                    .unwrap_or(false);
+                let text = format_number_text(
+                    number,
+                    NumberTextFormat {
+                        radix,
+                        min_width,
+                        signed_width,
+                        group_size,
+                        prefix,
+                    },
+                )
+                .map_err(|error| Error::Evaluation(error.to_string()))?;
+                Ok(EvalValue::Value(Value::Text(text)))
+            }
             "Error/new" => {
                 let code = self
                     .eval_named_arg(args, "code", row, event, output, consumer, bindings, work)?
@@ -7694,9 +8625,9 @@ impl Session {
                         Error::InvalidPlan(format!("BytesGet update {} has no index", op.id.0))
                     })?;
                 let index = nonnegative_usize(index, "byte index")?;
-                Value::integer(i64::from(*bytes.get(index).ok_or_else(|| {
+                Value::Bytes(vec![*bytes.get(index).ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
-                })?))?
+                })?])
             }
             PlanExpressionKind::BytesSet => {
                 let [input, index, value] = ordered_inputs.as_slice() else {
@@ -7710,13 +8641,17 @@ impl Session {
                     value_to_integer(&self.eval_update_ref(index, row, event, work)?)?,
                     "byte index",
                 )?;
-                let value = value_to_integer(&self.eval_update_ref(value, row, event, work)?)?;
-                let value = u8::try_from(value).map_err(|_| {
-                    Error::Evaluation(format!("byte value {value} is outside 0..=255"))
-                })?;
+                let value = value_to_bytes(&self.eval_update_ref(value, row, event, work)?)?;
+                let [value] = value.as_slice() else {
+                    return Err(Error::Evaluation(format!(
+                        "BytesSet update {} value must be BYTES[1], found {} byte(s)",
+                        op.id.0,
+                        value.len()
+                    )));
+                };
                 *bytes.get_mut(index).ok_or_else(|| {
                     Error::Evaluation(format!("byte index {index} is out of range"))
-                })? = value;
+                })? = *value;
                 Value::Bytes(bytes)
             }
             PlanExpressionKind::BytesSlice => {
@@ -8002,24 +8937,25 @@ impl Session {
         let (input, arms) = inputs
             .split_first()
             .ok_or_else(|| Error::InvalidPlan(format!("match update {} has no input", op.id.0)))?;
-        let current = value_to_text(&self.eval_update_ref(input, row, event, work)?)?;
+        let current = value_to_match_label(&self.eval_update_ref(input, row, event, work)?)?;
+        let mut selected = None;
         let mut wildcard = None;
         for pair in arms.chunks_exact(2) {
             let pattern = value_to_text(&self.eval_update_ref(&pair[0], row, event, work)?)?;
-            let value = self.eval_update_ref(&pair[1], row, event, work)?;
-            if pattern == current {
-                return Ok(value);
+            if pattern == current && selected.is_none() {
+                selected = Some(&pair[1]);
             }
             if pattern == "__" {
-                wildcard = Some(value);
+                wildcard = Some(&pair[1]);
             }
         }
-        wildcard.ok_or_else(|| {
+        let value = selected.or(wildcard).ok_or_else(|| {
             Error::Evaluation(format!(
                 "match update {} has no arm for `{current}`",
                 op.id.0
             ))
-        })
+        })?;
+        self.eval_update_ref(value, row, event, work)
     }
 
     fn evaluate_value_match_update(
@@ -8034,39 +8970,18 @@ impl Session {
         let (input, arms) = inputs
             .split_first()
             .ok_or_else(|| Error::InvalidPlan(format!("match update {} has no input", op.id.0)))?;
-        let input = value_to_text(&self.eval_update_ref(input, row, event, work)?)?;
+        let input = self.eval_update_ref(input, row, event, work)?;
         let current = if kind == PlanExpressionKind::MatchTextIsEmptyConst {
-            if input.is_empty() { "True" } else { "False" }
+            if value_to_text(&input)?.is_empty() {
+                "True".to_owned()
+            } else {
+                "False".to_owned()
+            }
         } else {
-            input.as_str()
+            value_to_match_label(&input)?
         };
         let mut cursor = 0usize;
-        let mut selected = None;
-        let mut wildcard = None;
-        while cursor < arms.len() {
-            let pattern = value_to_text(&self.eval_update_ref(
-                arms.get(cursor).ok_or_else(|| {
-                    Error::InvalidPlan(format!("match update {} has no arm pattern", op.id.0))
-                })?,
-                row,
-                event,
-                work,
-            )?)?;
-            cursor += 1;
-            let value = self.eval_encoded_update(arms, &mut cursor, row, event, work)?;
-            if pattern == current && selected.is_none() {
-                selected = Some(value.clone());
-            }
-            if pattern == "__" {
-                wildcard = Some(value);
-            }
-        }
-        selected.or(wildcard).ok_or_else(|| {
-            Error::Evaluation(format!(
-                "match update {} has no arm for `{current}`",
-                op.id.0
-            ))
-        })
+        self.eval_encoded_match_arms(arms, &mut cursor, None, &current, row, event, work)
     }
 
     fn evaluate_infix_match_update(
@@ -8089,24 +9004,7 @@ impl Session {
         let current = compare_update_values(&left, &operator, &right)?;
         let current = if current { "True" } else { "False" };
         let mut cursor = 0usize;
-        let mut wildcard = None;
-        while cursor < arms.len() {
-            let pattern = value_to_text(&self.eval_update_ref(&arms[cursor], row, event, work)?)?;
-            cursor += 1;
-            let value = self.eval_encoded_update(arms, &mut cursor, row, event, work)?;
-            if pattern == current {
-                return Ok(value);
-            }
-            if pattern == "__" {
-                wildcard = Some(value);
-            }
-        }
-        wildcard.ok_or_else(|| {
-            Error::Evaluation(format!(
-                "infix match update {} has no arm for `{current}`",
-                op.id.0
-            ))
-        })
+        self.eval_encoded_match_arms(arms, &mut cursor, None, current, row, event, work)
     }
 
     fn eval_encoded_update(
@@ -8154,35 +9052,29 @@ impl Session {
                     Error::InvalidPlan("encoded match has no arm count".to_owned())
                 })?;
                 *cursor += 2;
-                let input = value_to_text(&self.eval_update_ref(input, row, event, work)?)?;
-                let input = if tag == "match_text_is_empty_const" {
-                    if input.is_empty() { "True" } else { "False" }
+                let input = self.eval_update_ref(input, row, event, work)?;
+                let current = if tag == "match_text_is_empty_const" {
+                    if value_to_text(&input)?.is_empty() {
+                        "True".to_owned()
+                    } else {
+                        "False".to_owned()
+                    }
                 } else {
-                    input.as_str()
+                    value_to_match_label(&input)?
                 };
                 let arm_count = nonnegative_usize(
                     value_to_integer(&self.eval_update_ref(arm_count, row, event, work)?)?,
                     "encoded match arm count",
                 )?;
-                let mut selected = None;
-                let mut wildcard = None;
-                for _ in 0..arm_count {
-                    let pattern = inputs.get(*cursor).ok_or_else(|| {
-                        Error::InvalidPlan("encoded match has no arm pattern".to_owned())
-                    })?;
-                    *cursor += 1;
-                    let pattern = value_to_text(&self.eval_update_ref(pattern, row, event, work)?)?;
-                    let value = self.eval_encoded_update(inputs, cursor, row, event, work)?;
-                    if pattern == input && selected.is_none() {
-                        selected = Some(value.clone());
-                    }
-                    if pattern == "__" {
-                        wildcard = Some(value);
-                    }
-                }
-                selected.or(wildcard).ok_or_else(|| {
-                    Error::Evaluation(format!("encoded match has no arm for `{input}`"))
-                })
+                self.eval_encoded_match_arms(
+                    inputs,
+                    cursor,
+                    Some(arm_count),
+                    &current,
+                    row,
+                    event,
+                    work,
+                )
             }
             "match_infix_const" => {
                 let left = inputs.get(*cursor).ok_or_else(|| {
@@ -8210,30 +9102,115 @@ impl Session {
                     value_to_integer(&self.eval_update_ref(arm_count, row, event, work)?)?,
                     "encoded infix match arm count",
                 )?;
-                let mut selected = None;
-                let mut wildcard = None;
-                for _ in 0..arm_count {
-                    let pattern = inputs.get(*cursor).ok_or_else(|| {
-                        Error::InvalidPlan("encoded infix match has no arm pattern".to_owned())
-                    })?;
-                    *cursor += 1;
-                    let pattern = value_to_text(&self.eval_update_ref(pattern, row, event, work)?)?;
-                    let value = self.eval_encoded_update(inputs, cursor, row, event, work)?;
-                    if pattern == current && selected.is_none() {
-                        selected = Some(value.clone());
-                    }
-                    if pattern == "__" {
-                        wildcard = Some(value);
-                    }
-                }
-                selected.or(wildcard).ok_or_else(|| {
-                    Error::Evaluation(format!("encoded infix match has no arm for `{current}`"))
-                })
+                self.eval_encoded_match_arms(
+                    inputs,
+                    cursor,
+                    Some(arm_count),
+                    current,
+                    row,
+                    event,
+                    work,
+                )
             }
             other => Err(Error::Evaluation(format!(
                 "unsupported encoded update expression `{other}`"
             ))),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eval_encoded_match_arms(
+        &mut self,
+        inputs: &[ValueRef],
+        cursor: &mut usize,
+        arm_count: Option<usize>,
+        current: &str,
+        row: Option<RowId>,
+        event: &SourceEvent,
+        work: &mut Work,
+    ) -> Result<Value, Error> {
+        let mut selected = None;
+        let mut wildcard = None;
+        let mut seen = 0usize;
+        while arm_count.map_or(*cursor < inputs.len(), |count| seen < count) {
+            let pattern = inputs
+                .get(*cursor)
+                .ok_or_else(|| Error::InvalidPlan("encoded match has no arm pattern".to_owned()))?;
+            *cursor += 1;
+            let pattern = value_to_text(&self.eval_update_ref(pattern, row, event, work)?)?;
+            let value_start = *cursor;
+            self.skip_encoded_update(inputs, cursor, row, event, work)?;
+            if pattern == current && selected.is_none() {
+                selected = Some(value_start);
+            }
+            if pattern == "__" {
+                wildcard = Some(value_start);
+            }
+            seen += 1;
+        }
+        let value_start = selected.or(wildcard).ok_or_else(|| {
+            Error::Evaluation(format!("encoded match has no arm for `{current}`"))
+        })?;
+        let mut value_cursor = value_start;
+        self.eval_encoded_update(inputs, &mut value_cursor, row, event, work)
+    }
+
+    fn skip_encoded_update(
+        &mut self,
+        inputs: &[ValueRef],
+        cursor: &mut usize,
+        row: Option<RowId>,
+        event: &SourceEvent,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let tag = inputs
+            .get(*cursor)
+            .ok_or_else(|| Error::InvalidPlan("encoded update expression has no tag".to_owned()))?;
+        *cursor += 1;
+        let tag = value_to_text(&self.eval_update_ref(tag, row, event, work)?)?;
+        let fixed_inputs = match tag.as_str() {
+            "ref" => Some(1usize),
+            "number_infix" => Some(3usize),
+            "match_const" | "match_text_is_empty_const" => None,
+            "match_infix_const" => None,
+            other => {
+                return Err(Error::Evaluation(format!(
+                    "unsupported encoded update expression `{other}`"
+                )));
+            }
+        };
+        if let Some(count) = fixed_inputs {
+            let end = cursor
+                .checked_add(count)
+                .ok_or_else(|| Error::InvalidPlan("encoded update cursor overflow".to_owned()))?;
+            if end > inputs.len() {
+                return Err(Error::InvalidPlan(
+                    "encoded update expression is truncated".to_owned(),
+                ));
+            }
+            *cursor = end;
+            return Ok(());
+        }
+
+        let arm_count_offset = if tag == "match_infix_const" { 3 } else { 1 };
+        let arm_count_ref = inputs
+            .get(*cursor + arm_count_offset)
+            .ok_or_else(|| Error::InvalidPlan("encoded match has no arm count".to_owned()))?;
+        let arm_count = nonnegative_usize(
+            value_to_integer(&self.eval_update_ref(arm_count_ref, row, event, work)?)?,
+            "encoded match arm count",
+        )?;
+        *cursor += arm_count_offset + 1;
+        for _ in 0..arm_count {
+            if inputs.get(*cursor).is_none() {
+                return Err(Error::InvalidPlan(
+                    "encoded match has no arm pattern".to_owned(),
+                ));
+            }
+            *cursor += 1;
+            self.skip_encoded_update(inputs, cursor, row, event, work)?;
+        }
+        Ok(())
     }
 
     fn evaluate_list_find_update(
@@ -8276,6 +9253,7 @@ impl Session {
         op: &PlanOp,
         event: &SourceEvent,
         event_targets: &[RowId],
+        cause: MutationCause,
         work: &mut Work,
     ) -> Result<(), Error> {
         work.consume(1)?;
@@ -8296,11 +9274,11 @@ impl Session {
                 let append = append.as_ref().ok_or_else(|| {
                     Error::InvalidPlan(format!("append op {} has no descriptor", op.id.0))
                 })?;
-                if !self.mutation_trigger_accepts_source(&append.trigger, event.source) {
+                if !self.mutation_trigger_accepts(&append.trigger, cause) {
                     return Ok(());
                 }
                 let trigger = self.eval_update_ref(&append.trigger, None, event, work)?;
-                if !trigger_is_active(&trigger, event.source, &append.trigger) {
+                if !trigger_is_active(&trigger, cause, &append.trigger) {
                     return Ok(());
                 }
                 let Some(ValueRef::List(list)) = op.output else {
@@ -8377,24 +9355,37 @@ impl Session {
         Ok(())
     }
 
-    fn mutation_trigger_accepts_source(&self, trigger: &ValueRef, source: SourceId) -> bool {
+    fn mutation_trigger_accepts(&self, trigger: &ValueRef, cause: MutationCause) -> bool {
         match trigger {
-            ValueRef::Source(trigger) => *trigger == source,
+            ValueRef::Source(trigger) => cause == MutationCause::Source(*trigger),
             ValueRef::SourcePayload {
-                source_id: trigger,
-                ..
-            } => *trigger == source,
+                source_id: trigger, ..
+            } => cause == MutationCause::Source(*trigger),
+            ValueRef::State(trigger) => cause == MutationCause::State(*trigger),
+            ValueRef::StateProjection { state_id, .. } => cause == MutationCause::State(*state_id),
             ValueRef::Field(field) => self
                 .metadata
                 .root_computations
                 .get(field)
                 .filter(|op| source_event_transform_op(op))
                 .is_none_or(|op| {
-                    op.inputs
-                        .iter()
-                        .any(|input| matches!(input, ValueRef::Source(candidate) if *candidate == source))
+                    op.inputs.iter().any(|input| match (input, cause) {
+                        (ValueRef::Source(candidate), MutationCause::Source(source)) => {
+                            *candidate == source
+                        }
+                        (ValueRef::State(candidate), MutationCause::State(state))
+                        | (
+                            ValueRef::StateProjection {
+                                state_id: candidate,
+                                ..
+                            },
+                            MutationCause::State(state),
+                        ) => *candidate == state,
+                        _ => false,
+                    })
                 }),
-            ValueRef::Constant(_) | ValueRef::State(_) | ValueRef::List(_) => true,
+            ValueRef::Constant(_) | ValueRef::List(_) | ValueRef::DistributedImport(_) => true,
+            ValueRef::DistributedFunctionArgument { .. } => false,
         }
     }
 
@@ -8916,15 +9907,56 @@ impl Session {
     }
 }
 
-fn trigger_is_active(value: &Value, source: SourceId, trigger: &ValueRef) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationCause {
+    Source(SourceId),
+    State(StateId),
+}
+
+fn trigger_is_active(value: &Value, cause: MutationCause, trigger: &ValueRef) -> bool {
     match trigger {
-        ValueRef::Source(expected) => *expected == source,
+        ValueRef::Source(expected) => cause == MutationCause::Source(*expected),
+        ValueRef::State(expected) => cause == MutationCause::State(*expected),
         _ => match value {
             Value::Null | Value::Bool(false) | Value::Error { .. } => false,
             Value::Text(value) if value == "SKIP" => false,
             _ => true,
         },
     }
+}
+
+fn root_state_dependencies(
+    field: FieldId,
+    computations: &BTreeMap<FieldId, Arc<PlanOp>>,
+) -> Vec<StateId> {
+    fn collect(
+        field: FieldId,
+        computations: &BTreeMap<FieldId, Arc<PlanOp>>,
+        visiting: &mut BTreeSet<FieldId>,
+        states: &mut BTreeSet<StateId>,
+    ) {
+        if !visiting.insert(field) {
+            return;
+        }
+        if let Some(op) = computations.get(&field) {
+            for input in &op.inputs {
+                match input {
+                    ValueRef::State(state) => {
+                        states.insert(*state);
+                    }
+                    ValueRef::Field(dependency) => {
+                        collect(*dependency, computations, visiting, states);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        visiting.remove(&field);
+    }
+
+    let mut states = BTreeSet::new();
+    collect(field, computations, &mut BTreeSet::new(), &mut states);
+    states.into_iter().collect()
 }
 
 fn expression_row(row: Option<RowId>) -> Option<RowId> {
@@ -9193,10 +10225,37 @@ fn compare_update_values(left: &Value, op: &str, right: &Value) -> Result<bool, 
 fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool {
     match pattern {
         PlanRowSelectPattern::Bool { value: expected } => value == &Value::Bool(*expected),
-        PlanRowSelectPattern::Text { value: expected } => value == &Value::Text(expected.clone()),
+        PlanRowSelectPattern::Text { value: expected } => {
+            value == &Value::Text(expected.clone())
+                || tagged_value_label(value).is_some_and(|tag| tag == expected)
+        }
         PlanRowSelectPattern::Number { value: expected } => value == &Value::Number(*expected),
         PlanRowSelectPattern::NaN => value == &Value::Text("NaN".to_owned()),
         PlanRowSelectPattern::Wildcard => true,
+    }
+}
+
+fn value_to_match_label(value: &Value) -> Result<String, Error> {
+    tagged_value_label(value)
+        .map(str::to_owned)
+        .map(Ok)
+        .unwrap_or_else(|| value_to_text(value))
+}
+
+fn tagged_value_label(value: &Value) -> Option<&str> {
+    let Value::Record(fields) = value else {
+        return None;
+    };
+    fields.get("$tag").and_then(|tag| match tag {
+        Value::Text(tag) => Some(tag.as_str()),
+        _ => None,
+    })
+}
+
+fn effect_outcome_tag(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(tag) => Some(tag),
+        _ => tagged_value_label(value),
     }
 }
 
@@ -9424,6 +10483,7 @@ fn base64_digit(digit: u8) -> Result<u8, Error> {
 fn coalesce_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
     let mut output = Vec::with_capacity(deltas.len());
     let mut positions = BTreeMap::<ValueTarget, usize>::new();
+    let mut import_positions = BTreeMap::<ImportId, usize>::new();
     for delta in deltas {
         match delta {
             Delta::SetValue { target, value } => {
@@ -9432,6 +10492,14 @@ fn coalesce_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
                 } else {
                     positions.insert(target, output.len());
                     output.push(Delta::SetValue { target, value });
+                }
+            }
+            Delta::SetDistributedImport { import_id, value } => {
+                if let Some(position) = import_positions.get(&import_id).copied() {
+                    output[position] = Delta::SetDistributedImport { import_id, value };
+                } else {
+                    import_positions.insert(import_id, output.len());
+                    output.push(Delta::SetDistributedImport { import_id, value });
                 }
             }
             other => output.push(other),
@@ -9454,24 +10522,15 @@ fn source_payload_value(payload: &SourcePayload, field: &SourcePayloadField) -> 
     }
 }
 
-fn source_payload_schema_field_name(field: &SourcePayloadField) -> &str {
-    match field {
-        SourcePayloadField::Address => "address",
-        SourcePayloadField::Bytes => "bytes",
-        SourcePayloadField::Key => "key",
-        SourcePayloadField::Named(name) => name,
-        SourcePayloadField::Text => "text",
-    }
-}
-
-fn source_payload_field_from_effect_name(name: &str) -> SourcePayloadField {
-    match name {
-        "address" => SourcePayloadField::Address,
-        "bytes" => SourcePayloadField::Bytes,
-        "key" => SourcePayloadField::Key,
-        "text" => SourcePayloadField::Text,
-        _ => SourcePayloadField::Named(name.to_owned()),
-    }
+fn project_value<'a>(value: &'a Value, field_path: &[String]) -> Option<&'a Value> {
+    let Some((field, rest)) = field_path.split_first() else {
+        return Some(value);
+    };
+    let nested = match value {
+        Value::Record(fields) | Value::MappedRow { fields, .. } => fields.get(field)?,
+        _ => return None,
+    };
+    project_value(nested, rest)
 }
 
 fn set_source_payload_value(

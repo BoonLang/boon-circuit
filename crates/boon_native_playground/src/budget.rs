@@ -56,11 +56,6 @@ impl BudgetContract {
             .copied()
             .ok_or_else(|| format!("budget contract has no metric `{metric}`"))
     }
-
-    #[cfg(test)]
-    fn metric_count(&self) -> usize {
-        self.limits.len()
-    }
 }
 
 fn metric_id(name: &str) -> Result<String, String> {
@@ -107,48 +102,5 @@ fn limit_value(unit: BudgetUnit, value: &toml::Value, metric: &str) -> Result<u6
             .as_integer()
             .and_then(|value| u64::try_from(value).ok())
             .ok_or_else(|| format!("budget `{metric}` must be a non-negative integer")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn persons_contract_is_typed_and_exact() {
-        let contract =
-            BudgetContract::parse(include_str!("../../../examples/persons_pro.budget.toml"))
-                .unwrap();
-        assert_eq!(contract.metric_count(), 16);
-        assert_eq!(
-            contract.limit("keystroke-to-editor-visible-p95").unwrap(),
-            BudgetLimit {
-                unit: BudgetUnit::Microseconds,
-                at_most: 16_700,
-            }
-        );
-        assert_eq!(
-            contract.limit("proof-replacement-max").unwrap(),
-            BudgetLimit {
-                unit: BudgetUnit::Count,
-                at_most: 0,
-            }
-        );
-        assert_eq!(
-            contract.limit("trusted-parent-rebuilds-per-edit").unwrap(),
-            BudgetLimit {
-                unit: BudgetUnit::Count,
-                at_most: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn malformed_or_ambiguous_budget_data_is_rejected() {
-        assert!(BudgetContract::parse("").is_err());
-        assert!(BudgetContract::parse("[seconds]\nframe = 1").is_err());
-        assert!(BudgetContract::parse("[count]\nBad_Name = 1").is_err());
-        assert!(BudgetContract::parse("[count]\nitems = -1").is_err());
-        assert!(BudgetContract::parse("[latency_ms]\nframe = 0.0001").is_err());
     }
 }

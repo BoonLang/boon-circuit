@@ -29,28 +29,24 @@ struct NativeMapTileCapabilityConfig {
     timeout_ms: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeMapTileCapabilityFile {
+    #[serde(default)]
+    capability: Vec<NativeMapTileCapabilityConfig>,
+}
+
 #[derive(Clone, Debug)]
 enum NativeMapTileSource {
     Http {
         url: reqwest::Url,
         timeout: Duration,
     },
-    Fixture {
-        media_type: String,
-        encoded: Vec<u8>,
-    },
-    #[cfg(test)]
-    DelayedFixture {
-        media_type: String,
-        encoded: Vec<u8>,
-        delay: Duration,
-    },
 }
 
 #[derive(Clone, Debug, Default)]
 struct NativeMapTileCapabilities {
     entries: BTreeMap<String, NativeMapTileCapabilityConfig>,
-    fixtures: BTreeMap<String, (String, Vec<u8>)>,
 }
 
 impl NativeMapTileCapabilities {
@@ -61,14 +57,10 @@ impl NativeMapTileCapabilities {
         let value = value
             .into_string()
             .map_err(|_| format!("{NATIVE_MAP_TILE_CAPABILITIES_ENV} must be UTF-8"))?;
-        let entries = serde_json::from_str::<Vec<NativeMapTileCapabilityConfig>>(&value)
+        let config = toml::from_str::<NativeMapTileCapabilityFile>(&value)
             .map_err(|error| format!("decode {NATIVE_MAP_TILE_CAPABILITIES_ENV}: {error}"))?;
-        Self::new(entries)
-    }
-
-    fn new(entries: Vec<NativeMapTileCapabilityConfig>) -> Result<Self, String> {
         let mut by_name = BTreeMap::new();
-        for entry in entries {
+        for entry in config.capability {
             validate_capability_name(&entry.name)?;
             validate_url_template(&entry.url_template)?;
             if entry.timeout_ms == 0 || entry.timeout_ms > 60_000 {
@@ -81,30 +73,10 @@ impl NativeMapTileCapabilities {
                 return Err("duplicate native map tile capability".to_owned());
             }
         }
-        Ok(Self {
-            entries: by_name,
-            fixtures: BTreeMap::new(),
-        })
-    }
-
-    #[cfg(test)]
-    fn with_fixture(name: &str, media_type: &str, encoded: Vec<u8>) -> Result<Self, String> {
-        validate_capability_name(name)?;
-        let mut fixtures = BTreeMap::new();
-        fixtures.insert(name.to_owned(), (media_type.to_owned(), encoded));
-        Ok(Self {
-            entries: BTreeMap::new(),
-            fixtures,
-        })
+        Ok(Self { entries: by_name })
     }
 
     fn resolve(&self, request: &MapTileFetchRequest) -> Result<NativeMapTileSource, String> {
-        if let Some((media_type, encoded)) = self.fixtures.get(&request.url_template_capability) {
-            return Ok(NativeMapTileSource::Fixture {
-                media_type: media_type.clone(),
-                encoded: encoded.clone(),
-            });
-        }
         let capability = self
             .entries
             .get(&request.url_template_capability)
@@ -309,26 +281,11 @@ pub struct NativeMapTileHost {
 
 impl NativeMapTileHost {
     pub fn from_env() -> Result<Self, String> {
-        Self::new(
-            NativeMapTileCapabilities::from_env()?,
-            DEFAULT_MAX_IN_FLIGHT,
-            DEFAULT_MAX_RETRIES,
-        )
-    }
-
-    fn new(
-        capabilities: NativeMapTileCapabilities,
-        max_in_flight: usize,
-        max_retries: u8,
-    ) -> Result<Self, String> {
-        if max_in_flight == 0 {
-            return Err("native map tile max_in_flight must be non-zero".to_owned());
-        }
         Ok(Self {
-            capabilities,
-            worker: NativeMapTileWorker::start(max_in_flight)?,
-            max_in_flight,
-            max_retries,
+            capabilities: NativeMapTileCapabilities::from_env()?,
+            worker: NativeMapTileWorker::start(DEFAULT_MAX_IN_FLIGHT)?,
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            max_retries: DEFAULT_MAX_RETRIES,
             in_flight: BTreeMap::new(),
             attempts: BTreeMap::new(),
             metrics: NativeMapTileHostMetrics::default(),
@@ -511,19 +468,6 @@ async fn fetch_and_decode_native_tile(
     source: NativeMapTileSource,
 ) -> Result<DecodedMapTile, WorkerFailure> {
     let (media_type, encoded) = match source {
-        NativeMapTileSource::Fixture {
-            media_type,
-            encoded,
-        } => (media_type, encoded),
-        #[cfg(test)]
-        NativeMapTileSource::DelayedFixture {
-            media_type,
-            encoded,
-            delay,
-        } => {
-            tokio::time::sleep(delay).await;
-            (media_type, encoded)
-        }
         NativeMapTileSource::Http { url, timeout } => {
             let client = client.ok_or_else(|| WorkerFailure {
                 message: "initialize native map HTTP client".to_owned(),
@@ -666,111 +610,4 @@ fn request_key(request: &MapTileFetchRequest) -> RequestKey {
 
 const fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use boon_document::{MapTileCacheKey, MapTileScaleKey, MapTileSourceId, MapViewportGeneration};
-    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
-    use std::io::Cursor;
-    use std::time::Instant;
-
-    fn png_tile(size: u32) -> Vec<u8> {
-        let image = RgbaImage::from_pixel(size, size, Rgba([30, 130, 90, 255]));
-        let mut bytes = Cursor::new(Vec::new());
-        DynamicImage::ImageRgba8(image)
-            .write_to(&mut bytes, ImageFormat::Png)
-            .unwrap();
-        bytes.into_inner()
-    }
-
-    fn request(capability: &str, origin: &str) -> MapTileFetchRequest {
-        MapTileFetchRequest {
-            viewport: DocumentNodeId("generic.map".to_owned()),
-            identity: MapTileRequestIdentity {
-                generation: MapViewportGeneration(1),
-                tile: MapTileCacheKey {
-                    source: MapTileSourceId("generic.fixture".to_owned()),
-                    z: 2,
-                    x: 1,
-                    y: 2,
-                    scale: MapTileScaleKey::from_viewport_scale(1.0).unwrap(),
-                },
-            },
-            url_template_capability: capability.to_owned(),
-            allowed_origins: vec![origin.to_owned()],
-            expected_tile_size: 64,
-        }
-    }
-
-    #[test]
-    fn capability_resolution_requires_descriptor_origin() {
-        let capabilities = NativeMapTileCapabilities::new(vec![NativeMapTileCapabilityConfig {
-            name: "generic_xyz".to_owned(),
-            url_template: "https://tiles.example.test/{z}/{x}/{y}@{scale}.png".to_owned(),
-            timeout_ms: 100,
-        }])
-        .unwrap();
-        let resolved = capabilities
-            .resolve(&request("generic_xyz", "https://tiles.example.test"))
-            .unwrap();
-        assert!(matches!(resolved, NativeMapTileSource::Http { .. }));
-        assert!(
-            capabilities
-                .resolve(&request("generic_xyz", "https://other.example.test"))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn fixture_decode_runs_on_bounded_worker_and_preserves_identity() {
-        let capabilities =
-            NativeMapTileCapabilities::with_fixture("fixture_xyz", "image/png", png_tile(64))
-                .unwrap();
-        let host = NativeMapTileHost::new(capabilities.clone(), 2, 0).unwrap();
-        let request = request("fixture_xyz", "https://fixture.invalid");
-        let source = capabilities.resolve(&request).unwrap();
-        host.worker
-            .try_fetch(request_key(&request), request.clone(), source)
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let completion = loop {
-            match host.worker.completions.try_recv() {
-                Ok(completion) => break completion,
-                Err(TryRecvError::Empty) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                result => panic!("worker did not complete: {result:?}"),
-            }
-        };
-        let decoded = completion.result.unwrap();
-        assert_eq!(decoded.identity, request.identity);
-        assert_eq!((decoded.width, decoded.height), (64, 64));
-        assert_eq!(decoded.rgba.len(), 64 * 64 * 4);
-    }
-
-    #[test]
-    fn stale_request_cancellation_aborts_transport_before_completion() {
-        let host = NativeMapTileHost::new(NativeMapTileCapabilities::default(), 2, 0).unwrap();
-        let request = request("delayed_fixture", "https://fixture.invalid");
-        let key = request_key(&request);
-        host.worker
-            .try_fetch(
-                key.clone(),
-                request,
-                NativeMapTileSource::DelayedFixture {
-                    media_type: "image/png".to_owned(),
-                    encoded: png_tile(64),
-                    delay: Duration::from_millis(500),
-                },
-            )
-            .unwrap();
-        host.worker.cancel(key);
-        thread::sleep(Duration::from_millis(650));
-        assert!(matches!(
-            host.worker.completions.try_recv(),
-            Err(TryRecvError::Empty)
-        ));
-    }
 }

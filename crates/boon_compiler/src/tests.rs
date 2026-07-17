@@ -89,9 +89,85 @@ store: [
 ]
 "#;
 
+fn fixture_program_role(source: &str) -> ProgramRole {
+    if source.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("document:") || line.starts_with("scene:")
+    }) {
+        ProgramRole::Client
+    } else {
+        ProgramRole::Server
+    }
+}
+
+fn compile_fixture_source_text_to_machine_plan(
+    source_label: &str,
+    source: &str,
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_text_to_machine_plan_for_role(
+        source_label,
+        source,
+        target_profile,
+        fixture_program_role(source),
+    )
+}
+
+fn compile_fixture_source_text_to_machine_plan_with_identity(
+    source_label: &str,
+    source: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_text_to_machine_plan_for_role_with_identity(
+        source_label,
+        source,
+        target_profile,
+        fixture_program_role(source),
+        application_identity,
+    )
+}
+
+fn compile_fixture_runtime_source_text_with_persistence_identity(
+    source_label: &str,
+    source: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_text_to_machine_plan_for_role_with_persistence_catalog(
+        source_label,
+        source,
+        target_profile,
+        fixture_program_role(source),
+        application_identity,
+        schema_version,
+        &[],
+    )
+}
+
+fn compile_fixture_runtime_source_text_with_persistence_catalog(
+    source_label: &str,
+    source: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_text_to_machine_plan_for_role_with_persistence_catalog(
+        source_label,
+        source,
+        target_profile,
+        fixture_program_role(source),
+        application_identity,
+        schema_version,
+        migration_predecessors,
+    )
+}
+
 #[test]
 fn compiler_owns_typed_prefix_query_index_plan() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "indexed-prefix-query.bn",
         INDEXED_PREFIX_QUERY_SOURCE,
         TargetProfile::SoftwareDefault,
@@ -134,7 +210,7 @@ fn compiler_owns_typed_prefix_query_index_plan() {
 
 #[test]
 fn compiler_owns_generic_compound_query_and_page_contract() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "generic-compound-query.bn",
         GENERIC_COMPOUND_QUERY_SOURCE,
         TargetProfile::SoftwareDefault,
@@ -183,7 +259,7 @@ fn compiler_owns_generic_compound_query_and_page_contract() {
 
 #[test]
 fn compiler_owns_number_range_and_tag_exact_indexes() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "generic-number-tag-query.bn",
         GENERIC_NUMBER_AND_TAG_QUERY_SOURCE,
         TargetProfile::SoftwareDefault,
@@ -227,9 +303,10 @@ fn compiler_owns_number_range_and_tag_exact_indexes() {
 
 #[test]
 fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
-    let compiled = compile_source_path_to_machine_plan(
+    let compiled = compile_source_path_to_machine_plan_for_role(
         std::path::Path::new("examples/outbound_http_effect.bn"),
         TargetProfile::SoftwareDefault,
+        ProgramRole::Server,
     )
     .unwrap();
     let empty = BTreeSet::new();
@@ -256,6 +333,14 @@ fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
         "outbound HTTP fixture has unsupported ops: {unsupported:#?}"
     );
     assert!(compiled.plan.persistence.effect_outbox.is_empty());
+    assert!(
+        compiled
+            .plan
+            .persistence
+            .memory
+            .iter()
+            .all(|memory| memory.semantic_path != "store.response")
+    );
     let [contract] = compiled.plan.effects.as_slice() else {
         panic!("expected one outbound HTTP contract");
     };
@@ -284,17 +369,9 @@ fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
             _ => None,
         })
         .expect("typed outbound invocation");
-    let EffectResultRoute::CorrelatedSources { variants } = &invocation.result else {
-        panic!("outbound completion must route through typed source IDs");
-    };
-    assert_eq!(variants.len(), 2);
-    assert!(variants.iter().all(|route| {
-        compiled
-            .plan
-            .source_routes
-            .iter()
-            .any(|source| source.source_id == route.source_id)
-    }));
+    let EffectResultRoute::Target { target, policy } = &invocation.result;
+    assert!(matches!(target, ValueRef::State(_)));
+    assert_eq!(*policy, EffectResultPolicy::ReturnValue);
     let verification = verify_plan(&compiled.plan).unwrap();
     assert_eq!(
         verification.status,
@@ -318,7 +395,7 @@ fn compiler_diagnostic_columns_match_editor_grapheme_positions() {
 
 #[test]
 fn root_value_comparison_lowers_both_typed_operands() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "root-value-comparison.bn",
         r#"
 store: [
@@ -384,7 +461,7 @@ store: [
 
 #[test]
 fn timer_interval_lowers_once_as_a_scheduled_source_route() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "timer-interval.bn",
         r#"
 store: [
@@ -415,7 +492,7 @@ store: [
 
 #[test]
 fn source_payload_text_to_number_lowers_as_a_typed_conversion() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "source-text-to-number.bn",
         r#"
 store: [
@@ -563,7 +640,7 @@ fn compile_migration_fixture_chain(
         let relative_path = format!("examples/migrations/{fixture}/v{version}.bn");
         let source = fs::read_to_string(example_path(&relative_path)).unwrap();
         let bindings = predecessor.as_slice();
-        let compiled = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+        let compiled = compile_fixture_runtime_source_text_with_persistence_catalog(
             &relative_path,
             &source,
             TargetProfile::SoftwareDefault,
@@ -591,7 +668,7 @@ fn compile_migration_fixture_chain(
 
 #[test]
 fn compiler_emits_machine_plan_v4_as_its_only_output() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "examples/bytes_length_plan_ops.bn",
         include_str!("../../../examples/bytes_length_plan_ops.bn"),
         TargetProfile::SoftwareDefault,
@@ -605,7 +682,7 @@ fn compiler_emits_machine_plan_v4_as_its_only_output() {
 
 #[test]
 fn pure_function_wrapped_hold_initializer_is_materialized_as_a_typed_constant() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "function-initializer.bn",
         r#"
 FUNCTION starter_text() {
@@ -651,14 +728,14 @@ scene: Scene/Element/text(
 
 #[test]
 fn compiler_lowers_typed_output_roots_into_the_generic_registry() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "counter-output-root.bn",
         include_str!("../../../examples/counter.bn"),
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
-    assert_eq!(compiled.plan.program_role, ProgramRole::Document);
+    assert_eq!(compiled.plan.program_role, ProgramRole::Client);
 
     assert_eq!(compiled.plan.outputs.len(), 1);
     assert_eq!(compiled.plan.outputs[0].name, "document");
@@ -687,10 +764,11 @@ fn compiler_lowers_typed_output_roots_into_the_generic_registry() {
 
 #[test]
 fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_source_text_to_machine_plan_for_role(
         "server-outputs.bn",
         include_str!("../../../examples/server_outputs.bn"),
         TargetProfile::SoftwareDefault,
+        ProgramRole::Server,
     )
     .unwrap();
 
@@ -797,7 +875,7 @@ fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
 
 #[test]
 fn compiler_executes_recursive_http_payload_list_get() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "server-http-echo.bn",
         include_str!("../../../examples/server_http_echo.bn"),
         TargetProfile::SoftwareDefault,
@@ -830,7 +908,7 @@ fn compiler_executes_recursive_http_payload_list_get() {
 
 #[test]
 fn compiler_preserves_multiline_list_arguments_in_source_event_transforms() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "http-query-list-pipeline.bn",
         r#"
 store: [
@@ -906,9 +984,10 @@ store: [
 
 #[test]
 fn fjordpulse_server_host_boundary_is_cpu_executable() {
-    let compiled = compile_source_path_to_machine_plan(
+    let compiled = compile_source_path_to_machine_plan_for_role(
         std::path::Path::new("examples/fjordpulse/Server/RUN.bn"),
         TargetProfile::SoftwareDefault,
+        ProgramRole::Server,
     )
     .unwrap();
     let empty = BTreeSet::new();
@@ -928,7 +1007,19 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
                 &empty,
             )
         })
-        .map(|op| (op.id, op.kind.clone()))
+        .map(|op| {
+            let output_label = match &op.output {
+                Some(ValueRef::Field(field)) => compiled
+                    .plan
+                    .debug_map
+                    .fields
+                    .iter()
+                    .find(|entry| entry.id == format!("field:{}", field.0))
+                    .map(|entry| entry.label.clone()),
+                _ => None,
+            };
+            (op.id, op.output.clone(), output_label, op.kind.clone())
+        })
         .collect::<Vec<_>>();
     assert!(
         compiled.plan.capability_summary.cpu_plan_executor_complete,
@@ -942,9 +1033,9 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
         .iter()
         .find(|slot| slot.list_id == compiled.plan.query_indexes[0].source_list)
         .expect("station catalog list");
-    assert_eq!(stations.initial_rows.len(), 4);
+    assert_eq!(stations.initial_rows.len(), 5);
     assert!(stations.initial_rows.iter().all(|row| {
-        ["coordinate", "id", "kind", "modes", "name"]
+        ["id", "kind", "latitude", "longitude", "modes", "name"]
             .into_iter()
             .all(|name| row.fields.iter().any(|field| field.name == name))
     }));
@@ -952,7 +1043,7 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
 
 #[test]
 fn compiler_lowers_decimal_numbers_as_canonical_executable_number_constants() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "real-output.bn",
         r#"
 store: [
@@ -980,7 +1071,7 @@ outputs: [
 
 #[test]
 fn compiler_rejects_integer_literals_not_exactly_representable_as_number() {
-    let error = compile_source_text_to_machine_plan(
+    let error = compile_fixture_source_text_to_machine_plan(
         "inexact-number.bn",
         r#"
 store: [
@@ -1002,7 +1093,7 @@ outputs: [
 
 #[test]
 fn output_root_identity_ignores_formatting_and_unrelated_declarations() {
-    let compact = compile_source_text_to_machine_plan(
+    let compact = compile_fixture_source_text_to_machine_plan(
         "stable-output.bn",
         r#"
 store: [
@@ -1015,7 +1106,7 @@ outputs: [
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    let reformatted = compile_source_text_to_machine_plan(
+    let reformatted = compile_fixture_source_text_to_machine_plan(
         "stable-output.bn",
         r#"
 -- unrelated formatting and declaration do not define host identity
@@ -1044,7 +1135,7 @@ outputs: [
 
 #[test]
 fn consequential_io_cannot_hide_in_retained_document_evaluation() {
-    let error = compile_source_text_to_machine_plan(
+    let error = compile_fixture_source_text_to_machine_plan(
         "document-log-effect.bn",
         r#"
 document: Document/new(
@@ -1068,7 +1159,7 @@ document: Document/new(
 
 #[test]
 fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes() {
-    let read = compile_source_text_to_machine_plan(
+    let read = compile_fixture_source_text_to_machine_plan(
         "bytes-file-read.bn",
         include_str!("../../../examples/bytes_file_read_plan_ops.bn"),
         TargetProfile::SoftwareDefault,
@@ -1079,7 +1170,7 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
     assert_eq!(read.plan.effects[0].replay, EffectReplay::ReadOnly);
     assert_eq!(read.plan.effects[0].barrier, EffectBarrier::None);
 
-    let write = compile_source_text_to_machine_plan(
+    let write = compile_fixture_source_text_to_machine_plan(
         "transactional-file-write.bn",
         include_str!("../../../examples/bytes_file_write_effect.bn"),
         TargetProfile::SoftwareDefault,
@@ -1142,71 +1233,12 @@ fn compiler_uses_central_host_effect_contracts_and_lowers_transactional_writes()
 }
 
 fn typed_passkey_effect_source() -> &'static str {
-    r#"
-store: [
-    register: SOURCE
-    authenticate: SOURCE
-    registration_succeeded: SOURCE
-    registration_cancelled: SOURCE
-    registration_failed: SOURCE
-    duplicate_credential: SOURCE
-    authentication_succeeded: SOURCE
-    authentication_cancelled: SOURCE
-    authentication_failed: SOURCE
-    simulate_cancel: SOURCE
-    simulate_failure: SOURCE
-    simulate_duplicate: SOURCE
-    workspace_id: TEXT { workspace-1 } |> HOLD workspace_id
-    workspace_grant_id: TEXT { grant-1 } |> HOLD workspace_grant_id
-    account_id: TEXT { account-1 } |> HOLD account_id
-    credential_count: 1 |> HOLD credential_count
-    simulation:
-        Success |> HOLD simulation {
-            LATEST {
-                store.simulate_cancel |> THEN { Cancel }
-                store.simulate_failure |> THEN { Failure }
-                store.simulate_duplicate |> THEN { Duplicate }
-            }
-        }
-]
-
-effects: [
-    register_passkey: [
-        on: store.register
-        perform: DevelopmentPasskey/register(
-            workspace_id: store.workspace_id
-            workspace_grant_id: store.workspace_grant_id
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: store.simulation
-        )
-        results: [
-            RegistrationSucceeded: store.registration_succeeded
-            RegistrationCancelled: store.registration_cancelled
-            RegistrationFailed: store.registration_failed
-            DuplicateCredential: store.duplicate_credential
-        ]
-    ]
-    authenticate_passkey: [
-        on: store.authenticate
-        perform: DevelopmentPasskey/authenticate(
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: store.simulation
-        )
-        results: [
-            AuthenticationSucceeded: store.authentication_succeeded
-            AuthenticationCancelled: store.authentication_cancelled
-            AuthenticationFailed: store.authentication_failed
-        ]
-    ]
-]
-"#
+    include_str!("../../../testdata/typed_passkey_effects.bn")
 }
 
 #[test]
-fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes() {
-    let compiled = compile_source_text_to_machine_plan(
+fn compiler_lowers_typed_passkey_calls_to_canonical_outbox_and_result_states() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "typed-passkey-effects.bn",
         typed_passkey_effect_source(),
         TargetProfile::SoftwareDefault,
@@ -1222,7 +1254,7 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
             .iter()
             .find(|contract| contract.host_operation == operation)
             .unwrap();
-        assert_eq!(contract.result_policy, EffectResultPolicy::CorrelatedSource);
+        assert_eq!(contract.result_policy, EffectResultPolicy::ReturnValue);
         assert_eq!(contract.barrier, EffectBarrier::BeforeAndAfter);
         let schema = compiled
             .plan
@@ -1282,21 +1314,18 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
             .collect::<Vec<_>>(),
         ["Cancel", "Duplicate", "Failure", "Success"]
     );
-    let EffectResultRoute::CorrelatedSources { variants } = &registration.result else {
-        panic!("registration must route correlated variants");
-    };
-    assert_eq!(
-        variants
-            .iter()
-            .map(|route| route.tag.as_str())
-            .collect::<Vec<_>>(),
-        [
-            "DuplicateCredential",
-            "RegistrationCancelled",
-            "RegistrationFailed",
-            "RegistrationSucceeded"
-        ]
-    );
+    let EffectResultRoute::Target { target, policy } = &registration.result;
+    assert!(matches!(target, ValueRef::State(_)));
+    assert_eq!(*policy, EffectResultPolicy::ReturnValue);
+    let persistent_paths = compiled
+        .plan
+        .persistence
+        .memory
+        .iter()
+        .map(|memory| memory.semantic_path.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(persistent_paths.contains("store.registration_result"));
+    assert!(persistent_paths.contains("store.authentication_result"));
     let verification = verify_plan(&compiled.plan).unwrap();
     assert!(
         verification.checks.iter().all(|check| check.pass),
@@ -1311,7 +1340,7 @@ fn compiler_lowers_typed_passkey_effects_to_canonical_outbox_and_source_routes()
 
 #[test]
 fn host_effect_list_intent_uses_the_semantic_list_runtime_identity() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "server-effect-list-intent.bn",
         include_str!("../../../examples/server_effect_chain.bn"),
         TargetProfile::SoftwareDefault,
@@ -1355,38 +1384,175 @@ fn host_effect_list_intent_uses_the_semantic_list_runtime_identity() {
 }
 
 #[test]
-fn effect_invocation_identity_ignores_declaration_label_but_tracks_result_routes() {
-    let original = compile_source_text_to_machine_plan(
+fn state_triggered_effect_plan_has_no_original_source_input() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "state-triggered-effect-chain.bn",
+        include_str!("../../../testdata/state_triggered_effect_chain.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let start = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.start")
+        .unwrap()
+        .source_id;
+    let random = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| {
+            matches!(&op.kind,
+                PlanOpKind::UpdateBranch {
+                    expression_kind: PlanExpressionKind::HostEffect,
+                    effect: Some(effect),
+                    ..
+                } if compiled.plan.effects.iter().any(|contract|
+                    contract.effect_id == effect.effect_id
+                        && contract.host_operation == "Random/bytes"))
+        })
+        .expect("Random/bytes plan op");
+    let PlanOpKind::UpdateBranch { trigger, .. } = &random.kind else {
+        unreachable!();
+    };
+    assert!(matches!(trigger, ValueRef::State(_)));
+    assert!(
+        random
+            .inputs
+            .iter()
+            .all(|input| !matches!(input, ValueRef::Source(source) if *source == start)),
+        "a state-triggered effect must not retain the original SOURCE input"
+    );
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass)
+    );
+}
+
+#[test]
+fn tagged_host_effect_intent_lowers_as_a_typed_row_expression() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "tagged-host-effect-intent.bn",
+        r#"
+store: [
+    load: SOURCE
+    asset: PackageAsset[url: TEXT { asset://wave.vcd }]
+    result:
+        NotStarted |> HOLD result {
+            load |> THEN {
+                File/read_stream(
+                    file: asset
+                    chunk_bytes: 4096
+                    retain_content: True
+                )
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let asset = compiled
+        .plan
+        .debug_map
+        .fields
+        .iter()
+        .find(|field| field.label == "store.asset")
+        .and_then(|field| field.id.strip_prefix("field:"))
+        .and_then(|field| field.parse::<usize>().ok())
+        .map(FieldId)
+        .expect("asset field");
+    let expression = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| {
+            (op.output == Some(ValueRef::Field(asset)))
+                .then_some(&op.kind)
+                .and_then(|kind| match kind {
+                    PlanOpKind::DerivedValue {
+                        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                        ..
+                    } => Some(expression),
+                    _ => None,
+                })
+        })
+        .expect("asset derived expression");
+    let PlanRowExpression::TaggedObject { tag, fields } = expression else {
+        panic!("PackageAsset must lower as a generic tagged-object expression");
+    };
+    assert_eq!(tag, "PackageAsset");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "url");
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass)
+    );
+}
+
+#[test]
+fn multiline_when_arm_constructor_lowers_inline_select_arms() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "multiline-when-arm-constructor.bn",
+        r#"
+store: [
+    toggle: SOURCE
+    mode:
+        Dark |> HOLD mode {
+            toggle |> THEN { Light }
+        }
+]
+
+document: Document/new(
+    root: store.mode |> WHEN {
+        Dark => Element/label(
+            element: []
+            style: [background: [color: store.mode |> WHEN {
+                Dark => TEXT { #101820 }
+                Light => TEXT { #f4f7fb }
+            }]]
+            label: Element/text(element: [], style: [], text: TEXT { dark })
+        )
+        __ => Element/label(element: [], style: [], label: TEXT { light })
+    }
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let document = compiled.plan.document.as_ref().expect("document plan");
+    assert!(document.expressions.iter().any(|expression| {
+        matches!(&expression.op, DocumentExprOp::Select { arms, .. } if arms.len() == 2)
+    }));
+    assert!(
+        verify_plan(&compiled.plan)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.pass)
+    );
+}
+
+#[test]
+fn effect_invocation_identity_tracks_the_direct_result_state() {
+    let original = compile_fixture_source_text_to_machine_plan(
         "typed-passkey-effects.bn",
         typed_passkey_effect_source(),
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    let renamed_source =
-        typed_passkey_effect_source().replacen("register_passkey: [", "protect_workspace: [", 1);
-    let renamed = compile_source_text_to_machine_plan(
-        "typed-passkey-effects-renamed.bn",
-        &renamed_source,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-    assert_eq!(
-        original.plan.persistence.schema_hash, renamed.plan.persistence.schema_hash,
-        "renaming a declaration must not orphan its durable invocation"
-    );
-
-    let rerouted_source = typed_passkey_effect_source()
-        .replacen(
-            "registration_cancelled: SOURCE",
-            "registration_cancelled: SOURCE\n    registration_cancelled_alt: SOURCE",
-            1,
-        )
-        .replacen(
-            "RegistrationCancelled: store.registration_cancelled",
-            "RegistrationCancelled: store.registration_cancelled_alt",
-            1,
-        );
-    let rerouted = compile_source_text_to_machine_plan(
+    let rerouted_source =
+        typed_passkey_effect_source().replace("registration_result", "registration_result_alt");
+    let rerouted = compile_fixture_source_text_to_machine_plan(
         "typed-passkey-effects-rerouted.bn",
         &rerouted_source,
         TargetProfile::SoftwareDefault,
@@ -1394,13 +1560,13 @@ fn effect_invocation_identity_ignores_declaration_label_but_tracks_result_routes
     .unwrap();
     assert_ne!(
         original.plan.persistence.schema_hash, rerouted.plan.persistence.schema_hash,
-        "changing a correlated result route must change durable compatibility"
+        "changing the direct result state must change durable compatibility"
     );
 }
 
 #[test]
 fn function_call_match_input_in_hold_update_is_statically_scheduled() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "call-derived-match-input.bn",
         r#"
 store: [
@@ -1500,7 +1666,7 @@ store: [
 
 #[test]
 fn indexed_list_persistence_covers_every_executor_authority_field() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "todomvc-authority-coverage.bn",
         include_str!("../../../examples/todomvc.bn"),
         TargetProfile::SoftwareDefault,
@@ -1583,7 +1749,7 @@ fn persistence_ids_by_semantic_path(
 
 #[test]
 fn compiler_persistence_metadata_verifies_and_has_no_invented_migrations() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "counter-display-label.bn",
         include_str!("../../../examples/counter.bn"),
         TargetProfile::SoftwareDefault,
@@ -1615,13 +1781,13 @@ fn compiler_persistence_metadata_verifies_and_has_no_invented_migrations() {
 fn persistence_identity_is_stable_across_formatting_and_display_labels() {
     let source = include_str!("../../../examples/counter.bn");
     let formatted = format!("\n\n\n{source}\n\n");
-    let first = compile_source_text_to_machine_plan(
+    let first = compile_fixture_source_text_to_machine_plan(
         "first-display-label.bn",
         source,
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    let second = compile_source_text_to_machine_plan(
+    let second = compile_fixture_source_text_to_machine_plan(
         "renamed-display-label.bn",
         &formatted,
         TargetProfile::SoftwareDefault,
@@ -1684,10 +1850,13 @@ store: [
         }
 ]
 "#;
-    let first =
-        compile_source_text_to_machine_plan("ordered.bn", first, TargetProfile::SoftwareDefault)
-            .unwrap();
-    let reordered = compile_source_text_to_machine_plan(
+    let first = compile_fixture_source_text_to_machine_plan(
+        "ordered.bn",
+        first,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let reordered = compile_fixture_source_text_to_machine_plan(
         "reordered.bn",
         reordered,
         TargetProfile::SoftwareDefault,
@@ -1720,13 +1889,13 @@ value:
         LATEST { events |> THEN { TEXT { one } } }
     }
 "#;
-    let number = compile_source_text_to_machine_plan(
+    let number = compile_fixture_source_text_to_machine_plan(
         "number-default.bn",
         number,
         TargetProfile::SoftwareDefault,
     )
     .unwrap();
-    let text = compile_source_text_to_machine_plan(
+    let text = compile_fixture_source_text_to_machine_plan(
         "text-default.bn",
         text,
         TargetProfile::SoftwareDefault,
@@ -1745,14 +1914,14 @@ fn identity_aware_compiler_api_uses_host_identity_without_changing_memory_ids() 
     let source = include_str!("../../../examples/counter.bn");
     let first_identity = ApplicationIdentity::new("dev.boon.counter", "alice", "test");
     let second_identity = ApplicationIdentity::new("dev.boon.counter", "bob", "test");
-    let first = compile_source_text_to_machine_plan_with_identity(
+    let first = compile_fixture_source_text_to_machine_plan_with_identity(
         "counter-one.bn",
         source,
         TargetProfile::SoftwareDefault,
         first_identity.clone(),
     )
     .unwrap();
-    let second = compile_source_text_to_machine_plan_with_identity(
+    let second = compile_fixture_source_text_to_machine_plan_with_identity(
         "counter-two.bn",
         source,
         TargetProfile::SoftwareDefault,
@@ -1776,7 +1945,7 @@ fn identity_aware_compiler_api_uses_host_identity_without_changing_memory_ids() 
 fn persistence_schema_version_is_an_explicit_compiler_input() {
     let source = include_str!("../../../examples/counter.bn");
     let identity = ApplicationIdentity::new("dev.boon.counter", "migration", "test");
-    let v1 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let v1 = compile_fixture_runtime_source_text_with_persistence_identity(
         "counter-v1.bn",
         source,
         TargetProfile::SoftwareDefault,
@@ -1784,7 +1953,7 @@ fn persistence_schema_version_is_an_explicit_compiler_input() {
         1,
     )
     .unwrap();
-    let v2 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let v2 = compile_fixture_runtime_source_text_with_persistence_identity(
         "counter-v2.bn",
         source,
         TargetProfile::SoftwareDefault,
@@ -1811,7 +1980,7 @@ fn compatible_versions_bind_noop_edges_and_inherit_skipped_activation_catalog() 
     let v2_source = "count: 10 |> HOLD count { LATEST {} }";
     let v3_source = "count: 20 |> HOLD count { LATEST {} }";
     let identity = ApplicationIdentity::new("dev.boon.counter", "catalog", "test");
-    let v1 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let v1 = compile_fixture_runtime_source_text_with_persistence_identity(
         "counter-v1.bn",
         v1_source,
         TargetProfile::SoftwareDefault,
@@ -1820,7 +1989,7 @@ fn compatible_versions_bind_noop_edges_and_inherit_skipped_activation_catalog() 
     )
     .unwrap();
     let v1_binding = MigrationPredecessorBinding::from_machine_plan(&v1.plan);
-    let v2 = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+    let v2 = compile_fixture_runtime_source_text_with_persistence_catalog(
         "counter-v2.bn",
         v2_source,
         TargetProfile::SoftwareDefault,
@@ -1829,7 +1998,7 @@ fn compatible_versions_bind_noop_edges_and_inherit_skipped_activation_catalog() 
         std::slice::from_ref(&v1_binding),
     )
     .unwrap();
-    let v2_repeat = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+    let v2_repeat = compile_fixture_runtime_source_text_with_persistence_catalog(
         "counter-v2.bn",
         v2_source,
         TargetProfile::SoftwareDefault,
@@ -1852,7 +2021,7 @@ fn compatible_versions_bind_noop_edges_and_inherit_skipped_activation_catalog() 
     );
 
     let v2_binding = MigrationPredecessorBinding::from_machine_plan(&v2.plan);
-    let v3 = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+    let v3 = compile_fixture_runtime_source_text_with_persistence_catalog(
         "counter-v3.bn",
         v3_source,
         TargetProfile::SoftwareDefault,
@@ -1880,7 +2049,7 @@ fn compatible_versions_bind_noop_edges_and_inherit_skipped_activation_catalog() 
 #[test]
 fn incompatible_shared_memory_type_requires_drain() {
     let identity = ApplicationIdentity::new("dev.boon.counter", "incompatible", "test");
-    let v1 = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let v1 = compile_fixture_runtime_source_text_with_persistence_identity(
         "value-v1.bn",
         "value: 1 |> HOLD value { LATEST {} }",
         TargetProfile::SoftwareDefault,
@@ -1889,7 +2058,7 @@ fn incompatible_shared_memory_type_requires_drain() {
     )
     .unwrap();
     let predecessor = MigrationPredecessorBinding::from_machine_plan(&v1.plan);
-    let error = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+    let error = compile_fixture_runtime_source_text_with_persistence_catalog(
         "value-v2.bn",
         "value: TEXT { one } |> HOLD value { LATEST {} }",
         TargetProfile::SoftwareDefault,
@@ -1932,7 +2101,7 @@ status:
     |> HOLD status { LATEST {} }
 "#;
     let identity = ApplicationIdentity::new("dev.boon.todo", "migration", "test");
-    let predecessor_plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let predecessor_plan = compile_fixture_runtime_source_text_with_persistence_identity(
         "status-v1.bn",
         predecessor_source,
         TargetProfile::SoftwareDefault,
@@ -1940,7 +2109,7 @@ status:
         1,
     )
     .unwrap();
-    let unbound = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let unbound = compile_fixture_runtime_source_text_with_persistence_identity(
         "status-v2.bn",
         source,
         TargetProfile::SoftwareDefault,
@@ -1949,7 +2118,7 @@ status:
     )
     .unwrap();
     let predecessor = MigrationPredecessorBinding::from_machine_plan(&predecessor_plan.plan);
-    let bound = compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
+    let bound = compile_fixture_runtime_source_text_with_persistence_catalog(
         "status-v2.bn",
         source,
         TargetProfile::SoftwareDefault,
@@ -2021,7 +2190,7 @@ current:
     DRAIN { previous } + 0.5
     |> HOLD current { LATEST {} }
 "#;
-    let plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let plan = compile_fixture_runtime_source_text_with_persistence_identity(
         "fractional-migration.bn",
         source,
         TargetProfile::SoftwareDefault,
@@ -2068,7 +2237,7 @@ merged:
 
 "#;
     let identity = ApplicationIdentity::new("dev.boon.merge", "migration", "test");
-    let first = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let first = compile_fixture_runtime_source_text_with_persistence_identity(
         "merge-a.bn",
         ordered,
         TargetProfile::SoftwareDefault,
@@ -2076,7 +2245,7 @@ merged:
         2,
     )
     .unwrap();
-    let second = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let second = compile_fixture_runtime_source_text_with_persistence_identity(
         "merge-b.bn",
         reordered,
         TargetProfile::SoftwareDefault,
@@ -2137,7 +2306,7 @@ FUNCTION new_todo(todo) {
     ]
 }
 "#;
-    let list_plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let list_plan = compile_fixture_runtime_source_text_with_persistence_identity(
         "list-v2.bn",
         whole_list,
         TargetProfile::SoftwareDefault,
@@ -2146,7 +2315,7 @@ FUNCTION new_todo(todo) {
     )
     .unwrap()
     .plan;
-    let indexed_plan = compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+    let indexed_plan = compile_fixture_runtime_source_text_with_persistence_identity(
         "indexed-v2.bn",
         indexed,
         TargetProfile::SoftwareDefault,
@@ -2206,7 +2375,7 @@ FUNCTION new_todo(todo) {
 fn indexed_migrations_reconstruct_untouched_row_defaults() {
     let identity = ApplicationIdentity::new("dev.boon.todo-migration", "migration", "test");
     let compile_stage = |version, path: &str| {
-        compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+        compile_fixture_runtime_source_text_with_persistence_identity(
             path,
             &fs::read_to_string(example_path(path)).unwrap(),
             TargetProfile::SoftwareDefault,
@@ -2255,12 +2424,18 @@ fn indexed_migrations_reconstruct_untouched_row_defaults() {
 #[test]
 fn compiled_v4_binary_and_hash_are_deterministic() {
     let source = include_str!("../../../examples/counter.bn");
-    let first =
-        compile_source_text_to_machine_plan("counter.bn", source, TargetProfile::SoftwareDefault)
-            .unwrap();
-    let second =
-        compile_source_text_to_machine_plan("counter.bn", source, TargetProfile::SoftwareDefault)
-            .unwrap();
+    let first = compile_fixture_source_text_to_machine_plan(
+        "counter.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let second = compile_fixture_source_text_to_machine_plan(
+        "counter.bn",
+        source,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
 
     assert_eq!(
         plan_binary(&first.plan).unwrap(),
@@ -2274,7 +2449,7 @@ fn compiled_v4_binary_and_hash_are_deterministic() {
 
 #[test]
 fn anonymous_line_based_state_is_a_compile_diagnostic() {
-    let error = compile_source_text_to_machine_plan(
+    let error = compile_fixture_source_text_to_machine_plan(
         "anonymous-state.bn",
         r#"
 0 |> HOLD {
@@ -2293,7 +2468,7 @@ fn anonymous_line_based_state_is_a_compile_diagnostic() {
 
 #[test]
 fn compiler_root_demand_is_sorted_and_unique() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "examples/counter.bn",
         include_str!("../../../examples/counter.bn"),
         TargetProfile::SoftwareDefault,
@@ -2322,7 +2497,7 @@ fn compiler_preserves_empty_selected_demand() {
 
 #[test]
 fn scoped_list_event_projection_has_a_typed_source_transform() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "scoped-event-projection.bn",
         r#"
 store: [
@@ -2402,7 +2577,7 @@ FUNCTION new_row(item) {
 
 #[test]
 fn root_latest_memory_uses_the_branch_owned_by_each_source() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "source-event-branch-ownership.bn",
         r#"
 store: [
@@ -2475,7 +2650,7 @@ store: [
 
 #[test]
 fn derived_list_input_wins_over_same_named_list_memory() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "derived-list-ownership.bn",
         r#"
 store: [
@@ -2543,7 +2718,7 @@ store: [
 
 #[test]
 fn derived_list_map_lowers_record_returning_helper() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "derived-list-record-helper.bn",
         r#"
 store: [
@@ -2611,7 +2786,7 @@ FUNCTION decorate(item) {
 
 #[test]
 fn derived_list_map_lowers_multiline_helper_pipeline() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "derived-list-pipeline-helper.bn",
         r#"
 store: [
@@ -2683,7 +2858,7 @@ fn document_ids_are_stable_across_identical_compilation() {
 
 #[test]
 fn document_record_helper_ignores_nested_conditional_delimiters() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "document-style-helper.bn",
         r#"
 store: [mode: Dark]
@@ -2723,68 +2898,6 @@ document: Document/new(
             .map(|name| document.names[name.0].as_str())
             .collect::<Vec<_>>();
         names == ["width", "height", "background", "__hover_gloss"]
-    }));
-}
-
-#[test]
-fn document_list_binds_multiline_cross_module_source_continuation_to_previous_item() {
-    let units = [
-        CompilerSourceUnit {
-            path: "Components.bn".to_owned(),
-            source: r#"
-FUNCTION action_button(label) {
-    Element/button(
-        element: [event: [press: SOURCE]]
-        style: [width: 120, height: 36]
-        label: label
-    )
-}
-
-"#
-            .to_owned(),
-        },
-        CompilerSourceUnit {
-            path: "View.bn".to_owned(),
-            source: r#"
-FUNCTION root() {
-    Element/stripe(
-        element: []
-        direction: Row
-        style: [width: Fill]
-        items: LIST {
-            Components/action_button(
-                PASS: [store: PASSED.store]
-                label: TEXT { Publish }
-            )
-                |> SOURCE { PASSED.store.controls.publish }
-            Element/label(element: [], style: [], label: TEXT { Status })
-        }
-    )
-}
-"#
-            .to_owned(),
-        },
-        CompilerSourceUnit {
-            path: "RUN.bn".to_owned(),
-            source: r#"
-store: [controls: [publish: SOURCE]]
-document: Document/new(root: View/root(PASS: [store: store]))
-"#
-            .to_owned(),
-        },
-    ];
-
-    let compiled =
-        compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
-            .unwrap();
-    let document = compiled.plan.document.as_ref().unwrap();
-
-    assert!(document.view_bindings.iter().any(|binding| {
-        binding.kind == boon_plan::DocumentBindingKind::Source
-            && matches!(
-                binding.target,
-                boon_plan::DocumentBindingTarget::Source { .. }
-            )
     }));
 }
 
@@ -2872,103 +2985,8 @@ scene: ProfilePage/render(profile: profile)
 }
 
 #[test]
-fn document_function_block_binds_source_continuation_to_constructor_result() {
-    let compiled = compile_source_text_to_machine_plan(
-        "function-source-continuation.bn",
-        r#"
-store: [editor: SOURCE]
-
-FUNCTION editor() {
-    Scene/Element/text_input(
-        element: [event: [change: SOURCE]]
-        style: [width: Fill, height: 200, multiline: True]
-        text: TEXT { source }
-    )
-        |> SOURCE { PASSED.store.editor }
-}
-
-scene: editor(PASS: [store: store])
-"#,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-    let document = compiled.plan.document.as_ref().unwrap();
-
-    assert!(document.view_bindings.iter().any(|binding| {
-        binding.kind == boon_plan::DocumentBindingKind::Source
-            && matches!(
-                binding.target,
-                boon_plan::DocumentBindingTarget::Source { .. }
-            )
-    }));
-}
-
-#[test]
-fn document_select_binds_multiline_cross_module_source_continuation_to_its_arm() {
-    let units = [
-        CompilerSourceUnit {
-            path: "Components.bn".to_owned(),
-            source: r#"
-FUNCTION action_button(label) {
-    Element/button(
-        element: [event: [press: SOURCE]]
-        style: [width: 120, height: 36]
-        label: label
-    )
-}
-"#
-            .to_owned(),
-        },
-        CompilerSourceUnit {
-            path: "View.bn".to_owned(),
-            source: r#"
-FUNCTION root() {
-    Element/stripe(
-        element: []
-        direction: Row
-        style: [width: Fill]
-        items: LIST {
-            Edit |> WHEN {
-                Edit => Components/action_button(
-                    PASS: [store: PASSED.store]
-                    label: TEXT { Publish }
-                )
-                    |> SOURCE { PASSED.store.controls.publish }
-                __ => NoElement
-            }
-        }
-    )
-}
-"#
-            .to_owned(),
-        },
-        CompilerSourceUnit {
-            path: "RUN.bn".to_owned(),
-            source: r#"
-store: [mode: Edit, controls: [publish: SOURCE]]
-document: Document/new(root: View/root(PASS: [store: store]))
-"#
-            .to_owned(),
-        },
-    ];
-
-    let compiled =
-        compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
-            .unwrap();
-    let document = compiled.plan.document.as_ref().unwrap();
-
-    assert!(document.view_bindings.iter().any(|binding| {
-        binding.kind == boon_plan::DocumentBindingKind::Source
-            && matches!(
-                binding.target,
-                boon_plan::DocumentBindingTarget::Source { .. }
-            )
-    }));
-}
-
-#[test]
 fn document_row_alias_arguments_remain_rows_and_selects_follow_dynamic_inputs() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "document-row-argument.bn",
         r#"
 store: [
@@ -3203,7 +3221,7 @@ value: 0 |> HOLD value { LATEST { events |> THEN { value } } }
 items: LIST {}
 document: Document/new(root: Unknown/widget())
 "#;
-    let error = compile_source_text_to_machine_plan(
+    let error = compile_fixture_source_text_to_machine_plan(
         "unknown-document-constructor.bn",
         source,
         TargetProfile::SoftwareDefault,
@@ -3218,7 +3236,7 @@ document: Document/new(root: Unknown/widget())
 
 #[test]
 fn compiler_persists_root_latest_but_not_transient_or_derived_fields() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "root-latest-memory.bn",
         r#"
 store: [
@@ -3271,7 +3289,7 @@ store: [
 
 #[test]
 fn compiler_resolves_append_record_fields_from_the_trigger_source_payload() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_fixture_source_text_to_machine_plan(
         "append-source-payload-fields.bn",
         r#"
 store: [
@@ -3341,4 +3359,301 @@ FUNCTION revision_view(revision) {
             }) if payload_name == name
         ));
     }
+}
+
+fn distributed_compiler_test_program(
+    role: ProgramRole,
+    source: &str,
+) -> DistributedCompilerProgram {
+    let role_name = role.as_str();
+    DistributedCompilerProgram {
+        revision: 1,
+        role,
+        source_label: format!("distributed-{role_name}-test"),
+        units: vec![CompilerSourceUnit {
+            path: format!("{role_name}/RUN.bn"),
+            source: source.to_owned(),
+        }],
+        application: ApplicationIdentity::new(
+            "dev.boon.distributed-compiler-tests",
+            format!("distributed-{role_name}-state"),
+            "test.local",
+        ),
+        schema_version: 1,
+        migration_predecessors: Vec::new(),
+    }
+}
+
+fn compile_distributed_compiler_test_bundle(
+    client: &str,
+    session: &str,
+    server: &str,
+) -> CompilerResult<CompiledDistributedMachinePlans> {
+    compile_distributed_runtime_source_programs(
+        &[
+            distributed_compiler_test_program(ProgramRole::Client, client),
+            distributed_compiler_test_program(ProgramRole::Session, session),
+            distributed_compiler_test_program(ProgramRole::Server, server),
+        ],
+        TargetProfile::SoftwareDefault,
+    )
+}
+
+const DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT: &str = r#"
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: TEXT { Distributed compiler test }
+    )
+)
+"#;
+
+#[test]
+fn distributed_compiler_links_three_verified_role_plans_without_string_fallbacks() {
+    let compiled = compile_distributed_compiler_test_bundle(
+        r#"
+store: [
+    operand: 3
+    server_count: Server.store.count
+    session_count: Session.outputs.adjusted_count
+    sum: Server/add(value: operand + server_count + session_count)
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: TEXT { Distributed compiler test }
+    )
+)
+"#,
+        r#"
+store: [
+    server_count: Server.store.count
+    adjusted_count: server_count + 1
+]
+
+outputs: [
+    adjusted_count: store.adjusted_count
+]
+"#,
+        r#"
+store: [
+    increment: SOURCE
+    count:
+        40 |> HOLD count {
+            LATEST {
+                increment |> THEN { count + 1 }
+            }
+        }
+]
+
+outputs: [
+    count: store.count
+]
+
+FUNCTION add(value) {
+    value + 2
+}
+"#,
+    )
+    .unwrap();
+
+    let graph_id = compiled.graph.graph.graph_id;
+    assert_eq!(compiled.graph.endpoints.len(), 3);
+    for role in [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ] {
+        let plan = &compiled.program(role).expect("compiled role plan").plan;
+        let endpoint = plan
+            .distributed_endpoint
+            .as_ref()
+            .expect("distributed endpoint plan");
+        assert_eq!(plan.program_role, role);
+        assert_eq!(endpoint.endpoint.role, role);
+        assert_eq!(endpoint.graph.graph_id, graph_id);
+        assert!(plan.debug_map.unresolved_executable_refs.is_empty());
+        assert!(
+            plan.regions
+                .iter()
+                .flat_map(|region| &region.ops)
+                .all(|op| { op.unresolved_executable_ref_count == 0 })
+        );
+        let verification = verify_plan(plan).unwrap();
+        assert_eq!(
+            verification.status,
+            "pass",
+            "{role:?} verification failures: {:?}",
+            verification
+                .checks
+                .iter()
+                .filter(|check| !check.pass)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let server = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Server)
+        .unwrap();
+    assert_eq!(server.value_exports.len(), 1);
+    assert_eq!(server.pure_function_exports.len(), 1);
+    assert_eq!(server.pure_function_exports[0].parameters.len(), 1);
+
+    let session = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Session)
+        .unwrap();
+    assert_eq!(session.value_imports.len(), 1);
+    assert_eq!(session.value_exports.len(), 1);
+    let session_plan = &compiled.program(ProgramRole::Session).unwrap().plan;
+    assert!(session_plan.regions.iter().flat_map(|region| &region.ops).any(|op| {
+        op.inputs.iter().any(|input| {
+            matches!(input, ValueRef::DistributedImport(id) if *id == session.value_imports[0].import_id)
+        })
+    }));
+
+    let client = compiled
+        .graph
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.role == ProgramRole::Client)
+        .unwrap();
+    assert_eq!(client.value_imports.len(), 2);
+    let [call] = client.remote_call_sites.as_slice() else {
+        panic!(
+            "expected one remote call, got {:?}",
+            client.remote_call_sites
+        );
+    };
+    let [argument] = call.arguments.as_slice() else {
+        panic!(
+            "expected one remote call argument, got {:?}",
+            call.arguments
+        );
+    };
+    assert!(
+        matches!(argument.value, PlanRowExpression::NumberInfix { .. }),
+        "remote argument was not preserved as a compound pure expression: {:?}",
+        argument.value
+    );
+    let client_plan = &compiled.program(ProgramRole::Client).unwrap().plan;
+    let client_operation_imports = client_plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .flat_map(|op| &op.inputs)
+        .filter_map(|input| match input {
+            ValueRef::DistributedImport(import_id) => Some(*import_id),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let expected_client_imports = client
+        .value_imports
+        .iter()
+        .map(|import| import.import_id)
+        .chain([call.result_import_id])
+        .collect::<BTreeSet<_>>();
+    assert!(
+        expected_client_imports.is_subset(&client_operation_imports),
+        "missing executable distributed imports: expected {expected_client_imports:?}, got {client_operation_imports:?}"
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_dependencies_in_the_wrong_role_direction() {
+    let error = compile_distributed_compiler_test_bundle(
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT,
+        "outputs: [\n    count: 1\n]\n",
+        "outputs: [\n    count: Session.outputs.count\n]\n",
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("Session.outputs.count")
+            && (message.contains("direction")
+                || message.contains("cannot depend")
+                || message.contains("unknown qualified external value")),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_effectful_function_exports() {
+    let client = format!(
+        "result: Server/logged(value: 1)\n{}",
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+    );
+    let error = compile_distributed_compiler_test_bundle(
+        &client,
+        "outputs: [\n    ready: True\n]\n",
+        r#"
+outputs: [
+    ready: True
+]
+
+FUNCTION logged(value) {
+    value |> Log/info()
+}
+"#,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("Server/logged")
+            || message.contains("distributed function `logged`")
+            || message.contains("pure"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn distributed_compiler_rejects_remote_calls_inside_list_rows() {
+    let client = format!(
+        r#"
+store: [
+    items: LIST {{ [value: 1] }}
+    rows:
+        items
+        |> List/map(item, new: decorate(item: item))
+]
+
+FUNCTION decorate(item) {{
+    [value: Server/add(value: item.value)]
+}}
+
+{}
+"#,
+        DISTRIBUTED_COMPILER_TEST_CLIENT_DOCUMENT
+    );
+    let error = compile_distributed_compiler_test_bundle(
+        &client,
+        "outputs: [\n    ready: True\n]\n",
+        r#"
+outputs: [
+    ready: True
+]
+
+FUNCTION add(value) {
+    value + 1
+}
+"#,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("non-indexed root value")
+            || message.contains("scheduled call-site identity")
+            || message.contains("reusable functions")
+            || (message.contains("qualified external expression")
+                && message.contains("no checked type")),
+        "unexpected error: {message}"
+    );
 }

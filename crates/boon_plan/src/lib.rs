@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::path::{Component, Path};
@@ -10,10 +10,11 @@ mod document;
 mod host;
 
 pub use boon_data::{FiniteReal, FiniteRealError};
+pub use boon_document_model::ProgramRole;
 pub use document::*;
 pub use host::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 4;
+pub const PLAN_MAJOR_VERSION: u32 = 5;
 pub const PLAN_MINOR_VERSION: u32 = 0;
 pub const PERSISTENCE_FORMAT_VERSION: u32 = 2;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
@@ -48,28 +49,6 @@ pub enum TargetProfile {
     SoftwareDefault,
     SoftwareBounded,
     FpgaTodomvc,
-}
-
-/// Declares how a host drives a compiled program.
-///
-/// This is deliberately orthogonal to [`TargetProfile`]: the role describes
-/// the program boundary, while the target profile describes execution and
-/// resource constraints.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProgramRole {
-    #[default]
-    Document,
-    Server,
-}
-
-impl ProgramRole {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Document => "document",
-            Self::Server => "server",
-        }
-    }
 }
 
 impl TargetProfile {
@@ -149,6 +128,13 @@ plan_digest_ids!(
     EffectId,
     EffectInvocationId,
     OutputRootId,
+    DistributedGraphId,
+    DistributedEndpointId,
+    DistributedDeclarationId,
+    ExportId,
+    ImportId,
+    DistributedArgumentId,
+    RemoteCallSiteId,
     QueryCollectionId,
     QueryIndexId,
     MemoryId,
@@ -241,7 +227,6 @@ pub enum DataTypePlan {
     Null,
     Bool,
     Number,
-    Byte,
     Text,
     Bytes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -290,7 +275,6 @@ impl DataTypePlan {
             Self::Null
             | Self::Bool
             | Self::Number
-            | Self::Byte
             | Self::Text
             | Self::Bytes { .. }
             | Self::Unknown => self.clone(),
@@ -338,6 +322,1137 @@ fn canonical_data_type_fields(fields: &[DataTypeFieldPlan]) -> Vec<DataTypeField
     fields
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributedExportKind {
+    Value,
+    PureFunction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedGraphIdentityPlan {
+    pub graph_id: DistributedGraphId,
+    pub stable_identity: DistributedDeclarationId,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedValueExportPlan {
+    pub export_id: ExportId,
+    pub stable_identity: DistributedDeclarationId,
+    pub revision: u64,
+    pub producer_role: ProgramRole,
+    pub value: ValueRef,
+    pub data_type: DataTypePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedValueImportPlan {
+    pub import_id: ImportId,
+    pub stable_identity: DistributedDeclarationId,
+    pub revision: u64,
+    pub consumer_role: ProgramRole,
+    pub producer_role: ProgramRole,
+    pub source_export_id: ExportId,
+    pub source_revision: u64,
+    pub data_type: DataTypePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedFunctionParameterPlan {
+    pub argument_id: DistributedArgumentId,
+    pub name: String,
+    pub data_type: DataTypePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedPureFunctionExportPlan {
+    pub export_id: ExportId,
+    pub stable_identity: DistributedDeclarationId,
+    pub revision: u64,
+    pub producer_role: ProgramRole,
+    pub parameters: Vec<DistributedFunctionParameterPlan>,
+    pub result_type: DataTypePlan,
+    pub body: PlanRowExpression,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedCallArgumentPlan {
+    pub argument_id: DistributedArgumentId,
+    pub name: String,
+    pub data_type: DataTypePlan,
+    pub value: PlanRowExpression,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteCallSitePlan {
+    pub call_site_id: RemoteCallSiteId,
+    pub result_import_id: ImportId,
+    pub stable_identity: DistributedDeclarationId,
+    pub revision: u64,
+    pub caller_role: ProgramRole,
+    pub callee_role: ProgramRole,
+    pub function_export_id: ExportId,
+    pub function_revision: u64,
+    pub arguments: Vec<DistributedCallArgumentPlan>,
+    pub result_type: DataTypePlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedEndpointContractPlan {
+    pub endpoint_id: DistributedEndpointId,
+    pub stable_identity: DistributedDeclarationId,
+    pub revision: u64,
+    pub role: ProgramRole,
+    pub value_exports: Vec<DistributedValueExportPlan>,
+    pub value_imports: Vec<DistributedValueImportPlan>,
+    pub pure_function_exports: Vec<DistributedPureFunctionExportPlan>,
+    pub remote_call_sites: Vec<RemoteCallSitePlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedEndpointPlan {
+    pub graph: DistributedGraphIdentityPlan,
+    pub endpoint: DistributedEndpointContractPlan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DistributedGraphPlan {
+    pub graph: DistributedGraphIdentityPlan,
+    pub endpoints: Vec<DistributedEndpointContractPlan>,
+}
+
+impl DistributedGraphIdentityPlan {
+    pub fn new(
+        application: &ApplicationIdentity,
+        stable_identity: DistributedDeclarationId,
+        revision: u64,
+    ) -> Result<Self, PlanError> {
+        let plan = Self {
+            graph_id: DistributedGraphId::from_identity(application, stable_identity)?,
+            stable_identity,
+            revision,
+        };
+        plan.validate(application)?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self, application: &ApplicationIdentity) -> Result<(), PlanError> {
+        if self.revision == 0
+            || digest_is_zero(self.stable_identity.as_bytes())
+            || self.graph_id
+                != DistributedGraphId::from_identity(application, self.stable_identity)?
+        {
+            return Err(PlanError::new(
+                "distributed graph identity or revision is not canonical",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DistributedValueExportPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        graph_id: DistributedGraphId,
+        endpoint_id: DistributedEndpointId,
+        stable_identity: DistributedDeclarationId,
+        revision: u64,
+        producer_role: ProgramRole,
+        value: ValueRef,
+        data_type: DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        let plan = Self {
+            export_id: ExportId::from_identity(
+                graph_id,
+                endpoint_id,
+                DistributedExportKind::Value,
+                stable_identity,
+            )?,
+            stable_identity,
+            revision,
+            producer_role,
+            value,
+            data_type: data_type.canonicalized(),
+        };
+        validate_distributed_value_export(graph_id, endpoint_id, producer_role, &plan)?;
+        Ok(plan)
+    }
+}
+
+impl DistributedValueImportPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        graph_id: DistributedGraphId,
+        endpoint_id: DistributedEndpointId,
+        stable_identity: DistributedDeclarationId,
+        revision: u64,
+        consumer_role: ProgramRole,
+        source: &DistributedValueExportPlan,
+    ) -> Result<Self, PlanError> {
+        let plan = Self {
+            import_id: ImportId::from_value_identity(graph_id, endpoint_id, stable_identity)?,
+            stable_identity,
+            revision,
+            consumer_role,
+            producer_role: source.producer_role,
+            source_export_id: source.export_id,
+            source_revision: source.revision,
+            data_type: source.data_type.clone(),
+        };
+        validate_distributed_value_import(graph_id, endpoint_id, consumer_role, &plan)?;
+        Ok(plan)
+    }
+}
+
+impl DistributedFunctionParameterPlan {
+    pub fn new(
+        export_id: ExportId,
+        name: impl Into<String>,
+        data_type: DataTypePlan,
+    ) -> Result<Self, PlanError> {
+        let name = name.into();
+        let plan = Self {
+            argument_id: DistributedArgumentId::from_parameter_name(export_id, &name)?,
+            name,
+            data_type: data_type.canonicalized(),
+        };
+        if !distributed_data_type_is_supported(&plan.data_type) {
+            return Err(PlanError::new(
+                "distributed function parameters require canonical closed non-list types",
+            ));
+        }
+        Ok(plan)
+    }
+}
+
+impl DistributedPureFunctionExportPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        graph_id: DistributedGraphId,
+        endpoint_id: DistributedEndpointId,
+        stable_identity: DistributedDeclarationId,
+        revision: u64,
+        producer_role: ProgramRole,
+        parameters: Vec<(String, DataTypePlan)>,
+        result_type: DataTypePlan,
+        body: PlanRowExpression,
+    ) -> Result<Self, PlanError> {
+        let export_id = ExportId::from_identity(
+            graph_id,
+            endpoint_id,
+            DistributedExportKind::PureFunction,
+            stable_identity,
+        )?;
+        let mut parameters = parameters
+            .into_iter()
+            .map(|(name, data_type)| {
+                DistributedFunctionParameterPlan::new(export_id, name, data_type)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        parameters.sort_by(|left, right| left.name.cmp(&right.name));
+        let plan = Self {
+            export_id,
+            stable_identity,
+            revision,
+            producer_role,
+            parameters,
+            result_type: result_type.canonicalized(),
+            body,
+        };
+        validate_distributed_function_export(graph_id, endpoint_id, producer_role, &plan, None)?;
+        Ok(plan)
+    }
+}
+
+impl RemoteCallSitePlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new<V>(
+        graph_id: DistributedGraphId,
+        endpoint_id: DistributedEndpointId,
+        stable_identity: DistributedDeclarationId,
+        revision: u64,
+        caller_role: ProgramRole,
+        function: &DistributedPureFunctionExportPlan,
+        arguments: Vec<(String, V)>,
+    ) -> Result<Self, PlanError>
+    where
+        V: Into<PlanRowExpression>,
+    {
+        let call_site_id = RemoteCallSiteId::from_identity(graph_id, endpoint_id, stable_identity)?;
+        let mut arguments = arguments
+            .into_iter()
+            .map(|(name, value)| {
+                let parameter = function
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.name == name)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "remote call argument `{name}` does not exist in the target signature"
+                        ))
+                    })?;
+                Ok(DistributedCallArgumentPlan {
+                    argument_id: parameter.argument_id,
+                    name,
+                    data_type: parameter.data_type.clone(),
+                    value: value.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        arguments.sort_by(|left, right| left.name.cmp(&right.name));
+        let plan = Self {
+            call_site_id,
+            result_import_id: ImportId::from_remote_call_result(call_site_id)?,
+            stable_identity,
+            revision,
+            caller_role,
+            callee_role: function.producer_role,
+            function_export_id: function.export_id,
+            function_revision: function.revision,
+            arguments,
+            result_type: function.result_type.clone(),
+        };
+        validate_remote_call_site(graph_id, endpoint_id, caller_role, &plan, None)?;
+        Ok(plan)
+    }
+}
+
+impl DistributedEndpointContractPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        graph: &DistributedGraphIdentityPlan,
+        stable_identity: DistributedDeclarationId,
+        revision: u64,
+        role: ProgramRole,
+        mut value_exports: Vec<DistributedValueExportPlan>,
+        mut value_imports: Vec<DistributedValueImportPlan>,
+        mut pure_function_exports: Vec<DistributedPureFunctionExportPlan>,
+        mut remote_call_sites: Vec<RemoteCallSitePlan>,
+    ) -> Result<Self, PlanError> {
+        let endpoint_id =
+            DistributedEndpointId::from_identity(graph.graph_id, role, stable_identity)?;
+        value_exports.sort_by_key(|export| export.export_id);
+        value_imports.sort_by_key(|import| import.import_id);
+        pure_function_exports.sort_by_key(|export| export.export_id);
+        remote_call_sites.sort_by_key(|call| call.call_site_id);
+        let plan = Self {
+            endpoint_id,
+            stable_identity,
+            revision,
+            role,
+            value_exports,
+            value_imports,
+            pure_function_exports,
+            remote_call_sites,
+        };
+        validate_distributed_endpoint_contract(graph, &plan, None)?;
+        Ok(plan)
+    }
+}
+
+impl DistributedEndpointPlan {
+    pub fn new(
+        application: &ApplicationIdentity,
+        graph: DistributedGraphIdentityPlan,
+        endpoint: DistributedEndpointContractPlan,
+    ) -> Result<Self, PlanError> {
+        let plan = Self { graph, endpoint };
+        plan.validate(application, plan.endpoint.role)?;
+        Ok(plan)
+    }
+
+    pub fn validate(
+        &self,
+        application: &ApplicationIdentity,
+        machine_role: ProgramRole,
+    ) -> Result<(), PlanError> {
+        self.graph.validate(application)?;
+        if self.endpoint.role != machine_role {
+            return Err(PlanError::new(
+                "distributed endpoint role does not match the MachinePlan role",
+            ));
+        }
+        validate_distributed_endpoint_contract(&self.graph, &self.endpoint, None)
+    }
+}
+
+impl DistributedGraphPlan {
+    pub fn new(
+        application: &ApplicationIdentity,
+        graph: DistributedGraphIdentityPlan,
+        mut endpoints: Vec<DistributedEndpointContractPlan>,
+    ) -> Result<Self, PlanError> {
+        endpoints.sort_by_key(|endpoint| endpoint.role);
+        let plan = Self { graph, endpoints };
+        plan.validate(application)?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self, application: &ApplicationIdentity) -> Result<(), PlanError> {
+        self.graph.validate(application)?;
+        validate_distributed_graph_endpoints(&self.graph, &self.endpoints)
+    }
+
+    pub fn endpoint_plan(&self, role: ProgramRole) -> Option<DistributedEndpointPlan> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.role == role)
+            .cloned()
+            .map(|endpoint| DistributedEndpointPlan {
+                graph: self.graph.clone(),
+                endpoint,
+            })
+    }
+}
+
+fn distributed_name_is_canonical(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+fn digest_is_zero(digest: &[u8; 32]) -> bool {
+    digest.iter().all(|byte| *byte == 0)
+}
+
+fn distributed_role_can_depend(consumer: ProgramRole, producer: ProgramRole) -> bool {
+    matches!(
+        (consumer, producer),
+        (
+            ProgramRole::Client,
+            ProgramRole::Session | ProgramRole::Server
+        ) | (ProgramRole::Session, ProgramRole::Server)
+    )
+}
+
+fn distributed_data_type_is_supported(data_type: &DataTypePlan) -> bool {
+    if !data_type.is_canonical() {
+        return false;
+    }
+    let fields_supported = |fields: &[DataTypeFieldPlan]| {
+        fields.iter().all(|field| {
+            distributed_name_is_canonical(&field.name)
+                && distributed_data_type_is_supported(&field.data_type)
+        })
+    };
+    match data_type {
+        DataTypePlan::Variant { variants } => variants.iter().all(|variant| {
+            distributed_name_is_canonical(&variant.tag)
+                && !variant.open
+                && fields_supported(&variant.fields)
+        }),
+        DataTypePlan::Record { fields, open } | DataTypePlan::Error { fields, open } => {
+            !open && fields_supported(fields)
+        }
+        DataTypePlan::List { .. } | DataTypePlan::Unknown => false,
+        DataTypePlan::Null
+        | DataTypePlan::Bool
+        | DataTypePlan::Number
+        | DataTypePlan::Text
+        | DataTypePlan::Bytes { .. } => true,
+    }
+}
+
+fn distributed_external_value_ref_is_supported(value: &ValueRef) -> bool {
+    match value {
+        ValueRef::State(_) | ValueRef::Field(_) | ValueRef::Constant(_) => true,
+        ValueRef::StateProjection { field_path, .. } => {
+            !field_path.is_empty()
+                && field_path
+                    .iter()
+                    .all(|part| distributed_name_is_canonical(part))
+        }
+        ValueRef::DistributedImport(_) => true,
+        ValueRef::Source(_)
+        | ValueRef::SourcePayload { .. }
+        | ValueRef::List(_)
+        | ValueRef::DistributedFunctionArgument { .. } => false,
+    }
+}
+
+fn validate_distributed_value_export(
+    graph_id: DistributedGraphId,
+    endpoint_id: DistributedEndpointId,
+    endpoint_role: ProgramRole,
+    export: &DistributedValueExportPlan,
+) -> Result<(), PlanError> {
+    if export.revision == 0
+        || digest_is_zero(export.stable_identity.as_bytes())
+        || export.producer_role != endpoint_role
+        || export.export_id
+            != ExportId::from_identity(
+                graph_id,
+                endpoint_id,
+                DistributedExportKind::Value,
+                export.stable_identity,
+            )?
+        || !distributed_data_type_is_supported(&export.data_type)
+        || !distributed_external_value_ref_is_supported(&export.value)
+    {
+        return Err(PlanError::new(
+            "distributed value export has a noncanonical ID, revision, role, type, or value ref",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_distributed_value_import(
+    graph_id: DistributedGraphId,
+    endpoint_id: DistributedEndpointId,
+    endpoint_role: ProgramRole,
+    import: &DistributedValueImportPlan,
+) -> Result<(), PlanError> {
+    if import.revision == 0
+        || import.source_revision == 0
+        || digest_is_zero(import.stable_identity.as_bytes())
+        || import.consumer_role != endpoint_role
+        || !distributed_role_can_depend(import.consumer_role, import.producer_role)
+        || import.import_id
+            != ImportId::from_value_identity(graph_id, endpoint_id, import.stable_identity)?
+        || !distributed_data_type_is_supported(&import.data_type)
+    {
+        return Err(PlanError::new(
+            "distributed value import has a noncanonical ID, revision, direction, role, or type",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_distributed_function_export(
+    graph_id: DistributedGraphId,
+    endpoint_id: DistributedEndpointId,
+    endpoint_role: ProgramRole,
+    export: &DistributedPureFunctionExportPlan,
+    constants: Option<&[PlanConstant]>,
+) -> Result<(), PlanError> {
+    if export.revision == 0
+        || digest_is_zero(export.stable_identity.as_bytes())
+        || export.producer_role != endpoint_role
+        || export.export_id
+            != ExportId::from_identity(
+                graph_id,
+                endpoint_id,
+                DistributedExportKind::PureFunction,
+                export.stable_identity,
+            )?
+        || !distributed_data_type_is_supported(&export.result_type)
+        || !export
+            .parameters
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name)
+    {
+        return Err(PlanError::new(
+            "distributed pure function has a noncanonical ID, revision, role, signature, or parameter order",
+        ));
+    }
+    let mut argument_ids = BTreeSet::new();
+    for parameter in &export.parameters {
+        if !distributed_name_is_canonical(&parameter.name)
+            || !distributed_data_type_is_supported(&parameter.data_type)
+            || parameter.argument_id
+                != DistributedArgumentId::from_parameter_name(export.export_id, &parameter.name)?
+            || !argument_ids.insert(parameter.argument_id)
+        {
+            return Err(PlanError::new(
+                "distributed pure function parameters must be named, typed, unique, and canonically identified",
+            ));
+        }
+    }
+    validate_distributed_pure_expression(&export.body, export.export_id, &argument_ids, constants)
+}
+
+fn validate_remote_call_site(
+    graph_id: DistributedGraphId,
+    endpoint_id: DistributedEndpointId,
+    endpoint_role: ProgramRole,
+    call: &RemoteCallSitePlan,
+    constants: Option<&[PlanConstant]>,
+) -> Result<(), PlanError> {
+    if call.revision == 0
+        || call.function_revision == 0
+        || digest_is_zero(call.stable_identity.as_bytes())
+        || call.caller_role != endpoint_role
+        || !distributed_role_can_depend(call.caller_role, call.callee_role)
+        || call.call_site_id
+            != RemoteCallSiteId::from_identity(graph_id, endpoint_id, call.stable_identity)?
+        || call.result_import_id != ImportId::from_remote_call_result(call.call_site_id)?
+        || !distributed_data_type_is_supported(&call.result_type)
+        || !call
+            .arguments
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name)
+    {
+        return Err(PlanError::new(
+            "remote pure call has a noncanonical ID, revision, direction, role, result, or argument order",
+        ));
+    }
+    let mut argument_ids = BTreeSet::new();
+    for argument in &call.arguments {
+        if !distributed_name_is_canonical(&argument.name)
+            || !distributed_data_type_is_supported(&argument.data_type)
+            || !distributed_call_argument_expression_is_safe(&argument.value, constants)
+            || !argument_ids.insert(argument.argument_id)
+        {
+            return Err(PlanError::new(
+                "remote pure call arguments must be named, typed, unique, and use bounded pure expressions",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_distributed_pure_expression(
+    expression: &PlanRowExpression,
+    export_id: ExportId,
+    argument_ids: &BTreeSet<DistributedArgumentId>,
+    constants: Option<&[PlanConstant]>,
+) -> Result<(), PlanError> {
+    let validate = |expression: &PlanRowExpression| {
+        validate_distributed_pure_expression(expression, export_id, argument_ids, constants)
+    };
+    let valid = match expression {
+        PlanRowExpression::Field {
+            input:
+                ValueRef::DistributedFunctionArgument {
+                    export_id: owner,
+                    argument_id,
+                },
+        } => *owner == export_id && argument_ids.contains(argument_id),
+        PlanRowExpression::Field { .. } => false,
+        PlanRowExpression::Constant { constant_id } => constants
+            .is_none_or(|constants| constants.iter().any(|constant| constant.id == *constant_id)),
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextIsEmpty { input }
+        | PlanRowExpression::TextLength { input }
+        | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input }
+        | PlanRowExpression::BytesIsEmpty { input }
+        | PlanRowExpression::BytesLength { input } => validate(input).is_ok(),
+        PlanRowExpression::TextStartsWith { input, prefix }
+        | PlanRowExpression::BytesStartsWith { input, prefix } => {
+            validate(input).is_ok() && validate(prefix).is_ok()
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => {
+            validate(input).is_ok() && validate(suffix).is_ok()
+        }
+        PlanRowExpression::BytesConcat { left, right }
+        | PlanRowExpression::BytesEqual { left, right } => {
+            validate(left).is_ok() && validate(right).is_ok()
+        }
+        PlanRowExpression::NumberInfix { op, left, right } => {
+            matches!(
+                op.as_str(),
+                "+" | "-" | "*" | "/" | "%" | "==" | "!=" | ">" | ">=" | "<" | "<="
+            ) && validate(left).is_ok()
+                && validate(right).is_ok()
+        }
+        PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        } => validate(input).is_ok() && validate(start).is_ok() && validate(length).is_ok(),
+        PlanRowExpression::TextToBytes { input, encoding }
+        | PlanRowExpression::BytesToText { input, encoding } => {
+            validate(input).is_ok()
+                && encoding
+                    .as_deref()
+                    .is_none_or(|encoding| validate(encoding).is_ok())
+        }
+        PlanRowExpression::BytesGet { input, index } => {
+            validate(input).is_ok() && validate(index).is_ok()
+        }
+        PlanRowExpression::BytesSlice {
+            input,
+            offset,
+            byte_count,
+        } => validate(input).is_ok() && validate(offset).is_ok() && validate(byte_count).is_ok(),
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            validate(input).is_ok() && validate(byte_count).is_ok()
+        }
+        PlanRowExpression::BytesZeros { byte_count } => validate(byte_count).is_ok(),
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => {
+            validate(input).is_ok()
+                && validate(offset).is_ok()
+                && validate(byte_count).is_ok()
+                && validate(endian).is_ok()
+        }
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => validate(input).is_ok() && validate(index).is_ok() && validate(value).is_ok(),
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            validate(input).is_ok()
+                && validate(offset).is_ok()
+                && validate(byte_count).is_ok()
+                && validate(endian).is_ok()
+                && validate(value).is_ok()
+        }
+        PlanRowExpression::BytesFind { input, needle } => {
+            validate(input).is_ok() && validate(needle).is_ok()
+        }
+        PlanRowExpression::TextConcat { parts } => parts.iter().all(|part| validate(part).is_ok()),
+        PlanRowExpression::Object { fields } => {
+            fields.windows(2).all(|pair| pair[0].name < pair[1].name)
+                && fields.iter().all(|field| {
+                    distributed_name_is_canonical(&field.name) && validate(&field.value).is_ok()
+                })
+        }
+        PlanRowExpression::TaggedObject { tag, fields } => {
+            distributed_name_is_canonical(tag)
+                && fields.windows(2).all(|pair| pair[0].name < pair[1].name)
+                && fields.iter().all(|field| {
+                    distributed_name_is_canonical(&field.name) && validate(&field.value).is_ok()
+                })
+        }
+        PlanRowExpression::ObjectField { object, field } => {
+            distributed_name_is_canonical(field) && validate(object).is_ok()
+        }
+        PlanRowExpression::Select { input, arms } => {
+            !arms.is_empty()
+                && validate(input).is_ok()
+                && arms.iter().all(|arm| validate(&arm.value).is_ok())
+        }
+        PlanRowExpression::Intrinsic { .. }
+        | PlanRowExpression::ListGetField { .. }
+        | PlanRowExpression::ListRef { .. }
+        | PlanRowExpression::ListFindValue { .. }
+        | PlanRowExpression::ListRange { .. }
+        | PlanRowExpression::ListLiteral { .. }
+        | PlanRowExpression::ListMap { .. }
+        | PlanRowExpression::ListMapItem { .. }
+        | PlanRowExpression::ListSum { .. }
+        | PlanRowExpression::ListRowField { .. }
+        | PlanRowExpression::BuiltinCall { .. } => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(PlanError::new(
+            "distributed pure function body uses an unresolved, stateful, list, SOURCE, or symbol-string expression",
+        ))
+    }
+}
+
+fn distributed_call_argument_expression_is_safe(
+    expression: &PlanRowExpression,
+    constants: Option<&[PlanConstant]>,
+) -> bool {
+    let validate = |expression: &PlanRowExpression| {
+        distributed_call_argument_expression_is_safe(expression, constants)
+    };
+    match expression {
+        PlanRowExpression::Field { input } => {
+            distributed_external_value_ref_is_supported(input)
+                && !matches!(input, ValueRef::DistributedFunctionArgument { .. })
+        }
+        PlanRowExpression::Constant { constant_id } => constants
+            .is_none_or(|constants| constants.iter().any(|constant| constant.id == *constant_id)),
+        PlanRowExpression::TextTrim { input }
+        | PlanRowExpression::TextIsEmpty { input }
+        | PlanRowExpression::TextLength { input }
+        | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::BytesToHex { input }
+        | PlanRowExpression::BytesToBase64 { input }
+        | PlanRowExpression::BytesFromHex { input }
+        | PlanRowExpression::BytesFromBase64 { input }
+        | PlanRowExpression::BytesIsEmpty { input }
+        | PlanRowExpression::BytesLength { input } => validate(input),
+        PlanRowExpression::TextStartsWith { input, prefix }
+        | PlanRowExpression::BytesStartsWith { input, prefix } => {
+            validate(input) && validate(prefix)
+        }
+        PlanRowExpression::BytesEndsWith { input, suffix } => validate(input) && validate(suffix),
+        PlanRowExpression::BytesConcat { left, right }
+        | PlanRowExpression::BytesEqual { left, right } => validate(left) && validate(right),
+        PlanRowExpression::NumberInfix { op, left, right } => {
+            matches!(
+                op.as_str(),
+                "+" | "-" | "*" | "/" | "%" | "==" | "!=" | ">" | ">=" | "<" | "<="
+            ) && validate(left)
+                && validate(right)
+        }
+        PlanRowExpression::TextSubstring {
+            input,
+            start,
+            length,
+        } => validate(input) && validate(start) && validate(length),
+        PlanRowExpression::TextToBytes { input, encoding }
+        | PlanRowExpression::BytesToText { input, encoding } => {
+            validate(input) && encoding.as_deref().is_none_or(validate)
+        }
+        PlanRowExpression::BytesGet { input, index } => validate(input) && validate(index),
+        PlanRowExpression::BytesSlice {
+            input,
+            offset,
+            byte_count,
+        } => validate(input) && validate(offset) && validate(byte_count),
+        PlanRowExpression::BytesTake { input, byte_count }
+        | PlanRowExpression::BytesDrop { input, byte_count } => {
+            validate(input) && validate(byte_count)
+        }
+        PlanRowExpression::BytesZeros { byte_count } => validate(byte_count),
+        PlanRowExpression::BytesReadUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        }
+        | PlanRowExpression::BytesReadSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+        } => validate(input) && validate(offset) && validate(byte_count) && validate(endian),
+        PlanRowExpression::BytesSet {
+            input,
+            index,
+            value,
+        } => validate(input) && validate(index) && validate(value),
+        PlanRowExpression::BytesWriteUnsigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        }
+        | PlanRowExpression::BytesWriteSigned {
+            input,
+            offset,
+            byte_count,
+            endian,
+            value,
+        } => {
+            validate(input)
+                && validate(offset)
+                && validate(byte_count)
+                && validate(endian)
+                && validate(value)
+        }
+        PlanRowExpression::BytesFind { input, needle } => validate(input) && validate(needle),
+        PlanRowExpression::TextConcat { parts } => parts.iter().all(validate),
+        PlanRowExpression::Object { fields } => {
+            fields.windows(2).all(|pair| pair[0].name < pair[1].name)
+                && fields.iter().all(|field| {
+                    distributed_name_is_canonical(&field.name) && validate(&field.value)
+                })
+        }
+        PlanRowExpression::TaggedObject { tag, fields } => {
+            distributed_name_is_canonical(tag)
+                && fields.windows(2).all(|pair| pair[0].name < pair[1].name)
+                && fields.iter().all(|field| {
+                    distributed_name_is_canonical(&field.name) && validate(&field.value)
+                })
+        }
+        PlanRowExpression::ObjectField { object, field } => {
+            distributed_name_is_canonical(field) && validate(object)
+        }
+        PlanRowExpression::Select { input, arms } => {
+            !arms.is_empty() && validate(input) && arms.iter().all(|arm| validate(&arm.value))
+        }
+        PlanRowExpression::Intrinsic { .. }
+        | PlanRowExpression::ListGetField { .. }
+        | PlanRowExpression::ListRef { .. }
+        | PlanRowExpression::ListFindValue { .. }
+        | PlanRowExpression::ListRange { .. }
+        | PlanRowExpression::ListLiteral { .. }
+        | PlanRowExpression::ListMap { .. }
+        | PlanRowExpression::ListMapItem { .. }
+        | PlanRowExpression::ListSum { .. }
+        | PlanRowExpression::ListRowField { .. }
+        | PlanRowExpression::BuiltinCall { .. } => false,
+    }
+}
+
+fn validate_distributed_endpoint_contract(
+    graph: &DistributedGraphIdentityPlan,
+    endpoint: &DistributedEndpointContractPlan,
+    constants: Option<&[PlanConstant]>,
+) -> Result<(), PlanError> {
+    if endpoint.revision == 0
+        || digest_is_zero(endpoint.stable_identity.as_bytes())
+        || endpoint.endpoint_id
+            != DistributedEndpointId::from_identity(
+                graph.graph_id,
+                endpoint.role,
+                endpoint.stable_identity,
+            )?
+        || !endpoint
+            .value_exports
+            .windows(2)
+            .all(|pair| pair[0].export_id < pair[1].export_id)
+        || !endpoint
+            .value_imports
+            .windows(2)
+            .all(|pair| pair[0].import_id < pair[1].import_id)
+        || !endpoint
+            .pure_function_exports
+            .windows(2)
+            .all(|pair| pair[0].export_id < pair[1].export_id)
+        || !endpoint
+            .remote_call_sites
+            .windows(2)
+            .all(|pair| pair[0].call_site_id < pair[1].call_site_id)
+    {
+        return Err(PlanError::new(
+            "distributed endpoint identity, revision, or member ordering is not canonical",
+        ));
+    }
+    for export in &endpoint.value_exports {
+        validate_distributed_value_export(
+            graph.graph_id,
+            endpoint.endpoint_id,
+            endpoint.role,
+            export,
+        )?;
+    }
+    for import in &endpoint.value_imports {
+        validate_distributed_value_import(
+            graph.graph_id,
+            endpoint.endpoint_id,
+            endpoint.role,
+            import,
+        )?;
+    }
+    for export in &endpoint.pure_function_exports {
+        validate_distributed_function_export(
+            graph.graph_id,
+            endpoint.endpoint_id,
+            endpoint.role,
+            export,
+            constants,
+        )?;
+    }
+    for call in &endpoint.remote_call_sites {
+        validate_remote_call_site(
+            graph.graph_id,
+            endpoint.endpoint_id,
+            endpoint.role,
+            call,
+            constants,
+        )?;
+    }
+    if endpoint.role == ProgramRole::Server
+        && (!endpoint.value_imports.is_empty() || !endpoint.remote_call_sites.is_empty())
+    {
+        return Err(PlanError::new(
+            "server distributed endpoints cannot import values or make remote calls",
+        ));
+    }
+    let mut export_ids = BTreeSet::new();
+    if endpoint
+        .value_exports
+        .iter()
+        .map(|export| export.export_id)
+        .chain(
+            endpoint
+                .pure_function_exports
+                .iter()
+                .map(|export| export.export_id),
+        )
+        .any(|id| !export_ids.insert(id))
+    {
+        return Err(PlanError::new("distributed endpoint repeats an export ID"));
+    }
+    let local_import_ids = endpoint
+        .value_imports
+        .iter()
+        .map(|import| import.import_id)
+        .chain(
+            endpoint
+                .remote_call_sites
+                .iter()
+                .map(|call| call.result_import_id),
+        )
+        .collect::<BTreeSet<_>>();
+    if local_import_ids.len()
+        != endpoint.value_imports.len() + endpoint.remote_call_sites.len()
+        || endpoint.value_exports.iter().any(|export| {
+            matches!(export.value, ValueRef::DistributedImport(id) if !local_import_ids.contains(&id))
+        })
+        || endpoint.remote_call_sites.iter().any(|call| {
+            call.arguments.iter().any(|argument| {
+                distributed_expression_import_ids(&argument.value)
+                    .iter()
+                    .any(|id| !local_import_ids.contains(id))
+            })
+        })
+        || !distributed_call_dependencies_are_acyclic(&endpoint.remote_call_sites)
+    {
+        return Err(PlanError::new(
+            "distributed endpoint import refs must resolve uniquely without call-result cycles",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_distributed_graph_endpoints(
+    graph: &DistributedGraphIdentityPlan,
+    endpoints: &[DistributedEndpointContractPlan],
+) -> Result<(), PlanError> {
+    if endpoints.len() != 3
+        || !endpoints.iter().map(|endpoint| endpoint.role).eq([
+            ProgramRole::Client,
+            ProgramRole::Session,
+            ProgramRole::Server,
+        ])
+    {
+        return Err(PlanError::new(
+            "distributed graph requires one canonically ordered client, session, and server endpoint",
+        ));
+    }
+    for endpoint in endpoints {
+        validate_distributed_endpoint_contract(graph, endpoint, None)?;
+    }
+    let mut endpoint_ids = BTreeSet::new();
+    let mut export_ids = BTreeSet::new();
+    for endpoint in endpoints {
+        if !endpoint_ids.insert(endpoint.endpoint_id)
+            || endpoint
+                .value_exports
+                .iter()
+                .map(|export| export.export_id)
+                .chain(
+                    endpoint
+                        .pure_function_exports
+                        .iter()
+                        .map(|export| export.export_id),
+                )
+                .any(|id| !export_ids.insert(id))
+        {
+            return Err(PlanError::new(
+                "distributed graph repeats an endpoint or export ID",
+            ));
+        }
+    }
+    for endpoint in endpoints {
+        for import in &endpoint.value_imports {
+            let Some(source) = endpoints
+                .iter()
+                .flat_map(|endpoint| &endpoint.value_exports)
+                .find(|source| source.export_id == import.source_export_id)
+            else {
+                return Err(PlanError::new(
+                    "distributed value import references a missing value export",
+                ));
+            };
+            if source.producer_role != import.producer_role
+                || source.revision != import.source_revision
+                || source.data_type != import.data_type
+            {
+                return Err(PlanError::new(
+                    "distributed value import does not exactly match its export",
+                ));
+            }
+        }
+        for call in &endpoint.remote_call_sites {
+            let Some(function) = endpoints
+                .iter()
+                .flat_map(|endpoint| &endpoint.pure_function_exports)
+                .find(|function| function.export_id == call.function_export_id)
+            else {
+                return Err(PlanError::new(
+                    "remote call references a missing pure function export",
+                ));
+            };
+            let arguments_match =
+                call.arguments.len() == function.parameters.len()
+                    && call.arguments.iter().zip(&function.parameters).all(
+                        |(argument, parameter)| {
+                            argument.argument_id == parameter.argument_id
+                                && argument.name == parameter.name
+                                && argument.data_type == parameter.data_type
+                        },
+                    );
+            if function.producer_role != call.callee_role
+                || function.revision != call.function_revision
+                || function.result_type != call.result_type
+                || !arguments_match
+            {
+                return Err(PlanError::new(
+                    "remote call does not exactly match its pure function export",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn distributed_call_dependencies_are_acyclic(calls: &[RemoteCallSitePlan]) -> bool {
+    fn visit(
+        call: &RemoteCallSitePlan,
+        calls: &[RemoteCallSitePlan],
+        visiting: &mut BTreeSet<RemoteCallSiteId>,
+        visited: &mut BTreeSet<RemoteCallSiteId>,
+    ) -> bool {
+        if visited.contains(&call.call_site_id) {
+            return true;
+        }
+        if !visiting.insert(call.call_site_id) {
+            return false;
+        }
+        for import_id in call
+            .arguments
+            .iter()
+            .flat_map(|argument| distributed_expression_import_ids(&argument.value))
+        {
+            if let Some(dependency) = calls
+                .iter()
+                .find(|candidate| candidate.result_import_id == import_id)
+                && !visit(dependency, calls, visiting, visited)
+            {
+                return false;
+            }
+        }
+        visiting.remove(&call.call_site_id);
+        visited.insert(call.call_site_id);
+        true
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    calls
+        .iter()
+        .all(|call| visit(call, calls, &mut visiting, &mut visited))
+}
+
+fn distributed_expression_import_ids(expression: &PlanRowExpression) -> BTreeSet<ImportId> {
+    let mut imports = BTreeSet::new();
+    expression.visit_value_refs(&mut |value_ref| {
+        if let ValueRef::DistributedImport(import_id) = value_ref {
+            imports.insert(*import_id);
+        }
+    });
+    imports
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EffectContract {
     pub effect_id: EffectId,
@@ -345,6 +1460,8 @@ pub struct EffectContract {
     pub replay: EffectReplay,
     pub barrier: EffectBarrier,
     pub result_policy: EffectResultPolicy,
+    #[serde(default, skip_serializing_if = "EffectDeliveryCardinality::is_single")]
+    pub delivery: EffectDeliveryCardinality,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<EffectSchemaPlan>,
 }
@@ -353,6 +1470,36 @@ pub struct EffectContract {
 pub struct EffectSchemaPlan {
     pub intent_type: DataTypePlan,
     pub result_type: DataTypePlan,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_constraints: Vec<EffectIntentConstraintPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectIntentConstraintPlan {
+    UnsignedIntegerRange {
+        field_path: Vec<String>,
+        min_inclusive: u64,
+        max_inclusive: u64,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EffectDeliveryCardinality {
+    #[default]
+    Single,
+    Stream {
+        initial_credits: u32,
+        max_in_flight: u32,
+        terminal_result_tags: Vec<String>,
+    },
+}
+
+impl EffectDeliveryCardinality {
+    fn is_single(&self) -> bool {
+        matches!(self, Self::Single)
+    }
 }
 
 impl EffectContract {
@@ -369,6 +1516,7 @@ impl EffectContract {
             replay,
             barrier,
             result_policy,
+            delivery: EffectDeliveryCardinality::Single,
             schema: None,
         };
         contract.validate()?;
@@ -404,15 +1552,68 @@ impl EffectContract {
                 "effect schemas must use canonical closed data types",
             ));
         }
-        if self.result_policy == EffectResultPolicy::CorrelatedSource
-            && !matches!(
-                self.schema.as_ref().map(|schema| &schema.result_type),
-                Some(DataTypePlan::Variant { .. })
-            )
+        if let Some(schema) = &self.schema {
+            validate_effect_intent_constraints(schema)?;
+        }
+        if let EffectDeliveryCardinality::Stream {
+            initial_credits,
+            max_in_flight,
+            terminal_result_tags,
+        } = &self.delivery
         {
-            return Err(PlanError::new(
-                "correlated effects require a closed typed variant result schema",
-            ));
+            if !matches!(self.replay, EffectReplay::ReadOnly)
+                || self.barrier != EffectBarrier::None
+                || self.result_policy != EffectResultPolicy::ReturnValue
+            {
+                return Err(PlanError::new(
+                    "stream effects must be read-only, barrier-free return-value effects",
+                ));
+            }
+            if *initial_credits == 0
+                || *initial_credits > boon_effect_schema::MAX_STREAM_INITIAL_CREDITS
+                || *max_in_flight == 0
+                || *max_in_flight > boon_effect_schema::MAX_STREAM_IN_FLIGHT
+                || initial_credits > max_in_flight
+            {
+                return Err(PlanError::new(
+                    "stream effect credit limits must be nonzero, bounded, and ordered",
+                ));
+            }
+            if terminal_result_tags.is_empty()
+                || terminal_result_tags
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || terminal_result_tags
+                    .iter()
+                    .any(|tag| tag.trim().is_empty() || tag.trim() != tag)
+            {
+                return Err(PlanError::new(
+                    "stream terminal result tags must be nonempty, canonical, unique, and ordered",
+                ));
+            }
+            let Some(EffectSchemaPlan {
+                result_type: DataTypePlan::Variant { variants },
+                ..
+            }) = &self.schema
+            else {
+                return Err(PlanError::new(
+                    "stream effects require a closed variant result schema",
+                ));
+            };
+            if variants.iter().any(|variant| variant.open)
+                || terminal_result_tags
+                    .iter()
+                    .any(|terminal| !variants.iter().any(|variant| variant.tag == *terminal))
+            {
+                return Err(PlanError::new(
+                    "stream terminal result tags must exist in the closed result schema",
+                ));
+            }
+            if terminal_result_tags.len() == variants.len() {
+                return Err(PlanError::new(
+                    "stream effects require at least one nonterminal result variant",
+                ));
+            }
         }
         match (&self.replay, self.barrier, self.result_policy) {
             (EffectReplay::ReadOnly, EffectBarrier::None, _)
@@ -430,6 +1631,61 @@ impl EffectContract {
             )),
         }
     }
+}
+
+fn validate_effect_intent_constraints(schema: &EffectSchemaPlan) -> Result<(), PlanError> {
+    let mut previous_path: Option<&[String]> = None;
+    for constraint in &schema.intent_constraints {
+        let EffectIntentConstraintPlan::UnsignedIntegerRange {
+            field_path,
+            min_inclusive,
+            max_inclusive,
+        } = constraint;
+        if field_path.is_empty()
+            || field_path
+                .iter()
+                .any(|part| part.trim().is_empty() || part.trim() != part)
+            || min_inclusive > max_inclusive
+        {
+            return Err(PlanError::new(
+                "effect intent constraints must have a canonical field path and valid range",
+            ));
+        }
+        if previous_path.is_some_and(|previous| previous >= field_path.as_slice()) {
+            return Err(PlanError::new(
+                "effect intent constraints must be uniquely ordered by field path",
+            ));
+        }
+        previous_path = Some(field_path);
+        if !matches!(
+            data_type_at_record_path(&schema.intent_type, field_path),
+            Some(DataTypePlan::Number)
+        ) {
+            return Err(PlanError::new(
+                "unsigned integer constraints must target numeric intent fields",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn data_type_at_record_path<'a>(
+    root: &'a DataTypePlan,
+    field_path: &[String],
+) -> Option<&'a DataTypePlan> {
+    field_path.iter().try_fold(root, |data_type, part| {
+        let DataTypePlan::Record {
+            fields,
+            open: false,
+        } = data_type
+        else {
+            return None;
+        };
+        fields
+            .iter()
+            .find(|field| field.name == *part)
+            .map(|field| &field.data_type)
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -453,7 +1709,6 @@ pub enum EffectBarrier {
 pub enum EffectResultPolicy {
     ReturnValue,
     Acknowledgement,
-    CorrelatedSource,
     Discarded,
 }
 
@@ -461,6 +1716,7 @@ pub fn builtin_effect_contract(host_operation: &str) -> Result<Option<EffectCont
     let Some(spec) = boon_effect_schema::host_effect_spec(host_operation) else {
         return Ok(None);
     };
+    spec.validate().map_err(PlanError::new)?;
     let replay = match spec.replay {
         boon_effect_schema::ReplaySpec::ReadOnly => EffectReplay::ReadOnly,
         boon_effect_schema::ReplaySpec::IdempotentBytesKey => EffectReplay::Idempotent {
@@ -484,14 +1740,43 @@ pub fn builtin_effect_contract(host_operation: &str) -> Result<Option<EffectCont
             boon_effect_schema::ResultPolicySpec::Acknowledgement => {
                 EffectResultPolicy::Acknowledgement
             }
-            boon_effect_schema::ResultPolicySpec::CorrelatedSource => {
-                EffectResultPolicy::CorrelatedSource
-            }
             boon_effect_schema::ResultPolicySpec::Discarded => EffectResultPolicy::Discarded,
+        },
+        delivery: match &spec.delivery {
+            boon_effect_schema::DeliveryCardinalitySpec::Single => {
+                EffectDeliveryCardinality::Single
+            }
+            boon_effect_schema::DeliveryCardinalitySpec::Stream {
+                initial_credits,
+                max_in_flight,
+                terminal_result_tags,
+            } => EffectDeliveryCardinality::Stream {
+                initial_credits: *initial_credits,
+                max_in_flight: *max_in_flight,
+                terminal_result_tags: terminal_result_tags
+                    .iter()
+                    .map(|tag| (*tag).to_owned())
+                    .collect(),
+            },
         },
         schema: spec.schema.as_ref().map(|schema| EffectSchemaPlan {
             intent_type: effect_schema_type_to_plan(&schema.intent).canonicalized(),
             result_type: effect_schema_type_to_plan(&schema.result).canonicalized(),
+            intent_constraints: schema
+                .intent_constraints
+                .iter()
+                .map(|constraint| match constraint {
+                    boon_effect_schema::IntentConstraintSpec::UnsignedIntegerRange {
+                        field_path,
+                        min_inclusive,
+                        max_inclusive,
+                    } => EffectIntentConstraintPlan::UnsignedIntegerRange {
+                        field_path: field_path.iter().map(|part| (*part).to_owned()).collect(),
+                        min_inclusive: *min_inclusive,
+                        max_inclusive: *max_inclusive,
+                    },
+                })
+                .collect(),
         }),
     };
     contract.validate()?;
@@ -579,7 +1864,6 @@ fn data_type_contains_unknown(data_type: &DataTypePlan) -> bool {
         DataTypePlan::Null
         | DataTypePlan::Bool
         | DataTypePlan::Number
-        | DataTypePlan::Byte
         | DataTypePlan::Text
         | DataTypePlan::Bytes { .. } => false,
     }
@@ -874,9 +2158,6 @@ pub enum MigrationExpressionPlan {
     },
     Number {
         value: FiniteReal,
-    },
-    Byte {
-        value: u8,
     },
     Bool {
         value: bool,
@@ -1402,7 +2683,6 @@ fn canonicalize_migration_expression(
         | MigrationExpressionPlan::Parameter { .. }
         | MigrationExpressionPlan::Text { .. }
         | MigrationExpressionPlan::Number { .. }
-        | MigrationExpressionPlan::Byte { .. }
         | MigrationExpressionPlan::Bool { .. }
         | MigrationExpressionPlan::Variant { .. } => {}
     }
@@ -1705,7 +2985,6 @@ fn validate_migration_expression(
         }
         MigrationExpressionPlan::Text { .. }
         | MigrationExpressionPlan::Number { .. }
-        | MigrationExpressionPlan::Byte { .. }
         | MigrationExpressionPlan::Bool { .. }
         | MigrationExpressionPlan::Variant { .. } => {}
     }
@@ -1971,6 +3250,194 @@ impl OutputRootId {
     }
 }
 
+#[derive(Serialize)]
+struct DistributedDeclarationIdentityInput<'a> {
+    namespace: &'static str,
+    canonical_module: &'a str,
+    semantic_path: &'a str,
+}
+
+impl DistributedDeclarationId {
+    pub fn from_semantic_path(
+        canonical_module: &str,
+        semantic_path: &str,
+    ) -> Result<Self, PlanError> {
+        if !distributed_name_is_canonical(canonical_module)
+            || !distributed_name_is_canonical(semantic_path)
+        {
+            return Err(PlanError::new(
+                "distributed declaration identity components must be non-empty canonical names",
+            ));
+        }
+        Ok(Self(canonical_sha256(
+            &DistributedDeclarationIdentityInput {
+                namespace: "boon.distributed-declaration.v1",
+                canonical_module,
+                semantic_path,
+            },
+        )?))
+    }
+}
+
+#[derive(Serialize)]
+struct DistributedGraphIdentityInput<'a> {
+    namespace: &'static str,
+    package_id: &'a str,
+    deployment_domain: &'a str,
+    stable_identity: DistributedDeclarationId,
+}
+
+impl DistributedGraphId {
+    pub fn from_identity(
+        application: &ApplicationIdentity,
+        stable_identity: DistributedDeclarationId,
+    ) -> Result<Self, PlanError> {
+        if !application.is_valid() || digest_is_zero(stable_identity.as_bytes()) {
+            return Err(PlanError::new(
+                "distributed graph identity requires a valid application and declaration",
+            ));
+        }
+        Ok(Self(canonical_sha256(&DistributedGraphIdentityInput {
+            namespace: "boon.distributed-graph.v1",
+            package_id: &application.package_id,
+            deployment_domain: &application.deployment_domain,
+            stable_identity,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct DistributedEndpointIdentityInput {
+    namespace: &'static str,
+    graph_id: DistributedGraphId,
+    role: ProgramRole,
+    stable_identity: DistributedDeclarationId,
+}
+
+impl DistributedEndpointId {
+    pub fn from_identity(
+        graph_id: DistributedGraphId,
+        role: ProgramRole,
+        stable_identity: DistributedDeclarationId,
+    ) -> Result<Self, PlanError> {
+        if digest_is_zero(graph_id.as_bytes()) || digest_is_zero(stable_identity.as_bytes()) {
+            return Err(PlanError::new(
+                "distributed endpoint identity requires nonzero graph and declaration IDs",
+            ));
+        }
+        Ok(Self(canonical_sha256(&DistributedEndpointIdentityInput {
+            namespace: "boon.distributed-endpoint.v1",
+            graph_id,
+            role,
+            stable_identity,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct DistributedExportIdentityInput {
+    namespace: &'static str,
+    graph_id: DistributedGraphId,
+    endpoint_id: DistributedEndpointId,
+    kind: DistributedExportKind,
+    stable_identity: DistributedDeclarationId,
+}
+
+impl ExportId {
+    pub fn from_identity(
+        graph_id: DistributedGraphId,
+        endpoint_id: DistributedEndpointId,
+        kind: DistributedExportKind,
+        stable_identity: DistributedDeclarationId,
+    ) -> Result<Self, PlanError> {
+        Ok(Self(canonical_sha256(&DistributedExportIdentityInput {
+            namespace: "boon.distributed-export.v1",
+            graph_id,
+            endpoint_id,
+            kind,
+            stable_identity,
+        })?))
+    }
+}
+
+#[derive(Serialize)]
+struct DistributedImportIdentityInput {
+    namespace: &'static str,
+    graph_id: DistributedGraphId,
+    endpoint_id: DistributedEndpointId,
+    stable_identity: DistributedDeclarationId,
+}
+
+impl ImportId {
+    pub fn from_value_identity(
+        graph_id: DistributedGraphId,
+        endpoint_id: DistributedEndpointId,
+        stable_identity: DistributedDeclarationId,
+    ) -> Result<Self, PlanError> {
+        Ok(Self(canonical_sha256(&DistributedImportIdentityInput {
+            namespace: "boon.distributed-value-import.v1",
+            graph_id,
+            endpoint_id,
+            stable_identity,
+        })?))
+    }
+
+    pub fn from_remote_call_result(call_site_id: RemoteCallSiteId) -> Result<Self, PlanError> {
+        #[derive(Serialize)]
+        struct Input {
+            namespace: &'static str,
+            call_site_id: RemoteCallSiteId,
+        }
+        Ok(Self(canonical_sha256(&Input {
+            namespace: "boon.distributed-call-result.v1",
+            call_site_id,
+        })?))
+    }
+}
+
+impl DistributedArgumentId {
+    pub fn from_parameter_name(export_id: ExportId, name: &str) -> Result<Self, PlanError> {
+        #[derive(Serialize)]
+        struct Input<'a> {
+            namespace: &'static str,
+            export_id: ExportId,
+            name: &'a str,
+        }
+        if !distributed_name_is_canonical(name) {
+            return Err(PlanError::new(
+                "distributed function parameter name must be non-empty and canonical",
+            ));
+        }
+        Ok(Self(canonical_sha256(&Input {
+            namespace: "boon.distributed-function-argument.v1",
+            export_id,
+            name,
+        })?))
+    }
+}
+
+impl RemoteCallSiteId {
+    pub fn from_identity(
+        graph_id: DistributedGraphId,
+        endpoint_id: DistributedEndpointId,
+        stable_identity: DistributedDeclarationId,
+    ) -> Result<Self, PlanError> {
+        #[derive(Serialize)]
+        struct Input {
+            namespace: &'static str,
+            graph_id: DistributedGraphId,
+            endpoint_id: DistributedEndpointId,
+            stable_identity: DistributedDeclarationId,
+        }
+        Ok(Self(canonical_sha256(&Input {
+            namespace: "boon.distributed-call-site.v1",
+            graph_id,
+            endpoint_id,
+            stable_identity,
+        })?))
+    }
+}
+
 impl MemoryId {
     pub fn from_identity(
         owner: &MemoryOwnerPath,
@@ -2146,6 +3613,8 @@ pub struct MachinePlan {
     pub target_profile: TargetProfile,
     #[serde(default)]
     pub program_role: ProgramRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distributed_endpoint: Option<DistributedEndpointPlan>,
     pub application: ApplicationPlan,
     pub persistence: PersistencePlan,
     pub effects: Vec<EffectContract>,
@@ -2521,9 +3990,6 @@ pub enum PlanConstantValue {
     Number {
         value: FiniteReal,
     },
-    Byte {
-        value: u8,
-    },
     Bool {
         value: bool,
     },
@@ -2617,7 +4083,6 @@ pub struct PlanInitialListField {
 pub enum InitialValueKind {
     Text,
     Number,
-    Byte,
     Bool,
     Bytes,
     Enum,
@@ -2632,7 +4097,6 @@ pub enum InitialValueKind {
 pub enum PlanValueType {
     Text,
     Number,
-    Byte,
     Bool,
     Bytes {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2713,24 +4177,14 @@ pub enum EffectResultRoute {
         target: ValueRef,
         policy: EffectResultPolicy,
     },
-    CorrelatedSources {
-        variants: Vec<EffectResultVariantRoute>,
-    },
 }
 
 impl EffectResultRoute {
     pub fn policy(&self) -> EffectResultPolicy {
         match self {
             Self::Target { policy, .. } => *policy,
-            Self::CorrelatedSources { .. } => EffectResultPolicy::CorrelatedSource,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct EffectResultVariantRoute {
-    pub tag: String,
-    pub source_id: SourceId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2749,6 +4203,7 @@ pub enum PlanOpKind {
         expression: Option<PlanDerivedExpression>,
     },
     UpdateBranch {
+        trigger: ValueRef,
         expression_kind: PlanExpressionKind,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ordered_inputs: Vec<ValueRef>,
@@ -2965,9 +4420,19 @@ pub struct PlanSourceEventTransformArm {
     pub value: PlanRowExpression,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanIntrinsic {
+    SessionInfoStatus,
+    SessionInfoPrincipal,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanRowExpression {
+    Intrinsic {
+        intrinsic: PlanIntrinsic,
+    },
     Field {
         input: ValueRef,
     },
@@ -3139,6 +4604,10 @@ pub enum PlanRowExpression {
     Object {
         fields: Vec<PlanRowObjectField>,
     },
+    TaggedObject {
+        tag: String,
+        fields: Vec<PlanRowObjectField>,
+    },
     ObjectField {
         object: Box<PlanRowExpression>,
         field: String,
@@ -3158,6 +4627,180 @@ pub enum PlanRowExpression {
         input: Box<PlanRowExpression>,
         arms: Vec<PlanRowSelectArm>,
     },
+}
+
+impl From<ValueRef> for PlanRowExpression {
+    fn from(input: ValueRef) -> Self {
+        Self::Field { input }
+    }
+}
+
+impl PlanRowExpression {
+    pub fn visit_value_refs(&self, visitor: &mut impl FnMut(&ValueRef)) {
+        let mut visit = |expression: &PlanRowExpression| expression.visit_value_refs(visitor);
+        match self {
+            Self::Field { input } => visitor(input),
+            Self::Intrinsic { .. }
+            | Self::Constant { .. }
+            | Self::ListRef { .. }
+            | Self::ListMapItem { .. } => {}
+            Self::TextTrim { input }
+            | Self::TextIsEmpty { input }
+            | Self::TextLength { input }
+            | Self::TextToNumber { input }
+            | Self::BytesToHex { input }
+            | Self::BytesToBase64 { input }
+            | Self::BytesFromHex { input }
+            | Self::BytesFromBase64 { input }
+            | Self::BytesIsEmpty { input }
+            | Self::BytesLength { input }
+            | Self::ListSum { input }
+            | Self::ObjectField { object: input, .. }
+            | Self::ListRowField { row: input, .. } => visit(input),
+            Self::TextStartsWith { input, prefix }
+            | Self::BytesStartsWith { input, prefix }
+            | Self::BytesConcat {
+                left: input,
+                right: prefix,
+            }
+            | Self::BytesEqual {
+                left: input,
+                right: prefix,
+            }
+            | Self::NumberInfix {
+                left: input,
+                right: prefix,
+                ..
+            } => {
+                visit(input);
+                visit(prefix);
+            }
+            Self::BytesEndsWith { input, suffix }
+            | Self::BytesFind {
+                input,
+                needle: suffix,
+            }
+            | Self::BytesGet {
+                input,
+                index: suffix,
+            }
+            | Self::BytesTake {
+                input,
+                byte_count: suffix,
+            }
+            | Self::BytesDrop {
+                input,
+                byte_count: suffix,
+            } => {
+                visit(input);
+                visit(suffix);
+            }
+            Self::TextSubstring {
+                input,
+                start,
+                length,
+            }
+            | Self::BytesSlice {
+                input,
+                offset: start,
+                byte_count: length,
+            }
+            | Self::BytesSet {
+                input,
+                index: start,
+                value: length,
+            } => {
+                visit(input);
+                visit(start);
+                visit(length);
+            }
+            Self::TextToBytes { input, encoding } | Self::BytesToText { input, encoding } => {
+                visit(input);
+                if let Some(encoding) = encoding {
+                    visit(encoding);
+                }
+            }
+            Self::BytesZeros { byte_count } => visit(byte_count),
+            Self::BytesReadUnsigned {
+                input,
+                offset,
+                byte_count,
+                endian,
+            }
+            | Self::BytesReadSigned {
+                input,
+                offset,
+                byte_count,
+                endian,
+            } => {
+                visit(input);
+                visit(offset);
+                visit(byte_count);
+                visit(endian);
+            }
+            Self::BytesWriteUnsigned {
+                input,
+                offset,
+                byte_count,
+                endian,
+                value,
+            }
+            | Self::BytesWriteSigned {
+                input,
+                offset,
+                byte_count,
+                endian,
+                value,
+            } => {
+                visit(input);
+                visit(offset);
+                visit(byte_count);
+                visit(endian);
+                visit(value);
+            }
+            Self::TextConcat { parts } | Self::ListLiteral { items: parts } => {
+                for part in parts {
+                    visit(part);
+                }
+            }
+            Self::ListGetField { index, .. } => visit(index),
+            Self::ListFindValue {
+                value, fallback, ..
+            } => {
+                visit(value);
+                if let Some(fallback) = fallback {
+                    visit(fallback);
+                }
+            }
+            Self::ListRange { from, to } => {
+                visit(from);
+                visit(to);
+            }
+            Self::ListMap { input, value, .. } => {
+                visit(input);
+                visit(value);
+            }
+            Self::Object { fields } | Self::TaggedObject { fields, .. } => {
+                for field in fields {
+                    visit(&field.value);
+                }
+            }
+            Self::BuiltinCall { input, args, .. } => {
+                if let Some(input) = input {
+                    visit(input);
+                }
+                for argument in args {
+                    visit(&argument.value);
+                }
+            }
+            Self::Select { input, arms } => {
+                visit(input);
+                for arm in arms {
+                    visit(&arm.value);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3195,6 +4838,10 @@ pub enum PlanSourceGuard {
     SourcePayloadOneOf {
         source_id: SourceId,
         field: SourcePayloadField,
+        values: Vec<String>,
+    },
+    TriggerValueOneOf {
+        input: ValueRef,
         values: Vec<String>,
     },
 }
@@ -3319,9 +4966,18 @@ pub enum ValueRef {
         field: SourcePayloadField,
     },
     State(StateId),
+    StateProjection {
+        state_id: StateId,
+        field_path: Vec<String>,
+    },
     Field(FieldId),
     List(ListId),
     Constant(PlanConstantId),
+    DistributedImport(ImportId),
+    DistributedFunctionArgument {
+        export_id: ExportId,
+        argument_id: DistributedArgumentId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3458,6 +5114,40 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
             plan.application.identity.state_namespace,
             plan.application.identity.deployment_domain
         ),
+    });
+    let distributed_endpoint_failure = plan.distributed_endpoint.as_ref().and_then(|endpoint| {
+        endpoint
+            .graph
+            .validate(&plan.application.identity)
+            .and_then(|()| {
+                if endpoint.endpoint.role != plan.program_role {
+                    return Err(PlanError::new(
+                        "distributed endpoint role does not match the MachinePlan role",
+                    ));
+                }
+                validate_distributed_endpoint_contract(
+                    &endpoint.graph,
+                    &endpoint.endpoint,
+                    Some(&plan.constants),
+                )
+            })
+            .err()
+            .map(|error| error.to_string())
+    });
+    checks.push(PlanCheck {
+        id: "distributed-endpoint-canonical-and-resolved".to_owned(),
+        pass: distributed_endpoint_failure.is_none(),
+        detail: distributed_endpoint_failure.unwrap_or_else(|| match &plan.distributed_endpoint {
+            Some(endpoint) => format!(
+                "{} distributed endpoint with {} value export(s), {} value import(s), {} pure function export(s), and {} remote call site(s)",
+                endpoint.endpoint.role.as_str(),
+                endpoint.endpoint.value_exports.len(),
+                endpoint.endpoint.value_imports.len(),
+                endpoint.endpoint.pure_function_exports.len(),
+                endpoint.endpoint.remote_call_sites.len()
+            ),
+            None => "standalone machine plan with no distributed endpoint".to_owned(),
+        }),
     });
     checks.push(PlanCheck {
         id: "persistence-format-supported".to_owned(),
@@ -3638,10 +5328,17 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
             .unwrap_or_else(|| format!("{} typed host output root(s)", plan.outputs.len())),
     });
     let role_valid = match plan.program_role {
-        ProgramRole::Document => true,
-        ProgramRole::Server => {
+        ProgramRole::Client => {
+            plan.document.is_some()
+                && plan.outputs.iter().any(|output| {
+                    matches!(
+                        output.contract,
+                        OutputContractKind::Document | OutputContractKind::Scene
+                    )
+                })
+        }
+        ProgramRole::Session | ProgramRole::Server => {
             plan.document.is_none()
-                && !plan.outputs.is_empty()
                 && plan
                     .outputs
                     .iter()
@@ -4222,66 +5919,16 @@ fn effect_intent_fields_match_schema(
 }
 
 fn effect_result_route_matches(
-    plan: &MachinePlan,
+    _plan: &MachinePlan,
     op: &PlanOp,
     route: &EffectResultRoute,
-    result_type: &DataTypePlan,
+    _result_type: &DataTypePlan,
 ) -> bool {
     match route {
         EffectResultRoute::Target { target, policy } => {
-            *policy != EffectResultPolicy::CorrelatedSource && op.output.as_ref() == Some(target)
-        }
-        EffectResultRoute::CorrelatedSources { variants } => {
-            let DataTypePlan::Variant {
-                variants: result_variants,
-            } = result_type
-            else {
-                return false;
-            };
-            op.output.is_none()
-                && variants.windows(2).all(|pair| pair[0].tag < pair[1].tag)
-                && variants
-                    .iter()
-                    .map(|route| route.tag.as_str())
-                    .eq(result_variants.iter().map(|variant| variant.tag.as_str()))
-                && variants
-                    .iter()
-                    .zip(result_variants)
-                    .all(|(route, variant)| {
-                        plan.source_routes
-                            .iter()
-                            .find(|source| source.source_id == route.source_id)
-                            .is_some_and(|source| source_payload_matches_variant(source, variant))
-                    })
+            op.output.as_ref() == Some(target) && *policy == route.policy()
         }
     }
-}
-
-fn source_payload_matches_variant(source: &SourceRoute, variant: &DataVariantPlan) -> bool {
-    let expected = variant
-        .fields
-        .iter()
-        .map(|field| {
-            (
-                source_payload_field_from_schema_name(&field.name),
-                field.data_type.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let actual = source
-        .payload_schema
-        .typed_fields
-        .iter()
-        .map(|field| (field.field.clone(), field.data_type.clone()))
-        .collect::<BTreeMap<_, _>>();
-    actual == expected
-        && source
-            .payload_schema
-            .fields
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            == expected.keys().cloned().collect()
 }
 
 fn source_route_row_lookup_fields_resolve(plan: &MachinePlan) -> bool {
@@ -4302,16 +5949,6 @@ fn source_route_row_lookup_fields_resolve(plan: &MachinePlan) -> bool {
             (None, Some(_)) | (Some(_), None) => false,
         }
     })
-}
-
-fn source_payload_field_from_schema_name(name: &str) -> SourcePayloadField {
-    match name {
-        "address" => SourcePayloadField::Address,
-        "bytes" => SourcePayloadField::Bytes,
-        "key" => SourcePayloadField::Key,
-        "text" => SourcePayloadField::Text,
-        _ => SourcePayloadField::Named(name.to_owned()),
-    }
 }
 
 fn required_effect_operations(plan: &MachinePlan) -> BTreeSet<&'static str> {
@@ -4458,7 +6095,6 @@ fn data_type_is_closed(data_type: &DataTypePlan) -> bool {
         DataTypePlan::Null
         | DataTypePlan::Bool
         | DataTypePlan::Number
-        | DataTypePlan::Byte
         | DataTypePlan::Text
         | DataTypePlan::Bytes { .. } => true,
     }
@@ -4471,6 +6107,11 @@ fn runtime_output_ref_resolves(plan: &MachinePlan, value: &ValueRef) -> bool {
             .scalar_slots
             .iter()
             .any(|slot| slot.state_id == *state && !slot.indexed),
+        ValueRef::StateProjection { state_id, .. } => plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .any(|slot| slot.state_id == *state_id && !slot.indexed),
         ValueRef::Field(field) => plan
             .regions
             .iter()
@@ -4482,7 +6123,25 @@ fn runtime_output_ref_resolves(plan: &MachinePlan, value: &ValueRef) -> bool {
             .iter()
             .any(|slot| slot.list_id == *list),
         ValueRef::Constant(constant) => plan.constants.iter().any(|item| item.id == *constant),
-        ValueRef::Source(_) | ValueRef::SourcePayload { .. } => false,
+        ValueRef::DistributedImport(import_id) => {
+            plan.distributed_endpoint
+                .as_ref()
+                .is_some_and(|distributed| {
+                    distributed
+                        .endpoint
+                        .value_imports
+                        .iter()
+                        .any(|import| import.import_id == *import_id)
+                        || distributed
+                            .endpoint
+                            .remote_call_sites
+                            .iter()
+                            .any(|call| call.result_import_id == *import_id)
+                })
+        }
+        ValueRef::Source(_)
+        | ValueRef::SourcePayload { .. }
+        | ValueRef::DistributedFunctionArgument { .. } => false,
     }
 }
 
@@ -5035,6 +6694,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
         | PlanOpKind::StateInitialize { .. }
         | PlanOpKind::DependencyEdge => true,
         PlanOpKind::UpdateBranch {
+            trigger: _,
             expression_kind,
             ordered_inputs,
             source_payload_field,
@@ -5047,11 +6707,11 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
             }
             if *expression_kind == PlanExpressionKind::HostEffect {
                 return effect.is_some()
-                    && op.output.is_none()
+                    && update_branch_trigger_is_supported(op)
+                    && matches!(op.output, Some(ValueRef::State(_)))
                     && source_payload_field.is_none()
                     && update_constant_id.is_none()
-                    && source_guard.is_none()
-                    && update_branch_source_ids(op).len() == 1
+                    && source_guard_refs_resolve(op, source_guard)
                     && effect.as_ref().is_some_and(|effect| {
                         effect.intent_fields.len() == ordered_inputs.len()
                             && effect
@@ -5080,7 +6740,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     };
                     update_constant_id.is_none()
                         && source_payload_output_type_is_supported(scalar_slots, op, field)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && source_payload_input_matches_single_source(op, field)
                         && state_input_ids(op).is_empty()
                 }
@@ -5097,7 +6757,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                                         )
                                     })
                         )
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && state_input_ids(op).is_empty()
                         && source_payload_inputs_are_empty_or_guard_only(op, source_guard)
                 }
@@ -5105,14 +6765,14 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Bool)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && single_state_input_type_is(scalar_slots, op, &PlanValueType::Bool)
                         && source_payload_input_ids(op).is_empty()
                 }
                 PlanExpressionKind::TextToNumber => {
                     update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && text_to_number_inputs_are_supported(
                             scalar_slots,
                             op,
@@ -5122,13 +6782,13 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                 PlanExpressionKind::BytesLength => {
                     update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_input_is_supported(scalar_slots, op, source_payload_field.as_ref())
                 }
                 PlanExpressionKind::BytesIsEmpty => {
                     update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Bool)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_input_is_supported(scalar_slots, op, source_payload_field.as_ref())
                 }
                 PlanExpressionKind::BytesGet => {
@@ -5138,8 +6798,12 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                             .is_some_and(|constant| {
                                 plan_constant_is_non_negative_integer(&constant.value)
                             })
-                        && output_state_type_is(scalar_slots, op, &PlanValueType::Byte)
-                        && update_branch_source_ids(op).len() == 1
+                        && output_state_type_is(
+                            scalar_slots,
+                            op,
+                            &PlanValueType::Bytes { fixed_len: Some(1) },
+                        )
+                        && update_branch_trigger_is_supported(op)
                         && bytes_length_input_is_supported(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5150,14 +6814,14 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                             .is_some_and(|constant| {
                                 plan_constant_is_non_negative_integer(&constant.value)
                             })
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && list_get_inputs_are_supported(scalar_slots, constants, op)
                 }
                 PlanExpressionKind::BytesSet => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_set_inputs_are_supported(scalar_slots, constants, op)
                         && bytes_set_fixed_lengths_match(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
@@ -5166,7 +6830,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_slice_inputs_are_supported(scalar_slots, constants, op)
                         && bytes_slice_fixed_lengths_match(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
@@ -5175,7 +6839,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_take_inputs_are_supported(scalar_slots, constants, op)
                         && bytes_take_fixed_lengths_match(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
@@ -5184,7 +6848,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_drop_inputs_are_supported(scalar_slots, constants, op)
                         && bytes_drop_fixed_lengths_match(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
@@ -5193,7 +6857,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_zeros_inputs_are_supported(scalar_slots, constants, op)
                         && bytes_zeros_fixed_length_matches(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
@@ -5202,7 +6866,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && single_state_input_type_matches(scalar_slots, op, |value_type| {
                             matches!(value_type, PlanValueType::Bytes { .. })
                         })
@@ -5212,7 +6876,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && single_state_input_type_is(scalar_slots, op, &PlanValueType::Text)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5220,7 +6884,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_numeric_read_inputs_are_supported(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5228,7 +6892,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_numeric_write_inputs_are_supported(
                             scalar_slots,
                             constants,
@@ -5242,7 +6906,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_numeric_write_inputs_are_supported(
                             scalar_slots,
                             constants,
@@ -5256,7 +6920,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && file_read_bytes_inputs_are_supported(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5264,7 +6928,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && file_write_bytes_inputs_are_supported(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5272,7 +6936,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && text_to_bytes_inputs_are_supported(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5280,7 +6944,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_to_text_inputs_are_supported(scalar_slots, constants, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5288,7 +6952,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Bool)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_equal_inputs_are_supported(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5296,7 +6960,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_search_inputs_are_supported(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5304,7 +6968,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Bool)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_search_inputs_are_supported(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
                 }
@@ -5312,7 +6976,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_is_bytes(scalar_slots, op)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && bytes_concat_inputs_are_supported(scalar_slots, op)
                         && bytes_concat_fixed_lengths_match(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
@@ -5320,20 +6984,20 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                 PlanExpressionKind::ReadPath => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && read_path_inputs_supported(scalar_slots, op)
                 }
                 PlanExpressionKind::PreviousValue => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && previous_value_inputs_supported(scalar_slots, op)
                         && source_payload_input_ids(op).is_empty()
                 }
                 PlanExpressionKind::TextTrimOrPrevious => {
                     update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && text_trim_or_previous_inputs_supported(
                             scalar_slots,
                             constants,
@@ -5349,7 +7013,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     };
                     update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && source_payload_input_matches_single_source(op, field)
                         && prefix_concat_inputs_supported(scalar_slots, constants, op, true)
                 }
@@ -5357,26 +7021,26 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Text)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && source_payload_input_ids(op).is_empty()
                         && prefix_concat_inputs_supported(scalar_slots, constants, op, false)
                 }
                 PlanExpressionKind::MatchConst => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && root_match_const_inputs_supported(scalar_slots, constants, op)
                 }
                 PlanExpressionKind::MatchValueConst => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && root_match_value_const_inputs_supported(scalar_slots, constants, op)
                 }
                 PlanExpressionKind::MatchTextIsEmptyConst => {
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && root_match_text_is_empty_const_inputs_supported(
                             scalar_slots,
                             constants,
@@ -5387,7 +7051,7 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     source_payload_field.is_none()
                         && update_constant_id.is_none()
                         && output_state_type_is(scalar_slots, op, &PlanValueType::Number)
-                        && update_branch_source_ids(op).len() == 1
+                        && update_branch_trigger_is_supported(op)
                         && root_number_infix_inputs_supported(scalar_slots, constants, op)
                 }
                 PlanExpressionKind::ProjectTime
@@ -5779,7 +7443,11 @@ fn cpu_plan_executor_supports_indexed_update_op(
                 && update_constant_id
                     .and_then(|constant_id| plan_constant_by_id(constants, constant_id))
                     .is_some_and(|constant| plan_constant_is_non_negative_integer(&constant.value))
-                && output_state_type_is(scalar_slots, op, &PlanValueType::Byte)
+                && output_state_type_is(
+                    scalar_slots,
+                    op,
+                    &PlanValueType::Bytes { fixed_len: Some(1) },
+                )
                 && bytes_length_input_is_supported(scalar_slots, op)
                 && source_payload_input_ids(op).is_empty()
         }
@@ -6393,7 +8061,7 @@ fn bytes_set_inputs_are_supported(
                 }
             })
             && plan_constant_by_id(constants, *value_constant_id).is_some_and(|constant| {
-                matches!(constant.value, PlanConstantValue::Byte { .. })
+                plan_constant_is_single_inline_byte(&constant.value)
             })
     )
 }
@@ -7075,6 +8743,27 @@ fn update_branch_source_ids(op: &PlanOp) -> Vec<SourceId> {
     sources
 }
 
+fn update_branch_trigger_is_supported(op: &PlanOp) -> bool {
+    let PlanOpKind::UpdateBranch { trigger, .. } = &op.kind else {
+        return false;
+    };
+    match trigger {
+        ValueRef::Source(source_id) => {
+            op.inputs.contains(trigger) && update_branch_source_ids(op) == [*source_id]
+        }
+        ValueRef::State(_) => {
+            op.inputs.contains(trigger) && update_branch_source_ids(op).is_empty()
+        }
+        ValueRef::Field(_)
+        | ValueRef::StateProjection { .. }
+        | ValueRef::SourcePayload { .. }
+        | ValueRef::List(_)
+        | ValueRef::Constant(_)
+        | ValueRef::DistributedImport(_)
+        | ValueRef::DistributedFunctionArgument { .. } => false,
+    }
+}
+
 fn state_input_ids(op: &PlanOp) -> Vec<StateId> {
     let mut states = Vec::new();
     for input in &op.inputs {
@@ -7279,7 +8968,7 @@ fn source_payload_data_type_matches_plan_type(
     match payload_type {
         DataTypePlan::Bytes { .. } => matches!(plan_type, PlanValueType::Bytes { .. }),
         DataTypePlan::Bool => plan_type == &PlanValueType::Bool,
-        DataTypePlan::Number | DataTypePlan::Byte => plan_type == &PlanValueType::Number,
+        DataTypePlan::Number => plan_type == &PlanValueType::Number,
         DataTypePlan::Text => plan_type == &PlanValueType::Text,
         DataTypePlan::Null
         | DataTypePlan::Variant { .. }
@@ -7671,8 +9360,13 @@ fn root_number_operand_supported(
         }
         ValueRef::Constant(id) => plan_constant_by_id(constants, *id)
             .is_some_and(|constant| plan_constant_is_number(&constant.value)),
-        ValueRef::Field(_) | ValueRef::SourcePayload { .. } => op.inputs.contains(value),
-        ValueRef::Source(_) | ValueRef::List(_) => false,
+        ValueRef::Field(_) | ValueRef::StateProjection { .. } | ValueRef::SourcePayload { .. } => {
+            op.inputs.contains(value)
+        }
+        ValueRef::Source(_)
+        | ValueRef::List(_)
+        | ValueRef::DistributedImport(_)
+        | ValueRef::DistributedFunctionArgument { .. } => false,
     }
 }
 
@@ -7711,8 +9405,11 @@ fn root_update_value_ref_supported(
         ValueRef::Constant(_) => {
             match_const_output_ref_supported(constants, output_type, value_ref)
         }
-        ValueRef::Field(_) => op.inputs.contains(value_ref),
-        ValueRef::Source(_) | ValueRef::List(_) => false,
+        ValueRef::Field(_) | ValueRef::StateProjection { .. } => op.inputs.contains(value_ref),
+        ValueRef::Source(_)
+        | ValueRef::List(_)
+        | ValueRef::DistributedImport(_)
+        | ValueRef::DistributedFunctionArgument { .. } => false,
     }
 }
 
@@ -7732,8 +9429,12 @@ fn match_const_input_ref_supported(
         ValueRef::SourcePayload { field, .. } => {
             op.inputs.contains(value_ref) && *field != SourcePayloadField::Bytes
         }
-        ValueRef::Field(_) => op.inputs.contains(value_ref),
-        ValueRef::Constant(_) | ValueRef::Source(_) | ValueRef::List(_) => false,
+        ValueRef::Field(_) | ValueRef::StateProjection { .. } => op.inputs.contains(value_ref),
+        ValueRef::Constant(_)
+        | ValueRef::Source(_)
+        | ValueRef::List(_)
+        | ValueRef::DistributedImport(_)
+        | ValueRef::DistributedFunctionArgument { .. } => false,
     }
 }
 
@@ -7782,7 +9483,12 @@ fn text_operand_ref_supported(
         ValueRef::Constant(constant_id) => plan_constant_by_id(constants, *constant_id)
             .is_some_and(|constant| matches!(constant.value, PlanConstantValue::Text { .. })),
         ValueRef::SourcePayload { .. } => allow_source_payload,
-        ValueRef::Field(_) | ValueRef::Source(_) | ValueRef::List(_) => false,
+        ValueRef::StateProjection { .. } => true,
+        ValueRef::Field(_)
+        | ValueRef::Source(_)
+        | ValueRef::List(_)
+        | ValueRef::DistributedImport(_)
+        | ValueRef::DistributedFunctionArgument { .. } => false,
     }
 }
 
@@ -7877,7 +9583,6 @@ fn byte_constants_match_hashes(constants: &[PlanConstant]) -> bool {
         } => true,
         PlanConstantValue::Text { .. }
         | PlanConstantValue::Number { .. }
-        | PlanConstantValue::Byte { .. }
         | PlanConstantValue::Bool { .. }
         | PlanConstantValue::Enum { .. }
         | PlanConstantValue::Data { .. } => true,
@@ -8078,9 +9783,9 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                                 op.id.0, state_id.0
                             ));
                         };
-                        if value_type != &PlanValueType::Byte {
+                        if !matches!(value_type, PlanValueType::Bytes { fixed_len: Some(1) }) {
                             return Some(format!(
-                                "bytes-get update op {} outputs non-BYTE state {} type {:?}",
+                                "bytes-get update op {} outputs non-BYTES[1] state {} type {:?}",
                                 op.id.0, state_id.0, value_type
                             ));
                         }
@@ -8282,7 +9987,7 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
                     else {
                         return Some(constant_ref_update_op_failure(*expression_kind, op));
                     };
-                    if !matches!(value_constant.value, PlanConstantValue::Byte { .. }) {
+                    if !plan_constant_is_single_inline_byte(&value_constant.value) {
                         return Some(constant_ref_update_op_failure(*expression_kind, op));
                     }
                     if let Some(ValueRef::State(state_id)) = op.output {
@@ -9447,6 +11152,7 @@ fn derived_expression_refs_resolve_for_op(op: &PlanOp, expression: &PlanDerivedE
 
 fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> bool {
     match expression {
+        PlanRowExpression::Intrinsic { .. } => true,
         PlanRowExpression::Field { input } => op.inputs.contains(input),
         PlanRowExpression::Constant { constant_id } => {
             op.inputs.contains(&ValueRef::Constant(*constant_id))
@@ -9598,9 +11304,11 @@ fn row_expression_refs_resolve(op: &PlanOp, expression: &PlanRowExpression) -> b
         }
         PlanRowExpression::ListMapItem { .. } => true,
         PlanRowExpression::ListSum { input } => row_expression_refs_resolve(op, input),
-        PlanRowExpression::Object { fields } => fields
-            .iter()
-            .all(|field| row_expression_refs_resolve(op, &field.value)),
+        PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
+            fields
+                .iter()
+                .all(|field| row_expression_refs_resolve(op, &field.value))
+        }
         PlanRowExpression::ObjectField { object, .. } => row_expression_refs_resolve(op, object),
         PlanRowExpression::ListRowField { row, list_id, .. } => {
             op.inputs.contains(&ValueRef::List(*list_id)) && row_expression_refs_resolve(op, row)
@@ -9640,13 +11348,16 @@ fn row_expression_list_fields_resolve_inner(
     expression: &PlanRowExpression,
 ) -> bool {
     match expression {
-        PlanRowExpression::Field { .. }
+        PlanRowExpression::Intrinsic { .. }
+        | PlanRowExpression::Field { .. }
         | PlanRowExpression::Constant { .. }
         | PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListMapItem { .. } => true,
-        PlanRowExpression::Object { fields } => fields
-            .iter()
-            .all(|field| row_expression_list_fields_resolve_inner(plan, &field.value)),
+        PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
+            fields
+                .iter()
+                .all(|field| row_expression_list_fields_resolve_inner(plan, &field.value))
+        }
         PlanRowExpression::TextTrim { input }
         | PlanRowExpression::TextIsEmpty { input }
         | PlanRowExpression::TextLength { input }
@@ -9860,15 +11571,18 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
             row_expression_cpu_evaluable(value)
                 && fallback.as_deref().is_none_or(row_expression_cpu_evaluable)
         }
-        PlanRowExpression::Field { .. }
+        PlanRowExpression::Intrinsic { .. }
+        | PlanRowExpression::Field { .. }
         | PlanRowExpression::Constant { .. }
         | PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListRange { .. }
         | PlanRowExpression::ListMapItem { .. } => true,
         PlanRowExpression::ListLiteral { items } => items.iter().all(row_expression_cpu_evaluable),
-        PlanRowExpression::Object { fields } => fields
-            .iter()
-            .all(|field| row_expression_cpu_evaluable(&field.value)),
+        PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
+            fields
+                .iter()
+                .all(|field| row_expression_cpu_evaluable(&field.value))
+        }
         PlanRowExpression::TextTrim { input }
         | PlanRowExpression::TextIsEmpty { input }
         | PlanRowExpression::TextLength { input }
@@ -10003,6 +11717,7 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
                     | "Error/new"
                     | "Error/text"
                     | "Router/route"
+                    | "Number/to_text"
                     | "List/count"
                     | "List/length"
                     | "List/retain"
@@ -10026,20 +11741,31 @@ fn row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
 
 fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
     match expression {
-        PlanRowExpression::Field { .. }
+        PlanRowExpression::Intrinsic { .. }
+        | PlanRowExpression::Field { .. }
         | PlanRowExpression::Constant { .. }
         | PlanRowExpression::ListRef { .. }
         | PlanRowExpression::ListMapItem { .. } => true,
-        PlanRowExpression::Object { fields } => fields
-            .iter()
-            .all(|field| root_row_expression_cpu_evaluable(&field.value)),
+        PlanRowExpression::Object { fields } | PlanRowExpression::TaggedObject { fields, .. } => {
+            fields
+                .iter()
+                .all(|field| root_row_expression_cpu_evaluable(&field.value))
+        }
         PlanRowExpression::ListLiteral { items } => {
             items.iter().all(root_row_expression_cpu_evaluable)
         }
         PlanRowExpression::TextTrim { input }
         | PlanRowExpression::TextToNumber { input }
+        | PlanRowExpression::BytesLength { input }
         | PlanRowExpression::ObjectField { object: input, .. } => {
             root_row_expression_cpu_evaluable(input)
+        }
+        PlanRowExpression::TextToBytes { input, encoding }
+        | PlanRowExpression::BytesToText { input, encoding } => {
+            root_row_expression_cpu_evaluable(input)
+                && encoding
+                    .as_deref()
+                    .is_none_or(root_row_expression_cpu_evaluable)
         }
         PlanRowExpression::ListRowField { .. } => false,
         PlanRowExpression::TextConcat { parts } => {
@@ -10070,6 +11796,7 @@ fn root_row_expression_cpu_evaluable(expression: &PlanRowExpression) -> bool {
                     | "Error/new"
                     | "Error/text"
                     | "Router/route"
+                    | "Number/to_text"
                     | "List/count"
                     | "List/length"
                     | "List/retain"
@@ -10140,6 +11867,9 @@ fn source_guard_refs_resolve(op: &PlanOp, guard: &Option<PlanSourceGuard>) -> bo
                     )
                 })
         }
+        PlanSourceGuard::TriggerValueOneOf { input, values } => {
+            !values.is_empty() && op.inputs.contains(input)
+        }
     }
 }
 
@@ -10147,7 +11877,6 @@ fn constant_value_matches_plan_type(value: &PlanConstantValue, value_type: &Plan
     match (value, value_type) {
         (PlanConstantValue::Text { .. }, PlanValueType::Text) => true,
         (PlanConstantValue::Number { .. }, PlanValueType::Number) => true,
-        (PlanConstantValue::Byte { .. }, PlanValueType::Byte) => true,
         (PlanConstantValue::Bool { .. }, PlanValueType::Bool) => true,
         (PlanConstantValue::Enum { .. }, PlanValueType::Enum) => true,
         (PlanConstantValue::Data { .. }, PlanValueType::Data) => true,
@@ -10170,6 +11899,17 @@ fn constant_value_matches_plan_type(value: &PlanConstantValue, value_type: &Plan
 
 fn plan_constant_is_number(value: &PlanConstantValue) -> bool {
     matches!(value, PlanConstantValue::Number { .. })
+}
+
+fn plan_constant_is_single_inline_byte(value: &PlanConstantValue) -> bool {
+    matches!(
+        value,
+        PlanConstantValue::Bytes {
+            byte_len: 1,
+            inline_bytes: Some(bytes),
+            ..
+        } if bytes.len() == 1
+    )
 }
 
 fn plan_constant_is_non_negative_integer(value: &PlanConstantValue) -> bool {

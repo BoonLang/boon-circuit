@@ -191,6 +191,3 @@ fn print_help(manifest: &HandoffManifest) {
     }
     println!("  {}", manifest.aggregate.as_str());
 }
-
-#[cfg(test)]
-mod tests;

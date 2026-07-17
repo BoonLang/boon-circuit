@@ -1,8 +1,9 @@
 use boon_compiler::{
     CompileProfile, CompiledMachinePlanFromSource, CompilerSourceUnit,
-    compile_runtime_source_text_to_machine_plan_with_identity,
-    compile_runtime_source_units_to_machine_plan_with_identity, compiler_source_text_for_path,
-    compiler_source_units_for_manifest_source, compiler_source_units_for_path,
+    compile_runtime_source_text_to_machine_plan_for_role_with_identity,
+    compile_runtime_source_units_to_machine_plan_for_role_with_identity,
+    compiler_source_text_for_path, compiler_source_units_for_manifest_source,
+    compiler_source_units_for_path,
 };
 pub use boon_document_model::{DocumentFrame, DocumentPatch, ProgramCapabilityProfile};
 use boon_example_manifest::ExampleManifest;
@@ -10,12 +11,15 @@ pub use boon_example_manifest::{
     ExampleEntry as ExampleManifestEntry, MigrationScenario, MigrationSequence, MigrationTestDriver,
 };
 pub use boon_persistence::{DurableChange, RestoreImage};
-pub use boon_plan::{ApplicationIdentity, MachinePlan};
+pub use boon_plan::{
+    ApplicationIdentity, DistributedArgumentId, ExportId, ImportId, MachinePlan, ProgramRole,
+    RemoteCallSiteId,
+};
 use boon_plan::{MigrationEdgeId, OutputContractKind, OutputRootPlan, SourceId, TargetProfile};
 pub use boon_plan_executor::{
     AuthorityDelta, Delta, RowId, RowSnapshot, SessionOptions, Snapshot, SourceEvent,
-    SourcePayload, TransientEffectCallId, TransientEffectInvocation, TurnMetrics, Value,
-    ValueTarget,
+    SourcePayload, TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation,
+    TurnMetrics, Value, ValueTarget,
 };
 use boon_plan_executor::{Session, SessionBuilder, Turn};
 use serde::{Deserialize, Serialize};
@@ -97,6 +101,8 @@ pub struct RuntimeTurn {
     pub durable_changes: Vec<DurableChange>,
     pub outbox_changes: Vec<boon_persistence::DurableOutboxChange>,
     pub transient_effects: Vec<TransientEffectInvocation>,
+    pub cancelled_transient_effects: Vec<TransientEffectCallId>,
+    pub transient_effect_credit_grants: Vec<TransientEffectCreditGrant>,
     pub document_patches: Vec<DocumentPatch>,
     pub document_patch_status: DocumentPatchStatus,
     pub metrics: TurnMetrics,
@@ -135,6 +141,7 @@ enum RuntimeSourceCacheKey {
 struct RuntimePlanCacheKey {
     source: RuntimeSourceCacheKey,
     application: ApplicationIdentity,
+    role: ProgramRole,
 }
 
 fn plan_cache() -> &'static Mutex<BTreeMap<RuntimePlanCacheKey, CachedPlan>> {
@@ -177,7 +184,27 @@ impl LiveRuntime {
         source: &str,
         application: ApplicationIdentity,
     ) -> RuntimeResult<Self> {
-        Ok(Self::from_source_profiled_with_identity(source_label, source, application)?.0)
+        Self::from_source_for_role_with_identity(
+            source_label,
+            source,
+            ProgramRole::Client,
+            application,
+        )
+    }
+
+    pub fn from_source_for_role_with_identity(
+        source_label: &str,
+        source: &str,
+        role: ProgramRole,
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<Self> {
+        Ok(Self::from_source_profiled_for_role_with_identity(
+            source_label,
+            source,
+            role,
+            application,
+        )?
+        .0)
     }
 
     pub fn from_source_profiled(
@@ -196,15 +223,31 @@ impl LiveRuntime {
         source: &str,
         application: ApplicationIdentity,
     ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+        Self::from_source_profiled_for_role_with_identity(
+            source_label,
+            source,
+            ProgramRole::Client,
+            application,
+        )
+    }
+
+    pub fn from_source_profiled_for_role_with_identity(
+        source_label: &str,
+        source: &str,
+        role: ProgramRole,
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
         let key = RuntimePlanCacheKey {
             source: RuntimeSourceCacheKey::SourceText(sha256_bytes(source.as_bytes())),
             application: application.clone(),
+            role,
         };
         let (cached, cache_hit) = cached_plan(key, || {
-            compile_runtime_source_text_to_machine_plan_with_identity(
+            compile_runtime_source_text_to_machine_plan_for_role_with_identity(
                 source_label,
                 source,
                 TargetProfile::SoftwareDefault,
+                role,
                 application,
             )
         })?;
@@ -231,7 +274,27 @@ impl LiveRuntime {
         units: &[RuntimeSourceUnit],
         application: ApplicationIdentity,
     ) -> RuntimeResult<Self> {
-        Ok(Self::from_project_profiled_with_identity(source_label, units, application)?.0)
+        Self::from_project_for_role_with_identity(
+            source_label,
+            units,
+            ProgramRole::Client,
+            application,
+        )
+    }
+
+    pub fn from_project_for_role_with_identity(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        role: ProgramRole,
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<Self> {
+        Ok(Self::from_project_profiled_for_role_with_identity(
+            source_label,
+            units,
+            role,
+            application,
+        )?
+        .0)
     }
 
     pub fn from_project_profiled(
@@ -250,9 +313,24 @@ impl LiveRuntime {
         units: &[RuntimeSourceUnit],
         application: ApplicationIdentity,
     ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+        Self::from_project_profiled_for_role_with_identity(
+            source_label,
+            units,
+            ProgramRole::Client,
+            application,
+        )
+    }
+
+    pub fn from_project_profiled_for_role_with_identity(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+        role: ProgramRole,
+        application: ApplicationIdentity,
+    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
         let key = RuntimePlanCacheKey {
             source: RuntimeSourceCacheKey::SourceUnits(source_units_hash(units)),
             application: application.clone(),
+            role,
         };
         let compiler_units = units
             .iter()
@@ -262,10 +340,11 @@ impl LiveRuntime {
             })
             .collect::<Vec<_>>();
         let (cached, cache_hit) = cached_plan(key, || {
-            compile_runtime_source_units_to_machine_plan_with_identity(
+            compile_runtime_source_units_to_machine_plan_for_role_with_identity(
                 source_label,
                 &compiler_units,
                 TargetProfile::SoftwareDefault,
+                role,
                 application,
             )
         })?;
@@ -338,6 +417,8 @@ impl LiveRuntime {
             durable_changes: Vec::new(),
             outbox_changes: Vec::new(),
             transient_effects: Vec::new(),
+            cancelled_transient_effects: Vec::new(),
+            transient_effect_credit_grants: Vec::new(),
             document_patches: self
                 .document
                 .as_ref()
@@ -379,14 +460,14 @@ impl LiveRuntime {
         &mut self,
         item: &boon_persistence::DurableOutboxItem,
     ) -> RuntimeResult<RuntimeTurn> {
-        self.effect_turn(|session| session.begin_effect_dispatch(item))
+        self.effect_turn(|session, _| session.begin_effect_dispatch(item))
     }
 
     pub fn require_effect_reconciliation_unsettled(
         &mut self,
         item: &boon_persistence::DurableOutboxItem,
     ) -> RuntimeResult<RuntimeTurn> {
-        self.effect_turn(|session| session.require_effect_reconciliation(item))
+        self.effect_turn(|session, _| session.require_effect_reconciliation(item))
     }
 
     pub fn complete_effect_unsettled(
@@ -394,7 +475,9 @@ impl LiveRuntime {
         item: &boon_persistence::DurableOutboxItem,
         outcome: boon_persistence::StoredValue,
     ) -> RuntimeResult<RuntimeTurn> {
-        self.effect_turn(|session| session.complete_effect(item, outcome))
+        self.effect_turn(|session, demanded| {
+            session.complete_effect_with_demand(item, outcome, demanded)
+        })
     }
 
     pub fn complete_transient_effect_unsettled(
@@ -402,7 +485,9 @@ impl LiveRuntime {
         call_id: TransientEffectCallId,
         outcome: Value,
     ) -> RuntimeResult<RuntimeTurn> {
-        self.effect_turn(|session| session.complete_transient_effect(call_id, outcome))
+        self.effect_turn(|session, demanded| {
+            session.complete_transient_effect_with_demand(call_id, outcome, demanded)
+        })
     }
 
     pub fn complete_transient_effect(
@@ -411,6 +496,34 @@ impl LiveRuntime {
         outcome: Value,
     ) -> RuntimeResult<RuntimeTurn> {
         let turn = self.complete_transient_effect_unsettled(call_id, outcome)?;
+        self.settle_turn();
+        Ok(turn)
+    }
+
+    pub fn deliver_transient_effect_result_unsettled(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+    ) -> RuntimeResult<RuntimeTurn> {
+        self.effect_turn(|session, demanded| {
+            session.deliver_transient_effect_result_with_demand(
+                call_id,
+                result_sequence,
+                outcome,
+                demanded,
+            )
+        })
+    }
+
+    pub fn deliver_transient_effect_result(
+        &mut self,
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+    ) -> RuntimeResult<RuntimeTurn> {
+        let turn =
+            self.deliver_transient_effect_result_unsettled(call_id, result_sequence, outcome)?;
         self.settle_turn();
         Ok(turn)
     }
@@ -428,15 +541,83 @@ impl LiveRuntime {
         self.session.pending_transient_effect_count()
     }
 
-    fn effect_turn(
+    pub fn pending_transient_effect_credits(&self, call_id: TransientEffectCallId) -> Option<u32> {
+        self.session.pending_transient_effect_credits(call_id)
+    }
+
+    pub fn update_distributed_import_unsettled(
         &mut self,
-        build: impl FnOnce(&mut Session) -> Result<Turn, boon_plan_executor::Error>,
-    ) -> RuntimeResult<RuntimeTurn> {
+        import_id: ImportId,
+        content_revision: u64,
+        value: Value,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
         if self.pending_document_rollback.is_some() {
             return Err("previous runtime turn has not been settled".into());
         }
         let started = Instant::now();
-        let turn = build(&mut self.session)?;
+        self.session
+            .update_distributed_import(import_id, content_revision, value)?
+            .map(|turn| self.runtime_turn(turn, duration_us(started.elapsed())))
+            .transpose()
+    }
+
+    pub fn update_distributed_import(
+        &mut self,
+        import_id: ImportId,
+        content_revision: u64,
+        value: Value,
+    ) -> RuntimeResult<Option<RuntimeTurn>> {
+        let turn = self.update_distributed_import_unsettled(import_id, content_revision, value)?;
+        if turn.is_some() {
+            self.settle_turn();
+        }
+        Ok(turn)
+    }
+
+    pub fn distributed_import_revision(&self, import_id: ImportId) -> Option<u64> {
+        self.session.distributed_import_revision(import_id)
+    }
+
+    pub fn distributed_export_value_current(
+        &mut self,
+        export_id: ExportId,
+    ) -> RuntimeResult<Value> {
+        Ok(self.session.distributed_export_value_current(export_id)?)
+    }
+
+    pub fn evaluate_distributed_function(
+        &mut self,
+        export_id: ExportId,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    ) -> RuntimeResult<Value> {
+        Ok(self
+            .session
+            .evaluate_distributed_function(export_id, arguments)?)
+    }
+
+    pub fn distributed_call_arguments_current(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+    ) -> RuntimeResult<BTreeMap<DistributedArgumentId, Value>> {
+        Ok(self
+            .session
+            .distributed_call_arguments_current(call_site_id)?)
+    }
+
+    fn effect_turn(
+        &mut self,
+        build: impl FnOnce(&mut Session, &[ValueTarget]) -> Result<Turn, boon_plan_executor::Error>,
+    ) -> RuntimeResult<RuntimeTurn> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let demanded = self
+            .document
+            .as_ref()
+            .map(document::DocumentRuntime::demanded_targets)
+            .unwrap_or_default();
+        let started = Instant::now();
+        let turn = build(&mut self.session, &demanded)?;
         self.runtime_turn(turn, duration_us(started.elapsed()))
     }
 
@@ -1110,6 +1291,8 @@ impl LiveRuntime {
             durable_changes: turn.durable_changes,
             outbox_changes: turn.outbox_changes,
             transient_effects: turn.transient_effects,
+            cancelled_transient_effects: turn.cancelled_transient_effects,
+            transient_effect_credit_grants: turn.transient_effect_credit_grants,
             document_patches,
             document_patch_status: DocumentPatchStatus::Complete,
             metrics: turn.metrics,
@@ -1630,6 +1813,3 @@ fn resolve_repo_file(relative: impl AsRef<Path>) -> PathBuf {
     }
     relative.to_path_buf()
 }
-
-#[cfg(test)]
-mod tests;

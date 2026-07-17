@@ -2,42 +2,49 @@ use super::*;
 
 // IR tests are grouped by lowering domain while staying in this module for private helper access.
 include!("tests/bytes.rs");
-include!("tests/cells.rs");
-include!("tests/output_roots.rs");
-include!("tests/host_ports.rs");
-include!("tests/indexed_queries.rs");
-include!("tests/migrations.rs");
+include!("tests/distributed.rs");
 include!("tests/sources_and_events.rs");
-include!("tests/todomvc.rs");
 
 #[test]
-fn outbound_http_effect_lowers_recursive_schema_without_executable_string_routes() {
+fn outbound_http_call_lowers_as_a_direct_typed_state_update() {
     let parsed = boon_parser::parse_source(
         "outbound-http-effect.bn",
         include_str!("../../../examples/outbound_http_effect.bn"),
     )
     .unwrap();
     let typed = lower(&parsed).unwrap();
-    let [effect] = typed.host_effects.as_slice() else {
-        panic!("expected one typed outbound effect");
+    let branches = typed
+        .update_branches
+        .iter()
+        .filter(|branch| {
+            matches!(&branch.expression,
+            UpdateExpression::HostEffect { operation, .. } if operation == "Http/request")
+        })
+        .collect::<Vec<_>>();
+    let [branch] = branches.as_slice() else {
+        panic!("expected one direct typed outbound update");
     };
-    assert_eq!(effect.operation, "Http/request");
-    assert!(matches!(
-        effect
-            .intent_fields
-            .iter()
-            .find(|field| field.name == "headers")
-            .map(|field| &field.data_type),
-        Some(SemanticDataType::List { item })
-            if matches!(item.as_ref(), SemanticDataType::Record { open: false, .. })
-    ));
+    assert_eq!(branch.source, "store.request");
+    assert_eq!(branch.target, "store.response");
+    let UpdateExpression::HostEffect { arguments, .. } = &branch.expression else {
+        unreachable!();
+    };
     assert_eq!(
-        effect
-            .result_routes
+        arguments
             .iter()
-            .map(|route| route.variant.as_str())
+            .map(|argument| argument.name.as_str())
             .collect::<Vec<_>>(),
-        ["HttpFailed", "HttpSucceeded"]
+        [
+            "endpoint",
+            "method",
+            "path_segments",
+            "query",
+            "headers",
+            "body",
+            "connect_timeout_ms",
+            "overall_timeout_ms",
+            "cancellation",
+        ]
     );
     let request = typed
         .sources
@@ -51,15 +58,65 @@ fn outbound_http_effect_lowers_recursive_schema_without_executable_string_routes
 }
 
 #[test]
-fn typed_passkey_effects_lower_as_metadata_with_typed_result_sources() {
+fn effect_result_state_lowers_as_the_next_effect_trigger() {
+    let parsed = boon_parser::parse_source(
+        "state-triggered-effect-chain.bn",
+        r#"
+store: [
+    start: SOURCE
+    clock_result:
+        ClockNotRequested |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    random_result:
+        RandomNotRequested |> HOLD random_result {
+            clock_result |> WHEN {
+                WallClockRead => Random/bytes(byte_count: 16)
+                __ => SKIP
+            }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let typed = lower(&parsed).unwrap();
+    let branch = typed
+        .update_branches
+        .iter()
+        .find(|branch| {
+            matches!(&branch.expression,
+                UpdateExpression::HostEffect { operation, .. }
+                    if operation == "Random/bytes")
+        })
+        .expect("state-triggered Random/bytes branch");
+    assert_eq!(branch.source, "store.clock_result");
+    assert_eq!(branch.target, "store.random_result");
+    assert_eq!(
+        branch.guard,
+        Some(UpdateGuard::TriggerValueOneOf {
+            values: vec!["WallClockRead".to_owned()],
+        })
+    );
+    assert!(
+        !typed
+            .possible_causes
+            .iter()
+            .find(|cause| cause.target == "store.random_result")
+            .unwrap()
+            .sources
+            .iter()
+            .any(|source| source == "store.start"),
+        "the second effect must not inherit the original SOURCE trigger"
+    );
+}
+
+#[test]
+fn typed_passkey_call_lowers_to_its_result_hold() {
     let parsed = boon_parser::parse_source(
         "typed-passkey-effects.bn",
         r#"
 store: [
     authenticate: SOURCE
-    authentication_succeeded: SOURCE
-    authentication_cancelled: SOURCE
-    authentication_failed: SOURCE
     simulate_cancel: SOURCE
     simulate_failure: SOURCE
     simulate_duplicate: SOURCE
@@ -73,73 +130,40 @@ store: [
                 store.simulate_duplicate |> THEN { Duplicate }
             }
         }
-]
-
-effects: [
-    sign_in: [
-        on: store.authenticate
-        perform: DevelopmentPasskey/authenticate(
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: store.simulation
-        )
-        results: [
-            AuthenticationSucceeded: store.authentication_succeeded
-            AuthenticationCancelled: store.authentication_cancelled
-            AuthenticationFailed: store.authentication_failed
-        ]
-    ]
+    authentication_result:
+        AuthenticationNotRequested |> HOLD authentication_result {
+            store.authenticate |> THEN {
+                DevelopmentPasskey/authenticate(
+                    account_id: store.account_id
+                    credential_count: store.credential_count
+                    simulation: store.simulation
+                )
+            }
+        }
 ]
 "#,
     )
     .unwrap();
     let typed = lower(&parsed).unwrap();
-    assert_eq!(typed.host_effects.len(), 1);
-    let effect = &typed.host_effects[0];
-    assert_eq!(effect.name, "sign_in");
-    assert_eq!(effect.operation, "DevelopmentPasskey/authenticate");
-    let SemanticDataType::Variant { variants } = &effect
-        .intent_fields
+    let branch = typed
+        .update_branches
         .iter()
-        .find(|field| field.name == "simulation")
-        .unwrap()
-        .data_type
-    else {
-        panic!("simulation intent must remain a closed variant");
+        .find(|branch| {
+            matches!(&branch.expression,
+            UpdateExpression::HostEffect { operation, .. }
+                if operation == "DevelopmentPasskey/authenticate")
+        })
+        .unwrap();
+    assert_eq!(branch.source, "store.authenticate");
+    assert_eq!(branch.target, "store.authentication_result");
+    let UpdateExpression::HostEffect { arguments, .. } = &branch.expression else {
+        unreachable!();
     };
     assert_eq!(
-        variants
+        arguments
             .iter()
-            .map(|variant| variant.tag.as_str())
-            .collect::<Vec<_>>(),
-        ["Cancel", "Duplicate", "Failure", "Success"]
-    );
-    assert!(
-        variants
-            .iter()
-            .all(|variant| !variant.open && variant.fields.is_empty())
-    );
-    assert_eq!(
-        effect
-            .intent_fields
-            .iter()
-            .map(|field| field.name.as_str())
+            .map(|argument| argument.name.as_str())
             .collect::<Vec<_>>(),
         ["account_id", "credential_count", "simulation"]
     );
-    assert!(
-        typed
-            .derived_values
-            .iter()
-            .all(|value| !value.path.starts_with("effects."))
-    );
-    let failure = typed
-        .sources
-        .iter()
-        .find(|source| source.path == "store.authentication_failed")
-        .unwrap();
-    assert!(failure.payload_schema.typed_fields.iter().any(|field| {
-        field.field == SourcePayloadField::Named("retryable".to_owned())
-            && field.data_type == SemanticDataType::Bool
-    }));
 }

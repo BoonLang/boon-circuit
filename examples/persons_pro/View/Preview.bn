@@ -35,18 +35,18 @@ FUNCTION browser_bar() {
         items: LIST {
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.show_draft_page
                 label: TEXT { Draft }
                 tone: Neutral
                 selected: PASSED.store.preview_surface == DraftPage
             )
-                |> SOURCE { PASSED.store.elements.show_draft_page }
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.show_published_page
                 label: TEXT { Published }
                 tone: Neutral
                 selected: PASSED.store.preview_surface == PublishedPage
             )
-                |> SOURCE { PASSED.store.elements.show_published_page }
             Scene/Element/text(
                 element: []
                 style: [
@@ -71,7 +71,7 @@ FUNCTION preview_content() {
 
 FUNCTION draft_compiler() {
     Scene/Element/program(
-        element: [event: PASSED.store.elements.draft_program]
+        element: [events: PASSED.store.elements.draft_program]
         style: [width: 0, height: 0, paint: False]
         source: PASSED.store.source_draft
         support_sources: Profile/support_sources()
@@ -84,7 +84,7 @@ FUNCTION draft_compiler() {
             }
         bootstrap_artifact_id: PASSED.store.last_valid_draft_artifact_id
         bootstrap_revision: PASSED.store.last_valid_draft_revision
-        capability_profile: PublicDocument
+        capability_profile: PublicClient
         session_key: TEXT { persons-public-draft }
         mount: False
     )
@@ -92,7 +92,7 @@ FUNCTION draft_compiler() {
 
 FUNCTION draft_program() {
     Scene/Element/program(
-        element: [event: PASSED.store.elements.draft_program]
+        element: [events: PASSED.store.elements.draft_program]
         style: [
             width: Fill
             height: Fill
@@ -108,7 +108,7 @@ FUNCTION draft_program() {
             }
         bootstrap_artifact_id: PASSED.store.last_valid_draft_artifact_id
         bootstrap_revision: PASSED.store.last_valid_draft_revision
-        capability_profile: PublicDocument
+        capability_profile: PublicClient
         session_key: TEXT { persons-public-draft }
         mount: True
     )
@@ -117,11 +117,11 @@ FUNCTION draft_program() {
 FUNCTION published_program() {
     PASSED.store.has_published_revision |> WHEN {
         True => Scene/Element/program(
-            element: [event: PASSED.store.elements.published_program]
+            element: [events: PASSED.store.elements.published_program]
             style: [width: Fill, height: Fill]
             artifact_id: PASSED.store.published_artifact_id
             revision: PASSED.store.published_revision
-            capability_profile: PublicDocument
+            capability_profile: PublicClient
             session_key: TEXT { persons-public-published }
             mount: True
         )

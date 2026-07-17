@@ -12,7 +12,6 @@ boon_plan.workspace = true
 boon_persistence.workspace = true
 boon_runtime.workspace = true
 boon_server_host.workspace = true
-boon_transport_json.workspace = true
 
 [dev-dependencies]
 futures.workspace = true

@@ -489,8 +489,8 @@ mod tests {
                         source: format!("value: {revision}\n"),
                     }],
                     application: application("child-mailbox"),
-                    capability_profile:
-                        boon_document_model::ProgramCapabilityProfile::PublicDocument,
+                    role: boon_plan::ProgramRole::Client,
+                    capability_profile: boon_document_model::ProgramCapabilityProfile::PublicClient,
                 },
                 artifact_id: None,
                 artifact_ownership: None,

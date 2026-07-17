@@ -94,6 +94,149 @@ impl FiniteReal {
     }
 }
 
+/// Bounded formatting options for Boon's `Number/to_text()` builtin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NumberTextFormat {
+    pub radix: u32,
+    pub min_width: usize,
+    pub signed_width: Option<u32>,
+    pub group_size: Option<usize>,
+    pub prefix: bool,
+}
+
+impl Default for NumberTextFormat {
+    fn default() -> Self {
+        Self {
+            radix: 10,
+            min_width: 0,
+            signed_width: None,
+            group_size: None,
+            prefix: false,
+        }
+    }
+}
+
+pub const MAX_NUMBER_TEXT_DIGITS: usize = 4096;
+
+/// Formats one finite Number without implicit rounding or unbounded allocation.
+pub fn format_number_text(
+    value: FiniteReal,
+    format: NumberTextFormat,
+) -> Result<String, FiniteRealError> {
+    if !(2..=36).contains(&format.radix) {
+        return Err(FiniteRealError::new(
+            "Number/to_text radix must be between 2 and 36",
+        ));
+    }
+    if format.min_width > MAX_NUMBER_TEXT_DIGITS {
+        return Err(FiniteRealError::new(format!(
+            "Number/to_text min_width must not exceed {MAX_NUMBER_TEXT_DIGITS}"
+        )));
+    }
+    if format
+        .group_size
+        .is_some_and(|size| size == 0 || size > MAX_NUMBER_TEXT_DIGITS)
+    {
+        return Err(FiniteRealError::new(format!(
+            "Number/to_text group_size must be between 1 and {MAX_NUMBER_TEXT_DIGITS}"
+        )));
+    }
+    if format
+        .signed_width
+        .is_some_and(|width| !(1..=63).contains(&width))
+    {
+        return Err(FiniteRealError::new(
+            "Number/to_text signed_width must be between 1 and 63",
+        ));
+    }
+    let prefix = if format.prefix {
+        match format.radix {
+            2 => "0b",
+            8 => "0o",
+            16 => "0x",
+            _ => {
+                return Err(FiniteRealError::new(
+                    "Number/to_text prefix is supported only for radix 2, 8, or 16",
+                ));
+            }
+        }
+    } else {
+        ""
+    };
+
+    let integer_format = format.radix != 10
+        || format.min_width != 0
+        || format.signed_width.is_some()
+        || format.group_size.is_some()
+        || format.prefix;
+    if !integer_format {
+        return Ok(value.to_string());
+    }
+
+    let mut integer = value.to_i64_exact()?;
+    if let Some(width) = format.signed_width {
+        if integer < 0 {
+            return Err(FiniteRealError::new(
+                "Number/to_text signed_width requires a non-negative bit pattern",
+            ));
+        }
+        let raw = i128::from(integer);
+        let modulus = 1_i128 << width;
+        if raw >= modulus {
+            return Err(FiniteRealError::new(format!(
+                "Number/to_text value {integer} does not fit signed_width {width}"
+            )));
+        }
+        let sign_bit = 1_i128 << (width - 1);
+        if raw & sign_bit != 0 {
+            integer = i64::try_from(raw - modulus)
+                .map_err(|_| FiniteRealError::new("Number/to_text signed conversion overflowed"))?;
+        }
+    }
+
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let negative = integer < 0;
+    let mut magnitude = integer.unsigned_abs();
+    let mut digits = Vec::new();
+    loop {
+        digits.push(DIGITS[(magnitude % u64::from(format.radix)) as usize]);
+        magnitude /= u64::from(format.radix);
+        if magnitude == 0 {
+            break;
+        }
+    }
+    while digits.len() < format.min_width {
+        digits.push(b'0');
+    }
+    digits.reverse();
+
+    let separator_count = format
+        .group_size
+        .map(|size| digits.len().saturating_sub(1) / size)
+        .unwrap_or(0);
+    let mut output = String::with_capacity(
+        usize::from(negative) + prefix.len() + digits.len() + separator_count,
+    );
+    if negative {
+        output.push('-');
+    }
+    output.push_str(prefix);
+    if let Some(group_size) = format.group_size {
+        let first_group = digits.len() % group_size;
+        for (index, digit) in digits.into_iter().enumerate() {
+            if index > 0
+                && (index == first_group || (index - first_group).is_multiple_of(group_size))
+            {
+                output.push(' ');
+            }
+            output.push(char::from(digit));
+        }
+    } else {
+        output.extend(digits.into_iter().map(char::from));
+    }
+    Ok(output)
+}
+
 impl FromStr for FiniteReal {
     type Err = FiniteRealError;
 
@@ -230,6 +373,57 @@ mod tests {
         assert_eq!(positive_zero.cmp(&negative_zero), std::cmp::Ordering::Equal);
         assert_eq!(hash(positive_zero), hash(negative_zero));
         assert!(FiniteReal::new(1.5).unwrap() > FiniteReal::ONE);
+    }
+
+    #[test]
+    fn number_text_format_is_bounded_and_waveform_complete() {
+        let value = FiniteReal::from_i64_exact(42).unwrap();
+        assert_eq!(
+            format_number_text(
+                value,
+                NumberTextFormat {
+                    radix: 2,
+                    min_width: 8,
+                    group_size: Some(4),
+                    ..NumberTextFormat::default()
+                }
+            )
+            .unwrap(),
+            "0010 1010"
+        );
+        assert_eq!(
+            format_number_text(
+                value,
+                NumberTextFormat {
+                    radix: 16,
+                    prefix: true,
+                    ..NumberTextFormat::default()
+                }
+            )
+            .unwrap(),
+            "0x2a"
+        );
+        assert_eq!(
+            format_number_text(
+                FiniteReal::from_i64_exact(255).unwrap(),
+                NumberTextFormat {
+                    signed_width: Some(8),
+                    ..NumberTextFormat::default()
+                }
+            )
+            .unwrap(),
+            "-1"
+        );
+        assert!(
+            format_number_text(
+                value,
+                NumberTextFormat {
+                    min_width: MAX_NUMBER_TEXT_DIGITS + 1,
+                    ..NumberTextFormat::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

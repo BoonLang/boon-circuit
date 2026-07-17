@@ -13,6 +13,7 @@ mod map_interaction;
 mod map_tile;
 mod scheduler;
 mod semantic;
+mod startup;
 mod storage;
 mod support;
 
@@ -28,5 +29,6 @@ pub use map_interaction::*;
 pub use map_tile::*;
 pub use scheduler::*;
 pub use semantic::*;
+pub use startup::*;
 pub use storage::*;
 pub use support::*;

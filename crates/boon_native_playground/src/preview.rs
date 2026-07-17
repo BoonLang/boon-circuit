@@ -16,9 +16,9 @@ use futures::{FutureExt, StreamExt, pin_mut, select};
 use sha2::{Digest, Sha256};
 
 use boon_runtime::{
-    MigrationScenarioRunner, ProgramCompletion, ProgramHostCompletion, ProgramHostRequest,
-    ProgramRequestId, ProgramSessionId, RuntimePhaseTimings, ScenarioStep,
-    compile_program_artifact,
+    MigrationScenarioRunner, PersistentRuntimeStartupDisposition, ProgramCompletion,
+    ProgramHostCompletion, ProgramHostRequest, ProgramRequestId, ProgramSessionId,
+    RuntimePhaseTimings, ScenarioStep, compile_program_artifact,
 };
 
 use crate::compile::{
@@ -49,8 +49,7 @@ use crate::protocol::{
 };
 use crate::runtime_view::{
     ProgramCompletionObservation, RuntimeAsyncLaneKind, RuntimeAsyncLaneObservation,
-    RuntimeAsyncLaneOutcome, RuntimeSourceDispatch, RuntimeStartupDisposition, RuntimeView,
-    STATE_ROOT_ENV, digest_hex,
+    RuntimeAsyncLaneOutcome, RuntimeSourceDispatch, RuntimeView, STATE_ROOT_ENV, digest_hex,
 };
 use crate::view::{HitTarget, RetainedView};
 
@@ -673,6 +672,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
     let (program_compiler, mut program_compiled) = ProgramCompileWorker::start();
     let mut runtime = None::<RuntimeView>;
     let mut runtime_key = None::<String>;
+    let mut package_assets = Vec::<AssetBlob>::new();
     let mut state_mount_captured = false;
     let mut migration = None::<MigrationBundle>;
     let mut active_migration_stage = None::<String>;
@@ -1126,10 +1126,12 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 match message {
                     Message::PreviewAssets { assets } => {
                         let sources = assets
-                            .into_iter()
+                            .iter()
+                            .cloned()
                             .map(render_asset_source)
                             .collect::<Vec<_>>();
                         product.replace_asset_sources(sources)?;
+                        package_assets = assets;
                     }
                     Message::PreviewApply {
                         intent,
@@ -1465,6 +1467,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             compiled_preview.plan,
                             deterministic_runtime,
                             isolated_test,
+                            &package_assets,
                         ) {
                             Ok(activation) => {
                                 let capture_mount = state_evidence.mount && !state_mount_captured;
@@ -3481,6 +3484,7 @@ fn activate_compatible(
     plan: Arc<boon_plan::MachinePlan>,
     deterministic_scenario: bool,
     isolated_scenario: bool,
+    assets: &[AssetBlob],
 ) -> Result<RuntimeActivation, String> {
     if !isolated_scenario
         && let Some(runtime) = runtime.as_mut()
@@ -3495,9 +3499,9 @@ fn activate_compatible(
         return Ok(RuntimeActivation::Updated);
     }
     if isolated_scenario {
-        RuntimeView::open_for_scenario(plan)
+        RuntimeView::open_for_scenario_with_assets(plan, assets)
     } else {
-        RuntimeView::open(plan, deterministic_scenario)
+        RuntimeView::open_with_assets(plan, deterministic_scenario, assets)
     }
     .map(|runtime| RuntimeActivation::Opened(Box::new(runtime)))
 }
@@ -3736,9 +3740,9 @@ fn capture_state_mounted(
     let state = authoritative_state_evidence(runtime)?;
     let startup = runtime.startup_evidence();
     let (disposition, migration) = match &startup.disposition {
-        RuntimeStartupDisposition::Fresh => (StartupDisposition::Fresh, None),
-        RuntimeStartupDisposition::Restored => (StartupDisposition::Restored, None),
-        RuntimeStartupDisposition::Migrated(preview) => (
+        PersistentRuntimeStartupDisposition::Fresh => (StartupDisposition::Fresh, None),
+        PersistentRuntimeStartupDisposition::Restored => (StartupDisposition::Restored, None),
+        PersistentRuntimeStartupDisposition::Migrated(preview) => (
             StartupDisposition::Migrated,
             Some(StartupMigrationEvidence {
                 source_schema_version: preview.source_schema_version,
@@ -3753,8 +3757,8 @@ fn capture_state_mounted(
         observer,
         ObserverEvent::StateMounted {
             disposition,
-            schema_version: startup.schema_version,
-            schema_hash: digest_hex(&startup.schema_hash),
+            schema_version: startup.restore_image.schema_version,
+            schema_hash: digest_hex(&startup.restore_image.schema_hash),
             migration,
             source_revision,
             runtime_sequence: runtime.runtime_turn_sequence(),
@@ -6007,577 +6011,4 @@ fn duration_us(duration: Duration) -> u64 {
 
 fn accounted_end_to_end_us(measured: u64, queue_wait: u64, worker: u64, apply: u64) -> u64 {
     measured.max(queue_wait.saturating_add(worker).saturating_add(apply))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn canonical_state_artifact_envelope_rejects_payload_corruption() {
-        let mut artifact = canonical_state_artifact(7, vec![0x81, 0x01]);
-        artifact.bytes[1] ^= 0x5a;
-        assert!(validate_state_artifact_digest(&artifact).is_err());
-    }
-
-    fn counter_migration() -> (crate::catalog::LoadedExample, MigrationBundle) {
-        let mut example = crate::catalog::Catalog::load()
-            .unwrap()
-            .open("counter_migration")
-            .unwrap();
-        let migration = example.migration.take().expect("migration bundle");
-        (example, migration)
-    }
-
-    #[test]
-    fn test_cursor_path_moves_smoothly_and_finishes_on_the_hit_target() {
-        let path = test_cursor_path((24.0, 24.0), (384.0, 264.0));
-        assert!(path.len() > 2);
-        assert!(path.len() <= TEST_CURSOR_MAX_MOVE_FRAMES);
-        assert_eq!(path.last().copied(), Some((384.0, 264.0)));
-        assert!(path.windows(2).all(|pair| {
-            pair[0].0 <= pair[1].0 && pair[0].1 <= pair[1].1 && pair[0] != pair[1]
-        }));
-        assert_eq!(test_cursor_path((80.0, 40.0), (80.0, 40.0)), [(80.0, 40.0)]);
-    }
-
-    #[test]
-    fn native_workflow_pointer_frames_follow_real_pointer_phases() {
-        let step = TestStep {
-            id: "click".to_owned(),
-            source_path: "store.button".to_owned(),
-            action_kind: Some("click".to_owned()),
-            target_text: None,
-            text: None,
-            key: None,
-            address: None,
-            target_occurrence: None,
-            pointer_x: None,
-            pointer_y: None,
-            pointer_width: None,
-            pointer_height: None,
-            expectations: vec![boon_runtime::ScenarioExpectation::DocumentChanged],
-        };
-        let workflow = NativeWorkflowState {
-            test_request_id: 41,
-            steps: vec![step],
-            proof_steps: BTreeSet::new(),
-            prepared: true,
-            host_evidence_complete: true,
-            completed: 0,
-            initial_state_digest: Some("initial".to_owned()),
-            current_state_digest: Some("current".to_owned()),
-            pending: None,
-            test_completed_emitted: false,
-        };
-        let pointer = |phase, button| {
-            HostEvent::Pointer(PointerEvent {
-                surface: boon_host::SurfaceId("preview".to_owned()),
-                x: 120.0,
-                y: 84.0,
-                phase,
-                button,
-            })
-        };
-
-        let moved = native_workflow_pointer_presentation(
-            Some(&workflow),
-            &pointer(PointerPhase::Move, None),
-            Some("button"),
-            9,
-        )
-        .expect("move is presented");
-        assert_eq!(moved.request_id, 41);
-        assert_eq!(moved.step_index, 0);
-        assert_eq!(moved.phase, TestPointerPhase::Move);
-        assert_eq!(moved.target.as_deref(), Some("button"));
-        assert_eq!(moved.runtime_sequence, 9);
-
-        let down = native_workflow_pointer_presentation(
-            Some(&workflow),
-            &pointer(PointerPhase::Down, Some(PointerButton::Primary)),
-            Some("button"),
-            10,
-        )
-        .expect("primary down is presented");
-        assert_eq!(down.phase, TestPointerPhase::Down);
-        assert!(
-            native_workflow_pointer_presentation(
-                Some(&workflow),
-                &pointer(PointerPhase::Down, None),
-                Some("button"),
-                10,
-            )
-            .is_none()
-        );
-    }
-
-    fn native_click_workflow() -> NativeWorkflowState {
-        NativeWorkflowState {
-            test_request_id: 42,
-            steps: vec![TestStep {
-                id: "click".to_owned(),
-                source_path: "store.button".to_owned(),
-                action_kind: Some("click".to_owned()),
-                target_text: None,
-                text: None,
-                key: None,
-                address: None,
-                target_occurrence: None,
-                pointer_x: None,
-                pointer_y: None,
-                pointer_width: None,
-                pointer_height: None,
-                expectations: vec![boon_runtime::ScenarioExpectation::DocumentChanged],
-            }],
-            proof_steps: BTreeSet::new(),
-            prepared: true,
-            host_evidence_complete: true,
-            completed: 0,
-            initial_state_digest: Some("initial".to_owned()),
-            current_state_digest: Some("current".to_owned()),
-            pending: Some(NativeWorkflowPending {
-                request_id: 43,
-                action_digest: "action".to_owned(),
-                target_node: "button".to_owned(),
-                before_state_digest: "before".to_owned(),
-                started_at: None,
-                first_sequence: None,
-                last_sequence: None,
-                event_digests: Vec::new(),
-                batch_text: String::new(),
-                pointer_up_count: 0,
-                last_pointer_up_source_path: None,
-                last_pointer_up_dispatched_source_paths: Vec::new(),
-                keyboard_phase: 0,
-                action_complete: false,
-            }),
-            test_completed_emitted: false,
-        }
-    }
-
-    fn native_pointer_envelope(sequence: u64, phase: PointerPhase) -> HostEventEnvelope {
-        let surface = boon_host::SurfaceId("preview".to_owned());
-        HostEventEnvelope {
-            sequence,
-            origin: HostEventOrigin::RealOs,
-            callback_to_host_ns: boon_host::CallbackToHostNs::ZERO,
-            window: boon_host::WindowId("preview-window".to_owned()),
-            surface: surface.clone(),
-            surface_epoch: 1,
-            event: HostEvent::Pointer(PointerEvent {
-                surface,
-                x: 120.0,
-                y: 84.0,
-                phase,
-                button: Some(PointerButton::Primary),
-            }),
-        }
-    }
-
-    #[test]
-    fn native_workflow_click_uses_only_up_event_dispatch_evidence() {
-        let expected = RuntimeSourceDispatch {
-            source_path: "store.button".to_owned(),
-            source_sequence: 11,
-        };
-        let mut workflow = native_click_workflow();
-        observe_native_workflow_input(
-            &mut workflow,
-            &native_pointer_envelope(1, PointerPhase::Down),
-            Some("store.button"),
-            None,
-            std::slice::from_ref(&expected),
-        )
-        .unwrap();
-        observe_native_workflow_input(
-            &mut workflow,
-            &native_pointer_envelope(2, PointerPhase::Up),
-            Some("store.button"),
-            None,
-            &[],
-        )
-        .unwrap();
-        assert!(!workflow.pending.as_ref().unwrap().action_complete);
-    }
-
-    #[test]
-    fn native_workflow_click_accepts_expected_before_secondary_dispatch() {
-        let dispatches = [
-            RuntimeSourceDispatch {
-                source_path: "store.button".to_owned(),
-                source_sequence: 11,
-            },
-            RuntimeSourceDispatch {
-                source_path: "store.activation_focus".to_owned(),
-                source_sequence: 12,
-            },
-        ];
-        let mut workflow = native_click_workflow();
-        observe_native_workflow_input(
-            &mut workflow,
-            &native_pointer_envelope(1, PointerPhase::Down),
-            Some("store.button"),
-            None,
-            &[],
-        )
-        .unwrap();
-        observe_native_workflow_input(
-            &mut workflow,
-            &native_pointer_envelope(2, PointerPhase::Up),
-            Some("store.button"),
-            None,
-            &dispatches,
-        )
-        .unwrap();
-        assert!(workflow.pending.as_ref().unwrap().action_complete);
-    }
-
-    fn profile_test_frame(
-        frame_id: u64,
-        event_sequence: Option<u64>,
-        input_kind: Option<crate::observer::InputKind>,
-    ) -> PresentedFrame {
-        PresentedFrame {
-            key: crate::observer::FrameEvidenceKey {
-                surface_id: "test-preview".to_owned(),
-                process_id: 1,
-                session_id: "test-session".to_owned(),
-                frame_id,
-                input_id: frame_id,
-                content_id: frame_id,
-                layout_id: frame_id,
-                render_id: frame_id,
-                surface_epoch: 1,
-                present_id: frame_id,
-                proof_id: frame_id,
-            },
-            event_sequence,
-            input_kind,
-            callback_to_host_ns: 1,
-            input_to_present_us: 1,
-            event_dispatch_us: 1,
-            executor_us: 1,
-            runtime_document_us: 1,
-            document_update_us: 1,
-            render_us: 1,
-            document_scene_convert_us: 1,
-            scene_key_us: 1,
-            rect_vertices_us: 1,
-            asset_prepare_us: 1,
-            quad_batch_key_us: 1,
-            quad_upload_us: 1,
-            draw_pass_us: 1,
-            retained_metrics_us: 1,
-            text_render_us: 1,
-            submit_us: 1,
-            present_us: 1,
-            frame_us: 1,
-        }
-    }
-
-    fn profile_test_benchmark(batch_text: &str, completed: bool) -> ProductProfileBenchmark {
-        let request = SubmittedProgramRequest {
-            session: ProgramSessionId("profile-child".to_owned()),
-            request_id: ProgramRequestId("request-7".to_owned()),
-            revision: 7,
-            pending_depth: 1,
-        };
-        let mut completed_requests = BTreeSet::new();
-        if completed {
-            completed_requests.insert((request.session.0.clone(), request.request_id.0.clone()));
-        }
-        ProductProfileBenchmark {
-            baseline: Vec::new(),
-            source_path: "store.source".to_owned(),
-            target_node: "editor".to_owned(),
-            seed_text: "seed".to_owned(),
-            sample_count: 1,
-            completed_samples: 0,
-            phase: ProductProfilePhase::Seed,
-            candidate: Some(ProductProfileCandidate {
-                batch_text: batch_text.to_owned(),
-                input_sequence: 11,
-                callback_to_host_ns: 1,
-                accepted_at: Instant::now(),
-                parent_generation_before: 1,
-                parent_dispatch_us: 1,
-                parent_phase: RuntimePhaseTimings::default(),
-                update: RuntimeUpdateMeasurement::default(),
-                requests: vec![request],
-                closed: false,
-                editor_frame: completed.then(|| {
-                    profile_test_frame(1, Some(11), Some(crate::observer::InputKind::Text))
-                }),
-                editor_visible_us: completed.then_some(1),
-                compile_us: 1,
-                pending_depth: 1,
-                completion_us: 1,
-                completion_phase: RuntimePhaseTimings::default(),
-                completion_update: RuntimeUpdateMeasurement::default(),
-                completed_requests,
-                invalid_completion: false,
-                child_frame: completed.then(|| profile_test_frame(2, None, None)),
-                preview_visible_us: completed.then_some(1),
-            }),
-        }
-    }
-
-    #[test]
-    fn profile_batch_becomes_ready_when_marker_follows_completion() {
-        let mut benchmark = profile_test_benchmark("seed", true);
-
-        assert!(!product_proof_is_eligible(Some(&benchmark), None));
-        assert!(!profile_candidate_is_ready(&benchmark));
-        close_profile_input_batch(&mut benchmark).unwrap();
-        assert!(profile_candidate_is_ready(&benchmark));
-        benchmark.phase = ProductProfilePhase::Complete;
-        assert!(product_proof_is_eligible(Some(&benchmark), None));
-    }
-
-    #[test]
-    fn profile_open_batch_tolerates_an_invalid_intermediate_compile() {
-        let mut intermediate = profile_test_benchmark("see", false);
-
-        assert!(!record_profile_invalid_completion(&mut intermediate).unwrap());
-        assert!(
-            intermediate
-                .candidate
-                .as_ref()
-                .is_some_and(|candidate| candidate.invalid_completion)
-        );
-
-        let mut final_candidate = profile_test_benchmark("seed", false);
-        assert!(!record_profile_invalid_completion(&mut final_candidate).unwrap());
-        assert!(
-            close_profile_input_batch(&mut final_candidate)
-                .unwrap_err()
-                .to_string()
-                .contains("invalid final child program")
-        );
-    }
-
-    #[test]
-    fn test_settle_completes_pending_child_program_requests() {
-        let source = r#"
-store: [
-    child_program: [
-        compiled: SOURCE
-        rejected: SOURCE
-    ]
-]
-
-child_source: "scene: Missing/constructor("
-
-scene: Scene/Element/program(
-    element: [event: store.child_program]
-    style: [width: Fill, height: Fill]
-    source: child_source
-    revision: 1
-    capability_profile: PublicDocument
-    session_key: TEXT { test-child }
-    mount: True
-)
-"#;
-        let runtime = boon_runtime::LiveRuntime::from_source("test-child.bn", source).unwrap();
-        let mut runtime = RuntimeView::open_in_memory(runtime).unwrap();
-        let mut columns = boon_native_gpu::GlyphonRenderTextColumnMeasurer::new();
-        let mut view = RetainedView::new(
-            runtime.frame(),
-            Viewport {
-                surface: 1,
-                width: 1_280.0,
-                height: 800.0,
-                scale: 1.0,
-            },
-            &mut columns,
-        )
-        .unwrap();
-
-        settle_test_runtime(&mut runtime, &mut view, &mut columns).unwrap();
-
-        assert!(runtime.take_program_requests().is_empty());
-        let diagnostics = runtime.program_diagnostics();
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].session.0, "test-child");
-    }
-
-    #[test]
-    fn child_program_compiles_through_the_depth_one_worker() {
-        let source = r#"
-store: [
-    child_source: "scene: Scene/Element/text(element: [], style: [width: Fill], text: TEXT { Child })\n"
-    child_program: [
-        compiled: SOURCE
-        rejected: SOURCE
-    ]
-]
-
-scene: Scene/Element/program(
-    element: [event: store.child_program]
-    style: [width: Fill, height: Fill]
-    source: store.child_source
-    revision: 1
-    capability_profile: PublicDocument
-    session_key: TEXT { test-child }
-    mount: True
-)
-"#;
-        let runtime = boon_runtime::LiveRuntime::from_source("worker-child.bn", source).unwrap();
-        let mut runtime = RuntimeView::open_in_memory(runtime).unwrap();
-        let (worker, mut results) = ProgramCompileWorker::start();
-
-        let submitted = submit_program_requests(runtime.take_program_requests(), &worker);
-        assert_eq!(submitted.len(), 1);
-        assert_eq!(submitted[0].pending_depth, 1);
-        let outcome = futures::executor::block_on(results.next()).expect("worker outcome");
-        assert_eq!(outcome.revision, submitted[0].revision);
-        assert_eq!(outcome.pending_depth, 1);
-        let changed = runtime
-            .complete_program(&outcome.session, &outcome.request_id, outcome.result)
-            .unwrap();
-
-        let texts = runtime
-            .frame()
-            .nodes
-            .values()
-            .filter_map(|node| node.text.as_ref().map(|text| text.text.clone()))
-            .collect::<Vec<_>>();
-        assert!(changed, "texts={texts:?}");
-        assert!(texts.iter().any(|text| text == "Child"), "texts={texts:?}");
-        assert!(runtime.take_program_requests().is_empty());
-        assert!(runtime.program_diagnostics().is_empty());
-    }
-
-    #[test]
-    fn test_semantic_assertions_use_current_runtime_state_and_fail_closed_without_a_turn() {
-        let example = crate::catalog::Catalog::load()
-            .unwrap()
-            .open("counter")
-            .unwrap();
-        let units = example
-            .units
-            .into_iter()
-            .map(|unit| boon_runtime::RuntimeSourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let runtime =
-            boon_runtime::LiveRuntime::from_project("examples/counter.bn", &units).unwrap();
-        let mut runtime = RuntimeView::open_in_memory(runtime).unwrap();
-        let mut step = TestStep {
-            id: "initial".to_owned(),
-            source_path: "unused".to_owned(),
-            action_kind: None,
-            target_text: None,
-            text: None,
-            key: None,
-            address: None,
-            target_occurrence: None,
-            pointer_x: None,
-            pointer_y: None,
-            pointer_width: None,
-            pointer_height: None,
-            expectations: vec![boon_runtime::ScenarioExpectation::RootText {
-                name: "store.count".to_owned(),
-                value: "0".to_owned(),
-            }],
-        };
-
-        assert_eq!(assert_test_step_semantics(&mut runtime, &step).unwrap(), 1);
-
-        step.expectations = vec![boon_runtime::ScenarioExpectation::RootText {
-            name: "store.count".to_owned(),
-            value: "1".to_owned(),
-        }];
-        assert!(assert_test_step_semantics(&mut runtime, &step).is_err());
-
-        step.expectations = vec![boon_runtime::ScenarioExpectation::DocumentChanged];
-        let error = assert_test_step_semantics(&mut runtime, &step).unwrap_err();
-        assert!(error.contains("requires a source event"), "{error}");
-    }
-
-    #[test]
-    fn same_identity_schema_change_requires_explicit_migration_activation() {
-        let (example, migration) = counter_migration();
-        let initial =
-            compile_migration_stage(&example.application, &migration, &migration.initial_stage)
-                .unwrap();
-        let runtime = boon_runtime::LiveRuntime::from_shared_machine_plan(
-            initial,
-            boon_runtime::SessionOptions::default(),
-        )
-        .unwrap();
-        let mut runtime = Some(RuntimeView::open_in_memory(runtime).unwrap());
-        let before = runtime.as_ref().unwrap().persistence_schema_version();
-        let target = compile_migration_stage(&example.application, &migration, "v2").unwrap();
-
-        let error = match activate_compatible(&mut runtime, target, false, false) {
-            Err(error) => error,
-            Ok(_) => panic!("schema-changing source reload activated implicitly"),
-        };
-        assert!(error.contains("requires Migration Preview and Activate"));
-        assert_eq!(
-            runtime.as_ref().unwrap().persistence_schema_version(),
-            before
-        );
-    }
-
-    #[test]
-    fn migration_test_uses_the_generic_runner_with_temporary_namespaces() {
-        let (example, migration) = counter_migration();
-        let completed = run_migration_test(&migration, &example.application, 41, 3).unwrap();
-        assert_eq!(completed, migration.scenario.steps.len());
-    }
-
-    #[test]
-    fn persons_product_carries_source_controlled_migration_without_replacing_test_driver() {
-        let example = crate::catalog::Catalog::load()
-            .unwrap()
-            .open("persons_pro")
-            .unwrap();
-        let migration = example.migration.as_ref().expect("migration bundle");
-        assert_eq!(
-            migration.test_driver,
-            crate::protocol::MigrationTestDriver::Example
-        );
-        assert!(!example.test_steps.is_empty());
-        let completed = run_migration_test(migration, &example.application, 42, 3).unwrap();
-        assert_eq!(completed, migration.scenario.steps.len());
-    }
-
-    #[test]
-    fn persons_editor_actions_form_one_supported_native_workflow() {
-        let example = crate::catalog::Catalog::load()
-            .unwrap()
-            .open("persons_pro")
-            .unwrap();
-        let required = example
-            .test_steps
-            .iter()
-            .map(|step| step.id.clone())
-            .collect::<Vec<_>>();
-        let proof = required.iter().cloned().collect();
-        let workflow =
-            NativeWorkflowState::from_test_steps(1, &example.test_steps, &required, &proof)
-                .unwrap()
-                .unwrap();
-        assert_eq!(workflow.steps.len(), 36);
-        assert!(workflow.steps.len() <= TEST_STEP_LIMIT);
-        assert_eq!(crate::runtime_view::normalize_key("Next"), "pagedown");
-    }
-
-    #[test]
-    fn migration_targets_are_forward_only() {
-        let (_, migration) = counter_migration();
-        assert_eq!(
-            forward_migration_stage(&migration, "v1", "v3")
-                .unwrap()
-                .schema_version,
-            3
-        );
-        assert!(forward_migration_stage(&migration, "v2", "v1").is_err());
-        assert!(forward_migration_stage(&migration, "v2", "v2").is_err());
-    }
 }

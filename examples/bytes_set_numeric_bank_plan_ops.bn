@@ -7,7 +7,7 @@ store: [
     patched:
         BYTES[4] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: 16uFE) }
+                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: BYTES[1] { 16uFE }) }
             }
         }
     read_u16_be:

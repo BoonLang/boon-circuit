@@ -2,7 +2,7 @@ use super::{
     ActivationBatch, DurableOutboxState, OutboxItemId, RestoreImage, StoredList, StoredRow,
     StoredScalar, StoredValue, validate_outbox_item_schema,
 };
-use boon_data::FiniteReal;
+use boon_data::{FiniteReal, NumberTextFormat, format_number_text};
 use boon_plan::{
     ApplicationIdentity, DataTypePlan, MachinePlan, MemoryId, MemoryLeafId,
     MigrationArgumentValuePlan, MigrationEdgeId, MigrationEdgePlan, MigrationExpressionPlan,
@@ -753,7 +753,6 @@ fn evaluate_expression(
             .ok_or_else(|| MigrationError::Evaluation("lambda parameter is missing".to_owned())),
         MigrationExpressionPlan::Text { value } => Ok(StoredValue::Text(value.clone())),
         MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(*value)),
-        MigrationExpressionPlan::Byte { value } => stored_integer(i64::from(*value)),
         MigrationExpressionPlan::Bool { value } => Ok(StoredValue::Bool(*value)),
         MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::Variant {
             tag: tag.clone(),
@@ -902,12 +901,71 @@ fn evaluate_call(
                 "Bool/not requires one boolean".to_owned(),
             )),
         },
-        "Number/to_text" => match input.or_else(first_value) {
-            Some(StoredValue::Number(value)) => Ok(StoredValue::Text(value.to_string())),
-            _ => Err(MigrationError::Evaluation(
-                "Number/to_text requires one number".to_owned(),
-            )),
-        },
+        "Number/to_text" => {
+            let named_value = |name: &str| {
+                arguments.iter().find_map(|(candidate, argument)| {
+                    (*candidate == Some(name)).then(|| match argument {
+                        EvaluatedArgument::Value(value) => Some(value.clone()),
+                        EvaluatedArgument::Lambda { .. } => None,
+                    })?
+                })
+            };
+            let positional_value = || {
+                arguments.iter().find_map(|(name, argument)| {
+                    name.is_none().then(|| match argument {
+                        EvaluatedArgument::Value(value) => Some(value.clone()),
+                        EvaluatedArgument::Lambda { .. } => None,
+                    })?
+                })
+            };
+            let Some(StoredValue::Number(value)) = input
+                .or_else(|| named_value("value"))
+                .or_else(positional_value)
+            else {
+                return Err(MigrationError::Evaluation(
+                    "Number/to_text requires one number".to_owned(),
+                ));
+            };
+            let integer_arg = |name: &str| -> Result<Option<i64>, MigrationError> {
+                named_value(name)
+                    .map(|value| match value {
+                        StoredValue::Number(value) => value
+                            .to_i64_exact()
+                            .map_err(|error| MigrationError::Evaluation(error.to_string())),
+                        _ => Err(MigrationError::Evaluation(format!(
+                            "Number/to_text {name} must be a whole Number"
+                        ))),
+                    })
+                    .transpose()
+            };
+            let prefix = match named_value("prefix") {
+                Some(StoredValue::Bool(value)) => value,
+                Some(_) => {
+                    return Err(MigrationError::Evaluation(
+                        "Number/to_text prefix must be Bool".to_owned(),
+                    ));
+                }
+                None => false,
+            };
+            let radix = integer_arg("radix")?.unwrap_or(10);
+            let min_width = integer_arg("min_width")?.unwrap_or(0);
+            let signed_width =
+                integer_arg("signed_width")?.map(|value| u32::try_from(value).unwrap_or_default());
+            let group_size =
+                integer_arg("group_size")?.map(|value| usize::try_from(value).unwrap_or_default());
+            let text = format_number_text(
+                value,
+                NumberTextFormat {
+                    radix: u32::try_from(radix).unwrap_or_default(),
+                    min_width: usize::try_from(min_width).unwrap_or(usize::MAX),
+                    signed_width,
+                    group_size,
+                    prefix,
+                },
+            )
+            .map_err(|error| MigrationError::Evaluation(error.to_string()))?;
+            Ok(StoredValue::Text(text))
+        }
         "Text/to_number" => match input.or_else(first_value) {
             Some(StoredValue::Text(value)) => value
                 .parse::<FiniteReal>()
@@ -1059,10 +1117,6 @@ fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<()
         (StoredValue::Null, DataTypePlan::Null) => true,
         (StoredValue::Bool(_), DataTypePlan::Bool) => true,
         (StoredValue::Number(_), DataTypePlan::Number) => true,
-        (StoredValue::Number(value), DataTypePlan::Byte) => value
-            .to_i64_exact()
-            .ok()
-            .is_some_and(|value| u8::try_from(value).is_ok()),
         (StoredValue::Text(_), DataTypePlan::Text) => true,
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
             fixed_len.is_none_or(|expected| u64::try_from(value.len()) == Ok(expected))

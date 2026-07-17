@@ -200,7 +200,9 @@ initial_visible_assertions = [
   "no-large-blank-regions",
 ]
 input_scenarios = [
+  "type-new-todo",
   "add-todo",
+  "type-empty-todo",
   "reject-empty-todo",
   "toggle-one-todo",
   "toggle-all",
@@ -260,6 +262,9 @@ build_files = [
 ]
 asset_files = [
   "examples/novywave/assets/icons/novywave_mark.svg",
+  "examples/novywave/fixtures/simple.vcd",
+  "examples/novywave/fixtures/basic_test.fst",
+  "examples/novywave/fixtures/simple_test.ghw",
 ]
 scenario = "examples/novywave.scn"
 budget = "examples/novywave.budget.toml"
@@ -618,7 +623,7 @@ input_scenarios = [
   "open-vehicles",
   "open-details",
   "switch-language",
-  "switch-satellite",
+  "switch-streets",
   "search-station",
   "mobile-sheet-full",
   "follow-location",
@@ -626,7 +631,7 @@ input_scenarios = [
 native_preview_scenarios = [
   "select-bergen",
   "open-vehicles",
-  "switch-satellite",
+  "switch-streets",
 ]
 scroll_focus_scenarios = [
   "map-wheel-zoom",
@@ -647,7 +652,7 @@ performance_thresholds = [
 ]
 
 [[example.programs]]
-role = "document"
+role = "client"
 source = "examples/fjordpulse/Client/RUN.bn"
 source_files = [
   "examples/fjordpulse/Theme/FjordPulseTheme.bn",
@@ -658,6 +663,14 @@ source_files = [
   "examples/fjordpulse/Client/RUN.bn",
 ]
 state_namespace = "client-v1"
+
+[[example.programs]]
+role = "session"
+source = "examples/fjordpulse/Session/RUN.bn"
+source_files = [
+  "examples/fjordpulse/Session/RUN.bn",
+]
+state_namespace = "session-v1"
 
 [[example.programs]]
 role = "server"

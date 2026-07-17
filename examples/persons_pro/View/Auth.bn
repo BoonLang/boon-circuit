@@ -23,32 +23,32 @@ FUNCTION controls() {
             PASSED.store.account_state |> WHEN {
                 Anonymous => Components/button(
                     PASS: [store: PASSED.store]
+                    source: PASSED.store.elements.register_passkey
                     label: TEXT { Protect workspace }
                     tone: Primary
                     selected: False
                 )
-                    |> SOURCE { PASSED.store.elements.register_passkey }
                 OnePasskey => Components/button(
                     PASS: [store: PASSED.store]
+                    source: PASSED.store.elements.register_passkey
                     label: TEXT { Add passkey }
                     tone: Warning
                     selected: False
                 )
-                    |> SOURCE { PASSED.store.elements.register_passkey }
                 TwoPasskeys => Components/button(
                     PASS: [store: PASSED.store]
+                    source: PASSED.store.elements.sign_out
                     label: TEXT { Sign out }
                     tone: Neutral
                     selected: False
                 )
-                    |> SOURCE { PASSED.store.elements.sign_out }
                 SignedOut => Components/button(
                     PASS: [store: PASSED.store]
+                    source: PASSED.store.elements.sign_in
                     label: TEXT { Sign in }
                     tone: Primary
                     selected: False
                 )
-                    |> SOURCE { PASSED.store.elements.sign_in }
                 __ => NoElement
             }
         }
@@ -117,18 +117,18 @@ FUNCTION development_outcomes() {
                     items: LIST {
                         Components/button(
                             PASS: [store: PASSED.store]
+                            source: PASSED.store.elements.simulate_authentication_cancel
                             label: TEXT { Cancel sign-in }
                             tone: Neutral
                             selected: False
                         )
-                            |> SOURCE { PASSED.store.elements.simulate_authentication_cancel }
                         Components/button(
                             PASS: [store: PASSED.store]
+                            source: PASSED.store.elements.simulate_authentication_failure
                             label: TEXT { Fail sign-in }
                             tone: Neutral
                             selected: False
                         )
-                            |> SOURCE { PASSED.store.elements.simulate_authentication_failure }
                     }
                 )
                 __ => Scene/Element/stripe(
@@ -144,25 +144,25 @@ FUNCTION development_outcomes() {
                     items: LIST {
                         Components/button(
                             PASS: [store: PASSED.store]
+                            source: PASSED.store.elements.simulate_registration_cancel
                             label: TEXT { Cancel registration }
                             tone: Neutral
                             selected: False
                         )
-                            |> SOURCE { PASSED.store.elements.simulate_registration_cancel }
                         Components/button(
                             PASS: [store: PASSED.store]
+                            source: PASSED.store.elements.simulate_registration_failure
                             label: TEXT { Fail registration }
                             tone: Neutral
                             selected: False
                         )
-                            |> SOURCE { PASSED.store.elements.simulate_registration_failure }
                         Components/button(
                             PASS: [store: PASSED.store]
+                            source: PASSED.store.elements.simulate_registration_duplicate
                             label: TEXT { Duplicate credential }
                             tone: Neutral
                             selected: False
                         )
-                            |> SOURCE { PASSED.store.elements.simulate_registration_duplicate }
                     }
                 )
             }

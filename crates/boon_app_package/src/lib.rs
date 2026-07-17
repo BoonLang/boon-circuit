@@ -1,15 +1,17 @@
-//! Immutable paired-application packages for Boon production hosts.
+//! Immutable client/session/server application packages for Boon production hosts.
 //!
 //! Package construction is available behind the `build` feature. Runtime
 //! consumers only parse a closed manifest, verify every content digest, and
 //! decode precompiled program artifacts.
 
+mod browser;
 mod bundle;
 mod manifest;
 
 #[cfg(feature = "build")]
 mod build;
 
+pub use browser::*;
 pub use bundle::*;
 pub use manifest::*;
 
@@ -55,12 +57,6 @@ impl From<std::io::Error> for PackageError {
 
 impl From<toml::de::Error> for PackageError {
     fn from(error: toml::de::Error) -> Self {
-        Self(error.to_string())
-    }
-}
-
-impl From<serde_json::Error> for PackageError {
-    fn from(error: serde_json::Error) -> Self {
         Self(error.to_string())
     }
 }

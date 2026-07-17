@@ -19,8 +19,6 @@ boon_server_runtime.workspace = true
 boon_runtime.workspace = true
 fs2.workspace = true
 ipnet.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
 url.workspace = true
 

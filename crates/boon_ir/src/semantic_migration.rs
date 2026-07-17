@@ -73,7 +73,6 @@ pub enum SemanticDataType {
     Null,
     Bool,
     Number,
-    Byte,
     Text,
     Bytes {
         fixed_len: Option<usize>,
@@ -531,7 +530,6 @@ pub(crate) fn semantic_data_type(value: &Type) -> SemanticDataType {
     match value {
         Type::Text => SemanticDataType::Text,
         Type::Number => SemanticDataType::Number,
-        Type::Byte => SemanticDataType::Byte,
         Type::Bytes(BytesType::Dynamic) => SemanticDataType::Bytes { fixed_len: None },
         Type::Bytes(BytesType::Fixed(fixed_len)) => SemanticDataType::Bytes {
             fixed_len: Some(*fixed_len),
@@ -649,7 +647,6 @@ fn type_quality_counts(data_type: &SemanticDataType) -> (usize, usize, usize) {
         SemanticDataType::Null
         | SemanticDataType::Bool
         | SemanticDataType::Number
-        | SemanticDataType::Byte
         | SemanticDataType::Text
         | SemanticDataType::Bytes { .. } => (0, 0, 1),
     }
@@ -1076,7 +1073,6 @@ fn migration_type_needs_refinement(data_type: &SemanticDataType) -> bool {
         SemanticDataType::Null
         | SemanticDataType::Bool
         | SemanticDataType::Number
-        | SemanticDataType::Byte
         | SemanticDataType::Text
         | SemanticDataType::Bytes { .. } => false,
     }
@@ -2002,7 +1998,6 @@ fn ensure_closed_migration_type(data_type: &SemanticDataType, context: &str) -> 
         SemanticDataType::Null
         | SemanticDataType::Bool
         | SemanticDataType::Number
-        | SemanticDataType::Byte
         | SemanticDataType::Text
         | SemanticDataType::Bytes { .. } => Ok(()),
     }

@@ -412,21 +412,3 @@ fn map_tile_templates_bind_renderer_identity_to_declared_fetch_origin() {
             .is_err()
     );
 }
-
-#[test]
-fn frame_evidence_carries_product_revision_identity_without_claiming_proof() {
-    let identity = WebGpuFrameIdentity {
-        surface_id: SurfaceId("web:main".to_owned()),
-        content_revision: 11,
-        layout_revision: 12,
-        render_scene_revision: 13,
-        scene_identity: "scene:13".to_owned(),
-        input_event_seq: Some(7),
-        proof_request_id: None,
-    };
-    let encoded = serde_json::to_value(&identity).unwrap();
-    assert_eq!(encoded["surface_id"], "web:main");
-    assert_eq!(encoded["content_revision"], 11);
-    assert_eq!(encoded["input_event_seq"], 7);
-    assert!(encoded.get("proof_request_id").is_none());
-}

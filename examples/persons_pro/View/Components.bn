@@ -17,11 +17,10 @@ FUNCTION text(value, of) {
     )
 }
 
-FUNCTION button(label, tone, selected) {
+FUNCTION button(source, label, tone, selected) {
     Scene/Element/button(
         element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
+            events: [press: source]
         ]
         style: [
             width: Auto
@@ -75,7 +74,7 @@ FUNCTION status(label, tone) {
     )
 }
 
-FUNCTION field(label, value, placeholder) {
+FUNCTION field(source, label, value, placeholder) {
     Scene/Element/stripe(
         element: []
         direction: Column
@@ -94,7 +93,7 @@ FUNCTION field(label, value, placeholder) {
                 text: label
             )
             Scene/Element/text_input(
-                element: [event: [change: SOURCE]]
+                element: [events: [change: source]]
                 style: [
                     ...PersonsTheme/inset(mode: PASSED.store.mode)
                     ...PersonsTheme/body(mode: PASSED.store.mode)

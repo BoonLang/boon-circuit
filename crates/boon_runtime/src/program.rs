@@ -3,8 +3,10 @@ use crate::{
     RowId, RuntimeSourceUnit, SessionOptions, SourcePayload,
 };
 use boon_compiler::{
-    COMPILER_ID, CompileProfile, CompilerSourceUnit,
-    compile_runtime_source_units_to_machine_plan_with_identity, diagnose_runtime_source_units,
+    COMPILER_ID, CompileProfile, CompilerSourceUnit, DistributedCompilerProgram,
+    compile_distributed_runtime_source_programs,
+    compile_runtime_source_units_to_machine_plan_for_role_with_identity,
+    diagnose_runtime_source_units,
 };
 use boon_document_model::{
     DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor, ProgramArtifactRetention,
@@ -55,7 +57,7 @@ pub struct ProgramLimits {
 
 fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
     match profile {
-        ProgramCapabilityProfile::PublicDocument => ProgramLimits {
+        ProgramCapabilityProfile::PublicClient => ProgramLimits {
             max_source_units: 8,
             max_source_bytes: 64 * 1024,
             max_operations: 10_000,
@@ -69,6 +71,21 @@ fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
             max_document_materializations: 128,
             max_declared_list_capacity: 4_096,
             max_runtime_work_units_per_transaction: 20_000,
+        },
+        ProgramCapabilityProfile::TrustedSession => ProgramLimits {
+            max_source_units: 16,
+            max_source_bytes: 256 * 1024,
+            max_operations: 50_000,
+            max_scalar_slots: 2_048,
+            max_list_slots: 256,
+            max_source_routes: 1_024,
+            max_output_roots: 128,
+            max_effect_contracts: 128,
+            max_document_expressions: 0,
+            max_document_templates: 0,
+            max_document_materializations: 0,
+            max_declared_list_capacity: 32_768,
+            max_runtime_work_units_per_transaction: 100_000,
         },
         ProgramCapabilityProfile::TrustedServer => ProgramLimits {
             max_source_units: 32,
@@ -91,6 +108,7 @@ fn program_limits(profile: ProgramCapabilityProfile) -> ProgramLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramCompileRequest {
     pub revision: u64,
+    pub role: ProgramRole,
     pub entry_path: String,
     pub units: Vec<RuntimeSourceUnit>,
     pub application: ApplicationIdentity,
@@ -432,10 +450,11 @@ fn compile_validated_program_artifact(
             source: unit.source.clone(),
         })
         .collect::<Vec<_>>();
-    let compiled = compile_runtime_source_units_to_machine_plan_with_identity(
+    let compiled = compile_runtime_source_units_to_machine_plan_for_role_with_identity(
         &request.entry_path,
         &units,
         TargetProfile::SoftwareBounded,
+        request.role,
         request.application.clone(),
     )
     .map_err(|error| {
@@ -454,6 +473,97 @@ fn compile_validated_program_artifact(
             diagnostic.with_source_location(location.path, location.line, location.column)
         })
     })?;
+    artifact_from_compiled(request, source_digest, compiled)
+}
+
+pub fn compile_distributed_program_bundle(
+    requests: &[ProgramCompileRequest],
+) -> Result<DistributedProgramBundle, ProgramDiagnostic> {
+    for request in requests {
+        validate_request(request)?;
+    }
+    compile_validated_distributed_program_bundle(requests)
+}
+
+pub fn compile_trusted_package_distributed_program_bundle(
+    requests: &[ProgramCompileRequest],
+) -> Result<DistributedProgramBundle, ProgramDiagnostic> {
+    for request in requests {
+        validate_request_with_source_limits(
+            request,
+            MAX_TRUSTED_PACKAGE_SOURCE_UNITS,
+            MAX_TRUSTED_PACKAGE_SOURCE_BYTES,
+        )?;
+    }
+    compile_validated_distributed_program_bundle(requests)
+}
+
+fn compile_validated_distributed_program_bundle(
+    requests: &[ProgramCompileRequest],
+) -> Result<DistributedProgramBundle, ProgramDiagnostic> {
+    let revision = requests
+        .iter()
+        .map(|request| request.revision)
+        .max()
+        .unwrap_or(0);
+    let compiler_programs = requests
+        .iter()
+        .map(|request| DistributedCompilerProgram {
+            revision: request.revision,
+            role: request.role,
+            source_label: request.entry_path.clone(),
+            units: request
+                .units
+                .iter()
+                .map(|unit| CompilerSourceUnit {
+                    path: unit.path.clone(),
+                    source: unit.source.clone(),
+                })
+                .collect(),
+            application: request.application.clone(),
+            schema_version: boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+            migration_predecessors: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let compiled = compile_distributed_runtime_source_programs(
+        &compiler_programs,
+        TargetProfile::SoftwareBounded,
+    )
+    .map_err(|error| {
+        ProgramDiagnostic::new(revision, ProgramDiagnosticPhase::Compile, error.to_string())
+    })?;
+    let mut artifacts = Vec::with_capacity(requests.len());
+    for (role, compiled) in compiled.into_programs() {
+        let request = requests
+            .iter()
+            .find(|request| request.role == role)
+            .ok_or_else(|| {
+                ProgramDiagnostic::new(
+                    revision,
+                    ProgramDiagnosticPhase::Artifact,
+                    format!(
+                        "joint compiler returned an unexpected {} role",
+                        role.as_str()
+                    ),
+                )
+            })?;
+        let source_digest = crate::sha256_bytes(request.units[0].source.as_bytes());
+        artifacts.push(artifact_from_compiled(request, source_digest, compiled)?);
+    }
+    DistributedProgramBundle::new(artifacts).map_err(|error| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            error.to_string(),
+        )
+    })
+}
+
+fn artifact_from_compiled(
+    request: &ProgramCompileRequest,
+    source_digest: String,
+    compiled: boon_compiler::CompiledMachinePlanFromSource,
+) -> Result<ProgramArtifact, ProgramDiagnostic> {
     validate_plan(request.revision, request.capability_profile, &compiled.plan)?;
     let content = encode_program_artifact(
         request.revision,
@@ -490,9 +600,11 @@ pub struct ProgramSession {
 impl ProgramSession {
     pub fn start(artifact: ProgramArtifact) -> Result<Self, ProgramDiagnostic> {
         let limits = program_limits(artifact.capability_profile());
+        let id = deterministic_program_session_id(&artifact);
         let runtime = LiveRuntime::from_shared_machine_plan(
             Arc::clone(artifact.plan()),
             SessionOptions {
+                session_id: Some(id.0.clone()),
                 max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
                 ..SessionOptions::default()
             },
@@ -504,7 +616,6 @@ impl ProgramSession {
                 error.to_string(),
             )
         })?;
-        let id = deterministic_program_session_id(&artifact);
         Ok(Self {
             id,
             artifact,
@@ -575,6 +686,16 @@ impl ProgramSession {
         self.runtime.complete_transient_effect(call_id, outcome)
     }
 
+    pub fn deliver_transient_effect_result(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        result_sequence: u64,
+        outcome: crate::Value,
+    ) -> crate::RuntimeResult<crate::RuntimeTurn> {
+        self.runtime
+            .deliver_transient_effect_result(call_id, result_sequence, outcome)
+    }
+
     pub fn cancel_transient_effect(
         &mut self,
         call_id: crate::TransientEffectCallId,
@@ -584,6 +705,51 @@ impl ProgramSession {
 
     pub fn pending_transient_effect_count(&self) -> usize {
         self.runtime.pending_transient_effect_count()
+    }
+
+    pub fn pending_transient_effect_credits(
+        &self,
+        call_id: crate::TransientEffectCallId,
+    ) -> Option<u32> {
+        self.runtime.pending_transient_effect_credits(call_id)
+    }
+
+    pub fn update_distributed_import(
+        &mut self,
+        import_id: boon_plan::ImportId,
+        content_revision: u64,
+        value: crate::Value,
+    ) -> crate::RuntimeResult<Option<crate::RuntimeTurn>> {
+        self.runtime
+            .update_distributed_import(import_id, content_revision, value)
+    }
+
+    pub fn distributed_import_revision(&self, import_id: boon_plan::ImportId) -> Option<u64> {
+        self.runtime.distributed_import_revision(import_id)
+    }
+
+    pub fn distributed_export_value_current(
+        &mut self,
+        export_id: boon_plan::ExportId,
+    ) -> crate::RuntimeResult<crate::Value> {
+        self.runtime.distributed_export_value_current(export_id)
+    }
+
+    pub fn evaluate_distributed_function(
+        &mut self,
+        export_id: boon_plan::ExportId,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, crate::Value>,
+    ) -> crate::RuntimeResult<crate::Value> {
+        self.runtime
+            .evaluate_distributed_function(export_id, arguments)
+    }
+
+    pub fn distributed_call_arguments_current(
+        &mut self,
+        call_site_id: boon_plan::RemoteCallSiteId,
+    ) -> crate::RuntimeResult<BTreeMap<boon_plan::DistributedArgumentId, crate::Value>> {
+        self.runtime
+            .distributed_call_arguments_current(call_site_id)
     }
 }
 
@@ -619,9 +785,11 @@ impl PersistentProgramSession {
         D: PersistenceDriver + Send + 'static,
     {
         let limits = program_limits(artifact.capability_profile());
+        let id = deterministic_program_session_id(&artifact);
         let (runtime, startup) = crate::PersistentRuntime::from_shared_machine_plan(
             Arc::clone(artifact.plan()),
             SessionOptions {
+                session_id: Some(id.0.clone()),
                 max_work_units_per_transaction: Some(limits.max_runtime_work_units_per_transaction),
                 ..SessionOptions::default()
             },
@@ -635,7 +803,6 @@ impl PersistentProgramSession {
                 error.to_string(),
             )
         })?;
-        let id = deterministic_program_session_id(&artifact);
         Ok((
             Self {
                 id,
@@ -740,6 +907,26 @@ impl PersistentProgramSession {
         self.runtime.complete_transient_effect(call_id, outcome)
     }
 
+    pub fn deliver_transient_effect_result(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        result_sequence: u64,
+        outcome: crate::Value,
+    ) -> Result<crate::RuntimeTurn, crate::PersistentDispatchError> {
+        self.runtime
+            .deliver_transient_effect_result(call_id, result_sequence, outcome)
+    }
+
+    pub fn deliver_transient_effect_result_durably(
+        &mut self,
+        call_id: crate::TransientEffectCallId,
+        result_sequence: u64,
+        outcome: crate::Value,
+    ) -> Result<crate::DurablyAcknowledgedTurn, crate::PersistentDispatchError> {
+        self.runtime
+            .deliver_transient_effect_result_durably(call_id, result_sequence, outcome)
+    }
+
     pub fn complete_transient_effect_durably(
         &mut self,
         call_id: crate::TransientEffectCallId,
@@ -760,6 +947,13 @@ impl PersistentProgramSession {
         self.runtime.pending_transient_effect_count()
     }
 
+    pub fn pending_transient_effect_credits(
+        &self,
+        call_id: crate::TransientEffectCallId,
+    ) -> Option<u32> {
+        self.runtime.pending_transient_effect_credits(call_id)
+    }
+
     pub fn persistence_status(&self) -> PersistenceWorkerStatus {
         self.runtime.status()
     }
@@ -774,14 +968,17 @@ impl PersistentProgramSession {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProgramBundle {
+pub struct DistributedProgramBundle {
     artifacts: Vec<ProgramArtifact>,
 }
 
-impl ProgramBundle {
+impl DistributedProgramBundle {
     pub fn new(mut artifacts: Vec<ProgramArtifact>) -> crate::RuntimeResult<Self> {
-        if artifacts.is_empty() {
-            return Err("program bundle declares no artifacts".into());
+        if artifacts.len() != 3 {
+            return Err(
+                "distributed program requires exactly one client, one session, and one server artifact"
+                    .into(),
+            );
         }
         let package_id = artifacts[0].application().package_id.clone();
         let deployment_domain = artifacts[0].application().deployment_domain.clone();
@@ -811,6 +1008,49 @@ impl ProgramBundle {
                 .into());
             }
         }
+        let required_roles = BTreeSet::from([
+            ProgramRole::Client.as_str(),
+            ProgramRole::Session.as_str(),
+            ProgramRole::Server.as_str(),
+        ]);
+        if roles != required_roles {
+            return Err(
+                "distributed program requires client, session, and server artifacts".into(),
+            );
+        }
+        let graph_identity = artifacts[0]
+            .plan()
+            .distributed_endpoint
+            .as_ref()
+            .ok_or("distributed artifact has no linked endpoint contract")?
+            .graph
+            .clone();
+        let mut endpoint_contracts = Vec::with_capacity(artifacts.len());
+        for artifact in &artifacts {
+            let endpoint = artifact
+                .plan()
+                .distributed_endpoint
+                .as_ref()
+                .ok_or_else(|| {
+                    format!(
+                        "{} artifact has no linked distributed endpoint",
+                        artifact.role().as_str()
+                    )
+                })?;
+            if endpoint.graph != graph_identity || endpoint.endpoint.role != artifact.role() {
+                return Err(format!(
+                    "{} artifact does not match the bundle distributed graph",
+                    artifact.role().as_str()
+                )
+                .into());
+            }
+            endpoint_contracts.push(endpoint.endpoint.clone());
+        }
+        boon_plan::DistributedGraphPlan::new(
+            artifacts[0].application(),
+            graph_identity,
+            endpoint_contracts,
+        )?;
         artifacts.sort_by_key(|artifact| program_role_rank(artifact.role()));
         Ok(Self { artifacts })
     }
@@ -825,15 +1065,16 @@ impl ProgramBundle {
             .find(|artifact| artifact.role() == role)
     }
 
-    pub fn start_paired(&self) -> crate::RuntimeResult<PairedProgramLifecycle> {
-        PairedProgramLifecycle::start(self)
+    pub fn start_distributed(&self) -> crate::RuntimeResult<DistributedProgramLifecycle> {
+        DistributedProgramLifecycle::start(self)
     }
 }
 
 fn program_role_rank(role: ProgramRole) -> u8 {
     match role {
-        ProgramRole::Document => 0,
-        ProgramRole::Server => 1,
+        ProgramRole::Client => 0,
+        ProgramRole::Session => 1,
+        ProgramRole::Server => 2,
     }
 }
 
@@ -854,7 +1095,7 @@ fn deterministic_program_session_id(artifact: &ProgramArtifact) -> ProgramSessio
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PairedProgramTurn {
+pub struct DistributedProgramTurn {
     pub lifecycle_sequence: u64,
     pub session: ProgramSessionId,
     pub role: ProgramRole,
@@ -864,25 +1105,36 @@ pub struct PairedProgramTurn {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct PairedDispatchOutcome {
-    pub turn: PairedProgramTurn,
+pub struct DistributedDispatchOutcome {
+    pub turn: DistributedProgramTurn,
+    pub runtime_turn: crate::RuntimeTurn,
+    pub propagated_turns: Vec<DistributedPropagationTurn>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DistributedPropagationTurn {
+    pub consumer_role: ProgramRole,
+    pub import_id: boon_plan::ImportId,
     pub runtime_turn: crate::RuntimeTurn,
 }
 
-pub struct PairedProgramLifecycle {
+pub struct DistributedProgramLifecycle {
     sessions: Vec<ProgramSession>,
+    graph: boon_plan::DistributedGraphPlan,
+    delivered_values: BTreeMap<boon_plan::ImportId, (u64, crate::Value)>,
     next_lifecycle_sequence: u64,
-    turn_log: Vec<PairedProgramTurn>,
+    turn_log: Vec<DistributedProgramTurn>,
 }
 
-impl PairedProgramLifecycle {
-    fn start(bundle: &ProgramBundle) -> crate::RuntimeResult<Self> {
-        if bundle.artifacts.len() != 2
-            || bundle.artifact(ProgramRole::Document).is_none()
+impl DistributedProgramLifecycle {
+    fn start(bundle: &DistributedProgramBundle) -> crate::RuntimeResult<Self> {
+        if bundle.artifacts.len() != 3
+            || bundle.artifact(ProgramRole::Client).is_none()
+            || bundle.artifact(ProgramRole::Session).is_none()
             || bundle.artifact(ProgramRole::Server).is_none()
         {
             return Err(
-                "paired lifecycle requires exactly one document and one server artifact".into(),
+                "distributed lifecycle requires client, session, and server artifacts".into(),
             );
         }
         let sessions = bundle
@@ -891,11 +1143,39 @@ impl PairedProgramLifecycle {
             .cloned()
             .map(ProgramSession::start)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        let graph_identity = bundle.artifacts[0]
+            .plan()
+            .distributed_endpoint
+            .as_ref()
+            .expect("bundle validation requires endpoint contracts")
+            .graph
+            .clone();
+        let graph = boon_plan::DistributedGraphPlan::new(
+            bundle.artifacts[0].application(),
+            graph_identity,
+            bundle
+                .artifacts
+                .iter()
+                .map(|artifact| {
+                    artifact
+                        .plan()
+                        .distributed_endpoint
+                        .as_ref()
+                        .expect("bundle validation requires endpoint contracts")
+                        .endpoint
+                        .clone()
+                })
+                .collect(),
+        )?;
+        let mut lifecycle = Self {
             sessions,
+            graph,
+            delivered_values: BTreeMap::new(),
             next_lifecycle_sequence: 1,
             turn_log: Vec::new(),
-        })
+        };
+        lifecycle.propagate_distributed_currentness()?;
+        Ok(lifecycle)
     }
 
     pub fn session_count(&self) -> usize {
@@ -910,8 +1190,12 @@ impl PairedProgramLifecycle {
         self.session(role).map(ProgramSession::id)
     }
 
-    pub fn turn_log(&self) -> &[PairedProgramTurn] {
+    pub fn turn_log(&self) -> &[DistributedProgramTurn] {
         &self.turn_log
+    }
+
+    pub fn frame(&self, role: ProgramRole) -> Option<&DocumentFrame> {
+        self.session(role).and_then(ProgramSession::frame)
     }
 
     pub fn dispatch(
@@ -920,15 +1204,15 @@ impl PairedProgramLifecycle {
         source_path: &str,
         target: Option<RowId>,
         payload: SourcePayload,
-    ) -> crate::RuntimeResult<PairedDispatchOutcome> {
+    ) -> crate::RuntimeResult<DistributedDispatchOutcome> {
         let lifecycle_sequence = self.next_lifecycle_sequence;
         let next_lifecycle_sequence = lifecycle_sequence
             .checked_add(1)
-            .ok_or("paired lifecycle sequence overflow")?;
+            .ok_or("distributed lifecycle sequence overflow")?;
         let session = self.session_mut(role)?;
         let session_id = session.id().clone();
         let dispatched = session.dispatch(source_path, target, payload)?;
-        let turn = PairedProgramTurn {
+        let turn = DistributedProgramTurn {
             lifecycle_sequence,
             session: session_id,
             role,
@@ -938,9 +1222,11 @@ impl PairedProgramLifecycle {
         };
         self.next_lifecycle_sequence = next_lifecycle_sequence;
         self.turn_log.push(turn.clone());
-        Ok(PairedDispatchOutcome {
+        let propagated_turns = self.propagate_distributed_currentness()?;
+        Ok(DistributedDispatchOutcome {
             turn,
             runtime_turn: dispatched.runtime_turn,
+            propagated_turns,
         })
     }
 
@@ -960,6 +1246,107 @@ impl PairedProgramLifecycle {
         self.session_mut(role)?.output_value_current(name)
     }
 
+    pub fn propagate_distributed_currentness(
+        &mut self,
+    ) -> crate::RuntimeResult<Vec<DistributedPropagationTurn>> {
+        let mut propagated = Vec::new();
+        for consumer_role in [ProgramRole::Session, ProgramRole::Client] {
+            let endpoint = self
+                .graph
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.role == consumer_role)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "distributed graph has no {} endpoint",
+                        consumer_role.as_str()
+                    )
+                })?;
+            for import in &endpoint.value_imports {
+                let value = self
+                    .session_mut(import.producer_role)?
+                    .distributed_export_value_current(import.source_export_id)?;
+                self.deliver_distributed_value(
+                    consumer_role,
+                    import.import_id,
+                    value,
+                    &mut propagated,
+                )?;
+            }
+
+            // Call-result imports may depend on earlier calls in the same
+            // endpoint. Re-evaluate a bounded number of times; graph validation
+            // has already rejected cycles.
+            for _ in 0..=endpoint.remote_call_sites.len() {
+                let mut changed = false;
+                for call in &endpoint.remote_call_sites {
+                    let arguments = self
+                        .session_mut(consumer_role)?
+                        .distributed_call_arguments_current(call.call_site_id)?;
+                    let value = self
+                        .session_mut(call.callee_role)?
+                        .evaluate_distributed_function(call.function_export_id, arguments)?;
+                    changed |= self.deliver_distributed_value(
+                        consumer_role,
+                        call.result_import_id,
+                        value,
+                        &mut propagated,
+                    )?;
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+        Ok(propagated)
+    }
+
+    fn deliver_distributed_value(
+        &mut self,
+        consumer_role: ProgramRole,
+        import_id: boon_plan::ImportId,
+        value: crate::Value,
+        propagated: &mut Vec<DistributedPropagationTurn>,
+    ) -> crate::RuntimeResult<bool> {
+        if self
+            .delivered_values
+            .get(&import_id)
+            .is_some_and(|(_, current)| current == &value)
+        {
+            return Ok(false);
+        }
+        let revision = self
+            .delivered_values
+            .get(&import_id)
+            .map(|(revision, _)| revision.saturating_add(1))
+            .unwrap_or(1);
+        if revision == u64::MAX
+            && self
+                .delivered_values
+                .get(&import_id)
+                .is_some_and(|(current, _)| *current == u64::MAX)
+        {
+            return Err(
+                format!("distributed import {import_id} content revision exhausted").into(),
+            );
+        }
+        let turn = self.session_mut(consumer_role)?.update_distributed_import(
+            import_id,
+            revision,
+            value.clone(),
+        )?;
+        self.delivered_values.insert(import_id, (revision, value));
+        if let Some(runtime_turn) = turn {
+            propagated.push(DistributedPropagationTurn {
+                consumer_role,
+                import_id,
+                runtime_turn,
+            });
+        }
+        Ok(true)
+    }
+
     fn session(&self, role: ProgramRole) -> Option<&ProgramSession> {
         self.sessions
             .iter()
@@ -970,7 +1357,7 @@ impl PairedProgramLifecycle {
         self.sessions
             .iter_mut()
             .find(|session| session.artifact().role() == role)
-            .ok_or_else(|| format!("paired lifecycle has no {} session", role.as_str()).into())
+            .ok_or_else(|| format!("distributed lifecycle has no {} role", role.as_str()).into())
     }
 }
 
@@ -1089,6 +1476,23 @@ fn validate_request_with_source_limits(
     max_source_units: usize,
     max_source_bytes: usize,
 ) -> Result<(), ProgramDiagnostic> {
+    let required_profile = match request.role {
+        ProgramRole::Client => ProgramCapabilityProfile::PublicClient,
+        ProgramRole::Session => ProgramCapabilityProfile::TrustedSession,
+        ProgramRole::Server => ProgramCapabilityProfile::TrustedServer,
+    };
+    if request.capability_profile != required_profile {
+        return Err(ProgramDiagnostic::new(
+            request.revision,
+            ProgramDiagnosticPhase::Request,
+            format!(
+                "{} programs require capability profile `{}`, found `{}`",
+                request.role.as_str(),
+                required_profile.name(),
+                request.capability_profile.name()
+            ),
+        ));
+    }
     if request.revision == 0 {
         return Err(ProgramDiagnostic::new(
             request.revision,
@@ -1190,7 +1594,8 @@ fn validate_plan(
         .count();
     let mut failures = Vec::new();
     let expected_role = match profile {
-        ProgramCapabilityProfile::PublicDocument => ProgramRole::Document,
+        ProgramCapabilityProfile::PublicClient => ProgramRole::Client,
+        ProgramCapabilityProfile::TrustedSession => ProgramRole::Session,
         ProgramCapabilityProfile::TrustedServer => ProgramRole::Server,
     };
     if plan.program_role != expected_role {
@@ -1231,7 +1636,7 @@ fn validate_plan(
         ));
     }
     match profile {
-        ProgramCapabilityProfile::PublicDocument => {
+        ProgramCapabilityProfile::PublicClient => {
             if document.is_none() {
                 failures.push("program has no retained document or scene output".to_owned());
             }
@@ -1270,11 +1675,12 @@ fn validate_plan(
                 ));
             }
         }
-        ProgramCapabilityProfile::TrustedServer => {
+        ProgramCapabilityProfile::TrustedSession | ProgramCapabilityProfile::TrustedServer => {
             if document.is_some() || retained_outputs != 0 {
-                failures.push(
-                    "trusted server program must not contain a retained visual output".to_owned(),
-                );
+                failures.push(format!(
+                    "{} program must not contain a retained visual output",
+                    profile.name()
+                ));
             }
             if plan.outputs.is_empty()
                 || plan
@@ -1282,9 +1688,14 @@ fn validate_plan(
                     .iter()
                     .any(|output| !matches!(output.contract, OutputContractKind::HostValue { .. }))
             {
+                failures.push(format!(
+                    "{} program requires one or more typed host-value outputs",
+                    profile.name()
+                ));
+            }
+            if profile == ProgramCapabilityProfile::TrustedSession && !plan.host_ports.is_empty() {
                 failures.push(
-                    "trusted server program requires one or more typed host-value outputs"
-                        .to_owned(),
+                    "trusted session programs cannot own process-level host ports".to_owned(),
                 );
             }
         }
@@ -1313,7 +1724,10 @@ fn validate_plan(
         plan.source_routes.len(),
         limits.max_source_routes,
     );
-    if profile == ProgramCapabilityProfile::TrustedServer {
+    if matches!(
+        profile,
+        ProgramCapabilityProfile::TrustedSession | ProgramCapabilityProfile::TrustedServer
+    ) {
         check_limit(
             &mut failures,
             "output roots",
@@ -1385,7 +1799,8 @@ fn validate_plan(
 
 fn title_case_role(role: ProgramRole) -> &'static str {
     match role {
-        ProgramRole::Document => "Document",
+        ProgramRole::Client => "Client",
+        ProgramRole::Session => "Session",
         ProgramRole::Server => "Server",
     }
 }
@@ -1820,6 +2235,7 @@ impl ProgramDocumentHost {
                         host: host.clone(),
                         compile: ProgramCompileRequest {
                             revision: request_descriptor.revision,
+                            role: request_descriptor.role,
                             entry_path: "RUN.bn".to_owned(),
                             units,
                             application: child_application(&self.parent_application, &session),
@@ -2505,6 +2921,7 @@ fn same_program_definition(
         && left.bootstrap_source_digest == right.bootstrap_source_digest
         && left.bootstrap_artifact_id == right.bootstrap_artifact_id
         && left.bootstrap_revision == right.bootstrap_revision
+        && left.role == right.role
         && left.capability_profile == right.capability_profile
 }
 
@@ -2517,6 +2934,7 @@ fn same_current_program_definition(
         && left.artifact_id == right.artifact_id
         && left.artifact_retention == right.artifact_retention
         && left.revision == right.revision
+        && left.role == right.role
         && left.capability_profile == right.capability_profile
 }
 
@@ -2662,16 +3080,17 @@ mod tests {
                 "test-child",
                 "runtime-test",
             ),
-            capability_profile: ProgramCapabilityProfile::PublicDocument,
+            role: boon_plan::ProgramRole::Client,
+            capability_profile: ProgramCapabilityProfile::PublicClient,
         }
     }
 
     fn server_request(revision: u64, source: &str) -> ProgramCompileRequest {
         ProgramCompileRequest {
             revision,
-            entry_path: "Server.bn".to_owned(),
+            entry_path: "RUN.bn".to_owned(),
             units: vec![RuntimeSourceUnit {
-                path: "Server.bn".to_owned(),
+                path: "RUN.bn".to_owned(),
                 source: source.to_owned(),
             }],
             application: ApplicationIdentity::new(
@@ -2679,7 +3098,26 @@ mod tests {
                 "test-server",
                 "runtime-test",
             ),
+            role: boon_plan::ProgramRole::Server,
             capability_profile: ProgramCapabilityProfile::TrustedServer,
+        }
+    }
+
+    fn session_request(revision: u64, source: &str) -> ProgramCompileRequest {
+        ProgramCompileRequest {
+            revision,
+            entry_path: "RUN.bn".to_owned(),
+            units: vec![RuntimeSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: source.to_owned(),
+            }],
+            application: ApplicationIdentity::new(
+                "dev.boon.test-child",
+                "test-session",
+                "runtime-test",
+            ),
+            role: boon_plan::ProgramRole::Session,
+            capability_profile: ProgramCapabilityProfile::TrustedSession,
         }
     }
 
@@ -2723,29 +3161,22 @@ outputs: [
         r#"
 store: [
     request: SOURCE
-    succeeded: SOURCE
-    failed: SOURCE
-]
-
-effects: [
-    fetch_resource: [
-        on: store.request
-        perform: Http/request(
-            endpoint: store.request.endpoint
-            method: store.request.method
-            path_segments: store.request.path_segments
-            query: store.request.query
-            headers: store.request.headers
-            body: store.request.body
-            connect_timeout_ms: store.request.connect_timeout_ms
-            overall_timeout_ms: store.request.overall_timeout_ms
-            cancellation: store.request.cancellation
-        )
-        results: [
-            HttpSucceeded: store.succeeded
-            HttpFailed: store.failed
-        ]
-    ]
+    response:
+        NotRequested |> HOLD response {
+            store.request |> THEN {
+                Http/request(
+                    endpoint: store.request.endpoint
+                    method: store.request.method
+                    path_segments: store.request.path_segments
+                    query: store.request.query
+                    headers: store.request.headers
+                    body: store.request.body
+                    connect_timeout_ms: store.request.connect_timeout_ms
+                    overall_timeout_ms: store.request.overall_timeout_ms
+                    cancellation: store.request.cancellation
+                )
+            }
+        }
 ]
 
 scene: Scene/Element/text(
@@ -2764,7 +3195,8 @@ scene: Scene/Element/text(
             source: source.to_owned(),
             source_digest: crate::sha256_bytes(source.as_bytes()),
             revision,
-            capability_profile: ProgramCapabilityProfile::PublicDocument,
+            role: boon_plan::ProgramRole::Client,
+            capability_profile: ProgramCapabilityProfile::PublicClient,
             session_key: String::new(),
             mount: true,
             ..EmbeddedProgramDescriptor::default()
@@ -2889,7 +3321,7 @@ document: Document/new(
             artifact.plan().target_profile,
             TargetProfile::SoftwareBounded
         );
-        let mut controller = ProgramController::new(ProgramCapabilityProfile::PublicDocument);
+        let mut controller = ProgramController::new(ProgramCapabilityProfile::PublicClient);
         controller.request(1).unwrap();
         assert_eq!(
             controller.complete(Ok(artifact)),
@@ -2915,7 +3347,7 @@ document: Document/new(
         let content = first.to_content_artifact();
         let restored = ProgramArtifact::from_content_artifact(
             7,
-            ProgramCapabilityProfile::PublicDocument,
+            ProgramCapabilityProfile::PublicClient,
             content.clone(),
         )
         .unwrap();
@@ -2927,7 +3359,7 @@ document: Document/new(
         corrupt.bytes[0] ^= 0xff;
         let diagnostic = ProgramArtifact::from_content_artifact(
             7,
-            ProgramCapabilityProfile::PublicDocument,
+            ProgramCapabilityProfile::PublicClient,
             corrupt,
         )
         .unwrap_err();
@@ -2942,7 +3374,7 @@ document: Document/new(
         let incompatible = ContentArtifact::new(PROGRAM_ARTIFACT_MEDIA_TYPE, bytes).unwrap();
         let diagnostic = ProgramArtifact::from_content_artifact(
             7,
-            ProgramCapabilityProfile::PublicDocument,
+            ProgramCapabilityProfile::PublicClient,
             incompatible,
         )
         .unwrap_err();
@@ -2961,7 +3393,7 @@ document: Document/new(
         let stale_digest = ContentArtifact::new(PROGRAM_ARTIFACT_MEDIA_TYPE, bytes).unwrap();
         let diagnostic = ProgramArtifact::from_content_artifact(
             7,
-            ProgramCapabilityProfile::PublicDocument,
+            ProgramCapabilityProfile::PublicClient,
             stale_digest,
         )
         .unwrap_err();
@@ -3006,7 +3438,7 @@ document: Document/new(
     }
 
     #[test]
-    fn public_document_may_emit_typed_read_only_effect_without_an_outbox() {
+    fn public_client_may_emit_typed_read_only_effect_without_an_outbox() {
         let artifact = compile_program_artifact(&request(1, outbound_document_source())).unwrap();
         let [effect] = artifact.plan().effects.as_slice() else {
             panic!("document plan must own one outbound HTTP effect contract");
@@ -3155,7 +3587,7 @@ document: Document/new(
 
         let mut stored: StoredProgramArtifact =
             ciborium::de::from_reader(content.bytes.as_slice()).unwrap();
-        stored.plan.program_role = ProgramRole::Document;
+        stored.plan.program_role = ProgramRole::Client;
         stored.plan_digest = boon_plan::plan_sha256(&stored.plan).unwrap();
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&stored, &mut bytes).unwrap();
@@ -3171,38 +3603,123 @@ document: Document/new(
     }
 
     #[test]
-    fn program_bundle_requires_distinct_namespaces_and_starts_deterministic_sessions() {
-        let document = compile_program_artifact(&request(1, &child_source("Paired"))).unwrap();
-        let server = compile_program_artifact(&server_request(1, server_source())).unwrap();
-        let bundle = ProgramBundle::new(vec![server.clone(), document.clone()]).unwrap();
-        assert_eq!(bundle.artifacts()[0].role(), ProgramRole::Document);
-        assert_eq!(bundle.artifacts()[1].role(), ProgramRole::Server);
+    fn distributed_program_requires_distinct_namespaces_and_starts_deterministic_sessions() {
+        let client_request = request(1, &child_source("Distributed"));
+        let session_request = session_request(1, server_source());
+        let server_request = server_request(1, server_source());
+        let bundle = compile_distributed_program_bundle(&[
+            server_request.clone(),
+            client_request.clone(),
+            session_request.clone(),
+        ])
+        .unwrap();
+        assert_eq!(bundle.artifacts()[0].role(), ProgramRole::Client);
+        assert_eq!(bundle.artifacts()[1].role(), ProgramRole::Session);
+        assert_eq!(bundle.artifacts()[2].role(), ProgramRole::Server);
 
-        let first = bundle.start_paired().unwrap();
-        let second = bundle.start_paired().unwrap();
+        let first = bundle.start_distributed().unwrap();
+        let second = bundle.start_distributed().unwrap();
         assert_eq!(
-            first.session_id(ProgramRole::Document),
-            second.session_id(ProgramRole::Document)
+            first.session_id(ProgramRole::Client),
+            second.session_id(ProgramRole::Client)
+        );
+        assert_eq!(
+            first.session_id(ProgramRole::Session),
+            second.session_id(ProgramRole::Session)
         );
         assert_eq!(
             first.session_id(ProgramRole::Server),
             second.session_id(ProgramRole::Server)
         );
         assert_ne!(
-            first.session_id(ProgramRole::Document),
+            first.session_id(ProgramRole::Client),
             first.session_id(ProgramRole::Server)
         );
 
-        let mut duplicate_namespace_request = server_request(2, server_source());
+        let mut duplicate_namespace_request = server_request;
+        duplicate_namespace_request.revision = 2;
         duplicate_namespace_request.application.state_namespace =
-            document.application().state_namespace.clone();
-        let duplicate_server = compile_program_artifact(&duplicate_namespace_request).unwrap();
-        let error = ProgramBundle::new(vec![document, duplicate_server]).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("repeats state namespace `test-child`")
+            client_request.application.state_namespace.clone();
+        let error = compile_distributed_program_bundle(&[
+            client_request,
+            session_request,
+            duplicate_namespace_request,
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("distinct state namespaces"));
+    }
+
+    #[test]
+    fn distributed_value_updates_patch_the_client_document_directly() {
+        let client = request(
+            1,
+            r#"
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: Session.outputs.adjusted_count
+    )
+)
+"#,
         );
+        let session = session_request(
+            1,
+            r#"
+store: [
+    adjusted_count: Server.store.count + 1
+]
+
+outputs: [
+    adjusted_count: store.adjusted_count
+]
+"#,
+        );
+        let server = server_request(
+            1,
+            r#"
+store: [
+    increment: SOURCE
+    count:
+        40 |> HOLD count {
+            LATEST {
+                increment |> THEN { count + 1 }
+            }
+        }
+]
+
+outputs: [
+    count: store.count
+]
+"#,
+        );
+        let bundle = compile_distributed_program_bundle(&[client, session, server]).unwrap();
+        let mut lifecycle = bundle.start_distributed().unwrap();
+        assert!(frame_has_text(
+            lifecycle.frame(ProgramRole::Client).unwrap(),
+            "41"
+        ));
+
+        let outcome = lifecycle
+            .dispatch(
+                ProgramRole::Server,
+                "store.increment",
+                None,
+                SourcePayload::default(),
+            )
+            .unwrap();
+        assert!(outcome.propagated_turns.iter().any(|turn| {
+            turn.consumer_role == ProgramRole::Client
+                && turn
+                    .runtime_turn
+                    .document_patches
+                    .iter()
+                    .any(|patch| matches!(patch, DocumentPatch::SetText { .. }))
+        }));
+        assert!(frame_has_text(
+            lifecycle.frame(ProgramRole::Client).unwrap(),
+            "42"
+        ));
     }
 
     #[test]
@@ -3215,7 +3732,8 @@ document: Document/new(
         program.embedded_program = Some(EmbeddedProgramDescriptor {
             artifact_id: artifact.id_text(),
             revision: 1,
-            capability_profile: ProgramCapabilityProfile::PublicDocument,
+            role: boon_plan::ProgramRole::Client,
+            capability_profile: ProgramCapabilityProfile::PublicClient,
             session_key: "stored-child".to_owned(),
             mount: true,
             ..EmbeddedProgramDescriptor::default()
@@ -3339,7 +3857,7 @@ FUNCTION render() {
 
     #[test]
     fn rejected_revision_preserves_the_last_valid_session() {
-        let mut controller = ProgramController::new(ProgramCapabilityProfile::PublicDocument);
+        let mut controller = ProgramController::new(ProgramCapabilityProfile::PublicClient);
         controller.request(1).unwrap();
         controller.complete(compile_program_artifact(&request(
             1,
@@ -3372,7 +3890,7 @@ FUNCTION render() {
     fn stale_completion_cannot_replace_a_newer_requested_revision() {
         let older = compile_program_artifact(&request(1, &child_source("Older"))).unwrap();
         let newer = compile_program_artifact(&request(2, &child_source("Newer"))).unwrap();
-        let mut controller = ProgramController::new(ProgramCapabilityProfile::PublicDocument);
+        let mut controller = ProgramController::new(ProgramCapabilityProfile::PublicClient);
         controller.request(1).unwrap();
         controller.request(2).unwrap();
         assert_eq!(
@@ -3391,7 +3909,7 @@ FUNCTION render() {
     }
 
     #[test]
-    fn public_document_profile_rejects_host_effects_and_oversized_source() {
+    fn public_client_profile_rejects_host_effects_and_oversized_source() {
         let effectful = compile_program_artifact(&request(
             1,
             r#"
@@ -3404,8 +3922,8 @@ scene: Scene/Element/text(element: [], style: [], text: contents)
         assert_eq!(effectful.phase, ProgramDiagnosticPhase::Capability);
         assert!(effectful.message.contains("forbids"));
 
-        let oversized = "x"
-            .repeat(program_limits(ProgramCapabilityProfile::PublicDocument).max_source_bytes + 1);
+        let oversized =
+            "x".repeat(program_limits(ProgramCapabilityProfile::PublicClient).max_source_bytes + 1);
         let diagnostic = compile_program_artifact(&request(2, &oversized)).unwrap_err();
         assert_eq!(diagnostic.phase, ProgramDiagnosticPhase::Request);
         assert!(diagnostic.message.contains("source bundle uses"));
@@ -3419,7 +3937,7 @@ scene: Scene/Element/program(
     style: [width: Fill, height: Fill]
     source: TEXT { child source }
     revision: 7
-    capability_profile: PublicDocument
+    capability_profile: PublicClient
 )
 "#;
         let runtime = LiveRuntime::from_source("embedded-program.bn", source).unwrap();
@@ -3435,7 +3953,7 @@ scene: Scene/Element/program(
         assert_eq!(descriptor.revision, 7);
         assert_eq!(
             descriptor.capability_profile,
-            ProgramCapabilityProfile::PublicDocument
+            ProgramCapabilityProfile::PublicClient
         );
         assert!(descriptor.session_key.is_empty());
         assert!(descriptor.mount);
@@ -3457,7 +3975,8 @@ scene: Scene/Element/program(
                 source: source.clone(),
                 source_digest: crate::sha256_bytes(source.as_bytes()),
                 revision: 1,
-                capability_profile: ProgramCapabilityProfile::PublicDocument,
+                role: boon_plan::ProgramRole::Client,
+                capability_profile: ProgramCapabilityProfile::PublicClient,
                 session_key: "public-page".to_owned(),
                 mount: true,
                 ..EmbeddedProgramDescriptor::default()

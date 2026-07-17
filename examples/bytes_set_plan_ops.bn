@@ -10,11 +10,11 @@ store: [
     patched:
         BYTES[4] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: 16uAA) }
+                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: BYTES[1] { 16uAA }) }
             }
         }
     patched_byte:
-        16u00 |> HOLD patched_byte {
+        BYTES[1] { 16u00 } |> HOLD patched_byte {
             LATEST {
                 store.inspect |> THEN { store.patched |> Bytes/get(index: 2) }
             }
@@ -22,7 +22,7 @@ store: [
     patched_len:
         0 |> HOLD patched_len {
             LATEST {
-                store.inspect |> THEN { store.patched |> Bytes/length }
+                store.inspect |> THEN { store.patched |> Bytes/length() }
             }
         }
     patched_joined:

@@ -22,6 +22,7 @@ fn program() -> ProgramSession {
             source: include_str!("../../../examples/host_service_effects.bn").to_owned(),
         }],
         application: ApplicationIdentity::new("dev.boon.host-services", "test", "local"),
+        role: boon_plan::ProgramRole::Server,
         capability_profile: ProgramCapabilityProfile::TrustedServer,
     })
     .unwrap();

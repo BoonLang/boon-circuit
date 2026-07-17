@@ -9,11 +9,11 @@ fn program_capability_profiles_have_stable_names_and_public_default() {
 
     assert_eq!(
         ProgramCapabilityProfile::default(),
-        ProgramCapabilityProfile::PublicDocument
+        ProgramCapabilityProfile::PublicClient
     );
     assert_eq!(
-        ProgramCapabilityProfile::PublicDocument.name(),
-        "public_document"
+        ProgramCapabilityProfile::PublicClient.name(),
+        "public_client"
     );
     assert_eq!(
         ProgramCapabilityProfile::TrustedServer.name(),

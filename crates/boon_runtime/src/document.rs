@@ -1,3 +1,4 @@
+use boon_data::{NumberTextFormat, format_number_text};
 use boon_document_model::{
     Axis, DocumentFrame, DocumentNode, DocumentNodeId as FrameNodeId, DocumentNodeKind,
     DocumentPatch, EmbeddedProgramDescriptor, EmbeddedProgramSourceUnit, MapCamera, MapCoordinate,
@@ -12,7 +13,7 @@ use boon_plan::{
     DocumentConstructor, DocumentExprId, DocumentExprOp, DocumentFunctionId,
     DocumentMaterialization, DocumentMaterializationId, DocumentMaterializationSource,
     DocumentNameId, DocumentPattern, DocumentRead, DocumentScalarOp, DocumentTemplateId, FieldId,
-    FiniteReal, ListId, MachinePlan, ScopeId, SourceId,
+    FiniteReal, ImportId, ListId, MachinePlan, ScopeId, SourceId,
 };
 use boon_plan_executor::{Delta, RowId, Session, Value, ValueTarget};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,13 +24,19 @@ use std::sync::Arc;
 const DEFAULT_VISIBLE_ITEMS: u64 = 16;
 const DEFAULT_OVERSCAN_ITEMS: u64 = 4;
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DocumentDependency {
+    Value(ValueTarget),
+    DistributedImport(ImportId),
+}
+
 type RetainedScalarEvaluation = (
     EvalValue,
-    BTreeSet<ValueTarget>,
+    BTreeSet<DocumentDependency>,
     BTreeMap<ValueTarget, BTreeSet<Value>>,
 );
 type ScalarDependentIndexes = (
-    BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
+    BTreeMap<DocumentDependency, BTreeSet<RetainedBindingKey>>,
     BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
     BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>>,
 );
@@ -76,14 +83,14 @@ pub(crate) struct DocumentRuntime {
     last_nonempty_windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand>,
     empty_source_windows: BTreeSet<DocumentMaterializationId>,
     frame: DocumentFrame,
-    dependencies: BTreeSet<ValueTarget>,
-    structural_dependencies: BTreeSet<ValueTarget>,
+    dependencies: BTreeSet<DocumentDependency>,
+    structural_dependencies: BTreeSet<DocumentDependency>,
     structural_lists: BTreeSet<ListId>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
-    scalar_dependents: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
+    scalar_dependents: BTreeMap<DocumentDependency, BTreeSet<RetainedBindingKey>>,
     scalar_guarded_dependents: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>>,
     scalar_guard_values: BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>>,
-    target_values: BTreeMap<ValueTarget, Value>,
+    target_values: BTreeMap<DocumentDependency, Value>,
     full_evaluation_count: u64,
     retained_scalar_evaluation_count: u64,
     stats: DocumentMaterializationStats,
@@ -96,7 +103,7 @@ enum DocumentRollbackKind {
     Scalar {
         retained_nodes: Vec<(FrameNodeId, RetainedNode)>,
         frame_nodes: Vec<(FrameNodeId, DocumentNode)>,
-        target_values: Vec<(ValueTarget, Option<Value>)>,
+        target_values: Vec<(DocumentDependency, Option<Value>)>,
         retained_scalar_evaluation_count: u64,
     },
     Rebuilt {
@@ -262,14 +269,17 @@ impl DocumentRuntime {
     pub(crate) fn demanded_targets(&self) -> Vec<ValueTarget> {
         self.dependencies
             .iter()
-            .map(|target| match *target {
-                ValueTarget::Field(field) => self
-                    .field_state_aliases
-                    .get(&field)
-                    .copied()
-                    .map(ValueTarget::State)
-                    .unwrap_or(*target),
-                _ => *target,
+            .filter_map(|dependency| match *dependency {
+                DocumentDependency::DistributedImport(_) => None,
+                DocumentDependency::Value(target) => Some(match target {
+                    ValueTarget::Field(field) => self
+                        .field_state_aliases
+                        .get(&field)
+                        .copied()
+                        .map(ValueTarget::State)
+                        .unwrap_or(target),
+                    _ => target,
+                }),
             })
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -460,11 +470,16 @@ impl DocumentRuntime {
 
     fn turn_affects_structure(&self, deltas: &[Delta]) -> bool {
         deltas.iter().any(|delta| match delta {
-            Delta::SetValue { target, .. } => self.structural_dependencies.contains(target),
+            Delta::SetValue { target, .. } => self
+                .structural_dependencies
+                .contains(&DocumentDependency::Value(*target)),
+            Delta::SetDistributedImport { import_id, .. } => self
+                .structural_dependencies
+                .contains(&DocumentDependency::DistributedImport(*import_id)),
             Delta::InsertRow { row } => {
                 self.structural_lists.contains(&row.id.list)
-                    || self.structural_dependencies.iter().any(|target| {
-                        matches!(target, ValueTarget::RowField { row: target_row, .. } if target_row == &row.id)
+                    || self.structural_dependencies.iter().any(|dependency| {
+                        matches!(dependency, DocumentDependency::Value(ValueTarget::RowField { row: target_row, .. }) if target_row == &row.id)
                     })
             }
             Delta::RemoveRow { row } => self.structural_lists.contains(&row.list),
@@ -508,19 +523,21 @@ impl DocumentRuntime {
             self.scalar_guarded_dependents,
             self.scalar_guard_values,
         ) = scalar_dependent_indexes(&self.retained_nodes);
-        self.dependencies = self.structural_dependencies.clone();
-        self.dependencies
-            .extend(self.scalar_dependents.keys().copied());
+        self.dependencies = self
+            .structural_dependencies
+            .iter()
+            .copied()
+            .chain(self.scalar_dependents.keys().copied())
+            .collect();
     }
 
-    fn capture_delta_values(&self, deltas: &[Delta]) -> Vec<(ValueTarget, Option<Value>)> {
+    fn capture_delta_values(&self, deltas: &[Delta]) -> Vec<(DocumentDependency, Option<Value>)> {
         deltas
             .iter()
-            .filter_map(|delta| match delta {
-                Delta::SetValue { target, .. } => {
-                    Some((*target, self.target_values.get(target).cloned()))
-                }
-                _ => None,
+            .filter_map(|delta| {
+                delta_dependency(delta).map(|(dependency, _)| {
+                    (dependency, self.target_values.get(&dependency).cloned())
+                })
             })
             .collect::<BTreeMap<_, _>>()
             .into_iter()
@@ -530,25 +547,29 @@ impl DocumentRuntime {
     fn affected_scalar_bindings(&self, deltas: &[Delta]) -> BTreeSet<RetainedBindingKey> {
         let mut affected = BTreeSet::new();
         for delta in deltas {
-            let Delta::SetValue { target, value } = delta else {
+            let Some((dependency, value)) = delta_dependency(delta) else {
                 continue;
             };
-            let Some(dependents) = self.scalar_dependents.get(target) else {
+            let Some(dependents) = self.scalar_dependents.get(&dependency) else {
                 continue;
             };
-            let Some(guarded) = self.scalar_guarded_dependents.get(target) else {
+            let DocumentDependency::Value(target) = dependency else {
                 affected.extend(dependents.iter().cloned());
                 continue;
             };
-            let Some(previous) = self.target_values.get(target) else {
+            let Some(guarded) = self.scalar_guarded_dependents.get(&target) else {
+                affected.extend(dependents.iter().cloned());
+                continue;
+            };
+            let Some(previous) = self.target_values.get(&dependency) else {
                 affected.extend(dependents.iter().cloned());
                 continue;
             };
             affected.extend(dependents.difference(guarded).cloned());
-            if let Some(matches) = self.scalar_guard_values.get(&(*target, previous.clone())) {
+            if let Some(matches) = self.scalar_guard_values.get(&(target, previous.clone())) {
                 affected.extend(matches.iter().cloned());
             }
-            if let Some(matches) = self.scalar_guard_values.get(&(*target, value.clone())) {
+            if let Some(matches) = self.scalar_guard_values.get(&(target, value.clone())) {
                 affected.extend(matches.iter().cloned());
             }
         }
@@ -557,8 +578,8 @@ impl DocumentRuntime {
 
     fn record_delta_values(&mut self, deltas: &[Delta]) {
         for delta in deltas {
-            if let Delta::SetValue { target, value } = delta {
-                self.target_values.insert(*target, value.clone());
+            if let Some((dependency, value)) = delta_dependency(delta) {
+                self.target_values.insert(dependency, value.clone());
             }
         }
     }
@@ -732,8 +753,8 @@ impl DocumentRuntime {
     fn replace_scalar_dependencies(
         &mut self,
         key: &RetainedBindingKey,
-        previous: &BTreeSet<ValueTarget>,
-        next: &BTreeSet<ValueTarget>,
+        previous: &BTreeSet<DocumentDependency>,
+        next: &BTreeSet<DocumentDependency>,
         previous_guards: &BTreeMap<ValueTarget, BTreeSet<Value>>,
         next_guards: &BTreeMap<ValueTarget, BTreeSet<Value>>,
     ) {
@@ -864,12 +885,25 @@ impl DocumentRuntime {
 
 struct EvaluatedDocument {
     frame: DocumentFrame,
-    dependencies: BTreeSet<ValueTarget>,
-    structural_dependencies: BTreeSet<ValueTarget>,
+    dependencies: BTreeSet<DocumentDependency>,
+    structural_dependencies: BTreeSet<DocumentDependency>,
     structural_lists: BTreeSet<ListId>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
-    target_values: BTreeMap<ValueTarget, Value>,
+    target_values: BTreeMap<DocumentDependency, Value>,
     stats: DocumentMaterializationStats,
+}
+
+fn delta_dependency(delta: &Delta) -> Option<(DocumentDependency, &Value)> {
+    match delta {
+        Delta::SetValue { target, value } => Some((DocumentDependency::Value(*target), value)),
+        Delta::SetDistributedImport { import_id, value } => {
+            Some((DocumentDependency::DistributedImport(*import_id), value))
+        }
+        Delta::InsertRow { .. }
+        | Delta::RemoveRow { .. }
+        | Delta::BindSource { .. }
+        | Delta::UnbindSource { .. } => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -906,7 +940,6 @@ struct EvalEnv {
     active_row: Option<RowId>,
     parent: Option<FrameNodeId>,
     instance: Arc<Vec<String>>,
-    source_context: Option<EvalValue>,
 }
 
 #[derive(Clone, Debug)]
@@ -929,7 +962,7 @@ struct RetainedArgument {
 struct RetainedScalarBinding {
     expression: DocumentExprId,
     environment: EvalEnv,
-    dependencies: BTreeSet<ValueTarget>,
+    dependencies: BTreeSet<DocumentDependency>,
     guards: BTreeMap<ValueTarget, BTreeSet<Value>>,
 }
 
@@ -969,11 +1002,11 @@ struct Evaluator<'a> {
     runtime: &'a DocumentRuntime,
     session: &'a mut Session,
     frame: DocumentFrame,
-    projection_cache: BTreeMap<ValueTarget, Value>,
+    projection_cache: BTreeMap<DocumentDependency, Value>,
     static_value_cache: BTreeMap<DocumentExprId, EvalValue>,
-    dependencies: BTreeSet<ValueTarget>,
-    structural_dependencies: BTreeSet<ValueTarget>,
-    dependency_capture: Option<BTreeSet<ValueTarget>>,
+    dependencies: BTreeSet<DocumentDependency>,
+    structural_dependencies: BTreeSet<DocumentDependency>,
+    dependency_capture: Option<BTreeSet<DocumentDependency>>,
     structural_lists: BTreeSet<ListId>,
     retained_nodes: BTreeMap<FrameNodeId, RetainedNode>,
     materialized_rows: BTreeSet<RowId>,
@@ -1240,13 +1273,6 @@ impl<'a> Evaluator<'a> {
                     Ok(EvalValue::Null)
                 }
             }
-            DocumentExprOp::BindSource { input, source } => {
-                let source = self.eval(*source, env)?;
-                let previous = env.source_context.replace(source);
-                let result = self.eval(*input, env);
-                env.source_context = previous;
-                result
-            }
             DocumentExprOp::Constructor {
                 template,
                 constructor,
@@ -1256,9 +1282,6 @@ impl<'a> Evaluator<'a> {
                 self.materialize(*materialization, env)
             }
             DocumentExprOp::NoElement => Ok(EvalValue::Nodes(Vec::new())),
-            DocumentExprOp::SourceContext => {
-                Ok(env.source_context.clone().unwrap_or(EvalValue::Null))
-            }
         }
     }
 
@@ -1275,7 +1298,6 @@ impl<'a> Evaluator<'a> {
             DocumentConstantValue::Number { coefficient, scale } => {
                 EvalValue::Number(*coefficient as f64 / 10f64.powi(*scale as i32))
             }
-            DocumentConstantValue::Byte { value } => EvalValue::Number(f64::from(*value)),
             DocumentConstantValue::Bool { value } => EvalValue::Bool(*value),
             DocumentConstantValue::Bytes { value } => EvalValue::Bytes(value.clone()),
             DocumentConstantValue::Enum { name } => EvalValue::Enum(self.name(*name)?.to_owned()),
@@ -1314,6 +1336,7 @@ impl<'a> Evaluator<'a> {
                         .unwrap_or(Err(error)),
                 }
             }
+            DocumentRead::DistributedImport { import } => self.read_distributed_import(import),
             DocumentRead::List { list } => {
                 self.structural_lists.insert(list);
                 let rows = self
@@ -1402,8 +1425,9 @@ impl<'a> Evaluator<'a> {
     }
 
     fn read_target(&mut self, target: ValueTarget) -> Result<EvalValue, DocumentError> {
-        if let Some(value) = self.projection_cache.get(&target).cloned() {
-            self.record_dependency(target);
+        let dependency = DocumentDependency::Value(target);
+        if let Some(value) = self.projection_cache.get(&dependency).cloned() {
+            self.record_dependency(dependency);
             return Ok(self.value(value));
         }
         let mut projected = self
@@ -1413,17 +1437,32 @@ impl<'a> Evaluator<'a> {
         let value = projected.remove(&target).ok_or_else(|| {
             DocumentError::Evaluation(format!("value target {target:?} is not current"))
         })?;
-        self.record_dependency(target);
-        self.projection_cache.insert(target, value.clone());
+        self.record_dependency(dependency);
+        self.projection_cache.insert(dependency, value.clone());
         Ok(self.value(value))
     }
 
-    fn record_dependency(&mut self, target: ValueTarget) {
-        self.dependencies.insert(target);
+    fn read_distributed_import(&mut self, import: ImportId) -> Result<EvalValue, DocumentError> {
+        let dependency = DocumentDependency::DistributedImport(import);
+        if let Some(value) = self.projection_cache.get(&dependency).cloned() {
+            self.record_dependency(dependency);
+            return Ok(self.value(value));
+        }
+        let value = self
+            .session
+            .distributed_import_value_current(import)
+            .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
+        self.record_dependency(dependency);
+        self.projection_cache.insert(dependency, value.clone());
+        Ok(self.value(value))
+    }
+
+    fn record_dependency(&mut self, dependency: DocumentDependency) {
+        self.dependencies.insert(dependency);
         if let Some(capture) = self.dependency_capture.as_mut() {
-            capture.insert(target);
+            capture.insert(dependency);
         } else {
-            self.structural_dependencies.insert(target);
+            self.structural_dependencies.insert(dependency);
         }
     }
 
@@ -1449,10 +1488,13 @@ impl<'a> Evaluator<'a> {
         &mut self,
         expression: DocumentExprId,
         env: &EvalEnv,
-        dependencies: &BTreeSet<ValueTarget>,
+        dependencies: &BTreeSet<DocumentDependency>,
     ) -> Result<BTreeMap<ValueTarget, BTreeSet<Value>>, DocumentError> {
         let mut guards = BTreeMap::new();
-        for target in dependencies {
+        for dependency in dependencies {
+            let DocumentDependency::Value(target) = dependency else {
+                continue;
+            };
             if let ScalarTargetUse::Guarded(values) =
                 self.scalar_target_use(expression, env, *target, 0)?
                 && !values.is_empty()
@@ -1483,9 +1525,9 @@ impl<'a> Evaluator<'a> {
             .clone();
         let next = depth + 1;
         match op.as_ref() {
-            DocumentExprOp::Constant { .. }
-            | DocumentExprOp::NoElement
-            | DocumentExprOp::SourceContext => Ok(ScalarTargetUse::Independent),
+            DocumentExprOp::Constant { .. } | DocumentExprOp::NoElement => {
+                Ok(ScalarTargetUse::Independent)
+            }
             DocumentExprOp::Read { read } => {
                 if self.direct_read_target(read, env) == Some(target)
                     || (matches!(read, DocumentRead::Passed { .. })
@@ -1586,9 +1628,6 @@ impl<'a> Evaluator<'a> {
                 expressions.extend(*output);
                 self.merge_scalar_target_uses(&expressions, env, target, next)
             }
-            DocumentExprOp::BindSource { input, source } => {
-                self.merge_scalar_target_uses(&[*input, *source], env, target, next)
-            }
             DocumentExprOp::Constructor { .. } | DocumentExprOp::Materialize { .. } => {
                 Ok(ScalarTargetUse::Unguarded)
             }
@@ -1656,6 +1695,7 @@ impl<'a> Evaluator<'a> {
                 .copied()
                 .map(|row| ValueTarget::RowField { row, field: *field }),
             DocumentRead::List { .. }
+            | DocumentRead::DistributedImport { .. }
             | DocumentRead::Source { .. }
             | DocumentRead::Parameter { .. }
             | DocumentRead::Local { .. }
@@ -1685,9 +1725,7 @@ impl<'a> Evaluator<'a> {
                 .all(|child| self.guard_key_expression(*child, env, next))
         };
         match op.as_ref() {
-            DocumentExprOp::Constant { .. }
-            | DocumentExprOp::SourceContext
-            | DocumentExprOp::NoElement => true,
+            DocumentExprOp::Constant { .. } | DocumentExprOp::NoElement => true,
             DocumentExprOp::Read { read } => match read {
                 DocumentRead::Parameter { .. }
                 | DocumentRead::Local { .. }
@@ -1698,6 +1736,7 @@ impl<'a> Evaluator<'a> {
                 }
                 DocumentRead::State { .. }
                 | DocumentRead::Field { .. }
+                | DocumentRead::DistributedImport { .. }
                 | DocumentRead::List { .. }
                 | DocumentRead::Source { .. }
                 | DocumentRead::Row { .. } => false,
@@ -1750,10 +1789,6 @@ impl<'a> Evaluator<'a> {
                     && output
                         .iter()
                         .all(|output| self.guard_key_expression(*output, env, next))
-            }
-            DocumentExprOp::BindSource { input, source } => {
-                self.guard_key_expression(*input, env, next)
-                    && self.guard_key_expression(*source, env, next)
             }
             DocumentExprOp::FunctionCall { .. }
             | DocumentExprOp::Constructor { .. }
@@ -3002,8 +3037,35 @@ fn eval_builtin(
         ),
         DocumentBuiltin::NumberProjectOffset
         | DocumentBuiltin::NumberProjectTime
-        | DocumentBuiltin::NumberProjectWidth
-        | DocumentBuiltin::NumberToText => EvalValue::Text(first.text()),
+        | DocumentBuiltin::NumberProjectWidth => EvalValue::Text(first.text()),
+        DocumentBuiltin::NumberToText => {
+            let integer_argument = |name: &str| {
+                named_number(&arguments, name).and_then(|value| {
+                    FiniteReal::new(value)
+                        .ok()
+                        .and_then(|value| value.to_i64_exact().ok())
+                })
+            };
+            let format = NumberTextFormat {
+                radix: integer_argument("radix")
+                    .map(|value| u32::try_from(value).unwrap_or_default())
+                    .unwrap_or(10),
+                min_width: integer_argument("min_width")
+                    .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
+                    .unwrap_or_default(),
+                signed_width: integer_argument("signed_width")
+                    .map(|value| u32::try_from(value).unwrap_or_default()),
+                group_size: integer_argument("group_size")
+                    .map(|value| usize::try_from(value).unwrap_or_default()),
+                prefix: named_value(&arguments, "prefix").is_some_and(EvalValue::truthy),
+            };
+            first
+                .number()
+                .and_then(|value| FiniteReal::new(value).ok())
+                .and_then(|value| format_number_text(value, format).ok())
+                .map(EvalValue::Text)
+                .unwrap_or(EvalValue::Null)
+        }
         DocumentBuiltin::NumberRound => EvalValue::Number(first.number().unwrap_or(0.0).round()),
         DocumentBuiltin::NumberTruncate => EvalValue::Number(first.number().unwrap_or(0.0).trunc()),
         DocumentBuiltin::TextAllCharsIn => {
@@ -3210,10 +3272,8 @@ fn apply_value_argument(node: &mut DocumentNode, name: &str, value: EvalValue) {
             }
             "capability_profile" => {
                 program.capability_profile = match value.text().as_str() {
-                    "PublicDocument" | "public_document" => {
-                        ProgramCapabilityProfile::PublicDocument
-                    }
-                    _ => ProgramCapabilityProfile::PublicDocument,
+                    "PublicClient" | "public_client" => ProgramCapabilityProfile::PublicClient,
+                    _ => ProgramCapabilityProfile::PublicClient,
                 };
             }
             "session_key" => {
@@ -4270,7 +4330,7 @@ fn format_record(tag: Option<&str>, fields: &BTreeMap<String, EvalValue>) -> Str
 }
 
 fn scalar_dependent_indexes(nodes: &BTreeMap<FrameNodeId, RetainedNode>) -> ScalarDependentIndexes {
-    let mut index: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>> = BTreeMap::new();
+    let mut index: BTreeMap<DocumentDependency, BTreeSet<RetainedBindingKey>> = BTreeMap::new();
     let mut guarded: BTreeMap<ValueTarget, BTreeSet<RetainedBindingKey>> = BTreeMap::new();
     let mut guard_values: BTreeMap<(ValueTarget, Value), BTreeSet<RetainedBindingKey>> =
         BTreeMap::new();

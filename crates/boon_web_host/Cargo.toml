@@ -9,12 +9,17 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+boon_app_package.workspace = true
 boon_document.workspace = true
 boon_host.workspace = true
 boon_native_gpu.workspace = true
+boon_runtime.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
 wgpu.workspace = true
+
+[dev-dependencies]
+boon_plan.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 idb = { version = "0.6.5", default-features = false, features = ["builder"] }
@@ -78,9 +83,6 @@ web-sys = { version = "0.3.98", features = [
     "WheelEvent",
     "Window",
 ] }
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

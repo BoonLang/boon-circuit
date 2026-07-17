@@ -1,8 +1,0 @@
-FUNCTION title() {
-    TEXT { Paired notes }
-}
-
-FUNCTION response_text() {
-    TEXT { paired-server-ok }
-}
-

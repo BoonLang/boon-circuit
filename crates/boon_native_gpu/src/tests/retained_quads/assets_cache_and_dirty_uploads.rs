@@ -582,7 +582,7 @@ fn renderer_reuses_prepared_quad_cache_across_alternating_scene_identities() {
                 encoder: &mut first_a_encoder,
                 view: &view,
                 scene: &scene_a,
-                scene_identity: Some("scene-a"),
+                scene_identity: Some("scene-a-revision-3"),
                 format,
                 width: 96,
                 height: 64,
@@ -628,6 +628,7 @@ fn renderer_reuses_prepared_quad_cache_across_alternating_scene_identities() {
 
         assert!(!first_a.quad_cache_hit);
         assert!(!first_b.quad_cache_hit);
+        assert!(second_a.document_scene_cache_hit);
         assert!(second_a.quad_cache_hit);
         assert_eq!(second_a.queue_write_count, 0);
         assert_eq!(second_a.upload_bytes, 0);

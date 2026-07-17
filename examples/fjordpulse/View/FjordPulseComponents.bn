@@ -44,12 +44,9 @@ FUNCTION divider() {
     )
 }
 
-FUNCTION button(label, selected, width) {
+FUNCTION button(events, label, selected, width) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: events]
         style: [
             ...FjordPulseTheme/control(selected: selected, hovered: element.hovered)
             width: width
@@ -72,12 +69,9 @@ FUNCTION button(label, selected, width) {
     )
 }
 
-FUNCTION icon_button(label, selected) {
+FUNCTION icon_button(events, label, selected) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: events]
         style: [
             ...FjordPulseTheme/control(selected: selected, hovered: element.hovered)
             width: 46
@@ -302,13 +296,13 @@ FUNCTION metric(label, value, status) {
     )
 }
 
-FUNCTION search_result(title, detail, kind) {
-    search_option(title: title, detail: detail, kind: kind, selected: False)
+FUNCTION search_result(events, title, detail, kind) {
+    search_option(events: events, title: title, detail: detail, kind: kind, selected: False)
 }
 
-FUNCTION search_option(title, detail, kind, selected) {
+FUNCTION search_option(events, title, detail, kind, selected) {
     Scene/Element/button(
-        element: [event: [press: SOURCE], hovered: SOURCE]
+        element: [events: events]
         style: [
             width: Fill
             height: 62

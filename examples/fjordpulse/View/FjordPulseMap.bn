@@ -1,7 +1,6 @@
 FUNCTION viewport() {
     Scene/Element/map(
         element: [
-            event: [press: SOURCE]
             accessibility_label: FjordPulseModel/locale_text(
                 language: PASSED.store.language
                 norwegian: TEXT { Interaktivt kollektivkart }
@@ -64,18 +63,12 @@ FUNCTION viewport() {
             road(top: 78, left: 36, width: 560, rotation: -4)
             road(top: 228, left: 110, width: 510, rotation: 7)
             road(top: 350, left: 18, width: 620, rotation: -2)
-            marker(station: Forde, top: 252, left: 244)
-                |> SOURCE { PASSED.store.elements.station.forde }
-            marker(station: FordeFerry, top: 300, left: 194)
-                |> SOURCE { PASSED.store.elements.station.forde_ferry }
-            marker(station: OsloS, top: 166, left: 286)
-                |> SOURCE { PASSED.store.elements.station.oslo }
-            marker(station: Bergen, top: 292, left: 128)
-                |> SOURCE { PASSED.store.elements.station.bergen }
-            marker(station: Trondheim, top: 86, left: 462)
-                |> SOURCE { PASSED.store.elements.station.trondheim }
-            marker(station: Bodo, top: 376, left: 520)
-                |> SOURCE { PASSED.store.elements.station.bodo }
+            marker(station: Forde, top: 252, left: 244, events: PASSED.store.elements.station.forde.events)
+            marker(station: FordeFerry, top: 300, left: 194, events: PASSED.store.elements.station.forde_ferry.events)
+            marker(station: OsloS, top: 166, left: 286, events: PASSED.store.elements.station.oslo.events)
+            marker(station: Bergen, top: 292, left: 128, events: PASSED.store.elements.station.bergen.events)
+            marker(station: Trondheim, top: 86, left: 462, events: PASSED.store.elements.station.trondheim.events)
+            marker(station: Bodo, top: 376, left: 520, events: PASSED.store.elements.station.bodo.events)
             selected_vehicle_marker()
             map_controls()
             attribution()
@@ -123,12 +116,12 @@ FUNCTION road(top, left, width, rotation) {
     )
 }
 
-FUNCTION marker(station, top, left) {
+FUNCTION marker(events, station, top, left) {
     Scene/Element/block(
         element: []
         style: [width: Fill, height: Fill, padding: [top: top, left: left], paint: False]
         child: Scene/Element/button(
-            element: [event: [press: SOURCE], hovered: SOURCE]
+            element: [events: events]
             style: [
                 width: 132
                 height: 42
@@ -192,12 +185,9 @@ FUNCTION map_controls() {
             gap: 4
             style: [width: 46, paint: False]
             items: LIST {
-                FjordPulseComponents/icon_button(label: TEXT { + }, selected: False)
-                    |> SOURCE { PASSED.store.elements.map.zoom_in }
-                FjordPulseComponents/icon_button(label: TEXT { − }, selected: False)
-                    |> SOURCE { PASSED.store.elements.map.zoom_out }
-                FjordPulseComponents/icon_button(label: TEXT { ◎ }, selected: PASSED.store.map_locating)
-                    |> SOURCE { PASSED.store.elements.map.locate }
+                FjordPulseComponents/icon_button(label: TEXT { + }, selected: False, events: PASSED.store.elements.map.zoom_in.events)
+                FjordPulseComponents/icon_button(label: TEXT { − }, selected: False, events: PASSED.store.elements.map.zoom_out.events)
+                FjordPulseComponents/icon_button(label: TEXT { ◎ }, selected: PASSED.store.map_locating, events: PASSED.store.elements.map.locate.events)
             }
         )
     )
@@ -265,7 +255,8 @@ FUNCTION map_state_card(status, title, message, retry) {
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv kartet igjen }, english: TEXT { Retry map })
                         selected: False
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.map.retry }
+                        events: PASSED.store.elements.map.retry.events
+                    )
                     False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
                 }
             }

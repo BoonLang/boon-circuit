@@ -9,13 +9,13 @@ store: [
     empty_is_empty:
         False |> HOLD empty_is_empty {
             LATEST {
-                store.measure |> THEN { empty_payload |> Bytes/is_empty }
+                store.measure |> THEN { empty_payload |> Bytes/is_empty() }
             }
         }
     filled_is_empty:
         True |> HOLD filled_is_empty {
             LATEST {
-                store.measure |> THEN { filled_payload |> Bytes/is_empty }
+                store.measure |> THEN { filled_payload |> Bytes/is_empty() }
             }
         }
 ]

@@ -12,7 +12,7 @@ expect_root_text = { "store.map_state" = "Error", "store.route" = "PublicMap" }
 
 [[step]]
 id = "map-retry"
-expected_source_event = { source = "store.elements.map.retry", target_text = "Prøv kartet igjen" }
+expected_source_event = { source = "store.elements.map.retry.press", target_text = "Prøv kartet igjen" }
 expect_root_text = { "store.map_state" = "Retrying", "store.map_retry_count" = "1" }
 
 [[step]]
@@ -22,7 +22,7 @@ expect_root_text = { "store.map_state" = "Ready" }
 
 [[step]]
 id = "search-error"
-expected_source_event = { source = "store.elements.navigation.search", target_text = "Søk" }
+expected_source_event = { source = "store.elements.navigation.search.press", target_text = "Søk" }
 expect_root_text = { "store.search_state" = "Ready" }
 
 [[step]]
@@ -32,7 +32,7 @@ expect_root_text = { "store.search_state" = "Error", "store.route" = "PublicMap"
 
 [[step]]
 id = "search-retry"
-expected_source_event = { source = "store.elements.search_retry", target_text = "Prøv igjen" }
+expected_source_event = { source = "store.elements.search_retry.press", target_text = "Prøv igjen" }
 expect_root_text = { "store.search_state" = "Retrying", "store.search_retry_count" = "1" }
 
 [[step]]
@@ -42,7 +42,7 @@ expect_root_text = { "store.search_state" = "Empty" }
 
 [[step]]
 id = "select-station"
-expected_source_event = { source = "store.elements.station.forde", target_text = "Førde rutebilstasjon" }
+expected_source_event = { source = "store.elements.station.forde.press", target_text = "Førde rutebilstasjon" }
 expect_root_text = { "store.route" = "PublicStation", "store.station_state" = "Loading", "store.departures_state" = "Loading", "store.station_vehicles_state" = "Loading" }
 
 [[step]]
@@ -52,7 +52,7 @@ expect_root_text = { "store.station_state" = "Error", "store.departures_state" =
 
 [[step]]
 id = "station-retry"
-expected_source_event = { source = "store.elements.station.retry", target_text = "Prøv igjen" }
+expected_source_event = { source = "store.elements.station.retry.press", target_text = "Prøv igjen" }
 expect_root_text = { "store.station_state" = "Retrying", "store.station_retry_count" = "1" }
 
 [[step]]
@@ -72,7 +72,7 @@ expect_root_text = { "store.station_vehicles_state" = "Error", "store.departures
 
 [[step]]
 id = "admin-error"
-expected_source_event = { source = "store.elements.navigation.admin", target_text = "Admin" }
+expected_source_event = { source = "store.elements.navigation.admin.press", target_text = "Admin" }
 expect_root_text = { "store.route" = "AdminStatus" }
 
 [[step]]
@@ -82,7 +82,7 @@ expect_root_text = { "store.admin_resource_state" = "Error" }
 
 [[step]]
 id = "admin-retry"
-expected_source_event = { source = "store.elements.admin.retry", target_text = "Prøv igjen" }
+expected_source_event = { source = "store.elements.admin.retry.press", target_text = "Prøv igjen" }
 expect_root_text = { "store.admin_resource_state" = "Retrying", "store.admin_retry_count" = "1" }
 
 [[step]]

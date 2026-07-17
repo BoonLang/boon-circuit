@@ -1,4 +1,4 @@
-use crate::{FieldId, ListId, MachinePlan, ScopeId, SourceId, StateId};
+use crate::{FieldId, ImportId, ListId, MachinePlan, ScopeId, SourceId, StateId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -169,10 +169,6 @@ pub enum DocumentExprOp {
         input: DocumentExprId,
         output: Option<DocumentExprId>,
     },
-    BindSource {
-        input: DocumentExprId,
-        source: DocumentExprId,
-    },
     Constructor {
         template: DocumentTemplateId,
         constructor: DocumentConstructor,
@@ -182,7 +178,6 @@ pub enum DocumentExprOp {
         materialization: DocumentMaterializationId,
     },
     NoElement,
-    SourceContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -193,6 +188,9 @@ pub enum DocumentRead {
     },
     Field {
         field: FieldId,
+    },
+    DistributedImport {
+        import: ImportId,
     },
     List {
         list: ListId,
@@ -236,7 +234,6 @@ pub struct DocumentConstant {
 pub enum DocumentConstantValue {
     Text { value: String },
     Number { coefficient: i64, scale: u32 },
-    Byte { value: u8 },
     Bool { value: bool },
     Bytes { value: Vec<u8> },
     Enum { name: DocumentNameId },
@@ -595,7 +592,7 @@ impl DocumentPlan {
         }
     }
 
-    pub(crate) fn verify(&self, _machine: &MachinePlan) -> Result<(), String> {
+    pub(crate) fn verify(&self, machine: &MachinePlan) -> Result<(), String> {
         if self.unresolved_op_count != 0 {
             return Err(format!(
                 "{} unresolved document operation(s)",
@@ -650,6 +647,25 @@ impl DocumentPlan {
         }
         let expression_count = self.expressions.len();
         let constant_count = self.constants.len();
+        let distributed_imports = machine
+            .distributed_endpoint
+            .as_ref()
+            .map(|distributed| {
+                distributed
+                    .endpoint
+                    .value_imports
+                    .iter()
+                    .map(|import| import.import_id)
+                    .chain(
+                        distributed
+                            .endpoint
+                            .remote_call_sites
+                            .iter()
+                            .map(|call| call.result_import_id),
+                    )
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         for expression in &self.expressions {
             if matches!(
                 &expression.op,
@@ -687,6 +703,16 @@ impl DocumentPlan {
                 return Err(format!(
                     "document expression {} references missing function {}",
                     expression.id.0, function.0
+                ));
+            }
+            if let DocumentExprOp::Read {
+                read: DocumentRead::DistributedImport { import },
+            } = &expression.op
+                && !distributed_imports.contains(import)
+            {
+                return Err(format!(
+                    "document expression {} references missing distributed import {:?}",
+                    expression.id.0, import
                 ));
             }
             if let DocumentExprOp::Constructor { template, .. } = &expression.op
@@ -823,9 +849,7 @@ pub fn verify_map_viewport_constructor_contract(
 impl DocumentExprOp {
     fn expression_refs(&self) -> Vec<DocumentExprId> {
         match self {
-            Self::Constant { .. } | Self::Read { .. } | Self::NoElement | Self::SourceContext => {
-                Vec::new()
-            }
+            Self::Constant { .. } | Self::Read { .. } | Self::NoElement => Vec::new(),
             Self::Project { input, .. } => vec![*input],
             Self::Record { fields } | Self::TaggedRecord { fields, .. } => {
                 fields.iter().map(|field| field.value).collect()
@@ -867,7 +891,6 @@ impl DocumentExprOp {
             Self::Then { input, output } => std::iter::once(*input)
                 .chain(output.iter().copied())
                 .collect(),
-            Self::BindSource { input, source } => vec![*input, *source],
             Self::Constructor { arguments, .. } => {
                 arguments.iter().map(|argument| argument.value).collect()
             }

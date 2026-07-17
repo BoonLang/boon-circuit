@@ -396,7 +396,7 @@ FUNCTION todo_list() {
 
 FUNCTION todo_row(todo) {
     Element/stripe(
-        element: [hovered: True]
+        element: []
         direction: Row
         gap: 11
         style: [
@@ -540,7 +540,7 @@ FUNCTION todo_footer() {
                 child: Text/empty()
             )
             Element/button(
-                element: [events: PASSED.store.sources.filter_all.events, hovered: True]
+                element: [events: PASSED.store.sources.filter_all.events]
                 style: [
                     width: 32
                     height: 25.2
@@ -564,7 +564,7 @@ FUNCTION todo_footer() {
                 selected: PASSED.store.selected_filter == All
             )
             Element/button(
-                element: [events: PASSED.store.sources.filter_active.events, hovered: True]
+                element: [events: PASSED.store.sources.filter_active.events]
                 style: [
                     width: 56
                     height: 25.2
@@ -588,7 +588,7 @@ FUNCTION todo_footer() {
                 selected: PASSED.store.selected_filter == Active
             )
             Element/button(
-                element: [events: PASSED.store.sources.filter_completed.events, hovered: True]
+                element: [events: PASSED.store.sources.filter_completed.events]
                 style: [
                     width: 88
                     height: 25.2
@@ -617,7 +617,7 @@ FUNCTION todo_footer() {
                 child: Text/empty()
             )
             Element/button(
-                element: [events: PASSED.store.sources.clear_completed_button.events, hovered: True]
+                element: [events: PASSED.store.sources.clear_completed_button.events]
                 style: [width: 110, height: 25.2, line_height: 19.6, text_inset: 0, text_align: Left, vertical_align: Center, background: [color: Oklch[lightness:1]], font: [family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }, size: 15, color: Oklch[lightness:0.17], weight: Light, line: [underline: element.hovered]]]
                 label: TEXT { Clear completed }
                 visible: PASSED.store.has_completed
@@ -658,7 +658,7 @@ FUNCTION todo_info_author() {
             TEXT { Created by }
             Text/space()
             Element/link(
-                element: [hovered: True]
+                element: []
                 style: [width: Auto, auto_padding: 0, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]], font: [line: [underline: element.hovered]]]
                 label: TEXT { Martin Kavík }
                 to: TEXT { https://kavik.cz/ }
@@ -675,7 +675,7 @@ FUNCTION todo_info_reference() {
             TEXT { Part of }
             Text/space()
             Element/link(
-                element: [hovered: True]
+                element: []
                 style: [width: Auto, auto_padding: 0, height: 15, line_height: 15, vertical_align: Center, text_align: Left, text_inset: 0, background: [color: Oklch[lightness:0.97]], font: [line: [underline: element.hovered]]]
                 label: TEXT { TodoMVC }
                 to: TEXT { http://todomvc.com }

@@ -36,7 +36,7 @@ FUNCTION row_widget(row) {
         payload_hex:
             TEXT {} |> HOLD payload_hex {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/to_hex }
+                    inspect |> THEN { payload |> Bytes/to_hex() }
                 }
             }
         payload_base64:
@@ -60,7 +60,7 @@ FUNCTION row_widget(row) {
         decoded_hex_bytes:
             BYTES[3] {} |> HOLD decoded_hex_bytes {
                 LATEST {
-                    inspect |> THEN { hex_source |> Bytes/from_hex }
+                    inspect |> THEN { hex_source |> Bytes/from_hex() }
                 }
             }
         decoded_base64_bytes:

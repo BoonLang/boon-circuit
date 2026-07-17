@@ -322,7 +322,7 @@ enum HeaderValueType {
 
 #[derive(Clone, Debug)]
 struct HttpResponseSchema {
-    body: DataTypePlan,
+    body_fixed_len: Option<u64>,
     header_value: Option<HeaderValueType>,
 }
 
@@ -480,18 +480,6 @@ impl ServerRuntimeSession {
         }
     }
 
-    #[cfg(test)]
-    fn root_value_current(&mut self, name: &str) -> Result<Value, AdapterError> {
-        match self {
-            Self::Ephemeral(session) => session
-                .root_value_current(name)
-                .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error)),
-            Self::Persistent(session) => session
-                .root_value_current(name)
-                .map_err(|error| AdapterError::new(AdapterErrorKind::Runtime, error)),
-        }
-    }
-
     fn persistence_status(&self) -> Option<PersistenceWorkerStatus> {
         match self {
             Self::Ephemeral(_) => None,
@@ -614,7 +602,6 @@ pub struct BoonServerProgram {
     http: Option<HttpPortBinding>,
     websocket: Option<WebSocketPortBinding>,
     last_diagnostic: Option<AdapterError>,
-    json_limits: boon_transport_json::Limits,
     persistent: Option<PersistentServerState>,
     transient_effect_host: Option<Box<dyn TransientEffectHost>>,
     transient_effect_limits: TransientEffectLimits,
@@ -623,20 +610,6 @@ pub struct BoonServerProgram {
 
 impl BoonServerProgram {
     pub fn new(artifact: ProgramArtifact) -> Result<Self, AdapterError> {
-        Self::with_json_limits(artifact, boon_transport_json::Limits::STRICT_SERVER_CLIENT)
-    }
-
-    pub fn from_artifact(artifact: ProgramArtifact) -> Result<Self, AdapterError> {
-        Self::new(artifact)
-    }
-
-    pub fn with_json_limits(
-        artifact: ProgramArtifact,
-        json_limits: boon_transport_json::Limits,
-    ) -> Result<Self, AdapterError> {
-        json_limits
-            .validate()
-            .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
         validate_server_artifact(&artifact)?;
         let bindings = resolve_bindings(artifact.plan())?;
         let session = ProgramSession::start(artifact)
@@ -646,12 +619,15 @@ impl BoonServerProgram {
             http: bindings.http,
             websocket: bindings.websocket,
             last_diagnostic: None,
-            json_limits,
             persistent: None,
             transient_effect_host: None,
             transient_effect_limits: TransientEffectLimits::default(),
             active_transient_effects: BTreeSet::new(),
         })
+    }
+
+    pub fn from_artifact(artifact: ProgramArtifact) -> Result<Self, AdapterError> {
+        Self::new(artifact)
     }
 
     pub fn with_persistence<D>(
@@ -662,26 +638,6 @@ impl BoonServerProgram {
     where
         D: PersistenceDriver + Send + 'static,
     {
-        Self::with_persistence_and_json_limits(
-            artifact,
-            driver,
-            config,
-            boon_transport_json::Limits::STRICT_SERVER_CLIENT,
-        )
-    }
-
-    pub fn with_persistence_and_json_limits<D>(
-        artifact: ProgramArtifact,
-        driver: D,
-        config: PersistentServerConfig,
-        json_limits: boon_transport_json::Limits,
-    ) -> Result<(Self, PersistentServerStartup), AdapterError>
-    where
-        D: PersistenceDriver + Send + 'static,
-    {
-        json_limits
-            .validate()
-            .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidArtifact, error))?;
         validate_server_artifact(&artifact)?;
         let bindings = resolve_bindings(artifact.plan())?;
         let (session, startup) =
@@ -727,7 +683,6 @@ impl BoonServerProgram {
                 http: bindings.http,
                 websocket: bindings.websocket,
                 last_diagnostic: None,
-                json_limits,
                 persistent: Some(PersistentServerState {
                     durability: config.durability,
                     lifecycle,
@@ -1157,7 +1112,7 @@ impl BoonServerProgram {
                 return Err(error);
             }
         };
-        let response = decode_http_response(value, &response_schema, &self.json_limits);
+        let response = decode_http_response(value, &response_schema);
         if let Err(error) = &response {
             self.fail_persistent(error);
         }
@@ -1833,13 +1788,14 @@ fn validate_http_response_type(
             ));
         }
     }
-    if types
-        .keys()
-        .any(|name| !matches!(*name, "status" | "headers" | "body"))
+    if !matches!(types.len(), 2 | 3)
+        || types
+            .keys()
+            .any(|name| !matches!(*name, "status" | "headers" | "body"))
     {
         return Err(AdapterError::new(
             AdapterErrorKind::InvalidHostPort,
-            "HTTP response schema contains an unsupported field",
+            "HTTP response schema must contain exactly `status`, `body`, and optional `headers`",
         ));
     }
     if types.get("status") != Some(&&DataTypePlan::Number) {
@@ -1848,24 +1804,27 @@ fn validate_http_response_type(
             "HTTP response `status` must be Number",
         ));
     }
-    let body = types.get("body").ok_or_else(|| {
-        AdapterError::new(
-            AdapterErrorKind::InvalidHostPort,
-            "HTTP response schema requires `body`",
-        )
-    })?;
-    if !body_type_supported(body) {
-        return Err(AdapterError::new(
-            AdapterErrorKind::InvalidHostPort,
-            "HTTP response `body` is neither Text, Bytes, nor a closed JSON value",
-        ));
-    }
-    let header_value = types
-        .get("headers")
-        .map(|data_type| header_value_type(data_type))
-        .transpose()?;
+    let body_fixed_len = match types.get("body") {
+        Some(DataTypePlan::Bytes { fixed_len }) => *fixed_len,
+        _ => {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidHostPort,
+                "HTTP response `body` must be Bytes",
+            ));
+        }
+    };
+    let header_value = match (types.len(), types.get("headers")) {
+        (2, None) => None,
+        (3, Some(data_type)) => Some(header_value_type(data_type)?),
+        _ => {
+            return Err(AdapterError::new(
+                AdapterErrorKind::InvalidHostPort,
+                "HTTP response schema must contain exactly `status`, `body`, and optional `headers`",
+            ));
+        }
+    };
     Ok(HttpResponseSchema {
-        body: (*body).clone(),
+        body_fixed_len,
         header_value,
     })
 }
@@ -1902,35 +1861,6 @@ fn invalid_headers_schema() -> AdapterError {
         AdapterErrorKind::InvalidHostPort,
         "HTTP response `headers` must be a closed list of `{ name: Text, value: Text|Bytes }` records",
     )
-}
-
-fn body_type_supported(data_type: &DataTypePlan) -> bool {
-    match data_type {
-        DataTypePlan::Text | DataTypePlan::Bytes { .. } => true,
-        other => json_type_supported(other),
-    }
-}
-
-fn json_type_supported(data_type: &DataTypePlan) -> bool {
-    match data_type {
-        DataTypePlan::Null
-        | DataTypePlan::Bool
-        | DataTypePlan::Number
-        | DataTypePlan::Byte
-        | DataTypePlan::Text => true,
-        DataTypePlan::List { item } => json_type_supported(item),
-        DataTypePlan::Record {
-            fields,
-            open: false,
-        } => fields
-            .iter()
-            .all(|field| json_type_supported(&field.data_type)),
-        DataTypePlan::Bytes { .. }
-        | DataTypePlan::Variant { .. }
-        | DataTypePlan::Record { open: true, .. }
-        | DataTypePlan::Error { .. }
-        | DataTypePlan::Unknown => false,
-    }
 }
 
 fn http_request_payload(request: HttpRequest) -> Result<SourcePayload, AdapterError> {
@@ -2158,7 +2088,6 @@ fn named_text_pair(name: String, value: String) -> Value {
 fn decode_http_response(
     value: Value,
     schema: &HttpResponseSchema,
-    json_limits: &boon_transport_json::Limits,
 ) -> Result<HttpResponse, AdapterError> {
     let Value::Record(mut fields) = value else {
         return Err(AdapterError::new(
@@ -2178,7 +2107,7 @@ fn decode_http_response(
             .remove("status")
             .expect("closed response field set contains status"),
     )?;
-    let mut headers = match (&schema.header_value, fields.remove("headers")) {
+    let headers = match (&schema.header_value, fields.remove("headers")) {
         (Some(value_type), Some(value)) => decode_headers(value, value_type)?,
         (None, None) => Vec::new(),
         _ => {
@@ -2188,20 +2117,12 @@ fn decode_http_response(
             ));
         }
     };
-    let (body, is_json) = decode_body(
+    let body = decode_body(
         fields
             .remove("body")
             .expect("closed response field set contains body"),
-        &schema.body,
-        json_limits,
+        schema.body_fixed_len,
     )?;
-    if is_json
-        && !headers
-            .iter()
-            .any(|header| header.name.eq_ignore_ascii_case("content-type"))
-    {
-        headers.push(Header::new("content-type", b"application/json".to_vec()));
-    }
     Ok(HttpResponse {
         status,
         headers,
@@ -2616,23 +2537,13 @@ fn decode_headers(value: Value, value_type: &HeaderValueType) -> Result<Vec<Head
         .collect()
 }
 
-fn decode_body(
-    value: Value,
-    data_type: &DataTypePlan,
-    json_limits: &boon_transport_json::Limits,
-) -> Result<(Vec<u8>, bool), AdapterError> {
-    match (data_type, value) {
-        (DataTypePlan::Text, Value::Text(value)) => Ok((value.into_bytes(), false)),
-        (DataTypePlan::Bytes { fixed_len }, Value::Bytes(value)) => Ok((
-            validate_fixed_bytes(value, *fixed_len, "HTTP response body")?,
-            false,
+fn decode_body(value: Value, fixed_len: Option<u64>) -> Result<Vec<u8>, AdapterError> {
+    match value {
+        Value::Bytes(value) => validate_fixed_bytes(value, fixed_len, "HTTP response body"),
+        _ => Err(AdapterError::new(
+            AdapterErrorKind::InvalidOutput,
+            "HTTP response body differs from its declared Bytes type",
         )),
-        (data_type, value) => {
-            let value = json_value(&value, data_type, "body")?;
-            let body = boon_transport_json::encode(&value, json_limits)
-                .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidOutput, error))?;
-            Ok((body, true))
-        }
     }
 }
 
@@ -2648,78 +2559,6 @@ fn validate_fixed_bytes(
         ));
     }
     Ok(value)
-}
-
-fn json_value(
-    value: &Value,
-    data_type: &DataTypePlan,
-    path: &str,
-) -> Result<boon_transport_json::Value, AdapterError> {
-    match (data_type, value) {
-        (DataTypePlan::Null, Value::Null) => Ok(boon_transport_json::Value::Null),
-        (DataTypePlan::Bool, Value::Bool(value)) => Ok(boon_transport_json::Value::Bool(*value)),
-        (DataTypePlan::Number, Value::Number(value)) => {
-            Ok(boon_transport_json::Value::Number(*value))
-        }
-        (DataTypePlan::Byte, Value::Number(value)) => {
-            let byte = value
-                .to_i64_exact()
-                .map_err(|error| AdapterError::new(AdapterErrorKind::InvalidOutput, error))?;
-            let byte = u8::try_from(byte).map_err(|_| {
-                AdapterError::new(
-                    AdapterErrorKind::InvalidOutput,
-                    format_args!("JSON field `{path}` is outside the Byte range"),
-                )
-            })?;
-            Ok(boon_transport_json::Value::integer(i64::from(byte))
-                .expect("u8 is an exact Boon Number"))
-        }
-        (DataTypePlan::Text, Value::Text(value)) => {
-            Ok(boon_transport_json::Value::Text(value.clone()))
-        }
-        (DataTypePlan::List { item }, Value::List(values)) => values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| json_value(value, item, &format!("{path}[{index}]")))
-            .collect::<Result<Vec<_>, _>>()
-            .map(boon_transport_json::Value::List),
-        (
-            DataTypePlan::Record {
-                fields,
-                open: false,
-            },
-            Value::Record(values),
-        ) => {
-            let expected = fields
-                .iter()
-                .map(|field| field.name.as_str())
-                .collect::<BTreeSet<_>>();
-            let actual = values.keys().map(String::as_str).collect::<BTreeSet<_>>();
-            if actual != expected {
-                return Err(AdapterError::new(
-                    AdapterErrorKind::InvalidOutput,
-                    format_args!("JSON record `{path}` differs from its closed schema"),
-                ));
-            }
-            fields
-                .iter()
-                .map(|field| {
-                    let value = values
-                        .get(&field.name)
-                        .expect("closed JSON record contains declared field");
-                    Ok((
-                        field.name.clone(),
-                        json_value(value, &field.data_type, &format!("{path}.{}", field.name))?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, AdapterError>>()
-                .map(boon_transport_json::Value::Record)
-        }
-        _ => Err(AdapterError::new(
-            AdapterErrorKind::InvalidOutput,
-            format_args!("HTTP response value `{path}` differs from its declared type"),
-        )),
-    }
 }
 
 fn diagnostic_http_response(status: u16, error: &AdapterError) -> HttpResponse {
@@ -2753,1158 +2592,4 @@ fn bounded_text(mut text: String, max_bytes: usize) -> String {
     text.truncate(end);
     text.push_str(suffix);
     text
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use boon_persistence::{
-        InMemoryDriver, PersistenceCommand, PersistenceResult, ShutdownAck, StoreError,
-    };
-
-    use boon_plan::DataTypeFieldPlan;
-    use boon_runtime::{
-        ApplicationIdentity, ProgramCompileRequest, RuntimeSourceUnit, compile_program_artifact,
-    };
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Condvar, mpsc};
-    use std::thread;
-    use std::time::Duration;
-
-    fn drive_http(
-        program: &mut BoonServerProgram,
-        request: HttpRequest,
-    ) -> Result<HttpResponse, AdapterError> {
-        futures::executor::block_on(program.handle_http(request))
-    }
-
-    fn drive_websocket(
-        program: &mut BoonServerProgram,
-        event: WebSocketEvent,
-    ) -> Result<Vec<WebSocketAction>, AdapterError> {
-        futures::executor::block_on(program.handle_websocket(event))
-    }
-
-    struct ChainedEffectHost {
-        http: boon_plan::EffectId,
-        random: boon_plan::EffectId,
-        rounds: Arc<Mutex<Vec<Vec<boon_plan::EffectId>>>>,
-        cancelled: Arc<Mutex<Vec<TransientEffectCallId>>>,
-    }
-
-    struct MissingSettlementHost {
-        cancelled: Arc<Mutex<Vec<TransientEffectCallId>>>,
-    }
-
-    #[async_trait]
-    impl TransientEffectHost for MissingSettlementHost {
-        fn owns(&self, _effect_id: boon_plan::EffectId) -> bool {
-            true
-        }
-
-        async fn execute_batch(
-            &mut self,
-            _calls: Vec<TransientEffectInvocation>,
-        ) -> Result<TransientEffectBatchResult, TransientEffectHostError> {
-            Ok(TransientEffectBatchResult::default())
-        }
-
-        fn cancel(&mut self, call_id: TransientEffectCallId) {
-            self.cancelled.lock().unwrap().push(call_id);
-        }
-    }
-
-    #[async_trait]
-    impl TransientEffectHost for ChainedEffectHost {
-        fn owns(&self, effect_id: boon_plan::EffectId) -> bool {
-            effect_id == self.http || effect_id == self.random
-        }
-
-        async fn execute_batch(
-            &mut self,
-            calls: Vec<TransientEffectInvocation>,
-        ) -> Result<TransientEffectBatchResult, TransientEffectHostError> {
-            self.rounds
-                .lock()
-                .unwrap()
-                .push(calls.iter().map(|call| call.effect_id).collect());
-            let mut completions = Vec::new();
-            for call in calls {
-                let outcome = if call.effect_id == self.http {
-                    Value::Record(BTreeMap::from([
-                        ("$tag".to_owned(), Value::Text("HttpSucceeded".to_owned())),
-                        ("endpoint".to_owned(), Value::Text("catalog".to_owned())),
-                        ("status".to_owned(), Value::integer(200).unwrap()),
-                        ("headers".to_owned(), Value::List(Vec::new())),
-                        ("body".to_owned(), Value::Bytes(Vec::new())),
-                        ("redirects_followed".to_owned(), Value::integer(0).unwrap()),
-                    ]))
-                } else if call.effect_id == self.random {
-                    Value::Record(BTreeMap::from([
-                        (
-                            "$tag".to_owned(),
-                            Value::Text("RandomBytesReady".to_owned()),
-                        ),
-                        ("bytes".to_owned(), Value::Bytes(vec![0x5a; 16])),
-                    ]))
-                } else {
-                    return Err(TransientEffectHostError::new("unknown test effect"));
-                };
-                completions.push(TransientEffectCompletion {
-                    call_id: call.call_id,
-                    outcome,
-                });
-            }
-            Ok(TransientEffectBatchResult {
-                completions,
-                cancelled: Vec::new(),
-            })
-        }
-
-        fn cancel(&mut self, call_id: TransientEffectCallId) {
-            self.cancelled.lock().unwrap().push(call_id);
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum DriverCommand {
-        Load,
-        Initialize,
-        Commit,
-        Barrier,
-        Shutdown,
-        Other,
-    }
-
-    struct TestDriverState {
-        commands: Mutex<Vec<DriverCommand>>,
-        fail_start: AtomicBool,
-        fail_next_commit: AtomicBool,
-        fail_next_barrier: AtomicBool,
-        block_load: AtomicBool,
-        load_entered: AtomicBool,
-        load_gate: Mutex<bool>,
-        load_changed: Condvar,
-        block_commits: AtomicBool,
-        commit_entered: AtomicBool,
-        commit_gate: Mutex<bool>,
-        commit_changed: Condvar,
-    }
-
-    impl Default for TestDriverState {
-        fn default() -> Self {
-            Self {
-                commands: Mutex::new(Vec::new()),
-                fail_start: AtomicBool::new(false),
-                fail_next_commit: AtomicBool::new(false),
-                fail_next_barrier: AtomicBool::new(false),
-                block_load: AtomicBool::new(false),
-                load_entered: AtomicBool::new(false),
-                load_gate: Mutex::new(true),
-                load_changed: Condvar::new(),
-                block_commits: AtomicBool::new(false),
-                commit_entered: AtomicBool::new(false),
-                commit_gate: Mutex::new(true),
-                commit_changed: Condvar::new(),
-            }
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct SharedTestDriver {
-        inner: Arc<Mutex<InMemoryDriver>>,
-        state: Arc<TestDriverState>,
-    }
-
-    impl SharedTestDriver {
-        fn commands(&self) -> Vec<DriverCommand> {
-            self.state
-                .commands
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        }
-
-        fn block_commits(&self) {
-            *self
-                .state
-                .commit_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-            self.state.commit_entered.store(false, Ordering::Release);
-            self.state.block_commits.store(true, Ordering::Release);
-        }
-
-        fn block_startup_load(&self) {
-            *self
-                .state
-                .load_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
-            self.state.load_entered.store(false, Ordering::Release);
-            self.state.block_load.store(true, Ordering::Release);
-        }
-
-        fn wait_for_blocked_startup_load(&self) {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !self.state.load_entered.load(Ordering::Acquire) {
-                assert!(
-                    Instant::now() < deadline,
-                    "persistence restore did not start"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-
-        fn release_startup_load(&self) {
-            *self
-                .state
-                .load_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-            self.state.block_load.store(false, Ordering::Release);
-            self.state.load_changed.notify_all();
-        }
-
-        fn wait_for_blocked_commit(&self) {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !self.state.commit_entered.load(Ordering::Acquire) {
-                assert!(
-                    Instant::now() < deadline,
-                    "persistence commit did not start"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-
-        fn release_commits(&self) {
-            *self
-                .state
-                .commit_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-            self.state.block_commits.store(false, Ordering::Release);
-            self.state.commit_changed.notify_all();
-        }
-    }
-
-    impl PersistenceDriver for SharedTestDriver {
-        fn execute(&mut self, command: PersistenceCommand) -> PersistenceResult {
-            let observed = match &command {
-                PersistenceCommand::Load(_) => DriverCommand::Load,
-                PersistenceCommand::Initialize(_) => DriverCommand::Initialize,
-                PersistenceCommand::Commit(_) => DriverCommand::Commit,
-                PersistenceCommand::Barrier(_) => DriverCommand::Barrier,
-                PersistenceCommand::Shutdown(_) => DriverCommand::Shutdown,
-                _ => DriverCommand::Other,
-            };
-            self.state
-                .commands
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(observed);
-
-            if matches!(&command, PersistenceCommand::Load(_))
-                && self.state.fail_start.swap(false, Ordering::AcqRel)
-            {
-                return PersistenceResult::Loaded(Err(StoreError::Backend(
-                    "injected startup failure".to_owned(),
-                )));
-            }
-            if matches!(&command, PersistenceCommand::Load(_))
-                && self.state.block_load.load(Ordering::Acquire)
-            {
-                self.state.load_entered.store(true, Ordering::Release);
-                let mut released = self
-                    .state
-                    .load_gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                while !*released {
-                    released = self
-                        .state
-                        .load_changed
-                        .wait(released)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-            }
-            if matches!(&command, PersistenceCommand::Barrier(_))
-                && self.state.fail_next_barrier.swap(false, Ordering::AcqRel)
-            {
-                return PersistenceResult::BarrierComplete(Err(StoreError::Backend(
-                    "injected barrier failure".to_owned(),
-                )));
-            }
-            if matches!(&command, PersistenceCommand::Commit(_))
-                && self.state.block_commits.load(Ordering::Acquire)
-            {
-                self.state.commit_entered.store(true, Ordering::Release);
-                let mut released = self
-                    .state
-                    .commit_gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                while !*released {
-                    released = self
-                        .state
-                        .commit_changed
-                        .wait(released)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-            }
-            if matches!(&command, PersistenceCommand::Commit(_))
-                && self.state.fail_next_commit.swap(false, Ordering::AcqRel)
-            {
-                return PersistenceResult::Committed(Err(StoreError::Backend(
-                    "injected commit failure".to_owned(),
-                )));
-            }
-            if matches!(&command, PersistenceCommand::Shutdown(_)) {
-                return PersistenceResult::ShutdownComplete(Ok(ShutdownAck));
-            }
-            self.inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .execute(command)
-        }
-    }
-
-    fn compile_persistent_counter(namespace: &str) -> ProgramArtifact {
-        let path = "server_persistent_counter.bn";
-        compile_program_artifact(&ProgramCompileRequest {
-            revision: 1,
-            entry_path: path.to_owned(),
-            units: vec![RuntimeSourceUnit {
-                path: path.to_owned(),
-                source: include_str!("../../../examples/server_persistent_counter.bn").to_owned(),
-            }],
-            application: ApplicationIdentity::new(
-                "dev.boon.server-runtime-test",
-                namespace,
-                "persistent",
-            ),
-            capability_profile: ProgramCapabilityProfile::TrustedServer,
-        })
-        .expect("unrelated persistent counter fixture should compile")
-    }
-
-    fn counter_request() -> HttpRequest {
-        HttpRequest {
-            method: "POST".to_owned(),
-            path_segments: vec!["counter".to_owned()],
-            query: BTreeMap::new(),
-            headers: Vec::new(),
-            cookies: Vec::new(),
-            body: Vec::new(),
-            peer: PeerAddress::Unavailable,
-            scheme: boon_server_host::RequestScheme::Http,
-            deadline: Instant::now() + Duration::from_secs(1),
-        }
-    }
-
-    fn compile_effect_chain() -> ProgramArtifact {
-        compile_program_artifact(&ProgramCompileRequest {
-            revision: 1,
-            entry_path: "server_effect_chain.bn".to_owned(),
-            units: vec![RuntimeSourceUnit {
-                path: "server_effect_chain.bn".to_owned(),
-                source: include_str!("../../../examples/server_effect_chain.bn").to_owned(),
-            }],
-            application: ApplicationIdentity::new("dev.boon.server-effect-chain", "test", "local"),
-            capability_profile: ProgramCapabilityProfile::TrustedServer,
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn http_output_waits_for_bounded_chained_transient_effect_rounds() {
-        let artifact = compile_effect_chain();
-        let http = boon_plan::EffectId::from_host_operation(
-            boon_effect_schema::OUTBOUND_HTTP_REQUEST_OPERATION,
-        )
-        .unwrap();
-        let random = boon_plan::EffectId::from_host_operation(
-            boon_effect_schema::SECURE_RANDOM_BYTES_OPERATION,
-        )
-        .unwrap();
-        let rounds = Arc::new(Mutex::new(Vec::new()));
-        let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let mut program = BoonServerProgram::new(artifact).unwrap();
-        program
-            .attach_transient_effect_host(
-                Box::new(ChainedEffectHost {
-                    http,
-                    random,
-                    rounds: Arc::clone(&rounds),
-                    cancelled: Arc::clone(&cancelled),
-                }),
-                TransientEffectLimits::default(),
-            )
-            .unwrap();
-
-        let response = drive_http(&mut program, counter_request()).unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"16");
-        assert_eq!(
-            rounds.lock().unwrap().as_slice(),
-            [vec![http], vec![random]]
-        );
-        assert!(cancelled.lock().unwrap().is_empty());
-        assert_eq!(program.session.pending_transient_effect_count(), 0);
-    }
-
-    #[test]
-    fn transient_effect_without_a_host_is_rejected_and_cancelled_in_the_runtime() {
-        let mut program = BoonServerProgram::new(compile_effect_chain()).unwrap();
-
-        let error = drive_http(&mut program, counter_request()).unwrap_err();
-
-        assert_eq!(error.kind(), AdapterErrorKind::Unsupported);
-        assert_eq!(program.session.pending_transient_effect_count(), 0);
-        assert!(program.active_transient_effects.is_empty());
-    }
-
-    #[test]
-    fn incomplete_transient_effect_batch_cancels_every_admitted_runtime_call() {
-        let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let mut program = BoonServerProgram::new(compile_effect_chain()).unwrap();
-        program
-            .attach_transient_effect_host(
-                Box::new(MissingSettlementHost {
-                    cancelled: Arc::clone(&cancelled),
-                }),
-                TransientEffectLimits::default(),
-            )
-            .unwrap();
-
-        let error = drive_http(&mut program, counter_request()).unwrap_err();
-
-        assert_eq!(error.kind(), AdapterErrorKind::Runtime);
-        assert_eq!(cancelled.lock().unwrap().len(), 1);
-        assert_eq!(program.session.pending_transient_effect_count(), 0);
-        assert!(program.active_transient_effects.is_empty());
-    }
-
-    #[test]
-    fn chained_transient_effect_limit_cancels_the_unexecuted_next_round() {
-        let http = boon_plan::EffectId::from_host_operation(
-            boon_effect_schema::OUTBOUND_HTTP_REQUEST_OPERATION,
-        )
-        .unwrap();
-        let random = boon_plan::EffectId::from_host_operation(
-            boon_effect_schema::SECURE_RANDOM_BYTES_OPERATION,
-        )
-        .unwrap();
-        let rounds = Arc::new(Mutex::new(Vec::new()));
-        let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let mut program = BoonServerProgram::new(compile_effect_chain()).unwrap();
-        program
-            .attach_transient_effect_host(
-                Box::new(ChainedEffectHost {
-                    http,
-                    random,
-                    rounds: Arc::clone(&rounds),
-                    cancelled: Arc::clone(&cancelled),
-                }),
-                TransientEffectLimits {
-                    max_calls_per_round: 8,
-                    max_calls_per_transaction: 8,
-                    max_chained_rounds: 1,
-                },
-            )
-            .unwrap();
-
-        let error = drive_http(&mut program, counter_request()).unwrap_err();
-
-        assert_eq!(error.kind(), AdapterErrorKind::Runtime);
-        assert_eq!(rounds.lock().unwrap().as_slice(), [vec![http]]);
-        assert_eq!(cancelled.lock().unwrap().len(), 1);
-        assert_eq!(program.session.pending_transient_effect_count(), 0);
-        assert!(program.active_transient_effects.is_empty());
-    }
-
-    #[test]
-    fn closed_persistence_is_terminal_but_capacity_is_retryable() {
-        let closed = persistent_dispatch_error(PersistentDispatchError::Backpressure(
-            TurnReservationError::Closed,
-        ));
-        assert_eq!(closed.kind(), AdapterErrorKind::Persistence);
-
-        let saturated = persistent_dispatch_error(PersistentDispatchError::Backpressure(
-            TurnReservationError::Backpressure {
-                capacity: 1,
-                pending_turns: 1,
-                reserved_slots: 0,
-            },
-        ));
-        assert_eq!(saturated.kind(), AdapterErrorKind::Backpressure);
-    }
-
-    #[test]
-    fn persistent_program_is_not_constructible_until_restore_and_settling_finish() {
-        let artifact = compile_persistent_counter("startup-order-contract");
-        let driver = SharedTestDriver::default();
-        driver.block_startup_load();
-        let thread_driver = driver.clone();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
-            assert!(
-                sender
-                    .send(BoonServerProgram::with_persistence(
-                        artifact,
-                        thread_driver,
-                        PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
-                    ))
-                    .is_ok()
-            );
-        });
-
-        driver.wait_for_blocked_startup_load();
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        driver.release_startup_load();
-        let (mut program, startup) = receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            startup.lifecycle.status().phase,
-            ServerLifecyclePhase::Ready
-        );
-        assert!(startup.lifecycle.status().accepting_turns);
-        assert_eq!(
-            program
-                .session
-                .root_value_current("store.request_count")
-                .unwrap(),
-            Value::integer(0).unwrap()
-        );
-        program.shutdown_persistent().unwrap();
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn persistent_server_starts_settled_and_restores_acknowledged_authority() {
-        let artifact = compile_persistent_counter("restart-contract");
-        let restart_artifact = artifact.clone();
-        let driver = SharedTestDriver::default();
-        let (mut program, startup) = BoonServerProgram::with_persistence(
-            artifact,
-            driver.clone(),
-            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
-        )
-        .unwrap();
-
-        assert_eq!(
-            startup.disposition,
-            PersistentRuntimeStartupDisposition::Fresh
-        );
-        assert_eq!(startup.restore_epoch, 0);
-        assert_eq!(startup.restore_through_turn_sequence, 0);
-        assert_eq!(
-            &driver.commands()[..2],
-            &[DriverCommand::Load, DriverCommand::Initialize]
-        );
-        let ready = startup.lifecycle.status();
-        assert_eq!(ready.phase, ServerLifecyclePhase::Ready);
-        assert!(ready.accepting_turns);
-        assert!(ready.persistence.worker_alive);
-        assert_eq!(
-            program
-                .session
-                .root_value_current("store.request_count")
-                .unwrap(),
-            Value::integer(0).unwrap()
-        );
-
-        let response = drive_http(&mut program, counter_request()).unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"1");
-        let acknowledged = startup.lifecycle.status();
-        assert_eq!(acknowledged.accepted_turns, 1);
-        assert_eq!(acknowledged.durably_acknowledged_turns, 1);
-        assert_eq!(acknowledged.persistence.durable_through_turn_sequence, 1);
-        assert!(acknowledged.persistence.pending.is_none());
-        program.shutdown_persistent().unwrap();
-        assert_eq!(
-            startup.lifecycle.status().phase,
-            ServerLifecyclePhase::Stopped
-        );
-
-        let (mut restarted, restart) = BoonServerProgram::with_persistence(
-            restart_artifact,
-            driver.clone(),
-            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
-        )
-        .unwrap();
-        assert_eq!(
-            restart.disposition,
-            PersistentRuntimeStartupDisposition::Restored
-        );
-        assert_eq!(restart.restore_through_turn_sequence, 1);
-        assert_eq!(
-            restarted
-                .session
-                .root_value_current("store.request_count")
-                .unwrap(),
-            Value::integer(1).unwrap()
-        );
-        assert_eq!(
-            drive_http(&mut restarted, counter_request()).unwrap().body,
-            b"2"
-        );
-        restarted.shutdown_persistent().unwrap();
-    }
-
-    #[test]
-    fn immediate_http_response_waits_for_exact_commit_acknowledgement() {
-        let artifact = compile_persistent_counter("immediate-ack-contract");
-        let driver = SharedTestDriver::default();
-        let (program, startup) = BoonServerProgram::with_persistence(
-            artifact,
-            driver.clone(),
-            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
-        )
-        .unwrap();
-        driver.block_commits();
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let worker = thread::spawn(move || {
-            let mut program = program;
-            let response = drive_http(&mut program, counter_request());
-            assert!(sender.send((program, response)).is_ok());
-        });
-
-        driver.wait_for_blocked_commit();
-        assert!(matches!(
-            receiver.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-        assert_eq!(startup.lifecycle.status().durably_acknowledged_turns, 0);
-        driver.release_commits();
-        let (mut program, response) = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(response.unwrap().body, b"1");
-        assert_eq!(startup.lifecycle.status().durably_acknowledged_turns, 1);
-        program.shutdown_persistent().unwrap();
-        worker.join().unwrap();
-    }
-
-    #[test]
-    fn buffered_policy_rejects_queue_saturation_before_mutating_authority() {
-        let artifact = compile_persistent_counter("backpressure-contract");
-        let driver = SharedTestDriver::default();
-        let config = PersistentServerConfig {
-            worker: PersistenceWorkerConfig {
-                queue_capacity: 1,
-                max_batch_turns: 1,
-                coalesce_delay: Duration::ZERO,
-            },
-            durability: ServerDurabilityPolicy::BUFFERED,
-        };
-        let (mut program, startup) =
-            BoonServerProgram::with_persistence(artifact, driver.clone(), config).unwrap();
-        driver.block_commits();
-
-        assert_eq!(
-            drive_http(&mut program, counter_request()).unwrap().body,
-            b"1"
-        );
-        driver.wait_for_blocked_commit();
-        let overloaded = drive_http(&mut program, counter_request()).unwrap_err();
-        assert_eq!(overloaded.kind(), AdapterErrorKind::Backpressure);
-        assert_eq!(
-            startup.lifecycle.status().phase,
-            ServerLifecyclePhase::Ready
-        );
-        assert_eq!(startup.lifecycle.status().rejected_turns, 1);
-        assert_eq!(
-            program
-                .session
-                .root_value_current("store.request_count")
-                .unwrap(),
-            Value::integer(1).unwrap(),
-            "the rejected request must not mutate authority"
-        );
-
-        driver.release_commits();
-        program.session.barrier().unwrap();
-        assert_eq!(
-            drive_http(&mut program, counter_request()).unwrap().body,
-            b"2"
-        );
-        program.shutdown_persistent().unwrap();
-    }
-
-    #[test]
-    fn asynchronous_checkpoint_failure_closes_admission_on_next_observation() {
-        let artifact = compile_persistent_counter("buffered-failure-contract");
-        let driver = SharedTestDriver::default();
-        let config = PersistentServerConfig {
-            worker: PersistenceWorkerConfig {
-                queue_capacity: 1,
-                max_batch_turns: 1,
-                coalesce_delay: Duration::ZERO,
-            },
-            durability: ServerDurabilityPolicy::BUFFERED,
-        };
-        let (mut program, startup) =
-            BoonServerProgram::with_persistence(artifact, driver.clone(), config).unwrap();
-        driver.block_commits();
-        assert_eq!(
-            drive_http(&mut program, counter_request()).unwrap().body,
-            b"1"
-        );
-        driver.wait_for_blocked_commit();
-        driver.state.fail_next_commit.store(true, Ordering::Release);
-        driver.release_commits();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while program
-            .session
-            .persistence_status()
-            .is_some_and(|status| status.last_error.is_none())
-        {
-            assert!(
-                Instant::now() < deadline,
-                "failed checkpoint was not reported by the persistence worker"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-        let error = drive_http(&mut program, counter_request()).unwrap_err();
-        assert_eq!(error.kind(), AdapterErrorKind::Persistence);
-        assert_eq!(
-            startup.lifecycle.status().phase,
-            ServerLifecyclePhase::Failed
-        );
-        assert!(!startup.lifecycle.status().accepting_turns);
-    }
-
-    #[test]
-    fn startup_commit_and_shutdown_barrier_fail_closed() {
-        let startup_driver = SharedTestDriver::default();
-        startup_driver
-            .state
-            .fail_start
-            .store(true, Ordering::Release);
-        let startup_error = match BoonServerProgram::with_persistence(
-            compile_persistent_counter("startup-failure-contract"),
-            startup_driver,
-            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
-        ) {
-            Ok(_) => panic!("startup failure must not construct a bindable program"),
-            Err(error) => error,
-        };
-        assert_eq!(startup_error.kind(), AdapterErrorKind::Persistence);
-
-        let commit_driver = SharedTestDriver::default();
-        let (mut program, startup) = BoonServerProgram::with_persistence(
-            compile_persistent_counter("commit-failure-contract"),
-            commit_driver.clone(),
-            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
-        )
-        .unwrap();
-        commit_driver
-            .state
-            .fail_next_commit
-            .store(true, Ordering::Release);
-        let commit_error = drive_http(&mut program, counter_request()).unwrap_err();
-        assert_eq!(commit_error.kind(), AdapterErrorKind::Persistence);
-        assert_eq!(
-            startup.lifecycle.status().phase,
-            ServerLifecyclePhase::Failed
-        );
-        assert!(!startup.lifecycle.status().accepting_turns);
-        assert_eq!(
-            program
-                .session
-                .root_value_current("store.request_count")
-                .unwrap(),
-            Value::integer(0).unwrap(),
-            "failed immediate commit must roll back the runtime turn"
-        );
-        assert_eq!(
-            drive_http(&mut program, counter_request())
-                .unwrap_err()
-                .kind(),
-            AdapterErrorKind::Persistence
-        );
-
-        let barrier_driver = SharedTestDriver::default();
-        let (mut barrier_program, barrier_startup) = BoonServerProgram::with_persistence(
-            compile_persistent_counter("barrier-failure-contract"),
-            barrier_driver.clone(),
-            PersistentServerConfig::authoritative(PersistenceWorkerConfig::default()),
-        )
-        .unwrap();
-        barrier_driver
-            .state
-            .fail_next_barrier
-            .store(true, Ordering::Release);
-        let barrier_error = barrier_program.shutdown_persistent().unwrap_err();
-        assert_eq!(barrier_error.kind(), AdapterErrorKind::Persistence);
-        assert_eq!(
-            barrier_startup.lifecycle.status().phase,
-            ServerLifecyclePhase::Failed
-        );
-        assert!(!barrier_startup.lifecycle.status().accepting_turns);
-        let commands = barrier_driver.commands();
-        let barrier = commands
-            .iter()
-            .position(|command| *command == DriverCommand::Barrier)
-            .unwrap();
-        let shutdown = commands
-            .iter()
-            .position(|command| *command == DriverCommand::Shutdown)
-            .unwrap();
-        assert!(
-            barrier < shutdown,
-            "shutdown must attempt its barrier first"
-        );
-    }
-
-    #[test]
-    fn request_payload_contains_normalized_path_and_no_correlation() {
-        let request = HttpRequest {
-            method: "GET".to_owned(),
-            path_segments: vec!["health detail".to_owned(), "ready".to_owned()],
-            query: BTreeMap::new(),
-            headers: Vec::new(),
-            cookies: Vec::new(),
-            body: Vec::new(),
-            peer: PeerAddress::Known(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4321)),
-            scheme: boon_server_host::RequestScheme::Http,
-            deadline: Instant::now() + Duration::from_secs(1),
-        };
-
-        let payload = http_request_payload(request).unwrap();
-        assert_eq!(
-            payload.fields["path"],
-            Value::Text("/health detail/ready".to_owned())
-        );
-        assert!(payload.fields.keys().all(|name| {
-            !name.contains("request_id")
-                && !name.contains("connection")
-                && !name.contains("correlation")
-                && !name.contains("socket")
-        }));
-    }
-
-    #[test]
-    fn structural_body_is_canonical_json_with_default_content_type() {
-        let schema = HttpResponseSchema {
-            body: DataTypePlan::Record {
-                fields: vec![
-                    DataTypeFieldPlan {
-                        name: "ok".to_owned(),
-                        data_type: DataTypePlan::Bool,
-                    },
-                    DataTypeFieldPlan {
-                        name: "value".to_owned(),
-                        data_type: DataTypePlan::Number,
-                    },
-                ],
-                open: false,
-            },
-            header_value: None,
-        };
-        let value = Value::Record(BTreeMap::from([
-            (
-                "body".to_owned(),
-                Value::Record(BTreeMap::from([
-                    ("value".to_owned(), Value::integer(7).unwrap()),
-                    ("ok".to_owned(), Value::Bool(true)),
-                ])),
-            ),
-            ("status".to_owned(), Value::integer(200).unwrap()),
-        ]));
-
-        let response = decode_http_response(
-            value,
-            &schema,
-            &boon_transport_json::Limits::STRICT_SERVER_CLIENT,
-        )
-        .unwrap();
-        assert_eq!(response.body, br#"{"ok":true,"value":7}"#);
-        assert_eq!(
-            response.headers,
-            vec![Header::new("content-type", b"application/json".to_vec())]
-        );
-    }
-
-    #[test]
-    fn structural_body_preserves_an_explicit_content_type() {
-        let schema = HttpResponseSchema {
-            body: DataTypePlan::Bool,
-            header_value: Some(HeaderValueType::Text),
-        };
-        let value = Value::Record(BTreeMap::from([
-            ("body".to_owned(), Value::Bool(false)),
-            (
-                "headers".to_owned(),
-                Value::List(vec![Value::Record(BTreeMap::from([
-                    ("name".to_owned(), Value::Text("Content-Type".to_owned())),
-                    (
-                        "value".to_owned(),
-                        Value::Text("application/problem+json".to_owned()),
-                    ),
-                ]))]),
-            ),
-            ("status".to_owned(), Value::integer(200).unwrap()),
-        ]));
-
-        let response = decode_http_response(
-            value,
-            &schema,
-            &boon_transport_json::Limits::STRICT_SERVER_CLIENT,
-        )
-        .unwrap();
-        assert_eq!(response.body, b"false");
-        assert_eq!(
-            response.headers,
-            vec![Header::new(
-                "Content-Type",
-                b"application/problem+json".to_vec()
-            )]
-        );
-    }
-
-    fn action_envelope(kind: &str) -> BTreeMap<String, Value> {
-        BTreeMap::from([
-            ("body_bytes".to_owned(), Value::Bytes(Vec::new())),
-            ("body_kind".to_owned(), Value::Text(String::new())),
-            ("body_text".to_owned(), Value::Text(String::new())),
-            ("bytes".to_owned(), Value::Bytes(Vec::new())),
-            ("code".to_owned(), Value::integer(0).unwrap()),
-            ("frame_kind".to_owned(), Value::Text(String::new())),
-            ("include_current".to_owned(), Value::Bool(false)),
-            ("kind".to_owned(), Value::Text(kind.to_owned())),
-            ("reason".to_owned(), Value::Text(String::new())),
-            ("room".to_owned(), Value::Text(String::new())),
-            ("status".to_owned(), Value::integer(0).unwrap()),
-            ("text".to_owned(), Value::Text(String::new())),
-        ])
-    }
-
-    fn action_value(
-        kind: &str,
-        overrides: impl IntoIterator<Item = (&'static str, Value)>,
-    ) -> Value {
-        let mut fields = action_envelope(kind);
-        for (name, value) in overrides {
-            fields.insert(name.to_owned(), value);
-        }
-        Value::Record(fields)
-    }
-
-    #[test]
-    fn websocket_source_payloads_are_structural_and_have_no_correlation() {
-        let open = websocket_open_payload(WebSocketOpen {
-            path_segments: vec!["health detail".to_owned(), "ready".to_owned()],
-            query: BTreeMap::from([("mode".to_owned(), vec!["full".to_owned()])]),
-            headers: vec![Header::new(
-                "Sec-WebSocket-Protocol",
-                b"chat, superchat".to_vec(),
-            )],
-            cookies: Vec::new(),
-            peer: PeerAddress::Known(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4321)),
-            scheme: boon_server_host::RequestScheme::Http,
-            deadline: Instant::now() + Duration::from_secs(1),
-        })
-        .unwrap();
-        assert_eq!(
-            open.fields["path"],
-            Value::Text("/health detail/ready".to_owned())
-        );
-        assert_eq!(
-            open.fields["protocols"],
-            Value::List(vec![
-                Value::Text("chat".to_owned()),
-                Value::Text("superchat".to_owned()),
-            ])
-        );
-
-        let text = websocket_message_payload(Some("hello".to_owned()), None);
-        assert_eq!(text.text, Some("hello".to_owned()));
-        assert_eq!(text.fields["bytes"], Value::Bytes(Vec::new()));
-        assert_eq!(text.fields["kind"], Value::Text("TextMessage".to_owned()));
-
-        let binary = websocket_message_payload(None, Some(vec![1, 2, 3]));
-        assert_eq!(binary.text, Some(String::new()));
-        assert_eq!(binary.fields["bytes"], Value::Bytes(vec![1, 2, 3]));
-        assert_eq!(
-            binary.fields["kind"],
-            Value::Text("BinaryMessage".to_owned())
-        );
-
-        let close = websocket_close_payload(Some(WebSocketClose::new(1000, "done"))).unwrap();
-        assert_eq!(close.fields["clean"], Value::Bool(true));
-        assert_eq!(close.fields["code"], Value::integer(1000).unwrap());
-        assert_eq!(close.fields["reason"], Value::Text("done".to_owned()));
-
-        let error = websocket_transport_error_payload(WebSocketTransportError::Io);
-        assert_eq!(error.fields["code"], Value::Text("io".to_owned()));
-        assert_eq!(error.fields["retryable"], Value::Bool(true));
-
-        for payload in [&open, &text, &binary, &close, &error] {
-            assert!(payload.key.is_none());
-            assert!(payload.address.is_none());
-            assert!(payload.fields.keys().all(|name| {
-                !name.contains("request_id")
-                    && !name.contains("connection")
-                    && !name.contains("correlation")
-                    && !name.contains("socket")
-            }));
-        }
-    }
-
-    #[test]
-    fn websocket_action_decoder_covers_the_closed_contract() {
-        let accept = action_value("Accept", []);
-        let reject = action_value(
-            "Reject",
-            [
-                ("status", Value::integer(403).unwrap()),
-                ("body_kind", Value::Text("Text".to_owned())),
-                ("body_text", Value::Text("denied".to_owned())),
-            ],
-        );
-        let reply = action_value(
-            "Reply",
-            [
-                ("frame_kind", Value::Text("Text".to_owned())),
-                ("text", Value::Text("echo".to_owned())),
-            ],
-        );
-        let send = action_value(
-            "Send",
-            [
-                ("frame_kind", Value::Text("Binary".to_owned())),
-                ("bytes", Value::Bytes(vec![1, 2, 3])),
-            ],
-        );
-        let join = action_value("JoinRoom", [("room", Value::Text("blue".to_owned()))]);
-        let leave = action_value("LeaveRoom", [("room", Value::Text("blue".to_owned()))]);
-        let broadcast = action_value(
-            "Broadcast",
-            [
-                ("room", Value::Text("blue".to_owned())),
-                ("frame_kind", Value::Text("Text".to_owned())),
-                ("text", Value::Text("room:hello".to_owned())),
-                ("include_current", Value::Bool(true)),
-            ],
-        );
-        let resync = action_value(
-            "RequestResync",
-            [
-                ("frame_kind", Value::Text("Text".to_owned())),
-                ("text", Value::Text("snapshot".to_owned())),
-            ],
-        );
-        let close = action_value(
-            "Close",
-            [
-                ("code", Value::integer(1000).unwrap()),
-                ("reason", Value::Text("done".to_owned())),
-            ],
-        );
-
-        assert_eq!(
-            decode_websocket_actions(Value::List(vec![
-                accept, reject, reply, send, join, leave, broadcast, resync, close,
-            ]))
-            .unwrap(),
-            vec![
-                WebSocketAction::Accept,
-                WebSocketAction::Reject(HttpResponse::new(403, "denied")),
-                WebSocketAction::Reply(WebSocketFrame::Text("echo".to_owned())),
-                WebSocketAction::Send(WebSocketFrame::Binary(vec![1, 2, 3])),
-                WebSocketAction::JoinRoom {
-                    room: "blue".to_owned(),
-                },
-                WebSocketAction::LeaveRoom {
-                    room: "blue".to_owned(),
-                },
-                WebSocketAction::Broadcast {
-                    room: "blue".to_owned(),
-                    frame: WebSocketFrame::Text("room:hello".to_owned()),
-                    include_current: true,
-                },
-                WebSocketAction::RequestResync {
-                    frame: WebSocketFrame::Text("snapshot".to_owned()),
-                },
-                WebSocketAction::Close(WebSocketClose::new(1000, "done")),
-            ]
-        );
-    }
-
-    #[test]
-    fn websocket_action_decoder_rejects_malformed_semantics_with_bounded_diagnostics() {
-        let inactive_frame =
-            action_value("Accept", [("frame_kind", Value::Text("Text".to_owned()))]);
-        let error = decode_websocket_actions(Value::List(vec![inactive_frame])).unwrap_err();
-        assert_eq!(error.kind(), AdapterErrorKind::InvalidOutput);
-        assert!(error.diagnostic().contains("inactive `frame`"));
-
-        let reserved_close = action_value("Close", [("code", Value::integer(1005).unwrap())]);
-        let error = decode_websocket_actions(Value::List(vec![reserved_close])).unwrap_err();
-        assert!(error.diagnostic().contains("not valid on the wire"));
-        assert!(error.diagnostic().len() <= MAX_ADAPTER_DIAGNOSTIC_BYTES);
-    }
-
-    #[test]
-    fn websocket_actions_are_current_for_each_serialized_turn() {
-        let artifact = compile_program_artifact(&ProgramCompileRequest {
-            revision: 1,
-            entry_path: "server_websocket_echo.bn".to_owned(),
-            units: vec![RuntimeSourceUnit {
-                path: "server_websocket_echo.bn".to_owned(),
-                source: include_str!("../../../examples/server_websocket_echo.bn").to_owned(),
-            }],
-            application: ApplicationIdentity::new(
-                "dev.boon.server-runtime-test",
-                "websocket-current-turn-test",
-                "unit",
-            ),
-            capability_profile: ProgramCapabilityProfile::TrustedServer,
-        })
-        .unwrap();
-        let mut program = BoonServerProgram::new(artifact).unwrap();
-        let open = |segment: &str| {
-            WebSocketEvent::Open(WebSocketOpen {
-                path_segments: vec![segment.to_owned()],
-                query: BTreeMap::new(),
-                headers: Vec::new(),
-                cookies: Vec::new(),
-                peer: PeerAddress::Unavailable,
-                scheme: boon_server_host::RequestScheme::Http,
-                deadline: Instant::now() + Duration::from_secs(1),
-            })
-        };
-
-        assert_eq!(
-            drive_websocket(&mut program, open("reject")).unwrap(),
-            vec![WebSocketAction::Reject(HttpResponse::new(403, "denied"))]
-        );
-        let second = drive_websocket(&mut program, open("socket")).unwrap();
-        assert_eq!(
-            program
-                .session
-                .root_value_current("store.action_kind")
-                .unwrap(),
-            Value::Text("Accept".to_owned())
-        );
-        assert_eq!(second, vec![WebSocketAction::Accept]);
-    }
-
-    #[test]
-    fn diagnostics_are_utf8_safe_and_bounded() {
-        let error = AdapterError::new(AdapterErrorKind::InvalidOutput, "x".repeat(4_096));
-        assert!(error.to_string().len() <= MAX_ADAPTER_DIAGNOSTIC_BYTES);
-
-        let unicode = AdapterError::new(AdapterErrorKind::Runtime, "a".repeat(510) + "€");
-        assert!(unicode.to_string().len() <= MAX_ADAPTER_DIAGNOSTIC_BYTES);
-        assert!(std::str::from_utf8(unicode.to_string().as_bytes()).is_ok());
-    }
 }

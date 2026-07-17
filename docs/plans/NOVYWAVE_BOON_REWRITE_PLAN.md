@@ -1,6 +1,31 @@
 # NovyWave Boon Rewrite Plan
 
-Status: plan
+Status: implementation in progress
+
+## Implementation Checkpoint (2026-07-17)
+
+Implemented generically in the engine and native host:
+
+- bounded `File/read_stream()` with invocation ownership, terminal cleanup,
+  cancellation, retained `ContentRef` output, and bounded host polling;
+- a thin official `wellen` adapter for VCD, FST, and GHW;
+- typed `Wellen/open()`, `Wellen/hierarchy_page()`,
+  `Wellen/signal_page()`, and `Wellen/cursor_values()` calls;
+- committed real VCD, FST, and GHW package assets;
+- a native integration path that reads the packaged VCD, opens it through
+  `wellen`, requests bounded hierarchy/signal/cursor pages, and exposes the
+  resulting format and status through retained NovyWave UI fields;
+- generic parser, typechecker, plan, and executor support for multiline calls
+  in `WHEN` arms, state-triggered effect chains, and tagged structural values.
+
+Still required before NovyWave is complete:
+
+- app-owned native visual scenarios that prove real VCD, FST, and GHW data in
+  the rendered waveform surface, not only the inspector/status fields;
+- replacement/cancellation and bounded-backpressure scenarios through the
+  complete native application path;
+- removal of the remaining bootstrap waveform-page data after the real page
+  results drive the same signal-row and trace model.
 
 ## Goal
 
@@ -154,9 +179,32 @@ The manifest entry should be planned with:
 - visual artifacts for preview framebuffer, dev framebuffer, material crops,
   waveform crops, fixture comparison crops, and dark/light mode crops.
 
-The initial playground data should come from generated bounded fixtures, not
-from live host file loading. This gives the Boon model and renderer a stable,
-deterministic target before adding the Wellen bridge.
+Generated bounded fixtures are allowed only as bootstrap data for deterministic
+model and renderer development. Fixture-backed waveform data is not completion
+evidence for NovyWave.
+
+NovyWave is complete only when committed, small, real VCD, FST, and GHW test
+files are selected and read through the generic host file/stream contract, are
+parsed by the official `wellen` library, and drive the same Boon-owned model and
+view used by the playground. Functional scenarios and app-owned visual proof
+must exercise those real files. Filename branches, example-specific host
+metadata, predecoded fixture substitutions, and fixture-only acceptance are
+forbidden.
+
+The Boon source must use ordinary expressions, `SOURCE`, `HOLD`, `THEN`,
+`WHEN`, and `WHILE` with registered typed host calls. It must not introduce a
+top-level effect declaration block, manually route result variants to synthetic
+sources, or use any other syntax that is not part of the language. If the
+generic streaming contract is not implemented yet, implement that engine
+contract first rather than inventing NovyWave syntax.
+
+Every active file stream is owned by the dataflow invocation that created it.
+EOF, success, failure, timeout, and cancellation close the host resource
+automatically. Replacing or removing the producing expression, including a
+`WHILE` branch transition, cancels and drops the superseded stream. The host
+must bound outstanding chunks, drain only within an explicit bound, and use
+RAII cleanup so abandoned readers cannot retain file descriptors, buffers, or
+workers.
 
 ## Boon Data Model
 
@@ -197,7 +245,7 @@ Data rules:
 
 ## Bridge Contract
 
-The Wellen bridge should expose a small effect surface:
+The Wellen bridge exposes a small effect surface:
 
 ```text
 module: wellen.v1
@@ -206,8 +254,11 @@ open(OpenWaveformRequest) -> WaveformOpened
 hierarchy_page(HierarchyPageRequest) -> HierarchyPage
 signal_page(SignalPageRequest) -> SignalPage
 cursor_values(CursorValuesRequest) -> CursorSnapshot
-file_stats(FileStatsRequest) -> FileStats
 ```
+
+`WaveformOpened` carries bounded file statistics such as byte length, time
+bounds, scope count, signal count, timescale, and provider. There is no separate
+`file_stats` operation or fixture-only statistics path.
 
 Allowed bridge responsibilities:
 
@@ -390,12 +441,17 @@ Performance coverage:
 Bridge coverage:
 
 - successful VCD, FST, and GHW open through official `wellen`;
+- committed real VCD, FST, and GHW files, not generated decoded waveform
+  fixtures, drive functional and visual scenarios;
 - corrupted and unsupported files return diagnostics;
 - huge files return bounded pages without copying whole data into Boon;
 - stale responses are structurally rejected by Boon;
 - bridge results do not expose Rust handles or process-local ids;
 - repeated equal requests produce comparable equal Boon-visible results when
   source data is unchanged.
+- stream completion closes the reader, replacement cancels the previous reader,
+  a `WHILE` branch transition drops the inactive reader, and cancellation under
+  backpressure leaves no live host resource.
 
 ## Acceptance Criteria For The Plan Itself
 
@@ -410,3 +466,5 @@ This plan is complete when it makes the following constraints explicit:
   `todo_mvc_physical`.
 - Verification includes visual, scenario, performance, bridge, and clean-room
   checks.
+- Real-file VCD, FST, and GHW scenarios pass without invented declaration
+  syntax or example-specific host paths.

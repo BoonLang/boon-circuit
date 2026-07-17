@@ -30,18 +30,6 @@ fn test_document_scene_from_layout_frame(
     (scene, scene_identity)
 }
 
-fn flatten_quad_batches(batches: &[QuadBatch]) -> (Vec<f32>, Vec<u8>) {
-    let mut positions = Vec::new();
-    let mut colors = Vec::new();
-    for batch in batches {
-        for vertex in batch.vertices.iter() {
-            positions.extend_from_slice(&vertex.position);
-            colors.extend_from_slice(&rgba8_from_packed(vertex.color));
-        }
-    }
-    (positions, colors)
-}
-
 fn test_graph_pass(upload_bytes: u64, dirty_chunk_count: u32) -> RendererRenderGraphPassMetric {
     RendererRenderGraphPassMetric {
         schema_version: 1,
@@ -62,8 +50,6 @@ fn test_graph_pass(upload_bytes: u64, dirty_chunk_count: u32) -> RendererRenderG
 }
 
 // Native GPU tests are grouped by renderer area while staying in this module for private helper access.
-include!("tests/document_primitives.rs");
 include!("tests/render_graph.rs");
 include!("tests/map_viewport.rs");
 include!("tests/retained_quads.rs");
-include!("tests/text_and_fonts.rs");

@@ -8,7 +8,7 @@ expect_root_text = { "store.run_mode" = "Deterministic", "store.language" = "Nor
 [[step]]
 id = "open-search"
 user_action = { kind = "button_press", target = "search navigation", target_text = "Søk" }
-expected_source_event = { source = "store.elements.navigation.search", target_text = "Søk" }
+expected_source_event = { source = "store.elements.navigation.search.press", target_text = "Søk" }
 expect_root_text = { "store.search_state" = "Ready", "store.search_highlight" = "FordeStationResult" }
 
 [[step]]
@@ -20,7 +20,7 @@ expect_root_text = { "store.search_query" = "Forde", "store.search_state" = "Rea
 [[step]]
 id = "submit-deterministic-search"
 user_action = { kind = "button_press", target = "search submit", target_text = "Søk" }
-expected_source_event = { source = "store.elements.search_submit", target_text = "Søk" }
+expected_source_event = { source = "store.elements.search_submit.press", target_text = "Søk" }
 expect_root_text = { "store.search_state" = "Loading", "store.search_generation" = "1", "store.settled_search_query" = "Forde", "store.route" = "PublicMap" }
 
 [[step]]
@@ -64,43 +64,43 @@ expect_root_text = { "store.station_vehicles_state" = "Fresh" }
 [[step]]
 id = "open-vehicle-tab"
 user_action = { kind = "button_press", target = "station vehicles tab", target_text = "Kjøretøy" }
-expected_source_event = { source = "store.elements.tab.vehicles", target_text = "Kjøretøy" }
+expected_source_event = { source = "store.elements.tab.vehicles.press", target_text = "Kjøretøy" }
 expect_root_text = { "store.station_tab" = "Vehicles", "store.route" = "PublicStation" }
 
 [[step]]
 id = "open-details-tab"
 user_action = { kind = "button_press", target = "station details tab", target_text = "Detaljer" }
-expected_source_event = { source = "store.elements.tab.details", target_text = "Detaljer" }
+expected_source_event = { source = "store.elements.tab.details.press", target_text = "Detaljer" }
 expect_root_text = { "store.station_tab" = "Details" }
 
 [[step]]
 id = "return-to-departures-tab"
 user_action = { kind = "button_press", target = "station departures tab", target_text = "Avganger" }
-expected_source_event = { source = "store.elements.tab.departures", target_text = "Avganger" }
+expected_source_event = { source = "store.elements.tab.departures.press", target_text = "Avganger" }
 expect_root_text = { "store.station_tab" = "Departures" }
 
 [[step]]
 id = "toggle-to-streets"
 user_action = { kind = "button_press", target = "basemap", target_text = "Satellitt" }
-expected_source_event = { source = "store.elements.basemap", target_text = "Satellitt" }
+expected_source_event = { source = "store.elements.basemap.press", target_text = "Satellitt" }
 expect_root_text = { "store.basemap" = "Streets" }
 
 [[step]]
 id = "switch-to-english"
 user_action = { kind = "button_press", target = "language", target_text = "NO" }
-expected_source_event = { source = "store.elements.locale", target_text = "NO" }
+expected_source_event = { source = "store.elements.locale.press", target_text = "NO" }
 expect_root_text = { "store.language" = "English" }
 
 [[step]]
 id = "open-admin-status"
 user_action = { kind = "button_press", target = "admin navigation", target_text = "Admin" }
-expected_source_event = { source = "store.elements.navigation.admin", target_text = "Admin" }
+expected_source_event = { source = "store.elements.navigation.admin.press", target_text = "Admin" }
 expect_root_text = { "store.route" = "AdminStatus", "store.admin_session_state" = "Authenticated" }
 
 [[step]]
 id = "open-admin-watches"
 user_action = { kind = "button_press", target = "admin watches", target_text = "Watches" }
-expected_source_event = { source = "store.elements.admin.watches", target_text = "Watches" }
+expected_source_event = { source = "store.elements.admin.watches.press", target_text = "Watches" }
 expect_root_text = { "store.route" = "AdminWatches", "store.admin_resource_state" = "Loading" }
 
 [[step]]
@@ -111,17 +111,17 @@ expect_root_text = { "store.admin_resource_state" = "Fresh" }
 [[step]]
 id = "return-to-public-map"
 user_action = { kind = "button_press", target = "public map", target_text = "Public map" }
-expected_source_event = { source = "store.elements.admin.public_map", target_text = "Public map" }
+expected_source_event = { source = "store.elements.admin.public_map.press", target_text = "Public map" }
 expect_root_text = { "store.route" = "PublicMap" }
 
 [[step]]
 id = "expand-mobile-sheet-state"
 user_action = { kind = "button_press", target = "full sheet", target_text = "Full" }
-expected_source_event = { source = "store.elements.sheet.full", target_text = "Full" }
+expected_source_event = { source = "store.elements.sheet.full.press", target_text = "Full" }
 expect_root_text = { "store.mobile_sheet" = "Full" }
 
 [[step]]
 id = "toggle-location-follow"
 user_action = { kind = "button_press", target = "locate", target_text = "◎" }
-expected_source_event = { source = "store.elements.map.locate", target_text = "◎" }
+expected_source_event = { source = "store.elements.map.locate.press", target_text = "◎" }
 expect_root_text = { "store.map_locating" = "True" }

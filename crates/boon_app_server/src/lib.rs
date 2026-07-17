@@ -15,7 +15,6 @@ use boon_server_host::{
 };
 use fs2::FileExt;
 use ipnet::IpNet;
-use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -520,6 +519,7 @@ fn content_type(path: &str) -> &'static str {
         "html" => "text/html; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
         "json" => "application/json; charset=utf-8",
+        "cbor" => "application/cbor",
         "wasm" => "application/wasm",
         "svg" => "image/svg+xml",
         "png" => "image/png",
@@ -580,34 +580,27 @@ impl<P> ProductionProgram<P> {
     fn lifecycle_response(&self, readiness: bool) -> HttpResponse {
         let ready = self.lifecycle.is_ready();
         let status = if readiness && !ready { 503 } else { 200 };
-        let body = serde_json::to_vec(&LifecycleResponse {
-            status: if readiness {
-                if ready { "ready" } else { "not_ready" }
-            } else if self.lifecycle.is_shutting_down() {
-                "shutting_down"
-            } else {
-                "live"
-            },
-            package_id: &self.package_id,
-            source_revision: &self.source_revision,
-        })
-        .unwrap_or_else(|_| b"{\"status\":\"error\"}".to_vec());
+        let lifecycle = if readiness {
+            if ready { "ready" } else { "not_ready" }
+        } else if self.lifecycle.is_shutting_down() {
+            "shutting_down"
+        } else {
+            "live"
+        };
+        let body = format!(
+            "status={lifecycle}\npackage_id={}\nsource_revision={}\n",
+            self.package_id, self.source_revision
+        )
+        .into_bytes();
         HttpResponse {
             status,
             headers: vec![
-                Header::new("content-type", "application/json; charset=utf-8"),
+                Header::new("content-type", "text/plain; charset=utf-8"),
                 Header::new("cache-control", "no-store"),
             ],
             body,
         }
     }
-}
-
-#[derive(Serialize)]
-struct LifecycleResponse<'a> {
-    status: &'a str,
-    package_id: &'a str,
-    source_revision: &'a str,
 }
 
 #[async_trait]

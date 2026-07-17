@@ -46,13 +46,84 @@ store: [
     ]
 
     passkey: [
-        registration_succeeded: SOURCE
-        registration_cancelled: SOURCE
-        registration_failed: SOURCE
-        duplicate_credential: SOURCE
-        authentication_succeeded: SOURCE
-        authentication_cancelled: SOURCE
-        authentication_failed: SOURCE
+        registration_succeeded:
+            RegistrationNotRequested |> HOLD registration_succeeded {
+                store.elements.register_passkey |> THEN {
+                    DevelopmentPasskey/register(
+                        workspace_id: store.workspace_id
+                        workspace_grant_id: store.workspace_grant_id
+                        account_id: store.account_id
+                        credential_count: store.credential_count
+                        simulation: Success
+                    )
+                }
+            }
+        registration_cancelled:
+            RegistrationNotCancelled |> HOLD registration_cancelled {
+                store.elements.simulate_registration_cancel |> THEN {
+                    DevelopmentPasskey/register(
+                        workspace_id: store.workspace_id
+                        workspace_grant_id: store.workspace_grant_id
+                        account_id: store.account_id
+                        credential_count: store.credential_count
+                        simulation: Cancel
+                    )
+                }
+            }
+        registration_failed:
+            RegistrationNotFailed |> HOLD registration_failed {
+                store.elements.simulate_registration_failure |> THEN {
+                    DevelopmentPasskey/register(
+                        workspace_id: store.workspace_id
+                        workspace_grant_id: store.workspace_grant_id
+                        account_id: store.account_id
+                        credential_count: store.credential_count
+                        simulation: Failure
+                    )
+                }
+            }
+        duplicate_credential:
+            RegistrationNotDuplicated |> HOLD duplicate_credential {
+                store.elements.simulate_registration_duplicate |> THEN {
+                    DevelopmentPasskey/register(
+                        workspace_id: store.workspace_id
+                        workspace_grant_id: store.workspace_grant_id
+                        account_id: store.account_id
+                        credential_count: store.credential_count
+                        simulation: Duplicate
+                    )
+                }
+            }
+        authentication_succeeded:
+            AuthenticationNotRequested |> HOLD authentication_succeeded {
+                store.elements.sign_in |> THEN {
+                    DevelopmentPasskey/authenticate(
+                        account_id: store.account_id
+                        credential_count: store.credential_count
+                        simulation: Success
+                    )
+                }
+            }
+        authentication_cancelled:
+            AuthenticationNotCancelled |> HOLD authentication_cancelled {
+                store.elements.simulate_authentication_cancel |> THEN {
+                    DevelopmentPasskey/authenticate(
+                        account_id: store.account_id
+                        credential_count: store.credential_count
+                        simulation: Cancel
+                    )
+                }
+            }
+        authentication_failed:
+            AuthenticationNotFailed |> HOLD authentication_failed {
+                store.elements.simulate_authentication_failure |> THEN {
+                    DevelopmentPasskey/authenticate(
+                        account_id: store.account_id
+                        credential_count: store.credential_count
+                        simulation: Failure
+                    )
+                }
+            }
     ]
 
     workspace_id:
@@ -193,20 +264,10 @@ store: [
 
     registered_credential:
         passkey.registration_succeeded |> THEN {
-            credential_descriptors
-            |> List/any(credential, if:
-                credential.credential_id == passkey.registration_succeeded.credential_id
-            )
-            |> WHEN {
-                True => SKIP
-                False => credential_count >= 2 |> WHEN {
-                    True => SKIP
-                    False => [
-                        credential_id: passkey.registration_succeeded.credential_id
-                        label: passkey.registration_succeeded.label
-                    ]
-                }
-            }
+            [
+                credential_id: passkey.registration_succeeded.credential_id
+                label: passkey.registration_succeeded.label
+            ]
         }
 
     credential_descriptors:
@@ -404,112 +465,6 @@ store: [
                 }
             }
         }
-]
-
-effects: [
-    register_passkey: [
-        on: store.elements.register_passkey
-        perform: DevelopmentPasskey/register(
-            workspace_id: store.workspace_id
-            workspace_grant_id: store.workspace_grant_id
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: Success
-        )
-        results: [
-            RegistrationSucceeded: store.passkey.registration_succeeded
-            RegistrationCancelled: store.passkey.registration_cancelled
-            RegistrationFailed: store.passkey.registration_failed
-            DuplicateCredential: store.passkey.duplicate_credential
-        ]
-    ]
-    register_passkey_cancel: [
-        on: store.elements.simulate_registration_cancel
-        perform: DevelopmentPasskey/register(
-            workspace_id: store.workspace_id
-            workspace_grant_id: store.workspace_grant_id
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: Cancel
-        )
-        results: [
-            RegistrationSucceeded: store.passkey.registration_succeeded
-            RegistrationCancelled: store.passkey.registration_cancelled
-            RegistrationFailed: store.passkey.registration_failed
-            DuplicateCredential: store.passkey.duplicate_credential
-        ]
-    ]
-    register_passkey_failure: [
-        on: store.elements.simulate_registration_failure
-        perform: DevelopmentPasskey/register(
-            workspace_id: store.workspace_id
-            workspace_grant_id: store.workspace_grant_id
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: Failure
-        )
-        results: [
-            RegistrationSucceeded: store.passkey.registration_succeeded
-            RegistrationCancelled: store.passkey.registration_cancelled
-            RegistrationFailed: store.passkey.registration_failed
-            DuplicateCredential: store.passkey.duplicate_credential
-        ]
-    ]
-    register_passkey_duplicate: [
-        on: store.elements.simulate_registration_duplicate
-        perform: DevelopmentPasskey/register(
-            workspace_id: store.workspace_id
-            workspace_grant_id: store.workspace_grant_id
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: Duplicate
-        )
-        results: [
-            RegistrationSucceeded: store.passkey.registration_succeeded
-            RegistrationCancelled: store.passkey.registration_cancelled
-            RegistrationFailed: store.passkey.registration_failed
-            DuplicateCredential: store.passkey.duplicate_credential
-        ]
-    ]
-    authenticate: [
-        on: store.elements.sign_in
-        perform: DevelopmentPasskey/authenticate(
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: Success
-        )
-        results: [
-            AuthenticationSucceeded: store.passkey.authentication_succeeded
-            AuthenticationCancelled: store.passkey.authentication_cancelled
-            AuthenticationFailed: store.passkey.authentication_failed
-        ]
-    ]
-    authenticate_cancel: [
-        on: store.elements.simulate_authentication_cancel
-        perform: DevelopmentPasskey/authenticate(
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: Cancel
-        )
-        results: [
-            AuthenticationSucceeded: store.passkey.authentication_succeeded
-            AuthenticationCancelled: store.passkey.authentication_cancelled
-            AuthenticationFailed: store.passkey.authentication_failed
-        ]
-    ]
-    authenticate_failure: [
-        on: store.elements.simulate_authentication_failure
-        perform: DevelopmentPasskey/authenticate(
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: Failure
-        )
-        results: [
-            AuthenticationSucceeded: store.passkey.authentication_succeeded
-            AuthenticationCancelled: store.passkey.authentication_cancelled
-            AuthenticationFailed: store.passkey.authentication_failed
-        ]
-    ]
 ]
 
 scene: App/main_scene(PASS: [store: store])

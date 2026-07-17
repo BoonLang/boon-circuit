@@ -8,6 +8,8 @@ pub enum NativeHostError {
     InvalidConfig(&'static str),
     HostAlreadyOpen,
     WindowEventsAlreadyTaken,
+    EventPumpStart(String),
+    EventAdapterPoisoned,
     EventQueueOverflow,
     EventSourceClosed,
     MissingPointerPosition(&'static str),
@@ -46,6 +48,12 @@ impl Display for NativeHostError {
             }
             Self::WindowEventsAlreadyTaken => {
                 formatter.write_str("app_window surface events were already taken")
+            }
+            Self::EventPumpStart(error) => {
+                write!(formatter, "failed to start native event pump: {error}")
+            }
+            Self::EventAdapterPoisoned => {
+                formatter.write_str("native event adapter lock was poisoned")
             }
             Self::EventQueueOverflow => {
                 formatter.write_str("app_window event queue overflowed; input order is lost")

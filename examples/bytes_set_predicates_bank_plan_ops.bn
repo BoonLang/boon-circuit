@@ -22,7 +22,7 @@ store: [
     patched:
         BYTES[4] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: 16uAA) }
+                store.patch |> THEN { left_payload |> Bytes/set(index: 2, value: BYTES[1] { 16uAA }) }
             }
         }
     same:

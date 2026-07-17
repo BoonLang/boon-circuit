@@ -1,14 +1,13 @@
 use crate::{
-    APP_MANIFEST_FORMAT, AppManifest, ArtifactDescriptor, BUNDLE_FORMAT, BUNDLE_MANIFEST_FILE,
+    AppManifest, ArtifactDescriptor, BUNDLE_FORMAT, BUNDLE_MANIFEST_FILE, BrowserAppConfig,
     BundleFileDescriptor, BundleFileKind, BundleManifest, MAX_PACKAGE_FILE_BYTES, NamespaceProfile,
     PackageError, PackageFileManifest, ProgramManifest, RunMode, StaticCachePolicy, sha256_bytes,
 };
 use boon_plan::{ApplicationIdentity, ProgramRole};
 use boon_runtime::{
     ProgramArtifact, ProgramCompileRequest, RuntimeSourceUnit,
-    compile_trusted_package_program_artifact,
+    compile_trusted_package_distributed_program_bundle,
 };
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -138,24 +137,67 @@ fn build_into(
 ) -> Result<BundleManifest, PackageError> {
     let mut files = Vec::new();
     let mut targets = BTreeSet::new();
-    let document = compile_program(
+    let client = prepare_program(
         app,
-        &app.programs.document,
+        &app.programs.client,
         manifest_dir,
         workspace_root,
         namespace_profile,
     )?;
-    let server = compile_program(
+    let session = prepare_program(
+        app,
+        &app.programs.session,
+        manifest_dir,
+        workspace_root,
+        namespace_profile,
+    )?;
+    let server = prepare_program(
         app,
         &app.programs.server,
         manifest_dir,
         workspace_root,
         namespace_profile,
     )?;
-    let document_descriptor = write_artifact(
+    let bundle = compile_trusted_package_distributed_program_bundle(&[
+        client.request.clone(),
+        session.request.clone(),
+        server.request.clone(),
+    ])
+    .map_err(|error| PackageError::context("compile linked distributed program", error))?;
+    let client = client.into_compiled(
+        bundle
+            .artifact(ProgramRole::Client)
+            .expect("linked bundle has Client")
+            .clone(),
+        &app.programs.client,
+    )?;
+    let session = session.into_compiled(
+        bundle
+            .artifact(ProgramRole::Session)
+            .expect("linked bundle has Session")
+            .clone(),
+        &app.programs.session,
+    )?;
+    let server = server.into_compiled(
+        bundle
+            .artifact(ProgramRole::Server)
+            .expect("linked bundle has Server")
+            .clone(),
+        &app.programs.server,
+    )?;
+    let client_descriptor = write_artifact(
         output,
-        &app.programs.document,
-        document,
+        &app.programs.client,
+        client,
+        app.package.protocol_version,
+        namespace_profile,
+        &mut files,
+        &mut targets,
+    )?;
+    let session_descriptor = write_artifact(
+        output,
+        &app.programs.session,
+        session,
         app.package.protocol_version,
         namespace_profile,
         &mut files,
@@ -175,7 +217,7 @@ fn build_into(
         app,
         browser_wasm,
         output,
-        &document_descriptor,
+        &client_descriptor,
         &mut files,
         &mut targets,
     )?;
@@ -250,14 +292,16 @@ fn build_into(
         run_mode,
         namespace_profile,
         protocol_version: app.package.protocol_version,
-        artifacts: vec![document_descriptor, server_descriptor],
+        artifacts: vec![client_descriptor, session_descriptor, server_descriptor],
         files,
         browser: app.browser.clone(),
         http: app.http.clone(),
         environment: app.environment.clone(),
     };
     bundle.validate()?;
-    let bundle_bytes = serde_json::to_vec_pretty(&bundle)?;
+    let mut bundle_bytes = Vec::new();
+    ciborium::into_writer(&bundle, &mut bundle_bytes)
+        .map_err(|error| PackageError::context("encode bundle manifest", error))?;
     fs::write(output.join(BUNDLE_MANIFEST_FILE), bundle_bytes)?;
     Ok(bundle)
 }
@@ -267,13 +311,40 @@ struct CompiledProgram {
     source_bundle_sha256: String,
 }
 
-fn compile_program(
+struct PreparedProgram {
+    request: ProgramCompileRequest,
+    source_bundle_sha256: String,
+}
+
+impl PreparedProgram {
+    fn into_compiled(
+        self,
+        artifact: ProgramArtifact,
+        program: &ProgramManifest,
+    ) -> Result<CompiledProgram, PackageError> {
+        if artifact.role() != program.role
+            || artifact.capability_profile() != program.capability_profile
+            || artifact.plan().target_profile != program.target_profile
+        {
+            return Err(PackageError::new(format!(
+                "compiled {} artifact does not match the declared role/profile contract",
+                program.role.as_str()
+            )));
+        }
+        Ok(CompiledProgram {
+            artifact,
+            source_bundle_sha256: self.source_bundle_sha256,
+        })
+    }
+}
+
+fn prepare_program(
     app: &AppManifest,
     program: &ProgramManifest,
     manifest_dir: &Path,
     workspace_root: &Path,
     namespace_profile: NamespaceProfile,
-) -> Result<CompiledProgram, PackageError> {
+) -> Result<PreparedProgram, PackageError> {
     let mut source_by_declared_path = BTreeMap::new();
     let mut units = Vec::new();
     for declared in &program.sources {
@@ -299,6 +370,7 @@ fn compile_program(
     let source_bundle_sha256 = source_bundle_digest(&units);
     let request = ProgramCompileRequest {
         revision: PROGRAM_ARTIFACT_REVISION,
+        role: program.role,
         entry_path,
         units,
         application: ApplicationIdentity::new(
@@ -308,19 +380,8 @@ fn compile_program(
         ),
         capability_profile: program.capability_profile,
     };
-    let artifact = compile_trusted_package_program_artifact(&request)
-        .map_err(|error| PackageError::context("compile trusted program artifact", error))?;
-    if artifact.role() != program.role
-        || artifact.capability_profile() != program.capability_profile
-        || artifact.plan().target_profile != program.target_profile
-    {
-        return Err(PackageError::new(format!(
-            "compiled {} artifact does not match the declared role/profile contract",
-            program.role.as_str()
-        )));
-    }
-    Ok(CompiledProgram {
-        artifact,
+    Ok(PreparedProgram {
+        request,
         source_bundle_sha256,
     })
 }
@@ -355,7 +416,7 @@ fn write_artifact(
         kind: BundleFileKind::ProgramArtifact,
         bytes_sha256: bytes_sha256.clone(),
         bytes_len: content.bytes.len(),
-        public: program.role == ProgramRole::Document,
+        public: program.role == ProgramRole::Client,
         cache: StaticCachePolicy::Immutable,
     });
     Ok(ArtifactDescriptor {
@@ -382,7 +443,7 @@ fn generate_browser_assets(
     app: &AppManifest,
     browser_wasm: &Path,
     output: &Path,
-    document: &ArtifactDescriptor,
+    client: &ArtifactDescriptor,
     files: &mut Vec<BundleFileDescriptor>,
     targets: &mut BTreeSet<String>,
 ) -> Result<(), PackageError> {
@@ -412,19 +473,16 @@ fn generate_browser_assets(
         .generate(output)
         .map_err(|error| PackageError::context("compile browser Wasm bindings", error))?;
 
-    let app_config = BrowserAppConfig {
-        format: APP_MANIFEST_FORMAT,
-        package_id: &app.package.id,
-        protocol_version: app.package.protocol_version,
-        client_artifact_path: format!("/{}", document.path),
-        client_artifact_id: &document.content_artifact_id,
-        client_artifact_sha256: &document.bytes_sha256,
-        canvas_id: &app.browser.canvas_id,
-    };
-    let app_config_bytes = serde_json::to_vec_pretty(&app_config)?;
+    let app_config = BrowserAppConfig::for_client(
+        &app.package.id,
+        app.package.protocol_version,
+        &app.browser.canvas_id,
+        client,
+    )?;
+    let app_config_bytes = app_config.encode()?;
     write_generated_public_file(
         output,
-        "boon-app.json",
+        "boon-app.cbor",
         &app_config_bytes,
         StaticCachePolicy::Revalidate,
         files,
@@ -467,17 +525,6 @@ fn generate_browser_assets(
         )?;
     }
     Ok(())
-}
-
-#[derive(Serialize)]
-struct BrowserAppConfig<'a> {
-    format: u32,
-    package_id: &'a str,
-    protocol_version: u32,
-    client_artifact_path: String,
-    client_artifact_id: &'a str,
-    client_artifact_sha256: &'a str,
-    canvas_id: &'a str,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -722,8 +769,8 @@ fn browser_loader(wasm_output_name: &str) -> String {
     format!(
         "import init, * as host from '/{wasm_output_name}.js';\n\
 const unsupported = document.getElementById('boon-unsupported');\n\
-try {{\n  const app = await fetch('/boon-app.json', {{cache:'no-store'}}).then(r => {{\n\
-    if (!r.ok) throw new Error(`package metadata ${{r.status}}`); return r.json(); }});\n\
+try {{\n  const app = await fetch('/boon-app.cbor', {{cache:'no-store'}}).then(async r => {{\n\
+    if (!r.ok) throw new Error(`package metadata ${{r.status}}`); return new Uint8Array(await r.arrayBuffer()); }});\n\
   await init('/{wasm_output_name}_bg.wasm');\n\
   if (typeof host.start_boon_app !== 'function') throw new Error('browser host startup export is unavailable');\n\
   await host.start_boon_app(app);\n\

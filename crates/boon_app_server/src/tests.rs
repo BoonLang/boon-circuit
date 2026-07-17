@@ -293,7 +293,7 @@ async fn static_cache_spa_lifecycle_and_program_routes_share_one_host() {
         .await
         .unwrap();
     assert_eq!(ready.status(), 200);
-    assert!(ready.text().await.unwrap().contains("\"status\":\"ready\""));
+    assert!(ready.text().await.unwrap().contains("status=ready"));
 
     let (mut socket, _) =
         tokio_tungstenite::connect_async(format!("ws://{}/ws", running.local_addr()))

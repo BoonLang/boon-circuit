@@ -13,7 +13,7 @@ store: [
     encoded_len:
         0 |> HOLD encoded_len {
             LATEST {
-                store.decode |> THEN { store.encoded |> Bytes/length }
+                store.decode |> THEN { store.encoded |> Bytes/length() }
             }
         }
     decoded:

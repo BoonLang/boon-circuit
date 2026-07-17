@@ -1,36 +1,28 @@
 store: [
     request: SOURCE
-    succeeded: SOURCE
-    failed: SOURCE
 
-    last_status:
-        0 |> HOLD last_status {
-            LATEST {
-                succeeded.status |> THEN { succeeded.status }
-                failed.code |> THEN { 0 }
+    response:
+        NotRequested |> HOLD response {
+            request |> THEN {
+                Http/request(
+                    endpoint: request.endpoint
+                    method: request.method
+                    path_segments: request.path_segments
+                    query: request.query
+                    headers: request.headers
+                    body: request.body
+                    connect_timeout_ms: request.connect_timeout_ms
+                    overall_timeout_ms: request.overall_timeout_ms
+                    cancellation: request.cancellation
+                )
             }
         }
-]
 
-effects: [
-    fetch_resource: [
-        on: store.request
-        perform: Http/request(
-            endpoint: store.request.endpoint
-            method: store.request.method
-            path_segments: store.request.path_segments
-            query: store.request.query
-            headers: store.request.headers
-            body: store.request.body
-            connect_timeout_ms: store.request.connect_timeout_ms
-            overall_timeout_ms: store.request.overall_timeout_ms
-            cancellation: store.request.cancellation
-        )
-        results: [
-            HttpSucceeded: store.succeeded
-            HttpFailed: store.failed
-        ]
-    ]
+    last_status:
+        response |> WHEN {
+            HttpSucceeded => response.status
+            __ => 0
+        }
 ]
 
 outputs: [

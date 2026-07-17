@@ -21,11 +21,11 @@ FUNCTION row_widget(row) {
         payload_len:
             0 |> HOLD payload_len {
                 LATEST {
-                    inspect |> THEN { payload |> Bytes/length }
+                    inspect |> THEN { payload |> Bytes/length() }
                 }
             }
         payload_second:
-            16u00 |> HOLD payload_second {
+            BYTES[1] { 16u00 } |> HOLD payload_second {
                 LATEST {
                     inspect |> THEN { payload |> Bytes/get(index: 1) }
                 }

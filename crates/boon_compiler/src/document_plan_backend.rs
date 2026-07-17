@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn compile_document_plan(
     program: &TypedProgram,
     executable_fields: &BTreeSet<FieldId>,
+    distributed_expression_refs: &BTreeMap<usize, ValueRef>,
 ) -> Result<Option<DocumentPlan>, PlanError> {
     let mut roots = program.output_values.iter().filter(|output| {
         matches!(
@@ -22,7 +23,7 @@ pub(super) fn compile_document_plan(
             "MachinePlan can contain only one document or scene output root",
         ));
     }
-    DocumentCompiler::new(program, executable_fields)?
+    DocumentCompiler::new(program, executable_fields, distributed_expression_refs)?
         .compile(output)
         .map(Some)
 }
@@ -64,6 +65,7 @@ struct SourceGroupNode {
 
 struct DocumentCompiler<'a> {
     program: &'a TypedProgram,
+    distributed_expression_refs: &'a BTreeMap<usize, ValueRef>,
     globals: BTreeMap<String, GlobalValue>,
     global_aliases: BTreeMap<String, Option<GlobalValue>>,
     scoped_fields: BTreeMap<(ScopeId, String), FieldId>,
@@ -90,6 +92,7 @@ impl<'a> DocumentCompiler<'a> {
     fn new(
         program: &'a TypedProgram,
         executable_fields: &BTreeSet<FieldId>,
+        distributed_expression_refs: &'a BTreeMap<usize, ValueRef>,
     ) -> Result<Self, PlanError> {
         let mut globals = BTreeMap::new();
         for source in &program.sources {
@@ -230,6 +233,7 @@ impl<'a> DocumentCompiler<'a> {
 
         Ok(Self {
             program,
+            distributed_expression_refs,
             globals,
             global_aliases,
             scoped_fields,
@@ -475,18 +479,6 @@ impl<'a> DocumentCompiler<'a> {
                 }
                 return self.compile_record_children(&statement.children, context, statement.id);
             }
-            AstStatementKind::Source { field: Some(_), .. }
-                if matches!(
-                    statement.expr.and_then(|id| self.program.expressions.get(id)),
-                    Some(expr) if matches!(expr.kind, AstExprKind::Source)
-                ) =>
-            {
-                return Ok(self.push_expr(
-                    statement.expr.unwrap_or(statement.id),
-                    DocumentValueClass::DynamicScalar,
-                    DocumentExprOp::SourceContext,
-                ));
-            }
             AstStatementKind::Function { .. } => {
                 return self.compile_block(&statement.children, context, statement.id);
             }
@@ -545,9 +537,9 @@ impl<'a> DocumentCompiler<'a> {
                     DocumentConstantValue::Number { coefficient, scale },
                 ))
             }
-            AstExprKind::ByteLiteral { value, .. } => {
-                Ok(self.constant_expr(expr_id, DocumentConstantValue::Byte { value }))
-            }
+            AstExprKind::ByteLiteral { value, .. } => Ok(
+                self.constant_expr(expr_id, DocumentConstantValue::Bytes { value: vec![value] })
+            ),
             AstExprKind::Bool(value) => {
                 Ok(self.constant_expr(expr_id, DocumentConstantValue::Bool { value }))
             }
@@ -555,10 +547,8 @@ impl<'a> DocumentCompiler<'a> {
             AstExprKind::TaggedObject { tag, fields } => {
                 self.compile_record_expr(expr_id, Some(tag), &fields, children, context)
             }
-            AstExprKind::Source => Ok(self.push_expr(
-                expr_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::SourceContext,
+            AstExprKind::Source => Err(PlanError::new(
+                "bare SOURCE is not a document value; pass a declared source through an Element constructor's element.events field",
             )),
             AstExprKind::Call { function, args } => {
                 self.compile_call(expr_id, &function, &args, children, context, None)
@@ -739,28 +729,6 @@ impl<'a> DocumentCompiler<'a> {
         context: &CompileContext,
         input: Option<DocumentExprId>,
     ) -> Result<DocumentExprId, PlanError> {
-        if function == "SOURCE" {
-            let input = input.ok_or_else(|| {
-                PlanError::new(format!(
-                    "SOURCE binding expression {expr_id} has no element input"
-                ))
-            })?;
-            let source_arg = args
-                .first()
-                .map(|arg| arg.value)
-                .or_else(|| children.iter().find_map(|child| child.expr))
-                .ok_or_else(|| {
-                    PlanError::new(format!(
-                        "SOURCE binding expression {expr_id} has no typed source"
-                    ))
-                })?;
-            let source = self.compile_expr_with_children(source_arg, &[], context, None)?;
-            return Ok(self.push_expr(
-                expr_id,
-                DocumentValueClass::Render,
-                DocumentExprOp::BindSource { input, source },
-            ));
-        }
         if let Some(field) = function.strip_prefix("Field/") {
             let input = input
                 .or_else(|| {
@@ -1289,6 +1257,25 @@ impl<'a> DocumentCompiler<'a> {
             last_arm_context = Some(arm_context);
         }
         if arms.is_empty() {
+            for arm_expr in inline_select_arm_expr_ids(self.program, expr_id) {
+                let AstExprKind::MatchArm { pattern, .. } = self.expr_kind(arm_expr)? else {
+                    continue;
+                };
+                let pattern = pattern.clone();
+                let mut arm_context = context.clone();
+                arm_context.pattern_bindings.extend(
+                    pattern_binding_names(&pattern)
+                        .into_iter()
+                        .map(|name| (name, expr_id)),
+                );
+                let output = self.compile_expr_with_children(arm_expr, &[], &arm_context, None)?;
+                arms.push(DocumentSelectArm {
+                    pattern: self.compile_pattern(&pattern)?,
+                    output,
+                });
+            }
+        }
+        if arms.is_empty() {
             return Err(PlanError::new(format!(
                 "conditional expression {expr_id} has no typed arms"
             )));
@@ -1541,13 +1528,6 @@ impl<'a> DocumentCompiler<'a> {
                 DocumentExprOp::NoElement,
             ));
         }
-        if value == "SOURCE" {
-            return Ok(self.push_expr(
-                expr_id,
-                DocumentValueClass::DynamicScalar,
-                DocumentExprOp::SourceContext,
-            ));
-        }
         if value.chars().next().is_some_and(char::is_uppercase) {
             return self.compile_tag(expr_id, value);
         }
@@ -1581,6 +1561,19 @@ impl<'a> DocumentCompiler<'a> {
             return Err(PlanError::new(format!(
                 "document expression {expr_id} has an empty path"
             )));
+        }
+        if let Some(ValueRef::DistributedImport(import)) =
+            self.distributed_expression_refs.get(&expr_id)
+        {
+            let expression = self.push_expr(
+                expr_id,
+                DocumentValueClass::DynamicScalar,
+                DocumentExprOp::Read {
+                    read: DocumentRead::DistributedImport { import: *import },
+                },
+            );
+            self.record_compiled_path(context, path, expression);
+            return Ok(expression);
         }
         let explicit_passed = parts.first() == Some(&"PASSED");
         let stripped = parts.strip_prefix(&["PASSED"]).unwrap_or(parts.as_slice());
@@ -2005,8 +1998,8 @@ impl<'a> DocumentCompiler<'a> {
                     })
                     .ok_or_else(|| {
                         PlanError::new(format!(
-                            "view binding {} has no typed SourceId, FieldId, StateId, ListId, or expression",
-                            binding.id.0
+                            "view binding {} (`{}` attribute `{}`, scope {:?}) has no typed SourceId, FieldId, StateId, ListId, or expression",
+                            binding.id.0, binding.path, binding.attr, binding.scope_id
                         ))
                     })?;
                 DocumentBindingTarget::Expression { expression }
@@ -2232,6 +2225,34 @@ impl<'a> DocumentCompiler<'a> {
                 .or_insert(expression);
         }
     }
+}
+
+fn inline_select_arm_expr_ids(program: &TypedProgram, expr_id: usize) -> Vec<usize> {
+    let Some(select) = program.expressions.iter().find(|expr| expr.id == expr_id) else {
+        return Vec::new();
+    };
+    let candidates = program
+        .expressions
+        .iter()
+        .filter(|candidate| {
+            candidate.start >= select.start
+                && candidate.end <= select.end
+                && matches!(candidate.kind, AstExprKind::MatchArm { .. })
+        })
+        .collect::<Vec<_>>();
+    let mut direct = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidates.iter().any(|parent| {
+                parent.id != candidate.id
+                    && parent.start <= candidate.start
+                    && candidate.end <= parent.end
+            })
+        })
+        .collect::<Vec<_>>();
+    direct.sort_by_key(|arm| arm.start);
+    direct.into_iter().map(|arm| arm.id).collect()
 }
 
 fn parameter_id(

@@ -232,11 +232,16 @@ outputs: [
             method: store.request_method
             query: store.search_query
         ) + 0
+        headers: LIST {
+            [name: TEXT { content-type }, value: TEXT { application/json }]
+        }
         body: public_http_body(
             path: store.request_path
             method: store.request_method
             query: store.search_query
-        ) |> Text/trim()
+        )
+            |> Text/trim()
+            |> Text/to_bytes(encoding: Utf8)
     ]
 ]
 

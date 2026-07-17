@@ -1,6 +1,50 @@
 // Included by `../tests.rs`; kept in the parent test module for private IR helper access.
 
 #[test]
+fn bytes_set_lowers_a_fixed_single_byte_value() {
+    let parsed = boon_parser::parse_source(
+        "bytes-set-fixed-single-byte.bn",
+        r#"
+SOURCE
+HOLD
+LATEST
+LIST {}
+
+store: [
+    payload: BYTES[2] { 16u01, 16u02 }
+    patch: SOURCE
+    patched:
+        BYTES[2] {} |> HOLD patched {
+            LATEST {
+                store.patch |> THEN {
+                    store.payload |> Bytes/set(index: 1, value: BYTES[1] { 16u5A })
+                }
+            }
+        }
+]
+
+document: Document/new(root: Element/label(element: [], label: TEXT { Bytes }))
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).unwrap();
+    let branch = ir
+        .update_branches
+        .iter()
+        .find(|branch| branch.target == "store.patched")
+        .expect("missing Bytes/set update branch");
+
+    assert_eq!(
+        branch.expression,
+        UpdateExpression::BytesSet {
+            path: "store.payload".to_owned(),
+            index: 1,
+            value: 0x5A,
+        }
+    );
+}
+
+#[test]
 fn bytes_encoding_update_expressions_lower_from_pipe_and_call_forms() {
     let parsed = boon_parser::parse_source(
         "examples/bytes_encoding_plan_ops.bn",
@@ -139,7 +183,7 @@ text: TEXT { hi }
 encoded:
     BYTES {} |> HOLD encoded {
         LATEST {
-            store.encode |> THEN { store.text |> Text/to_bytes }
+            store.encode |> THEN { store.text |> Text/to_bytes() }
         }
     }
 ]
@@ -304,5 +348,3 @@ fn lower_rejects_duplicate_direct_latest_source_branches() {
         "duplicate LATEST error should identify the source trigger: {error}"
     );
 }
-
-

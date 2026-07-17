@@ -23,6 +23,7 @@ outputs: [
         status: 200
         body: store.request_method
             |> Text/concat(with: store.first_path_segment, separator: ":")
+            |> Text/to_bytes(encoding: Utf8)
     ]
 ]
 

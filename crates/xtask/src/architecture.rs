@@ -683,9 +683,10 @@ fn rust_file_line_counts(path: &str, bytes: &[u8]) -> Result<RustFileLineCounts,
     let source = std::str::from_utf8(bytes)
         .map_err(|error| format!("Rust source `{path}` is not UTF-8: {error}"))?;
     let lines = source.lines().collect::<Vec<_>>();
-    let inline_test_start = lines
-        .windows(2)
-        .rposition(|pair| pair[0].trim() == "#[cfg(test)]" && pair[1].trim() == "mod tests {");
+    let inline_test_start = lines.windows(2).rposition(|pair| {
+        let module = pair[1].trim();
+        pair[0].trim() == "#[cfg(test)]" && module.starts_with("mod ") && module.ends_with(" {")
+    });
     let tests = inline_test_start.map_or(0, |start| total.saturating_sub(start));
     Ok(RustFileLineCounts {
         total,
@@ -698,6 +699,7 @@ fn is_test_path(path: &str) -> bool {
     path.contains("/tests/")
         || path.ends_with("/tests.rs")
         || path.ends_with("_test.rs")
+        || path.ends_with("_tests.rs")
         || path.starts_with("tests/")
 }
 
@@ -752,31 +754,4 @@ fn bounded_list(values: &[String]) -> String {
         text.push_str(&format!(", and {} more", values.len() - 12));
     }
     text
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rust_line_counts_partition_trailing_inline_tests_once() {
-        let source =
-            b"fn product() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn works() {}\n}\n";
-        assert_eq!(
-            rust_file_line_counts("crates/example/src/lib.rs", source).unwrap(),
-            RustFileLineCounts {
-                total: 7,
-                tests: 5,
-                production: 2,
-            }
-        );
-        assert_eq!(
-            rust_file_line_counts("crates/example/tests/public.rs", source).unwrap(),
-            RustFileLineCounts {
-                total: 7,
-                tests: 7,
-                production: 0,
-            }
-        );
-    }
 }

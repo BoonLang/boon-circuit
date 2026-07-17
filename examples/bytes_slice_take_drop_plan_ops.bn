@@ -25,11 +25,11 @@ store: [
     sliced_len:
         0 |> HOLD sliced_len {
             LATEST {
-                store.inspect |> THEN { store.sliced |> Bytes/length }
+                store.inspect |> THEN { store.sliced |> Bytes/length() }
             }
         }
     taken_byte:
-        16u00 |> HOLD taken_byte {
+        BYTES[1] { 16u00 } |> HOLD taken_byte {
             LATEST {
                 store.inspect |> THEN { store.taken |> Bytes/get(index: 3) }
             }

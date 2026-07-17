@@ -67,12 +67,14 @@ FUNCTION public_top_bar() {
                 label: FjordPulseModel/language_code(language: PASSED.store.language)
                 selected: False
                 width: 52
-            ) |> SOURCE { PASSED.store.elements.locale }
+                events: PASSED.store.elements.locale.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/basemap_label(basemap: PASSED.store.basemap, language: PASSED.store.language)
                 selected: PASSED.store.basemap == Satellite
                 width: 96
-            ) |> SOURCE { PASSED.store.elements.basemap }
+                events: PASSED.store.elements.basemap.events
+            )
         }
     )
 }
@@ -132,14 +134,15 @@ FUNCTION desktop_rail() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Kart }, english: TEXT { Map })
                 selected: True
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.navigation.map }
+                events: PASSED.store.elements.navigation.map.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Søk }, english: TEXT { Search })
                 selected: PASSED.store.search_state != Closed
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.navigation.search }
-            FjordPulseComponents/button(label: TEXT { Admin }, selected: False, width: Fill)
-                |> SOURCE { PASSED.store.elements.navigation.admin }
+                events: PASSED.store.elements.navigation.search.events
+            )
+            FjordPulseComponents/button(label: TEXT { Admin }, selected: False, width: Fill, events: PASSED.store.elements.navigation.admin.events)
             Scene/Element/text(element: [], style: [width: Fill, height: Fill, paint: False], text: Text/empty())
             Scene/Element/text(element: [], style: [width: Fill, height: 44, center: True, color: FjordPulseTheme/text_on_chrome_muted(), size: 10], text: TEXT { dd6e750 })
         }
@@ -173,10 +176,7 @@ FUNCTION search_bar() {
         ]
         items: LIST {
             Scene/Element/text_input(
-                element: [event: [
-                    change: PASSED.store.elements.search.change
-                    key_down: PASSED.store.elements.search.key_down
-                ]]
+                element: [events: PASSED.store.elements.search.events]
                 style: [
                     width: Fill
                     height: 42
@@ -207,7 +207,8 @@ FUNCTION search_bar() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Søk }, english: TEXT { Search })
                 selected: PASSED.store.search_state == Loading
                 width: 82
-            ) |> SOURCE { PASSED.store.elements.search_submit }
+                events: PASSED.store.elements.search_submit.events
+            )
         }
     )
 }
@@ -258,8 +259,7 @@ FUNCTION search_ready() {
                 norwegian: TEXT { Utforsk Norge med holdeplass, sted, linje eller kjent kjøretøy. }
                 english: TEXT { Explore Norway by station, place, line, or known vehicle. }
             ))
-            FjordPulseComponents/icon_button(label: TEXT { × }, selected: False)
-                |> SOURCE { PASSED.store.elements.search_close }
+            FjordPulseComponents/icon_button(label: TEXT { × }, selected: False, events: PASSED.store.elements.search_close.events)
         }
     )
 }
@@ -293,25 +293,29 @@ FUNCTION search_results(stale) {
                 detail: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Holdeplass · Vestland }, english: TEXT { Station · Vestland })
                 kind: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Holdeplass }, english: TEXT { Station })
                 selected: PASSED.store.search_highlight == FordeStationResult
-            ) |> SOURCE { PASSED.store.elements.search_result.forde_station }
+                events: PASSED.store.elements.search_result.forde_station.events
+            )
             FjordPulseComponents/search_option(
                 title: TEXT { Førde ferjekai }
                 detail: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Ferjeterminal · Vestland }, english: TEXT { Ferry terminal · Vestland })
                 kind: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Holdeplass }, english: TEXT { Station })
                 selected: PASSED.store.search_highlight == FordeFerryResult
-            ) |> SOURCE { PASSED.store.elements.search_result.forde_ferry }
+                events: PASSED.store.elements.search_result.forde_ferry.events
+            )
             FjordPulseComponents/search_option(
                 title: TEXT { Førde sentrum }
                 detail: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Sted · Sunnfjord }, english: TEXT { Place · Sunnfjord })
                 kind: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Sted }, english: TEXT { Place })
                 selected: PASSED.store.search_highlight == FordePlaceResult
-            ) |> SOURCE { PASSED.store.elements.search_result.forde_place }
+                events: PASSED.store.elements.search_result.forde_place.events
+            )
             FjordPulseComponents/search_option(
                 title: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Linje 100 }, english: TEXT { Line 100 })
                 detail: TEXT { Førde · Sandane · Nordfjordeid }
                 kind: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Linje }, english: TEXT { Line })
                 selected: PASSED.store.search_highlight == Line100Result
-            ) |> SOURCE { PASSED.store.elements.search_result.line_100 }
+                events: PASSED.store.elements.search_result.line_100.events
+            )
             Scene/Element/stripe(
                 element: []
                 direction: Row
@@ -352,12 +356,14 @@ FUNCTION search_state_panel(status, title, message, retry) {
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv igjen }, english: TEXT { Retry })
                             selected: False
                             width: Fill
-                        ) |> SOURCE { PASSED.store.elements.search_retry }
+                            events: PASSED.store.elements.search_retry.events
+                        )
                         FjordPulseComponents/button(
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Lukk }, english: TEXT { Close })
                             selected: False
                             width: 92
-                        ) |> SOURCE { PASSED.store.elements.search_close }
+                            events: PASSED.store.elements.search_close.events
+                        )
                     }
                 )
                 False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
@@ -450,12 +456,14 @@ FUNCTION place_context_panel(width) {
                 label: TEXT { Førde rutebilstasjon }
                 selected: False
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.station.forde }
+                events: PASSED.store.elements.station.forde.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Tilbake til Norgeskartet }, english: TEXT { Back to Norway map })
                 selected: False
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.navigation.map }
+                events: PASSED.store.elements.navigation.map.events
+            )
         }
     )
 }
@@ -492,12 +500,14 @@ FUNCTION line_context_panel(width) {
                 label: TEXT { Førde rutebilstasjon }
                 selected: False
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.station.forde }
+                events: PASSED.store.elements.station.forde.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Tilbake til kartet }, english: TEXT { Back to map })
                 selected: False
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.navigation.map }
+                events: PASSED.store.elements.navigation.map.events
+            )
         }
     )
 }
@@ -532,8 +542,7 @@ FUNCTION station_panel(width) {
                             FjordPulseComponents/muted(value: FjordPulseModel/station_place(station: PASSED.store.selected_station))
                         }
                     )
-                    FjordPulseComponents/icon_button(label: TEXT { × }, selected: False)
-                        |> SOURCE { PASSED.store.elements.station.close }
+                    FjordPulseComponents/icon_button(label: TEXT { × }, selected: False, events: PASSED.store.elements.station.close.events)
                 }
             )
             FjordPulseComponents/status_pill(
@@ -590,7 +599,8 @@ FUNCTION station_state_panel(status, title, message, retry) {
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv holdeplassen igjen }, english: TEXT { Retry station })
                     selected: False
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.station.retry }
+                    events: PASSED.store.elements.station.retry.events
+                )
                 False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
             }
             FjordPulseComponents/data_row(
@@ -636,17 +646,20 @@ FUNCTION station_tabs() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Avganger }, english: TEXT { Departures })
                 selected: PASSED.store.station_tab == Departures
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.tab.departures }
+                events: PASSED.store.elements.tab.departures.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Kjøretøy }, english: TEXT { Vehicles })
                 selected: PASSED.store.station_tab == Vehicles
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.tab.vehicles }
+                events: PASSED.store.elements.tab.vehicles.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Detaljer }, english: TEXT { Details })
                 selected: PASSED.store.station_tab == Details
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.tab.details }
+                events: PASSED.store.elements.tab.details.events
+            )
         }
     )
 }
@@ -705,7 +718,8 @@ FUNCTION departure_state_panel(status, title, message, retry) {
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv avganger igjen }, english: TEXT { Retry departures })
                     selected: False
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.departures_retry }
+                    events: PASSED.store.elements.departures_retry.events
+                )
                 False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
             }
         }
@@ -797,7 +811,8 @@ FUNCTION station_vehicle_state_panel(status, title, message, retry) {
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv kjøretøy igjen }, english: TEXT { Retry vehicles })
                     selected: False
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.station_vehicles_retry }
+                    events: PASSED.store.elements.station_vehicles_retry.events
+                )
                 False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
             }
         }
@@ -826,12 +841,14 @@ FUNCTION station_vehicle_list(stale) {
                 title: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Tog R10 mot Lillehammer }, english: TEXT { Train R10 to Lillehammer })
                 detail: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Betjener holdeplassen · 0.4 km }, english: TEXT { Serves this station · 0.4 km })
                 kind: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Tog }, english: TEXT { Rail })
-            ) |> SOURCE { PASSED.store.elements.station.vehicle_train }
+                events: PASSED.store.elements.station.vehicle_train.events
+            )
             FjordPulseComponents/search_result(
                 title: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Buss 31 mot Fornebu }, english: TEXT { Bus 31 to Fornebu })
                 detail: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { I nærheten · 1.1 km }, english: TEXT { Nearby · 1.1 km })
                 kind: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Buss }, english: TEXT { Bus })
-            ) |> SOURCE { PASSED.store.elements.station.vehicle_bus }
+                events: PASSED.store.elements.station.vehicle_bus.events
+            )
         }
     )
 }
@@ -901,8 +918,7 @@ FUNCTION vehicle_panel(width) {
                             FjordPulseComponents/muted(value: FjordPulseModel/vehicle_route(vehicle: PASSED.store.selected_vehicle, language: PASSED.store.language))
                         }
                     )
-                    FjordPulseComponents/icon_button(label: TEXT { × }, selected: False)
-                        |> SOURCE { PASSED.store.elements.vehicle.close }
+                    FjordPulseComponents/icon_button(label: TEXT { × }, selected: False, events: PASSED.store.elements.vehicle.close.events)
                 }
             )
             FjordPulseComponents/status_pill(
@@ -959,7 +975,8 @@ FUNCTION vehicle_state_panel(status, title, message, retry) {
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv igjen }, english: TEXT { Retry })
                     selected: False
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.vehicle.retry }
+                    events: PASSED.store.elements.vehicle.retry.events
+                )
                 False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
             }
         }
@@ -1001,12 +1018,14 @@ FUNCTION vehicle_loaded(state) {
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Oppdater posisjon }, english: TEXT { Refresh position })
                             selected: False
                             width: Fill
-                        ) |> SOURCE { PASSED.store.elements.vehicle.retry }
+                            events: PASSED.store.elements.vehicle.retry.events
+                        )
                         FjordPulseComponents/button(
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Stopp }, english: TEXT { Stop })
                             selected: False
                             width: 86
-                        ) |> SOURCE { PASSED.store.elements.vehicle.stop }
+                            events: PASSED.store.elements.vehicle.stop.events
+                        )
                     }
                 )
                 __ => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
@@ -1085,7 +1104,8 @@ FUNCTION focus_controls() {
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Følg dette kjøretøyet }, english: TEXT { Focus this vehicle })
                     selected: False
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.vehicle.focus }
+                    events: PASSED.store.elements.vehicle.focus.events
+                )
                 FjordPulseComponents/muted(value: FjordPulseModel/locale_text(
                     language: PASSED.store.language
                     norwegian: TEXT { Kartet følger bare når nye posisjoner kommer. }
@@ -1110,12 +1130,14 @@ FUNCTION focus_controls() {
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Sett følging på pause }, english: TEXT { Pause follow })
                             selected: True
                             width: Fill
-                        ) |> SOURCE { PASSED.store.elements.vehicle.pause }
+                            events: PASSED.store.elements.vehicle.pause.events
+                        )
                         FjordPulseComponents/button(
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Slutt å følge }, english: TEXT { Unfocus })
                             selected: False
                             width: 116
-                        ) |> SOURCE { PASSED.store.elements.vehicle.unfocus }
+                            events: PASSED.store.elements.vehicle.unfocus.events
+                        )
                     }
                 )
             }
@@ -1137,12 +1159,14 @@ FUNCTION focus_controls() {
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Fortsett å følge }, english: TEXT { Resume follow })
                             selected: True
                             width: Fill
-                        ) |> SOURCE { PASSED.store.elements.vehicle.resume }
+                            events: PASSED.store.elements.vehicle.resume.events
+                        )
                         FjordPulseComponents/button(
                             label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Slutt å følge }, english: TEXT { Unfocus })
                             selected: False
                             width: 116
-                        ) |> SOURCE { PASSED.store.elements.vehicle.unfocus }
+                            events: PASSED.store.elements.vehicle.unfocus.events
+                        )
                     }
                 )
             }
@@ -1175,12 +1199,14 @@ FUNCTION vehicle_lost() {
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv igjen }, english: TEXT { Retry })
                         selected: False
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.vehicle.retry }
+                        events: PASSED.store.elements.vehicle.retry.events
+                    )
                     FjordPulseComponents/button(
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Slutt å følge }, english: TEXT { Stop following })
                         selected: False
                         width: 132
-                    ) |> SOURCE { PASSED.store.elements.vehicle.stop }
+                        events: PASSED.store.elements.vehicle.stop.events
+                    )
                 }
             )
         }
@@ -1240,8 +1266,7 @@ FUNCTION mobile_welcome() {
                                 value: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Norge i bevegelse. }, english: TEXT { Norway in motion. })
                                 size: 20
                             )
-                            FjordPulseComponents/icon_button(label: TEXT { × }, selected: False)
-                                |> SOURCE { PASSED.store.elements.welcome_close }
+                            FjordPulseComponents/icon_button(label: TEXT { × }, selected: False, events: PASSED.store.elements.welcome_close.events)
                         }
                     )
                     FjordPulseComponents/text(value: FjordPulseModel/locale_text(
@@ -1281,13 +1306,13 @@ FUNCTION mobile_place_sheet() {
                     norwegian: TEXT { Velg nærmeste holdeplass for avganger og kjøretøy. }
                     english: TEXT { Select the nearest station for departures and vehicles. }
                 ))
-                FjordPulseComponents/button(label: TEXT { Førde rutebilstasjon }, selected: False, width: Fill)
-                    |> SOURCE { PASSED.store.elements.station.forde }
+                FjordPulseComponents/button(label: TEXT { Førde rutebilstasjon }, selected: False, width: Fill, events: PASSED.store.elements.station.forde.events)
                 FjordPulseComponents/button(
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Tilbake til kartet }, english: TEXT { Back to map })
                     selected: False
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.navigation.map }
+                    events: PASSED.store.elements.navigation.map.events
+                )
             }
         )
     )
@@ -1313,13 +1338,13 @@ FUNCTION mobile_line_sheet() {
                     title: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Begrenset rutevisning }, english: TEXT { Limited route view })
                     message: TEXT { Førde → Sandane → Nordfjordeid }
                 )
-                FjordPulseComponents/button(label: TEXT { Førde rutebilstasjon }, selected: False, width: Fill)
-                    |> SOURCE { PASSED.store.elements.station.forde }
+                FjordPulseComponents/button(label: TEXT { Førde rutebilstasjon }, selected: False, width: Fill, events: PASSED.store.elements.station.forde.events)
                 FjordPulseComponents/button(
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Tilbake til kartet }, english: TEXT { Back to map })
                     selected: False
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.navigation.map }
+                    events: PASSED.store.elements.navigation.map.events
+                )
             }
         )
     )
@@ -1365,8 +1390,7 @@ FUNCTION mobile_station_sheet() {
                                 FjordPulseComponents/muted(value: FjordPulseModel/station_place(station: PASSED.store.selected_station))
                             }
                         )
-                        FjordPulseComponents/icon_button(label: TEXT { × }, selected: False)
-                            |> SOURCE { PASSED.store.elements.station.close }
+                        FjordPulseComponents/icon_button(label: TEXT { × }, selected: False, events: PASSED.store.elements.station.close.events)
                     }
                 )
                 station_body()
@@ -1422,8 +1446,7 @@ FUNCTION mobile_vehicle_sheet() {
                                 FjordPulseComponents/muted(value: FjordPulseModel/vehicle_id(vehicle: PASSED.store.selected_vehicle))
                             }
                         )
-                        FjordPulseComponents/icon_button(label: TEXT { × }, selected: False)
-                            |> SOURCE { PASSED.store.elements.vehicle.close }
+                        FjordPulseComponents/icon_button(label: TEXT { × }, selected: False, events: PASSED.store.elements.vehicle.close.events)
                     }
                 )
                 vehicle_body()
@@ -1443,14 +1466,15 @@ FUNCTION mobile_sheet_controls() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Kompakt }, english: TEXT { Peek })
                 selected: PASSED.store.mobile_sheet == Peek
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.sheet.peek }
+                events: PASSED.store.elements.sheet.peek.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Halv }, english: TEXT { Half })
                 selected: PASSED.store.mobile_sheet == Half
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.sheet.half }
-            FjordPulseComponents/button(label: TEXT { Full }, selected: PASSED.store.mobile_sheet == Full, width: Fill)
-                |> SOURCE { PASSED.store.elements.sheet.full }
+                events: PASSED.store.elements.sheet.half.events
+            )
+            FjordPulseComponents/button(label: TEXT { Full }, selected: PASSED.store.mobile_sheet == Full, width: Fill, events: PASSED.store.elements.sheet.full.events)
         }
     )
 }
@@ -1471,14 +1495,15 @@ FUNCTION mobile_navigation() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Kart }, english: TEXT { Map })
                 selected: True
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.navigation.map }
+                events: PASSED.store.elements.navigation.map.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Søk }, english: TEXT { Search })
                 selected: PASSED.store.search_state != Closed
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.navigation.search }
-            FjordPulseComponents/button(label: TEXT { Admin }, selected: False, width: Fill)
-                |> SOURCE { PASSED.store.elements.navigation.admin }
+                events: PASSED.store.elements.navigation.search.events
+            )
+            FjordPulseComponents/button(label: TEXT { Admin }, selected: False, width: Fill, events: PASSED.store.elements.navigation.admin.events)
         }
     )
 }
@@ -1539,12 +1564,14 @@ FUNCTION admin_sidebar() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Logg ut }, english: TEXT { Log out })
                 selected: False
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.logout }
+                events: PASSED.store.elements.admin.logout.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Til transportkartet }, english: TEXT { Public map })
                 selected: False
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.public_map }
+                events: PASSED.store.elements.admin.public_map.events
+            )
         }
     )
 }
@@ -1560,37 +1587,44 @@ FUNCTION admin_navigation_buttons() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Systemstatus }, english: TEXT { System status })
                 selected: PASSED.store.route == AdminStatus
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.status }
+                events: PASSED.store.elements.admin.status.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Infrastruktur }, english: TEXT { Infrastructure })
                 selected: PASSED.store.route == AdminInfrastructure
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.infrastructure }
+                events: PASSED.store.elements.admin.infrastructure.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Overvåkinger }, english: TEXT { Watches })
                 selected: PASSED.store.route == AdminWatches
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.watches }
+                events: PASSED.store.elements.admin.watches.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Entur-logg }, english: TEXT { Entur log })
                 selected: PASSED.store.route == AdminEnturLog
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.entur_log }
+                events: PASSED.store.elements.admin.entur_log.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Sanntid }, english: TEXT { Realtime })
                 selected: PASSED.store.route == AdminRealtime
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.realtime }
+                events: PASSED.store.elements.admin.realtime.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Hendelser }, english: TEXT { Events })
                 selected: PASSED.store.route == AdminEvents
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.events }
+                events: PASSED.store.elements.admin.events.events
+            )
             FjordPulseComponents/button(
                 label: TEXT { Database }
                 selected: PASSED.store.route == AdminDatabaseSchema
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.database_schema }
+                events: PASSED.store.elements.admin.database_schema.events
+            )
         }
     )
 }
@@ -1631,22 +1665,26 @@ FUNCTION admin_mobile_navigation() {
                         label: TEXT { Status }
                         selected: PASSED.store.route == AdminStatus
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.admin.status }
+                        events: PASSED.store.elements.admin.status.events
+                    )
                     FjordPulseComponents/button(
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Drift }, english: TEXT { Infra })
                         selected: PASSED.store.route == AdminInfrastructure
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.admin.infrastructure }
+                        events: PASSED.store.elements.admin.infrastructure.events
+                    )
                     FjordPulseComponents/button(
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Vakter }, english: TEXT { Watch })
                         selected: PASSED.store.route == AdminWatches
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.admin.watches }
+                        events: PASSED.store.elements.admin.watches.events
+                    )
                     FjordPulseComponents/button(
                         label: TEXT { DB }
                         selected: PASSED.store.route == AdminDatabaseSchema
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.admin.database_schema }
+                        events: PASSED.store.elements.admin.database_schema.events
+                    )
                 }
             )
             Scene/Element/stripe(
@@ -1655,23 +1693,25 @@ FUNCTION admin_mobile_navigation() {
                 gap: 5
                 style: [width: Fill, height: 40, paint: False]
                 items: LIST {
-                    FjordPulseComponents/button(label: TEXT { Entur }, selected: PASSED.store.route == AdminEnturLog, width: Fill)
-                        |> SOURCE { PASSED.store.elements.admin.entur_log }
+                    FjordPulseComponents/button(label: TEXT { Entur }, selected: PASSED.store.route == AdminEnturLog, width: Fill, events: PASSED.store.elements.admin.entur_log.events)
                     FjordPulseComponents/button(
                         label: TEXT { Live }
                         selected: PASSED.store.route == AdminRealtime
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.admin.realtime }
+                        events: PASSED.store.elements.admin.realtime.events
+                    )
                     FjordPulseComponents/button(
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Hendelser }, english: TEXT { Events })
                         selected: PASSED.store.route == AdminEvents
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.admin.events }
+                        events: PASSED.store.elements.admin.events.events
+                    )
                     FjordPulseComponents/button(
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Kart }, english: TEXT { Map })
                         selected: False
                         width: Fill
-                    ) |> SOURCE { PASSED.store.elements.admin.public_map }
+                        events: PASSED.store.elements.admin.public_map.events
+                    )
                 }
             )
         }
@@ -1708,7 +1748,8 @@ FUNCTION admin_header() {
                 label: FjordPulseModel/language_code(language: PASSED.store.language)
                 selected: False
                 width: 54
-            ) |> SOURCE { PASSED.store.elements.locale }
+                events: PASSED.store.elements.locale.events
+            )
         }
     )
 }
@@ -1745,7 +1786,8 @@ FUNCTION admin_login() {
                     label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Logg inn }, english: TEXT { Sign in })
                     selected: True
                     width: Fill
-                ) |> SOURCE { PASSED.store.elements.admin.login }
+                    events: PASSED.store.elements.admin.login.events
+                )
             }
         )
     )
@@ -1799,7 +1841,8 @@ FUNCTION admin_state_surface(status, title, message, retry) {
                         label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Prøv igjen }, english: TEXT { Retry })
                         selected: False
                         width: 180
-                    ) |> SOURCE { PASSED.store.elements.admin.retry }
+                        events: PASSED.store.elements.admin.retry.events
+                    )
                     False => Scene/Element/text(element: [], style: [width: Fill, height: 0, paint: False], text: Text/empty())
                 }
             }
@@ -2010,12 +2053,14 @@ FUNCTION admin_database_navigation() {
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Skjema }, english: TEXT { Schema })
                 selected: PASSED.store.route == AdminDatabaseSchema
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.database_schema }
+                events: PASSED.store.elements.admin.database_schema.events
+            )
             FjordPulseComponents/button(
                 label: FjordPulseModel/locale_text(language: PASSED.store.language, norwegian: TEXT { Migreringer }, english: TEXT { Migrations })
                 selected: PASSED.store.route == AdminDatabaseMigrations
                 width: Fill
-            ) |> SOURCE { PASSED.store.elements.admin.database_migrations }
+                events: PASSED.store.elements.admin.database_migrations.events
+            )
         }
     )
 }

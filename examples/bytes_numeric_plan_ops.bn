@@ -44,13 +44,13 @@ store: [
     written_unsigned_hex:
         TEXT { old } |> HOLD written_unsigned_hex {
             LATEST {
-                store.inspect |> THEN { store.written_unsigned |> Bytes/to_hex }
+                store.inspect |> THEN { store.written_unsigned |> Bytes/to_hex() }
             }
         }
     written_signed_hex:
         TEXT { old } |> HOLD written_signed_hex {
             LATEST {
-                store.inspect |> THEN { store.written_signed |> Bytes/to_hex }
+                store.inspect |> THEN { store.written_signed |> Bytes/to_hex() }
             }
         }
     written_unsigned_read:

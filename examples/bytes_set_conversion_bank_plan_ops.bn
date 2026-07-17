@@ -7,7 +7,7 @@ store: [
     patched:
         BYTES[3] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: 16u5A) }
+                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: BYTES[1] { 16u5A }) }
             }
         }
     text:
@@ -19,7 +19,7 @@ store: [
     hex:
         TEXT { old } |> HOLD hex {
             LATEST {
-                store.inspect |> THEN { store.patched |> Bytes/to_hex }
+                store.inspect |> THEN { store.patched |> Bytes/to_hex() }
             }
         }
     base64:

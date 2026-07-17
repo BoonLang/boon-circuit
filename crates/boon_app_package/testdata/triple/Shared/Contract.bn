@@ -1,0 +1,11 @@
+FUNCTION title() {
+    TEXT { Triple notes }
+}
+
+FUNCTION session_response_text() {
+    TEXT { triple-session-ok }
+}
+
+FUNCTION response_text() {
+    TEXT { triple-server-ok }
+}

@@ -6,8 +6,10 @@ FUNCTION page() {
         style: [width: Fill, paint: False]
         items: LIST {
             KavikComponents/page_hero(PASS: [store: PASSED.store], title: TEXT { Shelf }, tagline: TEXT { Books and games that shaped my thinking. })
-            KavikComponents/action_button(PASS: [store: PASSED.store], label: TEXT { Read The Boon of Dataflow })
-                |> SOURCE { PASSED.store.elements.post.boon }
+            KavikComponents/action_button(PASS: [store: PASSED.store]
+                source: PASSED.store.elements.post.boon
+                label: TEXT { Read The Boon of Dataflow }
+            )
             KavikComponents/section_header(PASS: [store: PASSED.store], title: TEXT { Books }, subtitle: TEXT { Ideas, systems, stories, and ways of working. })
             Scene/Element/stripe(
                 element: []

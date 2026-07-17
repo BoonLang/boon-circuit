@@ -9,9 +9,14 @@ expect_active_count = 3
 expect_completed_count = 1
 
 [[step]]
+id = "type-new-todo"
+user_action = { kind = "type_text", target = "new todo input", text = "Ship physical TodoMVC" }
+expected_source_event = { source = "store.elements.new_todo_title_text_input.change", text = "Ship physical TodoMVC" }
+
+[[step]]
 id = "add-todo"
-user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "Ship physical TodoMVC" }
-expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "Ship physical TodoMVC" }
+user_action = { kind = "key_down", target = "new todo input", key = "Enter" }
+expected_source_event = { source = "store.elements.new_todo_title_text_input.key_down", key = "Enter" }
 expect_root_text = { "theme_options.name" = "Classic" }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 expect_completed_titles = ["Finish TodoMVC renderer"]
@@ -19,9 +24,14 @@ expect_active_count = 4
 expect_completed_count = 1
 
 [[step]]
+id = "type-empty-todo"
+user_action = { kind = "type_text", target = "new todo input", text = "   " }
+expected_source_event = { source = "store.elements.new_todo_title_text_input.change", text = "   " }
+
+[[step]]
 id = "reject-empty-todo"
-user_action = { kind = "key_down", target = "new todo input", key = "Enter", text = "   " }
-expected_source_event = { source = "store.elements.new_todo_title_text_input", key = "Enter", text = "   " }
+user_action = { kind = "key_down", target = "new todo input", key = "Enter" }
+expected_source_event = { source = "store.elements.new_todo_title_text_input.key_down", key = "Enter" }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 expect_completed_titles = ["Finish TodoMVC renderer"]
 expect_active_count = 4
@@ -30,7 +40,7 @@ expect_completed_count = 1
 [[step]]
 id = "toggle-one-todo"
 user_action = { kind = "click", target = "todo checkbox", target_text = "Ship physical TodoMVC" }
-expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_text = "Ship physical TodoMVC" }
+expected_source_event = { source = "todo.todo_elements.todo_checkbox.click", target_text = "Ship physical TodoMVC" }
 expect_completed_titles = ["Finish TodoMVC renderer", "Ship physical TodoMVC"]
 expect_active_count = 3
 expect_completed_count = 2
@@ -38,7 +48,7 @@ expect_completed_count = 2
 [[step]]
 id = "toggle-all"
 user_action = { kind = "click", target = "toggle all" }
-expected_source_event = { source = "store.elements.toggle_all_checkbox" }
+expected_source_event = { source = "store.elements.toggle_all_checkbox.click" }
 expect_completed_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 expect_active_count = 0
 expect_completed_count = 5
@@ -46,7 +56,7 @@ expect_completed_count = 5
 [[step]]
 id = "toggle-all-active"
 user_action = { kind = "click", target = "toggle all" }
-expected_source_event = { source = "store.elements.toggle_all_checkbox" }
+expected_source_event = { source = "store.elements.toggle_all_checkbox.click" }
 expect_completed_titles = []
 expect_active_count = 5
 expect_completed_count = 0
@@ -54,55 +64,55 @@ expect_completed_count = 0
 [[step]]
 id = "filter-all-active-completed"
 user_action = { kind = "click", target = "all filter" }
-expected_source_event = { source = "store.elements.filter_buttons.all" }
+expected_source_event = { source = "store.elements.filter_buttons.all.press" }
 expect_root_text = { "store.selected_filter" = "All" }
 expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "filter-active"
 user_action = { kind = "click", target = "active filter" }
-expected_source_event = { source = "store.elements.filter_buttons.active" }
+expected_source_event = { source = "store.elements.filter_buttons.active.press" }
 expect_root_text = { "store.selected_filter" = "Active" }
 expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "filter-completed"
 user_action = { kind = "click", target = "completed filter" }
-expected_source_event = { source = "store.elements.filter_buttons.completed" }
+expected_source_event = { source = "store.elements.filter_buttons.completed.press" }
 expect_root_text = { "store.selected_filter" = "Completed" }
 expect_visible_titles = []
 
 [[step]]
 id = "filter-all-before-edit"
 user_action = { kind = "click", target = "all filter" }
-expected_source_event = { source = "store.elements.filter_buttons.all" }
+expected_source_event = { source = "store.elements.filter_buttons.all.press" }
 expect_root_text = { "store.selected_filter" = "All" }
 expect_visible_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC"]
 
 [[step]]
 id = "edit-todo"
 user_action = { kind = "double_click", target = "todo title", target_text = "Ship physical TodoMVC" }
-expected_source_event = { source = "todo.todo_elements.todo_title_element", target_text = "Ship physical TodoMVC" }
+expected_source_event = { source = "todo.todo_elements.todo_title_element.double_click", target_text = "Ship physical TodoMVC" }
 
 [[step]]
 id = "cancel-edit"
 user_action = { kind = "key_down", target = "editing todo title", target_text = "Ship physical TodoMVC", key = "Escape" }
-expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", key = "Escape" }
+expected_source_event = { source = "todo.todo_elements.editing_todo_title_element.key_down", target_text = "Ship physical TodoMVC", key = "Escape" }
 
 [[step]]
 id = "edit-todo-commit-open"
 user_action = { kind = "double_click", target = "todo title", target_text = "Ship physical TodoMVC" }
-expected_source_event = { source = "todo.todo_elements.todo_title_element", target_text = "Ship physical TodoMVC" }
+expected_source_event = { source = "todo.todo_elements.todo_title_element.double_click", target_text = "Ship physical TodoMVC" }
 
 [[step]]
 id = "edit-todo-change"
 user_action = { kind = "type_text", target = "editing todo title", target_text = "Ship physical TodoMVC", text = "Ship physical TodoMVC edited" }
-expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", text = "Ship physical TodoMVC edited" }
+expected_source_event = { source = "todo.todo_elements.editing_todo_title_element.change", target_text = "Ship physical TodoMVC", text = "Ship physical TodoMVC edited" }
 
 [[step]]
 id = "edit-todo-commit"
 user_action = { kind = "key_down", target = "editing todo title", target_text = "Ship physical TodoMVC", key = "Enter" }
-expected_source_event = { source = "todo.todo_elements.editing_todo_title_element", target_text = "Ship physical TodoMVC", key = "Enter" }
+expected_source_event = { source = "todo.todo_elements.editing_todo_title_element.key_down", target_text = "Ship physical TodoMVC", key = "Enter" }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries", "Ship physical TodoMVC edited"]
 expect_completed_titles = []
 expect_active_count = 5
@@ -111,7 +121,7 @@ expect_completed_count = 0
 [[step]]
 id = "toggle-edited-todo-completed"
 user_action = { kind = "click", target = "todo checkbox", target_text = "Ship physical TodoMVC edited" }
-expected_source_event = { source = "todo.todo_elements.todo_checkbox", target_text = "Ship physical TodoMVC edited" }
+expected_source_event = { source = "todo.todo_elements.todo_checkbox.click", target_text = "Ship physical TodoMVC edited" }
 expect_completed_titles = ["Ship physical TodoMVC edited"]
 expect_active_count = 4
 expect_completed_count = 1
@@ -120,7 +130,7 @@ expect_root_text = { "store.has_completed" = "True" }
 [[step]]
 id = "clear-completed"
 user_action = { kind = "click", target = "clear completed" }
-expected_source_event = { source = "store.elements.remove_completed_button" }
+expected_source_event = { source = "store.elements.remove_completed_button.press" }
 expect_titles = ["Read documentation", "Finish TodoMVC renderer", "Walk the dog", "Buy groceries"]
 expect_completed_titles = []
 expect_active_count = 4
@@ -130,46 +140,46 @@ expect_root_text = { "store.has_completed" = "False" }
 [[step]]
 id = "switch-theme-classic"
 user_action = { kind = "click", target = "theme classic" }
-expected_source_event = { source = "store.elements.theme_switcher.classic" }
+expected_source_event = { source = "store.elements.theme_switcher.classic.press" }
 expect_root_text = { "theme_options.name" = "Classic" }
 
 [[step]]
 id = "switch-theme-professional"
 user_action = { kind = "click", target = "theme professional" }
-expected_source_event = { source = "store.elements.theme_switcher.professional" }
+expected_source_event = { source = "store.elements.theme_switcher.professional.press" }
 expect_root_text = { "theme_options.name" = "Professional" }
 
 [[step]]
 id = "switch-theme-glassmorphism"
 user_action = { kind = "click", target = "theme glassmorphism" }
-expected_source_event = { source = "store.elements.theme_switcher.glassmorphism" }
+expected_source_event = { source = "store.elements.theme_switcher.glassmorphism.press" }
 expect_root_text = { "theme_options.name" = "Glassmorphism" }
 
 [[step]]
 id = "switch-theme-neobrutalism"
 user_action = { kind = "click", target = "theme neobrutalism" }
-expected_source_event = { source = "store.elements.theme_switcher.neobrutalism" }
+expected_source_event = { source = "store.elements.theme_switcher.neobrutalism.press" }
 expect_root_text = { "theme_options.name" = "Neobrutalism" }
 
 [[step]]
 id = "switch-theme-neumorphism"
 user_action = { kind = "click", target = "theme neumorphism" }
-expected_source_event = { source = "store.elements.theme_switcher.neumorphism" }
+expected_source_event = { source = "store.elements.theme_switcher.neumorphism.press" }
 expect_root_text = { "theme_options.name" = "Neumorphism" }
 
 [[step]]
 id = "toggle-light-dark-mode"
 user_action = { kind = "click", target = "theme mode toggle" }
-expected_source_event = { source = "store.elements.theme_switcher.mode_toggle" }
+expected_source_event = { source = "store.elements.theme_switcher.mode_toggle.press" }
 
 [[step]]
 id = "restore-light-mode"
 user_action = { kind = "click", target = "theme mode toggle" }
-expected_source_event = { source = "store.elements.theme_switcher.mode_toggle" }
+expected_source_event = { source = "store.elements.theme_switcher.mode_toggle.press" }
 expect_root_text = { "theme_options.mode" = "Light" }
 
 [[step]]
 id = "restore-classic-theme"
 user_action = { kind = "click", target = "theme classic" }
-expected_source_event = { source = "store.elements.theme_switcher.classic" }
+expected_source_event = { source = "store.elements.theme_switcher.classic.press" }
 expect_root_text = { "theme_options.name" = "Classic" }

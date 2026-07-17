@@ -1,59 +1,54 @@
 store: [
     request: SOURCE
-    http_succeeded: SOURCE
-    http_failed: SOURCE
-    random_ready: SOURCE
-    host_failed: SOURCE
-
-    final_byte_count:
-        0 |> HOLD final_byte_count {
-            LATEST {
-                random_ready.bytes |> THEN { random_ready.bytes |> Bytes/length }
-                http_failed.code |> THEN { -1 }
-                host_failed.code |> THEN { -2 }
-            }
-        }
 
     outbound_headers: LIST {
         [name: TEXT { accept }, value: BYTES {}]
     }
 
-]
+    response_result:
+        NotRequested |> HOLD response_result {
+            request |> THEN {
+                Http/request(
+                    endpoint: TEXT { catalog }
+                    method: Get
+                    path_segments: request.path_segments
+                    query: request.query
+                    headers: outbound_headers
+                    body: request.body
+                    connect_timeout_ms: 500
+                    overall_timeout_ms: 2000
+                    cancellation: Independent
+                )
+            }
+        }
 
-effects: [
-    fetch: [
-        on: store.request
-        perform: Http/request(
-            endpoint: TEXT { catalog }
-            method: Get
-            path_segments: store.request.path_segments
-            query: store.request.query
-            headers: store.outbound_headers
-            body: store.request.body
-            connect_timeout_ms: 500
-            overall_timeout_ms: 2000
-            cancellation: Independent
-        )
-        results: [
-            HttpSucceeded: store.http_succeeded
-            HttpFailed: store.http_failed
-        ]
-    ]
+    random_result:
+        RandomNotRequested |> HOLD random_result {
+            response_result |> THEN {
+                response_result |> WHEN {
+                    HttpSucceeded => Random/bytes(byte_count: 16)
+                    __ => SKIP
+                }
+            }
+        }
 
-    nonce: [
-        on: store.http_succeeded
-        perform: Random/bytes(byte_count: 16)
-        results: [
-            RandomBytesReady: store.random_ready
-            HostServiceFailed: store.host_failed
-        ]
-    ]
+    final_byte_count:
+        random_result |> WHEN {
+            RandomBytesReady => random_result.bytes |> Bytes/length()
+            HostServiceFailed => -2
+            __ => response_result |> WHEN {
+                HttpFailed => -1
+                __ => 0
+            }
+        }
 ]
 
 outputs: [
     response: [
         status: 200
         body: store.final_byte_count
+            |> Number/to_text(radix: 10)
+            |> Text/to_bytes(encoding: Utf8)
     ]
 ]
 

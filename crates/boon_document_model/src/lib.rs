@@ -58,18 +58,39 @@ pub enum DocumentNodeKind {
     ScrollRoot,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramRole {
+    #[default]
+    Client,
+    Session,
+    Server,
+}
+
+impl ProgramRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Session => "session",
+            Self::Server => "server",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgramCapabilityProfile {
     #[default]
-    PublicDocument,
+    PublicClient,
+    TrustedSession,
     TrustedServer,
 }
 
 impl ProgramCapabilityProfile {
     pub fn name(self) -> &'static str {
         match self {
-            Self::PublicDocument => "public_document",
+            Self::PublicClient => "public_client",
+            Self::TrustedSession => "trusted_session",
             Self::TrustedServer => "trusted_server",
         }
     }
@@ -133,6 +154,8 @@ pub struct EmbeddedProgramDescriptor {
     pub bootstrap_artifact_id: String,
     #[serde(default)]
     pub bootstrap_revision: u64,
+    #[serde(default)]
+    pub role: ProgramRole,
     pub capability_profile: ProgramCapabilityProfile,
     #[serde(default)]
     pub session_key: String,
@@ -153,6 +176,7 @@ impl Default for EmbeddedProgramDescriptor {
             bootstrap_source_digest: String::new(),
             bootstrap_artifact_id: String::new(),
             bootstrap_revision: 0,
+            role: ProgramRole::Client,
             capability_profile: ProgramCapabilityProfile::default(),
             session_key: String::new(),
             mount: true,
@@ -174,6 +198,7 @@ impl Debug for EmbeddedProgramDescriptor {
             .field("bootstrap_source_bytes", &self.bootstrap_source.len())
             .field("bootstrap_artifact_id", &self.bootstrap_artifact_id)
             .field("bootstrap_revision", &self.bootstrap_revision)
+            .field("role", &self.role)
             .field("capability_profile", &self.capability_profile)
             .field("session_key", &self.session_key)
             .field("mount", &self.mount)
@@ -198,6 +223,7 @@ impl Serialize for EmbeddedProgramDescriptor {
             bootstrap_source_bytes: usize,
             bootstrap_artifact_id: &'a str,
             bootstrap_revision: u64,
+            role: ProgramRole,
             capability_profile: ProgramCapabilityProfile,
             session_key: &'a str,
             mount: bool,
@@ -229,6 +255,7 @@ impl Serialize for EmbeddedProgramDescriptor {
             bootstrap_source_bytes: self.bootstrap_source.len(),
             bootstrap_artifact_id: &self.bootstrap_artifact_id,
             bootstrap_revision: self.bootstrap_revision,
+            role: self.role,
             capability_profile: self.capability_profile,
             session_key: &self.session_key,
             mount: self.mount,

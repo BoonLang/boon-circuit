@@ -9,6 +9,7 @@ mod map_host;
 mod network;
 mod raster;
 mod semantic_dom;
+mod startup;
 mod storage;
 
 pub use canvas::*;
@@ -19,6 +20,7 @@ pub use map_host::*;
 pub use network::*;
 pub use raster::*;
 pub use semantic_dom::*;
+pub use startup::*;
 pub use storage::*;
 
 use crate::{WebHostError, WebHostResult};

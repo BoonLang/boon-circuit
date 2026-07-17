@@ -1,0 +1,16 @@
+store: [
+    connected: SOURCE
+    disconnected: SOURCE
+
+    connection:
+        Connecting |> HOLD connection {
+            LATEST {
+                store.connected |> THEN { Connected }
+                store.disconnected |> THEN { Disconnected }
+            }
+        }
+]
+
+outputs: [
+    connection: store.connection
+]

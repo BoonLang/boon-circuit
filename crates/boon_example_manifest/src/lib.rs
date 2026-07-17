@@ -79,9 +79,9 @@ pub struct ExampleEntry {
     pub source: String,
     #[serde(default)]
     pub source_files: Vec<String>,
-    /// Independently compiled programs that form one application bundle.
+    /// Independently compiled client, session, and server programs.
     /// `source` and `source_files` remain the primary editor program and must
-    /// match the document-role entry when this list is present.
+    /// match the client entry when this list is present.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub programs: Vec<ExampleProgram>,
     #[serde(default)]
@@ -536,15 +536,22 @@ impl ExampleManifest {
                         }
                     }
                 }
-                let Some(primary) = entry.program(ProgramRole::Document) else {
+                let required_roles = BTreeSet::from(["client", "session", "server"]);
+                if roles != required_roles {
                     return Err(context.invalid(format!(
-                        "example `{}` program bundle has no document role",
+                        "example `{}` distributed program must declare client, session, and server roles",
+                        entry.id
+                    )));
+                }
+                let Some(primary) = entry.program(ProgramRole::Client) else {
+                    return Err(context.invalid(format!(
+                        "example `{}` distributed program has no client role",
                         entry.id
                     )));
                 };
                 if primary.source != entry.source || primary.source_files != entry.source_files {
                     return Err(context.invalid(format!(
-                        "example `{}` primary source must match its document program",
+                        "example `{}` primary source must match its client program",
                         entry.id
                     )));
                 }

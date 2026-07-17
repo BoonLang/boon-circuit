@@ -24,7 +24,7 @@ store: [
     hex:
         TEXT { old } |> HOLD hex {
             LATEST {
-                store.encode |> THEN { store.joined |> Bytes/to_hex }
+                store.encode |> THEN { store.joined |> Bytes/to_hex() }
             }
         }
     base64:
@@ -42,7 +42,7 @@ store: [
     decoded_hex:
         BYTES[4] {} |> HOLD decoded_hex {
             LATEST {
-                store.decode |> THEN { hex_input |> Bytes/from_hex }
+                store.decode |> THEN { hex_input |> Bytes/from_hex() }
             }
         }
     decoded_base64:
@@ -54,11 +54,11 @@ store: [
     zeros_len:
         0 |> HOLD zeros_len {
             LATEST {
-                store.inspect |> THEN { store.zeros |> Bytes/length }
+                store.inspect |> THEN { store.zeros |> Bytes/length() }
             }
         }
     decoded_hex_byte:
-        16u00 |> HOLD decoded_hex_byte {
+        BYTES[1] { 16u00 } |> HOLD decoded_hex_byte {
             LATEST {
                 store.inspect |> THEN { store.decoded_hex |> Bytes/get(index: 2) }
             }
@@ -66,7 +66,7 @@ store: [
     decoded_base64_hex:
         TEXT { old } |> HOLD decoded_base64_hex {
             LATEST {
-                store.inspect |> THEN { store.decoded_base64 |> Bytes/to_hex }
+                store.inspect |> THEN { store.decoded_base64 |> Bytes/to_hex() }
             }
         }
 ]

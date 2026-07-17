@@ -135,8 +135,10 @@ FUNCTION selected_work() {
                     KavikWork/boon_computer_card(PASS: [store: PASSED.store])
                 }
             )
-            KavikComponents/action_button(PASS: [store: PASSED.store], label: TEXT { View All Work })
-                |> SOURCE { PASSED.store.elements.view_all_work }
+            KavikComponents/action_button(PASS: [store: PASSED.store]
+                source: PASSED.store.elements.view_all_work
+                label: TEXT { View All Work }
+            )
         }
     )
 }
@@ -155,16 +157,21 @@ FUNCTION news() {
                 gap: 14
                 style: [width: Fill, wrap: True, wrap_min_width: 260, paint: False]
                 items: LIST {
-                    KavikBlog/boon_post_card(PASS: [store: PASSED.store])
-                        |> SOURCE { PASSED.store.elements.post.boon }
-                    KavikBlog/novywave_post_card(PASS: [store: PASSED.store])
-                        |> SOURCE { PASSED.store.elements.post.novywave }
-                    KavikBlog/moonzoon_foundations_card(PASS: [store: PASSED.store])
-                        |> SOURCE { PASSED.store.elements.post.moonzoon_foundations }
+                    KavikBlog/boon_post_card(PASS: [store: PASSED.store]
+                        source: PASSED.store.elements.post.boon
+                    )
+                    KavikBlog/novywave_post_card(PASS: [store: PASSED.store]
+                        source: PASSED.store.elements.post.novywave
+                    )
+                    KavikBlog/moonzoon_foundations_card(PASS: [store: PASSED.store]
+                        source: PASSED.store.elements.post.moonzoon_foundations
+                    )
                 }
             )
-            KavikComponents/action_button(PASS: [store: PASSED.store], label: TEXT { View All Posts })
-                |> SOURCE { PASSED.store.elements.view_all_posts }
+            KavikComponents/action_button(PASS: [store: PASSED.store]
+                source: PASSED.store.elements.view_all_posts
+                label: TEXT { View All Posts }
+            )
         }
     )
 }

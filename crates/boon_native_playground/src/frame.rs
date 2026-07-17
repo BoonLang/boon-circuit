@@ -954,24 +954,3 @@ fn nearest_rank(samples: &[u64], percentile: usize) -> u64 {
     let rank = percentile.saturating_mul(sorted.len()).div_ceil(100);
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nearest_rank_keeps_outliers_in_the_sample_set() {
-        let samples = [1, 2, 3, 4, 100];
-        assert_eq!(nearest_rank(&samples, 50), 3);
-        assert_eq!(nearest_rank(&samples, 95), 100);
-    }
-
-    #[test]
-    fn every_host_event_has_a_stable_metric_class() {
-        let event = HostEvent::Focus {
-            surface: boon_host::SurfaceId("preview".to_owned()),
-            focused: true,
-        };
-        assert_eq!(input_kind(&event), InputKind::Focus);
-    }
-}

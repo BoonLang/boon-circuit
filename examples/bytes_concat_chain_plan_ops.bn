@@ -16,11 +16,11 @@ store: [
     joined_len:
         0 |> HOLD joined_len {
             LATEST {
-                store.inspect |> THEN { store.joined |> Bytes/length }
+                store.inspect |> THEN { store.joined |> Bytes/length() }
             }
         }
     joined_byte:
-        16u00 |> HOLD joined_byte {
+        BYTES[1] { 16u00 } |> HOLD joined_byte {
             LATEST {
                 store.inspect |> THEN { store.joined |> Bytes/get(index: 3) }
             }

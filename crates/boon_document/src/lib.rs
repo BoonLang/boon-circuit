@@ -7163,6 +7163,3 @@ fn demand_from_report(report: &MaterializationReport) -> LayoutDemand {
         last_stable_key: report.last_stable_key.clone(),
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -40,7 +40,7 @@ FUNCTION header() {
 FUNCTION diagnostic(input_id) {
     PASSED.store.draft_compile_state |> WHEN {
         Invalid => Scene/Element/button(
-            element: [event: [press: SOURCE]]
+            element: [events: [press: PASSED.store.elements.focus_diagnostic]]
             activate_focus: [
                 input_id: input_id
                 line: PASSED.store.draft_compile_line
@@ -57,7 +57,6 @@ FUNCTION diagnostic(input_id) {
             ]
             label: diagnostic_content()
         )
-            |> SOURCE { PASSED.store.elements.focus_diagnostic }
         __ => NoElement
     }
 }
@@ -108,7 +107,7 @@ FUNCTION diagnostic_content() {
 
 FUNCTION source_panel(input_id) {
     Scene/Element/text_input(
-        element: [event: [change: SOURCE]]
+        element: [events: [change: PASSED.store.elements.source_editor]]
         input_id: input_id
         style: [
             ...PersonsTheme/inset(mode: PASSED.store.mode)
@@ -129,5 +128,4 @@ FUNCTION source_panel(input_id) {
         text: PASSED.store.source_draft
         placeholder: [text: TEXT { Enter a bounded Boon scene }]
     )
-        |> SOURCE { PASSED.store.elements.source_editor }
 }

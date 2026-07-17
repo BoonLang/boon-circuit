@@ -191,23 +191,3 @@ fn platform_failures_distinguish_quota_and_bound_diagnostics() {
     assert!(message.ends_with("..."));
     assert!(message.is_char_boundary(message.len()));
 }
-
-#[test]
-fn serialized_contract_keeps_value_types_and_errors_explicit() {
-    assert_eq!(
-        serde_json::to_string(&BrowserPreferenceValue::Text("plain".to_owned())).unwrap(),
-        r#"{"kind":"text","value":"plain"}"#
-    );
-    assert_eq!(
-        serde_json::to_string(&BrowserPreferencePutOutcome::Inserted).unwrap(),
-        r#""inserted""#
-    );
-    let error = BrowserPreferenceStorageError::from_platform(
-        "get",
-        Some("AbortError"),
-        "transaction aborted",
-    );
-    let json = serde_json::to_value(error).unwrap();
-    assert_eq!(json["kind"], "platform");
-    assert_eq!(json["operation"], "get");
-}

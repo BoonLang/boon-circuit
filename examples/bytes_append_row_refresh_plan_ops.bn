@@ -25,7 +25,7 @@ FUNCTION row_widget(row) {
                 LATEST {}
             }
         payload_len:
-            payload |> Bytes/length
+            payload |> Bytes/length()
         payload_second:
             payload |> Bytes/get(index: 1)
     ]

@@ -1,0 +1,14 @@
+store: [
+    start: SOURCE
+    clock_result:
+        ClockNotRequested |> HOLD clock_result {
+            start |> THEN { Clock/wall() }
+        }
+    random_result:
+        RandomNotRequested |> HOLD random_result {
+            clock_result |> WHEN {
+                WallClockRead => Random/bytes(byte_count: 16)
+                __ => SKIP
+            }
+        }
+]

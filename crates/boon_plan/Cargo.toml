@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 boon_data.workspace = true
 boon_effect_schema.workspace = true
+boon_document_model.workspace = true
 boon_query.workspace = true
 serde.workspace = true
 sha2.workspace = true

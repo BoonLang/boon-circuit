@@ -7,38 +7,48 @@
 store: [
     elements: [
         filter_buttons: [
-            all: SOURCE
-            active: SOURCE
-            completed: SOURCE
+            all: [events: [press: SOURCE]]
+            active: [events: [press: SOURCE]]
+            completed: [events: [press: SOURCE]]
         ]
-        remove_completed_button: SOURCE
-        toggle_all_checkbox: SOURCE
-        new_todo_title_text_input: SOURCE
+        remove_completed_button: [events: [press: SOURCE]]
+        toggle_all_checkbox: [events: [click: SOURCE]]
+        new_todo_title_text_input: [
+            events: [
+                change: SOURCE
+                key_down: SOURCE
+            ]
+        ]
         theme_switcher: [
-            classic: SOURCE
-            professional: SOURCE
-            glassmorphism: SOURCE
-            neobrutalism: SOURCE
-            neumorphism: SOURCE
-            mode_toggle: SOURCE
+            classic: [events: [press: SOURCE]]
+            professional: [events: [press: SOURCE]]
+            glassmorphism: [events: [press: SOURCE]]
+            neobrutalism: [events: [press: SOURCE]]
+            neumorphism: [events: [press: SOURCE]]
+            mode_toggle: [events: [press: SOURCE]]
         ]
     ]
     selected_filter:
         All |> HOLD selected_filter {
             LATEST {
-                elements.filter_buttons.all.event.press |> THEN { All }
-                elements.filter_buttons.active.event.press |> THEN { Active }
-                elements.filter_buttons.completed.event.press |> THEN { Completed }
+                elements.filter_buttons.all.events.press |> THEN { All }
+                elements.filter_buttons.active.events.press |> THEN { Active }
+                elements.filter_buttons.completed.events.press |> THEN { Completed }
             }
         }
-    title_to_save: elements.new_todo_title_text_input.event.key_down.key |> WHEN {
-        Enter => BLOCK {
-            new_todo_title: elements.new_todo_title_text_input.text |> Text/trim()
-            new_todo_title |> WHEN {
+    new_todo_text:
+        Text/empty() |> HOLD text {
+            LATEST {
+                elements.new_todo_title_text_input.events.change.text
+                title_to_save |> THEN { Text/empty() }
+            }
+        }
+    title_to_save: elements.new_todo_title_text_input.events.key_down.key |> WHEN {
+        Enter =>
+            new_todo_text |> Text/trim() |> WHEN {
                 TEXT {} => SKIP
                 title => title
             }
-        }
         __ => SKIP
     }
     todos: LIST {
@@ -53,9 +63,9 @@ store: [
         |> List/map(todo, new: new_todo(title: todo.title |> Text/trim(), initial_completed: todo.completed |> WHEN { True => True, False => False, __ => False }))
         |> List/retain(item, if: LATEST {
             True
-            item.todo_elements.remove_todo_button.event.press
+            item.todo_elements.remove_todo_button.events.press
                 |> THEN { False }
-            elements.remove_completed_button.event.press
+            elements.remove_completed_button.events.press
                 |> THEN { item.completed |> Bool/not() }
         })
     active_count:
@@ -88,32 +98,37 @@ store: [
 FUNCTION new_todo(title, initial_completed) {
     [
         todo_elements: [
-            remove_todo_button: SOURCE
-            editing_todo_title_element: SOURCE
-            todo_title_element: SOURCE
-            todo_checkbox: SOURCE
+            remove_todo_button: [events: [press: SOURCE]]
+            editing_todo_title_element: [
+                events: [
+                    blur: SOURCE
+                    change: SOURCE
+                    key_down: SOURCE
+                ]
+            ]
+            todo_title_element: [events: [double_click: SOURCE]]
+            todo_checkbox: [events: [click: SOURCE]]
         ]
         editing:
             False |> HOLD editing {
                 LATEST {
-                    todo_elements.todo_title_element.event.double_click |> THEN { True }
-                    todo_elements.editing_todo_title_element.event.key_down.key
+                    todo_elements.todo_title_element.events.double_click |> THEN { True }
+                    todo_elements.editing_todo_title_element.events.key_down.key
                         |> WHEN {
                             Enter => False
                             Escape => False
                             __ => SKIP
                         }
-                    todo_elements.editing_todo_title_element.event.blur |> THEN { False }
+                    todo_elements.editing_todo_title_element.events.blur |> THEN { False }
                 }
             }
         title_to_update:
             LATEST {
-                todo_elements.editing_todo_title_element.event.blur
-                    |> THEN { [] }
-                todo_elements.editing_todo_title_element.event.key_down.key
-                    |> WHEN { Enter => [], __ => SKIP }
+                todo_elements.editing_todo_title_element.events.blur
+                    |> THEN { edited_title }
+                todo_elements.editing_todo_title_element.events.key_down.key
+                    |> WHEN { Enter => edited_title, __ => SKIP }
             }
-            |> THEN { todo_elements.editing_todo_title_element.text }
         title: LATEST {
             title
             title_to_update
@@ -121,20 +136,20 @@ FUNCTION new_todo(title, initial_completed) {
         completed:
             LATEST {
                 initial_completed
-                store.elements.toggle_all_checkbox.event.click |> THEN {
+                store.elements.toggle_all_checkbox.events.click |> THEN {
                     store.all_completed |> Bool/not()
                 }
             }
-            |> Bool/toggle(when: todo_elements.todo_checkbox.event.click)
+            |> Bool/toggle(when: todo_elements.todo_checkbox.events.click)
         edited_title: BLOCK {
             draft_title: LATEST {
                 Text/empty()
-                todo_elements.editing_todo_title_element.event.change.text
+                todo_elements.editing_todo_title_element.events.change.text
                 title_to_update |> THEN { Text/empty() }
             }
             LATEST {
                 draft_title
-                todo_elements.todo_title_element.event.double_click |> THEN {
+                todo_elements.todo_title_element.events.double_click |> THEN {
                     draft_title
                         |> Text/is_empty()
                         |> WHEN { True => title, False => SKIP }
@@ -151,20 +166,20 @@ FUNCTION new_todo(title, initial_completed) {
 theme_options: [
     name: Classic |> HOLD name {
         LATEST {
-            store.elements.theme_switcher.classic.event.press
+            store.elements.theme_switcher.classic.events.press
                 |> THEN { Classic }
-            store.elements.theme_switcher.professional.event.press
+            store.elements.theme_switcher.professional.events.press
                 |> THEN { Professional }
-            store.elements.theme_switcher.glassmorphism.event.press
+            store.elements.theme_switcher.glassmorphism.events.press
                 |> THEN { Glassmorphism }
-            store.elements.theme_switcher.neobrutalism.event.press
+            store.elements.theme_switcher.neobrutalism.events.press
                 |> THEN { Neobrutalism }
-            store.elements.theme_switcher.neumorphism.event.press
+            store.elements.theme_switcher.neumorphism.events.press
                 |> THEN { Neumorphism }
         }
     }
     mode: Light |> HOLD state {
-        store.elements.theme_switcher.mode_toggle.event.press
+        store.elements.theme_switcher.mode_toggle.events.press
             |> THEN {
                 state |> WHEN {
                     Light => Dark
@@ -480,10 +495,8 @@ FUNCTION new_todo_entry() {
             height: 56
         ]
         items: LIST {
-            toggle_all_checkbox()
-                |> SOURCE { PASSED.store.elements.toggle_all_checkbox }
-            new_todo_title_text_input()
-                |> SOURCE { PASSED.store.elements.new_todo_title_text_input }
+            toggle_all_checkbox(events: PASSED.store.elements.toggle_all_checkbox.events)
+            new_todo_title_text_input(events: PASSED.store.elements.new_todo_title_text_input.events)
         }
     )
 }
@@ -492,14 +505,9 @@ FUNCTION new_todo_entry() {
 -- NEW TODO INPUT
 ------------------------------------------------------------------------
 
-FUNCTION new_todo_title_text_input() {
+FUNCTION new_todo_title_text_input(events) {
     Scene/Element/text_input(
-        element:[
-            event: [
-                change: SOURCE
-                key_down: SOURCE
-            ]
-        ]
+        element: [events: events]
         style: [
             width: Fill
             height: Fill
@@ -518,11 +526,7 @@ FUNCTION new_todo_title_text_input() {
             material: [color: TEXT { #00000000 }]
         ]
         label: Hidden[text: TEXT { What needs to be done? }]
-        text: LATEST {
-            Text/empty()
-            element.event.change.text
-            title_to_save |> THEN { Text/empty() }
-        }
+        text: store.new_todo_text
         placeholder: [
             style: [font: Theme/font(of: Placeholder)]
             text: TEXT { What needs to be done? }
@@ -556,9 +560,7 @@ FUNCTION todos_element() {
 
 FUNCTION todo_element(todo) {
     Scene/Element/stripe(
-        element: [
-            hovered: SOURCE
-        ]
+        element: []
         direction: Row
         gap: Theme/spacing(of: Tight)
         style: [
@@ -573,17 +575,13 @@ FUNCTION todo_element(todo) {
         items: todo.editing |> WHILE {
             True => LIST {
                 editing_todo_leading_spacer()
-                editing_todo_title_element(todo: todo)
-                    |> SOURCE { todo.todo_elements.editing_todo_title_element }
+                editing_todo_title_element(events: todo.todo_elements.editing_todo_title_element.events, todo: todo)
             }
             False => LIST {
-                todo_checkbox(todo: todo)
-                    |> SOURCE { todo.todo_elements.todo_checkbox }
-                todo_title_element(todo: todo)
-                    |> SOURCE { todo.todo_elements.todo_title_element }
+                todo_checkbox(events: todo.todo_elements.todo_checkbox.events, todo: todo)
+                todo_title_element(events: todo.todo_elements.todo_title_element.events, todo: todo)
                 element.hovered |> WHILE {
-                    True => remove_todo_button()
-                        |> SOURCE { todo.todo_elements.remove_todo_button }
+                    True => remove_todo_button(events: todo.todo_elements.remove_todo_button.events)
                     False => NoElement
                 }
             }
@@ -595,15 +593,12 @@ FUNCTION todo_element(todo) {
 -- TOGGLE ALL CHECKBOX
 ------------------------------------------------------------------------
 
-FUNCTION toggle_all_checkbox() {
+FUNCTION toggle_all_checkbox(events) {
     BLOCK {
         checked: store.all_completed
 
         Scene/Element/button(
-            element: [
-                event: [click: SOURCE]
-                hovered: SOURCE
-            ]
+            element: [events: events]
             style: [
                 width: Theme/sizing(of: ToggleControl)
                 height: Fill
@@ -636,15 +631,9 @@ FUNCTION toggle_all_checkbox() {
 -- EDITING TODO INPUT
 ------------------------------------------------------------------------
 
-FUNCTION editing_todo_title_element(todo) {
+FUNCTION editing_todo_title_element(events, todo) {
     Scene/Element/text_input(
-        element: [
-            event: [
-                blur: SOURCE
-                change: SOURCE
-                key_down: SOURCE
-            ]
-        ]
+        element: [events: events]
         style: [
             width: Fill
             height: Fill
@@ -686,13 +675,10 @@ FUNCTION editing_todo_leading_spacer() {
 -- TODO CHECKBOX
 ------------------------------------------------------------------------
 
-FUNCTION todo_checkbox(todo) {
+FUNCTION todo_checkbox(events, todo) {
     BLOCK {
         Scene/Element/checkbox(
-            element: [
-                event: [click: SOURCE]
-                hovered: SOURCE
-            ]
+            element: [events: events]
             style: [
                 size: Theme/sizing(of: TouchTarget)
                 spring_range: Theme/spring_range(of: Checkbox)
@@ -709,11 +695,9 @@ FUNCTION todo_checkbox(todo) {
 -- TODO TITLE LABEL
 ------------------------------------------------------------------------
 
-FUNCTION todo_title_element(todo) {
+FUNCTION todo_title_element(events, todo) {
     Scene/Element/label(
-        element: [
-            event: [double_click: SOURCE]
-        ]
+        element: [events: events]
         style: [
             width: Fill
             padding: [left: 0, right: 60]
@@ -729,12 +713,9 @@ FUNCTION todo_title_element(todo) {
 -- REMOVE TODO BUTTON
 ------------------------------------------------------------------------
 
-FUNCTION remove_todo_button() {
+FUNCTION remove_todo_button(events) {
     Scene/Element/button(
-        element:[
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: events]
         style: [
             size: Theme/sizing(of: TouchTarget)
             depth: Theme/depth(of: Hero)
@@ -770,8 +751,7 @@ FUNCTION panel_footer() {
             active_items_count_text()
             filters_element()
             store.has_completed |> WHILE {
-                True => remove_completed_button()
-                        |> SOURCE { PASSED.store.elements.remove_completed_button }
+                True => remove_completed_button(events: PASSED.store.elements.remove_completed_button.events)
                 False => NoElement
                 }
         }
@@ -815,25 +795,19 @@ FUNCTION filters_element() {
             paint: False
         ]
         items: LIST {
-            filter_button(filter: All)
-                |> SOURCE { PASSED.store.elements.filter_buttons.all }
-            filter_button(filter: Active)
-                |> SOURCE { PASSED.store.elements.filter_buttons.active }
-            filter_button(filter: Completed)
-                |> SOURCE { PASSED.store.elements.filter_buttons.completed }
+            filter_button(events: PASSED.store.elements.filter_buttons.all.events, filter: All)
+            filter_button(events: PASSED.store.elements.filter_buttons.active.events, filter: Active)
+            filter_button(events: PASSED.store.elements.filter_buttons.completed.events, filter: Completed)
         }
     )
 }
 
-FUNCTION filter_button(filter) {
+FUNCTION filter_button(events, filter) {
     BLOCK {
         selected: selected_filter == filter
 
         Scene/Element/button(
-            element: [
-                event: [press: SOURCE]
-                hovered: SOURCE
-            ]
+            element: [events: events]
             style: [
                 width: filter |> WHEN {
                     All => 32
@@ -871,12 +845,9 @@ FUNCTION filter_button(filter) {
 -- CLEAR COMPLETED BUTTON
 ------------------------------------------------------------------------
 
-FUNCTION remove_completed_button() {
+FUNCTION remove_completed_button(events) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: events]
         style: [
             align: Right
             width: 110
@@ -992,7 +963,7 @@ FUNCTION footer_reference_line() {
 
 FUNCTION footer_link(label, to) {
     Scene/Element/link(
-        element: [hovered: SOURCE]
+        element: []
         style: [
             ...small_flat_text(of: SmallLink[hovered: element.hovered])
             width: Auto
@@ -1030,16 +1001,11 @@ FUNCTION theme_switcher() {
                 gap: 6
                 style: [width: 414, height: 27, align: [row: Center], paint: False]
                 items: LIST {
-                    theme_name_button(theme_name: Classic)
-                        |> SOURCE { PASSED.store.elements.theme_switcher.classic }
-                    theme_name_button(theme_name: Professional)
-                        |> SOURCE { PASSED.store.elements.theme_switcher.professional }
-                    theme_name_button(theme_name: Glassmorphism)
-                        |> SOURCE { PASSED.store.elements.theme_switcher.glassmorphism }
-                    theme_name_button(theme_name: Neobrutalism)
-                        |> SOURCE { PASSED.store.elements.theme_switcher.neobrutalism }
-                    theme_name_button(theme_name: Neumorphism)
-                        |> SOURCE { PASSED.store.elements.theme_switcher.neumorphism }
+                    theme_name_button(events: PASSED.store.elements.theme_switcher.classic.events, theme_name: Classic)
+                    theme_name_button(events: PASSED.store.elements.theme_switcher.professional.events, theme_name: Professional)
+                    theme_name_button(events: PASSED.store.elements.theme_switcher.glassmorphism.events, theme_name: Glassmorphism)
+                    theme_name_button(events: PASSED.store.elements.theme_switcher.neobrutalism.events, theme_name: Neobrutalism)
+                    theme_name_button(events: PASSED.store.elements.theme_switcher.neumorphism.events, theme_name: Neumorphism)
                 }
             )
             Scene/Element/stripe(
@@ -1048,23 +1014,19 @@ FUNCTION theme_switcher() {
                 gap: 0
                 style: [width: 88, align: [row: Center], paint: False]
                 items: LIST {
-                    mode_toggle_button()
-                        |> SOURCE { PASSED.store.elements.theme_switcher.mode_toggle }
+                    mode_toggle_button(events: PASSED.store.elements.theme_switcher.mode_toggle.events)
                 }
             )
         }
     )
 }
 
-FUNCTION theme_name_button(theme_name) {
+FUNCTION theme_name_button(events, theme_name) {
     BLOCK {
         selected: PASSED.theme_options.name == theme_name
 
         Scene/Element/button(
-            element: [
-                event: [press: SOURCE]
-                hovered: SOURCE
-            ]
+            element: [events: events]
             style: [
                 width: theme_name |> WHEN {
                     Classic => 62
@@ -1115,12 +1077,9 @@ FUNCTION theme_name_button(theme_name) {
     }
 }
 
-FUNCTION mode_toggle_button() {
+FUNCTION mode_toggle_button(events) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: events]
         style: [
             width: 88
             height: 27

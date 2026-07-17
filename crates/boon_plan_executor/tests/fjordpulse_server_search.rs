@@ -1,5 +1,6 @@
 use boon_plan::{
-    FieldId, OutputValueRef, TargetProfile, ValueRef, cpu_plan_executor_supports_whole_plan_op,
+    FieldId, OutputValueRef, ProgramRole, TargetProfile, ValueRef,
+    cpu_plan_executor_supports_whole_plan_op,
 };
 use boon_plan_executor::{Session, SessionOptions, SourceEvent, SourcePayload, Value, ValueTarget};
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,9 +12,10 @@ fn number(value: i64) -> Value {
 
 #[test]
 fn fjordpulse_server_search_uses_the_compiler_owned_prefix_index() {
-    let compiled = boon_compiler::compile_source_path_to_machine_plan(
+    let compiled = boon_compiler::compile_source_path_to_machine_plan_for_role(
         Path::new("examples/fjordpulse/Server/RUN.bn"),
         TargetProfile::SoftwareDefault,
+        ProgramRole::Server,
     )
     .expect("deterministic FjordPulse Server should compile");
     let empty = BTreeSet::new();
@@ -121,9 +123,10 @@ fn fjordpulse_server_search_uses_the_compiler_owned_prefix_index() {
         panic!("HTTP response must remain structural")
     };
     assert_eq!(response["status"], number(200));
-    let Value::Text(body) = &response["body"] else {
-        panic!("intermediate heterogeneous wire body must be Text")
+    let Value::Bytes(body) = &response["body"] else {
+        panic!("HTTP response body must be Bytes")
     };
+    let body = std::str::from_utf8(body).expect("JSON response body must be UTF-8");
     assert!(body.contains("NSR:StopPlace:58366"));
     assert!(body.contains("Bergen stasjon"));
 }

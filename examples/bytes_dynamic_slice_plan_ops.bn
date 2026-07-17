@@ -15,11 +15,11 @@ store: [
     dynamic_len:
         0 |> HOLD dynamic_len {
             LATEST {
-                store.inspect |> THEN { store.dynamic_sliced |> Bytes/length }
+                store.inspect |> THEN { store.dynamic_sliced |> Bytes/length() }
             }
         }
     dynamic_byte:
-        16u00 |> HOLD dynamic_byte {
+        BYTES[1] { 16u00 } |> HOLD dynamic_byte {
             LATEST {
                 store.inspect |> THEN { store.dynamic_sliced |> Bytes/get(index: 2) }
             }

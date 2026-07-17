@@ -15,8 +15,14 @@ use unicode_segmentation::UnicodeSegmentation;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
+mod distributed_compiler;
 mod document_plan_backend;
 mod machine_plan_backend;
+
+pub use distributed_compiler::{
+    CompiledDistributedMachinePlans, DistributedCompilerProgram,
+    compile_distributed_runtime_source_programs,
+};
 
 pub type CompilerResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -444,9 +450,28 @@ pub fn compile_typed_program_with_persistence_catalog(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> Result<MachinePlan, PlanError> {
+    compile_typed_program_for_role_with_persistence_catalog(
+        program,
+        target_profile,
+        ProgramRole::Client,
+        application_identity,
+        schema_version,
+        migration_predecessors,
+    )
+}
+
+pub fn compile_typed_program_for_role_with_persistence_catalog(
+    program: &TypedProgram,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> Result<MachinePlan, PlanError> {
     machine_plan_backend::compile_typed_program(
         program,
         target_profile,
+        program_role,
         &application_identity,
         schema_version,
         migration_predecessors,
@@ -467,9 +492,36 @@ pub fn compile_source_path_to_machine_plan(
     )
 }
 
+pub fn compile_source_path_to_machine_plan_for_role(
+    source_path: &Path,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_path_to_machine_plan_for_role_with_identity(
+        source_path,
+        target_profile,
+        program_role,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
 pub fn compile_source_path_to_machine_plan_with_identity(
     source_path: &Path,
     target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_path_to_machine_plan_for_role_with_identity(
+        source_path,
+        target_profile,
+        ProgramRole::Client,
+        application_identity,
+    )
+}
+
+pub fn compile_source_path_to_machine_plan_for_role_with_identity(
+    source_path: &Path,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
     application_identity: ApplicationIdentity,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
@@ -481,6 +533,7 @@ pub fn compile_source_path_to_machine_plan_with_identity(
         parse_ms,
         total_started,
         target_profile,
+        program_role,
         LoweringMode::Full,
         application_identity,
         boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
@@ -501,10 +554,26 @@ pub fn compile_source_text_to_machine_plan(
     )
 }
 
-pub fn compile_source_text_to_machine_plan_with_identity(
+pub fn compile_source_text_to_machine_plan_for_role(
     source_label: &str,
     source_text: &str,
     target_profile: TargetProfile,
+    program_role: ProgramRole,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_text_to_machine_plan_for_role_with_identity(
+        source_label,
+        source_text,
+        target_profile,
+        program_role,
+        ApplicationIdentity::compiler_default(),
+    )
+}
+
+pub fn compile_source_text_to_machine_plan_for_role_with_identity(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
     application_identity: ApplicationIdentity,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
@@ -516,10 +585,26 @@ pub fn compile_source_text_to_machine_plan_with_identity(
         parse_ms,
         total_started,
         target_profile,
+        program_role,
         LoweringMode::Full,
         application_identity,
         boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
         &[],
+    )
+}
+
+pub fn compile_source_text_to_machine_plan_with_identity(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_source_text_to_machine_plan_for_role_with_identity(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Client,
+        application_identity,
     )
 }
 
@@ -551,6 +636,24 @@ pub fn compile_runtime_source_text_to_machine_plan_with_identity(
     )
 }
 
+pub fn compile_runtime_source_text_to_machine_plan_for_role_with_identity(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_text_to_machine_plan_for_role_with_persistence_catalog(
+        source_label,
+        source_text,
+        target_profile,
+        program_role,
+        application_identity,
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+        &[],
+    )
+}
+
 pub fn compile_runtime_source_text_to_machine_plan_with_persistence_identity(
     source_label: &str,
     source_text: &str,
@@ -576,6 +679,26 @@ pub fn compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_text_to_machine_plan_for_role_with_persistence_catalog(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Client,
+        application_identity,
+        schema_version,
+        migration_predecessors,
+    )
+}
+
+pub fn compile_runtime_source_text_to_machine_plan_for_role_with_persistence_catalog(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
     let parsed = parse_source(source_label.to_owned(), source_text.to_owned())?;
@@ -585,6 +708,7 @@ pub fn compile_runtime_source_text_to_machine_plan_with_persistence_catalog(
         parse_ms,
         total_started,
         target_profile,
+        program_role,
         LoweringMode::Runtime,
         application_identity,
         schema_version,
@@ -620,6 +744,7 @@ pub fn compile_source_units_to_machine_plan_with_identity(
         parse_ms,
         total_started,
         target_profile,
+        ProgramRole::Client,
         LoweringMode::Full,
         application_identity,
         boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
@@ -646,12 +771,56 @@ pub fn compile_runtime_source_units_to_machine_plan_with_identity(
     target_profile: TargetProfile,
     application_identity: ApplicationIdentity,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    compile_runtime_source_units_to_machine_plan_with_persistence_identity(
+    compile_runtime_source_units_to_machine_plan_for_role_with_identity(
         source_label,
         units,
         target_profile,
+        ProgramRole::Client,
+        application_identity,
+    )
+}
+
+pub fn compile_runtime_source_units_to_machine_plan_for_role_with_identity(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_runtime_source_units_to_machine_plan_for_role_with_persistence_catalog(
+        source_label,
+        units,
+        target_profile,
+        program_role,
         application_identity,
         boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+        &[],
+    )
+}
+
+pub fn compile_runtime_source_units_to_machine_plan_for_role_with_persistence_catalog(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let total_started = Instant::now();
+    let parse_started = Instant::now();
+    let parsed = parse_source_units(source_label, units)?;
+    let parse_ms = elapsed_ms(parse_started);
+    compile_parsed_to_machine_plan(
+        parsed,
+        parse_ms,
+        total_started,
+        target_profile,
+        program_role,
+        LoweringMode::Runtime,
+        application_identity,
+        schema_version,
+        migration_predecessors,
     )
 }
 
@@ -680,16 +849,11 @@ pub fn compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    let total_started = Instant::now();
-    let parse_started = Instant::now();
-    let parsed = parse_source_units(source_label, units)?;
-    let parse_ms = elapsed_ms(parse_started);
-    compile_parsed_to_machine_plan(
-        parsed,
-        parse_ms,
-        total_started,
+    compile_runtime_source_units_to_machine_plan_for_role_with_persistence_catalog(
+        source_label,
+        units,
         target_profile,
-        LoweringMode::Runtime,
+        ProgramRole::Client,
         application_identity,
         schema_version,
         migration_predecessors,
@@ -717,6 +881,7 @@ pub fn compile_parsed_program_to_machine_plan_with_identity(
         0.0,
         Instant::now(),
         target_profile,
+        ProgramRole::Client,
         LoweringMode::Full,
         application_identity,
         boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
@@ -736,6 +901,7 @@ fn compile_parsed_to_machine_plan(
     parse_ms: f64,
     total_started: Instant,
     target_profile: TargetProfile,
+    program_role: ProgramRole,
     lowering_mode: LoweringMode,
     application_identity: ApplicationIdentity,
     schema_version: u64,
@@ -748,10 +914,15 @@ fn compile_parsed_to_machine_plan(
             AstExprKind::Drain { .. } | AstExprKind::Draining { .. }
         )
     });
+    let external_types = boon_typecheck::ExternalTypeEnvironment::empty(program_role);
     let ir = match lowering_mode {
-        LoweringMode::Full => boon_ir::lower(&parsed),
-        LoweringMode::Runtime if requires_recursive_migration_types => boon_ir::lower(&parsed),
-        LoweringMode::Runtime => boon_ir::lower_runtime(&parsed),
+        LoweringMode::Full => boon_ir::lower_with_external_types(&parsed, &external_types),
+        LoweringMode::Runtime if requires_recursive_migration_types => {
+            boon_ir::lower_with_external_types(&parsed, &external_types)
+        }
+        LoweringMode::Runtime => {
+            boon_ir::lower_runtime_with_external_types(&parsed, &external_types)
+        }
     }?;
     let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();
@@ -759,9 +930,10 @@ fn compile_parsed_to_machine_plan(
     verify_static_schedule(&ir)?;
     let verify_ms = elapsed_ms(verify_started);
     let compile_started = Instant::now();
-    let plan = compile_typed_program_with_persistence_catalog(
+    let plan = compile_typed_program_for_role_with_persistence_catalog(
         &ir,
         target_profile,
+        program_role,
         application_identity,
         schema_version,
         migration_predecessors,

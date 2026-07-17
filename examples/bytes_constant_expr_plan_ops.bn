@@ -4,7 +4,7 @@ payload:
 store: [
     inspect: SOURCE
     folded_byte:
-        16u00 |> HOLD folded_byte {
+        BYTES[1] { 16u00 } |> HOLD folded_byte {
             LATEST {
                 store.inspect |> THEN { payload |> Bytes/get(index: 0 + 1) }
             }

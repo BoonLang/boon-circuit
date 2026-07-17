@@ -45,7 +45,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let document = result
         .manifest
-        .artifact(boon_plan::ProgramRole::Document)
+        .artifact(boon_plan::ProgramRole::Client)
         .ok_or("built bundle lost its document artifact")?;
     let server = result
         .manifest

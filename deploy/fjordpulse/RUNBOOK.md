@@ -22,7 +22,7 @@ the closed package inventory, and CA certificates. It runs as UID/GID 65532,
 has no shell, compiler, package manager, Python, Node, PHP, or database server,
 and writes only to `/var/lib/boon/fjordpulse` plus bounded `/tmp` scratch space.
 
-`bundle.json` is the runtime authority for source revision, compiler identity,
+`bundle.cbor` is the runtime authority for source revision, compiler identity,
 artifact/content/plan digests, roles, capability profiles, protocol version,
 state namespaces, and every packaged file digest. Startup fails before binding
 port 8080 when any value or byte differs.
@@ -68,4 +68,3 @@ and performance reports required by the canonical FjordPulse plan.
 The persistent volume preserves ordinary restart/redeploy continuity. It is not
 a backup and does not protect against host or disk loss, volume deletion, or
 operator error. Backup/restore automation remains a separately deferred item.
-

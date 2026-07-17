@@ -94,6 +94,7 @@ fn program() -> ProgramSession {
             source: include_str!("../../../examples/outbound_http_effect.bn").to_owned(),
         }],
         application: ApplicationIdentity::new("dev.boon.outbound-http-loopback", "test", "local"),
+        role: boon_plan::ProgramRole::Server,
         capability_profile: ProgramCapabilityProfile::TrustedServer,
     })
     .unwrap();

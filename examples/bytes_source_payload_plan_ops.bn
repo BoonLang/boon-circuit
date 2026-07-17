@@ -10,11 +10,11 @@ store: [
     received_len:
         0 |> HOLD received_len {
             LATEST {
-                store.inspect |> THEN { store.received |> Bytes/length }
+                store.inspect |> THEN { store.received |> Bytes/length() }
             }
         }
     received_byte:
-        16u00 |> HOLD received_byte {
+        BYTES[1] { 16u00 } |> HOLD received_byte {
             LATEST {
                 store.inspect |> THEN { store.received |> Bytes/get(index: 1) }
             }

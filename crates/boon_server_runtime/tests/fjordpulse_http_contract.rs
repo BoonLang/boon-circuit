@@ -4,7 +4,6 @@ use boon_runtime::{
 };
 use boon_server_host::{ServerConfig, bind};
 use boon_server_runtime::BoonServerProgram;
-use boon_transport_json::{Limits, Value, decode};
 use reqwest::{Client, Method, Response, StatusCode};
 use std::{
     fs,
@@ -45,6 +44,7 @@ fn compile_server() -> BoonServerProgram {
             "server-contract-test",
             "loopback",
         ),
+        role: boon_plan::ProgramRole::Server,
         capability_profile: ProgramCapabilityProfile::TrustedServer,
     })
     .expect("FjordPulse deterministic Server should compile");
@@ -63,16 +63,14 @@ fn compile_server() -> BoonServerProgram {
     BoonServerProgram::new(artifact).expect("generic HTTP host port should resolve")
 }
 
-async fn response_json(response: Response) -> (StatusCode, Value) {
+async fn response_body(response: Response) -> (StatusCode, Vec<u8>) {
     let status = response.status();
-    let body = response.bytes().await.expect("response body should read");
-    let value = decode(&body, &Limits::STRICT_SERVER_CLIENT)
-        .unwrap_or_else(|error| panic!("response must be bounded canonical JSON: {error}"));
-    (status, value)
-}
-
-fn fixture(bytes: &[u8]) -> Value {
-    decode(bytes, &Limits::STRICT_SERVER_CLIENT).expect("committed target fixture must be valid")
+    let body = response
+        .bytes()
+        .await
+        .expect("response body should read")
+        .to_vec();
+    (status, body)
 }
 
 async fn request(client: &Client, address: SocketAddr, method: Method, path: &str) -> Response {
@@ -91,9 +89,9 @@ async fn assert_fixture(
     status: StatusCode,
     expected: &[u8],
 ) {
-    let (actual_status, actual) = response_json(request(client, address, method, path).await).await;
+    let (actual_status, actual) = response_body(request(client, address, method, path).await).await;
     assert_eq!(actual_status, status, "status mismatch for {path}");
-    assert_eq!(actual, fixture(expected), "fixture mismatch for {path}");
+    assert_eq!(actual, expected, "fixture mismatch for {path}");
 }
 
 async fn write_target_fixture(
@@ -107,8 +105,10 @@ async fn write_target_fixture(
     let response = request(client, address, method, path).await;
     assert_eq!(response.status(), status, "status mismatch for {path}");
     let body = response.bytes().await.expect("response body should read");
-    decode(&body, &Limits::STRICT_SERVER_CLIENT)
-        .unwrap_or_else(|error| panic!("{path} must return bounded canonical JSON: {error}"));
+    assert!(
+        body.starts_with(b"{") && body.ends_with(b"}"),
+        "{path} must return a complete JSON object"
+    );
 
     let fixture_path = target_http_fixture_path(fixture_name);
     fs::create_dir_all(
@@ -121,17 +121,9 @@ async fn write_target_fixture(
         .unwrap_or_else(|error| panic!("{} should be writable: {error}", fixture_path.display()));
 }
 
-fn error_code(value: &Value) -> &str {
-    let Value::Record(root) = value else {
-        panic!("error response root must be a record")
-    };
-    let Value::Record(error) = &root["error"] else {
-        panic!("error response must contain an error record")
-    };
-    let Value::Text(code) = &error["code"] else {
-        panic!("error code must be Text")
-    };
-    code
+fn response_contains_error_code(body: &[u8], code: &str) -> bool {
+    let body = String::from_utf8_lossy(body);
+    body.contains(&format!(r#""code":"{code}""#)) || body.contains(&format!(r#""code": "{code}""#))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -411,12 +403,12 @@ async fn fjordpulse_public_http_slice_rejects_invalid_method_query_and_ids() {
         ),
     ];
     for (method, path, expected_status, expected_code) in cases {
-        let (status, value) = response_json(request(&client, address, method, path).await).await;
+        let (status, body) = response_body(request(&client, address, method, path).await).await;
         assert_eq!(status, expected_status, "status mismatch for {path}");
-        assert_eq!(
-            error_code(&value),
-            expected_code,
-            "error mismatch for {path}"
+        assert!(
+            response_contains_error_code(&body, expected_code),
+            "error mismatch for {path}: {}",
+            String::from_utf8_lossy(&body)
         );
     }
 

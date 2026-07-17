@@ -13,8 +13,8 @@ build = ["dep:wasm-bindgen-cli-support"]
 boon_persistence.workspace = true
 boon_plan.workspace = true
 boon_runtime.workspace = true
+ciborium.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 toml.workspace = true
 wasm-bindgen-cli-support = { workspace = true, optional = true }
@@ -22,4 +22,3 @@ wasm-bindgen-cli-support = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = "3.23.0"
 wat = "1.240.0"
-

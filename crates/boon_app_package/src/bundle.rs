@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-pub const BUNDLE_MANIFEST_FILE: &str = "bundle.json";
+pub const BUNDLE_MANIFEST_FILE: &str = "bundle.cbor";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,9 +102,9 @@ impl BundleManifest {
                 "bundle protocol_version must be greater than zero",
             ));
         }
-        if self.artifacts.len() != 2 {
+        if self.artifacts.len() != 3 {
             return Err(PackageError::new(
-                "bundle must contain exactly one document and one server artifact",
+                "bundle must contain exactly one client, one session, and one server artifact",
             ));
         }
         let mut roles = BTreeSet::new();
@@ -117,7 +117,12 @@ impl BundleManifest {
                 )));
             }
             validate_bundle_path("artifact path", &artifact.path)?;
-            artifact_paths.insert(artifact.path.as_str());
+            if !artifact_paths.insert(artifact.path.as_str()) {
+                return Err(PackageError::new(format!(
+                    "bundle repeats artifact path `{}`",
+                    artifact.path
+                )));
+            }
             if artifact.revision == 0 {
                 return Err(PackageError::new("artifact revision must be non-zero"));
             }
@@ -153,7 +158,8 @@ impl BundleManifest {
                 )));
             }
             let expected_capability = match artifact.role {
-                ProgramRole::Document => ProgramCapabilityProfile::PublicDocument,
+                ProgramRole::Client => ProgramCapabilityProfile::PublicClient,
+                ProgramRole::Session => ProgramCapabilityProfile::TrustedSession,
                 ProgramRole::Server => ProgramCapabilityProfile::TrustedServer,
             };
             if artifact.capability_profile != expected_capability {
@@ -170,9 +176,9 @@ impl BundleManifest {
                 )));
             }
         }
-        if roles != BTreeSet::from(["document", "server"]) {
+        if roles != BTreeSet::from(["client", "session", "server"]) {
             return Err(PackageError::new(
-                "bundle artifact roles are not the required document/server pair",
+                "bundle artifact roles are not the required client/session/server triple",
             ));
         }
         if self.files.is_empty() || self.files.len() > MAX_PACKAGE_FILES {
@@ -217,15 +223,14 @@ impl BundleManifest {
                 "artifact descriptors are absent from the closed file inventory",
             ));
         }
-        let document_namespace = self
-            .artifact(ProgramRole::Document)
-            .map(|artifact| artifact.state_namespace.as_str());
-        let server_namespace = self
-            .artifact(ProgramRole::Server)
-            .map(|artifact| artifact.state_namespace.as_str());
-        if document_namespace == server_namespace {
+        let namespaces = self
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.state_namespace.as_str())
+            .collect::<BTreeSet<_>>();
+        if namespaces.len() != 3 {
             return Err(PackageError::new(
-                "document and server bundle namespaces must differ",
+                "client, session, and server bundle namespaces must be distinct",
             ));
         }
         Ok(())
@@ -243,7 +248,8 @@ impl BundleManifest {
 pub struct LoadedAppBundle {
     root: PathBuf,
     manifest: BundleManifest,
-    document: ProgramArtifact,
+    client: ProgramArtifact,
+    session: ProgramArtifact,
     server: ProgramArtifact,
 }
 
@@ -267,17 +273,20 @@ impl LoadedAppBundle {
         }
         let bytes = fs::read(&manifest_path)
             .map_err(|error| PackageError::context("read bundle manifest", error))?;
-        let manifest: BundleManifest = serde_json::from_slice(&bytes)?;
+        let manifest: BundleManifest = ciborium::from_reader(bytes.as_slice())
+            .map_err(|error| PackageError::context("decode bundle manifest", error))?;
         manifest.validate()?;
         for descriptor in &manifest.files {
             verify_file(&root, descriptor)?;
         }
-        let document = load_artifact(&root, &manifest, ProgramRole::Document)?;
+        let client = load_artifact(&root, &manifest, ProgramRole::Client)?;
+        let session = load_artifact(&root, &manifest, ProgramRole::Session)?;
         let server = load_artifact(&root, &manifest, ProgramRole::Server)?;
         Ok(Self {
             root,
             manifest,
-            document,
+            client,
+            session,
             server,
         })
     }
@@ -290,8 +299,12 @@ impl LoadedAppBundle {
         &self.manifest
     }
 
-    pub fn document_artifact(&self) -> &ProgramArtifact {
-        &self.document
+    pub fn client_artifact(&self) -> &ProgramArtifact {
+        &self.client
+    }
+
+    pub fn session_artifact(&self) -> &ProgramArtifact {
+        &self.session
     }
 
     pub fn server_artifact(&self) -> &ProgramArtifact {

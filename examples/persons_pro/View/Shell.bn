@@ -37,8 +37,7 @@ FUNCTION header() {
         items: LIST {
             brand()
             header_spacer()
-            theme_button()
-                |> SOURCE { PASSED.store.elements.theme_toggle }
+            theme_button(source: PASSED.store.elements.theme_toggle)
         }
     )
 }
@@ -125,32 +124,33 @@ FUNCTION preview_width_controls() {
         items: LIST {
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.preview_phone
                 label: TEXT { Phone }
                 tone: Neutral
                 selected: PASSED.store.preview_width_mode == Phone
             )
-                |> SOURCE { PASSED.store.elements.preview_phone }
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.preview_tablet
                 label: TEXT { Tablet }
                 tone: Neutral
                 selected: PASSED.store.preview_width_mode == Tablet
             )
-                |> SOURCE { PASSED.store.elements.preview_tablet }
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.preview_desktop
                 label: TEXT { Auto }
                 tone: Neutral
                 selected: PASSED.store.preview_width_mode == Desktop
             )
-                |> SOURCE { PASSED.store.elements.preview_desktop }
         }
     )
 }
 
-FUNCTION theme_button() {
+FUNCTION theme_button(source) {
     Components/button(
         PASS: [store: PASSED.store]
+        source: source
         label: PASSED.store.mode |> WHEN {
             Dark => TEXT { Light }
             Light => TEXT { Dark }
@@ -257,25 +257,25 @@ FUNCTION mobile_tabs() {
         items: LIST {
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.show_code
                 label: TEXT { Code }
                 tone: Neutral
                 selected: PASSED.store.active_view == Code
             )
-                |> SOURCE { PASSED.store.elements.show_code }
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.show_preview
                 label: TEXT { Preview }
                 tone: Neutral
                 selected: PASSED.store.active_view == Preview
             )
-                |> SOURCE { PASSED.store.elements.show_preview }
             Components/button(
                 PASS: [store: PASSED.store]
+                source: PASSED.store.elements.show_publish
                 label: TEXT { Publish }
                 tone: Neutral
                 selected: PASSED.store.active_view == Publish
             )
-                |> SOURCE { PASSED.store.elements.show_publish }
         }
     )
 }

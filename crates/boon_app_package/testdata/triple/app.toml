@@ -1,0 +1,128 @@
+format = 1
+assets = [
+  { source = "assets/mark.svg", target = "assets/mark.svg", cache = "immutable" },
+]
+fixtures = []
+migrations = [
+  { source = "migrations/catalog.toml", target = "migrations/catalog.toml" },
+]
+scenarios = [
+  { source = "scenarios/smoke.toml", target = "scenarios/smoke.toml" },
+]
+budgets = [
+  { source = "budgets/release.toml", target = "budgets/release.toml" },
+]
+
+[package]
+id = "dev.boon.fixture.triple-notes"
+version = "1.0.0"
+deployment_domain = "fixture.local"
+protocol_version = 1
+modes = ["deterministic", "live"]
+
+[programs.client]
+role = "client"
+entry = "Client/RUN.bn"
+sources = ["Shared/Contract.bn", "Client/RUN.bn"]
+artifact = "artifacts/client.boon"
+target_profile = "software_bounded"
+capability_profile = "public_client"
+capability_profile_id = "public-webgpu-v1"
+protocol_version = 1
+
+[programs.client.namespaces]
+deterministic = "fixture-client-deterministic-v1"
+staging = "fixture-client-staging-v1"
+production = "fixture-client-production-v1"
+
+[programs.session]
+role = "session"
+entry = "Session/RUN.bn"
+sources = ["Shared/Contract.bn", "Session/RUN.bn"]
+artifact = "artifacts/session.boon"
+target_profile = "software_bounded"
+capability_profile = "trusted_session"
+capability_profile_id = "trusted-session-v1"
+protocol_version = 1
+
+[programs.session.namespaces]
+deterministic = "fixture-session-deterministic-v1"
+staging = "fixture-session-staging-v1"
+production = "fixture-session-production-v1"
+
+[programs.server]
+role = "server"
+entry = "Server/RUN.bn"
+sources = ["Shared/Contract.bn", "Server/RUN.bn"]
+artifact = "artifacts/server.boon"
+target_profile = "software_bounded"
+capability_profile = "trusted_server"
+capability_profile_id = "trusted-server-v1"
+protocol_version = 1
+
+[programs.server.namespaces]
+deterministic = "fixture-server-deterministic-v1"
+staging = "fixture-server-staging-v1"
+production = "fixture-server-production-v1"
+
+[capability_profiles."public-webgpu-v1"]
+id = "public-webgpu-v1"
+role = "client"
+grants = ["browser.webgpu", "browser.same-origin-http", "browser.same-origin-websocket"]
+
+[capability_profiles."trusted-session-v1"]
+id = "trusted-session-v1"
+role = "session"
+grants = ["session.state"]
+
+[capability_profiles."trusted-server-v1"]
+id = "trusted-server-v1"
+role = "server"
+grants = ["server.http", "server.websocket", "persistence.redb"]
+
+[browser]
+title = "Triple notes fixture"
+canvas_id = "boon-canvas"
+wasm_output_name = "boon_web_host"
+
+[http]
+program_path_prefixes = ["api", "ws"]
+health_path = "/api/health"
+readiness_path = "/api/readiness"
+spa_fallback = true
+
+[[environment]]
+name = "BOON_RUN_MODE"
+kind = "choice"
+required_modes = ["deterministic", "live"]
+allowed_values = ["deterministic", "live"]
+redaction = "public"
+description = "Explicit deterministic or live execution mode."
+
+[[environment]]
+name = "BOON_PUBLIC_ORIGIN"
+kind = "origin"
+required_modes = ["deterministic", "live"]
+redaction = "public"
+description = "Canonical public HTTP origin for this process."
+
+[[environment]]
+name = "BOON_DATA_DIR"
+kind = "text"
+required_modes = ["deterministic", "live"]
+redaction = "public"
+description = "Absolute writable directory for durable process data."
+
+[[environment]]
+name = "BOON_STATE_NAMESPACE"
+kind = "text"
+required_modes = ["deterministic", "live"]
+redaction = "public"
+description = "Exact server artifact state namespace."
+
+[[environment]]
+name = "FIXTURE_SIGNING_SECRET_REF"
+kind = "secret_ref"
+required_modes = ["live"]
+redaction = "reference"
+description = "Opaque host-vault reference used by the unrelated fixture."

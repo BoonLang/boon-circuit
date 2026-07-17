@@ -9,16 +9,16 @@ bad_count: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 3, endian: Little
 bad_endian: bytes |> Bytes/read_unsigned(offset: 0, byte_count: 4, endian: Middle)
 bad_length_input: Bytes/length(input: TEXT { bad })
 missing_get_input: Bytes/get(index: 0)
-missing_set_index: bytes |> Bytes/set(value: 16u01)
+missing_set_index: bytes |> Bytes/set(value: BYTES[1] { 16u01 })
 bad_decode_encoding: bytes |> Bytes/to_text(encoding: Middle)
-missing_decode_encoding: bytes |> Bytes/to_text
+missing_decode_encoding: bytes |> Bytes/to_text()
 bad_encode_encoding: TEXT { hi } |> Text/to_bytes(encoding: Middle)
-missing_encode_encoding: TEXT { hi } |> Text/to_bytes
+missing_encode_encoding: TEXT { hi } |> Text/to_bytes()
 bad_ascii_static_text: TEXT { č } |> Text/to_bytes(encoding: Ascii)
-bad_static_hex_odd: TEXT { 123 } |> Bytes/from_hex
-bad_static_hex_digit: TEXT { 12XX } |> Bytes/from_hex
-bad_static_base64_length: TEXT { AQI } |> Bytes/from_base64
-bad_static_base64_digit: TEXT { AQ*D } |> Bytes/from_base64
+bad_static_hex_odd: TEXT { 123 } |> Bytes/from_hex()
+bad_static_hex_digit: TEXT { 12XX } |> Bytes/from_hex()
+bad_static_base64_length: TEXT { AQI } |> Bytes/from_base64()
+bad_static_base64_digit: TEXT { AQ*D } |> Bytes/from_base64()
 unknown_extra_arg: bytes |> Bytes/find(needle: BYTES[1] { 16u02 }, surprise: 1)
 bad_zeros_input: Bytes/zeros(input: bytes, byte_count: 4)
 bad_zeros_pipe: bytes |> Bytes/zeros(byte_count: 4)
@@ -27,7 +27,7 @@ bad_positional_slice: Bytes/slice(TEXT { bad }, offset: 0, byte_count: 2)
 bad_positional_bytes_slice: Bytes/slice(BYTES[4] { 16u01, 16u02, 16u03, 16u04 }, offset: 1, byte_count: 4)
 bad_get_bounds: bytes |> Bytes/get(index: 4)
 bad_get_negative_bounds: bytes |> Bytes/get(index: -1)
-bad_set_bounds: bytes |> Bytes/set(index: 4, value: 16u01)
+bad_set_bounds: bytes |> Bytes/set(index: 4, value: BYTES[1] { 16u01 })
 bad_slice_bounds: bytes |> Bytes/slice(offset: 3, byte_count: 2)
 bad_slice_negative_bounds: bytes |> Bytes/slice(offset: -1, byte_count: 2)
 bad_take_bounds: bytes |> Bytes/take(byte_count: 5)

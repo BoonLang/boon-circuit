@@ -12,10 +12,18 @@ FUNCTION page() {
                 gap: 16
                 style: [width: Fill, wrap: True, wrap_min_width: 320, paint: False]
                 items: LIST {
-                    boon_post_card() |> SOURCE { PASSED.store.elements.post.boon }
-                    novywave_post_card() |> SOURCE { PASSED.store.elements.post.novywave }
-                    moonzoon_foundations_card() |> SOURCE { PASSED.store.elements.post.moonzoon_foundations }
-                    moonzoon_history_card() |> SOURCE { PASSED.store.elements.post.moonzoon_history }
+                    boon_post_card(
+                        source: PASSED.store.elements.post.boon
+                    )
+                    novywave_post_card(
+                        source: PASSED.store.elements.post.novywave
+                    )
+                    moonzoon_foundations_card(
+                        source: PASSED.store.elements.post.moonzoon_foundations
+                    )
+                    moonzoon_history_card(
+                        source: PASSED.store.elements.post.moonzoon_history
+                    )
                 }
             )
             KavikComponents/contact_section(PASS: [store: PASSED.store])
@@ -23,8 +31,9 @@ FUNCTION page() {
     )
 }
 
-FUNCTION boon_post_card() {
+FUNCTION boon_post_card(source) {
     KavikComponents/post_card(PASS: [store: PASSED.store]
+        source: source
         title: TEXT { The Boon of Dataflow }
         description: TEXT { What time manipulation games, hardware circuits, and factory sims taught me about programming. }
         meta: TEXT { Boon / dataflow / games / books }
@@ -32,8 +41,9 @@ FUNCTION boon_post_card() {
     )
 }
 
-FUNCTION novywave_post_card() {
+FUNCTION novywave_post_card(source) {
     KavikComponents/post_card(PASS: [store: PASSED.store]
+        source: source
         title: TEXT { Building NovyWave: GTKWave alternative }
         description: TEXT { NovyWave, user feedback, and the final stretch to a polished release. }
         meta: TEXT { NovyWave / user research / EDA / waveforms }
@@ -41,8 +51,9 @@ FUNCTION novywave_post_card() {
     )
 }
 
-FUNCTION moonzoon_foundations_card() {
+FUNCTION moonzoon_foundations_card(source) {
     KavikComponents/post_card(PASS: [store: PASSED.store]
+        source: source
         title: TEXT { MoonZoon: Foundations (2021) }
         description: TEXT { Signals over hooks, Wasm size battles, and fullstack Rust lessons. }
         meta: TEXT { MoonZoon / Rust / Wasm / signals / Boon }
@@ -50,8 +61,9 @@ FUNCTION moonzoon_foundations_card() {
     )
 }
 
-FUNCTION moonzoon_history_card() {
+FUNCTION moonzoon_history_card(source) {
     KavikComponents/post_card(PASS: [store: PASSED.store]
+        source: source
         title: TEXT { MoonZoon: 2021-2025 }
         description: TEXT { 922 commits and 4.5 years of routing, animations, workers, desktop apps, and GPU graphics. }
         meta: TEXT { MoonZoon / Rust / Wasm / graphics / Tauri }
@@ -71,8 +83,10 @@ FUNCTION article(title, deck, meta, image_url, image_alt, items) {
             paint: False
         ]
         items: LIST {
-            KavikComponents/action_button(PASS: [store: PASSED.store], label: TEXT { Back to Blog })
-                |> SOURCE { PASSED.store.elements.nav.blog }
+            KavikComponents/action_button(PASS: [store: PASSED.store]
+                source: PASSED.store.elements.nav.blog
+                label: TEXT { Back to Blog }
+            )
             KavikComponents/page_hero(PASS: [store: PASSED.store], title: title, tagline: deck)
             KavikComponents/muted(PASS: [store: PASSED.store], text: meta)
             KavikComponents/image(PASS: [store: PASSED.store], url: image_url, alt: image_alt, aspect: 1.75)

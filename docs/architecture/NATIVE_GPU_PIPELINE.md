@@ -112,7 +112,7 @@ The pinned `BoonLang/app_window` fork exposes one ordered asynchronous receiver
 per surface. It covers pointer motion/buttons, wheel, physical/logical keys,
 text and IME, focus, resize, scale, close, and accessibility actions.
 
-The queue contract is:
+The app-window queue contract is:
 
 - one queue and one `AtomicWaker`;
 - timestamp at the platform callback before the queue lock;
@@ -124,10 +124,18 @@ The queue contract is:
 - overflow is fatal because input order has been lost;
 - no polling timer, event history, resampling, or public verifier injection.
 
-`NativeSurfaceHost` converts each event to one `HostEventEnvelope`, including a
-bounded callback-to-host duration. OS input and TEST/operator input enter the
-same public `HostEvent` routing function. Operator events are explicitly marked
-and never call a private runtime dispatch API.
+`NativeSurfaceHost` moves that receiver onto one dedicated, sleeping input pump.
+The pump normalizes raw events into typed `HostEvent` values, assigns their
+sequence, and closes callback-to-host timing before placing them in a second
+bounded queue. It never evaluates Boon, mutates a document, lays out, renders,
+or performs proof work. This keeps an in-progress surface frame from delaying
+input acceptance. Both queues preserve order and fail closed on overflow.
+Resize is normalized on the pump but applied later by the surface-owning render
+thread before its `HostEventEnvelope` is exposed.
+
+OS input and TEST/operator input enter the same public `HostEvent` routing
+function. Operator events are explicitly marked and never call a private
+runtime dispatch API.
 
 ## Role Protocol
 
@@ -156,9 +164,9 @@ IPC, JSON, or proof query from a render hook.
 
 Preview and dev use the same transaction shape:
 
-1. await a native event or role message while idle;
-2. drain already queued events;
-3. accept visible input and record its sequence/time;
+1. await an accepted native event or role message while idle;
+2. drain already accepted events from the bounded host queue;
+3. record the visible input sequence/time selected for this transaction;
 4. apply runtime changes or local viewport state;
 5. patch the retained document/layout/render scene;
 6. acquire the surface, encode, submit, and present;
@@ -321,7 +329,9 @@ claims, and human observation are not native proof.
 
 ## Timing Definitions
 
-- callback-to-host: platform callback timestamp to accepted `HostEventEnvelope`;
+- callback-to-host: platform callback timestamp to completion of typed
+  `HostEvent` normalization on the dedicated input pump; envelope metadata and
+  surface-owned resize application happen after this boundary;
 - input-to-present: accepted visible-changing host input to return from
   `present()` for the frame containing that input;
 - render: CPU time inside retained scene encoding;

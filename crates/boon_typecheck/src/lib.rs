@@ -1,3 +1,5 @@
+use boon_data::MAX_NUMBER_TEXT_DIGITS;
+pub use boon_document_model::ProgramRole;
 use boon_parser::{
     AstCallArg, AstDrainPath, AstExpr, AstExprKind, AstRecordField, AstStatement, AstStatementKind,
     BytesSizeSyntax, ParsedProgram,
@@ -15,7 +17,6 @@ use web_time::Instant;
 pub enum Type {
     Text,
     Number,
-    Byte,
     Bytes(BytesType),
     Skip,
     VariantSet(Vec<Variant>),
@@ -197,6 +198,42 @@ pub struct FlowType {
     pub ty: Type,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExternalFunctionArgument {
+    pub name: String,
+    pub ty: Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExternalFunctionType {
+    pub args: Vec<ExternalFunctionArgument>,
+    pub result: FlowType,
+    pub pure: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExternalTypeEnvironment {
+    pub current_role: ProgramRole,
+    pub values: BTreeMap<String, FlowType>,
+    pub functions: BTreeMap<String, ExternalFunctionType>,
+}
+
+impl ExternalTypeEnvironment {
+    pub fn empty(current_role: ProgramRole) -> Self {
+        Self {
+            current_role,
+            values: BTreeMap::new(),
+            functions: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for ExternalTypeEnvironment {
+    fn default() -> Self {
+        Self::empty(ProgramRole::Client)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FlowMode {
     Continuous,
@@ -275,7 +312,6 @@ pub struct ResolvedConstantEntry {
 pub enum ResolvedConstantValue {
     UnsignedInteger { value: u64 },
     SignedInteger { value: i64 },
-    Byte { value: u8 },
     Symbol { value: String },
 }
 
@@ -295,6 +331,17 @@ pub struct FunctionTypeEntry {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct FunctionTypeTable {
     pub entries: Vec<FunctionTypeEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamedValueTypeEntry {
+    pub path: String,
+    pub flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamedValueTypeTable {
+    pub entries: Vec<NamedValueTypeEntry>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -377,11 +424,6 @@ pub struct SourcePayloadShapeField {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectTable {
-    pub declarations: Vec<HostEffectDeclaration>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostPortTable {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpServerPortTypeEntry>,
@@ -409,33 +451,6 @@ pub struct WebSocketServerPortTypeEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectDeclaration {
-    pub name: String,
-    pub line: usize,
-    pub trigger_source: String,
-    pub trigger_expr_id: usize,
-    pub operation: String,
-    pub perform_expr_id: usize,
-    pub intent_type: Type,
-    pub intent_fields: Vec<HostEffectIntentField>,
-    pub result_type: Type,
-    pub result_routes: Vec<HostEffectResultRoute>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectIntentField {
-    pub name: String,
-    pub value_expr_id: usize,
-    pub value_type: Type,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct HostEffectResultRoute {
-    pub variant: String,
-    pub source_path: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TypeCheckReport {
     pub expression_count: usize,
     pub checked_expression_count: usize,
@@ -447,8 +462,6 @@ pub struct TypeCheckReport {
     pub source_payload_shape_coverage: Vec<String>,
     pub source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
     #[serde(default)]
-    pub host_effect_table: HostEffectTable,
-    #[serde(default)]
     pub host_port_table: HostPortTable,
     pub full_document_typecheck_coverage: bool,
     pub list_map_binding_count_runtime_value: usize,
@@ -457,6 +470,8 @@ pub struct TypeCheckReport {
     pub output_root_types: Vec<OutputRootTypeEntry>,
     pub expr_type_table: ExprTypeTable,
     pub function_type_table: FunctionTypeTable,
+    #[serde(default)]
+    pub named_value_type_table: NamedValueTypeTable,
     pub type_hint_table: TypeHintTable,
     #[serde(default)]
     pub resolved_constant_table: ResolvedConstantTable,
@@ -485,7 +500,6 @@ impl TypeCheckReport {
 
 #[derive(Clone)]
 struct HostEffectSignature {
-    intent_type: Type,
     intent_fields: Vec<(String, Type)>,
     result_type: Type,
 }
@@ -493,7 +507,9 @@ struct HostEffectSignature {
 fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
     let spec = boon_effect_schema::host_effect_spec(operation)?;
     let schema = spec.schema?;
-    if spec.result_policy != boon_effect_schema::ResultPolicySpec::CorrelatedSource {
+    if operation == "File/write_bytes"
+        || spec.result_policy != boon_effect_schema::ResultPolicySpec::ReturnValue
+    {
         return None;
     }
     let boon_effect_schema::ValueType::Record {
@@ -513,13 +529,13 @@ fn host_effect_signature(operation: &str) -> Option<HostEffectSignature> {
         })
         .collect::<Vec<_>>();
     Some(HostEffectSignature {
-        intent_type: Type::Object(ObjectShape::from_ordered_fields(
-            intent_fields.iter().cloned(),
-            false,
-        )),
         intent_fields,
         result_type: effect_schema_type_to_type(&schema.result),
     })
+}
+
+pub fn is_typed_host_effect(operation: &str) -> bool {
+    host_effect_signature(operation).is_some()
 }
 
 fn effect_schema_type_to_type(value_type: &boon_effect_schema::ValueType) -> Type {
@@ -572,275 +588,6 @@ fn effect_schema_type_to_type(value_type: &boon_effect_schema::ValueType) -> Typ
                 .collect(),
         ),
     }
-}
-
-fn host_effect_table(
-    program: &ParsedProgram,
-    source_lookup: &SourcePayloadPathLookup,
-) -> (HostEffectTable, Vec<TypeDiagnostic>) {
-    let mut table = HostEffectTable::default();
-    let mut diagnostics = Vec::new();
-    let effects = program
-        .ast
-        .statements
-        .iter()
-        .filter(|statement| statement_field_name(statement) == Some("effects"))
-        .collect::<Vec<_>>();
-    if effects.len() > 1 {
-        diagnostics.push(diagnostic_for_statement(
-            effects.get(1).copied(),
-            "top-level `effects` may be declared only once".to_owned(),
-        ));
-    }
-    let Some(effects) = effects.first().copied() else {
-        return (table, diagnostics);
-    };
-    let mut declaration_names = BTreeSet::new();
-    for declaration in &effects.children {
-        let Some(name) = statement_field_name(declaration).map(str::to_owned) else {
-            diagnostics.push(diagnostic_for_statement(
-                Some(declaration),
-                "each `effects` entry must be a named record".to_owned(),
-            ));
-            continue;
-        };
-        let diagnostic_start = diagnostics.len();
-        if !declaration_names.insert(name.clone()) {
-            diagnostics.push(diagnostic_for_statement(
-                Some(declaration),
-                format!("effect declaration `{name}` is duplicated"),
-            ));
-        }
-        let mut members = BTreeMap::<&str, &AstStatement>::new();
-        for member in &declaration.children {
-            let Some(member_name) = statement_field_name(member) else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(member),
-                    format!("effect declaration `{name}` contains an unnamed member"),
-                ));
-                continue;
-            };
-            if !matches!(member_name, "on" | "perform" | "results") {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(member),
-                    format!(
-                        "effect declaration `{name}` has unsupported member `{member_name}`; expected `on`, `perform`, or `results`"
-                    ),
-                ));
-                continue;
-            }
-            if members.insert(member_name, member).is_some() {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(member),
-                    format!("effect declaration `{name}` repeats `{member_name}`"),
-                ));
-            }
-        }
-        for required in ["on", "perform", "results"] {
-            if !members.contains_key(required) {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(declaration),
-                    format!("effect declaration `{name}` is missing `{required}`"),
-                ));
-            }
-        }
-        let Some(on) = members.get("on").copied() else {
-            continue;
-        };
-        let Some(trigger_expr_id) = on.expr else {
-            diagnostics.push(diagnostic_for_statement(
-                Some(on),
-                format!("effect declaration `{name}` has no `on` source"),
-            ));
-            continue;
-        };
-        let Some(trigger_source) =
-            effect_source_path(program, trigger_expr_id, source_lookup, false)
-        else {
-            diagnostics.push(diagnostic_for_statement(
-                Some(on),
-                format!("effect declaration `{name}` `on` must resolve to one SOURCE"),
-            ));
-            continue;
-        };
-        let Some(perform) = members.get("perform").copied() else {
-            continue;
-        };
-        let Some(perform_expr_id) = perform.expr else {
-            diagnostics.push(diagnostic_for_statement(
-                Some(perform),
-                format!("effect declaration `{name}` has no `perform` call"),
-            ));
-            continue;
-        };
-        let Some(AstExpr {
-            kind: AstExprKind::Call { function, args },
-            ..
-        }) = program.expressions.get(perform_expr_id)
-        else {
-            diagnostics.push(diagnostic_for_statement(
-                Some(perform),
-                format!("effect declaration `{name}` `perform` must be a direct host call"),
-            ));
-            continue;
-        };
-        let Some(signature) = host_effect_signature(function) else {
-            diagnostics.push(diagnostic_for_statement(
-                Some(perform),
-                format!("effect declaration `{name}` uses unknown typed host effect `{function}`"),
-            ));
-            continue;
-        };
-        let mut args_by_name = BTreeMap::new();
-        for arg in args {
-            let Some(arg_name) = arg.name.as_deref() else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(perform),
-                    format!("effect declaration `{name}` requires named intent fields"),
-                ));
-                continue;
-            };
-            if args_by_name.insert(arg_name, arg.value).is_some() {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(perform),
-                    format!("effect declaration `{name}` repeats intent field `{arg_name}`"),
-                ));
-            }
-        }
-        for arg in &perform.children {
-            let Some(arg_name) = statement_field_name(arg) else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(arg),
-                    format!("effect declaration `{name}` requires named intent fields"),
-                ));
-                continue;
-            };
-            let Some(value_expr_id) = arg.expr else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(arg),
-                    format!("intent field `{arg_name}` has no value"),
-                ));
-                continue;
-            };
-            if args_by_name.insert(arg_name, value_expr_id).is_some() {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(arg),
-                    format!("effect declaration `{name}` repeats intent field `{arg_name}`"),
-                ));
-            }
-        }
-        let expected_args = signature
-            .intent_fields
-            .iter()
-            .map(|(field, _)| field.as_str())
-            .collect::<BTreeSet<_>>();
-        for actual in args_by_name.keys().copied() {
-            if !expected_args.contains(actual) {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(perform),
-                    format!("`{function}` has no intent field `{actual}`"),
-                ));
-            }
-        }
-        let mut intent_fields = Vec::new();
-        for (field, ty) in &signature.intent_fields {
-            let Some(value_expr_id) = args_by_name.get(field.as_str()).copied() else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(perform),
-                    format!("`{function}` is missing intent field `{field}`"),
-                ));
-                continue;
-            };
-            intent_fields.push(HostEffectIntentField {
-                name: field.clone(),
-                value_expr_id,
-                value_type: ty.clone(),
-            });
-        }
-        let Some(results) = members.get("results").copied() else {
-            continue;
-        };
-        let expected_variants = host_effect_variants(&signature.result_type);
-        let mut routes_by_variant = BTreeMap::new();
-        for route in &results.children {
-            let Some(variant) = statement_field_name(route) else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(route),
-                    format!("effect declaration `{name}` has an unnamed result route"),
-                ));
-                continue;
-            };
-            if !expected_variants.contains_key(variant) {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(route),
-                    format!("`{function}` has no result variant `{variant}`"),
-                ));
-                continue;
-            }
-            let Some(expr_id) = route.expr else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(route),
-                    format!("result variant `{variant}` has no SOURCE route"),
-                ));
-                continue;
-            };
-            let Some(source_path) = effect_source_path(program, expr_id, source_lookup, true)
-            else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(route),
-                    format!("result variant `{variant}` must route to one direct SOURCE"),
-                ));
-                continue;
-            };
-            if routes_by_variant.insert(variant, source_path).is_some() {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(route),
-                    format!("result variant `{variant}` is routed more than once"),
-                ));
-            }
-        }
-        let mut result_routes = Vec::new();
-        let mut routed_sources = BTreeSet::new();
-        for variant in expected_variants.keys() {
-            let Some(source_path) = routes_by_variant.get(variant.as_str()).cloned() else {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(results),
-                    format!("`{function}` is missing result route `{variant}`"),
-                ));
-                continue;
-            };
-            if !routed_sources.insert(source_path.clone()) {
-                diagnostics.push(diagnostic_for_statement(
-                    Some(results),
-                    format!(
-                        "effect declaration `{name}` routes multiple variants to `{source_path}`"
-                    ),
-                ));
-            }
-            result_routes.push(HostEffectResultRoute {
-                variant: variant.clone(),
-                source_path,
-            });
-        }
-        if diagnostics.len() == diagnostic_start {
-            table.declarations.push(HostEffectDeclaration {
-                name,
-                line: declaration.line,
-                trigger_source,
-                trigger_expr_id,
-                operation: function.clone(),
-                perform_expr_id,
-                intent_type: signature.intent_type,
-                intent_fields,
-                result_type: signature.result_type,
-                result_routes,
-            });
-        }
-    }
-    table
-        .declarations
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    (table, diagnostics)
 }
 
 fn host_port_table(
@@ -1125,21 +872,15 @@ fn effect_source_path(
     (matches.len() == 1).then(|| matches.remove(0))
 }
 
-fn host_effect_variants(result_type: &Type) -> BTreeMap<String, ObjectShape> {
-    let Type::VariantSet(variants) = result_type else {
-        return BTreeMap::new();
-    };
-    variants
-        .iter()
-        .map(|variant| match variant {
-            Variant::Tag(tag) => (tag.clone(), ObjectShape::new(BTreeMap::new(), false)),
-            Variant::Tagged { tag, fields } => (tag.clone(), fields.clone()),
-        })
-        .collect()
-}
-
 pub fn check(program: &ParsedProgram) -> TypeCheckReport {
     check_profiled(program).0
+}
+
+pub fn check_with_external_types(
+    program: &ParsedProgram,
+    external_types: &ExternalTypeEnvironment,
+) -> TypeCheckReport {
+    check_profiled_with_external_types(program, external_types).0
 }
 
 pub fn check_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckProfile) {
@@ -1147,9 +888,181 @@ pub fn check_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckPro
     checker.check_program_profiled(true, init_profile)
 }
 
+pub fn check_profiled_with_external_types(
+    program: &ParsedProgram,
+    external_types: &ExternalTypeEnvironment,
+) -> (TypeCheckReport, TypeCheckProfile) {
+    let (mut checker, init_profile) =
+        Checker::new_profiled_with_external_types(program, external_types);
+    checker.check_program_profiled(true, init_profile)
+}
+
 pub fn check_runtime_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckProfile) {
     let (mut checker, init_profile) = Checker::new_profiled(program);
     checker.check_program_profiled(false, init_profile)
+}
+
+pub fn check_runtime_profiled_with_external_types(
+    program: &ParsedProgram,
+    external_types: &ExternalTypeEnvironment,
+) -> (TypeCheckReport, TypeCheckProfile) {
+    let (mut checker, init_profile) =
+        Checker::new_profiled_with_external_types(program, external_types);
+    checker.check_program_profiled(false, init_profile)
+}
+
+fn role_for_namespace(namespace: &str) -> Option<ProgramRole> {
+    match namespace {
+        "Client" => Some(ProgramRole::Client),
+        "Session" => Some(ProgramRole::Session),
+        "Server" => Some(ProgramRole::Server),
+        _ => None,
+    }
+}
+
+fn external_value_role(parts: &[String]) -> Option<ProgramRole> {
+    parts.first().and_then(|part| role_for_namespace(part))
+}
+
+fn external_function_role(function: &str) -> Option<ProgramRole> {
+    function
+        .split_once('/')
+        .and_then(|(namespace, _)| role_for_namespace(namespace))
+}
+
+fn role_can_read(current: ProgramRole, producer: ProgramRole) -> bool {
+    matches!(
+        (current, producer),
+        (
+            ProgramRole::Client,
+            ProgramRole::Session | ProgramRole::Server
+        ) | (ProgramRole::Session, ProgramRole::Server)
+    )
+}
+
+fn role_namespace(role: ProgramRole) -> &'static str {
+    match role {
+        ProgramRole::Client => "Client",
+        ProgramRole::Session => "Session",
+        ProgramRole::Server => "Server",
+    }
+}
+
+fn external_data_type_is_closed(ty: &Type) -> bool {
+    match ty {
+        Type::Text | Type::Number | Type::Bytes(_) => true,
+        Type::Object(shape) => {
+            !shape.open && shape.fields.values().all(external_data_type_is_closed)
+        }
+        Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
+            Variant::Tag(_) => true,
+            Variant::Tagged { fields, .. } => {
+                !fields.open && fields.fields.values().all(external_data_type_is_closed)
+            }
+        }),
+        Type::Skip
+        | Type::RenderContract
+        | Type::List(_)
+        | Type::Function { .. }
+        | Type::UnresolvedShape { .. }
+        | Type::Var(_)
+        | Type::Unknown => false,
+    }
+}
+
+fn external_type_environment_diagnostics(
+    environment: &ExternalTypeEnvironment,
+) -> Vec<TypeDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for (path, flow_type) in &environment.values {
+        let valid_path = path.split_once('.').is_some_and(|(namespace, suffix)| {
+            role_for_namespace(namespace).is_some()
+                && !suffix.is_empty()
+                && !suffix.split('.').any(str::is_empty)
+        });
+        if !valid_path {
+            diagnostics.push(diagnostic_at_line(
+                1,
+                format!(
+                    "external value `{path}` must use an exact qualified path such as `Server.store.count`"
+                ),
+            ));
+        }
+        if flow_type.mode != FlowMode::Continuous {
+            diagnostics.push(diagnostic_at_line(
+                1,
+                format!("external value `{path}` must be continuous"),
+            ));
+        }
+        if !external_data_type_is_closed(&flow_type.ty) {
+            diagnostics.push(diagnostic_at_line(
+                1,
+                format!(
+                    "external value `{path}` must have a closed scalar, record, or variant type; found {}",
+                    boon_facing_type_label(&flow_type.ty)
+                ),
+            ));
+        }
+    }
+    for (function, signature) in &environment.functions {
+        let valid_function = function.split_once('/').is_some_and(|(namespace, suffix)| {
+            role_for_namespace(namespace).is_some()
+                && !suffix.is_empty()
+                && !suffix.split('/').any(str::is_empty)
+        });
+        if !valid_function {
+            diagnostics.push(diagnostic_at_line(
+                1,
+                format!(
+                    "external function `{function}` must use an exact qualified name such as `Server/Module/format`"
+                ),
+            ));
+        }
+        if !signature.pure {
+            diagnostics.push(diagnostic_at_line(
+                1,
+                format!("external function `{function}` must be pure"),
+            ));
+        }
+        if signature.result.mode != FlowMode::Continuous {
+            diagnostics.push(diagnostic_at_line(
+                1,
+                format!("external function `{function}` must have a continuous result"),
+            ));
+        }
+        if !external_data_type_is_closed(&signature.result.ty) {
+            diagnostics.push(diagnostic_at_line(
+                1,
+                format!(
+                    "external function `{function}` must have a closed result type; found {}",
+                    boon_facing_type_label(&signature.result.ty)
+                ),
+            ));
+        }
+        let mut names = BTreeSet::new();
+        for arg in &signature.args {
+            if arg.name.is_empty() || !names.insert(arg.name.as_str()) {
+                diagnostics.push(diagnostic_at_line(
+                    1,
+                    format!(
+                        "external function `{function}` has an empty or duplicate argument name `{}`",
+                        arg.name
+                    ),
+                ));
+            }
+            if !external_data_type_is_closed(&arg.ty) {
+                diagnostics.push(diagnostic_at_line(
+                    1,
+                    format!(
+                        "external function `{function}` argument `{}` must have a closed scalar, record, or variant type; found {}",
+                        arg.name,
+                        boon_facing_type_label(&arg.ty)
+                    ),
+                ));
+            }
+        }
+    }
+    diagnostics
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1194,6 +1107,7 @@ struct CheckerInitProfile {
 
 struct Checker<'a> {
     program: &'a ParsedProgram,
+    external_types: ExternalTypeEnvironment,
     vars: TypeVarStore,
     builtins: BuiltinSignatureRegistry,
     render_contracts: RenderContractRegistry,
@@ -1201,7 +1115,6 @@ struct Checker<'a> {
     source_payload_lookup: SourcePayloadPathLookup,
     source_payload_shape_table: Vec<SourcePayloadShapeEntry>,
     source_payload_types: BTreeMap<String, Type>,
-    host_effect_table: HostEffectTable,
     host_port_table: HostPortTable,
     function_statements: BTreeMap<String, &'a AstStatement>,
     function_call_graph: BTreeMap<String, BTreeSet<String>>,
@@ -1230,6 +1143,13 @@ struct Checker<'a> {
 
 impl<'a> Checker<'a> {
     fn new_profiled(program: &'a ParsedProgram) -> (Self, CheckerInitProfile) {
+        Self::new_profiled_with_external_types(program, &ExternalTypeEnvironment::default())
+    }
+
+    fn new_profiled_with_external_types(
+        program: &'a ParsedProgram,
+        external_types: &ExternalTypeEnvironment,
+    ) -> (Self, CheckerInitProfile) {
         let checker_init_started = Instant::now();
         let source_paths_started = Instant::now();
         let source_paths = program
@@ -1239,8 +1159,6 @@ impl<'a> Checker<'a> {
             .collect();
         let source_paths_ms = typecheck_elapsed_ms(source_paths_started);
         let source_payload_lookup = SourcePayloadPathLookup::new(&source_paths);
-        let (host_effect_table, host_effect_diagnostics) =
-            host_effect_table(program, &source_payload_lookup);
         let (host_port_table, host_port_diagnostics) =
             host_port_table(program, &source_payload_lookup);
         let source_payload_shape_table_started = Instant::now();
@@ -1248,7 +1166,6 @@ impl<'a> Checker<'a> {
             program,
             &source_paths,
             &source_payload_lookup,
-            &host_effect_table,
             &host_port_table,
         );
         let source_payload_shape_table_ms =
@@ -1278,6 +1195,16 @@ impl<'a> Checker<'a> {
             &source_payload_types,
             &function_param_requirements,
             &function_args_by_name,
+        );
+        for (path, flow_type) in &external_types.values {
+            name_bindings.insert(path.clone(), flow_type.ty.clone());
+        }
+        refresh_external_declaration_bindings(
+            &program.ast.statements,
+            &program.expressions,
+            external_types,
+            &mut Vec::new(),
+            &mut name_bindings,
         );
         let name_bindings_ms = typecheck_elapsed_ms(name_bindings_started);
         let passed_context_started = Instant::now();
@@ -1319,6 +1246,7 @@ impl<'a> Checker<'a> {
         );
         let mut checker = Self {
             program,
+            external_types: external_types.clone(),
             vars: TypeVarStore::default(),
             builtins: BuiltinSignatureRegistry::default(),
             render_contracts,
@@ -1326,7 +1254,6 @@ impl<'a> Checker<'a> {
             source_payload_lookup,
             source_payload_shape_table,
             source_payload_types,
-            host_effect_table,
             host_port_table,
             function_statements,
             function_call_graph,
@@ -1350,7 +1277,7 @@ impl<'a> Checker<'a> {
             render_slot_table: RenderSlotTable::default(),
             list_map_bindings: Vec::new(),
             constraints: Vec::new(),
-            diagnostics: host_effect_diagnostics
+            diagnostics: external_type_environment_diagnostics(external_types)
                 .into_iter()
                 .chain(host_port_diagnostics)
                 .collect(),
@@ -1486,12 +1413,13 @@ impl<'a> Checker<'a> {
         };
         let total_started = Instant::now();
         self.collect_type_hints = include_type_hints;
+        self.check_byte_literal_contexts();
         let recursive_functions_started = Instant::now();
         if trace_typecheck {
             eprintln!("boon_typecheck recursive_functions:start");
         }
         self.check_recursive_functions();
-        self.check_host_effect_declarations();
+        self.check_host_effect_calls();
         let recursive_functions_ms = typecheck_elapsed_ms(recursive_functions_started);
         trace_phase("recursive_functions", recursive_functions_ms);
         let check_statements_started = Instant::now();
@@ -1570,6 +1498,10 @@ impl<'a> Checker<'a> {
         let resolved_constant_table = resolved_constant_table(self.program);
         let output_root_types = self.check_output_roots();
         self.check_host_port_outputs(&output_root_types);
+        let named_value_type_table = self.named_value_type_table();
+        self.function_type_table
+            .entries
+            .sort_by(|left, right| left.name.cmp(&right.name));
         let assemble_report_started = Instant::now();
         if trace_typecheck {
             eprintln!("boon_typecheck assemble_report:start");
@@ -1589,7 +1521,6 @@ impl<'a> Checker<'a> {
                 .map(|source| source.path.clone())
                 .collect(),
             source_payload_shape_table,
-            host_effect_table: self.host_effect_table.clone(),
             host_port_table: self.host_port_table.clone(),
             full_document_typecheck_coverage: document_root(self.program).is_none_or(|root| {
                 statement_expr_ids(root)
@@ -1601,6 +1532,7 @@ impl<'a> Checker<'a> {
             output_root_types,
             expr_type_table: std::mem::take(&mut self.expr_type_table),
             function_type_table: std::mem::take(&mut self.function_type_table),
+            named_value_type_table,
             type_hint_table,
             resolved_constant_table,
             render_slot_table: std::mem::take(&mut self.render_slot_table),
@@ -1647,6 +1579,18 @@ impl<'a> Checker<'a> {
                 statement.children.len()
             );
         }
+        if let AstStatementKind::Function { name, args } = &statement.kind {
+            let arg_types = args
+                .iter()
+                .map(|arg| self.function_arg_display_type(name, arg))
+                .collect();
+            self.function_type_table.entries.push(FunctionTypeEntry {
+                name: name.clone(),
+                args: args.clone(),
+                arg_types,
+                result: self.function_type_hint_result(name),
+            });
+        }
         if !self.collect_type_hints && matches!(statement.kind, AstStatementKind::Function { .. }) {
             self.collect_runtime_document_contracts(statement, false);
             return;
@@ -1673,20 +1617,6 @@ impl<'a> Checker<'a> {
         self.check_pattern_constraints(statement);
         self.check_hold_update_compatibility(statement);
         self.check_latest_branch_compatibility(statement);
-        if self.collect_type_hints
-            && let AstStatementKind::Function { name, args } = &statement.kind
-        {
-            let arg_types = args
-                .iter()
-                .map(|arg| self.function_arg_display_type(name, arg))
-                .collect();
-            self.function_type_table.entries.push(FunctionTypeEntry {
-                name: name.clone(),
-                args: args.clone(),
-                arg_types,
-                result: self.function_type_hint_result(name),
-            });
-        }
         if next_in_document
             && matches!(
                 statement_field(statement).as_deref(),
@@ -1709,8 +1639,70 @@ impl<'a> Checker<'a> {
         } else {
             None
         };
+        let when_selector = statement
+            .expr
+            .and_then(|expr_id| {
+                pattern_selector_expr_id(expr_id, &self.program.expressions).map(|input_expr_id| {
+                    (
+                        expr_id,
+                        pipeline_source_expr_id(
+                            &self.program.ast.statements,
+                            expr_id,
+                            input_expr_id,
+                            &self.program.expressions,
+                        ),
+                    )
+                })
+            })
+            .map(|(_, selector_expr_id)| {
+                (
+                    pattern_selector_path(self.program.expressions.get(selector_expr_id)),
+                    self.ensure_expr(selector_expr_id).ty,
+                )
+            });
         for child in &statement.children {
+            let narrowed_bindings =
+                when_selector
+                    .as_ref()
+                    .and_then(|(selector_path, selector_ty)| {
+                        let pattern = child
+                            .expr
+                            .and_then(|expr_id| self.program.expressions.get(expr_id))
+                            .and_then(|expr| match &expr.kind {
+                                AstExprKind::MatchArm { pattern, .. } => Some(pattern.as_slice()),
+                                _ => None,
+                            })?;
+                        let narrowed = narrowed_pattern_binding(selector_ty, pattern)?;
+                        let path = selector_path.as_ref()?;
+                        let mut bindings = vec![(path.clone(), narrowed.clone())];
+                        if let Some(name) = path.rsplit('.').next()
+                            && name != path
+                        {
+                            bindings.push((name.to_owned(), narrowed));
+                        }
+                        Some(bindings)
+                    });
+            let saved_arm_bindings = narrowed_bindings.as_ref().map(|bindings| {
+                bindings
+                    .iter()
+                    .map(|(name, ty)| {
+                        (
+                            name.clone(),
+                            self.name_bindings.insert(name.clone(), ty.clone()),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
             self.check_statement(child, next_in_document);
+            if let Some(saved_arm_bindings) = saved_arm_bindings {
+                for (name, previous) in saved_arm_bindings {
+                    if let Some(previous) = previous {
+                        self.name_bindings.insert(name, previous);
+                    } else {
+                        self.name_bindings.remove(&name);
+                    }
+                }
+            }
         }
         if let Some(saved) = saved_name_bindings {
             self.name_bindings = saved;
@@ -1816,6 +1808,42 @@ impl<'a> Checker<'a> {
         entries
     }
 
+    fn named_value_type_table(&self) -> NamedValueTypeTable {
+        let mut paths = BTreeSet::new();
+        collect_canonical_named_value_paths(
+            &self.program.ast.statements,
+            &mut Vec::new(),
+            &mut paths,
+        );
+        let entries = paths
+            .into_iter()
+            .map(|path| {
+                let descendant_prefix = format!("{path}.");
+                let mode = self
+                    .flow_bindings
+                    .iter()
+                    .filter(|(candidate, _)| {
+                        candidate.as_str() == path || candidate.starts_with(&descendant_prefix)
+                    })
+                    .map(|(_, mode)| *mode)
+                    .reduce(merge_flow_modes)
+                    .unwrap_or(FlowMode::Continuous);
+                NamedValueTypeEntry {
+                    flow_type: FlowType {
+                        mode,
+                        ty: self
+                            .name_bindings
+                            .get(&path)
+                            .cloned()
+                            .unwrap_or(Type::Unknown),
+                    },
+                    path,
+                }
+            })
+            .collect();
+        NamedValueTypeTable { entries }
+    }
+
     fn check_host_port_outputs(&mut self, outputs: &[OutputRootTypeEntry]) {
         if let Some(http) = &self.host_port_table.http {
             let Some(output) = outputs
@@ -1835,7 +1863,7 @@ impl<'a> Checker<'a> {
                 self.diagnostics.push(diagnostic_at_line(
                     http.line,
                     format!(
-                        "host port `http.response` output `{}` must be a closed record with numeric `status` and a closed `body`; found {}",
+                        "host port `http.response` output `{}` must be exactly `{{ status: Number, body: Bytes }}` or `{{ status: Number, headers: List<{{ name: Text, value: Text|Bytes }}>, body: Bytes }}`; found {}",
                         output.name,
                         boon_facing_type_label(&output.ty)
                     ),
@@ -1953,9 +1981,11 @@ impl<'a> Checker<'a> {
             .get(function)
             .cloned()
             .flatten();
+        let inferred =
+            cached.or_else(|| self.user_function_return_type(function, &mut BTreeSet::new()));
         FlowType {
             mode: FlowMode::Continuous,
-            ty: cached.unwrap_or_else(|| {
+            ty: inferred.unwrap_or_else(|| {
                 if self.program.functions.iter().any(|name| name == function) {
                     open_object_type()
                 } else {
@@ -2245,7 +2275,7 @@ impl<'a> Checker<'a> {
         let ty = match &expr.kind {
             AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Type::Text,
             AstExprKind::Number(_) => Type::Number,
-            AstExprKind::ByteLiteral { .. } => Type::Byte,
+            AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
             AstExprKind::BytesLiteral { size, items } => {
                 self.infer_bytes_literal(expr, size, items)
             }
@@ -2277,6 +2307,9 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::Drain { path } => self.type_for_path(expr.id, &drain_path_parts(path)),
             AstExprKind::ListLiteral { .. } => Type::List(Box::new(open_object_type())),
+            AstExprKind::Call { function, args } if external_function_role(function).is_some() => {
+                self.check_external_function_call(expr.id, function, None, args)
+            }
             AstExprKind::Call { function, args } => {
                 for arg in args {
                     if !builtin_argument_is_symbol(function, arg.name.as_deref()) {
@@ -2284,6 +2317,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.check_bytes_builtin_arguments(expr.id, function, args, None);
+                self.check_number_to_text_arguments(expr.id, function, args, false);
                 self.check_builtin_call_compatibility(function, None, args);
                 self.check_user_function_arguments(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
@@ -2314,6 +2348,9 @@ impl<'a> Checker<'a> {
                     self.type_for_call_expr(expr.id, function)
                 }
             }
+            AstExprKind::Pipe { input, op, args } if external_function_role(op).is_some() => {
+                self.check_external_function_call(expr.id, op, Some(*input), args)
+            }
             AstExprKind::Pipe { input, op, args } => {
                 let input_flow = self.ensure_expr(*input);
                 let input_is_placeholder = self.expr_id_is_pipe_placeholder(*input);
@@ -2323,6 +2360,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 self.check_bytes_builtin_arguments(expr.id, op, args, Some(*input));
+                self.check_number_to_text_arguments(expr.id, op, args, true);
                 self.check_builtin_call_compatibility(op, Some(*input), args);
                 if !op.starts_with("Field/") {
                     self.check_user_function_arguments(expr.id, op, Some(*input), args);
@@ -2485,6 +2523,12 @@ impl<'a> Checker<'a> {
                     open_object_type()
                 } else if self.builtin_symbol_exprs.contains(&expr.id) {
                     Type::Unknown
+                } else if self.is_known_function(value) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expr.id,
+                        format!("function `{value}` must be called with parentheses: `{value}()`"),
+                    ));
+                    self.expr_type_var(expr.id)
                 } else if let Some(ty) = self.name_bindings.get(value) {
                     ty.clone()
                 } else {
@@ -2495,6 +2539,18 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::Delimiter => Type::List(Box::new(open_object_type())),
+            AstExprKind::Unknown(tokens)
+                if tokens.len() == 1 && self.is_known_function(&tokens[0]) =>
+            {
+                let function = &tokens[0];
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr.id,
+                    format!(
+                        "function `{function}` must be called with parentheses: `{function}()`"
+                    ),
+                ));
+                self.expr_type_var(expr.id)
+            }
             AstExprKind::Unknown(tokens) if unknown_tokens_are_quoted_text(tokens) => Type::Text,
             AstExprKind::Unknown(tokens) => {
                 self.diagnostics.push(self.diagnostic_for_expr(
@@ -2511,6 +2567,18 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn is_known_function(&self, name: &str) -> bool {
+        self.program
+            .functions
+            .iter()
+            .any(|function| function == name)
+            || self.external_types.functions.contains_key(name)
+            || !matches!(
+                self.builtins.type_for_call(name, &self.render_contracts),
+                Type::Unknown
+            )
+    }
+
     fn infer_bytes_literal(
         &mut self,
         expr: &AstExpr,
@@ -2522,7 +2590,6 @@ impl<'a> Checker<'a> {
         for item in items {
             let item_flow = self.ensure_expr(*item);
             match item_flow.ty {
-                Type::Byte => known_len += 1,
                 Type::Bytes(BytesType::Fixed(len)) => known_len += len,
                 Type::Bytes(BytesType::Dynamic) => {
                     all_fixed = false;
@@ -2578,6 +2645,30 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn check_byte_literal_contexts(&mut self) {
+        let bytes_items = self
+            .program
+            .expressions
+            .iter()
+            .filter_map(|expr| match &expr.kind {
+                AstExprKind::BytesLiteral { items, .. } => Some(items.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        for expr in &self.program.expressions {
+            if matches!(expr.kind, AstExprKind::ByteLiteral { .. })
+                && !bytes_items.contains(&expr.id)
+            {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr.id,
+                    "byte literals are only valid as direct BYTES constructor items".to_owned(),
+                ));
+            }
+        }
+    }
+
     fn check_bytes_builtin_arguments(
         &mut self,
         expr_id: usize,
@@ -2608,6 +2699,109 @@ impl<'a> Checker<'a> {
         self.check_bytes_static_integer_argument_overflow(function, args);
         self.check_bytes_static_bounds(expr_id, function, piped_input, args);
         self.check_bytes_static_text_conversion(expr_id, function, piped_input, args);
+    }
+
+    fn check_number_to_text_arguments(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        args: &[AstCallArg],
+        piped: bool,
+    ) {
+        if function != "Number/to_text" {
+            return;
+        }
+        let mut names = BTreeSet::new();
+        let mut positional_count = 0usize;
+        for arg in args {
+            match arg.name.as_deref() {
+                Some(name)
+                    if matches!(
+                        name,
+                        "value" | "radix" | "min_width" | "signed_width" | "group_size" | "prefix"
+                    ) =>
+                {
+                    if !names.insert(name) {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            arg.value,
+                            format!("`Number/to_text` argument `{name}` is duplicated"),
+                        ));
+                    }
+                    if piped && name == "value" {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            arg.value,
+                            "piped `Number/to_text` cannot also declare `value`".to_owned(),
+                        ));
+                    }
+                }
+                Some(name) => self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!("`Number/to_text` does not accept argument `{name}`"),
+                )),
+                None => {
+                    positional_count += 1;
+                    if piped || positional_count > 1 {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            arg.value,
+                            "`Number/to_text` accepts one positional value only when it is not piped"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        if !piped && positional_count == 0 && !names.contains("value") {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                "`Number/to_text` requires a Number value".to_owned(),
+            ));
+        }
+
+        for (name, minimum, maximum) in [
+            ("radix", 2_i128, 36_i128),
+            ("min_width", 0, MAX_NUMBER_TEXT_DIGITS as i128),
+            ("signed_width", 1, 63),
+            ("group_size", 1, MAX_NUMBER_TEXT_DIGITS as i128),
+        ] {
+            let Some(value_expr) = named_arg_expr(args, name) else {
+                continue;
+            };
+            if let Some(value) = self.static_integer_literal(value_expr) {
+                if !(minimum..=maximum).contains(&value) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        value_expr,
+                        format!(
+                            "`Number/to_text` {name} must be a whole Number between {minimum} and {maximum}"
+                        ),
+                    ));
+                }
+            } else if self
+                .program
+                .expressions
+                .get(value_expr)
+                .is_some_and(|expr| matches!(expr.kind, AstExprKind::Number(_)))
+            {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    value_expr,
+                    format!("`Number/to_text` {name} must be a whole Number"),
+                ));
+            }
+        }
+
+        let prefix_enabled = named_arg_expr(args, "prefix")
+            .and_then(|expr_id| self.program.expressions.get(expr_id))
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Bool(true)));
+        if prefix_enabled {
+            let radix = named_arg_expr(args, "radix")
+                .and_then(|expr_id| self.static_integer_literal(expr_id))
+                .unwrap_or(10);
+            if !matches!(radix, 2 | 8 | 16) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    named_arg_expr(args, "prefix").unwrap_or(expr_id),
+                    "`Number/to_text` prefix requires radix 2, 8, or 16".to_owned(),
+                ));
+            }
+        }
     }
 
     fn check_bytes_builtin_allowed_args(
@@ -3084,6 +3278,19 @@ impl<'a> Checker<'a> {
 
     fn type_for_path(&mut self, expr_id: usize, parts: &[String]) -> Type {
         let path = parts.join(".");
+        if let Some(producer) = external_value_role(parts) {
+            if !self.check_external_role_access(expr_id, producer, &path) {
+                return self.expr_type_var(expr_id);
+            }
+            if let Some(flow_type) = self.external_types.values.get(&path) {
+                return flow_type.ty.clone();
+            }
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!("unknown qualified external value `{path}`"),
+            ));
+            return self.expr_type_var(expr_id);
+        }
         if path == "element.hovered" {
             return true_false_type();
         }
@@ -3166,8 +3373,162 @@ impl<'a> Checker<'a> {
         self.expr_type_var(expr_id)
     }
 
+    fn check_external_role_access(
+        &mut self,
+        expr_id: usize,
+        producer: ProgramRole,
+        reference: &str,
+    ) -> bool {
+        let current = self.external_types.current_role;
+        if current == producer {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "same-role qualification `{reference}` is not allowed in {}; use an unqualified local name",
+                    role_namespace(current)
+                ),
+            ));
+            return false;
+        }
+        if !role_can_read(current, producer) {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "{} cannot depend on {} through `{reference}`",
+                    role_namespace(current),
+                    role_namespace(producer)
+                ),
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn check_external_function_call(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        pipe_input: Option<usize>,
+        call_args: &[AstCallArg],
+    ) -> Type {
+        let producer = external_function_role(function)
+            .expect("external call checker requires a role-qualified function");
+        if !self.check_external_role_access(expr_id, producer, function) {
+            return self.expr_type_var(expr_id);
+        }
+        let Some(signature) = self.external_types.functions.get(function).cloned() else {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!("unknown qualified external function `{function}`"),
+            ));
+            return self.expr_type_var(expr_id);
+        };
+        if let Some(input) = pipe_input {
+            self.ensure_expr(input);
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "external function `{function}` must be called directly with named arguments"
+                ),
+            ));
+        }
+
+        let expected_names = signature
+            .args
+            .iter()
+            .map(|arg| arg.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut actual_by_name = BTreeMap::<String, usize>::new();
+        for arg in call_args {
+            let actual = self.ensure_expr(arg.value);
+            let Some(name) = arg.name.as_deref() else {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!("external function `{function}` requires named arguments"),
+                ));
+                let _ = actual;
+                continue;
+            };
+            if !expected_names.contains(name) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!("external function `{function}` has no argument `{name}`"),
+                ));
+                continue;
+            }
+            if actual_by_name.insert(name.to_owned(), arg.value).is_some() {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!("external function `{function}` repeats argument `{name}`"),
+                ));
+            }
+        }
+
+        for expected in &signature.args {
+            let Some(actual_expr_id) = actual_by_name.get(&expected.name).copied() else {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr_id,
+                    format!(
+                        "external function `{function}` is missing argument `{}`",
+                        expected.name
+                    ),
+                ));
+                continue;
+            };
+            let actual = self.ensure_expr(actual_expr_id);
+            self.constraints.push(Constraint::FlowCompatible {
+                actual: actual.clone(),
+                expected: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: expected.ty.clone(),
+                },
+            });
+            if actual.mode != FlowMode::Continuous {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    actual_expr_id,
+                    format!(
+                        "external function `{function}` argument `{}` must be continuous",
+                        expected.name
+                    ),
+                ));
+            }
+            self.constraints.push(Constraint::Assignable {
+                actual: actual.ty.clone(),
+                expected: expected.ty.clone(),
+            });
+            if !external_data_type_is_closed(&actual.ty) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    actual_expr_id,
+                    format!(
+                        "external function `{function}` argument `{}` must have a closed value type; found {}",
+                        expected.name,
+                        boon_facing_type_label(&actual.ty)
+                    ),
+                ));
+            } else if !type_is_assignable_to(&actual.ty, &expected.ty) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    actual_expr_id,
+                    format!(
+                        "external function `{function}` argument `{}` has incompatible type\nexpected: {}\nfound: {}",
+                        expected.name,
+                        boon_facing_type_label(&expected.ty),
+                        boon_facing_type_label(&actual.ty)
+                    ),
+                ));
+            }
+        }
+        signature.result.ty
+    }
+
     fn static_type_for_path(&self, parts: &[String]) -> Option<Type> {
         let path = parts.join(".");
+        if external_value_role(parts).is_some() {
+            return self
+                .external_types
+                .values
+                .get(&path)
+                .map(|flow_type| flow_type.ty.clone());
+        }
         if let Some(access) = self.source_payload_lookup.access_for_parts(parts) {
             return match access {
                 SourcePayloadAccess::Direct(source_path) => {
@@ -3206,6 +3567,9 @@ impl<'a> Checker<'a> {
     }
 
     fn type_for_call(&self, function: &str) -> Type {
+        if let Some(signature) = self.external_types.functions.get(function) {
+            return signature.result.ty.clone();
+        }
         let ty = self
             .builtins
             .type_for_call(function, &self.render_contracts);
@@ -3240,6 +3604,7 @@ impl<'a> Checker<'a> {
         args: &[AstCallArg],
     ) -> Option<Type> {
         match function {
+            "Bytes/get" => Some(Type::Bytes(BytesType::Fixed(1))),
             "Bytes/set" | "Bytes/write_unsigned" | "Bytes/write_signed" => Some(
                 self.bytes_input_type(piped_input, args)
                     .unwrap_or(Type::Bytes(BytesType::Dynamic)),
@@ -3487,14 +3852,61 @@ impl<'a> Checker<'a> {
     }
 
     fn when_result_type(&mut self, expr_id: usize) -> Option<Type> {
-        let arm_expr_ids = when_arm_expr_ids(
+        let selector_expr_id =
+            pattern_selector_expr_id(expr_id, &self.program.expressions).map(|input_expr_id| {
+                pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expr_id,
+                    input_expr_id,
+                    &self.program.expressions,
+                )
+            });
+        let selector_path = selector_expr_id.and_then(|selector_expr_id| {
+            pattern_selector_path(self.program.expressions.get(selector_expr_id))
+        });
+        let selector_type =
+            selector_expr_id.map(|selector_expr_id| self.ensure_expr(selector_expr_id).ty);
+        let arms = when_arms(
             &self.program.ast.statements,
             expr_id,
             &self.program.expressions,
         );
         let mut result: Option<Type> = None;
-        for arm_expr_id in arm_expr_ids {
+        for (pattern, arm_expr_id) in arms {
+            let narrowed = selector_type
+                .as_ref()
+                .and_then(|selector_type| narrowed_pattern_binding(selector_type, &pattern));
+            let binding_keys = selector_path
+                .as_ref()
+                .map(|path| {
+                    let mut keys = vec![path.clone()];
+                    if let Some(name) = path.rsplit('.').next()
+                        && name != path
+                    {
+                        keys.push(name.to_owned());
+                    }
+                    keys
+                })
+                .unwrap_or_default();
+            let saved_bindings = narrowed.as_ref().map(|narrowed| {
+                binding_keys
+                    .iter()
+                    .map(|key| {
+                        let previous = self.name_bindings.insert(key.clone(), narrowed.clone());
+                        (key.clone(), previous)
+                    })
+                    .collect::<Vec<_>>()
+            });
             let arm_type = self.ensure_expr(arm_expr_id).ty;
+            if let Some(saved_bindings) = saved_bindings {
+                for (key, previous) in saved_bindings {
+                    if let Some(previous) = previous {
+                        self.name_bindings.insert(key, previous);
+                    } else {
+                        self.name_bindings.remove(&key);
+                    }
+                }
+            }
             result = Some(match result {
                 Some(existing) => widen_structural_type(&existing, &arm_type),
                 None => arm_type,
@@ -3546,6 +3958,9 @@ impl<'a> Checker<'a> {
     ) -> Option<Type> {
         match &expr.kind {
             AstExprKind::Call { function, args } => {
+                if let Some(signature) = self.external_types.functions.get(function) {
+                    return Some(signature.result.ty.clone());
+                }
                 if self.render_contracts.is_render_constructor(function) {
                     return Some(self.static_render_constructor_type(
                         function,
@@ -3666,7 +4081,7 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
             AstExprKind::Number(_) => Some(Type::Number),
-            AstExprKind::ByteLiteral { .. } => Some(Type::Byte),
+            AstExprKind::ByteLiteral { .. } => Some(Type::Bytes(BytesType::Fixed(1))),
             AstExprKind::BytesLiteral { size, items } => Some(static_bytes_literal_type(
                 size,
                 items,
@@ -3981,8 +4396,26 @@ impl<'a> Checker<'a> {
             }
             if let Some(field) = statement_output_name(statement)
                 && !matches!(field.as_str(), "document" | "scene")
-                && let Some(ty) =
-                    self.static_statement_type_with_bindings(statement, active_functions, bindings)
+                && let Some(ty) = statement
+                    .expr
+                    .and_then(|expr_id| {
+                        statement_pipeline_final_expr_id_containing_expr(
+                            statements,
+                            expr_id,
+                            &self.program.expressions,
+                        )
+                    })
+                    .and_then(|expr_id| {
+                        self.static_expr_type_for_pipeline_expr(expr_id, active_functions, bindings)
+                    })
+                    .filter(is_specific_type)
+                    .or_else(|| {
+                        self.static_statement_type_with_bindings(
+                            statement,
+                            active_functions,
+                            bindings,
+                        )
+                    })
             {
                 insert_ordered_shape_field(fields, field_order, field, ty);
             } else {
@@ -4083,7 +4516,23 @@ impl<'a> Checker<'a> {
             }
             if let Some(field) = statement_output_name(statement)
                 && !matches!(field.as_str(), "document" | "scene")
-                && let Some(ty) = self.static_statement_type(statement, active_functions)
+                && let Some(ty) = statement
+                    .expr
+                    .and_then(|expr_id| {
+                        statement_pipeline_final_expr_id_containing_expr(
+                            statements,
+                            expr_id,
+                            &self.program.expressions,
+                        )
+                    })
+                    .and_then(|expr_id| {
+                        self.program
+                            .expressions
+                            .get(expr_id)
+                            .and_then(|expr| self.static_expr_type(expr, active_functions))
+                    })
+                    .filter(is_specific_type)
+                    .or_else(|| self.static_statement_type(statement, active_functions))
             {
                 insert_ordered_shape_field(fields, field_order, field, ty);
             } else {
@@ -4343,8 +4792,8 @@ impl<'a> Checker<'a> {
             AstExprKind::Source => FlowMode::PresentOrAbsent,
             AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
             AstExprKind::Identifier(value) => {
-                if let Some(mode) = self.flow_bindings.get(value) {
-                    *mode
+                if let Some(mode) = flow_binding_mode(&self.flow_bindings, value) {
+                    mode
                 } else if path_is_source_path(&self.source_paths, value) {
                     FlowMode::PresentOrAbsent
                 } else {
@@ -4353,8 +4802,10 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::Path(parts) => {
                 let path = parts.join(".");
-                if let Some(mode) = self.flow_bindings.get(&path) {
-                    *mode
+                if let Some(flow_type) = self.external_types.values.get(&path) {
+                    flow_type.mode
+                } else if let Some(mode) = flow_binding_mode(&self.flow_bindings, &path) {
+                    mode
                 } else if path == "element.hovered" || path.ends_with(".element.hovered") {
                     FlowMode::Continuous
                 } else if path_is_source_path(&self.source_paths, &path)
@@ -4368,12 +4819,14 @@ impl<'a> Checker<'a> {
             AstExprKind::Drain { path } => {
                 let parts = drain_path_parts(path);
                 let path = parts.join(".");
-                self.flow_bindings
-                    .get(&path)
-                    .copied()
-                    .unwrap_or(FlowMode::Continuous)
+                flow_binding_mode(&self.flow_bindings, &path).unwrap_or(FlowMode::Continuous)
             }
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
+            AstExprKind::Call { function, .. }
+                if self.external_types.functions.contains_key(function) =>
+            {
+                self.external_types.functions[function].result.mode
+            }
             AstExprKind::Call { args, .. } => args
                 .iter()
                 .map(|arg| self.flow_mode_for_expr_id(arg.value))
@@ -4701,6 +5154,22 @@ impl<'a> Checker<'a> {
         pipe_input: Option<usize>,
         call_args: &[AstCallArg],
     ) {
+        if session_info_intrinsic_type(function).is_some() {
+            if let Some(input_expr_id) = pipe_input {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    input_expr_id,
+                    format!("`{function}` does not accept a pipe input"),
+                ));
+            }
+            for arg in call_args {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!("`{function}` does not accept arguments"),
+                ));
+            }
+            return;
+        }
+
         if let Some(input_expr_id) = pipe_input
             && !self.expr_id_is_pipe_placeholder(input_expr_id)
         {
@@ -4736,6 +5205,11 @@ impl<'a> Checker<'a> {
         let piped = pipe_input.is_some();
         for arg in call_args {
             let arg_name = arg.name.as_deref();
+            if is_registered_render_constructor(function)
+                && arg_name.is_some_and(|name| !render_arg_should_validate_directly(function, name))
+            {
+                continue;
+            }
             if function == "Bool/toggle" && arg_name == Some("when") {
                 let actual_flow = self.ensure_expr(arg.value);
                 self.constraints.push(Constraint::FlowCompatible {
@@ -5137,44 +5611,71 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_host_effect_declarations(&mut self) {
-        let declarations = self.host_effect_table.declarations.clone();
-        let perform_expr_ids = declarations
-            .iter()
-            .map(|declaration| declaration.perform_expr_id)
-            .collect::<BTreeSet<_>>();
-        for declaration in declarations {
-            for field in declaration.intent_fields {
-                let actual = self.ensure_expr(field.value_expr_id).ty;
-                self.constraints.push(Constraint::Assignable {
-                    actual: actual.clone(),
-                    expected: field.value_type.clone(),
-                });
-                if !type_is_assignable_to(&actual, &field.value_type) {
-                    self.diagnostics.push(self.diagnostic_for_expr(
-                        field.value_expr_id,
-                        format!(
-                            "`{}` intent field `{}` has incompatible type\nexpected: {}\nfound: {}",
-                            declaration.operation,
-                            field.name,
-                            boon_facing_type_label(&field.value_type),
-                            boon_facing_type_label(&actual)
-                        ),
-                    ));
-                }
-            }
-        }
+    fn check_host_effect_calls(&mut self) {
         for expr in &self.program.expressions {
-            let operation = match &expr.kind {
-                AstExprKind::Call { function, .. } => function,
-                AstExprKind::Pipe { op, .. } => op,
+            let (operation, inline_args, direct_call) = match &expr.kind {
+                AstExprKind::Call { function, args } => (function, args.as_slice(), true),
+                AstExprKind::Pipe { op, args, .. } => (op, args.as_slice(), false),
                 _ => continue,
             };
-            if host_effect_signature(operation).is_some() && !perform_expr_ids.contains(&expr.id) {
+            let Some(signature) = host_effect_signature(operation) else {
+                continue;
+            };
+            let event_gated = self.expression_is_in_triggered_hold_update(expr.id);
+            if !event_gated {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     expr.id,
                     format!(
-                        "typed host effect `{operation}` may only appear as `effects.<name>.perform`"
+                        "typed host effect `{operation}` may only appear in a dependency-triggered `HOLD` update"
+                    ),
+                ));
+            }
+            if !direct_call {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr.id,
+                    format!(
+                        "typed host effect `{operation}` must use direct named-call syntax, not a pipeline"
+                    ),
+                ));
+                continue;
+            }
+
+            let arguments = named_call_argument_exprs(self.program, expr.id, inline_args);
+            let mut actual = BTreeMap::<&str, usize>::new();
+            for (name, value_expr_id) in &arguments {
+                if actual.insert(name.as_str(), *value_expr_id).is_some() {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        *value_expr_id,
+                        format!("typed host effect `{operation}` repeats argument `{name}`"),
+                    ));
+                }
+            }
+            for argument in inline_args
+                .iter()
+                .filter(|argument| argument.name.is_none())
+            {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    argument.value,
+                    format!("typed host effect `{operation}` requires named arguments"),
+                ));
+            }
+
+            let expected = signature
+                .intent_fields
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<BTreeSet<_>>();
+            for name in actual.keys().filter(|name| !expected.contains(**name)) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr.id,
+                    format!("typed host effect `{operation}` has no argument `{name}`"),
+                ));
+            }
+            for name in expected.iter().filter(|name| !actual.contains_key(**name)) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr.id,
+                    format!(
+                        "typed host effect `{operation}` is missing required argument `{name}`"
                     ),
                 ));
             }
@@ -5190,6 +5691,73 @@ impl<'a> Checker<'a> {
             end: expr.map(|expr| expr.end).unwrap_or_default(),
             message,
         }
+    }
+
+    fn expression_is_in_triggered_hold_update(&self, expr_id: usize) -> bool {
+        fn contains(statement: &AstStatement, expr_id: usize, expressions: &[AstExpr]) -> bool {
+            statement.expr.is_some_and(|root| {
+                root == expr_id || expr_contains_expr_id(root, expr_id, expressions)
+            }) || statement
+                .children
+                .iter()
+                .any(|child| contains(child, expr_id, expressions))
+        }
+
+        fn visit_hold(statement: &AstStatement, expr_id: usize, expressions: &[AstExpr]) -> bool {
+            let is_hold = statement
+                .expr
+                .and_then(|id| expressions.get(id))
+                .is_some_and(|expr| {
+                    matches!(expr.kind, AstExprKind::Hold { .. })
+                        || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "HOLD")
+                });
+            if is_hold
+                && statement
+                    .children
+                    .iter()
+                    .any(|update| contains(update, expr_id, expressions))
+            {
+                return true;
+            }
+            statement
+                .children
+                .iter()
+                .any(|child| visit_hold(child, expr_id, expressions))
+        }
+
+        let expressions = &self.program.expressions;
+        if !self
+            .program
+            .ast
+            .statements
+            .iter()
+            .any(|statement| visit_hold(statement, expr_id, expressions))
+        {
+            return false;
+        }
+
+        expressions.iter().any(|trigger| match &trigger.kind {
+            AstExprKind::Then {
+                input,
+                output: Some(output),
+            } => {
+                matches!(
+                    self.flow_mode_for_expr_id(*input),
+                    FlowMode::TickPresent | FlowMode::PresentOrAbsent
+                ) && expr_contains_expr_id(*output, expr_id, expressions)
+            }
+            AstExprKind::When { input }
+                if matches!(
+                    self.flow_mode_for_expr_id(*input),
+                    FlowMode::TickPresent | FlowMode::PresentOrAbsent
+                ) =>
+            {
+                when_arms(&self.program.ast.statements, trigger.id, expressions)
+                    .into_iter()
+                    .any(|(_, output)| expr_contains_expr_id(output, expr_id, expressions))
+            }
+            _ => false,
+        })
     }
 }
 
@@ -5241,7 +5809,7 @@ fn statement_contains_output_authority(statement: &AstStatement) -> bool {
 
 fn host_output_type_is_closed(ty: &Type) -> bool {
     match ty {
-        Type::Text | Type::Number | Type::Byte | Type::Bytes(_) | Type::Skip => true,
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Skip => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -5262,13 +5830,42 @@ fn http_response_type_is_valid(ty: &Type) -> bool {
     let Type::Object(shape) = ty else {
         return false;
     };
-    !shape.open
-        && shape.fields.get("status") == Some(&Type::Number)
-        && shape
+    if shape.open
+        || shape.fields.get("status") != Some(&Type::Number)
+        || !matches!(shape.fields.get("body"), Some(Type::Bytes(_)))
+    {
+        return false;
+    }
+    match shape.fields.len() {
+        2 => shape
             .fields
-            .get("body")
-            .is_some_and(host_output_type_is_closed)
-        && shape.fields.values().all(host_output_type_is_closed)
+            .keys()
+            .all(|name| matches!(name.as_str(), "status" | "body")),
+        3 => {
+            shape
+                .fields
+                .keys()
+                .all(|name| matches!(name.as_str(), "status" | "headers" | "body"))
+                && shape
+                    .fields
+                    .get("headers")
+                    .is_some_and(http_headers_type_is_valid)
+        }
+        _ => false,
+    }
+}
+
+fn http_headers_type_is_valid(ty: &Type) -> bool {
+    let Type::List(item) = ty else {
+        return false;
+    };
+    let Type::Object(shape) = item.as_ref() else {
+        return false;
+    };
+    !shape.open
+        && shape.fields.len() == 2
+        && shape.fields.get("name") == Some(&Type::Text)
+        && matches!(shape.fields.get("value"), Some(Type::Text | Type::Bytes(_)))
 }
 
 fn websocket_actions_type_is_valid(ty: &Type) -> bool {
@@ -5827,6 +6424,7 @@ fn direct_statement_value_expr_id(
 
 fn expression_sequence_is_pipeline(expr_ids: &[usize], expressions: &[AstExpr]) -> bool {
     expr_ids.len() > 1
+        && !expr_is_pipeline_continuation(expr_ids[0], expressions)
         && expr_ids
             .iter()
             .skip(1)
@@ -6038,6 +6636,14 @@ fn expr_path(expr: Option<&AstExpr>, expressions: &[AstExpr]) -> Option<String> 
     }
 }
 
+fn pattern_selector_path(expr: Option<&AstExpr>) -> Option<String> {
+    match &expr?.kind {
+        AstExprKind::Identifier(value) => Some(value.clone()),
+        AstExprKind::Path(parts) => Some(parts.join(".")),
+        _ => None,
+    }
+}
+
 fn expr_single_name(expr: &AstExpr) -> Option<&str> {
     match &expr.kind {
         AstExprKind::Identifier(value) => Some(value.as_str()),
@@ -6127,9 +6733,7 @@ fn resolved_constant_value_for_expr(
                 })
             }
         }
-        AstExprKind::ByteLiteral { value, .. } => {
-            Some(ResolvedConstantValue::Byte { value: *value })
-        }
+        AstExprKind::ByteLiteral { .. } => None,
         AstExprKind::Enum(value) | AstExprKind::Tag(value)
             if matches!(value.as_str(), "Little" | "Big" | "Utf8" | "Ascii") =>
         {
@@ -6249,7 +6853,6 @@ fn scene_root(program: &ParsedProgram) -> Option<&AstStatement> {
 pub struct BuiltinSignatureRegistry {
     text_functions: BTreeSet<&'static str>,
     number_functions: BTreeSet<&'static str>,
-    byte_functions: BTreeSet<&'static str>,
     bytes_functions: BTreeSet<&'static str>,
     true_false_functions: BTreeSet<&'static str>,
     list_functions: BTreeSet<&'static str>,
@@ -6313,8 +6916,8 @@ impl Default for BuiltinSignatureRegistry {
             ]
             .into_iter()
             .collect(),
-            byte_functions: ["Bytes/get"].into_iter().collect(),
             bytes_functions: [
+                "Bytes/get",
                 "Bytes/set",
                 "Bytes/slice",
                 "Bytes/take",
@@ -6387,7 +6990,9 @@ impl Default for BuiltinSignatureRegistry {
 
 impl BuiltinSignatureRegistry {
     fn type_for_call(&self, function: &str, render_contracts: &RenderContractRegistry) -> Type {
-        if let Some(signature) = host_effect_signature(function) {
+        if let Some(intrinsic_type) = session_info_intrinsic_type(function) {
+            intrinsic_type
+        } else if let Some(signature) = host_effect_signature(function) {
             signature.result_type
         } else if function == "List/query" {
             indexed_query_page_type()
@@ -6395,8 +7000,6 @@ impl BuiltinSignatureRegistry {
             Type::Text
         } else if self.number_functions.contains(function) {
             Type::Number
-        } else if self.byte_functions.contains(function) {
-            Type::Byte
         } else if self.bytes_functions.contains(function) {
             Type::Bytes(BytesType::Dynamic)
         } else if self.true_false_functions.contains(function) {
@@ -6755,7 +7358,6 @@ fn boon_facing_type_display_tree_with_depth(
     match ty {
         Type::Text => scalar_type_display_node("TEXT"),
         Type::Number => scalar_type_display_node("NUMBER"),
-        Type::Byte => scalar_type_display_node("BYTE"),
         Type::Bytes(bytes) => scalar_type_display_node(bytes_type_label(bytes)),
         Type::Skip => scalar_type_display_node("ABSENT"),
         Type::RenderContract => TypeDisplayNode::Object {
@@ -6858,7 +7460,6 @@ fn boon_facing_type_label_with_depth(
     match ty {
         Type::Text => "TEXT".to_owned(),
         Type::Number => "NUMBER".to_owned(),
-        Type::Byte => "BYTE".to_owned(),
         Type::Bytes(bytes) => bytes_type_label(bytes),
         Type::Skip => "ABSENT".to_owned(),
         Type::RenderContract => document_render_contract_label(compact),
@@ -7053,7 +7654,6 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
         (_, right) if is_open_object_type(right) => false,
         (Type::Text, Type::Text)
         | (Type::Number, Type::Number)
-        | (Type::Byte, Type::Byte)
         | (Type::RenderContract, Type::RenderContract) => false,
         (Type::Bytes(left), Type::Bytes(right)) => bytes_type_conflict(left, right),
         (Type::VariantSet(_), Type::VariantSet(_)) => false,
@@ -7095,7 +7695,7 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
         (Type::UnresolvedShape { .. }, _) | (_, Type::UnresolvedShape { .. }) => true,
         (_, expected) if is_open_object_type(expected) => true,
         (actual, _) if is_open_object_type(actual) => true,
-        (Type::Text, Type::Text) | (Type::Number, Type::Number) | (Type::Byte, Type::Byte) => true,
+        (Type::Text, Type::Text) | (Type::Number, Type::Number) => true,
         (Type::Bytes(actual), Type::Bytes(expected)) => bytes_type_assignable(actual, expected),
         (actual, expected) if type_accepts_true_false(expected) => type_accepts_true_false(actual),
         (Type::RenderContract, Type::RenderContract) => true,
@@ -7208,29 +7808,113 @@ fn hold_update_exprs_for_expr(
     Vec::new()
 }
 
-fn when_arm_expr_ids(
+fn when_arms(
     statements: &[AstStatement],
     expr_id: usize,
     expressions: &[AstExpr],
-) -> Vec<usize> {
-    for statement in statements {
-        if statement.expr == Some(expr_id)
-            || statement.expr.is_some_and(|statement_expr_id| {
+) -> Vec<(Vec<String>, usize)> {
+    fn from_statements(
+        statements: &[AstStatement],
+        expr_id: usize,
+        expressions: &[AstExpr],
+    ) -> Vec<(Vec<String>, usize)> {
+        if let Some(statement) = exact_expression_statement(statements, expr_id) {
+            return when_arms_from_statement(statement, expressions);
+        }
+        for statement in statements {
+            let nested = from_statements(&statement.children, expr_id, expressions);
+            if !nested.is_empty() {
+                return nested;
+            }
+            if statement.expr.is_some_and(|statement_expr_id| {
                 expr_contains_expr_id(statement_expr_id, expr_id, expressions)
-            })
-        {
-            return statement
-                .children
-                .iter()
-                .flat_map(|child| statement_update_value_exprs(child, expressions))
-                .collect();
+            }) {
+                return when_arms_from_statement(statement, expressions);
+            }
         }
-        let nested = when_arm_expr_ids(&statement.children, expr_id, expressions);
-        if !nested.is_empty() {
-            return nested;
-        }
+        Vec::new()
     }
-    Vec::new()
+
+    let arms = from_statements(statements, expr_id, expressions);
+    if !arms.is_empty() {
+        return arms;
+    }
+    inline_when_arms(expr_id, expressions)
+}
+
+fn inline_when_arms(expr_id: usize, expressions: &[AstExpr]) -> Vec<(Vec<String>, usize)> {
+    let Some(select) = expressions.get(expr_id) else {
+        return Vec::new();
+    };
+    let candidates = expressions
+        .iter()
+        .filter(|candidate| {
+            candidate.start >= select.start
+                && candidate.end <= select.end
+                && matches!(candidate.kind, AstExprKind::MatchArm { .. })
+        })
+        .collect::<Vec<_>>();
+    let mut direct = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            !candidates.iter().any(|parent| {
+                parent.id != candidate.id
+                    && parent.start <= candidate.start
+                    && candidate.end <= parent.end
+            })
+        })
+        .collect::<Vec<_>>();
+    direct.sort_by_key(|arm| arm.start);
+    direct
+        .into_iter()
+        .filter_map(|arm| match &arm.kind {
+            AstExprKind::MatchArm {
+                pattern,
+                output: Some(output),
+            } => Some((pattern.clone(), *output)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn when_arms_from_statement(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Vec<(Vec<String>, usize)> {
+    statement
+        .children
+        .iter()
+        .flat_map(|child| {
+            let pattern = child
+                .expr
+                .and_then(|arm_expr_id| expressions.get(arm_expr_id))
+                .and_then(|arm_expr| match &arm_expr.kind {
+                    AstExprKind::MatchArm { pattern, .. } => Some(pattern.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            statement_update_value_exprs(child, expressions)
+                .into_iter()
+                .map(move |arm_expr_id| (pattern.clone(), arm_expr_id))
+        })
+        .collect()
+}
+
+fn narrowed_pattern_binding(selector: &Type, pattern: &[String]) -> Option<Type> {
+    let Variant::Tag(pattern_tag) = pattern_variant(pattern)? else {
+        return None;
+    };
+    let Type::VariantSet(variants) = selector else {
+        return None;
+    };
+    variants.iter().find_map(|variant| match variant {
+        Variant::Tagged { tag, fields } if tag == &pattern_tag => {
+            Some(Type::Object(fields.clone()))
+        }
+        Variant::Tag(tag) if tag == &pattern_tag => Some(Type::VariantSet(vec![variant.clone()])),
+        _ => None,
+    })
 }
 
 fn latest_branch_expr_ids(
@@ -7298,6 +7982,41 @@ fn exact_expression_statement(
         }
     }
     None
+}
+
+fn named_call_argument_exprs(
+    program: &ParsedProgram,
+    call_expr_id: usize,
+    inline_args: &[AstCallArg],
+) -> Vec<(String, usize)> {
+    if !inline_args.is_empty() {
+        return inline_args
+            .iter()
+            .filter_map(|argument| Some((argument.name.clone()?, argument.value)))
+            .collect();
+    }
+
+    exact_expression_statement(&program.ast.statements, call_expr_id)
+        .or_else(|| {
+            containing_expression_statement(
+                &program.ast.statements,
+                call_expr_id,
+                &program.expressions,
+            )
+        })
+        .into_iter()
+        .flat_map(|statement| &statement.children)
+        .filter_map(|argument| {
+            let name = match &argument.kind {
+                AstStatementKind::Field { name }
+                | AstStatementKind::List {
+                    field: Some(name), ..
+                } => name,
+                _ => return None,
+            };
+            Some((name.clone(), argument.expr?))
+        })
+        .collect()
 }
 
 fn containing_expression_statement<'a>(
@@ -7467,6 +8186,8 @@ fn collect_hold_update_exprs(
             for update in &child.children {
                 updates.extend(statement_update_value_exprs(update, expressions));
             }
+        } else {
+            updates.extend(statement_update_value_exprs(child, expressions));
         }
     }
 }
@@ -7671,10 +8392,41 @@ fn simple_list_statement_type(statement: &AstStatement, expressions: &[AstExpr])
 }
 
 fn simple_statement_value_type(statement: &AstStatement, expressions: &[AstExpr]) -> Option<Type> {
+    if let Some(expr_id) = direct_statement_value_expr_id(statement, expressions)
+        .map(|expr_id| expression_result_expr_id(expr_id, expressions))
+        && let Some(expr) = expressions.get(expr_id)
+    {
+        match &expr.kind {
+            AstExprKind::Hold { initial, .. } => {
+                let hold_statement = statement_for_expr(statement, expr_id).unwrap_or(statement);
+                return Some(simple_hold_result_type(
+                    hold_statement,
+                    *initial,
+                    expressions,
+                ));
+            }
+            AstExprKind::Pipe { input, op, .. } if op == "HOLD" => {
+                let hold_statement = statement_for_expr(statement, expr_id).unwrap_or(statement);
+                return Some(simple_hold_result_type(hold_statement, *input, expressions));
+            }
+            AstExprKind::When { .. } => {
+                return static_when_type_from_bindings(
+                    statement,
+                    expr_id,
+                    expressions,
+                    &BTreeMap::new(),
+                );
+            }
+            _ => {}
+        }
+    }
     if let Some(ty) = simple_statement_pipeline_type(statement, expressions) {
         return Some(ty);
     }
-    let expr_id = direct_statement_value_expr_id(statement, expressions)?;
+    let expr_id = expression_result_expr_id(
+        direct_statement_value_expr_id(statement, expressions)?,
+        expressions,
+    );
     let expr = expressions.get(expr_id)?;
     Some(match &expr.kind {
         AstExprKind::Hold { initial, .. } => {
@@ -7708,7 +8460,13 @@ fn simple_statement_pipeline_type(
         ) {
             continue;
         }
-        let next = simple_expr_type(expr, expressions);
+        let next = if matches!(expr.kind, AstExprKind::When { .. }) {
+            let when_statement = statement_for_expr(statement, *expr_id).unwrap_or(statement);
+            static_when_type_from_bindings(when_statement, *expr_id, expressions, &BTreeMap::new())
+                .unwrap_or_else(|| simple_expr_type(expr, expressions))
+        } else {
+            simple_expr_type(expr, expressions)
+        };
         if is_specific_type(&next) {
             ty = next;
         }
@@ -7721,6 +8479,29 @@ fn statement_value_type_from_bindings(
     expressions: &[AstExpr],
     bindings: &BTreeMap<String, Type>,
 ) -> Option<Type> {
+    if let Some(expr_id) = direct_statement_value_expr_id(statement, expressions)
+        .map(|expr_id| expression_result_expr_id(expr_id, expressions))
+        && let Some(expr) = expressions.get(expr_id)
+    {
+        match &expr.kind {
+            AstExprKind::Hold { initial, .. } => {
+                let hold_statement = statement_for_expr(statement, expr_id).unwrap_or(statement);
+                return Some(simple_hold_result_type(
+                    hold_statement,
+                    *initial,
+                    expressions,
+                ));
+            }
+            AstExprKind::Pipe { input, op, .. } if op == "HOLD" => {
+                let hold_statement = statement_for_expr(statement, expr_id).unwrap_or(statement);
+                return Some(simple_hold_result_type(hold_statement, *input, expressions));
+            }
+            AstExprKind::When { .. } => {
+                return static_when_type_from_bindings(statement, expr_id, expressions, bindings);
+            }
+            _ => {}
+        }
+    }
     let mut expr_ids = statement.expr.into_iter().collect::<Vec<_>>();
     expr_ids.extend(statement_expression_child_expr_ids(statement));
     if expression_sequence_is_pipeline(&expr_ids, expressions) {
@@ -7736,19 +8517,100 @@ fn statement_value_type_from_bindings(
             ) {
                 continue;
             }
-            if let Some(next) =
-                static_expr_type_from_bindings(expr, expressions, bindings).or_else(|| {
-                    let ty = simple_expr_type(expr, expressions);
-                    is_specific_type(&ty).then_some(ty)
-                })
-            {
+            let next = if matches!(expr.kind, AstExprKind::When { .. }) {
+                let when_statement = statement_for_expr(statement, *expr_id).unwrap_or(statement);
+                static_when_type_from_bindings(when_statement, *expr_id, expressions, bindings)
+            } else {
+                static_expr_type_from_bindings(expr, expressions, bindings)
+            };
+            if let Some(next) = next.or_else(|| {
+                let ty = simple_expr_type(expr, expressions);
+                is_specific_type(&ty).then_some(ty)
+            }) {
                 ty = next;
             }
         }
         return Some(ty);
     }
-    let expr_id = direct_statement_value_expr_id(statement, expressions)?;
+    let expr_id = expression_result_expr_id(
+        direct_statement_value_expr_id(statement, expressions)?,
+        expressions,
+    );
+    if matches!(expressions.get(expr_id)?.kind, AstExprKind::When { .. }) {
+        return static_when_type_from_bindings(statement, expr_id, expressions, bindings);
+    }
     static_expr_type_from_bindings(expressions.get(expr_id)?, expressions, bindings)
+}
+
+fn static_when_type_from_bindings(
+    statement: &AstStatement,
+    expr_id: usize,
+    expressions: &[AstExpr],
+    bindings: &BTreeMap<String, Type>,
+) -> Option<Type> {
+    let AstExprKind::When { input } = &expressions.get(expr_id)?.kind else {
+        return None;
+    };
+    let selector = expressions.get(*input)?;
+    let selector_path = pattern_selector_path(Some(selector));
+    let selector_type = static_expr_type_from_bindings(selector, expressions, bindings);
+    let mut result = None;
+    for arm in when_arm_statements(std::slice::from_ref(statement), expr_id, expressions) {
+        let pattern = arm
+            .expr
+            .and_then(|arm_expr_id| expressions.get(arm_expr_id))
+            .and_then(|arm_expr| match &arm_expr.kind {
+                AstExprKind::MatchArm { pattern, .. } => Some(pattern.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let narrowed = selector_type
+            .as_ref()
+            .and_then(|selector_type| narrowed_pattern_binding(selector_type, pattern));
+        let mut arm_bindings = bindings.clone();
+        if let (Some(path), Some(narrowed)) = (&selector_path, narrowed) {
+            arm_bindings.insert(path.clone(), narrowed.clone());
+            if let Some(name) = path.rsplit('.').next() {
+                arm_bindings.insert(name.to_owned(), narrowed);
+            }
+        }
+        let Some(arm_type) = statement_value_type_from_bindings(arm, expressions, &arm_bindings)
+            .or_else(|| simple_statement_value_type(arm, expressions))
+        else {
+            continue;
+        };
+        if matches!(arm_type, Type::Skip) {
+            continue;
+        }
+        result = Some(match result {
+            Some(existing) => widen_structural_type(&existing, &arm_type),
+            None => arm_type,
+        });
+    }
+    result
+}
+
+fn expression_result_expr_id(mut expr_id: usize, expressions: &[AstExpr]) -> usize {
+    loop {
+        let Some(expr) = expressions.get(expr_id) else {
+            return expr_id;
+        };
+        let next = match &expr.kind {
+            AstExprKind::MatchArm {
+                output: Some(output),
+                ..
+            }
+            | AstExprKind::Then {
+                output: Some(output),
+                ..
+            } => *output,
+            _ => return expr_id,
+        };
+        if next == expr_id {
+            return expr_id;
+        }
+        expr_id = next;
+    }
 }
 
 fn statement_for_expr(statement: &AstStatement, expr_id: usize) -> Option<&AstStatement> {
@@ -7779,6 +8641,22 @@ fn simple_hold_result_type(
             ty = widen_hold_type(&ty, &update_type);
         }
     }
+    let mut statement_expr_ids = Vec::new();
+    collect_statement_expr_ids(statement, &mut statement_expr_ids);
+    for result_type in expressions.iter().filter_map(|expr| {
+        if !statement_expr_ids
+            .iter()
+            .any(|root| *root == expr.id || expr_contains_expr_id(*root, expr.id, expressions))
+        {
+            return None;
+        }
+        let AstExprKind::Call { function, .. } = &expr.kind else {
+            return None;
+        };
+        host_effect_signature(function).map(|signature| signature.result_type)
+    }) {
+        ty = widen_hold_type(&ty, &result_type);
+    }
     ty
 }
 
@@ -7803,7 +8681,6 @@ where
     let mut all_fixed = true;
     for item in items {
         match expressions.get(*item).and_then(&mut type_for_expr) {
-            Some(Type::Byte) => known_len += 1,
             Some(Type::Bytes(BytesType::Fixed(len))) => known_len += len,
             Some(Type::Bytes(BytesType::Dynamic)) | None => all_fixed = false,
             Some(_) => all_fixed = false,
@@ -7818,10 +8695,20 @@ where
 }
 
 fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
+    if let AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } = &expr.kind
+        && let Some(intrinsic_type) = session_info_intrinsic_type(function)
+    {
+        return intrinsic_type;
+    }
+    if let AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } = &expr.kind
+        && let Some(signature) = host_effect_signature(function)
+    {
+        return signature.result_type;
+    }
     match &expr.kind {
         AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Type::Text,
         AstExprKind::Number(_) => Type::Number,
-        AstExprKind::ByteLiteral { .. } => Type::Byte,
+        AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
         AstExprKind::BytesLiteral { size, items } => {
             static_bytes_literal_type(size, items, expressions, |expr| {
                 Some(simple_expr_type(expr, expressions))
@@ -7859,6 +8746,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
                     | "Text/find"
                     | "Text/length"
                     | "Text/to_number"
+                    | "Bytes/length"
             ) =>
         {
             Type::Number
@@ -8503,19 +9391,21 @@ fn text_argument_expected_type(
 fn number_argument_expected_type(
     function: &str,
     arg_name: Option<&str>,
-    piped: bool,
+    _piped: bool,
 ) -> Option<Type> {
     match (function, arg_name) {
         ("Number/to_text", Some("prefix")) => Some(true_false_type()),
+        ("Number/to_text", Some("value")) => Some(Type::Number),
         ("Number/to_text", Some("radix" | "min_width" | "signed_width" | "group_size")) => {
             Some(Type::Number)
         }
-        ("Number/to_text", None) if piped => Some(Type::Number),
+        ("Number/to_text", None) => Some(Type::Number),
         ("Number/project_time", Some("pointer_x" | "pointer_width")) => Some(Type::Unknown),
         ("Number/project_time", Some("viewport_start" | "viewport_end" | "fallback")) => {
             Some(Type::Number)
         }
         ("Number/project_time", None) => Some(Type::Unknown),
+        ("Number/project_offset" | "Number/project_width", Some("zoom")) => Some(Type::Unknown),
         _ => None,
     }
 }
@@ -8574,12 +9464,7 @@ fn builtin_argument_custom_accepts(
 fn type_is_text_formattable_scalar(ty: &Type) -> bool {
     if matches!(
         ty,
-        Type::Text
-            | Type::Number
-            | Type::Byte
-            | Type::Unknown
-            | Type::Var(_)
-            | Type::UnresolvedShape { .. }
+        Type::Text | Type::Number | Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
     ) || is_open_object_type(ty)
     {
         return true;
@@ -8594,12 +9479,7 @@ fn type_is_text_formattable_scalar(ty: &Type) -> bool {
 fn type_is_number_or_numeric_text(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Number
-            | Type::Text
-            | Type::Byte
-            | Type::Unknown
-            | Type::Var(_)
-            | Type::UnresolvedShape { .. }
+        Type::Number | Type::Text | Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
     ) || is_open_object_type(ty)
 }
 
@@ -8643,7 +9523,7 @@ fn bytes_argument_expected_type(function: &str, arg_name: Option<&str>) -> Optio
         ) => Some(Type::Bytes(BytesType::Dynamic)),
         ("Bytes/from_hex" | "Bytes/from_base64", Some("input" | "text")) => Some(Type::Text),
         ("Bytes/to_text", Some("encoding")) => Some(Type::Unknown),
-        ("Bytes/set", Some("value")) => Some(Type::Byte),
+        ("Bytes/set", Some("value")) => Some(Type::Bytes(BytesType::Fixed(1))),
         (
             "Bytes/get"
             | "Bytes/set"
@@ -8900,6 +9780,11 @@ fn static_expr_type_from_bindings(
     expressions: &[AstExpr],
     bindings: &BTreeMap<String, Type>,
 ) -> Option<Type> {
+    if let AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } = &expr.kind
+        && let Some(signature) = host_effect_signature(function)
+    {
+        return Some(signature.result_type);
+    }
     match &expr.kind {
         AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
             Some(Type::Object(ObjectShape::from_ordered_fields(
@@ -8925,9 +9810,20 @@ fn static_expr_type_from_bindings(
         AstExprKind::Draining { input } => expressions
             .get(*input)
             .and_then(|expr| static_expr_type_from_bindings(expr, expressions, bindings)),
+        AstExprKind::Then { input, output } => output
+            .or(Some(*input))
+            .and_then(|expr_id| expressions.get(expr_id))
+            .and_then(|expr| static_expr_type_from_bindings(expr, expressions, bindings)),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => expressions
+            .get(*output)
+            .and_then(|expr| static_expr_type_from_bindings(expr, expressions, bindings)),
+        AstExprKind::MatchArm { output: None, .. } => Some(Type::Skip),
         AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
         AstExprKind::Number(_) => Some(Type::Number),
-        AstExprKind::ByteLiteral { .. } => Some(Type::Byte),
+        AstExprKind::ByteLiteral { .. } => Some(Type::Bytes(BytesType::Fixed(1))),
         AstExprKind::BytesLiteral { size, items } => Some(static_bytes_literal_type(
             size,
             items,
@@ -8938,6 +9834,10 @@ fn static_expr_type_from_bindings(
         AstExprKind::Enum(tag) | AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Skip),
         AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
             Some(Type::VariantSet(vec![Variant::Tag(tag.clone())]))
+        }
+        AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
+            let ty = simple_expr_type(expr, expressions);
+            is_specific_type(&ty).then_some(ty)
         }
         _ => None,
     }
@@ -8956,6 +9856,131 @@ fn static_path_type_from_bindings(
     })
 }
 
+fn refresh_external_declaration_bindings(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    external_types: &ExternalTypeEnvironment,
+    scope: &mut Vec<String>,
+    bindings: &mut BTreeMap<String, Type>,
+) {
+    for statement in statements {
+        match &statement.kind {
+            AstStatementKind::Function { .. } => continue,
+            AstStatementKind::Field { name } => {
+                let path = scoped_path(scope, name);
+                if let Some(expr_id) = direct_statement_value_expr_id(statement, expressions)
+                    .map(|expr_id| expression_result_expr_id(expr_id, expressions))
+                    && let Some(expr) = expressions.get(expr_id)
+                    && let Some(ty) = static_expr_type_with_external_types(
+                        expr,
+                        expressions,
+                        bindings,
+                        external_types,
+                    )
+                {
+                    insert_simple_binding_preserving_renderable(bindings, name, ty.clone());
+                    bindings.insert(path.clone(), ty);
+                }
+                scope.push(name.clone());
+                refresh_external_declaration_bindings(
+                    &statement.children,
+                    expressions,
+                    external_types,
+                    scope,
+                    bindings,
+                );
+                scope.pop();
+            }
+            _ => refresh_external_declaration_bindings(
+                &statement.children,
+                expressions,
+                external_types,
+                scope,
+                bindings,
+            ),
+        }
+    }
+}
+
+fn static_expr_type_with_external_types(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    bindings: &BTreeMap<String, Type>,
+    external_types: &ExternalTypeEnvironment,
+) -> Option<Type> {
+    match &expr.kind {
+        AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
+            if external_function_role(function).is_some() =>
+        {
+            external_types
+                .functions
+                .get(function)
+                .map(|signature| signature.result.ty.clone())
+        }
+        AstExprKind::Object(fields) | AstExprKind::Record(fields) => {
+            Some(Type::Object(ObjectShape::from_ordered_fields(
+                fields.iter().filter(|field| !field.spread).map(|field| {
+                    (
+                        field.name.clone(),
+                        expressions
+                            .get(field.value)
+                            .and_then(|field_expr| {
+                                static_expr_type_with_external_types(
+                                    field_expr,
+                                    expressions,
+                                    bindings,
+                                    external_types,
+                                )
+                            })
+                            .unwrap_or_else(open_object_type),
+                    )
+                }),
+                false,
+            )))
+        }
+        AstExprKind::TaggedObject { tag, fields } => {
+            Some(Type::VariantSet(vec![Variant::Tagged {
+                tag: tag.clone(),
+                fields: ObjectShape::from_ordered_fields(
+                    fields.iter().filter(|field| !field.spread).map(|field| {
+                        (
+                            field.name.clone(),
+                            expressions
+                                .get(field.value)
+                                .and_then(|field_expr| {
+                                    static_expr_type_with_external_types(
+                                        field_expr,
+                                        expressions,
+                                        bindings,
+                                        external_types,
+                                    )
+                                })
+                                .unwrap_or_else(open_object_type),
+                        )
+                    }),
+                    false,
+                ),
+            }]))
+        }
+        AstExprKind::Draining { input } => expressions.get(*input).and_then(|input| {
+            static_expr_type_with_external_types(input, expressions, bindings, external_types)
+        }),
+        AstExprKind::Then { input, output } => output
+            .or(Some(*input))
+            .and_then(|expr_id| expressions.get(expr_id))
+            .and_then(|output| {
+                static_expr_type_with_external_types(output, expressions, bindings, external_types)
+            }),
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => expressions.get(*output).and_then(|output| {
+            static_expr_type_with_external_types(output, expressions, bindings, external_types)
+        }),
+        _ => static_expr_type_from_bindings(expr, expressions, bindings),
+    }
+}
+
 fn flow_bindings(program: &ParsedProgram) -> BTreeMap<String, FlowMode> {
     let mut bindings = BTreeMap::new();
     collect_flow_bindings(
@@ -8965,6 +9990,51 @@ fn flow_bindings(program: &ParsedProgram) -> BTreeMap<String, FlowMode> {
         &mut bindings,
     );
     bindings
+}
+
+fn collect_canonical_named_value_paths(
+    statements: &[AstStatement],
+    scope: &mut Vec<String>,
+    paths: &mut BTreeSet<String>,
+) {
+    for statement in statements {
+        match &statement.kind {
+            AstStatementKind::Function { .. } => {}
+            AstStatementKind::Field { name } if matches!(name.as_str(), "document" | "scene") => {}
+            AstStatementKind::Field { name } => {
+                let path = scoped_path(scope, name);
+                paths.insert(path);
+                scope.push(name.clone());
+                collect_canonical_named_value_paths(&statement.children, scope, paths);
+                scope.pop();
+            }
+            AstStatementKind::Hold { field, name, .. } => {
+                if let Some(name) = field.as_ref().or(name.as_ref()) {
+                    let path = if scope.last() == Some(name) {
+                        scope.join(".")
+                    } else {
+                        scoped_path(scope, name)
+                    };
+                    paths.insert(path);
+                }
+            }
+            AstStatementKind::List {
+                field: Some(name), ..
+            }
+            | AstStatementKind::Source {
+                field: Some(name), ..
+            } => {
+                paths.insert(scoped_path(scope, name));
+            }
+            AstStatementKind::Block => {
+                collect_canonical_named_value_paths(&statement.children, scope, paths);
+            }
+            AstStatementKind::List { field: None, .. }
+            | AstStatementKind::Source { field: None, .. }
+            | AstStatementKind::Spread
+            | AstStatementKind::Expression => {}
+        }
+    }
 }
 
 fn collect_flow_bindings(
@@ -8980,9 +10050,9 @@ fn collect_flow_bindings(
                 if let Some(expr_id) = direct_statement_value_expr_id(statement, expressions)
                     && let Some(expr) = expressions.get(expr_id)
                 {
-                    let mode = simple_flow_mode(expr, expressions);
-                    bindings.insert(name.clone(), mode);
-                    bindings.insert(scoped_path(scope, name), mode);
+                    let mode = simple_statement_flow_mode(statement, expr, expressions, bindings);
+                    insert_flow_binding(bindings, name.clone(), mode);
+                    insert_flow_binding(bindings, scoped_path(scope, name), mode);
                 }
                 scope.push(name.clone());
                 collect_flow_bindings(&statement.children, expressions, scope, bindings);
@@ -8991,11 +10061,118 @@ fn collect_flow_bindings(
             AstStatementKind::Hold {
                 name: Some(name), ..
             } => {
-                bindings.insert(name.clone(), FlowMode::Continuous);
+                let mode = if statement_contains_typed_host_effect(statement, expressions) {
+                    FlowMode::PresentOrAbsent
+                } else {
+                    FlowMode::Continuous
+                };
+                let path = if scope.last() == Some(name) {
+                    scope.join(".")
+                } else {
+                    scoped_path(scope, name)
+                };
+                insert_flow_binding(bindings, name.clone(), mode);
+                insert_flow_binding(bindings, path, mode);
+                collect_flow_bindings(&statement.children, expressions, scope, bindings);
+            }
+            AstStatementKind::Source {
+                field: Some(name), ..
+            } => {
+                insert_flow_binding(bindings, name.clone(), FlowMode::PresentOrAbsent);
+                insert_flow_binding(
+                    bindings,
+                    scoped_path(scope, name),
+                    FlowMode::PresentOrAbsent,
+                );
                 collect_flow_bindings(&statement.children, expressions, scope, bindings);
             }
             _ => collect_flow_bindings(&statement.children, expressions, scope, bindings),
         }
+    }
+}
+
+fn insert_flow_binding(bindings: &mut BTreeMap<String, FlowMode>, path: String, mode: FlowMode) {
+    bindings
+        .entry(path)
+        .and_modify(|existing| *existing = merge_flow_modes(*existing, mode))
+        .or_insert(mode);
+}
+
+fn flow_binding_mode(bindings: &BTreeMap<String, FlowMode>, path: &str) -> Option<FlowMode> {
+    bindings.get(path).copied().or_else(|| {
+        let suffix = format!(".{path}");
+        bindings
+            .iter()
+            .filter(|(candidate, _)| candidate.ends_with(&suffix))
+            .map(|(_, mode)| *mode)
+            .reduce(merge_flow_modes)
+    })
+}
+
+fn statement_contains_typed_host_effect(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    let host_calls = expressions
+        .iter()
+        .filter_map(|expr| match &expr.kind {
+            AstExprKind::Call { function, .. } if is_typed_host_effect(function) => Some(expr.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    statement_expr_ids(statement).into_iter().any(|root| {
+        host_calls
+            .iter()
+            .any(|host_call| expr_contains_expr_id(root, *host_call, expressions))
+    })
+}
+
+fn simple_statement_flow_mode(
+    statement: &AstStatement,
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    bindings: &BTreeMap<String, FlowMode>,
+) -> FlowMode {
+    if !matches!(expr.kind, AstExprKind::Latest) {
+        return simple_flow_mode_with_bindings(expr, expressions, bindings);
+    }
+    statement
+        .children
+        .iter()
+        .filter_map(|child| {
+            direct_statement_value_expr_id(child, expressions)
+                .and_then(|expr_id| expressions.get(expr_id))
+                .map(|expr| simple_statement_flow_mode(child, expr, expressions, bindings))
+        })
+        .reduce(merge_flow_modes)
+        .unwrap_or(FlowMode::Continuous)
+}
+
+fn simple_flow_mode_with_bindings(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    bindings: &BTreeMap<String, FlowMode>,
+) -> FlowMode {
+    match &expr.kind {
+        AstExprKind::Identifier(path) => {
+            flow_binding_mode(bindings, path).unwrap_or(FlowMode::Continuous)
+        }
+        AstExprKind::Path(parts) => {
+            flow_binding_mode(bindings, &parts.join(".")).unwrap_or(FlowMode::Continuous)
+        }
+        AstExprKind::Call { args, .. } => args
+            .iter()
+            .filter_map(|arg| expressions.get(arg.value))
+            .map(|arg| simple_flow_mode_with_bindings(arg, expressions, bindings))
+            .fold(FlowMode::Continuous, merge_flow_modes),
+        AstExprKind::Pipe { input, op, args } if op != "WHILE" => args
+            .iter()
+            .filter_map(|arg| expressions.get(arg.value))
+            .chain(expressions.get(*input))
+            .map(|input| simple_flow_mode_with_bindings(input, expressions, bindings))
+            .fold(FlowMode::Continuous, merge_flow_modes),
+        AstExprKind::When { input } | AstExprKind::Draining { input } => expressions
+            .get(*input)
+            .map(|input| simple_flow_mode_with_bindings(input, expressions, bindings))
+            .unwrap_or(FlowMode::Continuous),
+        _ => simple_flow_mode(expr, expressions),
     }
 }
 
@@ -9840,16 +11017,12 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
         (no_element, ty) if is_no_element_type(no_element) => ty.clone(),
         (Type::Text, Type::Text) => Type::Text,
         (Type::Number, Type::Number) => Type::Number,
-        (Type::Byte, Type::Byte) => Type::Byte,
         (Type::Bytes(left), Type::Bytes(right)) => match (left, right) {
             (BytesType::Fixed(left), BytesType::Fixed(right)) if left == right => {
                 Type::Bytes(BytesType::Fixed(*left))
             }
             _ => Type::Bytes(BytesType::Dynamic),
         },
-        (Type::Byte, Type::Bytes(_)) | (Type::Bytes(_), Type::Byte) => {
-            Type::Bytes(BytesType::Dynamic)
-        }
         (Type::List(left), Type::List(right)) => {
             Type::List(Box::new(widen_structural_type(left, right)))
         }
@@ -10083,7 +11256,6 @@ fn source_payload_shape_table(
     program: &ParsedProgram,
     source_paths: &BTreeSet<String>,
     source_lookup: &SourcePayloadPathLookup,
-    host_effects: &HostEffectTable,
     host_ports: &HostPortTable,
 ) -> Vec<SourcePayloadShapeEntry> {
     let mut fields_by_source = source_paths
@@ -10109,12 +11281,32 @@ fn source_payload_shape_table(
         source_lookup,
         &mut fields_by_source,
     );
-    for declaration in &host_effects.declarations {
-        for intent_field in &declaration.intent_fields {
+    collect_payload_hold_update_types(
+        &program.ast.statements,
+        &program.ast.statements,
+        &program.expressions,
+        source_lookup,
+        &mut fields_by_source,
+    );
+    for expr in &program.expressions {
+        let AstExprKind::Call { function, args } = &expr.kind else {
+            continue;
+        };
+        let Some(signature) = host_effect_signature(function) else {
+            continue;
+        };
+        for (argument_name, argument_value) in named_call_argument_exprs(program, expr.id, args) {
+            let Some((_, expected_type)) = signature
+                .intent_fields
+                .iter()
+                .find(|(name, _)| name == &argument_name)
+            else {
+                continue;
+            };
             let Some(AstExpr {
                 kind: AstExprKind::Path(parts),
                 ..
-            }) = program.expressions.get(intent_field.value_expr_id)
+            }) = program.expressions.get(argument_value)
             else {
                 continue;
             };
@@ -10123,27 +11315,10 @@ fn source_payload_shape_table(
             else {
                 continue;
             };
-            if source_lookup
-                .source_paths_for_parts(parts)
-                .iter()
-                .any(|source| source == &declaration.trigger_source)
-                && let Some(fields) = fields_by_source.get_mut(&declaration.trigger_source)
-            {
-                fields.insert(payload_field, intent_field.value_type.clone());
-            }
-        }
-    }
-    for declaration in &host_effects.declarations {
-        let variants = host_effect_variants(&declaration.result_type);
-        for route in &declaration.result_routes {
-            let Some(fields) = fields_by_source.get_mut(&route.source_path) else {
-                continue;
-            };
-            let Some(result_fields) = variants.get(&route.variant) else {
-                continue;
-            };
-            for (name, ty) in result_fields.ordered_fields() {
-                fields.insert(name.clone(), ty.clone());
+            for source_path in source_lookup.source_paths_for_parts(parts) {
+                if let Some(fields) = fields_by_source.get_mut(&source_path) {
+                    fields.insert(payload_field.clone(), expected_type.clone());
+                }
             }
         }
     }
@@ -11010,6 +12185,66 @@ fn collect_payload_pattern_fields(
     }
 }
 
+fn collect_payload_hold_update_types(
+    roots: &[AstStatement],
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+    source_lookup: &SourcePayloadPathLookup,
+    fields_by_source: &mut BTreeMap<String, BTreeMap<String, Type>>,
+) {
+    for statement in statements {
+        if let Some(expr_id) = statement.expr
+            && let Some(AstExpr {
+                kind: AstExprKind::Hold { initial, .. },
+                ..
+            }) = expressions.get(expr_id)
+        {
+            let initial = pipeline_source_expr_id(roots, expr_id, *initial, expressions);
+            let expected = expressions
+                .get(initial)
+                .map(|expression| simple_expr_type(expression, expressions))
+                .map(|ty| {
+                    if type_accepts_true_false(&ty) {
+                        true_false_type()
+                    } else {
+                        ty
+                    }
+                });
+            if let Some(expected) = expected
+                .filter(is_specific_type)
+                .filter(|ty| !matches!(ty, Type::RenderContract))
+            {
+                for update in hold_update_exprs(statement, expressions) {
+                    let Some(AstExpr {
+                        kind: AstExprKind::Path(parts),
+                        ..
+                    }) = expressions.get(update)
+                    else {
+                        continue;
+                    };
+                    let Some(SourcePayloadAccess::Field(field)) =
+                        source_lookup.access_for_parts(parts)
+                    else {
+                        continue;
+                    };
+                    for source_path in source_lookup.source_paths_for_parts(parts) {
+                        if let Some(fields) = fields_by_source.get_mut(&source_path) {
+                            fields.insert(field.clone(), expected.clone());
+                        }
+                    }
+                }
+            }
+        }
+        collect_payload_hold_update_types(
+            roots,
+            &statement.children,
+            expressions,
+            source_lookup,
+            fields_by_source,
+        );
+    }
+}
+
 struct SourcePayloadPathLookup {
     exact_prefix: BTreeMap<String, Vec<String>>,
     suffix: BTreeMap<String, Vec<String>>,
@@ -11261,6 +12496,32 @@ fn true_false_type() -> Type {
     ])
 }
 
+fn session_info_intrinsic_type(function: &str) -> Option<Type> {
+    match function {
+        "SessionInfo/status" => Some(Type::VariantSet(vec![Variant::Tagged {
+            tag: "Active".to_owned(),
+            fields: ObjectShape::from_ordered_fields(
+                [
+                    (
+                        "role".to_owned(),
+                        tag_union_type(&["Client", "Session", "Server"]),
+                    ),
+                    ("session_id".to_owned(), Type::Text),
+                ],
+                false,
+            ),
+        }])),
+        "SessionInfo/principal" => Some(Type::VariantSet(vec![
+            Variant::Tag("Anonymous".to_owned()),
+            Variant::Tagged {
+                tag: "Authenticated".to_owned(),
+                fields: ObjectShape::from_ordered_fields([("id".to_owned(), Type::Text)], false),
+            },
+        ])),
+        _ => None,
+    }
+}
+
 fn tag_type(tag: &str) -> Type {
     Type::VariantSet(vec![Variant::Tag(tag.to_owned())])
 }
@@ -11359,7 +12620,6 @@ fn type_contains_renderable(ty: &Type) -> bool {
         Type::Function { result, .. } => type_contains_renderable(&result.ty),
         Type::Text
         | Type::Number
-        | Type::Byte
         | Type::Bytes(_)
         | Type::Skip
         | Type::Var(_)
@@ -11380,7 +12640,6 @@ fn type_contains_no_element(ty: &Type) -> bool {
         Type::Function { result, .. } => type_contains_no_element(&result.ty),
         Type::Text
         | Type::Number
-        | Type::Byte
         | Type::Bytes(_)
         | Type::Skip
         | Type::RenderContract
@@ -11402,7 +12661,6 @@ fn type_contains_skip(ty: &Type) -> bool {
         Type::Function { result, .. } => type_contains_skip(&result.ty),
         Type::Text
         | Type::Number
-        | Type::Byte
         | Type::Bytes(_)
         | Type::RenderContract
         | Type::Var(_)
@@ -11478,7 +12736,6 @@ fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {
         }
         Type::Text
         | Type::Number
-        | Type::Byte
         | Type::Bytes(_)
         | Type::Skip
         | Type::RenderContract

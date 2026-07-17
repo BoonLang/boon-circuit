@@ -6,7 +6,7 @@ store: [
     byte_len:
         0 |> HOLD byte_len {
             LATEST {
-                store.measure |> THEN { payload |> Bytes/length }
+                store.measure |> THEN { payload |> Bytes/length() }
             }
         }
 ]

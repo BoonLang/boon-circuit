@@ -1,0 +1,10 @@
+FUNCTION client_label() {
+    TEXT { Distributed program fixture }
+}
+
+FUNCTION response(count) {
+    [
+        status: TEXT { accepted }
+        count: count
+    ]
+}

@@ -2,19 +2,20 @@
 
 This document records the v1 language/runtime contract for Boon `BYTES`.
 
-Status: partial implementation. The parser, typechecker signatures, IR
-expression coverage, PlanExecutor byte storage, and runtime byte carriers have
-initial support. Full builtin runtime bodies, example refactors, and final
-verification gates are still part of the active BYTES/MachinePlan roadmap.
+Status: implemented scalar semantics. Streaming and host-owned content are a
+separate runtime/effect concern.
 
 ## Values
-
-`BYTE` is one unsigned byte in the range `0..255`.
 
 `BYTES` is an ordered byte sequence. It is not `TEXT`, not `LIST<NUMBER>`, and
 not a host-only opaque object. Runtime/debug summaries may show byte length,
 hash, and storage kind, but executable plans must carry typed byte storage and
 typed byte operation refs.
+
+Boon has no standalone byte type. A byte literal is constructor syntax and is
+valid only as a direct item of `BYTES { ... }`. Single-byte values use
+`BYTES[1]`; `Bytes/get()` returns `BYTES[1]`, and `Bytes/set(value:)` requires
+`BYTES[1]`.
 
 ## Constructors
 
@@ -51,7 +52,13 @@ Explicit-base byte literals use the v1 form:
 ```
 
 The parser rejects unsupported bases, invalid digits, empty digits, and values
-larger than `255`.
+larger than `255`. It also rejects a byte literal used as an ordinary scalar,
+including a raw literal passed to `Bytes/set(value:)`.
+
+```boon
+one: bytes |> Bytes/get(index: 0)
+patched: bytes |> Bytes/set(index: 0, value: BYTES[1] { 16uFF })
+```
 
 ## TEXT Boundaries
 
@@ -64,8 +71,8 @@ Use explicit conversion operations:
 text |> Text/to_bytes(encoding: Utf8)
 bytes |> Bytes/to_text(encoding: Utf8)
 formula_text |> Text/to_bytes(encoding: Ascii)
-bytes |> Bytes/to_hex
-TEXT { FF } |> Bytes/from_hex
+bytes |> Bytes/to_hex()
+TEXT { FF } |> Bytes/from_hex()
 ```
 
 When a `TEXT` value appears inside a `BYTES` constructor, the typechecker should
@@ -146,3 +153,31 @@ for descriptor-only external byte references.
 The final PlanExecutor path must not execute parser AST or string paths for
 BYTES. It must use typed IDs, typed storage layout, typed operation regions,
 and verified semantic deltas.
+
+## Streaming And Host-Owned Content
+
+`BYTES` is always one finite immutable value. A file, response body, or socket
+that can produce several chunks is not a second scalar kind and is not a value
+that can be put in `HOLD`, compared, persisted, or inserted into a `LIST`.
+
+Streaming is a bounded multishot host effect owned by the expression invocation
+that requested it. The host may emit ordered `Opened`, `Chunk`, `Finished`,
+`Failed`, and `Cancelled` outcomes through the registered typed effect
+contract. Every `Chunk` carries an ordinary bounded `BYTES` value. The runtime
+tracks hidden invocation identity, sequence, outstanding credit, and terminal
+state; Boon source uses ordinary calls, `WHEN`, `THEN`, `HOLD`, and `LATEST`.
+There is no top-level `effects:` declaration syntax and no manually routed
+result source.
+
+EOF, success, failure, timeout, and cancellation are terminal and release the
+host resource. Replacing or removing the producing expression, including a
+`WHILE` branch change, cancels the superseded invocation. Backpressure bounds
+outstanding chunks and host polling, and RAII cleanup closes abandoned readers.
+
+Large durable content is represented by a comparable `ContentRef` descriptor.
+The content store owns the bytes outside scalar state; Boon persists and passes
+the descriptor. Small protocol messages and bounded file chunks remain inline
+`BYTES`. At an in-process graph boundary the runtime passes values directly; at
+a process or network boundary the canonical Boon wire encoder carries typed
+values without exposing a serialization format to Boon code. An HTTP body is
+application-owned `BYTES`, never an implicitly encoded structural value.

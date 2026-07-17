@@ -28,8 +28,225 @@ fn typed_http_host_port_injects_closed_structural_request_payload() {
         .collect::<BTreeMap<_, _>>();
     assert_eq!(fields.get("method"), Some(&&Type::Text));
     assert!(matches!(fields.get("body"), Some(Type::Bytes(_))));
-    assert!(matches!(fields.get("path_segments"), Some(Type::List(item)) if item.as_ref() == &Type::Text));
-    assert!(matches!(fields.get("query"), Some(Type::List(item)) if matches!(item.as_ref(), Type::Object(shape) if !shape.open && shape.fields.contains_key("name") && shape.fields.contains_key("value"))));
+    assert!(
+        matches!(fields.get("path_segments"), Some(Type::List(item)) if item.as_ref() == &Type::Text)
+    );
+    assert!(
+        matches!(fields.get("query"), Some(Type::List(item)) if matches!(item.as_ref(), Type::Object(shape) if !shape.open && shape.fields.contains_key("name") && shape.fields.contains_key("value")))
+    );
+}
+
+#[test]
+fn latest_preserves_merged_source_event_flow_for_one_host_effect() {
+    let parsed = boon_parser::parse_source(
+        "merged-file-effect.bn",
+        r#"
+store: [
+    open_primary: SOURCE
+    open_secondary: SOURCE
+    request:
+        LATEST {
+            open_primary |> THEN { Primary }
+            open_secondary |> THEN { Secondary }
+        }
+    selected:
+        PackageAsset[url: TEXT { asset://files/primary.bin }] |> HOLD selected {
+            request |> WHEN {
+                Primary => PackageAsset[url: TEXT { asset://files/primary.bin }]
+                Secondary => PackageAsset[url: TEXT { asset://files/secondary.bin }]
+            }
+        }
+    result:
+        NotStarted |> HOLD result {
+            request |> THEN {
+                File/read_stream(
+                    file: selected
+                    chunk_bytes: 4096
+                    retain_content: True
+                )
+            }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "merged source events lost their effect-trigger flow: {:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn http_host_port_accepts_only_the_closed_bytes_response_contract() {
+    let valid_responses = [
+        r#"[
+            status: 200
+            body: BYTES {}
+        ]"#,
+        r#"[
+            status: 200
+            headers: LIST {
+                [name: TEXT { content-type }, value: TEXT { application/octet-stream }]
+            }
+            body: BYTES[1] { 16uff }
+        ]"#,
+        r#"[
+            status: 200
+            headers: LIST {
+                [name: TEXT { x-binary }, value: BYTES[1] { 16u01 }]
+            }
+            body: TEXT { ok } |> Text/to_bytes(encoding: Utf8)
+        ]"#,
+    ];
+    for (index, response) in valid_responses.into_iter().enumerate() {
+        let source = format!(
+            r#"
+store: [
+    request: SOURCE
+]
+outputs: [
+    response: {response}
+]
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]
+"#
+        );
+        let parsed = boon_parser::parse_source(&format!("valid-http-{index}.bn"), &source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            !report.has_errors(),
+            "valid response {index} produced diagnostics: {:?}",
+            report.diagnostics
+        );
+    }
+
+    let invalid_responses = [
+        (
+            "text-body",
+            r#"[
+                status: 200
+                body: TEXT { no }
+            ]"#,
+        ),
+        (
+            "number-body",
+            r#"[
+                status: 200
+                body: 1
+            ]"#,
+        ),
+        (
+            "record-body",
+            r#"[
+                status: 200
+                body: [ok: True]
+            ]"#,
+        ),
+        (
+            "malformed-headers",
+            r#"[
+                status: 200
+                headers: LIST {
+                    [name: TEXT { x-test }, value: TEXT { yes }, extra: TEXT { no }]
+                }
+                body: BYTES {}
+            ]"#,
+        ),
+        (
+            "extra-response-field",
+            r#"[
+                status: 200
+                body: BYTES {}
+                request_count: 1
+            ]"#,
+        ),
+    ];
+    for (name, response) in invalid_responses {
+        let source = format!(
+            r#"
+store: [
+    request: SOURCE
+]
+outputs: [
+    response: {response}
+]
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]
+"#
+        );
+        let parsed =
+            boon_parser::parse_source(&format!("invalid-http-{name}.bn"), &source).unwrap();
+        let report = check(&parsed);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("must be exactly `{ status: Number, body: Bytes }`")
+            }),
+            "invalid response {name} was not rejected by the HTTP boundary: {:?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
+fn nested_multiline_body_pipeline_keeps_the_enclosing_output_record_type() {
+    let parsed = boon_parser::parse_source(
+        "nested-http-body-pipeline.bn",
+        r#"
+store: [
+    request: SOURCE
+]
+outputs: [
+    response: [
+        status: 200
+        headers: LIST {
+            [name: TEXT { content-type }, value: TEXT { application/octet-stream }]
+        }
+        body: response_body(
+            text: TEXT { ok }
+        )
+            |> Text/trim()
+            |> Text/to_bytes(encoding: Utf8)
+    ]
+]
+host_ports: [
+    http: [
+        request: store.request
+        response: response
+    ]
+]
+
+FUNCTION response_body(text) {
+    text
+}
+"#,
+    )
+    .unwrap();
+    let report = check(&parsed);
+    assert!(
+        !report.has_errors(),
+        "nested body pipeline changed the output root type: {:?}",
+        report.diagnostics
+    );
+    assert!(matches!(
+        report
+            .output_root_types
+            .iter()
+            .find(|output| output.name == "response")
+            .map(|output| &output.ty),
+        Some(Type::Object(shape)) if shape.fields.contains_key("body")
+    ));
 }
 
 #[test]
@@ -101,7 +318,7 @@ store: [
     not_an_output: TEXT { no }
 ]
 outputs: [
-    response: [status: 200, body: TEXT { ok }]
+    response: [status: 200, body: BYTES {}]
 ]
 host_ports: [
     http: [

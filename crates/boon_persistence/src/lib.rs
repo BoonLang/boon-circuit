@@ -1482,10 +1482,6 @@ fn validate_stored_value_type(
         | (StoredValue::Bool(_), DataTypePlan::Bool)
         | (StoredValue::Number(_), DataTypePlan::Number)
         | (StoredValue::Text(_), DataTypePlan::Text) => true,
-        (StoredValue::Number(value), DataTypePlan::Byte) => value
-            .to_i64_exact()
-            .ok()
-            .is_some_and(|value| (0..=u8::MAX as i64).contains(&value)),
         (StoredValue::Bytes(value), DataTypePlan::Bytes { fixed_len }) => {
             fixed_len.is_none_or(|expected| u64::try_from(value.len()).ok() == Some(expected))
         }

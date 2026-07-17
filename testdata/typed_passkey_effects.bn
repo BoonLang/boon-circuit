@@ -1,0 +1,160 @@
+store: [
+    register: SOURCE
+    authenticate: SOURCE
+    simulate_cancel: SOURCE
+    simulate_failure: SOURCE
+    simulate_duplicate: SOURCE
+    workspace_id: TEXT { workspace-1 } |> HOLD workspace_id
+    workspace_grant_id: TEXT { grant-1 } |> HOLD workspace_grant_id
+    account_id: TEXT { account-1 } |> HOLD account_id
+    credential_count: 1 |> HOLD credential_count
+    simulation:
+        Success |> HOLD simulation {
+            LATEST {
+                store.simulate_cancel |> THEN { Cancel }
+                store.simulate_failure |> THEN { Failure }
+                store.simulate_duplicate |> THEN { Duplicate }
+            }
+        }
+    registration_result:
+        RegistrationNotRequested |> HOLD registration_result {
+            store.register |> THEN {
+                DevelopmentPasskey/register(
+                    workspace_id: store.workspace_id
+                    workspace_grant_id: store.workspace_grant_id
+                    account_id: store.account_id
+                    credential_count: store.credential_count
+                    simulation: store.simulation
+                )
+            }
+        }
+    authentication_result:
+        AuthenticationNotRequested |> HOLD authentication_result {
+            store.authenticate |> THEN {
+                DevelopmentPasskey/authenticate(
+                    account_id: store.account_id
+                    credential_count: store.credential_count
+                    simulation: store.simulation
+                )
+            }
+        }
+    registration_candidate:
+        registration_result |> THEN {
+            registration_result |> WHEN {
+                RegistrationSucceeded => [
+                    credential_id: registration_result.credential_id
+                    label: registration_result.label
+                ]
+                __ => SKIP
+            }
+        }
+    credentials:
+        LIST {}
+        |> List/append(item: registration_candidate)
+    last_result:
+        Pending |> HOLD last_result {
+            registration_result |> THEN {
+                registration_result |> WHEN {
+                    RegistrationSucceeded => RegistrationSucceeded
+                    RegistrationCancelled => RegistrationCancelled
+                    RegistrationFailed => RegistrationFailed
+                    DuplicateCredential => DuplicateCredential
+                    __ => SKIP
+                }
+            }
+            authentication_result |> THEN {
+                authentication_result |> WHEN {
+                    AuthenticationSucceeded => AuthenticationSucceeded
+                    AuthenticationCancelled => AuthenticationCancelled
+                    AuthenticationFailed => AuthenticationFailed
+                    __ => SKIP
+                }
+            }
+        }
+    result_account_id:
+        TEXT {} |> HOLD result_account_id {
+            registration_result |> THEN {
+                registration_result |> WHEN {
+                    RegistrationSucceeded => registration_result.account_id
+                    DuplicateCredential => registration_result.account_id
+                    __ => SKIP
+                }
+            }
+            authentication_result |> THEN {
+                authentication_result |> WHEN {
+                    AuthenticationSucceeded => authentication_result.account_id
+                    __ => SKIP
+                }
+            }
+        }
+    result_credential_id:
+        TEXT {} |> HOLD result_credential_id {
+            registration_result |> THEN {
+                registration_result |> WHEN {
+                    RegistrationSucceeded => registration_result.credential_id
+                    DuplicateCredential => registration_result.credential_id
+                    __ => SKIP
+                }
+            }
+            authentication_result |> THEN {
+                authentication_result |> WHEN {
+                    AuthenticationSucceeded => authentication_result.credential_id
+                    __ => SKIP
+                }
+            }
+        }
+    result_label:
+        TEXT {} |> HOLD result_label {
+            registration_result |> THEN {
+                registration_result |> WHEN {
+                    RegistrationSucceeded => registration_result.label
+                    __ => SKIP
+                }
+            }
+        }
+    failure_code:
+        TEXT {} |> HOLD failure_code {
+            registration_result |> THEN {
+                registration_result |> WHEN {
+                    RegistrationFailed => registration_result.code
+                    __ => SKIP
+                }
+            }
+            authentication_result |> THEN {
+                authentication_result |> WHEN {
+                    AuthenticationFailed => authentication_result.code
+                    __ => SKIP
+                }
+            }
+        }
+    failure_message:
+        TEXT {} |> HOLD failure_message {
+            registration_result |> THEN {
+                registration_result |> WHEN {
+                    RegistrationFailed => registration_result.message
+                    __ => SKIP
+                }
+            }
+            authentication_result |> THEN {
+                authentication_result |> WHEN {
+                    AuthenticationFailed => authentication_result.message
+                    __ => SKIP
+                }
+            }
+        }
+    failure_retryable:
+        False |> HOLD failure_retryable {
+            registration_result |> THEN {
+                registration_result |> WHEN {
+                    RegistrationFailed => registration_result.retryable
+                    __ => SKIP
+                }
+            }
+            authentication_result |> THEN {
+                authentication_result |> WHEN {
+                    AuthenticationFailed => authentication_result.retryable
+                    __ => SKIP
+                }
+            }
+        }
+]

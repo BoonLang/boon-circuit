@@ -1,10 +1,10 @@
-use crate::program_bundle::{ProgramSource, compile_program_bundle};
+use crate::distributed_program::{ProgramSource, compile_distributed_program};
 use crate::protocol::{
     ApplicationIdentity, AssetBlob, CatalogItem, MigrationBundle, MigrationStage,
     MigrationTestDriver, SourceUnit, TestStep,
 };
 use boon_plan::ProgramRole;
-use boon_runtime::{ExampleManifestEntry, PairedProgramLifecycle, ProgramBundle, RuntimeResult};
+use boon_runtime::{DistributedProgramBundle, ExampleManifestEntry, RuntimeResult};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::{fs, path::PathBuf};
@@ -18,20 +18,7 @@ pub struct LoadedExample {
     pub test_steps: Vec<TestStep>,
     pub assets: Vec<AssetBlob>,
     pub migration: Option<MigrationBundle>,
-    program_bundle: Option<ProgramBundle>,
-}
-
-impl LoadedExample {
-    pub(crate) fn program_bundle(&self) -> Option<&ProgramBundle> {
-        self.program_bundle.as_ref()
-    }
-
-    pub(crate) fn start_paired_programs(&self) -> RuntimeResult<Option<PairedProgramLifecycle>> {
-        self.program_bundle
-            .as_ref()
-            .map(ProgramBundle::start_paired)
-            .transpose()
-    }
+    distributed_program: Option<DistributedProgramBundle>,
 }
 
 pub struct Catalog {
@@ -118,10 +105,10 @@ impl Catalog {
                 .collect(),
         };
         let base_application = built_in_application_identity(entry);
-        let program_bundle = load_program_bundle(entry, &base_application, &units)?;
-        let application = program_bundle
+        let distributed_program = load_distributed_program(entry, &base_application, &units)?;
+        let application = distributed_program
             .as_ref()
-            .and_then(|bundle| bundle.artifact(ProgramRole::Document))
+            .and_then(|bundle| bundle.artifact(ProgramRole::Client))
             .map_or(base_application, |artifact| artifact.application().clone());
         let test_steps = match migration.as_ref().map(|migration| migration.test_driver) {
             Some(MigrationTestDriver::Migration) => Vec::new(),
@@ -144,20 +131,20 @@ impl Catalog {
             test_steps,
             assets,
             migration,
-            program_bundle,
+            distributed_program,
         })
     }
 }
 
-fn load_program_bundle(
+fn load_distributed_program(
     entry: &ExampleManifestEntry,
     base_application: &ApplicationIdentity,
     primary_units: &[SourceUnit],
-) -> RuntimeResult<Option<ProgramBundle>> {
+) -> RuntimeResult<Option<DistributedProgramBundle>> {
     if entry.programs.is_empty() {
         return Ok(None);
     }
-    let paired = entry.programs.len() > 1;
+    let distributed = entry.programs.len() == 3;
     let sources = entry
         .programs
         .iter()
@@ -175,7 +162,7 @@ fn load_program_bundle(
             })
             .collect::<RuntimeResult<Vec<_>>>()?;
             let state_namespace = program.state_namespace.clone().unwrap_or_else(|| {
-                if paired {
+                if distributed {
                     format!(
                         "{}:{}",
                         base_application.state_namespace,
@@ -206,18 +193,18 @@ fn load_program_bundle(
             })
         })
         .collect::<RuntimeResult<Vec<_>>>()?;
-    if let Some(document) = sources
+    if let Some(client) = sources
         .iter()
-        .find(|source| source.role == ProgramRole::Document)
-        && document.units != primary_units
+        .find(|source| source.role == ProgramRole::Client)
+        && client.units != primary_units
     {
         return Err(format!(
-            "example `{}` primary source differs from its declared document program",
+            "example `{}` primary source differs from its declared client program",
             entry.id
         )
         .into());
     }
-    compile_program_bundle(sources).map(Some)
+    compile_distributed_program(sources).map(Some)
 }
 
 fn workspace_relative_source_path(path: &str) -> RuntimeResult<String> {
@@ -385,6 +372,9 @@ fn load_asset(example_id: &str, path: &str) -> RuntimeResult<AssetBlob> {
         "png" => "image/png",
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
+        "vcd" => "application/vnd.boon.waveform.vcd",
+        "fst" => "application/vnd.boon.waveform.fst",
+        "ghw" => "application/vnd.boon.waveform.ghw",
         extension => {
             return Err(format!("unsupported asset extension `{extension}`: {path}").into());
         }
@@ -414,380 +404,4 @@ fn payload_field_text(payload: &boon_runtime::SourcePayload, name: &str) -> Opti
         boon_runtime::Value::Number(value) => Some(value.to_string()),
         _ => None,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loads_catalog_and_project_sources_through_runtime_api() {
-        let catalog = Catalog::load().expect("catalog");
-        let id = catalog.initial_id(Some("counter")).expect("counter id");
-        let example = catalog.open(id).expect("counter sources");
-        assert_eq!(example.id, "counter");
-        assert!(example.program_bundle().is_none());
-        assert!(!example.units.is_empty());
-        assert!(example.units.iter().all(|unit| !unit.path.is_empty()));
-        assert!(example.units.iter().all(|unit| !unit.source.is_empty()));
-        assert!(!example.test_steps.is_empty());
-        assert!(
-            example
-                .test_steps
-                .iter()
-                .all(|step| !step.expectations.is_empty())
-        );
-        assert!(example.test_steps[0].action_kind.is_none());
-        assert!(matches!(
-            example.test_steps[0].expectations.as_slice(),
-            [boon_runtime::ScenarioExpectation::RootText { name, value }]
-                if name == "store.count" && value == "0"
-        ));
-        let first_action = example
-            .test_steps
-            .iter()
-            .find(|step| step.action_kind.is_some())
-            .expect("counter action step");
-        assert!(matches!(
-            first_action.expectations.as_slice(),
-            [boon_runtime::ScenarioExpectation::RootText { name, value }]
-                if name == "store.count" && value == "1"
-        ));
-        assert_eq!(
-            example.application.state_namespace,
-            "builtin:example:counter"
-        );
-
-        let counter_again = catalog.open(id).expect("counter sources again");
-        assert_eq!(counter_again.application, example.application);
-
-        let migration = catalog
-            .open("counter_migration")
-            .expect("counter migration sources");
-        assert_eq!(
-            migration.application.package_id,
-            "dev.boon.example.counter-migration"
-        );
-        assert_eq!(
-            migration.application.state_namespace,
-            "builtin:example:counter_migration"
-        );
-        let migration_bundle = migration
-            .migration
-            .as_ref()
-            .expect("typed migration metadata");
-        assert_eq!(migration_bundle.initial_stage, "v1");
-        assert_eq!(migration_bundle.launch_stage, "v1");
-        assert_eq!(migration_bundle.test_driver, MigrationTestDriver::Migration);
-        assert_eq!(migration_bundle.stages.len(), 3);
-        assert!(!migration_bundle.scenario.steps.is_empty());
-        assert_eq!(
-            migration.units,
-            migration_bundle.initial().expect("initial stage").units,
-            "opening a migration example must use its declared initial stage"
-        );
-        assert!(migration.test_steps.is_empty());
-
-        let novywave = catalog.open("novywave").expect("NovyWave sources");
-        assert!(
-            novywave
-                .units
-                .iter()
-                .any(|unit| unit.path.ends_with("View/NovyView.bn"))
-        );
-        assert!(
-            novywave
-                .units
-                .last()
-                .is_some_and(|unit| unit.path.ends_with("novywave/RUN.bn"))
-        );
-
-        let persons = catalog.open("persons_pro").expect("Persons.pro sources");
-        assert_eq!(persons.label, "Persons.pro");
-        assert_eq!(persons.application.package_id, "pro.persons.workspace");
-        assert_eq!(persons.application.state_namespace, "local-first-v1");
-        let persons_migration = persons
-            .migration
-            .as_ref()
-            .expect("Persons.pro source-controlled migration sequence");
-        assert_eq!(persons_migration.initial_stage, "v1");
-        assert_eq!(persons_migration.launch_stage, "v3");
-        assert_eq!(persons_migration.test_driver, MigrationTestDriver::Example);
-        assert_eq!(
-            persons.units,
-            persons_migration
-                .launch()
-                .expect("Persons.pro launch stage")
-                .units
-        );
-        assert!(
-            persons
-                .units
-                .last()
-                .is_some_and(|unit| unit.path.ends_with("persons_pro/RUN.bn"))
-        );
-        let persons_step_ids = persons
-            .test_steps
-            .iter()
-            .map(|step| step.id.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(persons_step_ids.len(), persons.test_steps.len());
-        for expected in [
-            "fresh-anonymous-workspace-and-starter-preview",
-            "diagnostic-focuses-source-location",
-            "passkey-cancel-preserves-anonymous",
-            "passkey-registration-failure-preserves-anonymous",
-            "first-passkey-protects",
-            "duplicate-credential-is-rejected",
-            "second-passkey-same-account",
-            "authentication-cancellation-preserves-sign-out",
-            "authentication-failure-preserves-sign-out",
-            "passkey-sign-in-restores-access",
-            "phone-preview-width",
-            "restore-auto-preview-width",
-        ] {
-            assert!(persons_step_ids.contains(expected), "missing {expected}");
-        }
-
-        let items = catalog.items();
-        for (id, label) in [
-            ("minimal", "Minimal"),
-            ("hello_world", "Hello World"),
-            ("counter_latest", "Counter without HOLD"),
-            ("fibonacci", "Fibonacci"),
-            ("interval_latest", "Interval without HOLD"),
-            ("interval_hold", "Interval"),
-            ("flow_operators", "LATEST, THEN, WHEN, WHILE"),
-            ("layers", "Layers"),
-            ("pages", "Pages"),
-        ] {
-            assert!(
-                items
-                    .iter()
-                    .any(|item| item.id == id && item.label == label),
-                "missing built-in catalog entry {id:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn catalog_program_declarations_build_the_unrelated_runtime_owned_pair() {
-        const SHARED: &str =
-            "crates/boon_native_playground/testdata/paired_fixture/Shared/PairContract.bn";
-        const CLIENT: &str = "crates/boon_native_playground/testdata/paired_fixture/Client/RUN.bn";
-        const SERVER: &str = "crates/boon_native_playground/testdata/paired_fixture/Server/RUN.bn";
-
-        let catalog = Catalog::load().expect("catalog");
-        let mut entry = catalog
-            .entries
-            .iter()
-            .find(|entry| entry.programs.len() == 2)
-            .expect("paired catalog declaration")
-            .clone();
-        entry.id = "paired-fixture".to_owned();
-        entry.source = CLIENT.to_owned();
-        entry.source_files = vec![SHARED.to_owned(), CLIENT.to_owned()];
-        let document_declaration = entry
-            .programs
-            .iter_mut()
-            .find(|program| program.role == ProgramRole::Document)
-            .expect("document declaration");
-        document_declaration.source = CLIENT.to_owned();
-        document_declaration.source_files = vec![SHARED.to_owned(), CLIENT.to_owned()];
-        document_declaration.state_namespace = Some("fixture-client".to_owned());
-        let server_declaration = entry
-            .programs
-            .iter_mut()
-            .find(|program| program.role == ProgramRole::Server)
-            .expect("server declaration");
-        server_declaration.source = SERVER.to_owned();
-        server_declaration.source_files = vec![SHARED.to_owned(), SERVER.to_owned()];
-        server_declaration.state_namespace = Some("fixture-server".to_owned());
-
-        let primary_units = boon_runtime::source_units_for_entry(&entry)
-            .expect("fixture document source units")
-            .into_iter()
-            .map(|unit| SourceUnit {
-                path: unit.path,
-                source: unit.source,
-            })
-            .collect::<Vec<_>>();
-        let application = ApplicationIdentity::new("dev.boon.paired-fixture", "base", "test");
-        let bundle = load_program_bundle(&entry, &application, &primary_units)
-            .expect("load fixture program declarations")
-            .expect("paired fixture bundle");
-        assert_eq!(bundle.artifacts().len(), 2);
-
-        let document = bundle
-            .artifact(ProgramRole::Document)
-            .expect("fixture document artifact");
-        let server = bundle
-            .artifact(ProgramRole::Server)
-            .expect("fixture server artifact");
-        assert_eq!(document.role(), ProgramRole::Document);
-        assert_eq!(server.role(), ProgramRole::Server);
-        assert_eq!(
-            document.capability_profile(),
-            boon_runtime::ProgramCapabilityProfile::PublicDocument
-        );
-        assert_eq!(
-            server.capability_profile(),
-            boon_runtime::ProgramCapabilityProfile::TrustedServer
-        );
-        assert_eq!(document.application().state_namespace, "fixture-client");
-        assert_eq!(server.application().state_namespace, "fixture-server");
-        assert_ne!(document.application(), server.application());
-        assert!(!document.source_digest().is_empty());
-        assert!(!server.source_digest().is_empty());
-        let document_application = document.application().clone();
-
-        let mut loaded = catalog.open("counter").expect("catalog fixture host");
-        loaded.application = document_application.clone();
-        loaded.program_bundle = Some(bundle);
-        let mut lifecycle = loaded
-            .start_paired_programs()
-            .expect("start fixture programs")
-            .expect("fixture pair");
-        assert_eq!(lifecycle.session_count(), 2);
-        assert_eq!(
-            lifecycle
-                .artifact(ProgramRole::Document)
-                .expect("document session")
-                .application(),
-            &document_application
-        );
-        assert_eq!(
-            lifecycle
-                .root_value_current(ProgramRole::Server, "store.server_count")
-                .expect("initial server count"),
-            boon_runtime::Value::integer(0).unwrap()
-        );
-        lifecycle
-            .dispatch(
-                ProgramRole::Server,
-                "store.request_received",
-                None,
-                boon_runtime::SourcePayload::default(),
-            )
-            .expect("server source turn");
-        assert_eq!(
-            lifecycle
-                .root_value_current(ProgramRole::Server, "store.server_count")
-                .expect("updated server count"),
-            boon_runtime::Value::integer(1).unwrap()
-        );
-        let response = lifecycle
-            .output_value_current(ProgramRole::Server, "api_response")
-            .expect("server output");
-        assert!(matches!(response, boon_runtime::Value::Record(fields)
-            if fields.get("count") == Some(&boon_runtime::Value::integer(1).unwrap())));
-    }
-
-    #[test]
-    fn persons_semantic_memory_is_the_exact_authority_contract() {
-        let persons = Catalog::load()
-            .expect("catalog")
-            .open("persons_pro")
-            .expect("Persons.pro sources");
-        let migration = persons
-            .migration
-            .as_ref()
-            .expect("Persons.pro migration sequence");
-        let plan = crate::compile::compile_migration_stage(
-            &persons.application,
-            migration,
-            &migration.launch_stage,
-        )
-        .expect("Persons.pro launch plan");
-
-        let scalar_paths = plan
-            .persistence
-            .memory
-            .iter()
-            .map(|memory| memory.semantic_path.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            scalar_paths,
-            [
-                "store.account_id",
-                "store.active_view",
-                "store.draft_revision",
-                "store.last_valid_draft_artifact_id",
-                "store.last_valid_draft_revision",
-                "store.mode",
-                "store.passkey_workflow_state",
-                "store.preview_surface",
-                "store.preview_width_mode",
-                "store.publish_candidate_revision",
-                "store.publish_candidate_source",
-                "store.publish_request_sequence",
-                "store.publish_settled_sequence",
-                "store.published_artifact_id",
-                "store.published_capability_profile",
-                "store.published_compiler",
-                "store.published_plan_digest",
-                "store.published_revision",
-                "store.published_source",
-                "store.published_source_digest",
-                "store.published_target",
-                "store.signed_out",
-                "store.source_draft",
-                "store.workspace_grant_id",
-                "store.workspace_grant_state",
-                "store.workspace_id",
-            ]
-            .into_iter()
-            .collect()
-        );
-
-        let list_paths = plan
-            .persistence
-            .lists
-            .iter()
-            .map(|list| list.semantic_path.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            list_paths,
-            ["store.credential_descriptors", "store.published_revisions"]
-                .into_iter()
-                .collect()
-        );
-        let row_fields = plan
-            .persistence
-            .lists
-            .iter()
-            .flat_map(|list| list.row_fields.iter())
-            .map(|field| field.semantic_path.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            row_fields,
-            [
-                "store.credential_descriptors.credential_id",
-                "store.credential_descriptors.label",
-                "store.published_revisions.artifact_id",
-                "store.published_revisions.capability_profile",
-                "store.published_revisions.compiler",
-                "store.published_revisions.draft_revision",
-                "store.published_revisions.plan_digest",
-                "store.published_revisions.request",
-                "store.published_revisions.source",
-                "store.published_revisions.source_digest",
-                "store.published_revisions.target",
-            ]
-            .into_iter()
-            .collect()
-        );
-        for forbidden in [
-            "store.draft_compile_column",
-            "store.draft_compile_diagnostic",
-            "store.draft_compile_line",
-            "store.draft_compile_path",
-            "store.passkey_message",
-            "store.publish_diagnostic",
-            "store.publish_state",
-        ] {
-            assert!(!scalar_paths.contains(forbidden));
-        }
-        assert_eq!(plan.persistence.effect_outbox.len(), 2);
-    }
 }

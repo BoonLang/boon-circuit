@@ -8,6 +8,158 @@ store: [
             elements.load_default_file.event.press |> THEN { TEXT { Default file path exercised } }
         }
 
+    default_waveform_asset:
+        PackageAsset[url: TEXT { asset://novywave/simple.vcd }]
+
+    fst_waveform_asset:
+        PackageAsset[url: TEXT { asset://novywave/basic_test.fst }]
+
+    ghw_waveform_asset:
+        PackageAsset[url: TEXT { asset://novywave/simple_test.ghw }]
+
+    real_waveform_file_request:
+        LATEST {
+            elements.begin_default_file_load.event.press |> THEN { TEXT { simple.vcd } }
+            elements.load_default_file.event.press |> THEN { TEXT { simple.vcd } }
+            elements.select_counter_file.event.press |> THEN { TEXT { simple.vcd } }
+            elements.select_uart_compare_file.event.press |> THEN { TEXT { wave_27.fst } }
+            elements.select_ghw_file.event.press |> THEN { TEXT { simple_test.ghw } }
+            default_file_tree_selected_file
+            load_requested_fixture_file
+        }
+
+    real_waveform_asset:
+        default_waveform_asset |> HOLD real_waveform_asset {
+            real_waveform_file_request |> WHEN {
+                TEXT { simple.vcd } => default_waveform_asset
+                TEXT { wave_27.fst } => fst_waveform_asset
+                TEXT { simple_test.ghw } => ghw_waveform_asset
+                __ => SKIP
+            }
+        }
+
+    real_file_stream_result:
+        NotStarted |> HOLD real_file_stream_result {
+            real_waveform_file_request |> THEN {
+                File/read_stream(
+                    file: real_waveform_asset
+                    chunk_bytes: 65536
+                    retain_content: True
+                )
+            }
+        }
+
+    real_waveform_open_result:
+        NotStarted |> HOLD real_waveform_open_result {
+            real_file_stream_result |> WHEN {
+                Finished => Wellen/open(content: real_file_stream_result.content)
+                __ => SKIP
+            }
+        }
+
+    real_hierarchy_page_result:
+        NotStarted |> HOLD real_hierarchy_page_result {
+            real_waveform_open_result |> WHEN {
+                WaveformOpened => Wellen/hierarchy_page(
+                    artifact: real_waveform_open_result.artifact
+                    request_fingerprint: TEXT { hierarchy:default:0 }
+                    offset: 0
+                    limit: 256
+                )
+                __ => SKIP
+            }
+        }
+
+    real_first_signal_id:
+        real_hierarchy_page_result |> WHEN {
+            HierarchyPage => List/find_value(
+                real_hierarchy_page_result.rows
+                field: "kind"
+                value: TEXT { Signal }
+                target: "signal_id"
+                fallback: TEXT { none }
+            )
+            __ => TEXT { none }
+        }
+
+    real_signal_page_result:
+        NotStarted |> HOLD real_signal_page_result {
+            real_hierarchy_page_result |> WHEN {
+                HierarchyPage => Wellen/signal_page(
+                    artifact: real_hierarchy_page_result.artifact
+                    request_fingerprint: TEXT { signal:default:0 }
+                    signal_ids: real_hierarchy_page_result.signal_ids
+                    start_time: real_hierarchy_page_result.start_time
+                    end_time: real_hierarchy_page_result.end_time
+                    offset: 0
+                    max_transitions: 256
+                )
+                __ => SKIP
+            }
+        }
+
+    real_cursor_values_result:
+        NotStarted |> HOLD real_cursor_values_result {
+            real_signal_page_result |> WHEN {
+                SignalPage => Wellen/cursor_values(
+                    artifact: real_signal_page_result.artifact
+                    request_fingerprint: TEXT { cursor:default:end }
+                    cursor_time: real_signal_page_result.end_time
+                    signal_ids: real_signal_page_result.signal_ids
+                )
+                __ => SKIP
+            }
+        }
+
+    real_bridge_format:
+        real_waveform_open_result |> WHEN {
+            WaveformOpened => real_waveform_open_result.format
+            __ => TEXT { none }
+        }
+
+    real_bridge_stats:
+        real_waveform_open_result |> WHEN {
+            WaveformOpened =>
+                real_waveform_open_result.format
+                |> Text/concat(with: real_waveform_open_result.signal_count, separator: " ")
+                |> Text/concat(with: TEXT { signals }, separator: " ")
+                |> Text/concat(with: real_waveform_open_result.scope_count, separator: ", ")
+                |> Text/concat(with: TEXT { scopes }, separator: " ")
+            __ => TEXT { waveform not opened }
+        }
+
+    real_hierarchy_status:
+        real_hierarchy_page_result |> WHEN {
+            HierarchyPage =>
+                TEXT { hierarchy rows }
+                |> Text/concat(with: real_hierarchy_page_result.total_rows, separator: ": ")
+            WaveformFailed => real_hierarchy_page_result.diagnostic
+            __ => TEXT { hierarchy not requested }
+        }
+
+    real_signal_status:
+        real_signal_page_result |> WHEN {
+            SignalPage =>
+                TEXT { signal pages }
+                |> Text/concat(with: real_signal_page_result.signals |> List/length(), separator: ": ")
+            WaveformFailed => real_signal_page_result.diagnostic
+            __ => TEXT { signals not requested }
+        }
+
+    real_cursor_status:
+        real_cursor_values_result |> WHEN {
+            CursorValues =>
+                TEXT { cursor values }
+                |> Text/concat(with: real_cursor_values_result.rows |> List/length(), separator: ": ")
+            WaveformFailed => real_cursor_values_result.diagnostic
+            __ => TEXT { cursor not requested }
+        }
+
+    real_runtime_status:
+        real_hierarchy_status
+        |> Text/concat(with: real_signal_status, separator: ", ")
+        |> Text/concat(with: real_cursor_status, separator: ", ")
+
     elements: [
         open_workspace_dialog: SOURCE
         close_workspace_dialog: SOURCE
@@ -1041,38 +1193,49 @@ store: [
         }
 
     bridge_open_summary:
-        diagnostic_state == Unsupported |> WHEN {
-            True => TEXT { unsupported waveform file: corrupted.vcd }
-            False => waveform_status |> WHEN {
-                Empty => TEXT { no file loaded }
-                Loading => TEXT { opening VCD simple.vcd }
-                __ => external_file_active == Yes |> WHEN {
-                    True => TEXT { local file } |> Text/concat(with: active_file, separator: " ")
-                    False => TEXT { opened } |> Text/concat(with: bridge_file_format, separator: " ") |> Text/concat(with: bridge_waveform_ref, separator: " ")
+        real_waveform_open_result |> WHEN {
+            WaveformOpened =>
+                TEXT { opened }
+                |> Text/concat(with: real_bridge_stats, separator: " ")
+            __ => diagnostic_state == Unsupported |> WHEN {
+                True => TEXT { unsupported waveform file: corrupted.vcd }
+                False => waveform_status |> WHEN {
+                    Empty => TEXT { no file loaded }
+                    Loading => TEXT { opening VCD simple.vcd }
+                    __ => external_file_active == Yes |> WHEN {
+                        True => TEXT { local file } |> Text/concat(with: active_file, separator: " ")
+                        False => TEXT { opened } |> Text/concat(with: bridge_file_format, separator: " ") |> Text/concat(with: bridge_waveform_ref, separator: " ")
+                    }
                 }
             }
         }
 
     bridge_hierarchy_page_label:
-        diagnostic_state == Unsupported |> WHEN {
-            True => TEXT { HIER:none }
-            False => waveform_status |> WHEN {
-                Empty => TEXT { HIER:none }
-                Loading => TEXT { HIER:opening }
-                __ => external_file_active == Yes |> WHEN {
-                    True => TEXT { HIER:local file metadata }
-                    False => active_metadata_hierarchy_page
+        real_hierarchy_page_result |> WHEN {
+            HierarchyPage => real_runtime_status
+            __ => diagnostic_state == Unsupported |> WHEN {
+                True => TEXT { HIER:none }
+                False => waveform_status |> WHEN {
+                    Empty => TEXT { HIER:none }
+                    Loading => TEXT { HIER:opening }
+                    __ => external_file_active == Yes |> WHEN {
+                        True => TEXT { HIER:local file metadata }
+                        False => active_metadata_hierarchy_page
+                    }
                 }
             }
         }
 
-    bridge_file_stats_label:
-        diagnostic_state == Unsupported |> WHEN {
-            True => TEXT { no waveform stats }
-            False => waveform_status |> WHEN {
-                Empty => TEXT { no waveform stats }
-                Loading => TEXT { loading waveform stats }
-                __ => effective_metadata_stats
+    bridge_waveform_stats_label:
+        real_waveform_open_result |> WHEN {
+            WaveformOpened => real_bridge_stats
+            __ => diagnostic_state == Unsupported |> WHEN {
+                True => TEXT { no waveform stats }
+                False => waveform_status |> WHEN {
+                    Empty => TEXT { no waveform stats }
+                    Loading => TEXT { loading waveform stats }
+                    __ => effective_metadata_stats
+                }
             }
         }
 
@@ -2658,7 +2821,10 @@ store: [
         List/find_value(signal_catalog, field: "key", value: active_signal, target: "bridge_key", fallback: "NONE")
 
     format_label:
-        NovyModel/format_label(format: active_signal_format)
+        real_waveform_open_result |> WHEN {
+            WaveformOpened => real_bridge_format
+            __ => NovyModel/format_label(format: active_signal_format)
+        }
 
     data_bus_rendered_value:
         NovyModel/selected_data_value_at_cursor(format: data_bus_row_format, cursor: cursor_position)
@@ -3312,10 +3478,10 @@ store: [
         |> Text/concat(with: bridge_file_digest, separator: "|")
         |> Text/concat(with: cursor_label, separator: "|")
 
-    bridge_file_stats_page_digest:
-        TEXT { page:file_stats }
+    bridge_waveform_stats_page_digest:
+        TEXT { page:waveform_stats }
         |> Text/concat(with: bridge_file_digest, separator: "|")
-        |> Text/concat(with: bridge_file_stats_label, separator: "|")
+        |> Text/concat(with: bridge_waveform_stats_label, separator: "|")
 
     bridge_waveform_sample_count:
         selected_waveform_segments |> List/length()
@@ -3396,17 +3562,17 @@ store: [
             status: bridge_response_status
         ]
 
-    bridge_file_stats_page_ref:
+    bridge_waveform_stats_page_ref:
         [
             ref_type: TEXT { PageRef }
-            page_kind: TEXT { file_stats }
+            page_kind: TEXT { waveform_stats }
             artifact_digest: bridge_file_digest
             schema_version: bridge_page_schema_version
             schema_hash: bridge_page_schema_hash
             request_fingerprint: bridge_page_request_fingerprint
             response_fingerprint: bridge_page_response_fingerprint
             input_digest: bridge_page_request_input_digest
-            page_digest: bridge_file_stats_page_digest
+            page_digest: bridge_waveform_stats_page_digest
             generation: bridge_request_generation
             row_count: 1
             sample_count: 0
@@ -3488,9 +3654,9 @@ store: [
             status: bridge_response_status
         ]
 
-    bridge_file_stats:
+    bridge_waveform_stats:
         [
-            page_type: TEXT { file_stats }
+            page_type: TEXT { waveform_stats }
             file: bridge_descriptor_file
             format: bridge_file_format
             schema_version: bridge_page_schema_version
@@ -3498,7 +3664,7 @@ store: [
             request_fingerprint: bridge_page_request_fingerprint
             response_fingerprint: bridge_page_response_fingerprint
             input_digest: bridge_page_request_input_digest
-            page_digest: bridge_file_stats_page_digest
+            page_digest: bridge_waveform_stats_page_digest
             generation: bridge_request_generation
             row_count: selected_rows_count
             sample_count: 0
@@ -3527,10 +3693,10 @@ store: [
         ]
 
     stale_response_policy: TEXT { generation and request fingerprint equality required }
-    bridge_contract: TEXT { wellen.v1-compatible fixture contract: open, hierarchy_page, signal_page, cursor_values, file_stats }
+    bridge_contract: TEXT { wellen.v1-compatible fixture contract: open, hierarchy_page, signal_page, cursor_values }
     bridge_provider_version: TEXT { deterministic fixture provider v1 }
     bridge_schema_version: TEXT { wellen.v1 fixture schema; stable fixture hashes in descriptors }
-    bridge_effect_exports: TEXT { open/hierarchy/signal/cursor/stats }
+    bridge_effect_exports: TEXT { open/hierarchy/signal/cursor }
     bridge_data_policy: TEXT { comparable descriptors only; no Rust handles }
 ]
 

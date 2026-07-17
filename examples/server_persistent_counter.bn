@@ -13,6 +13,8 @@ outputs: [
     response: [
         status: 200
         body: store.request_count
+            |> Number/to_text(radix: 10)
+            |> Text/to_bytes(encoding: Utf8)
     ]
 ]
 

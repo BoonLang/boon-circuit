@@ -5,8 +5,8 @@ LIST {}
 hex_input: TEXT { 01020304 } |> HOLD hex_input { LATEST {} }
 base64_input: TEXT { AQIDBA== } |> HOLD base64_input { LATEST {} }
 bytes: BYTES[4] { 16u01, 16u02, 16u03, 16u04 }
-len: bytes |> Bytes/length
-empty: bytes |> Bytes/is_empty
+len: bytes |> Bytes/length()
+empty: bytes |> Bytes/is_empty()
 first: bytes |> Bytes/get(index: 0)
 sliced: bytes |> Bytes/slice(offset: 1, byte_count: 2)
 taken: bytes |> Bytes/take(byte_count: 2)
@@ -16,10 +16,10 @@ same: bytes |> Bytes/equal(with: BYTES[4] { 16u01, 16u02, 16u03, 16u04 })
 found: bytes |> Bytes/find(needle: BYTES[2] { 16u02, 16u03 })
 starts: bytes |> Bytes/starts_with(prefix: BYTES[2] { 16u01, 16u02 })
 ends: bytes |> Bytes/ends_with(suffix: BYTES[2] { 16u03, 16u04 })
-hex: bytes |> Bytes/to_hex
-base64: bytes |> Bytes/to_base64
-decoded: TEXT { 01020304 } |> Bytes/from_hex
-decoded64: TEXT { AQIDBA== } |> Bytes/from_base64
+hex: bytes |> Bytes/to_hex()
+base64: bytes |> Bytes/to_base64()
+decoded: TEXT { 01020304 } |> Bytes/from_hex()
+decoded64: TEXT { AQIDBA== } |> Bytes/from_base64()
 encoded: TEXT { hi } |> Text/to_bytes(encoding: Utf8)
 encoded_ascii_fixed: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
 text: bytes |> Bytes/to_text(encoding: Utf8)
@@ -31,12 +31,12 @@ zeros: Bytes/zeros(byte_count: 4)
 file_bytes: TEXT { ./asset.svg } |> File/read_bytes()
 file_text: TEXT { ./asset.svg } |> File/read_text()
 file_write: bytes |> File/write_bytes(path: TEXT { output.bin })
-static_hex: TEXT { 01 02 03 04 } |> Bytes/from_hex
-static_base64: TEXT { AQIDBA== } |> Bytes/from_base64
+static_hex: TEXT { 01 02 03 04 } |> Bytes/from_hex()
+static_base64: TEXT { AQIDBA== } |> Bytes/from_base64()
 static_utf8: TEXT { č } |> Text/to_bytes(encoding: Utf8)
 static_ascii: TEXT { AZ } |> Text/to_bytes(encoding: Ascii)
-dynamic_hex: hex_input |> Bytes/from_hex
-dynamic_base64: base64_input |> Bytes/from_base64
+dynamic_hex: hex_input |> Bytes/from_hex()
+dynamic_base64: base64_input |> Bytes/from_base64()
 dynamic_utf8: hex_input |> Text/to_bytes(encoding: Utf8)
 folded_index: bytes |> Bytes/get(index: 1 + 1)
 folded_slice: bytes |> Bytes/slice(offset: 1 + 1, byte_count: 1 + 1)

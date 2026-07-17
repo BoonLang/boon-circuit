@@ -10,11 +10,11 @@ store: [
     file_len:
         0 |> HOLD file_len {
             LATEST {
-                store.inspect |> THEN { store.file_bytes |> Bytes/length }
+                store.inspect |> THEN { store.file_bytes |> Bytes/length() }
             }
         }
     first_byte:
-        16u00 |> HOLD first_byte {
+        BYTES[1] { 16u00 } |> HOLD first_byte {
             LATEST {
                 store.inspect |> THEN { store.file_bytes |> Bytes/get(index: 0) }
             }

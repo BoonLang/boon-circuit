@@ -2,6 +2,30 @@ use super::*;
 use boon_plan::*;
 use std::collections::BTreeMap;
 
+fn compile_server_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    boon_compiler::compile_source_text_to_machine_plan_for_role(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Server,
+    )
+}
+
+fn compile_server_path(
+    source_path: &std::path::Path,
+    target_profile: TargetProfile,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    boon_compiler::compile_source_path_to_machine_plan_for_role(
+        source_path,
+        target_profile,
+        ProgramRole::Server,
+    )
+}
+
 const INDEXED_PREFIX_QUERY_SOURCE: &str = r#"
 store: [
     change: SOURCE
@@ -203,7 +227,8 @@ fn plan(
     MachinePlan {
         version: PlanVersion::default(),
         target_profile: TargetProfile::SoftwareDefault,
-        program_role: ProgramRole::Document,
+        program_role: ProgramRole::Client,
+        distributed_endpoint: None,
         application,
         persistence,
         effects: Vec::new(),
@@ -289,7 +314,6 @@ fn test_data_type(value_type: PlanValueType) -> DataTypePlan {
     match value_type {
         PlanValueType::Text => DataTypePlan::Text,
         PlanValueType::Number => DataTypePlan::Number,
-        PlanValueType::Byte => DataTypePlan::Byte,
         PlanValueType::Bool => DataTypePlan::Bool,
         PlanValueType::Bytes { fixed_len } => DataTypePlan::Bytes { fixed_len },
         PlanValueType::Enum => DataTypePlan::Variant {
@@ -366,6 +390,7 @@ fn const_update(id: usize, source: usize, state: usize, constant: usize) -> Plan
     PlanOp {
         id: PlanOpId(id),
         kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(source)),
             expression_kind: PlanExpressionKind::Const,
             ordered_inputs: Vec::new(),
             source_payload_field: None,
@@ -928,6 +953,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
     let select_update = PlanOp {
         id: PlanOpId(0),
         kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::Const,
             ordered_inputs: Vec::new(),
             source_payload_field: None,
@@ -1143,6 +1169,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
     let update = PlanOp {
         id: PlanOpId(0),
         kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::MatchInfixConst,
             ordered_inputs: vec![
                 ValueRef::Field(FieldId(10)),
@@ -1356,7 +1383,7 @@ fn list_find_uses_typed_index_without_scanning() {
 
 #[test]
 fn compiled_prefix_query_uses_bounded_index_and_tracks_currentness() {
-    let mut compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let mut compiled = compile_server_source(
         "indexed-prefix-query.bn",
         INDEXED_PREFIX_QUERY_SOURCE,
         TargetProfile::SoftwareDefault,
@@ -1414,7 +1441,7 @@ fn compiled_prefix_query_uses_bounded_index_and_tracks_currentness() {
 
 #[test]
 fn compiled_compound_query_executes_through_canonical_query_collection() {
-    let mut compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let mut compiled = compile_server_source(
         "generic-compound-query.bn",
         GENERIC_COMPOUND_QUERY_SOURCE,
         TargetProfile::SoftwareDefault,
@@ -1551,7 +1578,7 @@ fn compiled_compound_query_executes_through_canonical_query_collection() {
 
 #[test]
 fn indexed_query_mutation_is_atomic_current_and_never_scans() {
-    let mut compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let mut compiled = compile_server_source(
         "generic-query-mutation.bn",
         GENERIC_QUERY_MUTATION_SOURCE,
         TargetProfile::SoftwareDefault,
@@ -1785,6 +1812,7 @@ fn source_turn_work_budget_rolls_back_authority_and_current_outputs() {
     let read_update = PlanOp {
         id: PlanOpId(2),
         kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::ReadPath,
             ordered_inputs: Vec::new(),
             source_payload_field: None,
@@ -2010,6 +2038,7 @@ fn source_transform_keeps_precommit_state_for_the_event_turn() {
     let clear_state = PlanOp {
         id: PlanOpId(1),
         kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::Const,
             ordered_inputs: Vec::new(),
             source_payload_field: None,
@@ -2108,6 +2137,7 @@ fn same_turn_recompute_does_not_suppress_later_invalidation() {
     let read_update = |id, state| PlanOp {
         id: PlanOpId(id),
         kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::ReadPath,
             ordered_inputs: Vec::new(),
             source_payload_field: None,
@@ -2429,6 +2459,7 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
     let update = PlanOp {
         id: PlanOpId(0),
         kind: PlanOpKind::UpdateBranch {
+            trigger: ValueRef::Source(SourceId(0)),
             expression_kind: PlanExpressionKind::Const,
             ordered_inputs: Vec::new(),
             source_payload_field: None,
@@ -2549,7 +2580,7 @@ fn durable_variants_round_trip_tag_only_and_structured_values() {
 
 #[test]
 fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_server_source(
         "server-outputs.bn",
         include_str!("../../../examples/server_outputs.bn"),
         TargetProfile::SoftwareDefault,
@@ -2574,8 +2605,7 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
     assert_eq!(
         session.output_value_current("api_response").unwrap(),
         Value::Record(BTreeMap::from([
-            ("body".to_owned(), Value::Text("accepted".to_owned())),
-            ("request_count".to_owned(), number(0)),
+            ("body".to_owned(), Value::Bytes(b"accepted".to_vec())),
             ("status".to_owned(), number(200)),
         ]))
     );
@@ -2602,12 +2632,12 @@ fn host_outputs_are_demand_current_and_reconstructed_without_a_document() {
     let Value::Record(response) = session.output_value_current("api_response").unwrap() else {
         panic!("response output must remain a record");
     };
-    assert_eq!(response["request_count"], number(1));
+    assert_eq!(response["body"], Value::Bytes(b"accepted".to_vec()));
 }
 
 #[test]
 fn recursive_http_source_payload_executes_list_get_and_current_response() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_server_source(
         "server-http-echo.bn",
         include_str!("../../../examples/server_http_echo.bn"),
         TargetProfile::SoftwareDefault,
@@ -2641,15 +2671,78 @@ fn recursive_http_source_payload_executes_list_get_and_current_response() {
     assert_eq!(
         session.output_value_current("response").unwrap(),
         Value::Record(BTreeMap::from([
-            ("body".to_owned(), Value::Text("GET:health".to_owned())),
+            ("body".to_owned(), Value::Bytes(b"GET:health".to_vec())),
             ("status".to_owned(), number(200)),
         ]))
     );
 }
 
 #[test]
-fn fjordpulse_server_routes_one_structural_http_source_to_one_response() {
-    let compiled = boon_compiler::compile_source_path_to_machine_plan(
+fn number_to_text_then_utf8_bytes_executes_for_http_output() {
+    let compiled = compile_server_source(
+        "server-persistent-counter.bn",
+        include_str!("../../../examples/server_persistent_counter.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    let source = source_id(&compiled.plan, "store.request");
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: None,
+            payload: SourcePayload {
+                fields: BTreeMap::from([("method".to_owned(), Value::Text("POST".to_owned()))]),
+                ..SourcePayload::default()
+            },
+        })
+        .unwrap();
+
+    assert_eq!(
+        session.output_value_current("response").unwrap(),
+        Value::Record(BTreeMap::from([
+            ("body".to_owned(), Value::Bytes(b"1".to_vec())),
+            ("status".to_owned(), number(200)),
+        ]))
+    );
+}
+
+#[test]
+fn number_to_text_executes_all_bounded_waveform_formats() {
+    let compiled = compile_server_source(
+        "number-formats.bn",
+        r#"
+outputs: [
+    grouped: 42 |> Number/to_text(radix: 2, min_width: 8, group_size: 4)
+    signed: 255 |> Number/to_text(radix: 10, signed_width: 8)
+    hexadecimal: 42 |> Number/to_text(radix: 16, prefix: True)
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
+    let mut session = Session::new(compiled.plan, SessionOptions::default()).unwrap();
+    assert_eq!(
+        session.output_value_current("grouped").unwrap(),
+        Value::Text("0010 1010".to_owned())
+    );
+    assert_eq!(
+        session.output_value_current("signed").unwrap(),
+        Value::Text("-1".to_owned())
+    );
+    assert_eq!(
+        session.output_value_current("hexadecimal").unwrap(),
+        Value::Text("0x2a".to_owned())
+    );
+}
+
+#[test]
+fn fjordpulse_server_routes_http_and_keeps_search_results_structural() {
+    let compiled = compile_server_path(
         std::path::Path::new("examples/fjordpulse/Server/RUN.bn"),
         TargetProfile::SoftwareDefault,
     )
@@ -2685,12 +2778,13 @@ fn fjordpulse_server_routes_one_structural_http_source_to_one_response() {
         panic!("FjordPulse HTTP output must be a record");
     };
     assert_eq!(response["status"], number(200));
-    let Value::Record(body) = &response["body"] else {
-        panic!("FjordPulse HTTP body must remain structural until the host JSON boundary");
+    let Value::Bytes(body) = &response["body"] else {
+        panic!("FjordPulse HTTP body must be application-owned bytes");
     };
-    assert_eq!(body["ok"], Value::Bool(true));
-    assert_eq!(body["route"], Value::Text("/api/health".to_owned()));
-    assert_eq!(body["request_count"], number(1));
+    let body = std::str::from_utf8(body).unwrap();
+    assert!(body.starts_with("{\"ok\":true,"));
+    assert!(body.contains("\"status\":\"healthy\""));
+    assert!(body.contains("\"version\":\"boon-deterministic-v1\""));
 
     session
         .apply(SourceEvent {
@@ -2720,21 +2814,17 @@ fn fjordpulse_server_routes_one_structural_http_source_to_one_response() {
             },
         })
         .unwrap();
-    let Value::Record(search) = session.output_value_current("search_results").unwrap() else {
+    let Value::Record(search) = session.output_value_current("search_contract").unwrap() else {
         panic!("FjordPulse search output must be a record");
     };
-    let Value::List(matches) = &search["data"] else {
-        panic!("FjordPulse search data must be a list");
-    };
-    let [Value::Record(station)] = matches.as_slice() else {
-        panic!("indexed prefix search must return exactly one station DTO: {matches:?}");
-    };
-    assert_eq!(station["name"], Value::Text("Bergen stasjon".to_owned()));
+    assert_eq!(search["query"], Value::Text("ber".to_owned()));
+    assert_eq!(search["indexedResultCount"], number(1));
+    assert_eq!(search["limit"], number(20));
 }
 
 #[test]
 fn decimal_numbers_execute_arithmetic_and_host_output_without_integer_coercion() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_server_source(
         "real-arithmetic.bn",
         r#"
 store: [
@@ -2812,7 +2902,7 @@ fn whole_and_decimal_numbers_share_one_value_identity() {
 
 #[test]
 fn source_payload_text_to_number_executes_the_typed_conversion() {
-    let machine = boon_compiler::compile_source_text_to_machine_plan(
+    let machine = compile_server_source(
         "source-text-to-number-executor.bn",
         r#"
 store: [
@@ -2851,123 +2941,9 @@ store: [
 }
 
 fn typed_passkey_effect_machine() -> MachinePlan {
-    boon_compiler::compile_source_text_to_machine_plan(
+    compile_server_source(
         "typed-passkey-effects-executor.bn",
-        r#"
-store: [
-    register: SOURCE
-    authenticate: SOURCE
-    registration_succeeded: SOURCE
-    registration_cancelled: SOURCE
-    registration_failed: SOURCE
-    duplicate_credential: SOURCE
-    authentication_succeeded: SOURCE
-    authentication_cancelled: SOURCE
-    authentication_failed: SOURCE
-    simulate_cancel: SOURCE
-    simulate_failure: SOURCE
-    simulate_duplicate: SOURCE
-    workspace_id: TEXT { workspace-1 } |> HOLD workspace_id
-    workspace_grant_id: TEXT { grant-1 } |> HOLD workspace_grant_id
-    account_id: TEXT { account-1 } |> HOLD account_id
-    credential_count: 1 |> HOLD credential_count
-    simulation:
-        Success |> HOLD simulation {
-            LATEST {
-                store.simulate_cancel |> THEN { Cancel }
-                store.simulate_failure |> THEN { Failure }
-                store.simulate_duplicate |> THEN { Duplicate }
-            }
-        }
-    last_result:
-        Pending |> HOLD last_result {
-            LATEST {
-                store.registration_succeeded |> THEN { RegistrationSucceeded }
-                store.registration_cancelled |> THEN { RegistrationCancelled }
-                store.registration_failed |> THEN { RegistrationFailed }
-                store.duplicate_credential |> THEN { DuplicateCredential }
-                store.authentication_succeeded |> THEN { AuthenticationSucceeded }
-                store.authentication_cancelled |> THEN { AuthenticationCancelled }
-                store.authentication_failed |> THEN { AuthenticationFailed }
-            }
-        }
-    result_account_id:
-        TEXT {} |> HOLD result_account_id {
-            LATEST {
-                store.registration_succeeded |> THEN { store.registration_succeeded.account_id }
-                store.duplicate_credential |> THEN { store.duplicate_credential.account_id }
-                store.authentication_succeeded |> THEN { store.authentication_succeeded.account_id }
-            }
-        }
-    result_credential_id:
-        TEXT {} |> HOLD result_credential_id {
-            LATEST {
-                store.registration_succeeded |> THEN { store.registration_succeeded.credential_id }
-                store.duplicate_credential |> THEN { store.duplicate_credential.credential_id }
-                store.authentication_succeeded |> THEN { store.authentication_succeeded.credential_id }
-            }
-        }
-    result_label:
-        TEXT {} |> HOLD result_label {
-            LATEST {
-                store.registration_succeeded |> THEN { store.registration_succeeded.label }
-            }
-        }
-    failure_code:
-        TEXT {} |> HOLD failure_code {
-            LATEST {
-                store.registration_failed |> THEN { store.registration_failed.code }
-                store.authentication_failed |> THEN { store.authentication_failed.code }
-            }
-        }
-    failure_message:
-        TEXT {} |> HOLD failure_message {
-            LATEST {
-                store.registration_failed |> THEN { store.registration_failed.message }
-                store.authentication_failed |> THEN { store.authentication_failed.message }
-            }
-        }
-    failure_retryable:
-        False |> HOLD failure_retryable {
-            LATEST {
-                store.registration_failed |> THEN { store.registration_failed.retryable }
-                store.authentication_failed |> THEN { store.authentication_failed.retryable }
-            }
-        }
-]
-
-effects: [
-    register_passkey: [
-        on: store.register
-        perform: DevelopmentPasskey/register(
-            workspace_id: store.workspace_id
-            workspace_grant_id: store.workspace_grant_id
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: store.simulation
-        )
-        results: [
-            RegistrationSucceeded: store.registration_succeeded
-            RegistrationCancelled: store.registration_cancelled
-            RegistrationFailed: store.registration_failed
-            DuplicateCredential: store.duplicate_credential
-        ]
-    ]
-    authenticate_passkey: [
-        on: store.authenticate
-        perform: DevelopmentPasskey/authenticate(
-            account_id: store.account_id
-            credential_count: store.credential_count
-            simulation: store.simulation
-        )
-        results: [
-            AuthenticationSucceeded: store.authentication_succeeded
-            AuthenticationCancelled: store.authentication_cancelled
-            AuthenticationFailed: store.authentication_failed
-        ]
-    ]
-]
-"#,
+        include_str!("../../../testdata/typed_passkey_effects.bn"),
         TargetProfile::SoftwareDefault,
     )
     .unwrap()
@@ -2975,12 +2951,143 @@ effects: [
 }
 
 fn outbound_http_effect_machine() -> MachinePlan {
-    boon_compiler::compile_source_path_to_machine_plan(
+    compile_server_path(
         std::path::Path::new("examples/outbound_http_effect.bn"),
         TargetProfile::SoftwareDefault,
     )
     .unwrap()
     .plan
+}
+
+fn state_triggered_effect_chain_machine() -> MachinePlan {
+    compile_server_source(
+        "state-triggered-effect-chain.bn",
+        include_str!("../../../testdata/state_triggered_effect_chain.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap()
+    .plan
+}
+
+fn file_stream_effect_machine() -> MachinePlan {
+    boon_compiler::compile_source_text_to_machine_plan_for_role(
+        "file-stream-effect-executor.bn",
+        r#"
+store: [
+    read: SOURCE
+    stream_result:
+        NotStarted |> HOLD stream_result {
+            read |> THEN {
+                File/read_stream(
+                    file: read.file
+                    chunk_bytes: 4
+                    retain_content: False
+                )
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+        ProgramRole::Server,
+    )
+    .unwrap()
+    .plan
+}
+
+fn mapped_request_root_file_stream_effect_machine() -> MachinePlan {
+    boon_compiler::compile_source_text_to_machine_plan_for_role(
+        "mapped-request-root-file-stream.bn",
+        r#"
+store: [
+    root_open: SOURCE
+    primary_asset:
+        PackageAsset[url: TEXT { asset://files/primary.bin }]
+    secondary_asset:
+        PackageAsset[url: TEXT { asset://files/secondary.bin }]
+    rows:
+        LIST {
+            [name: TEXT { primary }]
+        }
+        |> List/map(row, new: mapped_effect_row(row: row))
+    mapped_request:
+        rows
+        |> List/map(row, new: LATEST {
+            row.open |> THEN { Primary }
+        })
+        |> List/latest()
+    request:
+        LATEST {
+            root_open |> THEN { Primary }
+            mapped_request
+        }
+    selected:
+        primary_asset |> HOLD selected {
+            request |> WHEN {
+                Primary => primary_asset
+                Secondary => secondary_asset
+                __ => SKIP
+            }
+        }
+    stream_result:
+        NotStarted |> HOLD stream_result {
+            request |> THEN {
+                File/read_stream(
+                    file: selected
+                    chunk_bytes: 4
+                    retain_content: False
+                )
+            }
+        }
+]
+
+outputs: [
+    stream_result: store.stream_result
+]
+
+FUNCTION mapped_effect_row(row) {
+    [
+        name: row.name
+        open: SOURCE
+    ]
+}
+"#,
+        TargetProfile::SoftwareDefault,
+        ProgramRole::Server,
+    )
+    .unwrap()
+    .plan
+}
+
+fn file_stream_payload() -> SourcePayload {
+    SourcePayload {
+        fields: BTreeMap::from([(
+            "file".to_owned(),
+            Value::Record(BTreeMap::from([
+                ("$tag".to_owned(), Value::Text("FileSelected".to_owned())),
+                (
+                    "capability".to_owned(),
+                    Value::Record(BTreeMap::from([
+                        ("token".to_owned(), Value::Bytes(vec![7; 32])),
+                        ("generation".to_owned(), number(1)),
+                    ])),
+                ),
+            ])),
+        )]),
+        ..SourcePayload::default()
+    }
+}
+
+fn file_stream_outcome(
+    tag: &str,
+    fields: impl IntoIterator<Item = (&'static str, Value)>,
+) -> Value {
+    let mut record = BTreeMap::from([("$tag".to_owned(), Value::Text(tag.to_owned()))]);
+    record.extend(
+        fields
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value)),
+    );
+    Value::Record(record)
 }
 
 fn outbound_http_payload() -> SourcePayload {
@@ -3047,6 +3154,12 @@ fn outbound_http_success(status: i64) -> Value {
 #[test]
 fn read_only_http_effect_is_transient_typed_correlated_and_cycle_safe() {
     let machine = outbound_http_effect_machine();
+    let last_status = match &machine.output_root("last_status").unwrap().value {
+        OutputValueRef::RuntimeValue {
+            value: ValueRef::Field(field),
+        } => *field,
+        other => panic!("unexpected last_status output ref: {other:?}"),
+    };
     let contract = machine
         .effects
         .iter()
@@ -3080,10 +3193,22 @@ fn read_only_http_effect_is_transient_typed_correlated_and_cycle_safe() {
     assert_eq!(session.pending_transient_effect_count(), 1);
 
     let completion = session
-        .complete_transient_effect(invocation.call_id, outbound_http_success(201))
+        .complete_transient_effect_with_demand(
+            invocation.call_id,
+            outbound_http_success(201),
+            &[ValueTarget::Field(last_status)],
+        )
         .unwrap();
     assert!(completion.outbox_changes.is_empty());
+    assert!(completion.durable_changes.is_empty());
     assert!(completion.transient_effects.is_empty());
+    assert!(completion.deltas.iter().any(|delta| matches!(
+        delta,
+        Delta::SetValue {
+            target: ValueTarget::Field(field),
+            value,
+        } if *field == last_status && value == &number(201)
+    )));
     assert_eq!(
         session.root_value_current("store.last_status").unwrap(),
         number(201)
@@ -3101,6 +3226,91 @@ fn read_only_http_effect_is_transient_typed_correlated_and_cycle_safe() {
     assert!(
         matches!(stale, Err(Error::InvalidEvent(detail)) if detail.contains("different session launch"))
     );
+}
+
+#[test]
+fn effect_completion_triggers_the_next_effect_even_when_the_value_repeats() {
+    let machine = state_triggered_effect_chain_machine();
+    let start = source_id(&machine, "store.start");
+    let clock_effect = machine
+        .effects
+        .iter()
+        .find(|effect| effect.host_operation == "Clock/wall")
+        .unwrap()
+        .effect_id;
+    let random_effect = machine
+        .effects
+        .iter()
+        .find(|effect| effect.host_operation == "Random/bytes")
+        .unwrap()
+        .effect_id;
+    let wall_result = Value::Record(BTreeMap::from([
+        ("$tag".to_owned(), Value::Text("WallClockRead".to_owned())),
+        ("unix_seconds".to_owned(), number(1_700_000_000)),
+        ("nanoseconds".to_owned(), number(123)),
+    ]));
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+
+    for sequence in 1..=2 {
+        let clock = session
+            .apply(SourceEvent {
+                sequence,
+                source: start,
+                target: None,
+                payload: SourcePayload::default(),
+            })
+            .unwrap()
+            .transient_effects
+            .remove(0);
+        assert_eq!(clock.effect_id, clock_effect);
+        let completion = session
+            .complete_transient_effect(clock.call_id, wall_result.clone())
+            .unwrap();
+        let [random] = completion.transient_effects.as_slice() else {
+            panic!("every wall-clock completion must trigger Random/bytes");
+        };
+        assert_eq!(random.effect_id, random_effect);
+        session
+            .complete_transient_effect(
+                random.call_id,
+                Value::Record(BTreeMap::from([
+                    (
+                        "$tag".to_owned(),
+                        Value::Text("RandomBytesReady".to_owned()),
+                    ),
+                    ("bytes".to_owned(), Value::Bytes(vec![sequence as u8; 16])),
+                ])),
+            )
+            .unwrap();
+    }
+
+    let clock = session
+        .apply(SourceEvent {
+            sequence: 3,
+            source: start,
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap()
+        .transient_effects
+        .remove(0);
+    let failure = session
+        .complete_transient_effect(
+            clock.call_id,
+            Value::Record(BTreeMap::from([
+                (
+                    "$tag".to_owned(),
+                    Value::Text("HostServiceFailed".to_owned()),
+                ),
+                ("code".to_owned(), Value::Text("clock_failed".to_owned())),
+                (
+                    "diagnostic".to_owned(),
+                    Value::Text("clock unavailable".to_owned()),
+                ),
+            ])),
+        )
+        .unwrap();
+    assert!(failure.transient_effects.is_empty());
 }
 
 #[test]
@@ -3150,6 +3360,226 @@ fn transient_http_cancel_and_rollback_preserve_one_shot_ownership() {
     session
         .complete_transient_effect(second.call_id, outbound_http_success(205))
         .unwrap();
+}
+
+#[test]
+fn stream_effect_delivery_is_ordered_bounded_terminal_and_replaced_by_owner() {
+    let machine = file_stream_effect_machine();
+    let read = source_id(&machine, "store.read");
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let first_turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: read,
+            target: None,
+            payload: file_stream_payload(),
+        })
+        .unwrap();
+    let [first] = first_turn.transient_effects.as_slice() else {
+        panic!("file read must launch exactly one stream");
+    };
+    assert!(matches!(
+        first.delivery,
+        EffectDeliveryCardinality::Stream {
+            initial_credits: 2,
+            max_in_flight: 4,
+            ..
+        }
+    ));
+    assert_eq!(
+        session.pending_transient_effect_credits(first.call_id),
+        Some(2)
+    );
+    assert!(
+        session
+            .complete_transient_effect(
+                first.call_id,
+                file_stream_outcome(
+                    "Opened",
+                    [
+                        ("size", number(3)),
+                        ("content_type", Value::Text("audio/wav".to_owned())),
+                        ("display_name", Value::Text("fixture.wav".to_owned())),
+                    ],
+                ),
+            )
+            .is_err()
+    );
+    assert!(
+        session
+            .deliver_transient_effect_result(
+                first.call_id,
+                1,
+                file_stream_outcome(
+                    "Opened",
+                    [
+                        ("size", number(3)),
+                        ("content_type", Value::Text("audio/wav".to_owned())),
+                        ("display_name", Value::Text("fixture.wav".to_owned())),
+                    ],
+                ),
+            )
+            .is_err()
+    );
+
+    let opened = session
+        .deliver_transient_effect_result(
+            first.call_id,
+            0,
+            file_stream_outcome(
+                "Opened",
+                [
+                    ("size", number(3)),
+                    ("content_type", Value::Text("audio/wav".to_owned())),
+                    ("display_name", Value::Text("fixture.wav".to_owned())),
+                ],
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        opened.transient_effect_credit_grants,
+        vec![TransientEffectCreditGrant {
+            call_id: first.call_id,
+            credits: 1,
+        }]
+    );
+    assert_eq!(
+        session.pending_transient_effect_credits(first.call_id),
+        Some(2)
+    );
+    assert!(matches!(
+        session.root_value_current("store.stream_result").unwrap(),
+        Value::Record(fields)
+            if fields.get("$tag") == Some(&Value::Text("Opened".to_owned()))
+    ));
+
+    let chunk = session
+        .deliver_transient_effect_result(
+            first.call_id,
+            1,
+            file_stream_outcome(
+                "Chunk",
+                [
+                    ("sequence", number(0)),
+                    ("offset", number(0)),
+                    ("bytes", Value::Bytes(vec![1, 2, 3])),
+                ],
+            ),
+        )
+        .unwrap();
+    assert_eq!(chunk.transient_effect_credit_grants[0].credits, 1);
+    let finished = session
+        .deliver_transient_effect_result(
+            first.call_id,
+            2,
+            file_stream_outcome(
+                "Finished",
+                [
+                    ("byte_count", number(3)),
+                    ("digest", Value::Bytes(vec![9; 32])),
+                    (
+                        "content",
+                        Value::Record(BTreeMap::from([
+                            ("digest".to_owned(), Value::Bytes(vec![9; 32])),
+                            ("byte_count".to_owned(), number(3)),
+                        ])),
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+    assert!(finished.transient_effect_credit_grants.is_empty());
+    assert_eq!(session.pending_transient_effect_count(), 0);
+    assert!(session
+        .deliver_transient_effect_result(first.call_id, 3, file_stream_outcome("Cancelled", []),)
+        .is_err());
+
+    let replacement_source = session
+        .apply(SourceEvent {
+            sequence: 2,
+            source: read,
+            target: None,
+            payload: file_stream_payload(),
+        })
+        .unwrap();
+    let replacement = replacement_source.transient_effects[0].clone();
+    let replaced_again = session
+        .apply(SourceEvent {
+            sequence: 3,
+            source: read,
+            target: None,
+            payload: file_stream_payload(),
+        })
+        .unwrap();
+    assert_eq!(
+        replaced_again.cancelled_transient_effects,
+        vec![replacement.call_id]
+    );
+    assert_eq!(session.pending_transient_effect_count(), 1);
+    assert!(
+        session
+            .deliver_transient_effect_result(
+                replacement.call_id,
+                0,
+                file_stream_outcome("Cancelled", []),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn mapped_source_row_does_not_become_the_root_effect_result_owner() {
+    let machine = mapped_request_root_file_stream_effect_machine();
+    let route = machine
+        .source_routes
+        .iter()
+        .find(|route| route.scope_id.is_some() && route.path.ends_with(".open"))
+        .unwrap();
+    let source = route.source_id;
+    let scope = route.scope_id.unwrap();
+    let list = machine
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.scope_id == Some(scope))
+        .unwrap()
+        .list_id;
+    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
+    let row = session.snapshot().unwrap().lists[&list][0].id;
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            target: Some(row),
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    let [invocation] = turn.transient_effects.as_slice() else {
+        panic!("mapped source must emit exactly one root stream invocation");
+    };
+    assert_eq!(invocation.target, None);
+    session
+        .deliver_transient_effect_result(
+            invocation.call_id,
+            0,
+            file_stream_outcome(
+                "Opened",
+                [
+                    ("size", number(4)),
+                    (
+                        "content_type",
+                        Value::Text("application/octet-stream".to_owned()),
+                    ),
+                    ("display_name", Value::Text("primary.bin".to_owned())),
+                ],
+            ),
+        )
+        .unwrap();
+    assert!(matches!(
+        session.root_value_current("store.stream_result").unwrap(),
+        Value::Record(fields)
+            if fields.get("$tag") == Some(&Value::Text("Opened".to_owned()))
+    ));
 }
 
 fn source_id(machine: &MachinePlan, path: &str) -> SourceId {
@@ -3346,6 +3776,15 @@ fn correlated_effect_completion_routes_each_registration_variant_with_typed_fiel
         if let Some((label, expected)) = typed_field {
             assert_eq!(snapshot.states[&state_id(&machine, label)], expected);
         }
+        assert_eq!(
+            snapshot
+                .lists
+                .values()
+                .map(|rows| rows.len())
+                .sum::<usize>(),
+            usize::from(expected_tag == "RegistrationSucceeded"),
+            "only a successful effect result may append a credential"
+        );
     }
 }
 
@@ -3393,23 +3832,21 @@ fn correlated_effect_completion_rejects_wrong_variant_and_shape_atomically() {
 }
 
 #[test]
-fn correlated_effect_result_source_rejects_external_dispatch() {
+fn effect_result_is_a_state_not_an_externally_dispatchable_source() {
     let machine = typed_passkey_effect_machine();
-    let result_source = source_id(&machine, "store.registration_succeeded");
-    let mut session = Session::new(machine, SessionOptions::default()).unwrap();
-    let error = session
-        .apply(SourceEvent {
-            sequence: 1,
-            source: result_source,
-            target: None,
-            payload: SourcePayload::default(),
-        })
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        Error::InvalidEvent(detail)
-            if detail.contains("reserved for correlated host-effect completion")
-    ));
+    assert!(
+        machine
+            .source_routes
+            .iter()
+            .all(|source| source.path != "store.registration_result")
+    );
+    assert!(
+        machine
+            .debug_map
+            .state_slots
+            .iter()
+            .any(|state| { state.label == "store.registration_result" })
+    );
 }
 
 #[test]
@@ -3521,7 +3958,7 @@ fn reconciliation_completion_routes_result_after_session_restart() {
 
 #[test]
 fn generated_plan_executes_nested_text_is_empty_match_updates() {
-    let machine = boon_compiler::compile_source_text_to_machine_plan(
+    let machine = compile_server_source(
         "nested-text-empty-update.bn",
         r#"
 store: [
@@ -3566,7 +4003,7 @@ store: [
 
 #[test]
 fn generated_plan_restores_bare_root_latest_as_its_only_scalar_authority() {
-    let machine = boon_compiler::compile_source_text_to_machine_plan(
+    let machine = compile_server_source(
         "root-latest-memory-executor.bn",
         r#"
 store: [
@@ -3617,7 +4054,7 @@ store: [
 
 #[test]
 fn list_append_reads_pre_turn_authority_and_skips_duplicate_candidate() {
-    let machine = boon_compiler::compile_source_text_to_machine_plan(
+    let machine = compile_server_source(
         "unique-append-executor.bn",
         r#"
 store: [
@@ -3705,7 +4142,7 @@ FUNCTION entry_view(entry) {
 
 #[test]
 fn list_append_record_transform_reads_current_source_payload_fields() {
-    let machine = boon_compiler::compile_source_text_to_machine_plan(
+    let machine = compile_server_source(
         "append-source-payload-fields-executor.bn",
         r#"
 store: [
@@ -3791,4 +4228,408 @@ FUNCTION revision_view(revision) {
     assert_eq!(row.fields[&digest], Value::Text("sha-123".to_owned()));
     assert_eq!(row.fields[&compiler], Value::Text("boon-test".to_owned()));
     assert_eq!(row.fields[&target], Value::Text("software".to_owned()));
+}
+
+const SESSION_INFO_SOURCE: &str = r#"
+outputs: [
+    status: SessionInfo/status()
+    principal: SessionInfo/principal()
+]
+"#;
+
+fn session_info_plan(role: ProgramRole) -> MachinePlan {
+    let mut plan = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        "session-info.bn",
+        SESSION_INFO_SOURCE,
+        TargetProfile::SoftwareDefault,
+        ProgramRole::Session,
+    )
+    .unwrap()
+    .plan;
+    plan.program_role = role;
+    plan
+}
+
+#[test]
+fn session_info_intrinsics_read_role_and_default_identity() {
+    for (role, expected_role) in [
+        (ProgramRole::Client, "Client"),
+        (ProgramRole::Session, "Session"),
+        (ProgramRole::Server, "Server"),
+    ] {
+        let mut session = Session::new(session_info_plan(role), SessionOptions::default()).unwrap();
+        assert_eq!(
+            session.output_value_current("status").unwrap(),
+            Value::Record(BTreeMap::from([
+                ("$tag".to_owned(), Value::Text("Active".to_owned())),
+                ("role".to_owned(), Value::Text(expected_role.to_owned())),
+                ("session_id".to_owned(), Value::Text(String::new())),
+            ]))
+        );
+        assert_eq!(
+            session.output_value_current("principal").unwrap(),
+            Value::Text("Anonymous".to_owned())
+        );
+    }
+}
+
+#[test]
+fn session_info_intrinsics_read_bounded_option_ids() {
+    let options = SessionOptions {
+        session_id: Some("session-01".to_owned()),
+        principal_id: Some("principal-42".to_owned()),
+        ..SessionOptions::default()
+    };
+    let mut session = Session::new(session_info_plan(ProgramRole::Server), options).unwrap();
+
+    assert_eq!(
+        session.output_value_current("status").unwrap(),
+        Value::Record(BTreeMap::from([
+            ("$tag".to_owned(), Value::Text("Active".to_owned())),
+            ("role".to_owned(), Value::Text("Server".to_owned())),
+            (
+                "session_id".to_owned(),
+                Value::Text("session-01".to_owned()),
+            ),
+        ]))
+    );
+    assert_eq!(
+        session.output_value_current("principal").unwrap(),
+        Value::Record(BTreeMap::from([
+            ("$tag".to_owned(), Value::Text("Authenticated".to_owned()),),
+            ("id".to_owned(), Value::Text("principal-42".to_owned()),),
+        ]))
+    );
+
+    let boundary_options = SessionOptions {
+        session_id: Some("s".repeat(MAX_SESSION_INFO_ID_BYTES)),
+        principal_id: Some("p".repeat(MAX_SESSION_INFO_ID_BYTES)),
+        ..SessionOptions::default()
+    };
+    assert!(Session::new(session_info_plan(ProgramRole::Session), boundary_options).is_ok());
+
+    for options in [
+        SessionOptions {
+            session_id: Some("s".repeat(MAX_SESSION_INFO_ID_BYTES + 1)),
+            ..SessionOptions::default()
+        },
+        SessionOptions {
+            principal_id: Some("p".repeat(MAX_SESSION_INFO_ID_BYTES + 1)),
+            ..SessionOptions::default()
+        },
+    ] {
+        let error = Session::new(session_info_plan(ProgramRole::Session), options)
+            .err()
+            .expect("oversized identity must be rejected");
+        assert!(matches!(error, Error::InvalidOptions(_)));
+    }
+}
+
+struct DistributedSessionFixture {
+    plan: MachinePlan,
+    import_id: ImportId,
+    value_export_id: ExportId,
+    function_export_id: ExportId,
+    function_argument_id: DistributedArgumentId,
+    undeclared_import_id: ImportId,
+    undeclared_export_id: ExportId,
+}
+
+fn executor_distributed_declaration(semantic_path: &str) -> DistributedDeclarationId {
+    DistributedDeclarationId::from_semantic_path("PlanExecutorDistributedFixture", semantic_path)
+        .unwrap()
+}
+
+fn distributed_session_fixture() -> DistributedSessionFixture {
+    let application_identity =
+        ApplicationIdentity::new("dev.boon.plan-executor-tests", "test", "local");
+    let graph = DistributedGraphIdentityPlan::new(
+        &application_identity,
+        executor_distributed_declaration("graph"),
+        1,
+    )
+    .unwrap();
+
+    let server_declaration = executor_distributed_declaration("endpoint.server");
+    let server_endpoint_id = DistributedEndpointId::from_identity(
+        graph.graph_id,
+        ProgramRole::Server,
+        server_declaration,
+    )
+    .unwrap();
+    let server_value = DistributedValueExportPlan::new(
+        graph.graph_id,
+        server_endpoint_id,
+        executor_distributed_declaration("server.value.count"),
+        1,
+        ProgramRole::Server,
+        ValueRef::Constant(PlanConstantId(99)),
+        DataTypePlan::Number,
+    )
+    .unwrap();
+
+    let session_declaration = executor_distributed_declaration("endpoint.session");
+    let session_endpoint_id = DistributedEndpointId::from_identity(
+        graph.graph_id,
+        ProgramRole::Session,
+        session_declaration,
+    )
+    .unwrap();
+    let value_import = DistributedValueImportPlan::new(
+        graph.graph_id,
+        session_endpoint_id,
+        executor_distributed_declaration("session.import.server_count"),
+        1,
+        ProgramRole::Session,
+        &server_value,
+    )
+    .unwrap();
+    let value_export = DistributedValueExportPlan::new(
+        graph.graph_id,
+        session_endpoint_id,
+        executor_distributed_declaration("session.value.current_count"),
+        1,
+        ProgramRole::Session,
+        ValueRef::Field(FieldId(0)),
+        DataTypePlan::Number,
+    )
+    .unwrap();
+
+    let function_declaration = executor_distributed_declaration("session.function.double");
+    let function_export_id = ExportId::from_identity(
+        graph.graph_id,
+        session_endpoint_id,
+        DistributedExportKind::PureFunction,
+        function_declaration,
+    )
+    .unwrap();
+    let function_argument_id =
+        DistributedArgumentId::from_parameter_name(function_export_id, "value").unwrap();
+    let function_argument = || PlanRowExpression::Field {
+        input: ValueRef::DistributedFunctionArgument {
+            export_id: function_export_id,
+            argument_id: function_argument_id,
+        },
+    };
+    let function_export = DistributedPureFunctionExportPlan::new(
+        graph.graph_id,
+        session_endpoint_id,
+        function_declaration,
+        1,
+        ProgramRole::Session,
+        vec![("value".to_owned(), DataTypePlan::Number)],
+        DataTypePlan::Number,
+        PlanRowExpression::NumberInfix {
+            op: "+".to_owned(),
+            left: Box::new(function_argument()),
+            right: Box::new(function_argument()),
+        },
+    )
+    .unwrap();
+    let endpoint = DistributedEndpointContractPlan::new(
+        &graph,
+        session_declaration,
+        1,
+        ProgramRole::Session,
+        vec![value_export.clone()],
+        vec![value_import.clone()],
+        vec![function_export],
+        Vec::new(),
+    )
+    .unwrap();
+
+    let remote_count = PlanRowExpression::Field {
+        input: ValueRef::DistributedImport(value_import.import_id),
+    };
+    let mut machine = plan(
+        RootOutputDemand::All,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![derived(
+            0,
+            0,
+            vec![ValueRef::DistributedImport(value_import.import_id)],
+            Some(remote_count),
+        )],
+        Vec::new(),
+        Vec::new(),
+        vec![(FieldId(0), "store.remote_count")],
+    );
+    assert_eq!(machine.application.identity, application_identity);
+    machine.program_role = ProgramRole::Session;
+    machine.distributed_endpoint =
+        Some(DistributedEndpointPlan::new(&application_identity, graph.clone(), endpoint).unwrap());
+
+    let undeclared_import_id = ImportId::from_value_identity(
+        graph.graph_id,
+        session_endpoint_id,
+        executor_distributed_declaration("session.import.undeclared"),
+    )
+    .unwrap();
+
+    DistributedSessionFixture {
+        plan: machine,
+        import_id: value_import.import_id,
+        value_export_id: value_export.export_id,
+        function_export_id,
+        function_argument_id,
+        undeclared_import_id,
+        undeclared_export_id: server_value.export_id,
+    }
+}
+
+#[test]
+fn distributed_import_updates_are_current_monotonic_and_idempotent() {
+    let fixture = distributed_session_fixture();
+    let mut session = Session::new(fixture.plan, SessionOptions::default()).unwrap();
+
+    assert_eq!(session.distributed_import_revision(fixture.import_id), None);
+    assert_eq!(
+        session.root_value_current("store.remote_count").unwrap(),
+        Value::Error {
+            code: "remote_not_current".to_owned(),
+        }
+    );
+    assert_eq!(
+        session
+            .distributed_export_value_current(fixture.value_export_id)
+            .unwrap(),
+        Value::Error {
+            code: "remote_not_current".to_owned(),
+        }
+    );
+
+    assert!(matches!(
+        session.update_distributed_import(fixture.import_id, 0, number(40)),
+        Err(Error::InvalidEvent(detail)) if detail.contains("must be positive")
+    ));
+    assert!(matches!(
+        session.update_distributed_import(fixture.undeclared_import_id, 1, number(40)),
+        Err(Error::InvalidEvent(detail)) if detail.contains("not declared")
+    ));
+    assert!(matches!(
+        session.update_distributed_import(
+            fixture.import_id,
+            1,
+            Value::Text("not a number".to_owned()),
+        ),
+        Err(Error::Evaluation(detail)) if detail.contains("declared data type")
+    ));
+    assert_eq!(session.distributed_import_revision(fixture.import_id), None);
+
+    let first = session
+        .update_distributed_import(fixture.import_id, 1, number(41))
+        .unwrap()
+        .expect("a newer import revision must produce an internal turn");
+    assert_eq!(first.source_sequence, None);
+    assert_eq!(first.metrics.recomputed_field_count, 1);
+    assert_eq!(
+        first.metrics.recomputed_targets,
+        vec![ValueTarget::Field(FieldId(0))]
+    );
+    assert!(first.deltas.iter().any(|delta| matches!(
+        delta,
+        Delta::SetValue {
+            target: ValueTarget::Field(FieldId(0)),
+            value,
+        } if value == &number(41)
+    )));
+    assert_eq!(
+        session.root_value_current("store.remote_count").unwrap(),
+        number(41)
+    );
+    assert_eq!(
+        session
+            .distributed_export_value_current(fixture.value_export_id)
+            .unwrap(),
+        number(41)
+    );
+    assert_eq!(
+        session.distributed_import_revision(fixture.import_id),
+        Some(1)
+    );
+
+    assert_eq!(
+        session
+            .update_distributed_import(fixture.import_id, 1, number(41))
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        session.update_distributed_import(fixture.import_id, 1, number(42)),
+        Err(Error::InvalidEvent(detail)) if detail.contains("conflicts")
+    ));
+
+    let second = session
+        .update_distributed_import(fixture.import_id, 2, number(42))
+        .unwrap()
+        .expect("a second newer revision must produce an internal turn");
+    assert_eq!(second.metrics.recomputed_field_count, 1);
+    assert_eq!(
+        session.root_value_current("store.remote_count").unwrap(),
+        number(42)
+    );
+    assert!(matches!(
+        session.update_distributed_import(fixture.import_id, 1, number(41)),
+        Err(Error::InvalidEvent(detail)) if detail.contains("stale")
+    ));
+    assert_eq!(
+        session.distributed_import_revision(fixture.import_id),
+        Some(2)
+    );
+    assert_eq!(
+        session.root_value_current("store.remote_count").unwrap(),
+        number(42)
+    );
+}
+
+#[test]
+fn distributed_pure_functions_use_typed_argument_ids_and_fail_closed() {
+    let fixture = distributed_session_fixture();
+    let mut session = Session::new(fixture.plan, SessionOptions::default()).unwrap();
+
+    assert_eq!(
+        session
+            .evaluate_distributed_function(
+                fixture.function_export_id,
+                BTreeMap::from([(fixture.function_argument_id, number(7))]),
+            )
+            .unwrap(),
+        number(14)
+    );
+
+    assert!(matches!(
+        session.evaluate_distributed_function(
+            fixture.function_export_id,
+            BTreeMap::from([(
+                fixture.function_argument_id,
+                Value::Text("wrong type".to_owned()),
+            )]),
+        ),
+        Err(Error::Evaluation(detail)) if detail.contains("declared data type")
+    ));
+
+    let wrong_argument_id =
+        DistributedArgumentId::from_parameter_name(fixture.function_export_id, "other").unwrap();
+    assert!(matches!(
+        session.evaluate_distributed_function(
+            fixture.function_export_id,
+            BTreeMap::from([(wrong_argument_id, number(7))]),
+        ),
+        Err(Error::InvalidEvent(detail)) if detail.contains("missing argument `value`")
+    ));
+    assert!(matches!(
+        session.evaluate_distributed_function(fixture.function_export_id, BTreeMap::new()),
+        Err(Error::InvalidEvent(detail)) if detail.contains("expected 1")
+    ));
+    assert!(matches!(
+        session.evaluate_distributed_function(fixture.undeclared_export_id, BTreeMap::new()),
+        Err(Error::InvalidEvent(detail)) if detail.contains("not declared")
+    ));
+    assert!(matches!(
+        session.distributed_export_value_current(fixture.function_export_id),
+        Err(Error::InvalidEvent(detail)) if detail.contains("not declared")
+    ));
 }

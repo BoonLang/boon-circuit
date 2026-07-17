@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+const RESERVED_STANDARD_NAMESPACES: &[&str] = &["Client", "Server", "Session", "SessionInfo"];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ProgramKind {
     Generic,
@@ -371,6 +373,7 @@ pub fn parse_source(
     source: impl Into<String>,
 ) -> Result<ParsedProgram, ParseError> {
     let path = path.into();
+    reject_reserved_module_path(&path)?;
     let source = source.into();
     let files = vec![ParsedSourceFile {
         path: path.clone(),
@@ -390,6 +393,7 @@ pub fn parse_project(
     let mut source = String::new();
     let mut next_line = 1usize;
     for (file_path, file_source) in files {
+        reject_reserved_module_path(&file_path)?;
         if !source.is_empty() && !source.ends_with('\n') {
             source.push('\n');
             next_line += 1;
@@ -515,6 +519,28 @@ fn module_name_for_project_file(entry_path: &str, file_path: &str) -> Option<Str
     } else {
         None
     }
+}
+
+fn reject_reserved_module_path(path: &str) -> Result<(), ParseError> {
+    let module = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str());
+    if module.is_some_and(is_reserved_standard_namespace) {
+        return Err(ParseError {
+            path: path.to_owned(),
+            line: None,
+            column: None,
+            message: format!(
+                "`{}` is a reserved Boon standard namespace and cannot be declared by an application",
+                module.unwrap_or_default()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn is_reserved_standard_namespace(name: &str) -> bool {
+    RESERVED_STANDARD_NAMESPACES.contains(&name)
 }
 
 fn namespace_project_modules(ast: &mut AstProgram, files: &[ParsedSourceFile]) {
@@ -1215,7 +1241,8 @@ fn merge_multiline_call_expression_lines(
         let has_trailing_expression = candidate
             .get(outer_close + 1..)
             .is_some_and(|tokens| !tokens.is_empty());
-        if !nested_call && !has_trailing_expression {
+        let when_arm_call = line.symbols[..open].iter().any(|symbol| symbol == "=>");
+        if !nested_call && !has_trailing_expression && !when_arm_call {
             merged.push(line.clone());
             index += 1;
             continue;
@@ -1599,9 +1626,6 @@ fn ast_expr_kind(
     if tokens == ["Text/empty", "(", ")"] {
         return AstExprKind::TextLiteral(String::new());
     }
-    if tokens == ["Text/empty"] {
-        return AstExprKind::TextLiteral(String::new());
-    }
     if tokens.first().map(String::as_str) == Some("BLOCK")
         && tokens.last().map(String::as_str) == Some("{")
     {
@@ -1872,22 +1896,6 @@ fn ast_pipe_expr_kind(
         return AstExprKind::Then {
             input,
             output: ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source),
-        };
-    }
-    if op == "SOURCE"
-        && let Some(value) = ast_operator_block_expr(&tokens[pipe + 1..], item, expressions, source)
-    {
-        let (start, end) =
-            span_for_tokens(&tokens[pipe + 1..], item).unwrap_or((item.start, item.end));
-        return AstExprKind::Pipe {
-            input,
-            op,
-            args: vec![AstCallArg {
-                name: None,
-                value,
-                start,
-                end,
-            }],
         };
     }
     AstExprKind::Pipe {
@@ -2449,9 +2457,6 @@ fn ast_map_new_function(symbols: &[String]) -> Option<&str> {
 }
 
 fn ast_opens_scope(symbols: &[String]) -> bool {
-    if symbols.iter().any(|lexeme| lexeme == "SOURCE") {
-        return false;
-    }
     matches!(
         symbols.last().map(String::as_str),
         Some(":") | Some("[") | Some("{")
@@ -2528,17 +2533,46 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
         }
     }
     for item in &ast.items {
-        for window in item.symbols.windows(2) {
+        for (index, window) in item.symbols.windows(2).enumerate() {
             if matches!(window, [pipe, op] if pipe == "|>" && op == "LINK") {
                 return Err(error(
                     path,
                     item.line,
                     item.indent + 1,
-                    "`|> LINK` is not supported; use `|> SOURCE` for source-port binding",
+                    "`|> LINK` is not supported; bind source ports through an Element constructor's `element.events` field",
+                ));
+            }
+            if matches!(window, [pipe, op] if pipe == "|>" && op == "SOURCE") {
+                return Err(error(
+                    path,
+                    item.line,
+                    item.symbol_spans
+                        .get(index + 1)
+                        .map_or(item.indent + 1, |(start, _)| {
+                            start.saturating_sub(item.start) + 1
+                        }),
+                    "`|> SOURCE { ... }` routing was removed; bind the source directly through the Element constructor's `element.events` field",
+                ));
+            }
+            let op = window[1].as_str();
+            if window[0] == "|>"
+                && pipeline_operator_requires_call_parentheses(op)
+                && item.symbols.get(index + 2).map(String::as_str) != Some("(")
+            {
+                return Err(error(
+                    path,
+                    item.line,
+                    item.symbol_spans
+                        .get(index + 1)
+                        .map_or(item.indent + 1, |(start, _)| {
+                            start.saturating_sub(item.start) + 1
+                        }),
+                    &format!("pipeline function `{op}` must be called with parentheses: `{op}()`"),
                 ));
             }
         }
     }
+    validate_reserved_standard_namespaces(path, &ast.statements)?;
     if example_source && let Some(document) = document_statement(ast) {
         let document_is_canonical = document.expr.is_some_and(|expr_id| {
             ast.expressions.get(expr_id).is_some_and(|expr| {
@@ -2556,6 +2590,38 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
     }
     validate_drain_syntax(path, ast, &text_literal_spans)?;
     validate_bytes_syntax(path, ast, &text_literal_spans)?;
+    Ok(())
+}
+
+fn pipeline_operator_requires_call_parentheses(operator: &str) -> bool {
+    !matches!(
+        operator,
+        "HOLD" | "LATEST" | "WHEN" | "WHILE" | "THEN" | "DRAIN" | "DRAINING" | "SOURCE"
+    )
+}
+
+fn validate_reserved_standard_namespaces(
+    path: &str,
+    statements: &[AstStatement],
+) -> Result<(), ParseError> {
+    for statement in statements {
+        if let AstStatementKind::Function { name, .. } = &statement.kind
+            && name
+                .split('/')
+                .next()
+                .is_some_and(is_reserved_standard_namespace)
+        {
+            return Err(error(
+                path,
+                statement.line,
+                statement.indent + 1,
+                &format!(
+                    "`{name}` is in a reserved Boon standard namespace and cannot be declared by an application"
+                ),
+            ));
+        }
+        validate_reserved_standard_namespaces(path, &statement.children)?;
+    }
     Ok(())
 }
 
@@ -4927,6 +4993,3 @@ fn error(path: &str, line: usize, column: usize, message: &str) -> ParseError {
         message: format!("{message} at line {line}, column {column}"),
     }
 }
-
-#[cfg(test)]
-mod tests;

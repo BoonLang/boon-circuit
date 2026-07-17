@@ -1,0 +1,16 @@
+store: [
+    session_changed: SOURCE
+
+    session_count:
+        0 |> HOLD session_count {
+            LATEST {
+                store.session_changed |> THEN { session_count + 1 }
+            }
+        }
+]
+
+outputs: [
+    session_snapshot: DistributedContract/response(count: store.session_count)
+    status: SessionInfo/status()
+    principal: SessionInfo/principal()
+]

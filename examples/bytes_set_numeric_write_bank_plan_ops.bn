@@ -9,7 +9,7 @@ store: [
     patched:
         BYTES[4] {} |> HOLD patched {
             LATEST {
-                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: 16uFE) }
+                store.patch |> THEN { left_payload |> Bytes/set(index: 1, value: BYTES[1] { 16uFE }) }
                 store.write_unsigned |> THEN { store.patched |> Bytes/write_unsigned(offset: 2, byte_count: 2, endian: Big, value: 4660) }
                 store.write_signed |> THEN { store.patched |> Bytes/write_signed(offset: 0, byte_count: 2, endian: Little, value: -2) }
             }
@@ -17,7 +17,7 @@ store: [
     hex:
         TEXT { old } |> HOLD hex {
             LATEST {
-                store.inspect |> THEN { store.patched |> Bytes/to_hex }
+                store.inspect |> THEN { store.patched |> Bytes/to_hex() }
             }
         }
     read_u16_be:

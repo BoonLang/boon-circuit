@@ -1,7 +1,7 @@
 -- Thin pure-data bridge contract description. No Rust handles are Boon values.
 
 FUNCTION contract_summary() {
-    TEXT { wellen.v1-compatible fixture contract: open, hierarchy_page, signal_page, cursor_values, file_stats }
+    TEXT { wellen.v1 content contract: open, hierarchy_page, signal_page, cursor_values }
 }
 
 FUNCTION page_status() {
@@ -9,15 +9,15 @@ FUNCTION page_status() {
 }
 
 FUNCTION provider_version() {
-    TEXT { deterministic fixture provider v1 }
+    TEXT { official wellen host adapter }
 }
 
 FUNCTION schema_version() {
-    TEXT { wellen.v1 fixture schema; stable fixture hashes in descriptors }
+    TEXT { wellen.v1; content-addressed artifacts and bounded typed pages }
 }
 
 FUNCTION effect_exports_label() {
-    TEXT { open/hierarchy/signal/cursor/stats }
+    TEXT { open/hierarchy/signal/cursor }
 }
 
 FUNCTION data_policy_label() {
@@ -101,19 +101,6 @@ FUNCTION cursor_values(page_ref, cursor_label, rows, status) {
         page_ref: page_ref
         cursor: cursor_label
         rows: rows
-        status: status
-    ]
-}
-
-FUNCTION file_stats(page_ref, file, format, byte_length, row_count, transition_count, status) {
-    [
-        page_type: TEXT { file_stats }
-        page_ref: page_ref
-        file: file
-        format: format
-        byte_length: byte_length
-        row_count: row_count
-        transition_count: transition_count
         status: status
     ]
 }

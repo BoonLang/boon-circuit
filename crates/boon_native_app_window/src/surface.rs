@@ -1,27 +1,31 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, ThreadId};
 
 use app_window::coordinates::{Position, Size};
-use app_window::event::{WindowEventEnvelope, WindowEventReceiver, WindowEventTimestamp};
+use app_window::event::WindowEventReceiver;
 use app_window::surface::Surface as AppWindowSurface;
 use app_window::window::Window;
 use app_window::{WGPU_STRATEGY, WGPU_SURFACE_STRATEGY, WGPUStrategy};
 use boon_host::{
-    CallbackToHostNs, HostEvent, HostEventEnvelope, LogicalSize, PhysicalSize, RoleId,
-    SensitiveInputHandle, SurfaceId, WindowId,
+    HostEvent, HostEventEnvelope, HostEventOrigin, LogicalSize, PhysicalSize, RoleId,
+    SensitiveInputHandle, SurfaceId, SurfaceResizeEvent, WindowId,
 };
+use futures::StreamExt;
+use futures::channel::mpsc;
 use wgpu::{CurrentSurfaceTexture, SurfaceTargetUnsafe};
 
 use crate::error::{
     NativeHostError, SurfaceAcquireError, SurfacePresentError, SurfaceReconfigureReason,
 };
 use crate::event::{
-    AdaptedWindowEvent, EventAdapter, NativeEventCapabilities, map_event_error, viewport,
+    AdaptedWindowEvent, EventAdapter, NativeEventCapabilities, PreparedWindowEvent,
+    map_event_error, viewport,
 };
 use crate::sensitive_input::SensitiveInputTarget;
 
 static HOST_OPEN: AtomicBool = AtomicBool::new(false);
+const HOST_EVENT_QUEUE_CAPACITY: usize = 256;
 
 struct HostClaim;
 
@@ -38,6 +42,57 @@ impl Drop for HostClaim {
     fn drop(&mut self) {
         HOST_OPEN.store(false, Ordering::Release);
     }
+}
+
+type PumpedEvent = Result<PreparedWindowEvent, NativeHostError>;
+
+fn spawn_event_pump(
+    mut source: WindowEventReceiver,
+    adapter: Arc<Mutex<EventAdapter>>,
+    role: &RoleId,
+) -> Result<
+    (
+        mpsc::Receiver<PumpedEvent>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ),
+    NativeHostError,
+> {
+    let (mut sender, receiver) = mpsc::channel(HOST_EVENT_QUEUE_CAPACITY);
+    let overflowed = Arc::new(AtomicBool::new(false));
+    let pump_overflowed = Arc::clone(&overflowed);
+    let name = format!("boon-{}-input", role.0);
+    let pump = thread::Builder::new()
+        .name(name)
+        .spawn(move || {
+            futures::executor::block_on(async move {
+                loop {
+                    let item = match source.next().await {
+                        Ok(envelope) => match adapter.lock() {
+                            Ok(mut adapter) => match adapter.prepare(envelope) {
+                                Ok(Some(event)) => Ok(event),
+                                Ok(None) => continue,
+                                Err(error) => Err(error),
+                            },
+                            Err(_) => Err(NativeHostError::EventAdapterPoisoned),
+                        },
+                        Err(error) => Err(map_event_error(error)),
+                    };
+                    let terminal = item.is_err();
+                    if let Err(error) = sender.try_send(item) {
+                        if error.is_full() {
+                            pump_overflowed.store(true, Ordering::Release);
+                        }
+                        break;
+                    }
+                    if terminal {
+                        break;
+                    }
+                }
+            });
+        })
+        .map_err(|error| NativeHostError::EventPumpStart(error.to_string()))?;
+    Ok((receiver, overflowed, pump))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,8 +236,10 @@ pub struct NativeSurfaceHost {
     present_id: u64,
     lifecycle: NativeSurfaceLifecycle,
     capabilities: NativeEventCapabilities,
-    event_adapter: EventAdapter,
-    events: Option<WindowEventReceiver>,
+    event_adapter: Arc<Mutex<EventAdapter>>,
+    events: mpsc::Receiver<Result<PreparedWindowEvent, NativeHostError>>,
+    event_queue_overflowed: Arc<AtomicBool>,
+    event_pump: Option<thread::JoinHandle<()>>,
     wgpu_surface: Option<Arc<wgpu::Surface<'static>>>,
     app_window_surface: Option<Arc<AppWindowSurface>>,
     window: Option<Window>,
@@ -226,6 +283,9 @@ impl NativeSurfaceHost {
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let wgpu_surface = create_wgpu_surface(&instance, &app_window_surface).await?;
         ensure_thread(render_thread, "WGPU surface creation")?;
+        let event_adapter = Arc::new(Mutex::new(EventAdapter::new(config.ids.clone())));
+        let (events, event_queue_overflowed, event_pump) =
+            spawn_event_pump(events, Arc::clone(&event_adapter), &config.ids.role)?;
 
         Ok(Self {
             ids: config.ids.clone(),
@@ -235,8 +295,10 @@ impl NativeSurfaceHost {
             present_id: 0,
             lifecycle: NativeSurfaceLifecycle::Unconfigured,
             capabilities,
-            event_adapter: EventAdapter::new(config.ids),
-            events: Some(events),
+            event_adapter,
+            events,
+            event_queue_overflowed,
+            event_pump: Some(event_pump),
             wgpu_surface: Some(wgpu_surface),
             app_window_surface: Some(app_window_surface),
             window: Some(window),
@@ -275,18 +337,27 @@ impl NativeSurfaceHost {
         target: SensitiveInputTarget,
     ) -> Result<SensitiveInputHandle, NativeHostError> {
         self.ensure_render_thread("sensitive input focus")?;
-        self.event_adapter.focus_sensitive_input(target)
+        self.event_adapter
+            .lock()
+            .map_err(|_| NativeHostError::EventAdapterPoisoned)?
+            .focus_sensitive_input(target)
     }
 
     pub fn clear_sensitive_input_focus(&mut self) -> Result<(), NativeHostError> {
         self.ensure_render_thread("sensitive input focus clear")?;
-        self.event_adapter.clear_sensitive_input_focus();
+        self.event_adapter
+            .lock()
+            .map_err(|_| NativeHostError::EventAdapterPoisoned)?
+            .clear_sensitive_input_focus();
         Ok(())
     }
 
     pub fn restart_sensitive_inputs(&mut self) -> Result<(), NativeHostError> {
         self.ensure_render_thread("sensitive input restart")?;
-        self.event_adapter.restart_sensitive_inputs();
+        self.event_adapter
+            .lock()
+            .map_err(|_| NativeHostError::EventAdapterPoisoned)?
+            .restart_sensitive_inputs();
         Ok(())
     }
 
@@ -297,6 +368,8 @@ impl NativeSurfaceHost {
     ) -> Result<R, NativeHostError> {
         self.ensure_render_thread("sensitive input access")?;
         self.event_adapter
+            .lock()
+            .map_err(|_| NativeHostError::EventAdapterPoisoned)?
             .with_sensitive_input(handle, use_bytes)
             .map_err(Into::into)
     }
@@ -398,32 +471,37 @@ impl NativeSurfaceHost {
 
     pub async fn next_event(&mut self) -> Result<HostEventEnvelope, NativeHostError> {
         self.ensure_render_thread("event receive")?;
-        loop {
-            let event = self
-                .events
-                .as_mut()
-                .expect("native event receiver missing")
-                .next()
-                .await
-                .map_err(map_event_error)?;
-            if let Some(event) = self.process_event(event).await? {
-                return Ok(event);
-            }
+        if self.event_queue_overflowed.load(Ordering::Acquire) {
+            return Err(NativeHostError::EventQueueOverflow);
         }
+        let event = self
+            .events
+            .next()
+            .await
+            .ok_or(NativeHostError::EventSourceClosed)??;
+        if self.event_queue_overflowed.load(Ordering::Acquire) {
+            return Err(NativeHostError::EventQueueOverflow);
+        }
+        self.process_event(event).await
     }
 
     pub async fn drain_events(&mut self) -> Result<Vec<HostEventEnvelope>, NativeHostError> {
         self.ensure_render_thread("event drain")?;
-        let events = self
-            .events
-            .as_mut()
-            .expect("native event receiver missing")
-            .try_drain()
-            .map_err(map_event_error)?;
-        let mut translated = Vec::with_capacity(events.len());
-        for event in events {
-            if let Some(event) = self.process_event(event).await? {
-                translated.push(event);
+        if self.event_queue_overflowed.load(Ordering::Acquire) {
+            return Err(NativeHostError::EventQueueOverflow);
+        }
+        let mut translated = Vec::with_capacity(8);
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => translated.push(self.process_event(event?).await?),
+                Err(error) if error.is_empty() => break,
+                Err(_) if translated.is_empty() => {
+                    return Err(NativeHostError::EventSourceClosed);
+                }
+                Err(_) => break,
+            }
+            if self.event_queue_overflowed.load(Ordering::Acquire) {
+                return Err(NativeHostError::EventQueueOverflow);
             }
         }
         Ok(translated)
@@ -472,7 +550,10 @@ impl NativeSurfaceHost {
     }
 
     pub fn begin_close(&mut self) {
-        self.event_adapter.restart_sensitive_inputs();
+        self.event_adapter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .restart_sensitive_inputs();
         self.lifecycle = NativeSurfaceLifecycle::Closing;
     }
 
@@ -480,26 +561,41 @@ impl NativeSurfaceHost {
 
     async fn process_event(
         &mut self,
-        event: WindowEventEnvelope,
-    ) -> Result<Option<HostEventEnvelope>, NativeHostError> {
-        let WindowEventEnvelope { event, callback_at } = event;
-        match self.event_adapter.adapt(event)? {
-            AdaptedWindowEvent::Omitted => Ok(None),
+        event: PreparedWindowEvent,
+    ) -> Result<HostEventEnvelope, NativeHostError> {
+        let PreparedWindowEvent {
+            sequence,
+            callback_to_host_ns,
+            event,
+        } = event;
+        let event = match event {
+            AdaptedWindowEvent::Omitted => unreachable!("omitted events never leave the pump"),
             AdaptedWindowEvent::Host(event) => {
                 if matches!(event, HostEvent::CloseRequested { .. }) {
                     self.begin_close();
                 }
-                self.event_adapter
-                    .envelope(event, self.epoch, callback_to_host_ns(&callback_at))
-                    .map(Some)
+                event
             }
             AdaptedWindowEvent::Resize(viewport) => {
                 self.apply_resize(viewport).await?;
-                self.event_adapter
-                    .resize_envelope(viewport, self.epoch, callback_to_host_ns(&callback_at))
-                    .map(Some)
+                HostEvent::Resize(SurfaceResizeEvent {
+                    surface: self.ids.surface.clone(),
+                    logical_size: viewport.logical_size,
+                    scale: viewport.scale,
+                    physical_size: viewport.physical_size,
+                    epoch: self.epoch,
+                })
             }
-        }
+        };
+        Ok(HostEventEnvelope {
+            sequence,
+            origin: HostEventOrigin::RealOs,
+            callback_to_host_ns,
+            window: self.ids.window.clone(),
+            surface: self.ids.surface.clone(),
+            surface_epoch: self.epoch,
+            event,
+        })
     }
 
     async fn apply_resize(&mut self, viewport: NativeViewport) -> Result<(), NativeHostError> {
@@ -638,20 +734,19 @@ impl NativeSurfaceHost {
     }
 }
 
-fn callback_to_host_ns(callback_at: &WindowEventTimestamp) -> CallbackToHostNs {
-    CallbackToHostNs::saturating_from_duration(callback_at.elapsed())
-}
-
 impl Drop for NativeSurfaceHost {
     fn drop(&mut self) {
         self.lifecycle = NativeSurfaceLifecycle::Closing;
         debug_assert!(!self.frame_in_flight);
-        self.events.take();
+        self.events.close();
         if let Some(surface) = self.wgpu_surface.take() {
             drop_wgpu_surface(surface);
         }
         self.app_window_surface.take();
         self.window.take();
+        if let Some(pump) = self.event_pump.take() {
+            let _ = pump.join();
+        }
         self.configuration.take();
         self.device.take();
         self.adapter.take();

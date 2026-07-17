@@ -12,8 +12,7 @@ store: [
 outputs: [
     api_response: [
         status: 200
-        body: TEXT { accepted }
-        request_count: store.request_count
+        body: TEXT { accepted } |> Text/to_bytes(encoding: Utf8)
     ]
     pending_priorities: List/range(from: 1, to: 2)
 ]

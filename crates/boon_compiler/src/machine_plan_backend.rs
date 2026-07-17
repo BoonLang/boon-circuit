@@ -135,12 +135,12 @@ fn bind_effect_outbox_invocations(
 
 fn effect_invocation_for_branch(
     branch: &boon_ir::UpdateBranch,
-    expression_kind: PlanExpressionKind,
     ordered_inputs: &[ValueRef],
     output: Option<ValueRef>,
 ) -> Result<Option<EffectInvocationPlan>, PlanError> {
-    let host_operation = match expression_kind {
-        PlanExpressionKind::FileWriteBytes => "File/write_bytes",
+    let host_operation = match &branch.expression {
+        UpdateExpression::FileWriteBytes { .. } => "File/write_bytes",
+        UpdateExpression::HostEffect { operation, .. } => operation.as_str(),
         _ => return Ok(None),
     };
     let contract = builtin_effect_contract(host_operation)?.ok_or_else(|| {
@@ -155,15 +155,15 @@ fn effect_invocation_for_branch(
             branch.target
         ))
     })?;
-    let schema = builtin_effect_outbox_schema(host_operation)?.ok_or_else(|| {
+    let schema = contract.schema.as_ref().ok_or_else(|| {
         PlanError::new(format!(
-            "effectful update has no centralized outbox schema for `{host_operation}`"
+            "effectful update has no centralized typed schema for `{host_operation}`"
         ))
     })?;
     let DataTypePlan::Record {
         fields: intent_schema,
         open: false,
-    } = schema.intent_type
+    } = &schema.intent_type
     else {
         return Err(PlanError::new(format!(
             "effectful update `{host_operation}` has a non-record intent schema"
@@ -171,7 +171,9 @@ fn effect_invocation_for_branch(
     };
     if intent_schema.len() != ordered_inputs.len() {
         return Err(PlanError::new(format!(
-            "effectful update `{host_operation}` intent arity differs from its schema"
+            "effectful update `{host_operation}` resolved {} of {} schema intent fields",
+            ordered_inputs.len(),
+            intent_schema.len()
         )));
     }
     Ok(Some(EffectInvocationPlan {
@@ -182,12 +184,12 @@ fn effect_invocation_for_branch(
         )?,
         effect_id: contract.effect_id,
         intent_fields: intent_schema
-            .into_iter()
+            .iter()
             .zip(ordered_inputs.iter().cloned())
             .map(|(field, input)| EffectIntentFieldPlan {
-                name: field.name,
+                name: field.name.clone(),
                 input,
-                data_type: field.data_type,
+                data_type: field.data_type.clone(),
             })
             .collect(),
         idempotency_key: EffectIdempotencyKeyPlan::InvocationTurnIntentSha256,
@@ -197,185 +199,6 @@ fn effect_invocation_for_branch(
         },
         barrier: contract.barrier,
     }))
-}
-
-fn host_effect_plan_op(
-    program: &TypedProgram,
-    declaration: &ir::HostEffectDeclaration,
-    index: &ValueIndex,
-    constants: &mut Vec<PlanConstant>,
-    next_op: &mut usize,
-) -> Result<PlanOp, PlanError> {
-    let contract = builtin_effect_contract(&declaration.operation)?.ok_or_else(|| {
-        PlanError::new(format!(
-            "typed host effect `{}` has no centralized contract",
-            declaration.operation
-        ))
-    })?;
-    let schema = contract.schema.as_ref().ok_or_else(|| {
-        PlanError::new(format!(
-            "typed host effect `{}` has no centralized typed schema",
-            declaration.operation
-        ))
-    })?;
-    if semantic_data_type_plan(&declaration.intent_type).canonicalized() != schema.intent_type
-        || semantic_data_type_plan(&declaration.result_type).canonicalized() != schema.result_type
-    {
-        return Err(PlanError::new(format!(
-            "typed host effect declaration `{}` differs from the centralized schema",
-            declaration.name
-        )));
-    }
-    let ValueRef::Source(trigger_source_id) =
-        index.resolve(&declaration.trigger_source).ok_or_else(|| {
-            PlanError::new(format!(
-                "typed host effect declaration `{}` has an unresolved trigger source `{}`",
-                declaration.name, declaration.trigger_source
-            ))
-        })?
-    else {
-        return Err(PlanError::new(format!(
-            "typed host effect declaration `{}` trigger is not a SOURCE",
-            declaration.name
-        )));
-    };
-    let DataTypePlan::Record {
-        fields: schema_fields,
-        open: false,
-    } = &schema.intent_type
-    else {
-        return Err(PlanError::new(format!(
-            "typed host effect `{}` has a non-record intent schema",
-            declaration.operation
-        )));
-    };
-    let declared_fields = declaration
-        .intent_fields
-        .iter()
-        .map(|field| (field.name.as_str(), field))
-        .collect::<BTreeMap<_, _>>();
-    let mut intent_fields = Vec::with_capacity(schema_fields.len());
-    for schema_field in schema_fields {
-        let field = declared_fields
-            .get(schema_field.name.as_str())
-            .ok_or_else(|| {
-                PlanError::new(format!(
-                    "typed host effect declaration `{}` is missing intent field `{}`",
-                    declaration.name, schema_field.name
-                ))
-            })?;
-        if semantic_data_type_plan(&field.data_type).canonicalized() != schema_field.data_type {
-            return Err(PlanError::new(format!(
-                "typed host effect declaration `{}` intent field `{}` differs from its schema",
-                declaration.name, field.name
-            )));
-        }
-        let input = host_effect_intent_value_ref(
-            program,
-            index,
-            constants,
-            &declaration.trigger_source,
-            field.value_expr_id.as_usize(),
-        )
-        .ok_or_else(|| {
-            PlanError::new(format!(
-                "typed host effect declaration `{}` intent field `{}` is not a lowerable value reference or constant",
-                declaration.name, field.name
-            ))
-        })?;
-        let input =
-            normalize_semantic_list_memory_value_ref(program, input, &schema_field.data_type);
-        intent_fields.push(EffectIntentFieldPlan {
-            name: schema_field.name.clone(),
-            input,
-            data_type: schema_field.data_type.clone(),
-        });
-    }
-    let DataTypePlan::Variant {
-        variants: result_variants,
-    } = &schema.result_type
-    else {
-        return Err(PlanError::new(format!(
-            "correlated host effect `{}` has a non-variant result schema",
-            declaration.operation
-        )));
-    };
-    let declared_routes = declaration
-        .result_routes
-        .iter()
-        .map(|route| (route.variant.as_str(), route))
-        .collect::<BTreeMap<_, _>>();
-    let mut variants = Vec::with_capacity(result_variants.len());
-    for result_variant in result_variants {
-        let route = declared_routes
-            .get(result_variant.tag.as_str())
-            .ok_or_else(|| {
-                PlanError::new(format!(
-                    "typed host effect declaration `{}` is missing result route `{}`",
-                    declaration.name, result_variant.tag
-                ))
-            })?;
-        let ValueRef::Source(source_id) = index.resolve(&route.source_path).ok_or_else(|| {
-            PlanError::new(format!(
-                "typed host effect declaration `{}` result route `{}` has unresolved SOURCE `{}`",
-                declaration.name, result_variant.tag, route.source_path
-            ))
-        })?
-        else {
-            return Err(PlanError::new(format!(
-                "typed host effect declaration `{}` result route `{}` is not a SOURCE",
-                declaration.name, result_variant.tag
-            )));
-        };
-        variants.push(EffectResultVariantRoute {
-            tag: result_variant.tag.clone(),
-            source_id,
-        });
-    }
-    let ordered_inputs = intent_fields
-        .iter()
-        .map(|field| field.input.clone())
-        .collect::<Vec<_>>();
-    let mut inputs = vec![ValueRef::Source(trigger_source_id)];
-    inputs.extend(ordered_inputs.iter().cloned());
-    let indexed = program
-        .sources
-        .iter()
-        .find(|source| source.path == declaration.trigger_source)
-        .is_some_and(|source| source.scoped);
-    let mut semantic_result_routes = declaration
-        .result_routes
-        .iter()
-        .map(|route| format!("{}={}", route.variant, route.source_path))
-        .collect::<Vec<_>>();
-    semantic_result_routes.sort();
-    let semantic_result_route = semantic_result_routes.join(";");
-    Ok(op(
-        next_op,
-        PlanOpKind::UpdateBranch {
-            expression_kind: PlanExpressionKind::HostEffect,
-            ordered_inputs,
-            source_payload_field: None,
-            update_constant_id: None,
-            source_guard: None,
-            effect: Some(EffectInvocationPlan {
-                invocation_id: EffectInvocationId::from_semantic_route(
-                    contract.effect_id,
-                    &declaration.trigger_source,
-                    &semantic_result_route,
-                )?,
-                effect_id: contract.effect_id,
-                intent_fields,
-                idempotency_key: EffectIdempotencyKeyPlan::InvocationTurnIntentSha256,
-                result: EffectResultRoute::CorrelatedSources { variants },
-                barrier: contract.barrier,
-            }),
-        },
-        unique_value_refs(inputs),
-        None,
-        indexed,
-        0,
-    ))
 }
 
 fn normalize_semantic_list_memory_value_ref(
@@ -401,10 +224,23 @@ fn host_effect_intent_value_ref(
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
     trigger_source: &str,
+    target: &str,
+    indexed: bool,
     expr_id: usize,
 ) -> Option<ValueRef> {
     if let Some(path) = expression_path_string(program, expr_id) {
-        return resolve_update_value_ref(index, trigger_source, "", false, &path);
+        return resolve_update_value_ref(index, trigger_source, target, indexed, &path).or_else(
+            || {
+                (!path.contains('.'))
+                    .then(|| {
+                        target
+                            .rsplit_once('.')
+                            .map(|(parent, _)| format!("{parent}.{path}"))
+                    })
+                    .flatten()
+                    .and_then(|canonical| index.resolve(&canonical))
+            },
+        );
     }
     constant_initial_expression_value(program, expr_id)
         .map(|value| ValueRef::Constant(push_plan_constant(constants, value)))
@@ -673,7 +509,6 @@ fn plan_value_type_from_initial(value: &InitialValue) -> PlanValueType {
     match value {
         InitialValue::Text { .. } => PlanValueType::Text,
         InitialValue::Number { .. } => PlanValueType::Number,
-        InitialValue::Byte { .. } => PlanValueType::Byte,
         InitialValue::Bool { .. } => PlanValueType::Bool,
         InitialValue::Bytes { fixed_len, .. } => PlanValueType::Bytes {
             fixed_len: fixed_len.map(|len| len as u64),
@@ -744,7 +579,6 @@ fn initial_value_kind_from_ir(value: &InitialValue) -> InitialValueKind {
     match value {
         InitialValue::Text { .. } => InitialValueKind::Text,
         InitialValue::Number { .. } => InitialValueKind::Number,
-        InitialValue::Byte { .. } => InitialValueKind::Byte,
         InitialValue::Bool { .. } => InitialValueKind::Bool,
         InitialValue::Bytes { .. } => InitialValueKind::Bytes,
         InitialValue::Enum { .. } => InitialValueKind::Enum,
@@ -791,7 +625,6 @@ fn state_initial_provenance(slot: &ScalarStorageSlot) -> InitialProvenance {
         InitialValueKind::Unknown => InitialProvenance::MaterializedAuthority,
         InitialValueKind::Text
         | InitialValueKind::Number
-        | InitialValueKind::Byte
         | InitialValueKind::Bool
         | InitialValueKind::Bytes
         | InitialValueKind::Enum
@@ -813,7 +646,6 @@ fn plan_value_type_from_semantic_data_type(data_type: &DataTypePlan) -> PlanValu
     match data_type {
         DataTypePlan::Text => PlanValueType::Text,
         DataTypePlan::Number => PlanValueType::Number,
-        DataTypePlan::Byte => PlanValueType::Byte,
         DataTypePlan::Bool => PlanValueType::Bool,
         DataTypePlan::Bytes { fixed_len } => PlanValueType::Bytes {
             fixed_len: *fixed_len,
@@ -831,7 +663,6 @@ fn initial_value_kind_from_plan_type(value_type: PlanValueType) -> InitialValueK
     match value_type {
         PlanValueType::Text => InitialValueKind::Text,
         PlanValueType::Number => InitialValueKind::Number,
-        PlanValueType::Byte => InitialValueKind::Byte,
         PlanValueType::Bool => InitialValueKind::Bool,
         PlanValueType::Bytes { .. } => InitialValueKind::Bytes,
         PlanValueType::Enum => InitialValueKind::Enum,
@@ -850,7 +681,6 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
         DataTypePlan::Number => Some(PlanConstantValue::Number {
             value: FiniteReal::ZERO,
         }),
-        DataTypePlan::Byte => Some(PlanConstantValue::Byte { value: 0 }),
         DataTypePlan::Bool => Some(PlanConstantValue::Bool { value: false }),
         DataTypePlan::Bytes {
             fixed_len: None | Some(0),
@@ -1089,7 +919,6 @@ fn semantic_data_type_plan(value: &ir::SemanticDataType) -> DataTypePlan {
         ir::SemanticDataType::Null => DataTypePlan::Null,
         ir::SemanticDataType::Bool => DataTypePlan::Bool,
         ir::SemanticDataType::Number => DataTypePlan::Number,
-        ir::SemanticDataType::Byte => DataTypePlan::Byte,
         ir::SemanticDataType::Text => DataTypePlan::Text,
         ir::SemanticDataType::Bytes { fixed_len } => DataTypePlan::Bytes {
             fixed_len: fixed_len.map(|len| len as u64),
@@ -1178,6 +1007,23 @@ fn semantic_memory_is_runtime_active(program: &TypedProgram, memory: &ir::Semant
                 } if candidate_list_id == list_id
             )
     })
+}
+
+fn semantic_memory_is_transient_effect_result(
+    memory: &ir::SemanticMemory,
+    transient_effect_result_targets: &BTreeSet<ValueRef>,
+) -> bool {
+    let (state_id, field_id) = match memory.runtime_backing {
+        ir::SemanticMemoryRuntimeBacking::RootState { state_id, field_id }
+        | ir::SemanticMemoryRuntimeBacking::IndexedState {
+            state_id, field_id, ..
+        } => (state_id, field_id),
+        ir::SemanticMemoryRuntimeBacking::List { .. } => return false,
+    };
+    transient_effect_result_targets.contains(&ValueRef::State(plan_state_id(state_id)))
+        || field_id.is_some_and(|field_id| {
+            transient_effect_result_targets.contains(&ValueRef::Field(plan_field_id(field_id)))
+        })
 }
 
 fn state_for_semantic_memory<'a>(
@@ -1518,7 +1364,6 @@ fn data_type_plan_from_initial_value(value: &InitialValue) -> Option<DataTypePla
     Some(match value {
         InitialValue::Text { .. } => DataTypePlan::Text,
         InitialValue::Number { .. } => DataTypePlan::Number,
-        InitialValue::Byte { .. } => DataTypePlan::Byte,
         InitialValue::Bool { .. } => DataTypePlan::Bool,
         InitialValue::Bytes { fixed_len, .. } => DataTypePlan::Bytes {
             fixed_len: fixed_len.map(|len| len as u64),
@@ -1625,11 +1470,17 @@ fn data_type_plan_for_value_ref(
     index: &ValueIndex,
     value_ref: &ValueRef,
 ) -> Option<DataTypePlan> {
+    if let ValueRef::StateProjection {
+        state_id,
+        field_path,
+    } = value_ref
+    {
+        return index.state_projection_data_type(*state_id, field_path);
+    }
     let value_type = plan_value_type_for_value_ref(program, index, value_ref)?;
     Some(match value_type {
         PlanValueType::Text => DataTypePlan::Text,
         PlanValueType::Number => DataTypePlan::Number,
-        PlanValueType::Byte => DataTypePlan::Byte,
         PlanValueType::Bool => DataTypePlan::Bool,
         PlanValueType::Bytes { fixed_len } => DataTypePlan::Bytes { fixed_len },
         PlanValueType::Enum => DataTypePlan::Variant {
@@ -1658,6 +1509,12 @@ fn plan_value_type_for_value_ref(
                 .as_str();
             *index.state_value_type(path)?
         }
+        ValueRef::StateProjection {
+            state_id,
+            field_path,
+        } => plan_value_type_from_semantic_data_type(
+            &index.state_projection_data_type(*state_id, field_path)?,
+        ),
         ValueRef::Source(_) => PlanValueType::Bool,
         ValueRef::SourcePayload { source_id, field } => {
             let source = program
@@ -1686,7 +1543,10 @@ fn plan_value_type_for_value_ref(
                 },
             }
         }
-        ValueRef::Constant(_) | ValueRef::List(_) => return None,
+        ValueRef::Constant(_)
+        | ValueRef::List(_)
+        | ValueRef::DistributedImport(_)
+        | ValueRef::DistributedFunctionArgument { .. } => return None,
     })
 }
 
@@ -1801,7 +1661,13 @@ fn durable_migration_source_list_plan(
         compiled_list_storage_slot(program, list, PlanStorageId(0), synthetic_initial_field_ids)?;
     let root_field_types = root_initial_field_value_types(program);
     let row_field_types = row_initial_field_value_types(program);
-    let index = ValueIndex::new(program, &root_field_types, &row_field_types);
+    let index = ValueIndex::new(
+        program,
+        &root_field_types,
+        &row_field_types,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
     semantic_list_memory_plan(
         program,
         memory,
@@ -2053,9 +1919,11 @@ impl MigrationExpressionLowerer<'_> {
                     ))
                 })?,
             }),
-            AstExprKind::ByteLiteral { value, .. } => {
-                Ok(MigrationExpressionPlan::Byte { value: *value })
-            }
+            AstExprKind::ByteLiteral { value, .. } => Ok(MigrationExpressionPlan::Number {
+                value: FiniteReal::from_i64_exact(i64::from(*value)).map_err(|error| {
+                    PlanError::new(format!("byte literal could not be lowered: {error}"))
+                })?,
+            }),
             AstExprKind::Bool(value) => Ok(MigrationExpressionPlan::Bool { value: *value }),
             AstExprKind::Enum(tag) | AstExprKind::Tag(tag) => {
                 Ok(MigrationExpressionPlan::Variant { tag: tag.clone() })
@@ -2353,7 +2221,6 @@ fn shift_migration_parameters_in_place(expression: &mut MigrationExpressionPlan,
         MigrationExpressionPlan::Input { .. }
         | MigrationExpressionPlan::Text { .. }
         | MigrationExpressionPlan::Number { .. }
-        | MigrationExpressionPlan::Byte { .. }
         | MigrationExpressionPlan::Bool { .. }
         | MigrationExpressionPlan::Variant { .. } => {}
     }
@@ -2940,16 +2807,16 @@ fn persistence_plan(
     list_slots: &[ListStorageSlot],
     synthetic_initial_field_ids: &BTreeMap<(String, String), FieldId>,
     index: &ValueIndex,
+    transient_effect_result_targets: &BTreeSet<ValueRef>,
     effect_outbox: Vec<EffectOutboxSchema>,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> Result<PersistencePlan, PlanError> {
     let mut memory = Vec::new();
     let mut lists = Vec::new();
-    for semantic_memory in program
-        .semantic_memory
-        .iter()
-        .filter(|memory| semantic_memory_is_runtime_active(program, memory))
-    {
+    for semantic_memory in program.semantic_memory.iter().filter(|memory| {
+        semantic_memory_is_runtime_active(program, memory)
+            && !semantic_memory_is_transient_effect_result(memory, transient_effect_result_targets)
+    }) {
         match semantic_memory.identity.kind {
             ir::SemanticMemoryKind::RootScalar | ir::SemanticMemoryKind::IndexedField => {
                 memory.push(semantic_scalar_memory_plan(
@@ -3006,9 +2873,37 @@ fn persistence_plan(
 pub fn compile_typed_program(
     program: &TypedProgram,
     target_profile: TargetProfile,
+    program_role: ProgramRole,
     application_identity: &ApplicationIdentity,
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
+) -> Result<MachinePlan, PlanError> {
+    compile_typed_program_with_distributed_context(
+        program,
+        target_profile,
+        program_role,
+        application_identity,
+        schema_version,
+        migration_predecessors,
+        &DistributedMachineContext::default(),
+    )
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DistributedMachineContext {
+    pub expression_refs: BTreeMap<usize, ValueRef>,
+    pub path_refs: BTreeMap<String, ValueRef>,
+    pub endpoint: Option<DistributedEndpointPlan>,
+}
+
+pub(crate) fn compile_typed_program_with_distributed_context(
+    program: &TypedProgram,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: &ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+    distributed: &DistributedMachineContext,
 ) -> Result<MachinePlan, PlanError> {
     validate_number_literals(program)?;
     let effects = effect_contracts(program)?;
@@ -3017,7 +2912,13 @@ pub fn compile_typed_program(
     let root_initial_field_types = root_initial_field_value_types(program);
     let expression_value_types = expression_value_type_lookup(program);
     let synthetic_initial_field_ids = synthetic_initial_list_field_ids(program);
-    let index = ValueIndex::new(program, &root_initial_field_types, &row_initial_field_types);
+    let index = ValueIndex::new(
+        program,
+        &root_initial_field_types,
+        &row_initial_field_types,
+        &distributed.expression_refs,
+        &distributed.path_refs,
+    );
     let mut next_op = 0usize;
     let mut unresolved_refs = BTreeSet::new();
 
@@ -3250,7 +3151,7 @@ pub fn compile_typed_program(
         ));
     }
 
-    let mut update_ops = program
+    let update_ops = program
         .update_branches
         .iter()
         .map(|branch| {
@@ -3287,6 +3188,7 @@ pub fn compile_typed_program(
                 &branch.expression,
             );
             let ordered_inputs = ordered_update_expression_inputs(
+                program,
                 &index,
                 &mut constants,
                 &branch.source,
@@ -3294,15 +3196,18 @@ pub fn compile_typed_program(
                 branch.indexed,
                 &branch.expression,
             );
-            let effect = effect_invocation_for_branch(
-                branch,
-                expression_kind,
-                &ordered_inputs,
-                output.clone(),
-            )?;
+            inputs.extend(ordered_inputs.iter().cloned());
+            let effect = effect_invocation_for_branch(branch, &ordered_inputs, output.clone())?;
+            let trigger = index.resolve(&branch.source).ok_or_else(|| {
+                PlanError::new(format!(
+                    "update branch `{}` has an unresolved trigger `{}`",
+                    branch.target, branch.source
+                ))
+            })?;
             Ok(op(
                 &mut next_op,
                 PlanOpKind::UpdateBranch {
+                    trigger,
                     expression_kind,
                     ordered_inputs,
                     source_payload_field: source_payload_field_for_branch(
@@ -3328,16 +3233,6 @@ pub fn compile_typed_program(
             ))
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
-    for declaration in &program.host_effects {
-        update_ops.push(host_effect_plan_op(
-            program,
-            declaration,
-            &index,
-            &mut constants,
-            &mut next_op,
-        )?);
-    }
-
     let list_ops = program
         .list_operations
         .iter()
@@ -4002,15 +3897,27 @@ pub fn compile_typed_program(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let document =
-        super::document_plan_backend::compile_document_plan(program, &executable_fields)?;
+    let document = super::document_plan_backend::compile_document_plan(
+        program,
+        &executable_fields,
+        &distributed.expression_refs,
+    )?;
     let outputs = output_root_plans(program, document.as_ref(), &index)?;
     let host_ports = host_port_plans(program, &outputs)?;
-    let program_role = if document.is_none() && !outputs.is_empty() {
-        boon_plan::ProgramRole::Server
-    } else {
-        boon_plan::ProgramRole::Document
-    };
+    match program_role {
+        ProgramRole::Client if document.is_none() => {
+            return Err(PlanError::new(
+                "client programs must expose one retained document or scene root",
+            ));
+        }
+        ProgramRole::Session | ProgramRole::Server if document.is_some() => {
+            return Err(PlanError::new(format!(
+                "{} programs cannot contain retained document or scene roots",
+                program_role.as_str()
+            )));
+        }
+        ProgramRole::Client | ProgramRole::Session | ProgramRole::Server => {}
+    }
 
     let operation_count = regions.iter().map(|region| region.ops.len()).sum::<usize>();
     let unresolved_executable_ref_count = regions
@@ -4055,6 +3962,25 @@ pub fn compile_typed_program(
     let cpu_plan_executor_complete =
         typed_lowering_executable && cpu_plan_executor_unsupported_op_count == 0;
     bind_effect_outbox_invocations(&mut effect_outbox, &regions)?;
+    let transient_effect_result_targets = regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::UpdateBranch {
+                effect: Some(effect),
+                ..
+            } if effects.iter().any(|contract| {
+                contract.effect_id == effect.effect_id
+                    && matches!(contract.replay, EffectReplay::ReadOnly)
+            }) =>
+            {
+                match &effect.result {
+                    EffectResultRoute::Target { target, .. } => Some(target.clone()),
+                }
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let application = ApplicationPlan::new(application_identity.clone())?;
     let persistence = persistence_plan(
         program,
@@ -4064,6 +3990,7 @@ pub fn compile_typed_program(
         &list_slots,
         &synthetic_initial_field_ids,
         &index,
+        &transient_effect_result_targets,
         effect_outbox,
         migration_predecessors,
     )?;
@@ -4088,6 +4015,7 @@ pub fn compile_typed_program(
         version: PlanVersion::default(),
         target_profile,
         program_role,
+        distributed_endpoint: distributed.endpoint.clone(),
         application,
         persistence,
         effects,
@@ -4113,7 +4041,7 @@ pub fn compile_typed_program(
                 .count(),
         },
         commit_plan: CommitPlan {
-            update_branch_count: program.update_branches.len() + program.host_effects.len(),
+            update_branch_count: program.update_branches.len(),
             unresolved_update_branch_count: regions[3]
                 .ops
                 .iter()
@@ -4215,6 +4143,167 @@ pub fn compile_typed_program(
     Ok(plan)
 }
 
+pub(crate) fn distributed_exportable_values(
+    program: &TypedProgram,
+) -> BTreeMap<String, (boon_typecheck::FlowType, ValueRef)> {
+    let root_field_types = root_initial_field_value_types(program);
+    let row_field_types = row_initial_field_value_types(program);
+    let index = ValueIndex::new(
+        program,
+        &root_field_types,
+        &row_field_types,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+    program
+        .typecheck_report
+        .named_value_type_table
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let value_ref = index.resolve(&entry.path)?;
+            matches!(
+                value_ref,
+                ValueRef::State(_)
+                    | ValueRef::StateProjection { .. }
+                    | ValueRef::Field(_)
+                    | ValueRef::Constant(_)
+            )
+            .then(|| (entry.path.clone(), (entry.flow_type.clone(), value_ref)))
+        })
+        .collect()
+}
+
+pub(crate) fn lower_distributed_root_expression(
+    program: &TypedProgram,
+    owner_path: &str,
+    expr_id: usize,
+    constants: &mut Vec<PlanConstant>,
+    distributed: &DistributedMachineContext,
+) -> Result<PlanRowExpression, PlanError> {
+    let root_field_types = root_initial_field_value_types(program);
+    let row_field_types = row_initial_field_value_types(program);
+    let index = ValueIndex::new(
+        program,
+        &root_field_types,
+        &row_field_types,
+        &distributed.expression_refs,
+        &distributed.path_refs,
+    );
+    let derived = ir::DerivedValue {
+        id: ir::FieldId(usize::MAX),
+        path: owner_path.to_owned(),
+        kind: DerivedValueKind::Pure,
+        sources: Vec::new(),
+        indexed: false,
+        scope_id: None,
+        startup_recompute: false,
+        statement: AstStatement {
+            id: usize::MAX,
+            line: 0,
+            indent: 0,
+            start: 0,
+            end: 0,
+            kind: AstStatementKind::Expression,
+            expr: Some(expr_id),
+            children: Vec::new(),
+        },
+    };
+    let mut inputs = Vec::new();
+    let mut env = BTreeMap::new();
+    let expression_types = expression_value_type_lookup(program);
+    lower_row_expr(
+        program,
+        &derived,
+        &index,
+        constants,
+        &mut inputs,
+        &mut env,
+        &expression_types,
+        expr_id,
+    )
+    .and_then(lowered_scalar)
+    .ok_or_else(|| {
+        PlanError::new(format!(
+            "distributed call argument expression {expr_id} in `{owner_path}` is not a closed root value expression"
+        ))
+    })
+}
+
+pub(crate) fn lower_distributed_pure_function_body(
+    program: &TypedProgram,
+    function_name: &str,
+    export_id: ExportId,
+    parameters: &[(String, DistributedArgumentId)],
+    constants: &mut Vec<PlanConstant>,
+) -> Result<PlanRowExpression, PlanError> {
+    let function = program
+        .functions
+        .iter()
+        .find(|candidate| {
+            candidate.name == function_name
+                || function_name
+                    .rsplit_once('/')
+                    .is_some_and(|(_, suffix)| suffix == candidate.name)
+        })
+        .ok_or_else(|| {
+            PlanError::new(format!(
+                "distributed function `{function_name}` has no local definition"
+            ))
+        })?;
+    let root_field_types = root_initial_field_value_types(program);
+    let row_field_types = row_initial_field_value_types(program);
+    let index = ValueIndex::new(
+        program,
+        &root_field_types,
+        &row_field_types,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+    );
+    let derived = ir::DerivedValue {
+        id: ir::FieldId(usize::MAX),
+        path: format!("distributed.{function_name}"),
+        kind: DerivedValueKind::Pure,
+        sources: Vec::new(),
+        indexed: false,
+        scope_id: None,
+        startup_recompute: false,
+        statement: function.statement.clone(),
+    };
+    let mut env = parameters
+        .iter()
+        .map(|(name, argument_id)| {
+            (
+                name.clone(),
+                LoweredRowValue::Scalar(PlanRowExpression::Field {
+                    input: ValueRef::DistributedFunctionArgument {
+                        export_id,
+                        argument_id: *argument_id,
+                    },
+                }),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut inputs = Vec::new();
+    let expression_types = expression_value_type_lookup(program);
+    lower_row_function_body(
+        program,
+        &derived,
+        &index,
+        constants,
+        &mut inputs,
+        &function.statement,
+        &mut env,
+        &expression_types,
+    )
+    .and_then(lowered_scalar)
+    .ok_or_else(|| {
+        PlanError::new(format!(
+            "distributed function `{function_name}` does not lower to one pure closed value"
+        ))
+    })
+}
+
 fn validate_number_literals(program: &TypedProgram) -> Result<(), PlanError> {
     for expression in &program.expressions {
         let AstExprKind::Number(literal) = &expression.kind else {
@@ -4297,7 +4386,6 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
         InitialValue::Number { value } => Some(PlanConstantValue::Number {
             value: value.parse().ok()?,
         }),
-        InitialValue::Byte { value } => Some(PlanConstantValue::Byte { value: *value }),
         InitialValue::Bool { value } => Some(PlanConstantValue::Bool { value: *value }),
         InitialValue::Bytes { bytes, .. } => {
             let mut hasher = Sha256::new();
@@ -4324,7 +4412,6 @@ fn initial_value_kind_from_constant(value: &PlanConstantValue) -> InitialValueKi
     match value {
         PlanConstantValue::Text { .. } => InitialValueKind::Text,
         PlanConstantValue::Number { .. } => InitialValueKind::Number,
-        PlanConstantValue::Byte { .. } => InitialValueKind::Byte,
         PlanConstantValue::Bool { .. } => InitialValueKind::Bool,
         PlanConstantValue::Bytes { .. } => InitialValueKind::Bytes,
         PlanConstantValue::Enum { .. } => InitialValueKind::Enum,
@@ -4354,7 +4441,7 @@ fn constant_initial_expression_value_inner(
             .parse()
             .ok()
             .map(|value| PlanConstantValue::Number { value }),
-        AstExprKind::ByteLiteral { value, .. } => Some(PlanConstantValue::Byte { value: *value }),
+        AstExprKind::ByteLiteral { value, .. } => bytes_plan_constant(&[*value]),
         AstExprKind::Bool(value) => Some(PlanConstantValue::Bool { value: *value }),
         AstExprKind::Enum(value) | AstExprKind::Tag(value) => Some(PlanConstantValue::Enum {
             value: value.clone(),
@@ -4929,7 +5016,7 @@ fn update_expression_output_type_for_root_initial(
         | UpdateExpression::BytesReadUnsigned { .. }
         | UpdateExpression::BytesReadSigned { .. }
         | UpdateExpression::BytesFind { .. } => Some(PlanValueType::Number),
-        UpdateExpression::BytesGet { .. } => Some(PlanValueType::Byte),
+        UpdateExpression::BytesGet { .. } => Some(PlanValueType::Bytes { fixed_len: Some(1) }),
         UpdateExpression::BytesSet { .. }
         | UpdateExpression::BytesSlice { .. }
         | UpdateExpression::BytesTake { .. }
@@ -4949,6 +5036,7 @@ fn update_expression_output_type_for_root_initial(
         | UpdateExpression::MatchTextIsEmptyConst { .. }
         | UpdateExpression::MatchInfixConst { .. }
         | UpdateExpression::ListFindValue { .. }
+        | UpdateExpression::HostEffect { .. }
         | UpdateExpression::Unknown { .. } => None,
     }
 }
@@ -5003,7 +5091,6 @@ fn plan_value_type_is_concrete(value_type: PlanValueType) -> bool {
         value_type,
         PlanValueType::Text
             | PlanValueType::Number
-            | PlanValueType::Byte
             | PlanValueType::Bool
             | PlanValueType::Bytes { .. }
             | PlanValueType::Enum
@@ -5146,7 +5233,7 @@ fn inferred_expression_value_type_inner(
     match &expr.kind {
         AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(PlanValueType::Text),
         AstExprKind::Number(_) => Some(PlanValueType::Number),
-        AstExprKind::ByteLiteral { .. } => Some(PlanValueType::Byte),
+        AstExprKind::ByteLiteral { .. } => Some(PlanValueType::Bytes { fixed_len: Some(1) }),
         AstExprKind::Bool(_) => Some(PlanValueType::Bool),
         AstExprKind::Tag(_) | AstExprKind::Enum(_) | AstExprKind::TaggedObject { .. } => {
             Some(PlanValueType::Enum)
@@ -5236,7 +5323,6 @@ fn inferred_bytes_literal_value_type(
             let mut len = 0u64;
             for item in items {
                 match inferred_expression_value_type(program, *item, expr_value_types)? {
-                    PlanValueType::Byte => len += 1,
                     PlanValueType::Bytes {
                         fixed_len: Some(item_len),
                     } => len += item_len,
@@ -5337,7 +5423,7 @@ fn inferred_builtin_call_value_type(
         | "Bytes/find"
         | "Bytes/read_unsigned"
         | "Bytes/read_signed" => Some(PlanValueType::Number),
-        "Bytes/get" => Some(PlanValueType::Byte),
+        "Bytes/get" => Some(PlanValueType::Bytes { fixed_len: Some(1) }),
         "Bool/not" | "Bool/and" | "Bool/toggle" | "Text/is_empty" | "Text/is_not_empty"
         | "Text/starts_with" | "Text/contains" | "Text/all_chars_in" | "Bytes/is_empty"
         | "Bytes/equal" | "Bytes/starts_with" | "Bytes/ends_with" => Some(PlanValueType::Bool),
@@ -5373,7 +5459,6 @@ fn plan_value_type_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<Plan
     match ty {
         boon_typecheck::Type::Text => Some(PlanValueType::Text),
         boon_typecheck::Type::Number => Some(PlanValueType::Number),
-        boon_typecheck::Type::Byte => Some(PlanValueType::Byte),
         boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic) => {
             Some(PlanValueType::Bytes { fixed_len: None })
         }
@@ -5733,7 +5818,7 @@ fn query_key_type(
     }
     Some(match data_type {
         DataTypePlan::Bool => QueryKeyType::Bool,
-        DataTypePlan::Number | DataTypePlan::Byte => QueryKeyType::Number,
+        DataTypePlan::Number => QueryKeyType::Number,
         DataTypePlan::Text => QueryKeyType::Text,
         DataTypePlan::Variant { variants }
             if !variants.is_empty()
@@ -6016,6 +6101,16 @@ fn plan_number_constant(value: &str) -> Option<PlanConstantValue> {
         .map(|value| PlanConstantValue::Number { value })
 }
 
+fn bytes_plan_constant(bytes: &[u8]) -> Option<PlanConstantValue> {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Some(PlanConstantValue::Bytes {
+        byte_len: bytes.len() as u64,
+        sha256: format!("{:x}", hasher.finalize()),
+        inline_bytes: (bytes.len() <= INLINE_BYTE_CONSTANT_LIMIT).then(|| bytes.to_vec()),
+    })
+}
+
 fn plan_integer_constant(value: i64) -> Option<PlanConstantValue> {
     FiniteReal::from_i64_exact(value)
         .ok()
@@ -6039,6 +6134,7 @@ fn derived_expression_for_value(
 ) -> Option<PlanDerivedExpression> {
     source_group_derived_expression(program, derived, index, inputs)
         .or_else(|| source_key_text_trim_non_empty_expression(program, derived, index, inputs))
+        .or_else(|| state_event_transform_expression(program, derived, index, constants, inputs))
         .or_else(|| source_event_transform_expression(program, derived, index, constants, inputs))
         .or_else(|| bool_not_derived_expression(program, derived, index, inputs))
         .or_else(|| number_compare_const_derived_expression(program, derived, index, inputs))
@@ -6095,6 +6191,40 @@ fn source_group_row_expression(
         fields.push(PlanRowObjectField { name, value });
     }
     Some(PlanRowExpression::Object { fields })
+}
+
+fn state_event_transform_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+) -> Option<PlanDerivedExpression> {
+    let [source] = derived.sources.as_slice() else {
+        return None;
+    };
+    if derived.kind != DerivedValueKind::SourceEventTransform
+        || !matches!(index.resolve(source), Some(ValueRef::State(_)))
+    {
+        return None;
+    }
+    let mut local_constants = constants.clone();
+    let mut local_inputs = inputs.clone();
+    let expr_value_types = expression_value_type_lookup(program);
+    let exprs = super::compiler_statement_ast_exprs(&derived.statement, &program.expressions);
+    let expression = source_event_transform_arm_expression(
+        program,
+        derived,
+        index,
+        &mut local_constants,
+        &mut local_inputs,
+        &expr_value_types,
+        &exprs,
+        source,
+    )?;
+    *constants = local_constants;
+    *inputs = local_inputs;
+    Some(PlanDerivedExpression::RowExpression { expression })
 }
 
 fn source_event_transform_expression(
@@ -6218,7 +6348,6 @@ fn source_event_transform_fresh_value(
         Some(PlanValueType::Number) => PlanConstantValue::Number {
             value: FiniteReal::ZERO,
         },
-        Some(PlanValueType::Byte) => PlanConstantValue::Byte { value: 0 },
         Some(PlanValueType::Bool) => PlanConstantValue::Bool { value: false },
         Some(PlanValueType::Bytes { fixed_len }) => {
             let bytes = vec![0; fixed_len.unwrap_or_default() as usize];
@@ -6281,6 +6410,18 @@ fn source_event_transform_arm_expression(
     exprs: &[AstExpr],
     source: &str,
 ) -> Option<PlanRowExpression> {
+    if matches!(index.resolve(source), Some(ValueRef::State(_))) {
+        return state_event_transform_arm_expression(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            expr_value_types,
+            exprs,
+            source,
+        );
+    }
     let arm =
         source_event_transform_arm_statement(program, derived, exprs, source, &derived.statement)?;
     let arm_expr = expr_by_id(program, arm.expr?)?;
@@ -6385,6 +6526,91 @@ fn source_event_transform_arm_expression(
                         )
                     })
                     .flatten()
+            })
+            .or_else(|| {
+                lower_row_expr(
+                    program,
+                    derived,
+                    index,
+                    constants,
+                    inputs,
+                    &mut env,
+                    expr_value_types,
+                    *output,
+                )
+            }),
+        AstExprKind::Then { output: None, .. } => lower_row_function_body(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            arm,
+            &mut env,
+            expr_value_types,
+        ),
+        _ => lower_row_statement_value(
+            program,
+            derived,
+            index,
+            constants,
+            inputs,
+            &mut env,
+            expr_value_types,
+            arm,
+        ),
+    };
+    lowered.and_then(lowered_scalar)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn state_event_transform_arm_expression(
+    program: &TypedProgram,
+    derived: &boon_ir::DerivedValue,
+    index: &ValueIndex,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    expr_value_types: &BTreeMap<usize, PlanValueType>,
+    exprs: &[AstExpr],
+    source: &str,
+) -> Option<PlanRowExpression> {
+    let arm =
+        source_event_transform_arm_statement(program, derived, exprs, source, &derived.statement)?;
+    let arm_expr = expr_by_id(program, arm.expr?)?;
+    let mut env = BTreeMap::new();
+    let lowered = match &arm_expr.kind {
+        AstExprKind::Then {
+            output: Some(output),
+            ..
+        } => (!arm.children.is_empty())
+            .then(|| {
+                lower_row_function_body(
+                    program,
+                    derived,
+                    index,
+                    constants,
+                    inputs,
+                    arm,
+                    &mut env,
+                    expr_value_types,
+                )
+            })
+            .flatten()
+            .or_else(|| {
+                statement_with_expression(arm, *output)
+                    .filter(|statement| !statement.children.is_empty())
+                    .and_then(|statement| {
+                        lower_row_statement_value(
+                            program,
+                            derived,
+                            index,
+                            constants,
+                            inputs,
+                            &mut env,
+                            expr_value_types,
+                            statement,
+                        )
+                    })
             })
             .or_else(|| {
                 lower_row_expr(
@@ -7184,6 +7410,14 @@ fn lower_row_expr(
     expr_id: usize,
 ) -> Option<LoweredRowValue> {
     let expr = expr_by_id(program, expr_id)?;
+    if let Some(value_ref) = index.resolve_distributed_expression(expr_id) {
+        if !inputs.contains(&value_ref) {
+            inputs.push(value_ref.clone());
+        }
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::Field {
+            input: value_ref,
+        }));
+    }
     if matches!(&expr.kind, AstExprKind::Call { args, .. } if args.is_empty())
         && let Some(statement) = statement_for_expression(program, expr_id)
         && statement
@@ -7203,6 +7437,14 @@ fn lower_row_expr(
         )
     {
         return Some(value);
+    }
+    if let AstExprKind::Call { function, args } = &expr.kind
+        && args.is_empty()
+        && let Some(intrinsic) = session_info_intrinsic(function)
+    {
+        return Some(LoweredRowValue::Scalar(PlanRowExpression::Intrinsic {
+            intrinsic,
+        }));
     }
     match &expr.kind {
         AstExprKind::Delimiter => env.get(ROW_PREVIOUS_BINDING).cloned(),
@@ -7306,6 +7548,13 @@ fn lower_row_expr(
                 .map(LoweredRowValue::Scalar)
         }
         AstExprKind::Path(parts) if parts.len() > 2 => {
+            let path = parts.join(".");
+            if let Some(value) = env.get(&path).cloned() {
+                return Some(value);
+            }
+            if let Some(value) = row_field_expression(program, derived, index, inputs, &path) {
+                return Some(LoweredRowValue::Scalar(value));
+            }
             let mut value = env.get(parts.first()?)?.clone();
             for field in &parts[1..] {
                 value = lower_row_value_field(program, inputs, value, field)?;
@@ -7351,7 +7600,7 @@ fn lower_row_expr(
             PlanConstantValue::Bool { value: *value },
         ))),
         AstExprKind::ByteLiteral { value, .. } => Some(LoweredRowValue::Scalar(
-            row_constant_expression(constants, inputs, PlanConstantValue::Byte { value: *value }),
+            row_bytes_constant_expression(constants, inputs, vec![*value]),
         )),
         AstExprKind::BytesLiteral { size: _, items } => {
             let bytes = row_static_bytes_literal(program, items)?;
@@ -7391,6 +7640,33 @@ fn lower_row_expr(
                 });
             }
             Some(LoweredRowValue::Scalar(PlanRowExpression::Object {
+                fields: object_fields,
+            }))
+        }
+        AstExprKind::TaggedObject { tag, fields } => {
+            let mut object_fields = Vec::with_capacity(fields.len());
+            for field in fields {
+                if field.spread {
+                    return None;
+                }
+                let value = lower_row_expr(
+                    program,
+                    derived,
+                    index,
+                    constants,
+                    inputs,
+                    env,
+                    expr_value_types,
+                    field.value,
+                )
+                .and_then(lowered_scalar)?;
+                object_fields.push(PlanRowObjectField {
+                    name: field.name.clone(),
+                    value,
+                });
+            }
+            Some(LoweredRowValue::Scalar(PlanRowExpression::TaggedObject {
+                tag: tag.clone(),
                 fields: object_fields,
             }))
         }
@@ -7917,6 +8193,7 @@ fn row_expression_value_type(
     expression: &PlanRowExpression,
 ) -> Option<PlanValueType> {
     match expression {
+        PlanRowExpression::Intrinsic { .. } => Some(PlanValueType::Enum),
         PlanRowExpression::Field { input } => plan_value_type_for_value_ref(program, index, input),
         PlanRowExpression::Constant { constant_id } => constants
             .iter()
@@ -7924,7 +8201,6 @@ fn row_expression_value_type(
             .map(|constant| match constant.value {
                 PlanConstantValue::Text { .. } => PlanValueType::Text,
                 PlanConstantValue::Number { .. } => PlanValueType::Number,
-                PlanConstantValue::Byte { .. } => PlanValueType::Byte,
                 PlanConstantValue::Bool { .. } => PlanValueType::Bool,
                 PlanConstantValue::Bytes { byte_len, .. } => PlanValueType::Bytes {
                     fixed_len: Some(byte_len),
@@ -7955,7 +8231,7 @@ fn row_expression_value_type(
         | PlanRowExpression::BytesFind { .. }
         | PlanRowExpression::BytesReadUnsigned { .. }
         | PlanRowExpression::BytesReadSigned { .. } => Some(PlanValueType::Number),
-        PlanRowExpression::BytesGet { .. } => Some(PlanValueType::Byte),
+        PlanRowExpression::BytesGet { .. } => Some(PlanValueType::Bytes { fixed_len: Some(1) }),
         PlanRowExpression::BytesIsEmpty { .. }
         | PlanRowExpression::BytesStartsWith { .. }
         | PlanRowExpression::BytesEndsWith { .. }
@@ -7989,7 +8265,16 @@ fn row_expression_value_type(
         | PlanRowExpression::ListMap { .. }
         | PlanRowExpression::ListMapItem { .. }
         | PlanRowExpression::Object { .. }
+        | PlanRowExpression::TaggedObject { .. }
         | PlanRowExpression::ObjectField { .. } => None,
+    }
+}
+
+fn session_info_intrinsic(function: &str) -> Option<PlanIntrinsic> {
+    match function {
+        "SessionInfo/status" => Some(PlanIntrinsic::SessionInfoStatus),
+        "SessionInfo/principal" => Some(PlanIntrinsic::SessionInfoPrincipal),
+        _ => None,
     }
 }
 
@@ -8310,6 +8595,32 @@ fn lower_row_pipeline_child_statement(
         }
     }
     result
+}
+
+fn row_statement_is_pipeline_continuation(
+    program: &TypedProgram,
+    statement: &AstStatement,
+) -> bool {
+    statement
+        .expr
+        .is_some_and(|expr_id| row_expr_chain_starts_with_pipeline_placeholder(program, expr_id))
+}
+
+fn row_expr_chain_starts_with_pipeline_placeholder(program: &TypedProgram, expr_id: usize) -> bool {
+    let Some(expr) = expr_by_id(program, expr_id) else {
+        return false;
+    };
+    match &expr.kind {
+        AstExprKind::Delimiter => true,
+        AstExprKind::Pipe { input, .. }
+        | AstExprKind::Then { input, .. }
+        | AstExprKind::When { input }
+        | AstExprKind::Draining { input }
+        | AstExprKind::Hold { initial: input, .. } => {
+            row_expr_chain_starts_with_pipeline_placeholder(program, *input)
+        }
+        _ => false,
+    }
 }
 
 fn row_list_multiline_args(
@@ -8918,6 +9229,7 @@ fn row_generic_builtin(function: &str) -> bool {
         function,
         "Text/empty"
             | "Router/route"
+            | "Number/to_text"
             | "Text/to_bytes"
             | "Bytes/to_text"
             | "Bytes/to_hex"
@@ -9715,7 +10027,10 @@ fn row_call_arg_value(args: &[PlanRowCallArg], names: &[&str]) -> Option<PlanRow
 fn row_builtin_arg_expects_number(function: &str, arg_name: Option<&str>) -> bool {
     matches!(
         (function, arg_name),
-        ("Bytes/get", Some("index"))
+        (
+            "Number/to_text",
+            Some("radix" | "min_width" | "signed_width" | "group_size")
+        ) | ("Bytes/get", Some("index"))
             | ("Bytes/slice", Some("offset"))
             | ("Bytes/slice", Some("byte_count"))
             | ("Bytes/take", Some("byte_count" | "length" | "count"))
@@ -10187,6 +10502,7 @@ fn lower_row_function_body(
         .unwrap_or(statement);
     let mut output = None;
     let mut object_fields = Vec::new();
+    let mut pending_field: Option<(String, LoweredRowValue, Option<usize>)> = None;
     for child in &body.children {
         if row_statement_is_empty_delimiter(child, program) {
             continue;
@@ -10197,7 +10513,10 @@ fn lower_row_function_body(
             env.remove(ROW_PREVIOUS_BINDING);
         }
         match &child.kind {
-            AstStatementKind::Field { name } => {
+            AstStatementKind::Field { name }
+            | AstStatementKind::List {
+                field: Some(name), ..
+            } => {
                 let value = lower_row_statement_value(
                     program,
                     derived,
@@ -10208,15 +10527,40 @@ fn lower_row_function_body(
                     expr_value_types,
                     child,
                 )?;
-                if let Some(scalar) = lowered_scalar(value.clone()) {
+                let object_index = lowered_scalar(value.clone()).map(|scalar| {
+                    let index = object_fields.len();
                     object_fields.push(PlanRowObjectField {
                         name: name.clone(),
                         value: scalar,
                     });
-                }
-                env.insert(name.clone(), value);
+                    index
+                });
+                env.insert(name.clone(), value.clone());
+                pending_field = Some((name.clone(), value, object_index));
             }
             AstStatementKind::Expression => {
+                if row_statement_is_pipeline_continuation(program, child)
+                    && let Some((name, previous, object_index)) = pending_field.take()
+                {
+                    let value = lower_row_pipeline_child_statement(
+                        program,
+                        derived,
+                        index,
+                        constants,
+                        inputs,
+                        env,
+                        expr_value_types,
+                        previous,
+                        child,
+                    )?;
+                    if let Some(object_index) = object_index {
+                        object_fields[object_index].value = lowered_scalar(value.clone())?;
+                    }
+                    env.insert(name.clone(), value.clone());
+                    pending_field = Some((name, value, object_index));
+                    continue;
+                }
+                pending_field = None;
                 output = Some(lower_row_statement_value(
                     program,
                     derived,
@@ -10229,6 +10573,7 @@ fn lower_row_function_body(
                 )?);
             }
             AstStatementKind::List { field: None, .. } => {
+                pending_field = None;
                 output = Some(lower_row_statement_value(
                     program,
                     derived,
@@ -10241,6 +10586,7 @@ fn lower_row_function_body(
                 )?);
             }
             AstStatementKind::Block => {
+                pending_field = None;
                 output = Some(lower_row_function_body(
                     program,
                     derived,
@@ -10252,7 +10598,9 @@ fn lower_row_function_body(
                     expr_value_types,
                 )?);
             }
-            _ => {}
+            _ => {
+                pending_field = None;
+            }
         }
     }
     env.remove(ROW_PREVIOUS_BINDING);
@@ -10453,17 +10801,27 @@ fn canonical_sibling_path(parent_path: &str, path: &str) -> String {
 }
 
 fn scoped_resolution_candidates(parent_path: &str, path: &str) -> Vec<String> {
-    if let Some((_, local_name)) = path.rsplit_once('.') {
-        return vec![path.to_owned(), local_name.to_owned()];
-    }
-
+    let parent_root = parent_path.split('.').next();
+    let path_root = path.split('.').next();
+    let explicitly_qualified = path.contains('.')
+        && (path_root == parent_root
+            || path_root.is_some_and(|root| matches!(root, "Client" | "Session" | "Server")));
     let mut candidates = Vec::new();
+    if explicitly_qualified {
+        candidates.push(path.to_owned());
+    }
     let mut scope = parent_path.rsplit_once('.').map(|(parent, _)| parent);
     while let Some(parent) = scope {
         candidates.push(format!("{parent}.{path}"));
         scope = parent.rsplit_once('.').map(|(grandparent, _)| grandparent);
     }
-    candidates.push(path.to_owned());
+    if !explicitly_qualified {
+        candidates.push(path.to_owned());
+    }
+    if let Some((_, local_name)) = path.rsplit_once('.') {
+        candidates.push(local_name.to_owned());
+    }
+    candidates.dedup();
     candidates
 }
 
@@ -10570,10 +10928,6 @@ fn update_constant_value(value: &str, target_type: &PlanValueType) -> Option<Pla
             value: value.to_owned(),
         }),
         PlanValueType::Number => plan_number_constant(value),
-        PlanValueType::Byte => value
-            .parse::<u8>()
-            .ok()
-            .map(|value| PlanConstantValue::Byte { value }),
         PlanValueType::Bool => match value {
             "True" => Some(PlanConstantValue::Bool { value: true }),
             "False" => Some(PlanConstantValue::Bool { value: false }),
@@ -10780,7 +11134,9 @@ fn collect_update_expression_refs(
             resolve_update_path(index, source, target, indexed, path, refs, unresolved)
                 + resolve_update_path(index, source, target, indexed, suffix, refs, unresolved)
         }
-        UpdateExpression::Const { .. } | UpdateExpression::Unknown { .. } => 0,
+        UpdateExpression::Const { .. }
+        | UpdateExpression::HostEffect { .. }
+        | UpdateExpression::Unknown { .. } => 0,
         UpdateExpression::NumberInfix { left, right, .. } => {
             collect_number_operand_ref(index, source, target, indexed, left, refs, unresolved)
                 + collect_number_operand_ref(
@@ -10955,6 +11311,7 @@ fn collect_bytes_scalar_arg_ref(
 }
 
 fn ordered_update_expression_inputs(
+    program: &TypedProgram,
     index: &ValueIndex,
     constants: &mut Vec<PlanConstant>,
     source: &str,
@@ -10963,6 +11320,48 @@ fn ordered_update_expression_inputs(
     expression: &UpdateExpression,
 ) -> Vec<ValueRef> {
     match expression {
+        UpdateExpression::HostEffect {
+            operation,
+            arguments,
+            ..
+        } => {
+            let Ok(Some(contract)) = builtin_effect_contract(operation) else {
+                return Vec::new();
+            };
+            let Some(EffectSchemaPlan {
+                intent_type:
+                    DataTypePlan::Record {
+                        fields,
+                        open: false,
+                    },
+                ..
+            }) = contract.schema
+            else {
+                return Vec::new();
+            };
+            fields
+                .iter()
+                .filter_map(|schema_field| {
+                    let argument = arguments
+                        .iter()
+                        .find(|argument| argument.name == schema_field.name)?;
+                    let input = host_effect_intent_value_ref(
+                        program,
+                        index,
+                        constants,
+                        source,
+                        target,
+                        indexed,
+                        argument.value_expr_id.as_usize(),
+                    )?;
+                    Some(normalize_semantic_list_memory_value_ref(
+                        program,
+                        input,
+                        &schema_field.data_type,
+                    ))
+                })
+                .collect()
+        }
         UpdateExpression::TextToNumber { path } => {
             resolve_update_value_ref(index, source, target, indexed, path)
                 .into_iter()
@@ -11018,8 +11417,10 @@ fn ordered_update_expression_inputs(
             let Some(index_constant_id) = push_integer_plan_constant(constants, index_value) else {
                 return Vec::new();
             };
-            let value_constant_id =
-                push_plan_constant(constants, PlanConstantValue::Byte { value: *value });
+            let Some(value_constant) = bytes_plan_constant(&[*value]) else {
+                return Vec::new();
+            };
+            let value_constant_id = push_plan_constant(constants, value_constant);
             vec![
                 input,
                 ValueRef::Constant(index_constant_id),
@@ -11777,21 +12178,38 @@ fn source_guard_for_update_guard(
     unresolved: &mut usize,
 ) -> Option<PlanSourceGuard> {
     let guard = guard?;
-    let Some(ValueRef::Source(source_id)) = index.resolve(source) else {
-        unresolved_refs.insert(source.to_owned());
-        *unresolved += 1;
-        return None;
-    };
     match guard {
         UpdateGuard::SourcePayloadOneOf { field, values } => {
+            let Some(ValueRef::Source(source_id)) = index.resolve(source) else {
+                unresolved_refs.insert(source.to_owned());
+                *unresolved += 1;
+                return None;
+            };
             let field = source_payload_field_from_ir(field);
-            refs.push(ValueRef::SourcePayload {
+            let input = ValueRef::SourcePayload {
                 source_id,
                 field: field.clone(),
-            });
+            };
+            if !refs.contains(&input) {
+                refs.push(input);
+            }
             Some(PlanSourceGuard::SourcePayloadOneOf {
                 source_id,
                 field,
+                values: values.clone(),
+            })
+        }
+        UpdateGuard::TriggerValueOneOf { values } => {
+            let Some(input) = index.resolve(source) else {
+                unresolved_refs.insert(source.to_owned());
+                *unresolved += 1;
+                return None;
+            };
+            if !refs.contains(&input) {
+                refs.push(input.clone());
+            }
+            Some(PlanSourceGuard::TriggerValueOneOf {
+                input,
                 values: values.clone(),
             })
         }
@@ -12286,6 +12704,7 @@ fn update_expression_kind(expression: &UpdateExpression) -> PlanExpressionKind {
         UpdateExpression::BytesWriteSigned { .. } => PlanExpressionKind::BytesWriteSigned,
         UpdateExpression::FileReadBytes { .. } => PlanExpressionKind::FileReadBytes,
         UpdateExpression::FileWriteBytes { .. } => PlanExpressionKind::FileWriteBytes,
+        UpdateExpression::HostEffect { .. } => PlanExpressionKind::HostEffect,
         UpdateExpression::TextToBytes { .. } => PlanExpressionKind::TextToBytes,
         UpdateExpression::BytesToText { .. } => PlanExpressionKind::BytesToText,
         UpdateExpression::BytesConcat { .. } => PlanExpressionKind::BytesConcat,
@@ -12347,10 +12766,12 @@ fn derived_output_ref(program: &TypedProgram, derived: &boon_ir::DerivedValue) -
 
 struct ValueIndex {
     by_path: BTreeMap<String, ValueRef>,
+    distributed_by_expr: BTreeMap<usize, ValueRef>,
     source_payload_fields: BTreeMap<String, BTreeSet<SourcePayloadField>>,
     source_row_lookup_fields: BTreeMap<String, String>,
     source_field_payload_aliases: BTreeMap<(String, String), SourcePayloadField>,
     state_value_types: BTreeMap<String, PlanValueType>,
+    state_data_types: BTreeMap<StateId, DataTypePlan>,
     field_value_types: BTreeMap<FieldId, PlanValueType>,
 }
 
@@ -12359,11 +12780,14 @@ impl ValueIndex {
         program: &TypedProgram,
         root_field_types: &RootInitialFieldTypeMap,
         row_field_types: &RowInitialFieldTypeMap,
+        distributed_by_expr: &BTreeMap<usize, ValueRef>,
+        distributed_by_path: &BTreeMap<String, ValueRef>,
     ) -> Self {
         let mut by_path = BTreeMap::new();
         let mut source_payload_fields = BTreeMap::new();
         let mut source_row_lookup_fields = BTreeMap::new();
         let mut state_value_types = BTreeMap::new();
+        let mut state_data_types = BTreeMap::new();
         let mut field_value_types = BTreeMap::new();
         let expression_types = expression_value_type_lookup(program);
         let synthetic_field_ids = synthetic_initial_list_field_ids(program);
@@ -12402,6 +12826,25 @@ impl ValueIndex {
                     |default| default.value_type,
                 ),
             );
+        }
+        for branch in &program.update_branches {
+            let UpdateExpression::HostEffect { operation, .. } = &branch.expression else {
+                continue;
+            };
+            let Some(state) = program
+                .state_cells
+                .iter()
+                .find(|state| state.path == branch.target)
+            else {
+                continue;
+            };
+            let Ok(Some(contract)) = builtin_effect_contract(operation) else {
+                continue;
+            };
+            let Some(schema) = contract.schema else {
+                continue;
+            };
+            state_data_types.insert(plan_state_id(state.id), schema.result_type);
         }
         for list in &program.lists {
             by_path.insert(list.name.clone(), ValueRef::List(plan_list_id(list.id)));
@@ -12453,6 +12896,9 @@ impl ValueIndex {
                 .entry(field.path.clone())
                 .or_insert(ValueRef::Field(plan_field_id(field.id)));
         }
+        for (path, value_ref) in distributed_by_path {
+            by_path.insert(path.clone(), value_ref.clone());
+        }
         let source_field_payload_aliases = source_field_payload_aliases_from_program(
             program,
             &source_payload_fields,
@@ -12460,16 +12906,54 @@ impl ValueIndex {
         );
         Self {
             by_path,
+            distributed_by_expr: distributed_by_expr.clone(),
             source_payload_fields,
             source_row_lookup_fields,
             source_field_payload_aliases,
             state_value_types,
+            state_data_types,
             field_value_types,
         }
     }
 
     fn resolve(&self, path: &str) -> Option<ValueRef> {
-        self.by_path.get(path).cloned()
+        self.by_path
+            .get(path)
+            .cloned()
+            .or_else(|| self.resolve_state_projection(path))
+    }
+
+    fn resolve_distributed_expression(&self, expr_id: usize) -> Option<ValueRef> {
+        self.distributed_by_expr.get(&expr_id).cloned()
+    }
+
+    fn resolve_state_projection(&self, path: &str) -> Option<ValueRef> {
+        self.by_path
+            .iter()
+            .filter_map(|(state_path, value_ref)| {
+                let ValueRef::State(state_id) = value_ref else {
+                    return None;
+                };
+                state_path_suffixes(state_path).find_map(|candidate| {
+                    let suffix = path.strip_prefix(candidate)?.strip_prefix('.')?;
+                    let field_path = suffix
+                        .split('.')
+                        .filter(|field| !field.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    (!field_path.is_empty()).then(|| {
+                        (
+                            candidate.len(),
+                            ValueRef::StateProjection {
+                                state_id: *state_id,
+                                field_path,
+                            },
+                        )
+                    })
+                })
+            })
+            .max_by_key(|(matched_len, _)| *matched_len)
+            .map(|(_, value_ref)| value_ref)
     }
 
     fn source_has_payload_field(&self, source: &str, field: &SourcePayloadField) -> bool {
@@ -12497,6 +12981,47 @@ impl ValueIndex {
     fn field_value_type(&self, field_id: FieldId) -> Option<&PlanValueType> {
         self.field_value_types.get(&field_id)
     }
+
+    fn state_projection_data_type(
+        &self,
+        state_id: StateId,
+        field_path: &[String],
+    ) -> Option<DataTypePlan> {
+        project_data_type(self.state_data_types.get(&state_id)?, field_path)
+    }
+}
+
+fn state_path_suffixes(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(path), |candidate| {
+        candidate.split_once('.').map(|(_, suffix)| suffix)
+    })
+}
+
+fn project_data_type(data_type: &DataTypePlan, field_path: &[String]) -> Option<DataTypePlan> {
+    let Some((field, rest)) = field_path.split_first() else {
+        return Some(data_type.clone());
+    };
+    let projected = match data_type {
+        DataTypePlan::Record { fields, .. } | DataTypePlan::Error { fields, .. } => fields
+            .iter()
+            .find(|candidate| candidate.name == *field)
+            .map(|candidate| candidate.data_type.clone()),
+        DataTypePlan::Variant { variants } => {
+            let mut projected = variants.iter().filter_map(|variant| {
+                variant
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.name == *field)
+                    .map(|candidate| candidate.data_type.clone())
+            });
+            let first = projected.next()?;
+            projected
+                .all(|candidate| candidate == first)
+                .then_some(first)
+        }
+        _ => None,
+    }?;
+    project_data_type(&projected, rest)
 }
 
 fn insert_field_value_type(
@@ -12526,4 +13051,82 @@ fn insert_field_value_type_if_absent(
         return;
     }
     field_value_types.entry(field_id).or_insert(value_type);
+}
+
+#[cfg(test)]
+mod session_info_intrinsic_tests {
+    use super::*;
+
+    const SOURCE: &str = r#"
+outputs: [
+    status: SessionInfo/status()
+    principal: SessionInfo/principal()
+]
+"#;
+
+    #[test]
+    fn compiler_lowers_session_info_as_typed_plan_intrinsics() {
+        let compiled = crate::compile_source_text_to_machine_plan_for_role(
+            "session-info.bn",
+            SOURCE,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Session,
+        )
+        .unwrap();
+
+        assert!(compiled.plan.constants.is_empty());
+        assert!(compiled.plan.effects.is_empty());
+        let intrinsic_ops = compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .filter_map(|op| match &op.kind {
+                PlanOpKind::DerivedValue {
+                    expression:
+                        Some(PlanDerivedExpression::RowExpression {
+                            expression: PlanRowExpression::Intrinsic { intrinsic },
+                        }),
+                    ..
+                } => Some((*intrinsic, op.inputs.as_slice())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            intrinsic_ops,
+            vec![
+                (PlanIntrinsic::SessionInfoStatus, &[][..]),
+                (PlanIntrinsic::SessionInfoPrincipal, &[][..]),
+            ]
+        );
+
+        let status_type = compiled
+            .plan
+            .output_root("status")
+            .map(|output| &output.contract)
+            .unwrap();
+        assert!(matches!(status_type,
+            OutputContractKind::HostValue {
+                data_type: DataTypePlan::Variant { variants }
+            } if matches!(variants.as_slice(),
+                [DataVariantPlan { tag, fields, open: false }]
+                    if tag == "Active"
+                        && fields.iter().any(|field| field.name == "role")
+                        && fields.iter().any(|field| field.name == "session_id"))));
+        let principal_type = compiled
+            .plan
+            .output_root("principal")
+            .map(|output| &output.contract)
+            .unwrap();
+        assert!(matches!(principal_type,
+            OutputContractKind::HostValue {
+                data_type: DataTypePlan::Variant { variants }
+            } if variants.len() == 2
+                && variants.iter().all(|variant| !variant.open)
+                && variants.iter().any(|variant| variant.tag == "Anonymous")
+                && variants.iter().any(|variant| variant.tag == "Authenticated")));
+
+        let verification = verify_plan(&compiled.plan).unwrap();
+        assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
+    }
 }

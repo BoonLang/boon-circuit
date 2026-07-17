@@ -8,9 +8,77 @@ fn source_payload_schema_row_lookup_field_uses_generic_name() {
         row_lookup_field: Some("file".to_owned()),
     };
     assert_eq!(schema.row_lookup_field_name(), Some("file"));
-
 }
 
+#[test]
+fn structural_group_does_not_inherit_child_event_flow() {
+    let parsed = boon_parser::parse_source(
+        "structural-group-event-flow.bn",
+        r#"
+store: [
+    trigger: SOURCE
+    results: [
+        child:
+            Idle |> HOLD child {
+                trigger |> THEN { Done }
+            }
+    ]
+]
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).unwrap();
+    let group = ir
+        .derived_values
+        .iter()
+        .find(|value| value.path == "store.results")
+        .expect("structural group remains available to semantic consumers");
+
+    assert_eq!(group.kind, DerivedValueKind::Pure);
+    assert!(group.sources.is_empty());
+    assert!(ir.state_cells.iter().any(|state| state.path == "store.results.child"));
+    assert!(ir
+        .update_branches
+        .iter()
+        .any(|branch| branch.source == "store.trigger" && branch.target == "store.results.child"));
+}
+
+#[test]
+fn nested_effect_result_is_an_independent_state_event_cause() {
+    let parsed = boon_parser::parse_source(
+        "nested-effect-result-cause.bn",
+        r#"
+store: [
+    start: SOURCE
+    effect: [
+        result:
+            NotRequested |> HOLD result {
+                start |> THEN { Clock/wall() }
+            }
+    ]
+    workflow:
+        Idle |> HOLD workflow {
+            start |> THEN { Working }
+            effect.result |> THEN { Done }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let ir = lower(&parsed).unwrap();
+    let workflow_sources = ir
+        .update_branches
+        .iter()
+        .filter(|branch| branch.target == "store.workflow")
+        .map(|branch| branch.source.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(workflow_sources.contains(&"store.start"));
+    assert!(
+        workflow_sources.contains(&"store.effect.result"),
+        "effect completion must schedule its own turn instead of being folded into the initiating source: {workflow_sources:?}"
+    );
+}
 
 #[test]
 fn press_payload_fields_are_bool_typed() {
@@ -23,7 +91,6 @@ fn press_payload_fields_are_bool_typed() {
         SemanticDataType::Text
     );
 }
-
 
 #[test]
 fn scoped_source_lookup_prefers_source_intent_identity_field() {
@@ -44,7 +111,6 @@ fn scoped_source_lookup_prefers_source_intent_identity_field() {
         Some("file")
     );
 }
-
 
 #[test]
 fn view_row_source_alias_resolves_to_unique_canonical_source_path() {
@@ -75,11 +141,8 @@ fn selected_row_source_projection_resolves_by_unique_source_suffix() {
         ("cell.sources.editor.commit", SourceId(1)),
     ];
     assert_eq!(
-        canonical_view_source_path(
-            &sources,
-            "store.selected_input.sources.editor.change"
-        )
-        .map(|(path, source_id)| (path, source_id.as_usize())),
+        canonical_view_source_path(&sources, "store.selected_input.sources.editor.change")
+            .map(|(path, source_id)| (path, source_id.as_usize())),
         Some(("cell.sources.editor.change", 0))
     );
 
@@ -88,15 +151,11 @@ fn selected_row_source_projection_resolves_by_unique_source_suffix() {
         ("right.sources.editor.change", SourceId(1)),
     ];
     assert!(
-        canonical_view_source_path(
-            &ambiguous,
-            "store.selected_input.sources.editor.change"
-        )
-        .is_none(),
+        canonical_view_source_path(&ambiguous, "store.selected_input.sources.editor.change")
+            .is_none(),
         "selected-row source aliases must remain ambiguity-safe"
     );
 }
-
 
 #[test]
 fn semantic_symbol_table_reuses_duplicate_category_text_pairs() {
@@ -118,7 +177,6 @@ fn semantic_symbol_table_reuses_duplicate_category_text_pairs() {
     assert_eq!(entries[1].category, "source_label");
     assert_eq!(entries[1].text, "count");
 }
-
 
 #[test]
 fn source_payload_match_rejects_unsupported_nested_numeric_infix_operator() {
@@ -147,7 +205,6 @@ zoom_step:
         "unexpected static verification error: {error}"
     );
 }
-
 
 #[test]
 fn projected_helper_field_access_does_not_create_persistent_helper_fields() {
@@ -209,7 +266,6 @@ document: Document/new(root: Element/label(element: [], label: TEXT { Rows }))
     assert!(ir.static_schedule_verified);
 }
 
-
 #[test]
 fn event_press_pulse_is_not_payload_guard_field() {
     let variants = source_ref_variants("store.elements.select_clk");
@@ -258,15 +314,15 @@ scene: Scene/new(
         style: [width: Fill, height: Fill]
         items: LIST {
             Scene/Element/button(
-                element: [event: [press: SOURCE]]
+                element: [events: [press: store.controls.admin.status]]
                 style: [width: 80, height: 40]
                 label: TEXT { Status }
-            ) |> SOURCE { store.controls.admin.status }
+            )
             Scene/Element/button(
-                element: [event: [press: SOURCE]]
+                element: [events: [press: store.controls.admin.events]]
                 style: [width: 80, height: 40]
                 label: TEXT { Events }
-            ) |> SOURCE { store.controls.admin.events }
+            )
         }
     )
 )
@@ -279,15 +335,9 @@ scene: Scene/new(
             .iter()
             .map(|source| source.path.as_str())
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "store.controls.admin.events",
-            "store.controls.admin.status",
-        ])
+        BTreeSet::from(["store.controls.admin.events", "store.controls.admin.status",])
     );
-    for source_path in [
-        "store.controls.admin.status",
-        "store.controls.admin.events",
-    ] {
+    for source_path in ["store.controls.admin.status", "store.controls.admin.events"] {
         let source = ir
             .sources
             .iter()
@@ -301,14 +351,154 @@ scene: Scene/new(
             "missing press payload for {source_path}: {:?}",
             source.payload_schema
         );
-        assert!(ir
-            .update_branches
+        assert!(
+            ir.update_branches
+                .iter()
+                .any(|branch| branch.source == source_path && branch.target == "store.page")
+        );
+        assert!(
+            ir.view_bindings
+                .iter()
+                .any(|binding| binding.path == source_path && binding.source_id == Some(source.id))
+        );
+    }
+}
+
+#[test]
+fn element_events_resolve_source_leaves_through_function_arguments() {
+    let source = r#"
+store: [submit: SOURCE]
+
+FUNCTION submit_button(events) {
+    Scene/Element/button(
+        element: [events: events]
+        style: [width: 80, height: 40]
+        label: TEXT { Submit }
+    )
+}
+
+scene: Scene/new(
+    root: submit_button(events: [press: store.submit])
+)
+"#;
+    let parsed = boon_parser::parse_source("constructor-source-argument.bn", source).unwrap();
+    let ir = lower(&parsed).expect("constructor event arguments must resolve source leaves");
+
+    assert!(ir.view_bindings.iter().any(|binding| {
+        binding.node_kind == "Button"
+            && binding.attr == "press"
+            && binding.path == "store.submit"
+            && binding.kind == ViewBindingKind::Source
+            && binding.source_id == Some(SourceId(0))
+    }));
+}
+
+#[test]
+fn render_list_map_alias_uses_derived_list_storage_row_scope() {
+    let source = r#"
+store: [
+    rows:
+        LIST {
+            [title: TEXT { First }, visible: True]
+            [title: TEXT { Hidden }, visible: False]
+        }
+        |> List/map(row, new: new_row(title: row.title, visible: row.visible))
+    visible_rows:
+        rows
+        |> List/retain(candidate, if: candidate.visible)
+]
+
+FUNCTION new_row(title, visible) {
+    [
+        controls: [press: SOURCE]
+        title: title
+        visible: visible
+    ]
+}
+
+FUNCTION render_row(item) {
+    Element/button(
+        element: [events: [press: item.controls.press]]
+        style: []
+        label: item.title
+    )
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: store.visible_rows
+            |> List/map(old, new: render_row(item: old))
+    )
+)
+"#;
+    let parsed = boon_parser::parse_source("render-row-alias-retain.bn", source).unwrap();
+    let ir = lower(&parsed).expect("render aliases must preserve the storage row scope");
+
+    let row_scope = ir
+        .row_scopes
+        .iter()
+        .find(|scope| scope.list == "rows" && scope.row_scope == "row")
+        .expect("rows storage scope");
+    let source = ir
+        .sources
+        .iter()
+        .find(|source| source.path == "row.controls.press")
+        .expect("row press source");
+
+    assert_eq!(source.scope_id, Some(row_scope.id));
+    assert!(ir.view_bindings.iter().any(|binding| {
+        binding.node_kind == "Button"
+            && binding.attr == "press"
+            && binding.path == "row.controls.press"
+            && binding.kind == ViewBindingKind::Source
+            && binding.scope_id == Some(row_scope.id)
+            && binding.source_id == Some(source.id)
+    }));
+    assert!(ir.view_bindings.iter().any(|binding| {
+        binding.node_kind == "Button"
+            && binding.attr == "label"
+            && binding.path == "row.title"
+            && binding.kind == ViewBindingKind::Data
+            && binding.scope_id == Some(row_scope.id)
+            && binding.source_id.is_none()
+    }));
+    assert!(
+        ir.view_bindings
             .iter()
-            .any(|branch| branch.source == source_path && branch.target == "store.page"));
-        assert!(ir
-            .view_bindings
-            .iter()
-            .any(|binding| binding.path == source_path && binding.source_id == Some(source.id)));
+            .all(|binding| !binding.path.starts_with("old."))
+    );
+}
+
+#[test]
+fn element_events_without_concrete_source_leaves_fail_lowering() {
+    let source = r#"
+store: [enabled: True]
+
+scene: Scene/new(
+    root: Scene/Element/button(
+        element: [events: [press: store.enabled]]
+        style: [width: 80, height: 40]
+        label: TEXT { Submit }
+    )
+    )
+"#;
+    let parsed = boon_parser::parse_source("constructor-without-source-leaves.bn", source).unwrap();
+    let errors = [
+        lower(&parsed).expect_err("non-source event leaves must fail lowering"),
+        lower_runtime(&parsed)
+            .expect_err("non-source event leaves must fail runtime-profile lowering"),
+    ];
+
+    for error in errors {
+        assert!(
+            error.contains("Element constructor `Scene/Element/button`")
+                && error.contains("`element.events`")
+                && error.contains("no concrete SOURCE leaves"),
+            "unexpected source-binding error: {error}"
+        );
     }
 }
 
@@ -353,22 +543,57 @@ store: [
         "transitive event transforms must preserve the original trigger only"
     );
 
-    assert!(ir.update_branches.iter().any(|branch| {
-        branch.source == "store.elements.open"
-            && branch.target == "store.dialog"
-            && matches!(
-                &branch.expression,
-                UpdateExpression::MatchValueConst { input, arms }
-                    if input == "store.requested"
-                        && arms.iter().any(|arm| {
-                            arm.pattern == "__"
-                                && arm.output
-                                    == UpdateValueExpression::Const {
-                                        value: "Closed".to_owned(),
-                                    }
-                        })
-            )
-    }), "event-derived inline match was not lowered: {:#?}", ir.update_branches);
+    assert!(
+        ir.update_branches.iter().any(|branch| {
+            branch.source == "store.elements.open"
+                && branch.target == "store.dialog"
+                && matches!(
+                    &branch.expression,
+                    UpdateExpression::MatchValueConst { input, arms }
+                        if input == "store.requested"
+                            && arms.iter().any(|arm| {
+                                arm.pattern == "__"
+                                    && arm.output
+                                        == UpdateValueExpression::Const {
+                                            value: "Closed".to_owned(),
+                                        }
+                            })
+                )
+        }),
+        "event-derived inline match was not lowered: {:#?}",
+        ir.update_branches
+    );
+}
+
+#[test]
+fn nested_match_over_grouped_key_event_uses_the_canonical_source_path() {
+    let source = r#"
+store: [
+    elements: [search: [events: [key_down: SOURCE]]]
+    highlighted:
+        First |> HOLD highlighted {
+            elements.search.events.key_down.key |> WHEN {
+                ArrowDown => highlighted |> WHEN {
+                    First => Second
+                    Second => First
+                }
+                __ => SKIP
+            }
+        }
+]
+"#;
+    let parsed = boon_parser::parse_source("grouped-key-event-nested-match.bn", source).unwrap();
+    let ir = lower(&parsed).expect("grouped key events must lower through their SOURCE owner");
+
+    assert!(
+        ir.update_branches.iter().any(|branch| {
+            branch.source == "store.elements.search.key_down"
+                && branch.target == "store.highlighted"
+                && matches!(branch.expression, UpdateExpression::MatchValueConst { .. })
+        }),
+        "grouped key event did not produce a typed static update: {:#?}",
+        ir.update_branches
+    );
 }
 
 #[test]
@@ -391,27 +616,31 @@ store: [
     let parsed = boon_parser::parse_source("inline-text-comparison-match.bn", source).unwrap();
     let ir = lower(&parsed).expect("text comparison matches must have a static schedule");
 
-    assert!(ir.update_branches.iter().any(|branch| {
-        branch.source == "store.elements.remove"
-            && branch.target == "store.selected"
-            && matches!(
-                &branch.expression,
-                UpdateExpression::MatchInfixConst {
-                    left: UpdateValueExpression::ReadPath { path: left },
-                    op,
-                    right: UpdateValueExpression::Const { value: right },
-                    arms,
-                } if left == "store.key"
-                    && op == "=="
-                    && right == "clk"
-                    && arms.iter().any(|arm| {
-                        arm.pattern == "True"
-                            && arm.output == UpdateValueExpression::Const {
-                                value: "False".to_owned(),
-                            }
-                    })
-            )
-    }), "text comparison was not lowered as typed infix operands: {:#?}", ir.update_branches);
+    assert!(
+        ir.update_branches.iter().any(|branch| {
+            branch.source == "store.elements.remove"
+                && branch.target == "store.selected"
+                && matches!(
+                    &branch.expression,
+                    UpdateExpression::MatchInfixConst {
+                        left: UpdateValueExpression::ReadPath { path: left },
+                        op,
+                        right: UpdateValueExpression::Const { value: right },
+                        arms,
+                    } if left == "store.key"
+                        && op == "=="
+                        && right == "clk"
+                        && arms.iter().any(|arm| {
+                            arm.pattern == "True"
+                                && arm.output == UpdateValueExpression::Const {
+                                    value: "False".to_owned(),
+                                }
+                        })
+                )
+        }),
+        "text comparison was not lowered as typed infix operands: {:#?}",
+        ir.update_branches
+    );
 }
 
 #[test]
@@ -440,8 +669,7 @@ store: [
         .list_operations
         .iter()
         .find(|operation| {
-            operation.list == "groups"
-                && matches!(operation.kind, ListOperationKind::Append { .. })
+            operation.list == "groups" && matches!(operation.kind, ListOperationKind::Append { .. })
         })
         .expect("groups append operation");
     let ListOperationKind::Append { trigger, fields } = &append.kind else {
@@ -599,10 +827,7 @@ store: [
     assert_eq!(
         ir.semantic_memory
             .iter()
-            .map(|memory| (
-                memory.identity.semantic_path.as_str(),
-                memory.identity.kind,
-            ))
+            .map(|memory| (memory.identity.semantic_path.as_str(), memory.identity.kind,))
             .collect::<Vec<_>>(),
         [("store.count", SemanticMemoryKind::RootScalar)]
     );
@@ -668,8 +893,62 @@ FUNCTION entry_view(entry) {
         &fields[0].value,
         ListAppendFieldValue::Source { path } if path == "add.text"
     ));
-    assert!(ir
-        .derived_values
+    assert!(
+        ir.derived_values
+            .iter()
+            .any(|value| value.path == "store.candidate")
+    );
+}
+
+#[test]
+fn mapped_row_state_ignores_sources_owned_by_sibling_fields_and_list_operations() {
+    let source = r#"
+store: [
+    controls: [
+        append: SOURCE
+        toggle_all: SOURCE
+    ]
+    rows:
+        LIST {
+            [completed: False]
+            [completed: True]
+        }
+        |> List/append(item: controls.append |> THEN {
+            [completed: False]
+        })
+        |> List/map(row, new: new_row(initial_completed: row.completed))
+    all_completed: rows |> List/every(row, if: row.completed)
+]
+
+FUNCTION new_row(initial_completed) {
+    [
+        controls: [
+            edit: SOURCE
+            toggle: SOURCE
+        ]
+        completed:
+            LATEST {
+                initial_completed
+                store.controls.toggle_all |> THEN {
+                    store.all_completed |> Bool/not()
+                }
+            }
+            |> Bool/toggle(when: controls.toggle)
+    ]
+}
+"#;
+    let parsed = boon_parser::parse_source("mapped-row-source-ownership.bn", source).unwrap();
+    let ir = lower(&parsed).expect("mapped row source ownership must lower");
+    let sources = ir
+        .update_branches
         .iter()
-        .any(|value| value.path == "store.candidate"));
+        .filter(|branch| branch.target == "row.completed")
+        .map(|branch| branch.source.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        sources,
+        ["store.controls.toggle_all", "row.controls.toggle"],
+        "row state must not inherit append or sibling-field event sources"
+    );
 }

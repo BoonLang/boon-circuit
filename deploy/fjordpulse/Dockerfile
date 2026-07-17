@@ -29,7 +29,7 @@ ARG SOURCE_REVISION
 LABEL org.opencontainers.image.title="FjordPulse on Boon" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.source="https://github.com/BoonLang/boon-circuit" \
-      io.boon.package.manifest="/opt/boon/app/bundle.json" \
+      io.boon.package.manifest="/opt/boon/app/bundle.cbor" \
       io.boon.protocol.version="1"
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
@@ -47,4 +47,3 @@ STOPSIGNAL SIGTERM
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=6 \
   CMD ["/usr/local/bin/boon-app-server", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/boon-app-server", "serve"]
-

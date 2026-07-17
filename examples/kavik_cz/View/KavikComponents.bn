@@ -134,7 +134,7 @@ FUNCTION pill(label, accent) {
 
 FUNCTION external_link(label, to) {
     Scene/Element/link(
-        element: [hovered: SOURCE]
+        element: []
         style: [
             ...KavikTheme/link_text(mode: PASSED.store.mode)
             width: Auto
@@ -162,12 +162,9 @@ FUNCTION external_link(label, to) {
     )
 }
 
-FUNCTION action_button(label) {
+FUNCTION action_button(source, label) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: [press: source]]
         style: [
             width: Auto
             auto_padding: 28
@@ -200,7 +197,7 @@ FUNCTION action_button(label) {
 
 FUNCTION project_card(title, description, body, tags, image_url, image_alt, link_label, link_url) {
     Scene/Element/stripe(
-        element: [hovered: SOURCE]
+        element: []
         direction: Column
         gap: 12
         style: [
@@ -220,12 +217,9 @@ FUNCTION project_card(title, description, body, tags, image_url, image_alt, link
     )
 }
 
-FUNCTION post_card(title, description, meta, latest) {
+FUNCTION post_card(source, title, description, meta, latest) {
     Scene/Element/button(
-        element: [
-            event: [press: SOURCE]
-            hovered: SOURCE
-        ]
+        element: [events: [press: source]]
         style: [
             ...KavikTheme/panel_alt(mode: PASSED.store.mode)
             width: Fill
@@ -252,7 +246,7 @@ FUNCTION post_card(title, description, meta, latest) {
 
 FUNCTION media(title, video_id, poster_url, to) {
     Scene/Element/embedded_media(
-        element: [hovered: SOURCE]
+        element: []
         style: [
             ...KavikTheme/panel(mode: PASSED.store.mode)
             width: Fill

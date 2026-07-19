@@ -2,9 +2,10 @@
 
 ## Status
 
-This document records an agreed language and compiler direction. It is an
-implementation plan, not a description of syntax currently accepted by every
-compiler path.
+**Implementation-ready canonical plan.** This document records the agreed
+language surface, compiler cutover, runtime ownership model, collection API
+migrations, verification work, and clear end condition. It is not a
+description of syntax currently accepted by every compiler path.
 
 The design must remain a general Boon feature. `List/map` is the motivating
 case, but compiler, runtime, document, distributed, and verifier code must not
@@ -24,6 +25,12 @@ special-case `List/map` or any example.
 - Erase `OUT` wiring before executable runtime plans are produced.
 - Diagnose ambiguous ownership, cycles, incompatible scopes, and invalid
   forwarding statically.
+- Replace reflective collection calls with typed contextual calls that remain
+  indexable and virtualizable.
+- Make every executable backend consume one checked and elaborated program
+  instead of rediscovering call or row semantics independently.
+- Materialize only demanded keyed list windows while keeping logical list
+  length, state, dependencies, and identity intact.
 
 ## Non-Goals
 
@@ -36,6 +43,9 @@ special-case `List/map` or any example.
 - This design does not make intentionally ordered constructs unordered.
   Pipeline stages, spread override precedence, and chronological selection such
   as `LATEST` retain their own ordering semantics.
+- This design does not preserve positional calls, caller-selected output field
+  names, `List/find_value`, or compatibility fallbacks. The migration is an
+  atomic language cutover.
 
 ## SOURCE Versus OUT
 
@@ -282,6 +292,117 @@ declared output, the wrapper output remains structurally undriven. That is a
 hard compiler error even when the wrapper output is referenced elsewhere; the
 language does not rely only on an unused-parameter warning.
 
+## Reserved PASS Context
+
+`PASS` is compile-time context wiring, not an ordinary function parameter or
+argument. It remains a separate reserved call clause:
+
+```boon
+Components/button(
+    source: store.submit
+    label: TEXT { Submit }
+    PASS: [store: PASSED.store]
+)
+```
+
+The rules are deliberately narrow:
+
+- `PASS:` may appear at most once and must be the final call clause.
+- Its payload is resolved as compile-time context and is not part of the
+  function's declared value or `OUT` parameter list.
+- Actual value and `OUT` entries before it must exactly match the declaration
+  names and order.
+- `PASS` cannot be piped, forwarded as an `OUT`, persisted, serialized, or
+  exposed as a runtime value.
+- A function cannot declare a parameter named `PASS`; `PASS` and `PASSED` are
+  reserved language context names.
+
+Keeping `PASS` separate avoids a hidden optional function parameter and
+preserves exact call arity. Keeping it last leaves the complete declared
+function contract contiguous and then appends orthogonal context wiring. This
+is a source-order rule only: `PASS` does not establish evaluation order, and
+ordinary arguments may use the resulting `PASSED` context regardless of where
+their expressions appear. The parser, resolver, editor, and migration tooling
+must represent it separately from ordinary call entries. Calls whose only
+clause is `PASS` are trivially both first and last.
+
+## Canonical Collection APIs
+
+Collection operators use ordinary typed calls plus `OUT`; they do not use
+quoted field reflection, caller-selected result field names, or a second
+template language.
+
+### List/chunk
+
+The canonical call is:
+
+```boon
+rows:
+    cells
+    |> List/chunk(size: 26)
+```
+
+Each result row has canonical typed fields:
+
+```boon
+row.items
+row.label
+```
+
+`items:` and `label:` are not caller-provided field-name arguments. Existing
+calls such as `List/chunk(cells, size: 26, items: cells, label: row_number)`
+must migrate and the old spelling must be deleted. `row.items` is a lazy keyed
+slice retaining the source item identities; `row.label` is the canonical chunk
+label/index supplied by the operator.
+
+### List/find
+
+The canonical typed lookup is:
+
+```boon
+result:
+    cells
+    |> List/find(
+        cell
+        if: cell.address == target_address
+    )
+```
+
+It returns a typed result:
+
+```boon
+Found[value: CELL] | NotFound
+```
+
+The result is handled with ordinary Boon matching:
+
+```boon
+result |> WHEN {
+    Found[value] => value
+    NotFound => fallback
+}
+```
+
+`List/find_value`, quoted `field:`/`target:` arguments, and embedded
+`fallback:` behavior are removed. A caller selects a field from the returned
+typed row after handling `NotFound`.
+
+The typed predicate is semantic, not reflective. Equality of a current row
+field with a loop-invariant value, such as
+`cell.address == target_address`, is recognized by typed IR and may use the
+existing field index. Cells address lookup must therefore report index hits and
+zero scans without a Cells-specific branch. Predicates that cannot use an
+index remain correct bounded/incremental predicates and report their scan work
+honestly.
+
+### Other Collection Helpers
+
+Operators that naturally evaluate per row use typed `OUT` predicates or
+projections, for example `List/filter(item, if: ...)` and
+`List/map(item, new: ...)`. Only genuine schema/index declarations may retain
+compile-time metadata. User data access must not be encoded as quoted field
+names merely to help a backend recognize an operation.
+
 ## Order-Independent Lexical Binding
 
 Declarations are collected before references are resolved within a lexical
@@ -514,17 +635,44 @@ Contextual calls are elaborated and output nets are unified before final dense
 `ScopeId`, `SourceId`, machine-plan, document-plan, or distributed-plan IDs are
 assigned.
 
-Runtime identity is based on structural provenance:
+Runtime identity is based on structural provenance and every repeated ancestor,
+not only the nearest row:
 
 ```text
-parent scope
-+ authoritative operator/list identity
-+ hidden row key
-+ generation
-+ event binding epoch where applicable
+OwnerInstanceId
+  static owner ID
+  ancestor instances: [(list ID, hidden row key, generation), ...]
 ```
 
 Output names and parameter ordinals are diagnostics, not runtime identity.
+`OwnerInstanceId` is interned so normal evaluation and event routing compare a
+small stable ID rather than repeatedly allocating or hashing the full ancestry.
+State, sources, effects, dependencies, persistence ownership, retained
+document rows, and currentness caches all use this same owner.
+
+Values materialized from repeated operators retain ownership explicitly:
+
+```text
+KeyedItem
+  owner: OwnerInstanceId
+  value
+```
+
+Host events use a complete route token:
+
+```text
+EventRoute
+  program revision
+  owner instance
+  source ID
+  row generation
+  binding epoch
+```
+
+Payload matching, list index fallback, inferred generation `1`, and any other
+best-effort recovery are forbidden. A stale or incomplete route is rejected.
+The same correlation fields survive Client, Session, and Server transport;
+`OUT` itself never crosses that boundary.
 
 After elaboration, transparent wrappers must disappear. Direct and wrapped
 forms must produce equivalent executable work:
@@ -539,12 +687,22 @@ forms must produce equivalent executable work:
 - no loss of virtualization or demand-current behavior.
 
 Debug provenance may retain the wrapper stack and source spans without changing
-runtime identity.
+runtime identity. Debug-only provenance is excluded from executable hashes,
+persistence schema IDs, wire schema IDs, and direct-versus-wrapped equivalence
+comparisons.
 
 General stateful wrappers must not ship while generic list materialization uses
 unstable positional identity or snapshots an entire logical list merely to
 render a visible window. Keyed incremental materialization and bounded
 virtualization are prerequisites.
+
+The normal list/document path exposes logical length and demanded ranges. It
+must not first create a full `Vec<Value>`, lower all rows, or recover a row with
+`list_row_at(index)`. Map, filter, chunk, and find preserve keyed ownership;
+document layout requests a visible range plus bounded overscan; retained row
+subframes survive scrolling; only document/render caches may evict offscreen
+materialization. Runtime state and formula dependencies remain independently
+owned and current.
 
 ## Compiler Architecture
 
@@ -626,6 +784,101 @@ Before backend lowering:
 No fallback may eagerly compile all call arguments in the caller scope when
 the typed signature requires a contextual scope.
 
+### Checked And Erased Programs
+
+The cutover uses two authoritative compiler products rather than letting each
+backend reinterpret parser AST:
+
+```text
+CheckedProgram (owned by boon_typecheck)
+  stable DeclId and LexicalScopeId
+  resolved callable identity
+  exact typed call entries
+  polymorphic contextual signatures
+  semantic occurrences and source spans
+  scope-effect and correlation summaries
+  typed collection predicates and projections
+
+ErasedProgram (owned by boon_ir)
+  expanded contextual functions
+  unified and validated OutNet graph
+  structural OwnerInstanceId anchors
+  canonical executable operations
+  no OUT, PASS, wrapper call, or parser-level call ambiguity
+```
+
+No new crate is required. `boon_typecheck` owns declaration resolution and the
+checked semantic program; `boon_ir` owns contextual elaboration, output-net
+validation, erasure, and canonical executable IR. Machine, document,
+distributed, persistence, native host, and verifier backends consume only the
+post-erasure representation.
+
+One typed signature registry covers built-ins and user functions. Initially,
+built-ins may register trusted generic signatures and lowering capabilities,
+but they are checked through the same call binder and `OutNet` verifier. Parser
+row-scope heuristics, `ListMapBinding`, backend-specific positional binders,
+string matching on contextual function names, and backend rediscovery of
+template arguments are deleted after the cutover.
+
+Transparent wrappers are expanded before executable IDs and hashes are
+assigned. The authoritative structural owner belongs to the outer fresh-output
+operator call; forwarding wrappers add debug provenance only. This guarantees
+that direct, one-wrapper, and multi-wrapper forms produce identical executable
+ownership and work.
+
+### Incremental Collection Lowering
+
+Typed collection operations lower to lazy keyed views with at least:
+
+- logical length without value materialization;
+- stable row IDs for demanded ranges;
+- current field projection reads;
+- incremental map, filter, chunk, and find state;
+- index selection from typed predicate equality;
+- precise dirty-key and dependency propagation;
+- bounded visible-window materialization.
+
+`List/chunk` stores an internal keyed slice/range and exposes canonical
+`.items`/`.label`; it does not copy every child row. `List/find` installs a
+dependency on the selected row and predicate inputs, uses a compatible typed
+index when available, and returns `Found`/`NotFound` without evaluating an
+unrelated projection or fallback branch.
+
+The document backend asks for the visible range before requesting row values.
+It retains row fragments by `OwnerInstanceId` and patches transforms, clips,
+text, and style data incrementally. A normal selection, edit, formula update,
+or scroll must not trigger a full list snapshot, full document lower, full
+layout frame rebuild, full host reconciliation, or full render-scene rebuild.
+
+### Current Repository Cut Map
+
+The implementation starts from concrete duplicated paths that exist today:
+
+- `boon_parser::AstCallArg` stores only an optional name and expression, so it
+  must be replaced or complemented by structured bare/named/PASS call entries
+  and structured function parameters.
+- `boon_typecheck::ListMapBinding`, render-slot template fields, and parser
+  helpers such as `list_map_binding_name` encode contextual row behavior outside
+  the general function model and must disappear into `CheckedProgram`.
+- `boon_ir` and both compiler backends repeatedly inspect `AstCallArg` and
+  function strings to reconstruct list-map, find, chunk, and template behavior.
+  Those consumers must receive typed call/elaboration nodes instead.
+- `boon_plan_executor` currently materializes `ListRef` and `ListMap` as full
+  vectors and carries special `MappedRow` values. It must operate on lazy
+  `KeyedItem` views and preserve owner identity through projections.
+- `boon_runtime::document` may recover materialization identity through
+  `list_row_at(list, index)`. That positional fallback must be replaced by the
+  keyed owner already carried by the demanded item.
+- `List/find_value` has dedicated plan, compiler, executor, and example paths.
+  They are removed after source migration to typed `Found | NotFound`.
+- `SourceEvent` currently lacks complete program/owner/binding identity, and
+  runtime/playground paths still contain default-generation and payload lookup
+  recovery. Event routing must fail closed on the complete route token.
+
+This is a deletion map, not a compatibility checklist. Once the replacement
+representation is connected, remove these paths in the same implementation
+slice rather than leaving old and new execution worlds in parallel.
+
 ## Diagnostics
 
 Diagnostics must use the language concepts in this document, not compiler
@@ -648,6 +901,14 @@ Required errors include:
 - correlated outputs must be forwarded together;
 - argument `new` is evaluated under incompatible output scopes;
 - argument names or positions do not match the function declaration;
+- `PASS:` must appear once at most and after all value/output entries;
+- `PASS` is reserved context and cannot be declared or used as a value
+  parameter;
+- `List/find` requires a typed row predicate and returns `Found | NotFound`;
+- reflective `field:`, `target:`, or `fallback:` lookup syntax is not
+  supported;
+- `List/chunk` result fields are canonical `.items` and `.label` and cannot be
+  renamed by the caller;
 - local declaration shadows the outer name throughout this scope;
 - instantaneous dependency cycle with the complete declaration path.
 
@@ -687,41 +948,100 @@ The migration should also enforce already-agreed call consistency:
 - ordinary positional arguments are removed; a bare call entry exclusively
   declares a fresh `OUT` binding;
 - a pipe supplies the first ordinary parameter;
+- `PASS:` is the only reserved context clause, appears last, and is not an
+  argument;
+- `List/find_value` and reflective `List/find(field:, value:)` are replaced by
+  typed `List/find(item, if:) -> Found | NotFound`;
+- `List/chunk` exposes canonical `.items` and `.label` fields rather than
+  accepting caller-selected field names;
 - one-input `LATEST` is rejected because it performs no merge or selection;
 - user documentation does not expose compiler-internal contextual-template or
   item-binder terminology.
 
 ## Implementation Order
 
-1. Add parser, typechecker, compiler, runtime, and document negative fixtures
-   that encode this contract before changing accepted syntax.
-2. Replace string-only function parameters with structured `Value` and `Out`
-   declarations and preserve source spans.
-3. Implement exact named inputs, bare output bindings, ordered call binding,
-   pipe desugaring, required parentheses, and removal of positional and
-   argument-renaming fallbacks.
-4. Centralize declaration collection and order-independent resolution for
-   functions, modules, `BLOCK`, explicit record fields, and call outputs.
-5. Separate type constraints, output aliases, value dependencies, temporal
-   dependencies, and distributed dependencies, with graph-specific SCC
-   diagnostics.
-6. Add typed function signatures carrying output ports, correlation, and
-   parameter scope effects.
-7. Add one contextual-call elaborator and output-net unifier before machine,
-   document, and distributed backend lowering.
-8. Fix generic keyed list identity, incremental materialization, and bounded
-   visible-window virtualization where current positional or full-snapshot
-   behavior violates this contract.
-9. Erase wrappers and outputs before canonical plan-ID assignment, then compare
-   direct and wrapped plans.
-10. Move built-in collection operators to the same typed contextual-function
-    model and migrate all examples and fixtures.
-11. Add semantic tokens, matching-reference ranges, hover/navigation data, and
-    inline diagnostics for fresh and forwarded outputs to the dev editor.
-12. Verify state, effect, event, persistence, Session, and distributed
-    invariants under nested and forwarded outputs.
-13. Remove superseded contextual-operator branches, positional call fallbacks,
-    compatibility syntax, and stale tests rather than retaining two models.
+Implement this as one compiler/runtime cutover. Intermediate commits may be
+temporarily uncompilable inside a local branch, but no compatibility mode,
+dual execution path, or permanent syntax adapter may ship.
+
+1. **Freeze executable contract fixtures.** Add small unrelated list and
+   dictionary programs for direct, one-wrapper, and multi-wrapper forms;
+   `PASS`; `List/find`; `List/chunk`; nested keyed state; effect cancellation;
+   stale event routing; and visible-window materialization. Record normalized
+   executable sections and work counters, not parser AST snapshots alone.
+2. **Introduce structured syntax.** Replace string-only function parameters
+   with spanned `Value`/`Out` declarations. Parse call entries as
+   `BareBinding` or `Named`, and parse `PASS` into its own optional context
+   field. Keep syntax errors local and deterministic.
+3. **Build the two-pass resolver.** Predeclare functions, modules, `BLOCK`
+   bindings, explicit record fields, parameters, and fresh call outputs with
+   stable `DeclId`/`LexicalScopeId`; then resolve references independently of
+   textual order. Build labeled type, alias, value, temporal, and distributed
+   edges and reject illegal SCCs.
+4. **Create the authoritative `CheckedProgram`.** Resolve every callable once,
+   bind exact call entries against the unified typed signature registry, infer
+   output scope effects and correlation, and emit semantic occurrences for
+   tooling. Remove parser-level row-scope inference as soon as consumers use
+   this representation.
+5. **Enforce the new call model atomically.** Require parentheses, named
+   ordinary inputs, canonical bare fresh outputs, named compatible forwarding,
+   declaration order, a pipe only for the first ordinary input, and the
+   separate final `PASS` clause. Delete positional binding, argument
+   renaming, first-unused-parameter recovery, and unknown-name fallback.
+6. **Implement `OutNet` elaboration in `boon_ir`.** Allocate and unify output
+   nets, validate one producer, type/shape/role/generation/correlation
+   compatibility, expand contextual functions in their declaring island, and
+   erase wrappers/outputs into `ErasedProgram` before executable IDs and hashes
+   are assigned.
+7. **Cut every backend to `ErasedProgram`.** Convert machine, document,
+   distributed, persistence, native host, and verifier lowering together.
+   Delete `ListMapBinding`, template-argument rediscovery, string-based
+   contextual function switches, backend positional binders, and runtime
+   `OUT` representations. Do not leave an AST fallback.
+8. **Install structural keyed ownership.** Intern `OwnerInstanceId` from static
+   owner plus all ancestor `(list, key, generation)` instances. Key state,
+   sources, effects, dependencies, persistence, retained document rows, and
+   currentness by that owner. Route events with program revision, source ID,
+   owner, generation, and binding epoch; delete payload/index/default-generation
+   recovery.
+9. **Replace collection APIs.** Migrate `List/map` and related contextual
+   helpers to typed signatures, replace `List/find_value` and reflective find
+   calls with `List/find(item, if:) -> Found | NotFound`, and replace renamed
+   `List/chunk` outputs with canonical `.items`/`.label`. Derive index use from
+   typed predicate equality.
+10. **Make collection execution lazy and keyed.** Preserve row identity through
+    map/filter/chunk/find; provide logical length and demanded ranges; make
+    current field reads precise; and remove full-list value snapshots,
+    positional reconciliation, discarded mapped row IDs, and
+    `list_row_at(index)` ownership recovery from normal execution.
+11. **Cut document/render materialization to visible demand.** Request visible
+    ranges plus bounded overscan before row evaluation, retain keyed row
+    subframes, and patch selection/edit/scroll state without full lower,
+    layout, host reconcile, or scene rebuild. Keep offscreen application state
+    independent from evictable document/render caches.
+12. **Migrate source mechanically.** Use a temporary parser-aware Rust codemod
+    to label ordinary arguments, preserve bare outputs, place `PASS` last,
+    quote only genuine metadata constants, add explicit outer aliases for
+    same-name record fields, and rewrite find/chunk calls. Migrate all examples,
+    tests, embedded Boon source, diagnostics fixtures, persistence migrations,
+    and docs. Do not use regex rewriting or Python. Delete the codemod after the
+    one-time migration.
+13. **Finish diagnostics and editor semantics.** Emit structured primary spans,
+    notes, and fixes for call/OUT/PASS/cycle errors. Feed semantic occurrences
+    into syntax styling, hover, references, F12/Ctrl-click navigation, and an
+    optional inline `OUT` hint that defaults off.
+14. **Delete superseded code before broad testing.** Run repository scans and
+    remove positional binders, parser row heuristics, backend contextual
+    rediscovery, runtime output handles, `List/find_value`, reflective find,
+    caller-renamed chunk fields, full-snapshot normal paths, stale fixtures,
+    and example-specific branches. Do not quarantine, rename, or preserve them
+    as fallback code.
+15. **Verify in layers once per completed cut.** Run focused parser/typecheck/IR
+    tests, then executor/runtime/document tests, then native scenario and
+    performance reports. Only after the source and binaries are final, run all
+    reports from `native_gpu_handoff_manifest.json` and the manifest-backed
+    aggregate. Avoid repeatedly refreshing expensive reports between small
+    edits.
 
 ## Verification Matrix
 
@@ -737,6 +1057,10 @@ The migration should also enforce already-agreed call consistency:
 - Rejection of unknown, duplicated, missing, renamed, or out-of-order
   arguments.
 - Pipe and explicit-first-argument equivalence.
+- `PASS` is parsed separately, accepted only once in final position, and does
+  not change function arity, parameter order, or executable data values.
+- Rejection of a `PASS` parameter, a non-final or duplicated `PASS`, and
+  attempts to pipe, forward, persist, or serialize it.
 - Forward references in functions, modules, `BLOCK`, and explicit record
   fields.
 - Whole-scope shadowing and explicit enclosing aliases.
@@ -749,6 +1073,10 @@ The migration should also enforce already-agreed call consistency:
 - Rejection of incompatible parameter scope effects.
 - Rejection of unsupported branch-local producer combinations.
 - Rejection of one-input `LATEST`.
+- Typed `List/find(item, if:)` returns `Found[value] | NotFound`; reflective
+  find arguments and `List/find_value` are rejected.
+- `List/chunk(size:)` exposes only canonical `.items` and `.label`; caller
+  field renaming is rejected.
 - Semantic-token, hover, reference-range, and diagnostic snapshots distinguish
   fresh output binding, output forwarding, and ordinary value references.
 
@@ -756,28 +1084,44 @@ The migration should also enforce already-agreed call consistency:
 
 - Direct `List/map` and one-wrapper forms normalize to equivalent executable
   operations.
-- One-wrapper and multi-wrapper forms have identical dirty-set and allocation
-  bounds.
+- Direct, one-wrapper, and multi-wrapper forms have identical executable graph
+  sections, persistence/wire schemas, owner IDs, dirty sets, allocation bounds,
+  and evaluated-row counts. Debug provenance is excluded from that comparison.
 - Two calls to the same wrapper retain distinct call-site ownership.
 - Nested rows with the same child key under different parents remain distinct.
 - Reorder, delete, reinsert, and key reuse preserve generation safety.
 - Stale input events are rejected after replacement.
+- A joined ownership scenario proves row-local `HOLD`, source routing, effect
+  cancellation, late-completion rejection, reorder, deletion, and reinsertion
+  in one executor run.
 - Offscreen rows rematerialize without duplicate state or effects.
 - Constant per-row expressions still receive keyed ownership.
 - Repeated reads in one scope share one graph node.
 - No wrapper causes a full-list scan, full document relower, or full render
   rebuild.
 - Currentness barriers expose derived values before rendering or publication.
+- A 2,600-row fixture materializes only the visible range plus bounded
+  overscan; scrolling changes that window without full-list map/filter/chunk
+  evaluation or positional row lookup.
+- Indexed `List/find` reports index hits, candidate counts, and zero scans for
+  compatible typed equality; non-indexed predicates report bounded scan work.
+- Normal list/document counters prove zero full-list snapshots, zero full
+  document relowers, zero full host reconciles, and zero full scene rebuilds
+  for selection, edit, formula update, and passive scroll.
 
 ### Persistence And Distribution
 
 - Plans and reports contain no runtime `OUT` value or serializable output ID.
+- Plans, persistence schemas, CBOR frames, native reports, and protocol values
+  contain no `PASS`, `OutNet`, wrapper-debug identity, or parser call entry.
 - Persisted state is keyed by structural ownership, not parameter names.
 - Client, Session, and Server boundaries carry ordinary values/events only.
 - Role mismatch and stale Session generation are rejected statically or at the
   host boundary as appropriate.
 - Correlated event routes retain parent key, row key, generation, program
   revision, and binding epoch.
+- Two Session tabs with overlapping local row keys remain isolated because
+  their complete owner ancestry and Session generation differ.
 
 ### Genericity And Cleanup
 
@@ -787,6 +1131,12 @@ The migration should also enforce already-agreed call consistency:
   branches on example or component identity.
 - Scan for the removed positional/renaming call fallbacks and hardcoded
   contextual `List/map` handling.
+- Scan for `ListMapBinding`, `List/find_value`, reflective `List/find`, renamed
+  `List/chunk` result fields, parser row-scope heuristics, AST-consuming
+  executable backends, runtime output handles, positional owner recovery, and
+  default generation/event-route fallbacks.
+- Scan compiler, runtime, document, renderer, host, and verifier crates for
+  branches on Cells, NovyWave, FjordPulse, or another example identity.
 - Compare normalized plans rather than accepting output-only behavioral tests.
 
 ## Clear End Condition
@@ -795,30 +1145,78 @@ This plan is complete only when all of the following are true from final source:
 
 1. The documented fresh and forwarded `OUT` syntax compiles, including
    cross-name forwarding.
-2. Exact ordinary argument names, bare output-binding names, declaration
-   positions, pipe semantics, and order-independent lexical resolution are
-   enforced consistently by every compiler backend.
-3. Generic user-defined wrappers can express the collection examples without
-   built-in-only contextual syntax.
-4. Direct and transparently wrapped forms normalize to equivalent executable
-   plans and measured work bounds.
-5. Keyed identity, currentness, virtualization, state/effect ownership, stale
-   event rejection, persistence, and distributed-role tests pass.
-6. All invalid ownership, forwarding, cycle, and correlation cases fail with
-   deterministic language-level diagnostics.
-7. Superseded contextual-operator branches, argument-renaming behavior,
-   compatibility fallbacks, and stale fixtures are deleted.
-8. No generic layer contains an example-specific or `List/map`-specific
-   shortcut after contextual signatures have been migrated.
-9. Relevant workspace and manifest-backed verification gates pass from fresh
-   artifacts.
-10. The Boon editor visibly distinguishes fresh output bindings, traces
-    forwarded outputs, and reports structural output errors without requiring
-    runtime execution.
+2. Exact ordinary argument names and positions, canonical bare output names,
+   named forwarding, pipe semantics, order-independent lexical resolution, and
+   separate final `PASS` context are enforced once in
+   `CheckedProgram`, not independently by backends.
+3. `OutNet` validation and transparent expansion produce one `ErasedProgram`;
+   every executable backend consumes it and no backend reparses contextual
+   semantics from AST, names, or strings.
+4. Generic user-defined wrappers express the collection examples without
+   built-in-only contextual syntax, and built-ins use the same typed signature
+   and output verification model.
+5. `List/find(item, if:) -> Found | NotFound` and canonical
+   `List/chunk(size:)` are the only supported forms; `List/find_value`,
+   reflective lookup arguments, and caller-renamed chunk fields are absent
+   from source, fixtures, docs, plans, and executable code.
+6. Direct, one-wrapper, and multi-wrapper forms normalize to equivalent
+   executable plans, persistence/wire schemas, owner identities, dirty work,
+   allocations, and evaluated-row bounds.
+7. `OwnerInstanceId` includes all ancestor row keys and generations; state,
+   sources, effects, dependencies, persistence, currentness, document rows, and
+   event routes consistently use it.
+8. Keyed incremental list execution and visible-window document demand are in
+   the normal path. A 2,600-row fixture materializes only visible rows plus
+   bounded overscan and proves no full-list/full-document fallback during
+   selection, edit, formula update, or scroll.
+9. Indexed typed find proves index hits and zero scans for Cells-style address
+   lookup without any example-specific branch.
+10. Keyed identity, currentness, state/effect cancellation, stale event
+    rejection, persistence, Session isolation, and distributed correlation
+    tests all pass, including reorder/delete/reinsert and late completion.
+11. All invalid ownership, forwarding, call, `PASS`, cycle, scope, and
+    correlation cases fail with deterministic language-level diagnostics and
+    source spans.
+12. The Boon editor distinguishes fresh output bindings, traces forwarded
+    outputs, reports structural errors, and supports hover/references/navigation
+    from typed semantic occurrences without runtime execution.
+13. Superseded contextual branches, `ListMapBinding`, positional/renaming
+    binders, first-unused recovery, parser row heuristics, runtime output
+    handles, positional row recovery, event-route fallbacks, compatibility
+    syntax, temporary codemod, and stale fixtures are deleted rather than
+    hidden or renamed.
+14. No compiler, runtime, document, renderer, host, verifier, or migration layer
+    branches on `List/map` after typed registration or on Cells, NovyWave,
+    FjordPulse, or another example identity.
+15. Focused workspace tests pass, every final-source native report named by
+    `docs/architecture/native_gpu_handoff_manifest.json` is fresh and passing,
+    and `cargo xtask verify-all --check-existing --report
+    target/reports/report-v2/verify-all.json` passes against those artifacts.
 
 The work must not be marked complete because syntax parses, one example works,
-or output values happen to match. Structural plan equivalence and runtime
-identity/work evidence are required.
+output values happen to match, or a compatibility path keeps old fixtures
+green. Structural plan equivalence, bounded runtime work, deletion scans,
+editor evidence, and fresh manifest-backed verification are all mandatory.
+
+## Implementation Constraints And Initial Limits
+
+- User-defined function parameters are required and have no implicit defaults.
+  Only explicitly registered standard-library functions may declare defaults,
+  and the typed binder still expands them deterministically.
+- Recursive contextual functions and branch-local output producers are rejected
+  in the first complete implementation. They may be designed later only with a
+  finite scope-effect proof and exact branch signatures.
+- `PASS` is the sole reserved call-context clause. It is never a user
+  parameter, executable value, persisted value, or wire field.
+- The implementation uses existing crates: `boon_typecheck` owns
+  `CheckedProgram`; `boon_ir` owns elaboration, output-net verification, and
+  `ErasedProgram`.
+- Source migration is parser-aware Rust code that is deleted after use. No
+  Python, regex-only source rewriting, or permanent compatibility translator is
+  added.
+- Performance counters and normalized debug provenance are diagnostic side
+  channels. They cannot alter executable IDs, currentness, scheduling, or
+  visible behavior.
 
 ## Rejected Alternatives
 
@@ -843,6 +1241,22 @@ identity/work evidence are required.
   ownership, and performance while losing static graph guarantees.
 - **Hardcoded collection operators:** they prevent ordinary Boon wrappers and
   duplicate semantics across compiler backends.
+- **Reflective `List/find(field:, target:)`:** quoted application field names
+  discard type information and force backends to rediscover structure. A typed
+  predicate is clearer and still allows compiler-selected indexes.
+- **`List/find_value` with embedded fallback:** it combines lookup, projection,
+  and control flow, hides absence, and multiplies special lowering paths. A
+  typed `Found | NotFound` result composes with ordinary Boon matching.
+- **Caller-named `List/chunk` fields:** allowing `items:` and `label:` to name
+  result fields makes result types call-site dependent and reflective. Fixed
+  `.items` and `.label` keep the operation typed and optimizable.
+- **Treating `PASS` as an optional function parameter:** that would make arity,
+  ordering, piping, serialization, and diagnostics ambiguous. It remains a
+  separately parsed final compile-time context clause.
+- **Allowing `PASS` anywhere:** this has no semantic or implementation benefit,
+  breaks the contiguous declaration-order argument sequence, and permits
+  inconsistent call layouts. The final position is canonical even when earlier
+  arguments read `PASSED` values.
 - **Textual evaluation order:** it conflicts with Boon's declarative graph and
   makes harmless reordering change meaning.
 - **Type-only forwarding compatibility:** equal value types do not prove equal
